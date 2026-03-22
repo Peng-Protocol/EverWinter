@@ -11,6 +11,7 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Tiered DCA Strategy:** Manages risk through a three-tier "Add" system (at +3%, +9%, and +15% price increases) to improve entry averages during volatile spikes.
 * **Dynamic Take-Profit (TP):**
     * **Base TP:** Standard profit targets for the initial entry and each DCA tier.
+    * **TP Drift:** Often due to latency and volatility; the TP price drifts from its intended ROI percent, the bot actively monitors TP ROI for each position and adjusts them to match expected values for each DCA stage or entry.
     * **Time-Decay TP:** Automatically reduces TP targets to 3% after 12 hours to prioritize capital rotation.
 * **Hard-Stop Recovery:** Includes a "Force Market Close" safety mechanism that triggers if a position remains open for more than 24 hours.
 * **Client-Side Security:** API keys are stored only in volatile memory (RAM) or local browser storage; credentials are never sent to any third-party server except Bybit’s official API.
