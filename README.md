@@ -11,7 +11,7 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Tiered DCA Strategy:** Manages risk through a three-tier "Add" system (at +3%, +9%, and +15% price increases) to improve entry averages during volatile spikes.
 * **Dynamic Take-Profit (TP):**
     * **Base TP:** Standard profit targets for the initial entry and each DCA tier.
-    * **TP Drift:** Often due to latency and volatility; the TP price drifts from its intended ROI percent, the bot actively monitors TP ROI for each position and adjusts them to match expected values for each DCA stage or entry.
+    * **TP Drift:** Often due to latency and volatility; the TP price drifts from its intended ROI percent, the bot actively monitors TP ROIs for each position and adjusts them to match expected values for all DCA stages or the original entry.
     * **Time-Decay TP:** Automatically reduces TP targets to 3% after 12 hours to prioritize capital rotation.
 * **Hard-Stop Recovery:** Includes a "Force Market Close" safety mechanism that triggers if a position remains open for more than 24 hours.
 * **Client-Side Security:** API keys are stored only in volatile memory (RAM) or local browser storage; credentials are never sent to any third-party server except Bybit’s official API.
@@ -49,7 +49,7 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 ## Getting Started
 
 1.  **Download the HTML:** Very self-explanatory. 
-2.  **Open the App:** Simply open `Everwinter1.0.html` in any modern web browser.
+2.  **Open the App:** Simply open `EverWinter1.0.html` in any modern web browser.
 3.  **Connect API:**
     * Generate an API Key on Bybit with **Contract/Derivatives** permissions.
 4.  **Configure & Start:** Adjust your leverage and margin settings, then click **"Start Bot"**.
@@ -57,4 +57,4 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 ## ⚠️ Risk Warning
 
 Trading perpetual futures involves significant risk. EverWinter is a tool for automation and does not guarantee profits. 
-* **Liquidation Risk:** High leverage can lead to liquidations during parabolic "short squeezes." It is advised to only use this bot during a prolonged bear market. 
+* **Loss Risk:** High leverage can lead to heavy losses during parabolic "short squeezes." It is advised to only use this bot during a prolonged bear market with the default settings applied.
