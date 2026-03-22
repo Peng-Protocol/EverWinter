@@ -17,7 +17,7 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Client-Side Security:** API keys are stored only in volatile memory (RAM) or local browser storage; credentials are never sent to any third-party server except Bybit’s official API.
 * **Stop-Loss (SL):** 
    * **Trend Continuation:** In the rare event where an upward trend continues, it is safer to absorb losses than hold, on isolated margin the position will be automatically liquidated at -75% ROI.
-   * **Loss Absorption:** For cross margin an SL is required to prevent total erasure of the account, as such; the bot will automatically set a stop loss after the third DCA conditional is triggered,this amounts to **-104%** of the position's value. 
+   * **Loss Absorption:** For cross margin an SL is required to prevent total erasure of the account, as such; the bot will automatically set a stop loss after the third DCA conditional is triggered, this amounts to **-105%** of the position's value. 
 
 ## Technical Stack
 
