@@ -797,7 +797,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
         <!-- BTC always-visible row -->
         <div class="gr" x-show="cfg.btcMode!=='gainers'" style="border-bottom:1px solid var(--border-hi);background:rgba(249,115,22,0.04)">
           <span class="g-sym" style="color:#f97316">BTCUSDT</span>
-          <span class="g-chg" x-text="btcWatchEntry.change!=null?'+'+btcWatchEntry.change.toFixed(2)+'%':'—'"></span>
+          <span class="g-chg" x-text="btcWatchEntry.change!=null ? (btcWatchEntry.change > 0 ? '+' : '') + btcWatchEntry.change.toFixed(2) + '%' : '—'"></span>
           <span class="g-rsi"
             :class="btcWatchEntry.rsi6>=75&&btcWatchEntry.rsi12>=75&&btcWatchEntry.rsi24>=65?'hot':btcWatchEntry.rsi6>=65||btcWatchEntry.rsi12>=65?'warm':'cool'"
             x-text="(btcWatchEntry.rsi6?btcWatchEntry.rsi6.toFixed(0):'?')+'/'+(btcWatchEntry.rsi12?btcWatchEntry.rsi12.toFixed(0):'?')+'/'+(btcWatchEntry.rsi24?btcWatchEntry.rsi24.toFixed(0):'?')">
@@ -1049,6 +1049,7 @@ function ew() { return {
   _lastSignedCall: 0, // timestamp of last signed API call — enforces minimum spacing
   _instrCache: {},   // null entries = unsupported symbols (cleared on reconnect)   // symbol → { minQty, qtyStep, pricePrecision }
   bot: { running:false, startTime:null, lastScan:'', lastScanAt:0, scanCd:0, scanPct:100, _cdTimer:null, _watchTimer:null, _refreshTimer:null, _audioTimer:null },
+  _closingIds: new Set(),  // positions currently being closed — guards against concurrent double-count
   _onboarding: new Set(),
   audioState: 'off', // 'off' | 'running' | 'suspended'
 
@@ -1912,6 +1913,14 @@ function ew() { return {
           const roiTarget = 0.03;
           const basePrice = p.markPrice || p.entryPrice;
           const nt = basePrice * (1 - (roiTarget / p.leverage));
+          // Edge case: if the position already has ≥3% ROI, the computed TP would be
+          // at or above the current mark price — Bybit will reject the trading-stop call.
+          // In this scenario, skip the reduction and close immediately instead.
+          if (nt >= basePrice) {
+            this.log(`${p.symbol}${p.isBtc?' [BTC]':''}: 12h — ROI already ≥3% (TP would be above mark price — Bybit would reject). Closing immediately.`, 'warn');
+            this.persist();
+            await this.closePosition(p, 'force'); continue;
+          }
           p.currentTpPrice = nt; p.tpPct = 3;
           await this.setTP(p.symbol, nt);
           this.log(`${p.symbol}${p.isBtc?' [BTC]':''}: 12h — TP → 3% (${fmtP(nt)})`, 'warn');
@@ -2270,7 +2279,13 @@ function ew() { return {
             }
           }
         } else if (!pos.isPending) {
-          // Position gone from exchange — fetch closed PnL record to classify outcome
+          // Position gone from exchange — fetch closed PnL record to classify outcome.
+          // Guard must be set synchronously (before any await) so a concurrent syncPositions
+          // call racing through the same snapshot sees it immediately and skips this position,
+          // preventing a double win/loss count.
+          if (this._closingIds.has(pos.id)) continue;
+          this._closingIds.add(pos.id);
+
           await this.cancelAllConditionals(pos.symbol);
           this.liveOrders   = this.liveOrders.filter(o => o.symbol !== pos.symbol);
           this.condEntries  = this.condEntries.filter(e => e.symbol !== pos.symbol);
@@ -2279,7 +2294,10 @@ function ew() { return {
           if (pos.isBtc) this.btcWatchEntry.status = 'pending'; // B indicator off
           this.positions = this.positions.filter(x => x.id !== pos.id);
           this.persist();
-          setTimeout(() => this.recordClosedPosition(pos), 2500);
+          setTimeout(() => {
+            this.recordClosedPosition(pos);
+            this._closingIds.delete(pos.id);
+          }, 2500);
           if (this.bot.running) {
             this.log(`${pos.symbol}${pos.isBtc?' [BTC]':''}: position closed — fetching close data...`, 'info');
             setTimeout(() => this.runScan(), 500);
