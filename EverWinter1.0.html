@@ -1518,8 +1518,8 @@ function ew() { return {
     // Balance check: 3 DCA add margins must be available
     const addMarginEach    = this.cfg.btcNotional / BTC_LEV;
     const dcaMarginRequired = 3 * addMarginEach;
-    if (this.acct.available != null && this.acct.available < dcaMarginRequired) {
-      this.log(`BTC: skipped — insufficient balance for DCA adds. Need $${dcaMarginRequired.toFixed(2)}, available $${this.acct.available.toFixed(2)}`, 'warn');
+    if (this.acct.balance != null && this.acct.balance < dcaMarginRequired) {
+      this.log(`BTC: skipped — insufficient balance for DCA adds. Need $${dcaMarginRequired.toFixed(2)}, available $${this.acct.balance.toFixed(2)}`, 'warn');
       this.btcWatchEntry.status = 'lowbal';
       return;
     }
@@ -1548,7 +1548,12 @@ function ew() { return {
     this.log(`▼ BTC SHORT BTCUSDT @ ~${fmtP(price)} | Qty:${qty} | Notional:$${actualNotional.toFixed(2)} | Margin:$${marginCost.toFixed(2)} | RSI6:${rsi6?.toFixed(1)} RSI12:${rsi12?.toFixed(1)} RSI24:${rsi24?.toFixed(1)}`, 'trade');
 
     const fillPrice = await this.waitForPosition(SYM);
-    const tpBase    = fillPrice || price;
+    if (!fillPrice) {
+      await this.cancelAllConditionals(SYM);
+      this.log(`BTC: entry aborted (no fill confirmed) — conditionals cancelled.`, 'warn');
+      return;
+    }
+    const tpBase    = fillPrice;
 
     // TP: 25% ROI → price falls 1% from fill
     const tpPrice = instr
@@ -1644,8 +1649,8 @@ function ew() { return {
     // On cross margin, adds aren't committed yet but will be drawn from the same pool
     // when triggered — we must have the headroom now or risk forced liquidation mid-DCA.
     const dcaMarginRequired = 3 * (this.cfg.addNotional / effectiveLev);
-    if (this.acct.available != null && this.acct.available < dcaMarginRequired) {
-      this.log(`✕ ${sym}: skipped — insufficient balance for DCA adds. Need $${dcaMarginRequired.toFixed(2)} (3× add margin at ${effectiveLev}×), available $${this.acct.available.toFixed(2)}`, 'warn');
+    if (this.acct.balance != null && this.acct.balance < dcaMarginRequired) {
+      this.log(`✕ ${sym}: skipped — insufficient balance for DCA adds. Need $${dcaMarginRequired.toFixed(2)} (3× add margin at ${effectiveLev}×), available $${this.acct.balance.toFixed(2)}`, 'warn');
       const g = this.gainers.find(x => x.symbol === sym);
       if (g) g.status = 'lowbal';
       return;
@@ -1667,10 +1672,16 @@ function ew() { return {
 
     // Poll until position exists on exchange — returns actual fill price
     const fillPrice = await this.waitForPosition(sym);
+    if (!fillPrice) {
+      // Order did not fill — cancel any conditionals that may have been queued
+      // and abort without logging a position. Do not count as a trade outcome.
+      await this.cancelAllConditionals(sym);
+      this.log(`${sym}: entry aborted (no fill confirmed) — conditionals cancelled.`, 'warn');
+      return;
+    }
 
     // Calculate TP from real fill price (not scan price) to prevent drift
-    // Falls back to scan price if fill price unavailable (watcher will retry)
-    const tpBase  = fillPrice || price;
+    const tpBase  = fillPrice;
     const tpPrice = this.snapPrice(tpBase * (1 - (this.cfg.tp[0] / 100) / effectiveLev), instr);
     if (fillPrice && Math.abs(fillPrice - price) / price > 0.005) {
       this.log(`${sym}: fill drift detected — scan ${fmtP(price)} → fill ${fmtP(fillPrice)} (${((fillPrice-price)/price*100).toFixed(2)}%). TP recalculated from fill price.`, 'warn');
@@ -1757,8 +1768,8 @@ function ew() { return {
 
     // Guard: available balance must cover all 3 DCA add margins before committing a conditional entry.
     const dcaMarginRequired = 3 * (this.cfg.addNotional / effectiveLev);
-    if (this.acct.available != null && this.acct.available < dcaMarginRequired) {
-      this.log(`✕ ${sym}: cond entry skipped — insufficient balance for DCA adds. Need $${dcaMarginRequired.toFixed(2)} (3× add margin at ${effectiveLev}×), available $${this.acct.available.toFixed(2)}`, 'warn');
+    if (this.acct.balance != null && this.acct.balance < dcaMarginRequired) {
+      this.log(`✕ ${sym}: cond entry skipped — insufficient balance for DCA adds. Need $${dcaMarginRequired.toFixed(2)} (3× add margin at ${effectiveLev}×), available $${this.acct.balance.toFixed(2)}`, 'warn');
       if (g) g.status = 'lowbalcond';
       return;
     }
@@ -2305,11 +2316,9 @@ function ew() { return {
       const records = d.result?.list || [];
       const rec = records[0]; // most recent close
       if (!rec) {
-        const pnl = pos.upnl || 0;
-        this.sess.trades++;
-        this.sess.pnl += pnl;
-        if (pnl >= 0) this.sess.wins++; else this.sess.losses++;
-        this.log(`${pos.symbol}: closed (no close record found) — PnL ~${pnl>=0?'+':''}${pnl.toFixed(2)} USDT [${pnl>=0?'win':'loss'} by upnl fallback]`, pnl>=0?'success':'warn');
+        // No close record found — position likely never filled (e.g. testnet illiquidity).
+        // Do not count as a trade outcome; just log and discard.
+        this.log(`${pos.symbol}: no close record found — position may not have filled. Not counted as win/loss.`, 'warn');
         this.persist();
         return;
       }
@@ -2588,25 +2597,23 @@ function ew() { return {
   // Returns the actual fill price (avgPrice) on success, or null on timeout.
   // Callers must use the returned fill price to calculate TP — NOT the pre-order scan price.
   async waitForPosition(symbol) {
-    const maxAttempts = 8;
-    for (let i = 0; i < maxAttempts; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      try {
-        await this.signedDelay();
-        const p = `category=linear&symbol=${symbol}`;
-        const h = await signHdr(this.creds.key, this.creds.secret, p);
-        const r = await fetch(`${this.base}/v5/position/list?${p}`, {headers:h});
-        const d = await this.safeJson(r);
-        const pos = d ? (d.result?.list||[]).find(e => e.symbol===symbol && e.side==='Sell' && parseFloat(e.size)>0) : null;
-        if (pos) {
-          const fillPrice = parseFloat(pos.avgPrice || pos.entryPrice || 0);
-          this.log(`${symbol}: position confirmed on exchange (${i+1}s) — fill price: ${fmtP(fillPrice)}`, 'info');
-          return fillPrice > 0 ? fillPrice : null;
-        }
-      } catch(e) {}
-      this.log(`${symbol}: waiting for position fill... (${i+1}/${maxAttempts})`, 'info');
-    }
-    this.log(`${symbol}: position not confirmed after ${maxAttempts}s — TP not set. Watcher will retry.`, 'warn');
+    // Single attempt only — testnet is unreliable and retrying causes ghost positions
+    // to be logged and DCAs placed for orders that never actually filled.
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      await this.signedDelay();
+      const p = `category=linear&symbol=${symbol}`;
+      const h = await signHdr(this.creds.key, this.creds.secret, p);
+      const r = await fetch(`${this.base}/v5/position/list?${p}`, {headers:h});
+      const d = await this.safeJson(r);
+      const pos = d ? (d.result?.list||[]).find(e => e.symbol===symbol && e.side==='Sell' && parseFloat(e.size)>0) : null;
+      if (pos) {
+        const fillPrice = parseFloat(pos.avgPrice || pos.entryPrice || 0);
+        this.log(`${symbol}: position confirmed on exchange — fill price: ${fmtP(fillPrice)}`, 'info');
+        return fillPrice > 0 ? fillPrice : null;
+      }
+    } catch(e) {}
+    this.log(`${symbol}: order did not fill within 2s — aborting to prevent ghost position.`, 'warn');
     return null;
   },
 
