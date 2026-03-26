@@ -19,7 +19,7 @@ Copyright 2026 Peng Protocol
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>❄ EVERWINTER v1.2 — Bybit Short Bot</title>
+<title>❄ EVERWINTER v1.3 — Bybit Short Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -1878,11 +1878,72 @@ function ew() { return {
         pos.orders.some(o => o.type === 'cond' && o.orderId && !o.filled)
       );
       if (orders.length > 0 || !hasUnfilledConds) {
+        // ── Step 1: Identify symbols that have conditionals missing from StopOrder list ──
+        // For those symbols, fetch active Limit orders (orderFilter=Order) to detect
+        // "triggered-but-unfilled" limit orders sitting as maker orders in the book.
+        // This prevents _replaceMissedConditional from firing when the conditional already
+        // triggered and became a limit order — it just hasn't filled yet (price gapped back).
+        const symbolsNeedingLimitCheck = new Set();
+        for (const pos of this.positions) {
+          for (const o of pos.orders) {
+            if (o.type === 'cond' && o.orderId && !o.filled) {
+              if (!fetchedOrderIds.has(o.orderId)) {
+                symbolsNeedingLimitCheck.add(pos.symbol);
+              }
+            }
+          }
+        }
+
+        // Build a map: symbol → Set of active limit order prices (rounded to 4dp for fuzzy match)
+        const activeLimitPrices = new Map(); // symbol → Set<number>
+        for (const sym of symbolsNeedingLimitCheck) {
+          try {
+            await this.signedDelay();
+            const lp = `category=linear&symbol=${sym}&orderFilter=Order&openOnly=1`;
+            const lh = await signHdr(this.creds.key, this.creds.secret, lp);
+            const lr = await fetch(`${this.base}/v5/order/list?${lp}`, {headers:lh});
+            const ld = await this.safeJson(lr);
+            if (ld && ld.retCode === 0) {
+              const limitPrices = new Set(
+                (ld.result?.list || [])
+                  .filter(lo => lo.side === 'Sell' && lo.orderStatus === 'New')
+                  .map(lo => parseFloat(lo.price))
+              );
+              activeLimitPrices.set(sym, limitPrices);
+              if (limitPrices.size > 0) {
+                this.log(`${sym}: ${limitPrices.size} triggered limit order(s) sitting in book — will not replace conditional`, 'info');
+              }
+            }
+          } catch(e) {
+            // Non-fatal — if we can't check, fall through to normal replacement logic
+            this.log(`${sym}: limit order check failed (${e.message}) — proceeding with normal replacement logic`, 'warn');
+          }
+        }
+
+        // ── Step 2: Process each missing conditional ──
         for (const pos of this.positions) {
           for (const o of pos.orders) {
             if (o.type === 'cond' && o.orderId) {
               const still_open = orders.find(lo => lo.orderId === o.orderId);
               if (!still_open && !o.filled) {
+                // Before declaring it missing, check if a triggered limit is sitting in the book
+                // at or near this conditional's trigger price (±2 ticks tolerance).
+                const limitPricesForSym = activeLimitPrices.get(pos.symbol);
+                if (limitPricesForSym && limitPricesForSym.size > 0) {
+                  const triggerPx = o.price; // o.price = trigger price for cond orders
+                  // Compute tick tolerance — use cached instr if available, else 0.1% of price
+                  const instrCached = this._instrCache?.[pos.symbol];
+                  const tickTol = instrCached ? instrCached.tickSize * 2 : triggerPx * 0.001;
+                  const hasMatchingLimit = [...limitPricesForSym].some(lp => Math.abs(lp - triggerPx) <= tickTol);
+                  if (hasMatchingLimit) {
+                    // Conditional triggered → became a limit order → price gapped back below it.
+                    // The limit is sitting as a maker order waiting for price to return.
+                    // Do NOT replace — just wait for the fill or the next scan cycle.
+                    this.log(`${pos.symbol} ${o.label}: conditional triggered but limit order sitting unfilled @ ~${fmtP(triggerPx)} — awaiting fill, skipping replacement`, 'info');
+                    continue;
+                  }
+                }
+
                 // Order gone from exchange — check if position notional actually grew by
                 // a meaningful amount. If not, it's a partial/failed fill, not a real DCA add.
                 const currentNotional = pos.entryPrice * pos.totalSize;
