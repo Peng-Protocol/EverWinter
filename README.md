@@ -49,7 +49,7 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 ## Getting Started
 
 1.  **Download the HTML:** Very self-explanatory. 
-2.  **Open the App:** Simply open `EverWinter1.2.html` in any modern web browser.
+2.  **Open the App:** Simply open `EverWinter1.0.html` in any modern web browser.
 3.  **Connect API:**
     * Generate an API Key on Bybit with **Contract/Derivatives** permissions.
 4.  **Configure & Start:** Adjust your leverage and margin settings, then click **"Start Bot"**.
