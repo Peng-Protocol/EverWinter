@@ -49,7 +49,7 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 ## Getting Started
 
 1.  **Download the HTML:** Very self-explanatory. 
-2.  **Open the App:** Simply open `EverWinter1.0.html` in any modern web browser.
+2.  **Open the App:** Simply open `EverWinter1.2.html` in any modern web browser.
 3.  **Connect API:**
     * Generate an API Key on Bybit with **Contract/Derivatives** permissions.
 4.  **Configure & Start:** Adjust your leverage and margin settings, then click **"Start Bot"**.
@@ -58,3 +58,13 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 
 Trading perpetual futures involves significant risk. EverWinter is a tool for automation and does not guarantee profits. 
 * **Loss Risk:** High leverage can lead to heavy losses during parabolic "short squeezes." It is advised to only use this bot during a prolonged bear market with the default settings applied.
+
+## 🧪 PseudoWinter (Simulation Mode)
+
+**PseudoWinter** is the built-in sandbox environment designed for strategy calibration and risk-free observation. It allows you to run the full EverWinter logic—including RSI scanning and tiered DCA execution—using real-time market data but with "phantom" capital.
+
+### Features
+* **Closed Trades:** Includes a "PnL" scorecard section showing past trades, their duration and performance.
+* **Key Requirement:** Only requires a "Read-Only" API key. While it is possible to run the bot using Bybit's public API, the current version accounts for operation via file explorer (which the public API will reject).
+
+> **Note:** PseudoWinter calculations use the same latency-compensation logic as the live bot, providing a highly accurate representation of "TP Drift", slippage and execution timing.
