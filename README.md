@@ -10,7 +10,7 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Multi-Timeframe RSI Filter:** Executes entries only when RSI6, RSI12, and RSI24 on the 15-minute timeframe align to signal an overbought state.
 * **Tiered DCA Strategy:** Manages risk through a three-tier "Add" system (at +3%, +9%, and +15% price increases) to improve entry averages during volatile spikes.
 * **Dynamic Take-Profit (TP):**
-    * **Base TP:** Standard profit targets for the initial entry and each DCA tier.
+    * **Base TP and Stages:** For each DCA stage the TP ROI gradually reduces; Stage-0 = 16%, Stage-1 = 9%, Stage-2 = 6%, Stage-3 = 4%. This aims for a similar overall profit as the price moves against the position. 
     * **TP Drift:** Often due to latency and volatility; the TP price drifts from its intended ROI percent, the bot actively monitors TP ROIs for each position and adjusts them to match expected values for all DCA stages or the original entry.
     * **Time-Decay TP:** Automatically reduces TP targets to 3% after 12 hours to prioritize capital rotation.
 * **Hard-Stop Recovery:** Includes a "Force Market Close" safety mechanism that triggers if a position remains open for more than 24 hours.
@@ -19,8 +19,8 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
    * **Trend Continuation:** In the rare event where an upward trend continues, it is safer to absorb losses than hold, on isolated margin the position will be automatically liquidated at -75% ROI.
    * **Loss Absorption:** For cross margin an SL is required to prevent total erasure of the account, as such; the bot will automatically set a stop loss after the third DCA conditional is triggered, this amounts to **-105%** of the position's value. 
 * **Funding Rates:**
-      * **Overcrowded Slots:** When an asset's funding rate is deeply negative this implies that it is being heavily shorted, which can incentivize bullish traders to hold and reap funding fees or even push the asset higher and squeeze shorts to force a liquidation cascade. 
-      * **Filter:** The bot features an optional and adjustable funding rate filter that starts with a default value of -0.05%. 
+   * **Overcrowded Slots:** When an asset's funding rate is deeply negative this implies that it is being heavily shorted, which can incentivize bullish traders to hold and reap funding fees or even push the asset higher and squeeze shorts to force a liquidation cascade. 
+    * **Filter:** The bot features an optional and adjustable funding rate filter that starts with a default value of -0.05%. 
 
 ## Technical Stack
 
@@ -28,16 +28,6 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Styling:** Bootstrap 5 + Custom "Glacier-Void" CSS theme
 * **Communication:** Bybit V5 API (REST)
 * **Architecture:** Single-file HTML/JavaScript application.
-
-## Configuration Parameters
-
-| Parameter | Description | Default/Range |
-| :--- | :--- | :--- |
-| **Leverage** | Account leverage for all positions. | 1x - 20x |
-| **Entry Notional** | Initial position size in USDT. | $6 - $200 |
-| **RSI Thresholds** | Minimum RSI levels required to trigger a short. | 50 - 90 |
-| **Max Positions** | Total concurrent active shorts allowed. | 1 - 6 |
-| **Scan Frequency** | Interval between market scans for new gainers. | 5 - 60 mins |
 
 ## Background Sync
 * **Audio Loop:** The bot plays a silent looped audio when started, this allows it to be persistent on Android even when the screen is off or the browser is in the background. 
