@@ -34,8 +34,8 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Edge Cases:** If the loop is ever interrupted it will automatically try to restart once the page is reopened, if this fails the "sync" indicator at the top of the page will blink orange, you can click on it to try and resync.
 
 ## Bitcoin Strategy 
-* **Structure:** The bot can optionally execute a Bitcoin based strategy with hardcoded values, it targets RSI6-12-24 equal to or greater than 75-75-65, using a similar DCA structure as the gainers strategy.
-* **Leverage and Take-Profit:** The bot uses 25x leverage hardcoded for its Bitcoin strategy, with TP ROI at 25% (-1%) price change.
+* **Structure:** The bot can optionally execute a Bitcoin based strategy with hardcoded leverage, using a similar RSI configuration and DCA structure as the gainers strategy.
+* **Leverage and Take-Profit:** The bot uses 25x leverage hardcoded for its Bitcoin strategy, with TP ROI at 25% (-1%) price change on the original entry.
 * **Selection:** The bot can be setup to execute either the gainers strategy, Bitcoin strategy or both. 
 * **Capital Utilization:** The Bitcoin strategy has fewer entries but allows greater capital utilization, up to $10,000 notional ($400 cost) per "add", compared to the gainers' max $200 notional per "add". 
 
