@@ -18,6 +18,9 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Stop-Loss (SL):** 
    * **Trend Continuation:** In the rare event where an upward trend continues, it is safer to absorb losses than hold, on isolated margin the position will be automatically liquidated at -75% ROI.
    * **Loss Absorption:** For cross margin an SL is required to prevent total erasure of the account, as such; the bot will automatically set a stop loss after the third DCA conditional is triggered, this amounts to **-105%** of the position's value. 
+* **Funding Rates:**
+      * **Overcrowded Slots:** When an asset's funding rate is deeply negative this implies that it is being heavily shorted, which can incentivize bullish traders to hold and reap funding fees or even push the asset higher and squeeze shorts to force a liquidation cascade. 
+      * **Filter:** The bot features an optional and adjustable funding rate filter that starts with a default value of -0.05%. 
 
 ## Technical Stack
 
@@ -67,4 +70,4 @@ Trading perpetual futures involves significant risk. EverWinter is a tool for au
 * **Closed Trades:** Includes a "PnL" scorecard section showing past trades, their duration and performance.
 * **Key Requirement:** Only requires a "Read-Only" API key. While it is possible to run the bot using Bybit's public API, the current version accounts for operation via file explorer (which the public API will reject).
 
-> **Note:** PseudoWinter calculations use the same latency-compensation logic as the live bot, providing a highly accurate representation of "TP Drift", slippage and execution timing.
+> **Note:** PseudoWinter calculations use the same latency-compensation logic as the live bot, providing a highly accurate representation of "TP Drift", slippage and execution timing. It also accounts for funding fees paid through the duration of the short.
