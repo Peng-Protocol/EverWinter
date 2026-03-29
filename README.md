@@ -21,6 +21,10 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Funding Rates:**
    * **Overcrowded Slots:** When an asset's funding rate is deeply negative this implies that it is being heavily shorted, which can incentivize bullish traders to hold and reap funding fees or even push the asset higher and squeeze shorts to force a liquidation cascade. 
     * **Filter:** The bot features an optional and adjustable funding rate filter that starts with a default value of -0.05%. 
+* **Rodeo Filter:** 
+   * **Repeat Entry:** When coins are volatile they tend to wick into our TP very quickly then wick back up and become eligible again. This is a trap which can often yield many "rides" but always ends in a position that threatens SL. 
+   * **The Filter:** Whenever an asset hits our TP it is recorded as a "creep" and its "implied RSI gate" is increased by 3% across all timeframes. This "creep mode" lasts (6) hours for the asset. E.g if the starting requirement is 70-70-75, after the first ride it will creep to 72-72-77, and after the second it will creep to 74-74-79, etc. 
+   * **Configuration:** The creep percent can be adjusted in the config menu, active creeps are displayed under the creep slider. 
 
 ## Technical Stack
 
