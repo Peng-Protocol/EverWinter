@@ -25,6 +25,10 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
    * **Repeat Entry:** When coins are volatile they tend to wick into our TP very quickly then wick back up and become eligible again. This is a trap which can often yield many "rides" but always ends in a position that threatens SL. 
    * **The Filter:** Whenever an asset hits our TP it is recorded as a "creep" and its "implied RSI gate" is increased by 3% across all timeframes. This "creep mode" lasts (6) hours for the asset. E.g if the starting requirement is 70-70-75, after the first ride it will creep to 72-72-77, and after the second it will creep to 74-74-79, etc. 
    * **Configuration:** The creep percent can be adjusted in the config menu, active creeps are displayed under the creep slider. 
+* **Max RSI6:** Prevents entries when RSI6 exceeds a configurable value, (default 90). While typically overbought, extreme RSI6 levels signal excessive short-term momentum that could potentially extend further. This acts as a safety to avoid shorting vertical "blow-offs" before they peak.
+* **Volume Divergence Filter:** A configurable dual-sided filter to manage capital risk amid manipulation.
+    * **Positive:** Blocks entries if volume is above the configurable threshold (default >35%) higher than the top 3 or 4 gainers (or losers) excluding the subject coin. Such divergence indicates heavy capital injection that could cause parabolic moves.
+    * **Negative:** Flags coins moving on low volume, lower than the lowest 3 or 4 gainers (or losers) excluding the subject coin. Such divergence suggests whale accumulation ahead of late retail volatility.
 
 ## Technical Stack
 
@@ -37,11 +41,10 @@ Built as a lightweight, single-file web application, EverWinter provides a "term
 * **Audio Loop:** The bot plays a silent looped audio when started, this allows it to be persistent on Android even when the screen is off or the browser is in the background. 
 * **Edge Cases:** If the loop is ever interrupted it will automatically try to restart once the page is reopened, if this fails the "sync" indicator at the top of the page will blink orange, you can click on it to try and resync.
 
-## Bitcoin Strategy 
-* **Structure:** The bot can optionally execute a Bitcoin based strategy with hardcoded leverage, using a similar RSI configuration and DCA structure as the gainers strategy.
-* **Leverage and Take-Profit:** The bot uses 25x leverage hardcoded for its Bitcoin strategy, with TP ROI at 25% (-1%) price change on the original entry.
-* **Selection:** The bot can be setup to execute either the gainers strategy, Bitcoin strategy or both. 
-* **Capital Utilization:** The Bitcoin strategy has fewer entries but allows greater capital utilization, up to $10,000 notional ($400 cost) per "add", compared to the gainers' max $200 notional per "add". 
+### Follow-Through Strategy
+
+An extension of the **Rodeo Filter** that targets assets after a specific number of successful "rides". If the asset's RSI across all timeframes settles into a configurable range (default 20-50), the bot will re-enter the coin for a set number of cycles. 
+The rationale being; repeated entries at/around the 24hr top of a coin indicate extreme volatility and weakness. Follow-Through allows the bot to stay aggressive on a weakening asset even after the standard RSI gates have "blown-off" and come down.
 
 ## Getting Started
 
