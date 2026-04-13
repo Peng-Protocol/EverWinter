@@ -19,7 +19,7 @@ Copyright 2026 Peng Protocol
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>❄ EVERWINTER v1.3 — Bybit Short Bot</title>
+<title>❄ EVERWINTER v1.4 — Bybit Short Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -1752,6 +1752,9 @@ function ew() { return {
     this.bot.scanCd  = this.cfg.scanMins * 60;
     this.bot.scanPct = 100;
     this.pruneRodeoCreep();
+    // ── Open order audit — must run before scan logic so orphan conditionals
+    // are cancelled before any new entries are evaluated this cycle.
+    await this.fetchAndAuditOpenOrders();
     this.log('Scanning top gainers...', 'scan');
     try {
       const tr=await fetch(`${this.base}/v5/market/tickers?category=linear`);
@@ -2585,15 +2588,32 @@ function ew() { return {
       const badgeStyle = isWin
         ? 'color:var(--profit);border-color:rgba(0,229,160,.3);background:var(--profit-dim)'
         : 'color:var(--short);border-color:rgba(255,69,96,.3);background:var(--short-glow)';
-      const reasonLabel = t.reason === 'tp' ? 'TP' : t.reason === 'sl' ? 'SL' : t.reason === 'force' ? 'FORCE' : 'CLOSE';
+      const reasonLabel = t.reason === 'tp'     ? 'TP'
+                        : t.reason === 'sl'     ? 'SL'
+                        : t.reason === 'force'  ? 'FORCE'
+                        : t.reason === 'adl'    ? 'ADL'
+                        : t.reason === 'liq'    ? 'LIQ'
+                        : t.reason === 'manual' ? 'MANUAL'
+                        : 'CLOSE';
       const ftBadge = t._ft
         ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(126,232,250,.35);color:var(--ice);background:var(--ice-faint)">🎯 FT</span>`
         : '';
-      const pnl    = t.pnl    ?? 0;
-      const pnlPct = t.pnlPct ?? 0;
-      const net    = t.totalPnl ?? pnl;
-      const pnlCol = pnl >= 0 ? 'var(--profit)' : 'var(--short)';
-      const netCol = net >= 0 ? 'var(--profit)' : 'var(--short)';
+      const pnl         = t.pnl    ?? 0;
+      const pnlPct      = t.pnlPct ?? 0;
+      // fundingFee: positive = collected (adds to PnL), negative = paid (reduces PnL).
+      // null/undefined means the field predates v1.1 or the fetch was unavailable.
+      const fundingFee  = t.fundingFee ?? null;
+      const hasFunding  = fundingFee !== null;
+      const net         = t.totalPnl ?? pnl;
+      const pnlCol      = pnl >= 0 ? 'var(--profit)' : 'var(--short)';
+      const netCol      = net >= 0 ? 'var(--profit)' : 'var(--short)';
+      const fundingCol  = !hasFunding ? 'var(--text-lo)'
+                        : fundingFee >= 0 ? 'var(--profit)' : 'var(--short)';
+      const fundingStr  = !hasFunding ? '—'
+                        : (fundingFee >= 0 ? '+' : '') + fundingFee.toFixed(4);
+      // Show funding row only when it's non-zero or explicitly fetched (hasFunding).
+      // Zero funding on a very short-lived position is normal and expected.
+      const showFundingRow = hasFunding;
       const durStr = (() => {
         try {
           const s = Math.floor((t.duration || 0) / 1000);
@@ -2626,11 +2646,25 @@ function ew() { return {
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:5px">
               <div class="ps"><div class="psl">Margin</div><div class="psv">$${(t.margin ?? 0).toFixed(2)}</div></div>
               <div class="ps"><div class="psl">Lev</div><div class="psv">${t.leverage ?? '?'}×</div></div>
-              <div class="ps"><div class="psl">PnL</div><div class="psv" style="color:${pnlCol}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)</div></div>
+              <div class="ps"><div class="psl">Trade PnL</div><div class="psv" style="color:${pnlCol}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)</div></div>
             </div>
+            ${showFundingRow ? `
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:5px">
+              <div class="ps" style="grid-column:1/2">
+                <div class="psl" style="display:flex;align-items:center;gap:4px">
+                  Funding
+                  <span style="font-size:8px;color:var(--text-lo);font-family:var(--mono)" title="Funding fees paid/collected during position lifetime. Positive = collected (added to PnL). Separate from trade PnL.">ⓘ</span>
+                </div>
+                <div class="psv" style="color:${fundingCol}">${fundingStr} USDT</div>
+              </div>
+              <div class="ps" style="grid-column:2/3">
+                <div class="psl">Net PnL <span style="font-size:8px;color:var(--text-lo)">(trade+funding)</span></div>
+                <div class="psv" style="font-weight:600;color:${netCol}">${net >= 0 ? '+' : ''}${net.toFixed(2)} USDT</div>
+              </div>
+            </div>` : `
             <div style="margin-bottom:5px">
               <div class="ps"><div class="psl">Net PnL</div><div class="psv" style="font-weight:600;color:${netCol}">${net >= 0 ? '+' : ''}${net.toFixed(2)} USDT</div></div>
-            </div>
+            </div>`}
             <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);border-top:1px solid var(--border);padding-top:5px">${tsStr}</div>
           </div>
         </div>`;
@@ -3093,15 +3127,27 @@ function ew() { return {
         }
       }
 
-      // Check if any tracked positions no longer exist on exchange (closed externally)
+      // Check if any tracked positions no longer exist on exchange (closed externally).
+      // Mirrors syncPositions: cancel conditionals, record PnL card, and clean up state.
+      // Using _closingIds prevents a concurrent syncPositions call from double-counting
+      // if it runs before the setTimeout(recordClosedPosition) fires.
       for (const p of [...this.positions]) {
         const stillOpen = exPositions.find(e => e.symbol === p.symbol);
         if (!stillOpen) {
+          if (_closingIds.has(p.id)) continue;
+          _closingIds.add(p.id);
           this.log(`${p.symbol}: no longer on exchange — removing from tracker`, 'warn');
           await this.cancelAllConditionals(p.symbol);
           const g = this.gainers.find(x => x.symbol === p.symbol);
           if (g) g.status = 'closed';
           this.positions = this.positions.filter(x => x.id !== p.id);
+          this.persist();
+          // Record PnL card exactly as syncPositions does — 2.5s delay lets Bybit
+          // settle the closed-pnl record before we query it.
+          setTimeout(() => {
+            this.recordClosedPosition(p);
+            _closingIds.delete(p.id);
+          }, 2500);
         }
       }
 
@@ -3383,17 +3429,76 @@ function ew() { return {
       }
 
       const realisedPnl = parseFloat(rec.closedPnl || 0);
-      const closeType   = (rec.execType || rec.orderType || '').toLowerCase();
       const exitPrice   = parseFloat(rec.avgExitPrice || rec.exitPrice || 0);
       const entryPrice  = parseFloat(rec.avgEntryPrice || rec.entryPrice || pos.entryPrice);
 
-      // Classify by realised PnL sign — this is the only reliable source of truth.
-      // Bybit's execType/orderType fields ('trade', 'takeprofit', 'byuser', etc.) are
-      // inconsistent across close methods and cannot be trusted for win/loss classification.
-      const isWin = realisedPnl > 0;
+      // ── Close reason classification ──
+      // Bybit's closed-pnl record has three relevant fields:
+      //   rec.execType      — execution mechanism: "Trade", "AdlTrade", "BustTrade" etc.
+      //                       NOT useful for TP/SL/manual distinction — it's almost always "Trade".
+      //   rec.stopOrderType — "TakeProfit", "StopLoss", "TrailingStop", or "" / "UNKNOWN" for
+      //                       market/limit closes. This is the reliable classifier for exchange-side TP/SL.
+      //   rec.orderType     — "Market" / "Limit" — useless for classification (TP and force both show "Market").
+      //
+      // Priority:
+      //   1. stopOrderType = "TakeProfit"  → 'tp'
+      //   2. stopOrderType = "StopLoss"    → 'sl'
+      //   3. pos.pendingCloseReason = 'force'  (bot-initiated close at 12h/24h) → 'force'
+      //   4. execType = "AdlTrade"          → 'adl'  (auto-deleveraging)
+      //   5. execType = "BustTrade"         → 'liq'  (liquidation)
+      //   6. Everything else               → 'manual' (closed outside the bot, unknown)
+      //
+      // NOTE: 'force' is ONLY set when the bot itself explicitly called closePosition()
+      //       with reason='force' (12h/24h timer) AND the close was NOT caught by exchange TP/SL.
+      //       If a TP order happened to fill right at the 12h/24h boundary, stopOrderType
+      //       will correctly return "TakeProfit" and take priority over pendingCloseReason.
+      const stopOrderType = (rec.stopOrderType || '').toLowerCase();
+      const execType      = (rec.execType || '').toLowerCase();
+      const closeReason =
+        stopOrderType === 'takeprofit'  ? 'tp'     :
+        stopOrderType === 'stoploss'    ? 'sl'     :
+        stopOrderType === 'trailingstop'? 'sl'     :
+        execType      === 'adltrade'    ? 'adl'    :
+        execType      === 'busttrade'   ? 'liq'    :
+        pos.pendingCloseReason === 'force' ? 'force' :
+        (pos.phase === 'force' || pos.phase === 'reduce') ? 'force' :
+        'manual';
+      // typeLabel used in log only — shows the raw Bybit fields for diagnostics
+      const typeLabel = [stopOrderType || execType || 'unknown', closeReason !== 'manual' ? closeReason : '']
+        .filter(Boolean).join('/') || 'unknown';
+
+      // ── Fetch funding fees paid during this position's lifetime ──
+      // Bybit's closedPnl field reflects (gross PnL − trading fees) only.
+      // Funding fees are settled separately and NOT included in closedPnl.
+      // We query the transaction log for FUNDING entries on this symbol since
+      // the position was opened (openedAt), accumulate them, and display on the card.
+      let fundingFeePaid = 0;
+      try {
+        await this.signedDelay();
+        const openedMs  = pos.openedAt || 0;
+        const closedMs  = Date.now();
+        const fp = `category=linear&symbol=${pos.symbol}&type=FUNDING&startTime=${openedMs}&endTime=${closedMs}&limit=50`;
+        const fh = await signHdr(this.creds.key, this.creds.secret, fp, this._tsOffset);
+        const fr = await fetch(`${this.base}/v5/account/transaction-log?${fp}`, {headers:fh});
+        const fd = await this.safeJson(fr);
+        if (fd && fd.retCode === 0) {
+          for (const entry of (fd.result?.list || [])) {
+            fundingFeePaid += parseFloat(entry.cashFlow || entry.amount || 0);
+          }
+        }
+      } catch(e) { /* non-fatal — funding fee display will show N/A */ }
+
+      // totalPnl = realised trade PnL + funding fees collected/paid.
+      // For a short: positive funding rate means the bot COLLECTED funding (adds to PnL).
+      // fundingFeePaid from Bybit transaction log is negative when paid, positive when collected.
+      const totalPnl = realisedPnl + fundingFeePaid;
+
+      // Classify by total PnL (trade PnL + funding). A trade that was "profitable"
+      // on price but had huge funding costs should be classified as a loss.
+      const isWin = totalPnl > 0;
 
       this.sess.trades++;
-      this.sess.pnl += realisedPnl;
+      this.sess.pnl += totalPnl;
       if (isWin) this.sess.wins++; else this.sess.losses++;
 
       // ── RODEO CREEP ── Register/increment implied RSI requirement for this coin.
@@ -3423,9 +3528,11 @@ function ew() { return {
         }
       }
 
-      const typeLabel = closeType || 'unknown';
+      const fundingStr = fundingFeePaid !== 0
+        ? ` | Funding ${fundingFeePaid >= 0 ? '+' : ''}${fundingFeePaid.toFixed(4)} USDT`
+        : '';
       this.log(
-        `${pos.symbol}: closed [${typeLabel}] — entry ${fmtP(entryPrice)} → exit ${fmtP(exitPrice)} | PnL ${realisedPnl>=0?'+':''}${realisedPnl.toFixed(2)} USDT [${isWin?'WIN':'LOSS'}]`,
+        `${pos.symbol}: closed [${typeLabel}] — entry ${fmtP(entryPrice)} → exit ${fmtP(exitPrice)} | Trade PnL ${realisedPnl>=0?'+':''}${realisedPnl.toFixed(2)}${fundingStr} | Net ${totalPnl>=0?'+':''}${totalPnl.toFixed(2)} USDT [${isWin?'WIN':'LOSS'}]`,
         isWin ? 'success' : 'warn'
       );
       // Record in trade feed
@@ -3440,8 +3547,9 @@ function ew() { return {
           entryPrice, exitPrice,
           pnl: realisedPnl,
           pnlPct: entryPrice > 0 ? (entryPrice - exitPrice) / entryPrice * pos.leverage * 100 : 0,
-          totalPnl: realisedPnl, isWin,
-          reason: closeType.includes('takeprofit') ? 'tp' : closeType.includes('stoploss') ? 'sl' : 'force',
+          fundingFee: fundingFeePaid,
+          totalPnl, isWin,
+          reason: closeReason,
           margin: pos.margin, leverage: pos.leverage, dcaStage: pos.dcaStage || 0,
           duration: Date.now() - pos.openedAt, closedAt,
         });
@@ -3841,6 +3949,58 @@ function ew() { return {
     const b=JSON.stringify({category:'linear',symbol,orderFilter:'StopOrder'});
     const h=await signHdr(this.creds.key,this.creds.secret,b, this._tsOffset);
     try { await fetch(`${this.base}/v5/order/cancel-all`,{method:'POST',headers:h,body:b}); this.log(`${symbol}: conditionals cancelled`,'info'); } catch(e){}
+  },
+
+  // ── AUDIT OPEN CONDITIONAL ORDERS ──
+  // Fetches all open StopOrders across all linear symbols from Bybit.
+  // Runs at the start of each scan cycle.
+  // Orphan detection: any conditional found for a symbol NOT in this.positions
+  // is immediately cancelled and prominently warned — this is the scenario where
+  // a ghost DCA order was left behind after a position closed without cleanup.
+  async fetchAndAuditOpenOrders() {
+    try {
+      await this.signedDelay();
+      // Bybit v5 order/list supports settleCoin=USDT to batch-fetch all symbols
+      const p = 'category=linear&settleCoin=USDT&orderFilter=StopOrder&openOnly=1&limit=50';
+      const h = await signHdr(this.creds.key, this.creds.secret, p, this._tsOffset);
+      const r = await fetch(`${this.base}/v5/order/list?${p}`, {headers:h});
+      const d = await this.safeJson(r);
+      if (!d || d.retCode !== 0) {
+        this.log(`Open order audit: fetch failed (${d?.retMsg || 'no response'})`, 'warn');
+        return;
+      }
+      const orders = d.result?.list || [];
+      if (!orders.length) {
+        this.log('Open order audit: no open conditional orders on exchange.', 'info');
+        return;
+      }
+
+      const activeSymbols = new Set(this.positions.map(p => p.symbol));
+      const orphans = orders.filter(o => !activeSymbols.has(o.symbol));
+      const known   = orders.filter(o =>  activeSymbols.has(o.symbol));
+
+      if (known.length) {
+        const summary = [...new Set(known.map(o => o.symbol))].join(', ');
+        this.log(`Open order audit: ${known.length} conditional(s) for tracked position(s) — ${summary}`, 'info');
+      }
+
+      if (orphans.length) {
+        // Group orphans by symbol for a cleaner log
+        const bySymbol = {};
+        for (const o of orphans) {
+          (bySymbol[o.symbol] = bySymbol[o.symbol] || []).push(o);
+        }
+        for (const [sym, symOrphans] of Object.entries(bySymbol)) {
+          const ids = symOrphans.map(o => o.orderId).join(', ');
+          this.log(`⚠ ORPHAN ORDER: ${sym} has ${symOrphans.length} open conditional(s) with NO tracked position — cancelling now. OrderId(s): ${ids}`, 'error');
+          await this.cancelAllConditionals(sym);
+        }
+      } else {
+        this.log(`Open order audit: ${orders.length} open conditional(s) — all match tracked positions. ✓`, 'info');
+      }
+    } catch(e) {
+      this.log(`Open order audit error: ${e.message}`, 'warn');
+    }
   },
 
   async refreshBalance() {

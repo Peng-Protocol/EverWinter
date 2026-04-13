@@ -1491,6 +1491,10 @@ const LS_KEY = 'pw_v1';
 // reference replacement that can defeat the per-object _closing flag when the
 // positions array is reconstructed (e.g. by loadSaved or array spread operations).
 const _closingIds = new Set();
+// Module-level gap-audit lock — true while pseudoAuditGap is running.
+// Prevents the visibilitychange handler from firing a concurrent pseudoWatchPositions
+// that could process and close the same positions the audit is mid-flight on.
+let _auditRunning = false;
 
 // FADE_ENTRY_TP_ROI has been moved into cfg.fadeEntryTpRoi (configurable slider, default 25%).
 
@@ -3174,9 +3178,11 @@ function pw() { return {
     this.correctFaderMargins();
     // ── One-shot invalid position purge — must run before gap-fill audit ──
     this.purgeInvalidPositions();
-    if (!this.positions.length && !this.potEntries.length) return;
+    if (!this.positions.length && !this.potEntries.length) { _auditRunning = false; return; }
+    _auditRunning = true;
     const now = Date.now();
     this.log('🌑 Gap-fill audit starting...', 'info');
+    try {
 
     // ── Audit open positions ──
     for (const pos of [...this.positions]) {
@@ -3184,6 +3190,11 @@ function pw() { return {
       const gapFrom = pos._lastSeenAt || pos.openedAt;
       const gapTo   = now;
       if (gapTo - gapFrom < 5000) continue; // trivial gap
+      // Guard: claim this position ID before any async work so that if
+      // pseudoWatchPositions fires concurrently (e.g. from visibilitychange)
+      // it cannot also close the same position while we are mid-audit.
+      if (_closingIds.has(pos.id)) continue;
+      _closingIds.add(pos.id);
       this.log(`🌑 ${pos.symbol}: auditing ${Math.round((gapTo-gapFrom)/60000)}min gap...`, 'info');
 
       try {
@@ -3191,6 +3202,7 @@ function pw() { return {
         if (!candles.length) {
           this.log(`${pos.symbol}: no kline data for gap — keeping position as-is`, 'warn');
           pos._lastSeenAt = now;
+          _closingIds.delete(pos.id);
           continue;
         }
 
@@ -3273,6 +3285,20 @@ function pw() { return {
           const pnlPct = (pos.entryPrice - closePrice) / pos.entryPrice * pos.leverage * 100;
           const isWin  = pnl > 0;
           const duration = closedAt - pos.openedAt;
+          // Dedup guard — matches pseudoClosePosition logic. If a record with the same
+          // entry/exit/margin already exists (e.g. the position was already closed by a
+          // concurrent pseudoWatchPositions tick before our kline fetch returned), skip
+          // the write to prevent a duplicate PnL card.
+          const _gapDupKey = `${pos.entryPrice}|${closePrice}|${pos.margin.toFixed(4)}`;
+          const _gapIsDup  = this.closedTrades.slice(0, 5).some(t =>
+            `${t.entryPrice}|${t.exitPrice}|${(t.margin??0).toFixed(4)}` === _gapDupKey
+          );
+          if (_gapIsDup) {
+            this.log(`⚠ ${pos.symbol}: gap-audit duplicate close detected — record suppressed.`, 'warn');
+            this.positions = this.positions.filter(x => x.id !== pos.id);
+            _closingIds.delete(pos.id);
+            continue;
+          }
           this.sess.trades++;
           this.sess.pnl += pnl;
           if (isWin) this.sess.wins++; else this.sess.losses++;
@@ -3308,6 +3334,7 @@ function pw() { return {
           const g = this.gainers.find(x => x.symbol === pos.symbol);
           if (g) g.status = 'closed';
           this.positions = this.positions.filter(x => x.id !== pos.id);
+          _closingIds.delete(pos.id);
         } else {
           // Still open — update mark price from last candle
           const lastCandle = candles[candles.length - 1];
@@ -3317,10 +3344,12 @@ function pw() { return {
           }
           pos._lastSeenAt = now;
           this.log(`🌑 ${pos.symbol}: gap audit complete — still open. Mark: ${fmtP(pos.markPrice)}`, 'info');
+          _closingIds.delete(pos.id);
         }
       } catch(e) {
         this.log(`🌑 ${pos.symbol}: gap audit error — ${e.message}`, 'error');
         pos._lastSeenAt = now;
+        _closingIds.delete(pos.id);
       }
     }
 
@@ -3351,7 +3380,9 @@ function pw() { return {
     this.persist();
     this.renderPotEntries();
     this.renderPotFaders();
+    _auditRunning = false;
     this.log('🌑 Gap-fill audit complete.', 'success');
+    } finally { _auditRunning = false; } // safety net — ensures flag is always cleared
   },
 
   // ── PSEUDO OPEN SHORT ──
@@ -3762,6 +3793,7 @@ function pw() { return {
   // and is throttled to at most once per 15s to reduce bandwidth.
   async pseudoWatchPositions() {
     if (!this.connected.api) return;
+    if (_auditRunning) return; // gap-fill audit is in progress — defer until it completes
     if (this._watchRunning) return; // prevent concurrent execution
     this._watchRunning = true;
     const now = Date.now();
@@ -3832,6 +3864,7 @@ function pw() { return {
       if (!pos._pseudo) continue;
       if (pos._ft) continue; // FT positions handled separately by ftWatchPositions
       if (!this.positions.find(x => x.id === pos.id)) continue;
+      if (_closingIds.has(pos.id)) continue; // gap-audit is mid-flight for this position — skip
       await new Promise(r => setTimeout(r, 1000)); // 1s delay per position
 
       const mark = pos.markPrice;
