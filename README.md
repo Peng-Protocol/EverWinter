@@ -1,70 +1,178 @@
 # ❄️ EVERWINTER
 
-**EverWinter** is a high-frequency volatility-fading bot designed for Bybit USDT Perpetuals. It specializes in identifying and shorting "blow-off gainers"—targeting overextended assets by utilizing a multi-timeframe RSI strategy and a tiered DCA (Dollar Cost Averaging) approach.
+**EverWinter** is a single-file, browser-based bot for Bybit USDT Perpetuals. It targets mean-reversion opportunities on top gainers using multi-timeframe RSI gating, tiered DCA, and a suite of risk management routines. This document covers the application's architecture, UI sections, position lifecycle, and polling behaviour. For the underlying trading strategy — including entry logic, RSI gate tuning, and risk rationale — see the [Strategy Guide](https://drive.google.com/file/d/1T2YXmIT8E-u0TvvR5QT7qvXI8T5SHEbr/view?usp=drivesdk).
 
-Built as a lightweight, single-file web application, EverWinter provides a "terminal-style" dashboard for real-time monitoring and automated execution directly from your browser.
-
-## Key Features
-
-* **Top Gainer Scanning:** Automatically monitors the "Top N" gainers on Bybit to find assets with the highest probability of a mean-reversion.
-* **Multi-Timeframe RSI Filter:** Executes entries only when RSI6, RSI12, and RSI24 on the 15-minute timeframe align to signal an overbought state.
-* **Tiered DCA Strategy:** Manages risk through a three-tier "Add" system (at +3%, +9%, and +15% price increases) to improve entry averages during volatile spikes.
-* **Dynamic Take-Profit (TP):**
-    * **Base TP and Stages:** For each DCA stage the TP ROI gradually reduces; Stage-0 = 16%, Stage-1 = 9%, Stage-2 = 6%, Stage-3 = 4%. This aims for a similar overall profit as the price moves against the position. 
-    * **TP Drift:** Often due to latency and volatility; the TP price drifts from its intended ROI percent, the bot actively monitors TP ROIs for each position and adjusts them to match expected values for all DCA stages or the original entry.
-    * **Time-Decay TP:** Automatically reduces TP targets to 3% after 12 hours to prioritize capital rotation.
-* **Hard-Stop Recovery:** Includes a "Force Market Close" safety mechanism that triggers if a position remains open for more than 24 hours.
-* **Client-Side Security:** API keys are stored only in volatile memory (RAM) or local browser storage; credentials are never sent to any third-party server except Bybit’s official API.
-* **Stop-Loss (SL):** 
-   * **Trend Continuation:** In the rare event where an upward trend continues, it is safer to absorb losses than hold, on isolated margin the position will be automatically liquidated at -75% ROI.
-   * **Loss Absorption:** For cross margin an SL is required to prevent total erasure of the account, as such; the bot will automatically set a stop loss after the third DCA conditional is triggered, this amounts to **-105%** of the position's value. 
-* **Funding Rates:**
-   * **Overcrowded Slots:** When an asset's funding rate is deeply negative this implies that it is being heavily shorted, which can incentivize bullish traders to hold and reap funding fees or even push the asset higher and squeeze shorts to force a liquidation cascade. 
-    * **Filter:** The bot features an optional and adjustable funding rate filter that starts with a default value of -0.05%. 
-* **Rodeo Filter:** 
-   * **Repeat Entry:** When coins are volatile they tend to wick into our TP very quickly then wick back up and become eligible again. This is a trap which can often yield many "rides" but always ends in a position that threatens SL. 
-   * **The Filter:** Whenever an asset hits our TP it is recorded as a "creep" and its "implied RSI gate" is increased by 3% across all timeframes. This "creep mode" lasts (6) hours for the asset. E.g if the starting requirement is 70-70-75, after the first ride it will creep to 72-72-77, and after the second it will creep to 74-74-79, etc. 
-   * **Configuration:** The creep percent can be adjusted in the config menu, active creeps are displayed under the creep slider. 
-* **Max RSI6:** Prevents entries when RSI6 exceeds a configurable value, (default 90). While typically overbought, extreme RSI6 levels signal excessive short-term momentum that could potentially extend further. This acts as a safety to avoid shorting vertical "blow-offs" before they peak.
-* **Volume Divergence Filter:** A configurable dual-sided filter to manage capital risk amid manipulation.
-    * **Positive:** Blocks entries if volume is above the configurable threshold (default >35%) higher than the top 3 or 4 gainers (or losers) excluding the subject coin. Such divergence indicates heavy capital injection that could cause parabolic moves.
-    * **Negative:** Flags coins moving on low volume, lower than the lowest 3 or 4 gainers (or losers) excluding the subject coin. Such divergence suggests whale accumulation ahead of late retail volatility.
+---
 
 ## Technical Stack
 
-* **Frontend:** Alpine.js (Reactive UI logic)
-* **Styling:** Bootstrap 5 + Custom "Glacier-Void" CSS theme
-* **Communication:** Bybit V5 API (REST)
-* **Architecture:** Single-file HTML/JavaScript application.
+- **Frontend:** Alpine.js (reactive state), Bootstrap 5, custom "Glacier-Void" CSS theme
+- **API:** Bybit V5 REST (USDT Perpetuals — `category: linear`)
+- **Architecture:** Single-file HTML/JS application — no build step, no backend, no third-party data routing. All API calls go directly to Bybit.
+- **Persistence:** `localStorage` — config, session stats, trade history, positions, and rodeo state all survive page reloads.
+- **Credentials:** API keys are held in volatile Alpine state and optionally persisted to `localStorage`. They are never transmitted to any server other than `api.bybit.com`.
 
-## Background Sync
-* **Audio Loop:** The bot plays a silent looped audio when started, this allows it to be persistent on Android even when the screen is off or the browser is in the background. 
-* **Edge Cases:** If the loop is ever interrupted it will automatically try to restart once the page is reopened, if this fails the "sync" indicator at the top of the page will blink orange, you can click on it to try and resync.
-
-### Follow-Through Strategy
-
-An extension of the **Rodeo Filter** that targets assets after a specific number of successful "rides". If the asset's RSI across all timeframes settles into a configurable range (default 20-50), the bot will re-enter the coin for a set number of cycles. 
-The rationale being; repeated entries at/around the 24hr top of a coin indicate extreme volatility and weakness. Follow-Through allows the bot to stay aggressive on a weakening asset even after the standard RSI gates have "blown-off" and come down.
+---
 
 ## Getting Started
 
-1.  **Download the HTML:** Very self-explanatory. 
-2.  **Open the App:** Simply open `EverWinter1.0.html` in any modern web browser.
-3.  **Connect API:**
-    * Generate an API Key on Bybit with **Contract/Derivatives** permissions.
-4.  **Configure & Start:** Adjust your leverage and margin settings, then click **"Start Bot"**.
+1. Download `EverWinter1.0.html` and open it in any modern desktop or mobile browser.
+2. Generate a Bybit API key with **Contract/Derivatives** read + trade permissions.
+3. Enter the key pair in the API panel, configure leverage and margin, then click **Start Bot**.
 
-## ⚠️ Risk Warning
+---
 
-Trading perpetual futures involves significant risk. EverWinter is a tool for automation and does not guarantee profits. 
-* **Loss Risk:** High leverage can lead to heavy losses during parabolic "short squeezes." It is advised to only use this bot during a prolonged bear market with the default settings applied.
+## Position Types
 
-## 🧪 PseudoWinter (Simulation Mode)
+EverWinter operates (6) distinct position archetypes. Both share the same DCA/TP mechanics but differ in how they are entered and how re-entry state is tracked.
+These are; 
 
-**PseudoWinter** is the built-in sandbox environment designed for strategy calibration and risk-free observation. It allows you to run the full EverWinter logic—including RSI scanning and tiered DCA execution—using real-time market data but with "phantom" capital.
+* **Standard Gainer Positions**
+* **Extension Diving (EXD)**
+* **Follow-Through (FT)**
+* **Advanced Follow-Through (ADV)**
+* **Pile-on Follow-Through (P-FT)**
+* **Faders**
+* **Carry-On Faders**
 
-### Features
-* **Closed Trades:** Includes a "PnL" scorecard section showing past trades, their duration and performance.
-* **Key Requirement:** Only requires a "Read-Only" API key. While it is possible to run the bot using Bybit's public API, the current version accounts for operation via file explorer (which the public API will reject).
+All of which are explained in the [Strategy Guide](https://drive.google.com/file/d/1T2YXmIT8E-u0TvvR5QT7qvXI8T5SHEbr/view?usp=drivesdk).
 
-> **Note:** PseudoWinter calculations use the same latency-compensation logic as the live bot, providing a highly accurate representation of "TP Drift", slippage and execution timing. It also accounts for funding fees paid through the duration of the short.
+### Position Badges 
+Each position type has a unique badge pinned to its header which makes it instantly identifiable. 
+
+---
+
+## Watchlists
+
+EverWinter maintains (3) distinct watchlists, each with different entry criteria and lifecycle rules.
+
+### Potential Entries Watchlist
+Populated during each main scan pass for symbols that are within a configurable RSI shortfall percentage of the full entry gate (default 10%). These are near-threshold candidates that aren't yet tradeable. Each entry carries a snapshot of the RSI gates that were in effect at placement time (including any current Rodeo Creep offset) and expires after a configurable window (default set in the Potential Entries config section). The 5-second RSI poller monitors this list independently; once all gates are cleared, the position opens immediately without waiting for the next full scan.
+This watchlist also evicts any tickers that fail other filters such as over-extension, funding rate, volume divergence etc during the course of their watch. 
+
+### Follow-Through Watchlist (`ftWatchlist`)
+A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its Rodeo/over-extension/Pile-on count and how many FT trades have been opened against it. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
+
+### Rodeo Creep Panel
+Not a tradeable watchlist but a live display of all symbols currently under active Rodeo Creep, showing the accumulated RSI gate offset and the countdown to expiry. Creep entries expire after 6 hours from the last qualifying close.
+
+---
+
+## Pollers
+
+EverWinter runs four independent `setInterval` loops with different cadences and responsibilities.
+
+### Scan Countdown (`_cdTimer`)
+Fires every second. Decrements `bot.scanCd` for the UI countdown display and triggers the full `scan()` routine when it reaches zero. The interval between scans is configurable (`scanMins`, default 15 minutes).
+
+### Position Watcher (`_watchTimer`)
+Fires every **15 seconds**. Calls `watchPositions()` to fetch current mark prices and order fill status for all open positions, then dispatches to `ftWatchPositions()` for any FT-tagged positions. Handles TP drift correction, 12-hour time-decay phase transitions, 24-hour force-close, DCA stage progression, and SL placement after DCA3.
+
+### Potential Entries Poller (`_potEntryTimer`)
+Fires every **5 seconds**. For each symbol on the Potential Entries watchlist it fetches a fresh RSI (kline cache is force-evicted per symbol on every tick to prevent stale reads), re-checks all gates including current Rodeo Creep and volume divergence, and opens a short immediately if the symbol qualifies. This is the only routine that can open a position between main scan cycles.
+
+### Market Refresh (`_refreshTimer`)
+Fires every **60 seconds**. Calls `refreshMarket()` to update the gainer table with current prices and 24-hour change percentages. Does not trigger a scan and does not interfere with the scan countdown.
+
+### Audio Keepalive (`_audioTimer`)
+Fires every **25 seconds** when the bot is running. Replays a silent audio clip to maintain an active `AudioContext`, which prevents Android browsers from suspending the page when the screen is off or the tab is backgrounded. If the context is interrupted the **SYNC** indicator in the header blinks orange; tapping it attempts a manual resync.
+
+---
+
+## Scan Behaviour
+
+A full scan runs at the configured interval or on demand via the **SCAN NOW** button. The sequence is:
+
+1. **Prune** — expired Rodeo Creep entries are removed.
+2. **Ticker fetch** — the top `topN + 10` gainers by 24-hour change are retrieved in a single call. Funding rates are extracted from the ticker payload and written to the kline cache to avoid per-symbol funding-rate requests later.
+3. **Ticker snapshot** — the top `topN` tickers are stored as `_scanTickerSnapshot` for use by the Potential Entries poller's volume-divergence re-check (the poller cannot afford a fresh fetch on every 5-second tick).
+4. **Per-symbol evaluation** — for each of the top `topN` symbols: klines are fetched once and shared across RSI6, RSI12, and RSI24 calculations; all gates are checked in order (funding filter → volume divergence → max positions → already open → RSI gates including Rodeo Creep → RSI6 max); qualifying symbols open immediately, near-threshold symbols are added to the Potential Entries watchlist.
+5. **FT scan** — if Follow-Through is enabled, `scanFollowThroughs()` runs against the persisted `ftCandidates` roster.
+6. **Countdown reset** — `bot.scanCd` is reset to `scanMins × 60`.
+
+The kline cache (`_klineCache`) stores candle arrays keyed by `symbol_15` with a scan-interval TTL. Cache entries are evicted at the start of each scan cycle; the Potential Entries poller force-evicts its own entries on every tick for real-time accuracy.
+
+---
+
+## Stats Menu
+
+The right-hand column contains several distinct sections.
+
+### Session
+Running totals for the current bot session: trade count, wins, losses, win rate, and net PnL in USDT. Also tracks **Force Closes** (positions closed by the 24-hour hard stop or laggard system) and **TP Reduces** (positions that transitioned to the 3% time-decay TP). The session timer shows elapsed time since the last **Start Bot**. Stats reset on **Clear Stats** or when the bot is stopped and restarted — they do not reset on page reload.
+
+### Trade History
+A compact summary of the closed-trade log: most recent symbol and result, best PnL percentage, and worst PnL percentage. The full feed is in the Trades column.
+
+### Constants
+Displays the computed SL exposure after DCA3 based on current notional and leverage settings. This is a read-only reference, not a configurable value.
+
+### Rodeo Creep
+Lists all symbols currently under active Rodeo Creep with their ride count, current RSI gate offsets, and countdown to reset. Empty when no creep is active.
+
+### Extenders Counter 
+Lists tickers that were recently "Over-Extended", shows the number of times they've returned over-extended again. Uses a timestamp based poll at scan time that allows synced RSI6 fetches to determine over-extension tick. 
+Shows the current "VM" at scan time if "EXD" is currently active, the VM poller lasts 30 minutes. 
+
+### Pile-ons Counter
+Similar to the "Extenders" Counter, but keeps tab of tickers that have returned "Over-Shorted". 
+
+### Persistence
+Export and import controls for the full application state (config, session stats, trade history, positions, rodeo creep). Import overwrites all local data; open positions are preserved and re-synced on the next connect. A separate **Clear Stats** button in the Danger Zone resets only session counters and trade history without affecting config or open positions.
+
+---
+
+## Trades Menu
+
+The Trades column (mobile: **📋 Trades** tab) is a reverse-chronological feed of all closed positions for the current session. Each card shows:
+
+- Symbol, close direction, and win/loss badge
+- Entry price, exit price, and DCA stage at close
+- Duration, realised PnL (USDT and %), and close reason (`TP`, `Force`, `Manual`)
+- For FT positions: the Rodeo count that qualified the entry, rendered in purple
+
+The feed is rendered via a vanilla JS `renderTradeFeed()` function rather than Alpine `x-for` to avoid reactivity performance issues with large lists. A **CLEAR** button truncates the feed and resets the closed-trades array in state and storage.
+
+---
+
+## PseudoWinter (Simulation Mode)
+
+PseudoWinter runs the complete EverWinter logic against live market data with phantom capital — no real orders are placed. It requires only a read-only API key and is suitable for strategy calibration before live deployment.
+
+**Features (canonical specification; full integration into EverWinter is in progress):**
+
+- All scan, RSI, and DCA logic runs identically to the live bot, including TP drift compensation and Rodeo Creep.
+- Funding fees are deducted from simulated PnL over the duration of each phantom position.
+- A **Closed Trades** scorecard section records each completed phantom trade with its symbol, DCA stage, duration, and PnL percentage.
+- Latency compensation applies the same slippage model used by the live bot, giving an accurate representation of real execution timing.
+- Operates correctly when opened via the local file system (i.e. `file://` protocol), unlike the Bybit public API which rejects cross-origin requests from file explorer contexts.
+
+> PseudoWinter's closed-trade PnL scorecard and funding-fee accounting are implemented and canonical but not yet fully integrated into the live EverWinter build.
+
+---
+
+## ChartWinter
+
+**ChartWinter** (`ChartWinter.html`) is a standalone companion charting tool in the same single-file format. It deviates by having a gray/ash visual theme, it has a compatible config schema with EverWinter, but operates entirely independently — no shared state, no inter-app communication.
+
+### Core Function
+ChartWinter runs its own configurable top-gainer scan (identical `topN`, `scanMins`, RSI gate, and funding-rate filter parameters) and renders a candlestick chart with a separate volume pane for the selected ticker. RSI values (RSI6, RSI12, RSI24) are computed client-side using Wilder's method, matching PseudoWinter's implementation exactly.
+
+### Scan Results Panel
+The left panel lists scan results with per-symbol price, 24-hour change, funding rate, and RSI6. Results can be sorted by change or RSI6. A full-text search mode lets you load any Bybit ticker directly, bypassing the scan filter.
+
+### Charting
+Charts are rendered via LightweightCharts. Kline data is cached per symbol and is exportable/importable as JSON. A configurable poll interval auto-refreshes the active chart. Lookback depth and the number of extended candles rendered are configurable.
+
+### Persistent Price Lines
+Users can draw, label, and colour-code horizontal price lines on any ticker. Lines are persisted per symbol in `localStorage` and survive page reloads. A **Manage Lines** modal allows editing and deletion.
+
+### Settings Export / Import
+All ChartWinter settings can be exported and re-imported as JSON, independent of EverWinter's state.
+
+---
+
+## Background Sync
+Same as EverWinter. 
+
+---
