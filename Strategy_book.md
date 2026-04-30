@@ -350,7 +350,7 @@ Promoted from the over-shorted tracking system after accumulating 8+ pile-on hit
 - **"Carrion"**: The ticker is functionally a dead animal at this point
 - **"Carrying on"**: Continuing an existing assault on the ticker, likely after it's been traded by the FT paths and dropped from their range
 
-Carry-Ons operate on a different timeline than regular faders. We watch each Carry-On ticker for up to 48 hours (configurable), looking for optimal entry windows during its extended collapse. This is actually shorter than the FT roster window, but the expectation is different—we're waiting for a ticker that's already confirmed bearish to present entry opportunities as it continues downward.
+Carry-Ons operate on a different timeline than regular faders. We watch each Carry-On ticker for up to 6 hours (configurable), looking for optimal entry windows during its extended collapse. This is actually shorter than the FT roster window, but the expectation is different—we're waiting for a ticker that's already confirmed bearish to present entry opportunities as it continues downward.
 
 Trades are limited to **2 per confirmation** to avoid sudden reversion at market lows.
 
@@ -409,7 +409,7 @@ Carry-Ons use a **different gate structure** focused on sustained collapse rathe
 ### Why 3× Margin
 
 Faders use **3× margin**—the highest in the system. When a ticker has collapsed into the 10-50 RSI range, shows strong volume momentum or velocity, passes all filters, and has no over-extension history, it's in **controlled freefall**. The conviction is highest here because:
-- The ticker has already fallen significantly (not catching a falling knife)
+- The ticker has already fallen significantly (not catching a hot rocket)
 - Volume confirms continued selling pressure
 - No recent over-extension (not a bounce candidate)
 - The collapse is sustained, not a single-day event

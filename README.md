@@ -1,6 +1,6 @@
 # ❄️ EVERWINTER
 
-**EverWinter** is a single-file, browser-based bot for Bybit USDT Perpetuals. It targets mean-reversion opportunities on top gainers using multi-timeframe RSI gating, tiered DCA, and a suite of risk management routines. This document covers the application's architecture, UI sections, position lifecycle, and polling behaviour. For the underlying trading strategy — including entry logic, RSI gate tuning, and risk rationale — see the [Strategy Guide](https://drive.google.com/file/d/1T2YXmIT8E-u0TvvR5QT7qvXI8T5SHEbr/view?usp=drivesdk).
+**EverWinter** is a single-file, browser-based bot for Bybit USDT Perpetuals. It targets mean-reversion opportunities on top gainers using multi-timeframe RSI gating, tiered DCA, and a suite of risk management routines. This document covers the application's architecture, UI sections, position lifecycle, and polling behaviour. For the underlying trading strategy — including entry logic, RSI gate tuning, and risk rationale — see the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md).
 
 ---
 
@@ -24,7 +24,7 @@
 
 ## Position Types
 
-EverWinter operates (6) distinct position archetypes. Both share the same DCA/TP mechanics but differ in how they are entered and how re-entry state is tracked.
+EverWinter operates (7) distinct position archetypes. All share the same DCA/TP mechanics but differ in how they are entered and how re-entry state is tracked.
 These are; 
 
 * **Standard Gainer Positions**
@@ -35,7 +35,7 @@ These are;
 * **Faders**
 * **Carry-On Faders**
 
-All of which are explained in the [Strategy Guide](https://drive.google.com/file/d/1T2YXmIT8E-u0TvvR5QT7qvXI8T5SHEbr/view?usp=drivesdk).
+All of which are explained in the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md).
 
 ### Position Badges 
 Each position type has a unique badge pinned to its header which makes it instantly identifiable. 
@@ -47,35 +47,35 @@ Each position type has a unique badge pinned to its header which makes it instan
 EverWinter maintains (3) distinct watchlists, each with different entry criteria and lifecycle rules.
 
 ### Potential Entries Watchlist
-Populated during each main scan pass for symbols that are within a configurable RSI shortfall percentage of the full entry gate (default 10%). These are near-threshold candidates that aren't yet tradeable. Each entry carries a snapshot of the RSI gates that were in effect at placement time (including any current Rodeo Creep offset) and expires after a configurable window (default set in the Potential Entries config section). The 5-second RSI poller monitors this list independently; once all gates are cleared, the position opens immediately without waiting for the next full scan.
+Populated during each main scan pass for symbols that are within a configurable RSI shortfall percentage of the full entry gate (default 10%). These are near-threshold candidates that aren't yet tradeable. Each entry carries a snapshot of the RSI gates that were in effect at placement time (including any current Rodeo Creep offset) and expires after a configurable window (default set in the Potential Entries config section). The (5)-second RSI poller monitors this list independently; once all gates are cleared, the position opens immediately without waiting for the next full scan.
 This watchlist also evicts any tickers that fail other filters such as over-extension, funding rate, volume divergence etc during the course of their watch. 
 
 ### Follow-Through Watchlist (`ftWatchlist`)
 A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its Rodeo/over-extension/Pile-on count and how many FT trades have been opened against it. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
 
 ### Rodeo Creep Panel
-Not a tradeable watchlist but a live display of all symbols currently under active Rodeo Creep, showing the accumulated RSI gate offset and the countdown to expiry. Creep entries expire after 6 hours from the last qualifying close.
+Not a tradeable watchlist but a live display of all symbols currently under active Rodeo Creep, showing the accumulated RSI gate offset and the countdown to expiry. Creep entries expire after (6) hours from the last qualifying close.
 
 ---
 
 ## Pollers
 
-EverWinter runs four independent `setInterval` loops with different cadences and responsibilities.
+EverWinter runs (5) independent `setInterval` loops with different cadences and responsibilities.
 
 ### Scan Countdown (`_cdTimer`)
-Fires every second. Decrements `bot.scanCd` for the UI countdown display and triggers the full `scan()` routine when it reaches zero. The interval between scans is configurable (`scanMins`, default 15 minutes).
+Fires every second. Decrements `bot.scanCd` for the UI countdown display and triggers the full `scan()` routine when it reaches zero. The interval between scans is configurable (`scanMins`, default (15) minutes).
 
 ### Position Watcher (`_watchTimer`)
-Fires every **15 seconds**. Calls `watchPositions()` to fetch current mark prices and order fill status for all open positions, then dispatches to `ftWatchPositions()` for any FT-tagged positions. Handles TP drift correction, 12-hour time-decay phase transitions, 24-hour force-close, DCA stage progression, and SL placement after DCA3.
+Fires every (15) seconds. Calls `watchPositions()` to fetch current mark prices and order fill status for all open positions, then dispatches to `ftWatchPositions()` for any FT-tagged positions. Handles TP drift correction, (12)-hour time-decay phase transitions, (24)-hour force-close, DCA stage progression, and SL placement after DCA3.
 
 ### Potential Entries Poller (`_potEntryTimer`)
-Fires every **5 seconds**. For each symbol on the Potential Entries watchlist it fetches a fresh RSI (kline cache is force-evicted per symbol on every tick to prevent stale reads), re-checks all gates including current Rodeo Creep and volume divergence, and opens a short immediately if the symbol qualifies. This is the only routine that can open a position between main scan cycles.
+Fires every (5) seconds. For each symbol on the Potential Entries watchlist it fetches a fresh RSI (kline cache is force-evicted per symbol on every tick to prevent stale reads), re-checks all gates including current Rodeo Creep and volume divergence, and opens a short immediately if the symbol qualifies. This is the only routine that can open a position between main scan cycles.
 
 ### Market Refresh (`_refreshTimer`)
-Fires every **60 seconds**. Calls `refreshMarket()` to update the gainer table with current prices and 24-hour change percentages. Does not trigger a scan and does not interfere with the scan countdown.
+Fires every (60) seconds. Calls `refreshMarket()` to update the gainer table with current prices and (24)-hour change percentages. Does not trigger a scan and does not interfere with the scan countdown.
 
 ### Audio Keepalive (`_audioTimer`)
-Fires every **25 seconds** when the bot is running. Replays a silent audio clip to maintain an active `AudioContext`, which prevents Android browsers from suspending the page when the screen is off or the tab is backgrounded. If the context is interrupted the **SYNC** indicator in the header blinks orange; tapping it attempts a manual resync.
+Fires every (25) seconds when the bot is running. Replays a silent audio clip to maintain an active `AudioContext`, which prevents Android browsers from suspending the page when the screen is off or the tab is backgrounded. If the context is interrupted the **SYNC** indicator in the header blinks orange; tapping it attempts a manual resync.
 
 ---
 
@@ -84,8 +84,8 @@ Fires every **25 seconds** when the bot is running. Replays a silent audio clip 
 A full scan runs at the configured interval or on demand via the **SCAN NOW** button. The sequence is:
 
 1. **Prune** — expired Rodeo Creep entries are removed.
-2. **Ticker fetch** — the top `topN + 10` gainers by 24-hour change are retrieved in a single call. Funding rates are extracted from the ticker payload and written to the kline cache to avoid per-symbol funding-rate requests later.
-3. **Ticker snapshot** — the top `topN` tickers are stored as `_scanTickerSnapshot` for use by the Potential Entries poller's volume-divergence re-check (the poller cannot afford a fresh fetch on every 5-second tick).
+2. **Ticker fetch** — the top `topN + 10` gainers by (24)-hour change are retrieved in a single call. Funding rates are extracted from the ticker payload and written to the kline cache to avoid per-symbol funding-rate requests later.
+3. **Ticker snapshot** — the top `topN` tickers are stored as `_scanTickerSnapshot` for use by the Potential Entries poller's volume-divergence re-check (the poller cannot afford a fresh fetch on every (5)-second tick).
 4. **Per-symbol evaluation** — for each of the top `topN` symbols: klines are fetched once and shared across RSI6, RSI12, and RSI24 calculations; all gates are checked in order (funding filter → volume divergence → max positions → already open → RSI gates including Rodeo Creep → RSI6 max); qualifying symbols open immediately, near-threshold symbols are added to the Potential Entries watchlist.
 5. **FT scan** — if Follow-Through is enabled, `scanFollowThroughs()` runs against the persisted `ftCandidates` roster.
 6. **Countdown reset** — `bot.scanCd` is reset to `scanMins × 60`.
@@ -99,7 +99,7 @@ The kline cache (`_klineCache`) stores candle arrays keyed by `symbol_15` with a
 The right-hand column contains several distinct sections.
 
 ### Session
-Running totals for the current bot session: trade count, wins, losses, win rate, and net PnL in USDT. Also tracks **Force Closes** (positions closed by the 24-hour hard stop or laggard system) and **TP Reduces** (positions that transitioned to the 3% time-decay TP). The session timer shows elapsed time since the last **Start Bot**. Stats reset on **Clear Stats** or when the bot is stopped and restarted — they do not reset on page reload.
+Running totals for the current bot session: trade count, wins, losses, win rate, and net PnL in USDT. Also tracks **Force Closes** (positions closed by the (24)-hour hard stop or laggard system) and **TP Reduces** (positions that transitioned to the 3% time-decay TP). The session timer shows elapsed time since the last **Start Bot**. Stats reset on **Clear Stats** or when the bot is stopped and restarted — they do not reset on page reload.
 
 ### Trade History
 A compact summary of the closed-trade log: most recent symbol and result, best PnL percentage, and worst PnL percentage. The full feed is in the Trades column.
@@ -112,10 +112,13 @@ Lists all symbols currently under active Rodeo Creep with their ride count, curr
 
 ### Extenders Counter 
 Lists tickers that were recently "Over-Extended", shows the number of times they've returned over-extended again. Uses a timestamp based poll at scan time that allows synced RSI6 fetches to determine over-extension tick. 
-Shows the current "VM" at scan time if "EXD" is currently active, the VM poller lasts 30 minutes. 
+Shows the current "VM" at scan time if "EXD" is currently active, the VM poller lasts (30) minutes. 
 
 ### Pile-ons Counter
 Similar to the "Extenders" Counter, but keeps tab of tickers that have returned "Over-Shorted". 
+
+### Activity Log
+A capped reverse-chronological event feed, holding a maximum of (300) entries. Each entry is timestamped and colour-coded by type: `scan` events (light blue) cover scan cycle summaries and FT roster changes; `trade` events (ice blue) record every order open, DCA trigger, and close; `success` entries (green) confirm connections and bot start; `warn` entries (amber) cover Rodeo Creep registrations, TP reductions, and non-fatal anomalies; `error` entries (red) flag API failures and scan errors; and `info` entries (muted) carry general status messages. The log is purely observational — it has no effect on bot state and is cleared on **Clear Stats**.
 
 ### Persistence
 Export and import controls for the full application state (config, session stats, trade history, positions, rodeo creep). Import overwrites all local data; open positions are preserved and re-synced on the next connect. A separate **Clear Stats** button in the Danger Zone resets only session counters and trade history without affecting config or open positions.
@@ -159,7 +162,7 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 ChartWinter runs its own configurable top-gainer scan (identical `topN`, `scanMins`, RSI gate, and funding-rate filter parameters) and renders a candlestick chart with a separate volume pane for the selected ticker. RSI values (RSI6, RSI12, RSI24) are computed client-side using Wilder's method, matching PseudoWinter's implementation exactly.
 
 ### Scan Results Panel
-The left panel lists scan results with per-symbol price, 24-hour change, funding rate, and RSI6. Results can be sorted by change or RSI6. A full-text search mode lets you load any Bybit ticker directly, bypassing the scan filter.
+The left panel lists scan results with per-symbol price, (24)-hour change, funding rate, and RSI6. Results can be sorted by change or RSI6. A full-text search mode lets you load any Bybit ticker directly, bypassing the scan filter.
 
 ### Charting
 Charts are rendered via LightweightCharts. Kline data is cached per symbol and is exportable/importable as JSON. A configurable poll interval auto-refreshes the active chart. Lookback depth and the number of extended candles rendered are configurable.
