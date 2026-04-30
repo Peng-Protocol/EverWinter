@@ -84,7 +84,7 @@ Despite tickers having different market caps and reacting differently to buyer i
 **Edge Cases**:
 - One or two low-volume pumps can crowd the top 3, giving everything else high vol div
 - Abnormally high-volume coin in the low gainers creates inverse skew
-- These scenarios produce **acceptable false positives** — we simply skip those entries
+- These scenarios produce **acceptable false negatives** — we simply skip those entries
 
 #### 4. **RSI6 Maximum: 90 (Over-Extension Disqualifier)**
 Rather than being a bullish signal, **RSI6 > 90 is a sign of doom**.
@@ -104,13 +104,13 @@ If a coin was recently over-extended, there's high probability it will:
 - Exhibit continued parabolic behavior
 - Generate false entries that quickly reverse
 
-The 3-hour block prevents premature re-entry after a parabolic move settles.
+The 3-hour graylist prevents premature re-entry after a parabolic move settles.
 
 ---
 
 ### Rodeo Mechanism (Instability Detection)
 
-The **rodeo filter** responds to repeated failed entries.
+The **rodeo filter** responds to repeated successful entries.
 
 #### How It Works:
 1. **Entry**: We open a gainer position
