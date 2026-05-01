@@ -166,23 +166,18 @@ When a ticker hits **RSI6 ≥ 90** during our gainer scan, it's too over-extende
 **What is Volume Momentum?**
 Volume momentum compares **buying vs selling volume** across a 24-hour period. When sell volume exceeds buy volume by our threshold percentage, this **precedes downward price action** — the coin is being heavily sold into, but the price hasn't reflected this selling pressure yet.
 
-**Base Threshold**: **13%**
+**Base Threshold**: **15%**
 
 **Why Escalate?**
 A phenomenon we've observed: **the longer a ticker over-extends, the more vol mom is required to signal downward action**. Higher pumps can sustain more selling pressure before reversing.
 
 **Escalation Rules**:
-- For each over-extension tick beyond 2, we multiply the threshold by 1.25 per tick
-  - Example: 5 ticks = 13% × (1.25)^3 = 25.4%
-- For each rodeo re-entry, we add 30% per rodeo
-  - Example: 2 rodeos = additional +60% to threshold
+- For each over-extension tick beyond 1, we multiply the threshold by 2 per tick
+  - Example: 5 ticks = 15% × (2)^4 = 240%
+- For each rodeo re-entry, we multiply the result by 100% per rodeo
+  - Example: 2 rodeos = additional +200% to threshold
 
-**Combined Example**:
-- Base: 13%
-- Ticker at tick 4 (2 excess ticks): 13% × 1.56 = 20.3%
-- After 1 rodeo: 20.3% × 1.30 = 26.4% vol mom required
-
-**Why 13% Base?**
+**Why 15% Base?**
 Determined through trial and error. Lower thresholds create false entries before sell pressure truly dominates. Higher thresholds miss valid reversals.
 
 #### 2. **RSI24 Floor**
