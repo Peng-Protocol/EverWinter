@@ -1512,7 +1512,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   const r12 = +(c.rsi12 ?? _symData[c.symbol]?.rsi12 ?? null);
                   const r24 = +(c.rsi24 ?? _symData[c.symbol]?.rsi24 ?? null);
                   if (isNaN(r6)) return '<span style=\'color:var(--text-lo)\'>—</span>';
-                  const rsiMax = cfg.ftRsiMax;
+                  const rsiMax = (c.isAdvFt ? cfg.rsi6Max : cfg.ftRsiMax);
                   const vals=[r6,r12,r24];
                   const parts=vals.map(v=>{
                     if(isNaN(v)) return '<span style=\'color:var(--text-lo)\'>?</span>';
@@ -1588,7 +1588,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   const sd = _symData[sym] || {};
                   const r6 = +(sd.rsi6 ?? null), r12 = +(sd.rsi12 ?? null), r24 = +(sd.rsi24 ?? null);
                   if (isNaN(r6)) return '<span style=\'color:var(--text-lo)\'>—</span>';
-                  const rsiMax = cfg.ftRsiMax;
+                  const rsiMax = entry._advFt ? cfg.rsi6Max : cfg.ftRsiMax;
                   const parts=[r6,r12,r24].map(v=>{
                     if(isNaN(v)) return '<span style=\'color:var(--text-lo)\'>?</span>';
                     const col=v>=rsiMax?'var(--short)':v<=cfg.ftRsiMin?'var(--warn)':'var(--profit)';
@@ -2881,7 +2881,7 @@ function ew() { return {
 
   // Increments extenderCount for a symbol (RSI6 ≥ rsi6Max hit). 3h TTL.
   // At advFtThreshold promotes (or upgrades) the FT roster entry to _advFt: true.
-  extenderBump(symbol, rsi6 = null, exdFromHistorical = false) {
+  extenderBump(symbol, rsi6 = null) {
     const EXTENDER_TTL = 3 * 3600 * 1000;
     const now = Date.now();
     const entry = this.extenderCount[symbol];
@@ -2893,10 +2893,16 @@ function ew() { return {
       this._extenderGraylist[symbol] = now + GRAYLIST_DURATION;
       const rsiNote = rsi6 != null ? ` — RSI6 ${rsi6.toFixed(1)} (max ${this.cfg.rsi6Max})` : '';
       this.log(`⚡ ${symbol}: over-extended ×1${rsiNote} — graylisted from gainers for 3h`, 'info');
+      // One-time lookback: verify true historical ext-tick count from kline history.
+      // Result is cached into extenderCount so the EXD poller and ADV FT path use it directly.
+      this._fetchConfirmedExtTicks(symbol).then(({ confirmedTicks, fallback }) => {
+        if (!fallback && this.extenderCount[symbol] && confirmedTicks > 1) {
+          this.extenderCount[symbol].count = Math.max(this.extenderCount[symbol].count, confirmedTicks);
+          this.log(`⚡ ${symbol}: lookback confirmed ×${confirmedTicks} over-extension ticks`, 'info');
+        }
+      }).catch(() => {});
       // Start EXD vol-mom poller on first hit
-      if (!exdFromHistorical && this.cfg.exdEnabled) {
-        this._startExdPoller(symbol);
-      }
+      if (this.cfg.exdEnabled) this._startExdPoller(symbol);
     }
     const count = this.extenderCount[symbol].count;
 
@@ -3056,18 +3062,7 @@ function ew() { return {
       this.log(`⚡ ${symbol}: EXD — max trades reached`, 'debug'); return;
     }
 
-    const { confirmedTicks, fallback } = await this._fetchConfirmedExtTicks(symbol);
-    const registeredTicks = this.extenderCount[symbol]?.count || 1;
-    if (!fallback && confirmedTicks > registeredTicks) {
-      this.extenderCount[symbol].count = confirmedTicks;
-    }
-
-    const savedCount = this.extenderCount[symbol]?.count;
-    if (this.extenderCount[symbol]) this.extenderCount[symbol].count = confirmedTicks;
     const effThreshold = this.exdVolMomThreshold(symbol);
-    if (this.extenderCount[symbol] && savedCount != null) {
-      this.extenderCount[symbol].count = Math.max(savedCount, confirmedTicks);
-    }
 
     let price = 0, fr = null;
     try {
@@ -3122,17 +3117,6 @@ function ew() { return {
       if (this.positions.find(p => p._ft && p.symbol === symbol)) { this._stopExdPoller(symbol); return; }
       if (this._symbolBanlist[symbol]) { this._stopExdPoller(symbol); return; }
       try {
-        // Over-extension look-back: re-verify confirmed tick count before evaluating the VM threshold.
-        // This matches the ADV FT pre-entry look-back and ensures the EXD poller always
-        // uses the true historical over-extension count rather than the stale scan-time register.
-        try {
-          const { confirmedTicks: ct, fallback } = await this._fetchConfirmedExtTicks(symbol);
-          if (!fallback && this.extenderCount[symbol]) {
-            const prev = this.extenderCount[symbol].count || 1;
-            this.extenderCount[symbol].count = Math.max(prev, ct);
-          }
-        } catch(e) { /* non-fatal — use registered count */ }
-
         const bl = await this.fetchVolBaseline(symbol);
         if (!bl || bl.v24 <= 0 || bl.t24 <= 0 || bl.lp <= 0) return;
         const blended   = this.calcVolMomPct(bl.v24, bl.t24, bl.lp);
@@ -3934,7 +3918,7 @@ function ew() { return {
         const { rsi6, rsi12, rsi24 } = await this.fetchRSIMulti(sym);
 
         // ADV FT uses wider RSI range (ftRsiMin..rsi6Max) vs regular FT (ftRsiMin..ftRsiMax)
-        const rsiMax = this.cfg.ftRsiMax;
+        const rsiMax = ftEntry._advFt ? this.cfg.rsi6Max : this.cfg.ftRsiMax;
         const rsiOk  = (
           rsi6  != null && rsi6  > this.cfg.ftRsiMin && rsi6  < rsiMax &&
           rsi12 != null && rsi12 > this.cfg.ftRsiMin && rsi12 < rsiMax &&
@@ -3977,29 +3961,11 @@ function ew() { return {
           continue;
         }
 
-        // For ADV FT: recalculate confirmed ext ticks from kline history right before entry
-        // so the VM requirement reflects the true over-extension count, not just the scan counter.
-        let confirmedTicks = ftEntry.count;
-        if (ftEntry._advFt && this.cfg.ftVolMomEnabled) {
-          try {
-            const { confirmedTicks: ct, fallback } = await this._fetchConfirmedExtTicks(sym);
-            if (!fallback) {
-              confirmedTicks = Math.max(ftEntry.count, ct);
-              if (ct > ftEntry.count && this.extenderCount[sym]) {
-                this.extenderCount[sym].count = confirmedTicks;
-                ftEntry.count = confirmedTicks;
-              }
-            }
-          } catch(e) { /* non-fatal — use registered count */ }
-        }
-
         if (this.cfg.ftVolMomEnabled) {
           const tickEntry   = tickList.find(t => t.symbol === sym);
           const turnover24h = tickEntry ? parseFloat(tickEntry.turnover24h || 0) : 0;
           const volume24h   = tickEntry ? parseFloat(tickEntry.volume24h   || 0) : 0;
-          // ADV FT VM scaling uses over-extension tick count (extenderCount), not rodeo close count (ftEntry.count).
-          // confirmedTicks is the lookback-verified ext-tick count for ADV FT; for regular FT it equals ftEntry.count.
-          const vmTicks     = ftEntry._advFt ? (this.extenderCount[sym]?.count || confirmedTicks) : confirmedTicks;
+          const vmTicks     = ftEntry._advFt ? (this.extenderCount[sym]?.count || ftEntry.count) : ftEntry.count;
           const momCheck    = this.computeFtVolMom(sym, turnover24h, volume24h, price, vmTicks, !!ftEntry._advFt);
           if (!momCheck.ok) {
             this.log(`🎯 ${sym}: FT skipped — ${momCheck.reason}`, 'debug');
