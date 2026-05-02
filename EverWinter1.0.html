@@ -1328,6 +1328,18 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <div class="psl">Rodeo Count</div>
                 <div class="psv" style="color:#c084fc" x-text="p.rodeoCount!=null?'×'+p.rodeoCount:'—'"></div>
               </div>
+              <!-- Live vol mom — shown for FT, ADV FT, and fader positions -->
+              <div class="ps" x-show="(p._ft || p._fade) && p.volMomPct != null">
+                <div class="psl">Vol Mom</div>
+                <div class="psv" :style="p.volMomPct>=0?'color:var(--profit)':'color:var(--short)'"
+                     x-text="p.volMomPct!=null?(p.volMomPct>=0?'+':'')+p.volMomPct.toFixed(1)+'%':'—'"></div>
+              </div>
+              <!-- Carry-on VSI count at entry -->
+              <div class="ps" x-show="p._carryOn && p._vsiCount != null">
+                <div class="psl">VSI at Entry</div>
+                <div class="psv" :style="p._vsiCount>=p._vsiReq?'color:var(--profit)':'color:var(--warn)'"
+                     x-text="p._vsiCount!=null?(p._vsiCount+'/'+(p._vsiReq??'?')):'—'"></div>
+              </div>
             </div>
             <!-- DCA stage price ladder bar — copied from PseudoWinter -->
             <div x-data="{
@@ -3110,7 +3122,17 @@ function ew() { return {
       if (this.positions.find(p => p._ft && p.symbol === symbol)) { this._stopExdPoller(symbol); return; }
       if (this._symbolBanlist[symbol]) { this._stopExdPoller(symbol); return; }
       try {
-        // Vol-mom check only — look-back runs in _exdEntry as a pre-entry gate, not here.
+        // Over-extension look-back: re-verify confirmed tick count before evaluating the VM threshold.
+        // This matches the ADV FT pre-entry look-back and ensures the EXD poller always
+        // uses the true historical over-extension count rather than the stale scan-time register.
+        try {
+          const { confirmedTicks: ct, fallback } = await this._fetchConfirmedExtTicks(symbol);
+          if (!fallback && this.extenderCount[symbol]) {
+            const prev = this.extenderCount[symbol].count || 1;
+            this.extenderCount[symbol].count = Math.max(prev, ct);
+          }
+        } catch(e) { /* non-fatal — use registered count */ }
+
         const bl = await this.fetchVolBaseline(symbol);
         if (!bl || bl.v24 <= 0 || bl.t24 <= 0 || bl.lp <= 0) return;
         const blended   = this.calcVolMomPct(bl.v24, bl.t24, bl.lp);
@@ -3921,9 +3943,20 @@ function ew() { return {
 
         if (!rsiOk) {
           const anyHigh = [rsi6, rsi12, rsi24].filter(r => r != null).some(r => r >= rsiMax);
-          const ftRsiStatus = anyHigh ? 'ft-highrsi' : 'ft-lowrsi';
-          if (anyHigh) _ftTally.highrsi++; else _ftTally.lowrsi++;
-          candidates.push({ symbol: sym, rodeoCount: ftEntry.count, price, rsi6, rsi12, rsi24, fundingRate: fr, status: ftRsiStatus, isAdvFt: !!ftEntry._advFt });
+          if (anyHigh) {
+            // RSI over max — keep on roster, high RSI is valid over-extension context
+            _ftTally.highrsi++;
+            candidates.push({ symbol: sym, rodeoCount: ftEntry.count, price, rsi6, rsi12, rsi24, fundingRate: fr, status: 'ft-highrsi', isAdvFt: !!ftEntry._advFt });
+          } else {
+            // RSI below min — momentum gone, evict immediately
+            this.log(`🎯 ${sym}: FT radar evicted — RSI dropped below min (${rsi6?.toFixed(1)}/${rsi12?.toFixed(1)}/${rsi24?.toFixed(1)} ≤ ${this.cfg.ftRsiMin})`, 'info');
+            delete this.ftCandidates[sym];
+            delete this._vsiCounts[sym];
+            this._stopAdvFtPoller(sym);
+            if (this._advFtGraylist[sym]) delete this._advFtGraylist[sym];
+            this.persist();
+            _ftTally.lowrsi++;
+          }
           continue;
         }
 
@@ -4943,7 +4976,9 @@ function ew() { return {
           if (!coPrice) continue;
           const fr = await this.fetchFundingRate(pf.symbol).catch(() => null);
 
-          this.log(`📎 ${pf.symbol}: C-ON entry [${entryPath}] @ ${fmtP(coPrice)} | RSI ${coRsi6?.toFixed(1)}/${coRsi12?.toFixed(1)}/${coRsi24?.toFixed(1)} | vol mom ${blended.toFixed(1)}%`, 'trade');
+          const _coVsiCount = this._vsiCounts[pf.symbol]?.count || 0;
+          const _coVsiReq   = this.overShortedCount[pf.symbol]?.count || this.cfg.carryOnThreshold || 8;
+          this.log(`📎 ${pf.symbol}: C-ON entry [${entryPath}] @ ${fmtP(coPrice)} | RSI ${coRsi6?.toFixed(1)}/${coRsi12?.toFixed(1)}/${coRsi24?.toFixed(1)} | vol mom ${blended.toFixed(1)}% | VSI ${_coVsiCount}/${_coVsiReq}`, 'trade');
           this.potFaders = this.potFaders.filter(e => e.id !== pf.id);
           this.persist(); this.renderPotFaders();
           await this.openFade({ symbol: pf.symbol, price: coPrice, change: pf.change, rsi6: coRsi6, rsi12: coRsi12, rsi24: coRsi24, fundingRate: fr, _carryOn: true });
@@ -5064,9 +5099,11 @@ function ew() { return {
       const cid           = await this.placeConditional(sym, 'Sell', addQty, addTp, addPrice);
       orders.push({ label: `Add${i+1} +${this.cfg.addPcts[i]}%`, price: addPrice, qty: addQty, tpPrice: addTp, type: 'cond', filled: false, orderId: cid });
     }
+    const _fadeVsiCount = candidate._carryOn ? (this._vsiCounts[sym]?.count || 0) : undefined;
+    const _fadeVsiReq   = candidate._carryOn ? (this.overShortedCount[sym]?.count || this.cfg.carryOnThreshold || 8) : undefined;
     this.positions.push({
       id: Date.now() + Math.random(), symbol: sym, _fade: true,
-      ...(candidate._carryOn ? { _carryOn: true } : {}),
+      ...(candidate._carryOn ? { _carryOn: true, _vsiCount: _fadeVsiCount, _vsiReq: _fadeVsiReq } : {}),
       entryPrice: fillPrice, originalEntryPrice: fillPrice, markPrice: fillPrice, totalSize: qty,
       leverage: effectiveLev, margin,
       change24h: (candidate.change ?? 0).toFixed(2),
@@ -5263,6 +5300,17 @@ function ew() { return {
           const fr = await this.fetchFundingRate(pos.symbol);
           if (fr !== null) pos.fundingRate = fr;
         } catch(e) { /* non-fatal */ }
+      }
+
+      // ── Refresh live vol mom for FT, ADV FT, and fader positions ──
+      // Reads from the cached vol baseline (seeded each scan) — no extra network calls.
+      // Written to pos.volMomPct so the position card can display it live.
+      for (const pos of this.positions) {
+        if (!pos._ft && !pos._fade) continue;
+        const bl = this._volBaseline[pos.symbol];
+        if (!bl?.volume24h) continue;
+        const vm = this.calcVolMomPct(bl.volume24h, bl.turnover24h, bl.lastPrice);
+        if (vm !== null) pos.volMomPct = vm;
       }
 
       const now=Date.now();
