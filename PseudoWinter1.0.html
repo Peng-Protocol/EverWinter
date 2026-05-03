@@ -1365,7 +1365,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <span class="tog-l">Fund Chasing</span>
             </label>
             <div style="font-size:9.5px;color:var(--text-lo);margin-top:6px;line-height:1.6">
-              High funding = someone's paying to stay long. Collect it.
+              Longs still paying to hold losers. Collect it.
             </div>
             <div x-show="!cfg.gainersEnabled" class="alert a-warn" style="margin-top:8px;font-size:10px">
               ⚠ Gainers strategy is off — FUN is inactive.
@@ -1381,8 +1381,12 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               </div>
             </div>
             <div class="g" style="margin-top:10px">
-              <div class="lbl">Scan Pool (top N gainers) <b x-text="cfg.funTopN"></b></div>
-              <input type="range" min="3" max="30" step="1" x-model.number="cfg.funTopN" :disabled="bot.running" @change="persist()">
+              <div class="lbl">Top Gainers <b x-text="cfg.funGainerN"></b></div>
+              <input type="range" min="3" max="50" step="1" x-model.number="cfg.funGainerN" :disabled="bot.running" @change="persist()">
+              <div style="margin-top:8px">
+                <div class="lbl">Worst Losers <b x-text="cfg.funLoserN"></b></div>
+                <input type="range" min="3" max="50" step="1" x-model.number="cfg.funLoserN" :disabled="bot.running" @change="persist()">
+              </div>
               <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px;line-height:1.6">
                 How far to cast the net.
               </div>
@@ -2325,7 +2329,8 @@ function pw() { return {
     // ── FUN (Fund Chasing) Strategy ──
     funEnabled: false,         // enable fund-chasing strategy
     funFundingMin: 0.05,       // min funding rate % to qualify (e.g. 0.05 = 0.05%)
-    funTopN: 25,               // how many top gainers to scan for high-funding candidates
+    funGainerN: 25,            // how many top gainers to evaluate for FUN entries
+    funLoserN: 25,             // how many worst losers (-3% to -99%) to evaluate for FUN entries
     funVolMomEnabled: true,    // require positive vol momentum before FUN entry
     funVolMomMin: 10,          // min vol mom % required (default 10%)
     funVolMomCreepPct: 10,     // VM floor increase % per re-entry within 6h window
@@ -3380,27 +3385,41 @@ function pw() { return {
       }
 
       // ── FUN (Fund Chasing) Strategy ──
-      // Scans top gainers for very high funding rates. RSI filters bypassed.
+      // Evaluates top gainers + worst losers for positive funding rates. All data is free —
+      // seeded from the bulk ticker fetch above. RSI filters bypassed.
       // Optional vol momentum gate (funVolMomEnabled, default 10%).
       // Uses 3× notional and 3× DCA margin. Enters immediately if slot is available.
       if (this.cfg.funEnabled && this.cfg.gainersEnabled) {
-        const funPool = allTickers
-          .filter(t => t.symbol.endsWith('USDT') && parseFloat(t.price24hPcnt || 0) > 0
-                    && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
+        const seen = new Set();
+        const addPool = (arr) => arr.filter(t => {
+          if (!t.symbol.endsWith('USDT') || t.symbol === 'BTCUSDT') return false;
+          if (parseFloat(t.lastPrice || 0) < 0.001) return false;
+          if (seen.has(t.symbol)) return false;
+          seen.add(t.symbol);
+          return true;
+        });
+        const gainers = allTickers
+          .filter(t => parseFloat(t.price24hPcnt || 0) > 0)
           .sort((a, b) => parseFloat(b.price24hPcnt) - parseFloat(a.price24hPcnt))
-          .slice(0, this.cfg.funTopN);
-        let funOpened = 0;
+          .slice(0, this.cfg.funGainerN);
+        const losers = allTickers
+          .filter(t => { const chg = parseFloat(t.price24hPcnt || 0) * 100; return chg <= -3 && chg >= -99; })
+          .sort((a, b) => parseFloat(a.price24hPcnt) - parseFloat(b.price24hPcnt))
+          .slice(0, this.cfg.funLoserN);
+        const funPool = [...addPool(gainers), ...addPool(losers)];
+
+        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0;
+        const gainerSyms = new Set(gainers.map(t => t.symbol));
         for (const t of funPool) {
           const sym   = t.symbol;
           const price = parseFloat(t.lastPrice || 0);
           if (!price) continue;
           if (this._symbolBanlist[sym]) continue;
-          if (this.positions.find(p => p.symbol === sym)) continue; // already open
+          if (this.positions.find(p => p.symbol === sym)) continue;
           const eff = this.positions.reduce((n, p) => n + (p._fade || p._fun ? 3 : p._ft ? 2 : 1), 0);
-          if (eff + 3 > this.cfg.maxPos) break; // FUN takes 3 slots
+          if (eff + 3 > this.cfg.maxPos) break;
           const fr = await this.fetchFundingRate(sym).catch(() => null);
           if (fr === null || fr < this.cfg.funFundingMin) continue;
-          // Vol momentum filter
           if (this.cfg.funVolMomEnabled) {
             const tickEntry = this._volBaseline[sym];
             const vmResult = this.calcFtVolMom(sym, tickEntry
@@ -3408,15 +3427,17 @@ function pw() { return {
               : null);
             const vmMin = this.funVolMomThreshold(sym);
             if (vmResult.pct != null && vmResult.pct < vmMin) {
-              this.log(`💰 ${sym}: FUN blocked — vol mom ${vmResult.pct.toFixed(1)}% < ${vmMin.toFixed(1)}% (creep ×${this.funCreep[sym]?.count || 0})`, 'info');
+              if (gainerSyms.has(sym)) vmBlockedGainers++; else vmBlockedLosers++;
               continue;
             }
           }
-          // Open a 3× notional short — tagged _fun
           const opened = await this.funOpenShort(sym, price, fr);
           if (opened) funOpened++;
         }
-        if (funPool.length > 0) this.log(`💰 FUN scan done. ${funOpened} opened.`, 'scan');
+        const vmNote = (vmBlockedGainers + vmBlockedLosers) > 0
+          ? ` | VM blocked: ${vmBlockedGainers}G ${vmBlockedLosers}L`
+          : '';
+        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}.`, 'scan');
       }
 
       await this.refreshBalance();
