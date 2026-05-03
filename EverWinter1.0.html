@@ -19,7 +19,7 @@ Copyright 2026 Peng Protocol
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>❄ EVERWINTER v1.8.4 — Bybit Short Bot</title>
+<title>❄ EVERWINTER v1.8.12 — Bybit Short Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -1114,6 +1114,18 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Block entry when vol mom ≤ 0 (buyers dominating).</div>
               </div>
               <div class="g" style="margin-top:8px">
+                <label class="tog" @click.prevent="if(!cfgLocked){cfg.fadeLsaEnabled=!cfg.fadeLsaEnabled;persist()}" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''">
+                  <div class="tog-t" :class="cfg.fadeLsaEnabled?'on':''"><div class="tog-k"></div></div>
+                  <span class="tog-l">Localized Sell Average</span>
+                </label>
+                <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Block entry when the last closed 15m candle volume deviates from the window average by more than the factor below (spike or drought).</div>
+              </div>
+              <div x-show="cfg.fadeLsaEnabled" class="g" style="margin-top:6px">
+                <div class="lbl">LSA Factor ±<b x-text="cfg.fadeLsaFactor+'%'"></b></div>
+                <input type="range" min="10" max="200" step="10" x-model.number="cfg.fadeLsaFactor" :disabled="bot.running" @change="persist()">
+                <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Block if last candle vol deviates more than ±<span x-text="cfg.fadeLsaFactor"></span>% from the window average.</div>
+              </div>
+              <div class="g" style="margin-top:8px">
                 <label class="tog" @click.prevent="if(!cfgLocked){cfg.fadeFundingFilter=!cfg.fadeFundingFilter;persist()}" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''">
                   <div class="tog-t" :class="cfg.fadeFundingFilter?'on':''"><div class="tog-k"></div></div>
                   <span class="tog-l">Funding Rate Filter</span>
@@ -1297,6 +1309,13 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <div class="psl">Vol Mom</div>
                 <div class="psv" :style="p.volMomPct>=0?'color:var(--profit)':'color:var(--short)'"
                      x-text="p.volMomPct!=null?(p.volMomPct>=0?'+':'')+p.volMomPct.toFixed(1)+'%':'—'"></div>
+              </div>
+              <!-- Live LSA ratio — shown for fader positions when kline cache is populated -->
+              <div class="ps" x-show="p._fade && p.lsaRatio != null">
+                <div class="psl">LSA</div>
+                <div class="psv"
+                     :style="p.lsaRatio == null ? '' : (p.lsaRatio > (1 + (cfg.fadeLsaFactor||50)/100) || p.lsaRatio < 1/(1+(cfg.fadeLsaFactor||50)/100)) ? 'color:var(--warn)' : 'color:var(--profit)'"
+                     x-text="p.lsaRatio != null ? ((p.lsaRatio >= 1 ? '+' : '') + ((p.lsaRatio - 1) * 100).toFixed(1) + '%') : '—'"></div>
               </div>
               <!-- Carry-on VSI count at entry -->
               <div class="ps" x-show="p._carryOn && p._vsiCount != null">
@@ -2102,6 +2121,8 @@ function ew() { return {
     fadeVolDivMax: 50,      // max vol mom % (above = already over-sold)
     fadePositiveVolMom: true,  // block when vol mom ≤ 0
     fadeFundingFilter: true,
+    fadeLsaEnabled: true,   // localized sell average filter — block if last 15m candle vol deviates too far from avg
+    fadeLsaFactor: 50,      // % deviation threshold (50 = ±50% from avg)
     potFaderExpireMins: 30,
     maxPotFaders: 10,
     dcaDoublingEnabled: false, // each add escalates by dcaMultiplier; faster rescue, heavier margin
@@ -3540,6 +3561,26 @@ function ew() { return {
     } catch { return null; }
   },
 
+  // Localized Sell Average — compares last complete 15m candle volume to the window average.
+  // Returns { blocked, ratio, reason }. Uses the existing _15 kline cache — zero extra fetches.
+  // After reversal oldest→newest, the last index is the in-progress candle; use length-2 for
+  // the last *closed* bar.
+  checkLsa(symbol) {
+    if (!this.cfg.fadeLsaEnabled) return { blocked: false };
+    const cached = this._klineCache[`${symbol}_15`];
+    if (!cached?.volumes?.length || cached.volumes.length < 4) return { blocked: false };
+    const vols        = cached.volumes;
+    const lastComplete = vols[vols.length - 2];          // second-to-last = last closed candle
+    const windowVols   = vols.slice(0, vols.length - 1); // exclude in-progress candle
+    const avg = windowVols.reduce((s, v) => s + v, 0) / windowVols.length;
+    if (!avg || avg <= 0) return { blocked: false };
+    const ratio  = lastComplete / avg;
+    const factor = 1 + (this.cfg.fadeLsaFactor ?? 50) / 100;
+    if (ratio > factor)     return { blocked: true, ratio, reason: `last candle ${ratio.toFixed(2)}× avg (spike > +${this.cfg.fadeLsaFactor}%)` };
+    if (ratio < 1 / factor) return { blocked: true, ratio, reason: `last candle ${ratio.toFixed(2)}× avg (drought < -${this.cfg.fadeLsaFactor}%)` };
+    return { blocked: false, ratio };
+  },
+
   // Vol mom = % by which avg15mTurnover exceeds avg15mVolUSDT.
   // A > B → positive (selling pressure). Effective floor creeps up per tick above 2.
   computeFtVolMom(symbol, turnover24h, volume24h, price, confirmedTicks = 1, isAdvFt = false) {
@@ -4563,7 +4604,7 @@ function ew() { return {
         return { t, mom };
       }).sort((a, b) => b.mom - a.mom);
 
-      const _scanTally = { vm: 0, fund: 0, rsi: 0, graylist: 0 };
+      const _scanTally = { vm: 0, fund: 0, rsi: 0, graylist: 0, lsa: 0 };
 
       for (const { t, mom } of poolSorted) {
         const sym    = t.symbol;
@@ -4615,6 +4656,12 @@ function ew() { return {
                         rsi24 > this.cfg.fadeRsiMin && rsi24 < this.cfg.fadeRsiMax;
         if (!inRange) { _scanTally.rsi++; continue; }
 
+        // LSA scan-pass check — kline already cached from fetchRSIMulti above
+        if (this.cfg.fadeLsaEnabled) {
+          const lsa = this.checkLsa(sym);
+          if (lsa.blocked) { _scanTally.lsa++; continue; }
+        }
+
         const alreadyWatching = this.potFaders.find(e => e.symbol === sym);
         if (alreadyWatching) continue;
 
@@ -4641,15 +4688,18 @@ function ew() { return {
       const _wlVmBlocked   = this.potFaders.filter(e => !e._carryOn && (e._volLowBlocked || e._posBocked)).length;
       const _wlFundBlocked = this.potFaders.filter(e => !e._carryOn && e._fundBlocked).length;
       const _wlRsiBlocked  = this.potFaders.filter(e => !e._carryOn && e._rsiBlocked).length;
+      const _wlLsaBlocked  = this.potFaders.filter(e => e._lsaBlocked).length;
       const summaryParts   = [];
       if (_watchlistSize > 0) summaryParts.push(`${_watchlistSize} on watchlist`);
       if (_carryOnSize   > 0) summaryParts.push(`${_carryOnSize} carry-on`);
       if (_scanTally.vm   > 0) summaryParts.push(`${_scanTally.vm} vm-blocked`);
       if (_scanTally.rsi  > 0) summaryParts.push(`${_scanTally.rsi} rsi-blocked`);
       if (_scanTally.fund > 0) summaryParts.push(`${_scanTally.fund} fund-blocked`);
+      if (_scanTally.lsa  > 0) summaryParts.push(`${_scanTally.lsa} lsa-blocked`);
       if (_wlVmBlocked   > 0) summaryParts.push(`${_wlVmBlocked} wl-vm`);
       if (_wlRsiBlocked  > 0) summaryParts.push(`${_wlRsiBlocked} wl-rsi`);
       if (_wlFundBlocked > 0) summaryParts.push(`${_wlFundBlocked} wl-fund`);
+      if (_wlLsaBlocked  > 0) summaryParts.push(`${_wlLsaBlocked} wl-lsa`);
       if (summaryParts.length === 0) summaryParts.push('0 eligible');
       this.log(`📉 Faders scan done. ${pool.length} evaluated — ${summaryParts.join(', ')}.`, 'scan');
     } catch(e) { this.log('📉 Faders scan error: ' + e.message, 'error'); }
@@ -4706,16 +4756,24 @@ function ew() { return {
       });
       const rsiCell = rsiParts.join('<span style="color:var(--text-lo)">/</span>');
 
-      // VSI cell — carry-ons show VSI count or VELO; regular faders show VELO/FUND when blocked, — otherwise
+      // VSI cell — carry-ons show LSA block (priority) or VSI count; regular faders show LSA/FUND when blocked
       let vsiCell = '<span style="color:var(--text-lo);font-size:9px">—</span>';
       if (pf._carryOn) {
-        const vsiCount = this._vsiCounts[pf.symbol]?.count || 0;
-        const vsiReq   = pf._pileOnCount || this.cfg.carryOnThreshold || 8;
-        const vsiCol   = vsiCount >= vsiReq ? 'var(--profit)' : vsiCount > 0 ? 'var(--warn)' : 'var(--text-lo)';
-        vsiCell = `<span style="color:${vsiCol};font-size:9px;font-family:var(--mono)">${vsiCount}/${vsiReq}</span>`;
+        if (pf._lsaBlocked) {
+          const ratioStr = pf._lsaRatio != null ? pf._lsaRatio.toFixed(2) + '×' : '';
+          vsiCell = `<span style="color:var(--short);font-size:9px;font-weight:600" title="Localized Sell Average: last 15m candle volume ${ratioStr} avg">LSA${ratioStr ? ' ' + ratioStr : ''}</span>`;
+        } else {
+          const vsiCount = this._vsiCounts[pf.symbol]?.count || 0;
+          const vsiReq   = pf._pileOnCount || this.cfg.carryOnThreshold || 8;
+          const vsiCol   = vsiCount >= vsiReq ? 'var(--profit)' : vsiCount > 0 ? 'var(--warn)' : 'var(--text-lo)';
+          vsiCell = `<span style="color:${vsiCol};font-size:9px;font-family:var(--mono)">${vsiCount}/${vsiReq}</span>`;
+        }
       } else {
-        // Regular fader — surface FUND block if active
-        if (pf._fundBlocked) {
+        // Regular fader — surface LSA or FUND block if active
+        if (pf._lsaBlocked) {
+          const ratioStr = pf._lsaRatio != null ? pf._lsaRatio.toFixed(2) + '×' : '';
+          vsiCell = `<span style="color:var(--short);font-size:9px;font-weight:600" title="Localized Sell Average: last 15m candle volume ${ratioStr} avg">LSA${ratioStr ? ' ' + ratioStr : ''}</span>`;
+        } else if (pf._fundBlocked) {
           vsiCell = '<span style="color:var(--short);font-size:9px;font-weight:600">FUND</span>';
         }
       }
@@ -4866,12 +4924,22 @@ function ew() { return {
             this.log(`📎 ${pf.symbol}: C-ON blocked — live RSI ${coRsi6?.toFixed(1)}/${coRsi12?.toFixed(1)}/${coRsi24?.toFixed(1)} ≥ max ${coRsiMax}`, 'debug');
             continue;
           }
+
+          // LSA check — kline cache freshly populated by fetchRSIMulti above
+          const coLsa = this.checkLsa(pf.symbol);
+          if (coLsa.blocked) {
+            this.log(`📎 ${pf.symbol}: C-ON blocked — LSA ${coLsa.reason}`, 'debug');
+            this.potFaders = this.potFaders.map(e => e.id === pf.id ? { ...e, _lsaBlocked: true, _lsaRatio: coLsa.ratio } : e);
+            continue;
+          }
+          this.potFaders = this.potFaders.map(e => e.id === pf.id ? { ...e, _lsaBlocked: false, _lsaRatio: coLsa.ratio } : e);
+
           const _coVsiCount = this._vsiCounts[pf.symbol]?.count || 0;
           const _coVsiReq   = this.overShortedCount[pf.symbol]?.count || this.cfg.carryOnThreshold || 8;
-          this.log(`📎 ${pf.symbol}: C-ON entry [${entryPath}] @ ${fmtP(coPrice)} | RSI ${coRsi6?.toFixed(1)}/${coRsi12?.toFixed(1)}/${coRsi24?.toFixed(1)} | vol mom ${blended.toFixed(1)}% | VSI ${_coVsiCount}/${_coVsiReq}`, 'trade');
+          this.log(`📎 ${pf.symbol}: C-ON entry [${entryPath}] @ ${fmtP(coPrice)} | RSI ${coRsi6?.toFixed(1)}/${coRsi12?.toFixed(1)}/${coRsi24?.toFixed(1)} | vol mom ${blended.toFixed(1)}% | LSA ${coLsa.ratio != null ? coLsa.ratio.toFixed(2)+'×' : '—'} | VSI ${_coVsiCount}/${_coVsiReq}`, 'trade');
           this.potFaders = this.potFaders.filter(e => e.id !== pf.id);
           this.persist(); this.renderPotFaders();
-          await this.openFade({ symbol: pf.symbol, price: coPrice, change: pf.change, rsi6: coRsi6, rsi12: coRsi12, rsi24: coRsi24, fundingRate: fr, _carryOn: true });
+          await this.openFade({ symbol: pf.symbol, price: coPrice, change: pf.change, rsi6: coRsi6, rsi12: coRsi12, rsi24: coRsi24, fundingRate: fr, _carryOn: true, lsaRatio: coLsa.ratio });
           continue;
         }
 
@@ -4923,6 +4991,18 @@ function ew() { return {
         }
         this.potFaders = this.potFaders.map(e => e.id === pf.id ? { ...e, _rsiBlocked: false } : e);
 
+        // ── Localized Sell Average ──
+        // kline cache was just refreshed by fetchRSIMulti above — no extra fetch needed.
+        const lsa = this.checkLsa(pf.symbol);
+        if (lsa.blocked) {
+          if (!pf._lsaBlocked) {
+            this.log(`📉 ${pf.symbol}: fader blocked — LSA ${lsa.reason}`, 'debug');
+            this.potFaders = this.potFaders.map(e => e.id === pf.id ? { ...e, _lsaBlocked: true, _lsaRatio: lsa.ratio } : e);
+          }
+          continue;
+        }
+        this.potFaders = this.potFaders.map(e => e.id === pf.id ? { ...e, _lsaBlocked: false, _lsaRatio: lsa.ratio } : e);
+
         if (this.cfg.fadeFundingFilter) {
           const fr = await this.fetchFundingRate(pf.symbol);
           if (fr !== null && fr < (this.cfg.fundingRateMin * 100)) {
@@ -4939,11 +5019,11 @@ function ew() { return {
         try { const tk = await this.fetchTicker(pf.symbol); entryPrice = parseFloat(tk?.lastPrice || 0); } catch(e) {}
         if (!entryPrice) continue;
 
-        this.log(`📉 ${pf.symbol}: fader gates met | RSI ${rsi6.toFixed(1)}/${rsi12.toFixed(1)}/${rsi24.toFixed(1)} | vol mom ${blended.toFixed(1)}% @ ${fmtP(entryPrice)} — opening`, 'trade');
+        this.log(`📉 ${pf.symbol}: fader gates met | RSI ${rsi6.toFixed(1)}/${rsi12.toFixed(1)}/${rsi24.toFixed(1)} | vol mom ${blended.toFixed(1)}% | LSA ${pf._lsaRatio != null ? pf._lsaRatio.toFixed(2)+'×' : '—'} @ ${fmtP(entryPrice)} — opening`, 'trade');
         this.potFaders = this.potFaders.filter(e => e.id !== pf.id);
         this.persist(); this.renderPotFaders();
         const fr = await this.fetchFundingRate(pf.symbol).catch(() => null);
-        await this.openFade({ symbol: pf.symbol, price: entryPrice, change: pf.change, rsi6, rsi12, rsi24, fundingRate: fr });
+        await this.openFade({ symbol: pf.symbol, price: entryPrice, change: pf.change, rsi6, rsi12, rsi24, fundingRate: fr, lsaRatio: pf._lsaRatio });
       }
     } catch(e) {
       this.log('Fader watch error: ' + e.message, 'error');
@@ -5022,7 +5102,7 @@ function ew() { return {
     const g = this.gainers.find(x => x.symbol === sym);
     if (g) g.status = 'active';
     const coTag = candidate._carryOn ? ' [C-ON]' : '';
-    this.log(`📉 ▼ FADE${coTag} SHORT ${sym} @ ${fmtP(fillPrice)} | Qty:${qty} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} | RSI:${candidate.rsi6?.toFixed(1)}/${candidate.rsi12?.toFixed(1)}/${candidate.rsi24?.toFixed(1)}`, 'trade');
+    this.log(`📉 ▼ FADE${coTag} SHORT ${sym} @ ${fmtP(fillPrice)} | Qty:${qty} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} | RSI:${candidate.rsi6?.toFixed(1)}/${candidate.rsi12?.toFixed(1)}/${candidate.rsi24?.toFixed(1)} | LSA:${candidate.lsaRatio != null ? candidate.lsaRatio.toFixed(2)+'×' : '—'}`, 'trade');
     this.persist();
     await this.refreshBalance();
   },
@@ -5227,15 +5307,20 @@ function ew() { return {
         } catch(e) { /* non-fatal */ }
       }
 
-      // ── Refresh live vol mom for FT, ADV FT, and fader positions ──
-      // Reads from the cached vol baseline (seeded each scan) — no extra network calls.
-      // Written to pos.volMomPct so the position card can display it live.
+      // ── Refresh live vol mom and LSA for FT, ADV FT, and fader positions ──
+      // Reads from the cached vol baseline / kline cache — no extra network calls.
       for (const pos of this.positions) {
         if (!pos._ft && !pos._fade) continue;
         const bl = this._volBaseline[pos.symbol];
-        if (!bl?.volume24h) continue;
-        const vm = this.calcVolMomPct(bl.volume24h, bl.turnover24h, bl.lastPrice);
-        if (vm !== null) pos.volMomPct = vm;
+        if (bl?.volume24h) {
+          const vm = this.calcVolMomPct(bl.volume24h, bl.turnover24h, bl.lastPrice);
+          if (vm !== null) pos.volMomPct = vm;
+        }
+        // LSA — fader positions only, reads from kline cache seeded by syncPositions RSI fetches
+        if (pos._fade) {
+          const lsa = this.checkLsa(pos.symbol);
+          pos.lsaRatio = lsa.ratio ?? null;
+        }
       }
 
       const now=Date.now();
