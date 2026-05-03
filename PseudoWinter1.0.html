@@ -2353,6 +2353,7 @@ function pw() { return {
   _extenderGraylist: {}, // symbol → expiresAt — graylisted on first over-extension; 3h window
   _ftEvictGraylist:  {}, // symbol → evictedAt — prevents extenderBump re-promoting an evicted FT entry within same window
   _ftMaxGraylist:    {}, // symbol → expiresAt — 12h cooldown after FT max trades reached (all FT types)
+  _funLoserOEGraylist: {}, // symbol → expiresAt — 3h graylist: FUN loser with any RSI6 over-extension in 3h lookback is contradictory and filtered out
   _exdPollers: {}, // symbol → { timerId, expiresAt } — 60s vol-mom pollers spawned on first over-extension (EXD)
   _cycleRunning: false, // re-entry guard for runScheduledCycle
   _exdLastVolMom: {}, // symbol → { pct, ts } — last vol-mom % fetched by poller; drives stats panel feedback
@@ -2463,10 +2464,11 @@ function pw() { return {
         exdPollerExpiries: Object.fromEntries(
           Object.entries(this._exdPollers).map(([sym, p]) => [sym, p.expiresAt])
         ),
-        ftMaxGraylist:    this._ftMaxGraylist,
-        carryOnGraylist:  this.carryOnGraylist,
-        advFtGraylist:    this._advFtGraylist,
-        extenderGraylist: this._extenderGraylist,
+        ftMaxGraylist:      this._ftMaxGraylist,
+        carryOnGraylist:    this.carryOnGraylist,
+        advFtGraylist:      this._advFtGraylist,
+        extenderGraylist:   this._extenderGraylist,
+        funLoserOEGraylist: this._funLoserOEGraylist,
       }));
       this.savedPositions = [...this.positions];
     } catch(e) {}
@@ -2536,6 +2538,11 @@ function pw() { return {
           if (expiry > nowGl) this._extenderGraylist[sym] = expiry;
         }
       }
+      if (s.funLoserOEGraylist && typeof s.funLoserOEGraylist === 'object') {
+        for (const [sym, expiry] of Object.entries(s.funLoserOEGraylist)) {
+          if (expiry > nowGl) this._funLoserOEGraylist[sym] = expiry;
+        }
+      }
       if (s.positions?.length) {
         this.savedPositions = s.positions;
         this.positions = s.positions.map(p => ({
@@ -2582,15 +2589,8 @@ function pw() { return {
     this._extenderGraylist = {};
     this._ftEvictGraylist  = {};
     this._ftMaxGraylist    = {};
+    this._funLoserOEGraylist = {};
     this._stopAllIftPollers();
-    this.overShortedCount = {};
-    this._stopAllCarryOnPollers();
-    this._stopAllPileOnPollers();
-    this._symData = {};
-    this.renderTradeFeed();
-  },
-
-  clearStats() {
     this.sess = { trades:0, wins:0, losses:0, pnl:0, forceClose:0, tpReduce:0, ftTotalDone:0, exdDone:0, carryOnDone:0 };
     this.closedTrades = [];
     this.ftCandidates      = {};
@@ -2607,6 +2607,7 @@ function pw() { return {
     this._fadeGraylist     = {};
     this._ftEvictGraylist  = {};
     this._ftMaxGraylist    = {};
+    this._funLoserOEGraylist = {};
     this.overShortedCount  = {};
     this._stopAllCarryOnPollers();
     this._stopAllPileOnPollers();
@@ -3119,6 +3120,12 @@ function pw() { return {
         this.log(`🎯 ${sym}: 12h max-trades graylist expired — symbol may re-qualify for FT roster`, 'info');
       }
     }
+    for (const sym of Object.keys(this._funLoserOEGraylist)) {
+      if (now_ec >= this._funLoserOEGraylist[sym]) {
+        delete this._funLoserOEGraylist[sym];
+        this.log(`💰 ${sym}: FUN loser OE graylist expired — may re-qualify if RSI6 clears`, 'info');
+      }
+    }
     if (extenderCleaned > 0) {
       this.persist();
     }
@@ -3425,7 +3432,24 @@ function pw() { return {
             this.funCreepSyncOverExt(sym, funHistOverExtCount);
           }
 
-          // ── RSI6 proximity check (current candle) ──
+          // ── FUN loser over-extension graylist ──
+          // A loser (price falling) with any RSI6 over-extension in the 3h lookback is
+          // contradictory — momentum is overbought while the 24h move is down, signalling
+          // structural disorder. Filter it out and graylist for 3h so we don't keep paying
+          // API cost to evaluate a coin that shouldn't qualify.
+          if (isLoser && funHistOverExtCount > 0) {
+            const FUN_LOSER_OE_TTL = 3 * 3600 * 1000;
+            const alreadyGraylisted = this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym];
+            if (!alreadyGraylisted) {
+              this._funLoserOEGraylist[sym] = Date.now() + FUN_LOSER_OE_TTL;
+              this.log(`💰 ${sym}: FUN loser OE graylist — ${funHistOverExtCount} candle(s) over-extended in 3h lookback; loser + OE is contradictory → graylisted 3h`, 'warn');
+              this.persist();
+            }
+            continue;
+          }
+          if (isLoser && this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym]) {
+            continue; // still within graylist window (OE cleared but TTL not yet expired)
+          }
           const funRsi6 = await this.fetchRSI(sym, 6);
           if (funRsi6 !== null && funRsi6 >= this.cfg.rsi6Max) {
             // Over-extended now — already captured in histOverExtCount; just log it
