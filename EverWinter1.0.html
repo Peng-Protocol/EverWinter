@@ -19,7 +19,7 @@ Copyright 2026 Peng Protocol
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>❄ EVERWINTER v1.8.1 — Bybit Short Bot</title>
+<title>❄ EVERWINTER v1.8.4 — Bybit Short Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -451,7 +451,8 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
    and can't escape its containing grid cell via a compositing layer. Alpine x-show just
    toggles display:none — no transitions that could bleed across column boundaries. */
 .cfg-acc-body { padding: 13px; border-bottom: 1px solid var(--border); }
-.cfg-acc-body input[type=range] { max-width: calc(100% - 4px); }
+.cfg-acc-body input[type=range],
+.cfg-acc-body input[type=number] { max-width: calc(100% - 4px); }
 .hint { font-size:9.5px; color:var(--text-lo); margin-top:2px; line-height:1.5; }
 /* ─── CONFIG LOCK ─── */
 /* When locked: all range/number inputs and selects inside the config col are inert */
@@ -667,7 +668,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             <input type="range" min="6" max="20" x-model.number="cfg.leverage" :disabled="bot.running" @change="persist()">
           </div>
           <div class="g"><div class="lbl">Notional per entry &amp; DCA add <b x-text="'$'+cfg.minNotional"></b></div>
-            <input type="range" min="6" max="666" step="6" x-model.number="cfg.minNotional" :disabled="bot.running" @change="cfg.addNotional=cfg.minNotional;persist()">
+            <input type="number" min="6" max="666" step="1" x-model.number="cfg.minNotional" :disabled="bot.running" @change="cfg.minNotional=Math.min(666,Math.max(6,cfg.minNotional||6));cfg.addNotional=cfg.minNotional;persist()" style="background:var(--bg-raised);color:var(--text-hi);border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px">
             <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Margin = $<span x-text="(cfg.minNotional/cfg.leverage).toFixed(2)"></span> per entry/add</div>
           </div>
           <div class="g" style="margin-top:8px">
@@ -3782,8 +3783,9 @@ function ew() { return {
       // Merge new rodeoCreep qualifiers into ftCandidates
       for (const [sym, entry] of Object.entries(this.rodeoCreep)) {
         const count = entry.closedCount || 0;
-        // Do not re-promote a symbol that is still in the max-trades graylist
+        // Do not re-promote a symbol that is still in the max-trades or evict graylist
         if (this._ftMaxGraylist[sym] && Date.now() < this._ftMaxGraylist[sym]) continue;
+        if (this._ftEvictGraylist[sym] && Date.now() < this._ftEvictGraylist[sym]) continue;
         if (count >= this.cfg.ftRodeoThreshold && !this.ftCandidates[sym]) {
           this.ftCandidates[sym] = { count, qualifiedAt: Date.now(), addedAt: Date.now() };
           this.log(`🎯 ${sym}: promoted to FT roster (×${count} rides, scan merge)`, 'debug');
@@ -3877,12 +3879,14 @@ function ew() { return {
             _ftTally.highrsi++;
             candidates.push({ symbol: sym, rodeoCount: ftEntry.count, price, rsi6, rsi12, rsi24, fundingRate: fr, status: 'ft-highrsi', isAdvFt: !!ftEntry._advFt });
           } else {
-            // RSI below min — momentum gone, evict immediately
+            // RSI below min — momentum gone, evict immediately and graylist so
+            // the rodeoCreep merge loop doesn't re-promote before next scan
             this.log(`🎯 ${sym}: FT radar evicted — RSI dropped below min (${rsi6?.toFixed(1)}/${rsi12?.toFixed(1)}/${rsi24?.toFixed(1)} ≤ ${this.cfg.ftRsiMin})`, 'info');
             delete this.ftCandidates[sym];
             delete this._vsiCounts[sym];
             this._stopAdvFtPoller(sym);
             if (this._advFtGraylist[sym]) delete this._advFtGraylist[sym];
+            this._ftEvictGraylist[sym] = Date.now() + 15 * 60 * 1000; // 15min cooldown
             this.persist();
             _ftTally.lowrsi++;
           }
@@ -4103,31 +4107,6 @@ function ew() { return {
   async ftWatchPositions() {
     const now = Date.now();
 
-    // Auto-reduce on congestion — push FT positions to reduce phase when position count hits threshold
-    if (this.cfg.laggardCheckEnabled && this.cfg.laggardAutoReduce) {
-      const threshold = this.cfg.laggardAutoReduceThreshold || 4;
-      const posCount  = this.positions.length;
-      if (posCount >= threshold || posCount >= this.cfg.maxPos) {
-        for (const pos of [...this.positions.filter(p => p._ft)]) {
-          if (!this.positions.find(x => x.id === pos.id)) continue;
-          if (pos.phase === 'reduce') continue;
-          if (pos.tpPct <= 3) continue;
-          const mark       = pos.markPrice || pos.entryPrice;
-          const currentROI = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
-          pos.phase = 'reduce';
-          if (currentROI >= 3) {
-            this.log(`⏳ ${pos.symbol}: FT auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — ROI ${currentROI.toFixed(1)}% ≥ 3% — closing`, 'warn');
-            await this.ftClosePosition(pos, 'force');
-            continue;
-          }
-          const newTp = pos.entryPrice * (1 - 0.03 / pos.leverage);
-          pos.currentTpPrice = newTp;
-          pos.tpPct = 3;
-          this.log(`⏳ ${pos.symbol}: FT auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% (${fmtP(newTp)})`, 'warn');
-          this.persist();
-        }
-      }
-    }
     // Batch fetch mark prices for all FT positions
     const ftSyms = [...new Set(this.positions.filter(p => p._ft).map(p => p.symbol))];
     const markMap = {};
@@ -4881,6 +4860,12 @@ function ew() { return {
           if (!coPrice) continue;
           const fr = await this.fetchFundingRate(pf.symbol).catch(() => null);
 
+          // Re-validate live RSI against carryOnRsiMax — stale pf.rsi* may have drifted
+          const coRsiMax = this.cfg.carryOnRsiMax ?? 50;
+          if ([coRsi6, coRsi12, coRsi24].filter(r => r != null).some(r => r >= coRsiMax)) {
+            this.log(`📎 ${pf.symbol}: C-ON blocked — live RSI ${coRsi6?.toFixed(1)}/${coRsi12?.toFixed(1)}/${coRsi24?.toFixed(1)} ≥ max ${coRsiMax}`, 'debug');
+            continue;
+          }
           const _coVsiCount = this._vsiCounts[pf.symbol]?.count || 0;
           const _coVsiReq   = this.overShortedCount[pf.symbol]?.count || this.cfg.carryOnThreshold || 8;
           this.log(`📎 ${pf.symbol}: C-ON entry [${entryPath}] @ ${fmtP(coPrice)} | RSI ${coRsi6?.toFixed(1)}/${coRsi12?.toFixed(1)}/${coRsi24?.toFixed(1)} | vol mom ${blended.toFixed(1)}% | VSI ${_coVsiCount}/${_coVsiReq}`, 'trade');
@@ -5196,6 +5181,33 @@ function ew() { return {
     if (!this.connected.api) return;
     if (this.positions.length) {
       await this.syncPositions();
+
+      // ── Auto-reduce on congestion — runs for ALL positions, no _ft dependency ──
+      if (this.cfg.laggardCheckEnabled && this.cfg.laggardAutoReduce) {
+        const threshold = this.cfg.laggardAutoReduceThreshold || 4;
+        const posCount  = this.positions.length;
+        if (posCount >= threshold || posCount >= this.cfg.maxPos) {
+          for (const pos of [...this.positions]) {
+            if (!this.positions.find(x => x.id === pos.id)) continue;
+            if (pos.phase === 'reduce') continue;
+            if (pos.tpPct <= 3) continue;
+            const mark       = pos.markPrice || pos.entryPrice;
+            const currentROI = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
+            pos.phase = 'reduce';
+            if (currentROI >= 3) {
+              this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — ROI ${currentROI.toFixed(1)}% ≥ 3% — closing`, 'warn');
+              pos._ft ? await this.ftClosePosition(pos, 'force') : await this.closePosition(pos, 'force');
+              continue;
+            }
+            const newTp = pos.entryPrice * (1 - 0.03 / pos.leverage);
+            pos.currentTpPrice = newTp;
+            pos.tpPct = 3;
+            await this.setTP(pos.symbol, newTp);
+            this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% (${fmtP(newTp)})`, 'warn');
+            this.persist();
+          }
+        }
+      }
 
       // ── FT position watcher — runs for _ft positions only ──
       if (this.cfg.ftEnabled && this.positions.some(p => p._ft)) {
