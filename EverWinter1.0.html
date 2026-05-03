@@ -19,7 +19,7 @@ Copyright 2026 Peng Protocol
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>❄ EVERWINTER v1.8.12 — Bybit Short Bot</title>
+<title>❄ EVERWINTER v1.8.13 — Bybit Short Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -2550,6 +2550,11 @@ function ew() { return {
     this.renderPotGainers();
     // Stop all EXD pollers
     for (const sym of Object.keys(this._exdPollers)) this._stopExdPoller(sym);
+    // Stop all pending close retry workers
+    if (this._closeRetryWorkers) {
+      for (const id of Object.values(this._closeRetryWorkers)) clearInterval(id);
+      this._closeRetryWorkers = {};
+    }
     this.log('Bot stopped.', 'warn');
     this.persist();
   },
@@ -3404,6 +3409,34 @@ function ew() { return {
           }
         }
 
+        // ── Historical over-extension check — if extenderCount exists and within TTL, graylist entry ──
+        // This catches the case where rsi6 < rsi6Max on the current scan but the symbol
+        // has been over-extended multiple times in the last 3h (extenderCount is the source of truth).
+        const EXTENDER_TTL_SCAN = 3 * 3600 * 1000;
+        const extEntry_scan = this.extenderCount[sym];
+        if (extEntry_scan && (Date.now() - (extEntry_scan.setAt || 0)) < EXTENDER_TTL_SCAN) {
+          // Symbol has live historical over-extension — enforce graylists
+          if (!this._extenderGraylist[sym]) {
+            this._extenderGraylist[sym] = (extEntry_scan.setAt || Date.now()) + EXTENDER_TTL_SCAN;
+          }
+          if (!this._advFtGraylist[sym] && extEntry_scan.count >= (this.cfg.advFtThreshold ?? 4)) {
+            // Already at ADV FT threshold — graylist from gainers (ADV FT path owns this coin)
+            const advGlExpiry = (this.ftCandidates[sym]?.qualifiedAt || Date.now()) + this.forceCloseMs();
+            this._advFtGraylist[sym] = advGlExpiry;
+          }
+          const nowScan = Date.now();
+          if (this._advFtGraylist[sym] && nowScan < this._advFtGraylist[sym]) {
+            candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate,status:'overextended',skipReason:`hist over-ext ×${extEntry_scan.count} — ADV FT graylist`});
+            _tally.overextended++;
+            continue;
+          }
+          if (this._extenderGraylist[sym] && nowScan < this._extenderGraylist[sym]) {
+            candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate,status:'overextended',skipReason:`hist over-ext ×${extEntry_scan.count} — extender graylist`});
+            _tally.overextended++;
+            continue;
+          }
+        }
+
         // ── RSI fetch — one kline call per symbol, cached for the scan interval ──
         const { rsi6, rsi12, rsi24 } = await this.fetchRSIMulti(sym);
         let status='skip';
@@ -3424,31 +3457,42 @@ function ew() { return {
         const rsi12Req = this.cfg.rsi12Min + creepOffset;
         const rsi24Req = this.cfg.rsi24Min + creepOffset;
         if (creepOffset > 0) _tally.creep++;
+        // Proximity gate: if RSI6 is within rsi6ProximityPct pts below rsi6Max,
+        // route to watchlist instead of immediate entry regardless of other gates.
+        // This prevents entering right before an over-extension event.
+        const proximityFloor = this.cfg.rsi6Max - (this.cfg.rsi6ProximityPct ?? 2);
+        const inProximityZone = rsi6 !== null && rsi6 >= proximityFloor && rsi6 < this.cfg.rsi6Max;
+
         if (rsi6>=rsi6Req&&rsi12>=rsi12Req&&rsi24>=rsi24Req) {
-          const instr = await this.getInstrInfo(sym);
-          if (!instr) {
-            status='invalid'; skipReason='not supported on this exchange';
+          if (inProximityZone) {
+            // RSI6 within proximity of rsi6Max — watchlist only, no immediate entry
+            status = 'watch';
           } else {
-            const rawQty   = this.cfg.minNotional / price;
-            const qty      = this.snapQty(rawQty, instr);
-            const tpPrice  = this.snapPrice(price * (1 - (this.cfg.entryTpRoi / 100) / this.cfg.leverage), instr);
-            const notional = qty * price;
-            if (qty <= 0) {
-              status='invalid'; skipReason='qty below min';
-            } else if (instr.minOrderAmt > 0 && notional < instr.minOrderAmt) {
-              status='invalid'; skipReason=`notional $${notional.toFixed(2)} < min $${instr.minOrderAmt}`;
-            } else if (instr.minPrice > 0 && tpPrice <= instr.minPrice) {
-              status='invalid'; skipReason=`TP ${fmtP(tpPrice)} ≤ minPrice ${instr.minPrice}`;
+            const instr = await this.getInstrInfo(sym);
+            if (!instr) {
+              status='invalid'; skipReason='not supported on this exchange';
             } else {
-              status='ready';
+              const rawQty   = this.cfg.minNotional / price;
+              const qty      = this.snapQty(rawQty, instr);
+              const tpPrice  = this.snapPrice(price * (1 - (this.cfg.entryTpRoi / 100) / this.cfg.leverage), instr);
+              const notional = qty * price;
+              if (qty <= 0) {
+                status='invalid'; skipReason='qty below min';
+              } else if (instr.minOrderAmt > 0 && notional < instr.minOrderAmt) {
+                status='invalid'; skipReason=`notional $${notional.toFixed(2)} < min $${instr.minOrderAmt}`;
+              } else if (instr.minPrice > 0 && tpPrice <= instr.minPrice) {
+                status='invalid'; skipReason=`TP ${fmtP(tpPrice)} ≤ minPrice ${instr.minPrice}`;
+              } else {
+                status='ready';
+              }
+            }
+            if (status==='invalid') {
+              this.log(`${sym}: skipped — ${skipReason}`, 'debug');
+              _tally.invalid++;
             }
           }
-          if (status==='invalid') {
-            this.log(`${sym}: skipped — ${skipReason}`, 'debug');
-            _tally.invalid++;
-          }
         } else if (
-          rsi6  !== null && rsi6  >= (this.cfg.rsi6Max - (this.cfg.rsi6ProximityPct ?? 2)) &&
+          inProximityZone &&
           rsi12 !== null && rsi12 >= rsi12Req &&
           rsi24 !== null && rsi24 >= rsi24Req
         ) {
@@ -3622,6 +3666,22 @@ function ew() { return {
       if (g) g.status = 'skip';
       return;
     }
+
+    // ── Historical over-extension gate — must pass before admitting to watchlist ──
+    // If extenderCount is live within 3h TTL, this coin is on the extender/ADV FT path.
+    const EXTENDER_TTL_PG = 3 * 3600 * 1000;
+    const pgExtEntry = this.extenderCount[sym];
+    if (pgExtEntry && (Date.now() - (pgExtEntry.setAt || 0)) < EXTENDER_TTL_PG) {
+      const nowPg = Date.now();
+      const inAdvGl = this._advFtGraylist[sym]    && nowPg < this._advFtGraylist[sym];
+      const inExtGl = this._extenderGraylist[sym] && nowPg < this._extenderGraylist[sym];
+      if (inAdvGl || inExtGl) {
+        this.log(`◉ ${sym}: pot-gainer rejected — hist over-ext ×${pgExtEntry.count} (${inAdvGl ? 'ADV FT' : 'extender'} graylist)`, 'info');
+        if (g) g.status = 'overextended';
+        return;
+      }
+    }
+
     const instr = await this.getInstrInfo(sym);
     if (!instr) { if (g) g.status = 'notlive'; return; }
     const levResolved = this.resolveEffectiveLeverage(sym, instr);
@@ -3706,6 +3766,26 @@ function ew() { return {
           this.persist();
           this.renderPotGainers();
           continue;
+        }
+
+        // ── Historical over-extension check (lookback) — runs before RSI entry gate ──
+        // If extenderCount is live, this coin is on the ADV FT / extender path and must
+        // not enter via the gainer path. Evict from watchlist.
+        const EXTENDER_TTL_PG = 3 * 3600 * 1000;
+        const pgExtEntry_w = this.extenderCount[pe.symbol];
+        if (pgExtEntry_w && (Date.now() - (pgExtEntry_w.setAt || 0)) < EXTENDER_TTL_PG) {
+          const nowPgW = Date.now();
+          const inAdvGlW = this._advFtGraylist[pe.symbol]    && nowPgW < this._advFtGraylist[pe.symbol];
+          const inExtGlW = this._extenderGraylist[pe.symbol] && nowPgW < this._extenderGraylist[pe.symbol];
+          if (inAdvGlW || inExtGlW) {
+            this.log(`◉ ${pe.symbol}: pot-gainer evicted — hist over-ext ×${pgExtEntry_w.count} (${inAdvGlW ? 'ADV FT' : 'extender'} graylist)`, 'info');
+            this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
+            const g = this.gainers.find(x => x.symbol === pe.symbol);
+            if (g && g.status === 'watch') g.status = 'overextended';
+            this.persist();
+            this.renderPotGainers();
+            continue;
+          }
         }
 
         // Vol-div re-check using cached scan snapshot
@@ -5355,15 +5435,14 @@ function ew() { return {
         // Guard: skip if a previous iteration this cycle already closed this position
         if (!this.positions.find(x => x.id === p.id)) continue;
 
-        // pendingClose retry — at scan interval (min 15min), no cap.
+        // pendingClose retry — worker is primary (30s interval), this is a fallback
+        // in case the worker died (e.g. bot restart) or was never spawned.
         if (p.pendingClose) {
-          const retryIntervalMs = Math.max(15, this.cfg.scanMins) * 60 * 1000;
-          const elapsed = now - (p.pendingCloseLastRetry || p.pendingCloseAt || 0);
-          if (elapsed >= retryIntervalMs) {
-            p.pendingCloseRetries = (p.pendingCloseRetries || 0) + 1;
-            p.pendingCloseLastRetry = now;
-            this.log(`${p.symbol}: retrying close (attempt ${p.pendingCloseRetries}, reason: ${p.pendingCloseReason||'force'})`, 'warn');
-            await this.closePosition(p, p.pendingCloseReason || 'force');
+          // Re-spawn worker if not running (e.g. after bot restart)
+          if (!this._closeRetryWorkers) this._closeRetryWorkers = {};
+          if (!this._closeRetryWorkers[p.id]) {
+            this.log(`${p.symbol}: pendingClose detected without active worker — respawning`, 'debug');
+            this._spawnCloseRetryWorker(p);
           }
           continue;
         }
@@ -6560,17 +6639,18 @@ function ew() { return {
       } catch(e) { /* network blip — assume gone, syncPositions will catch it */ }
 
       if (stillOpen) {
-        // IOC filled zero — mark for retry on the next watch cycle instead of
-        // removing the position locally. Conditionals are cancelled now since
-        // they are no longer valid regardless of fill outcome.
+        // IOC filled zero — mark for retry. Cancel conditionals now (they're invalid regardless).
+        // Spawn a dedicated 30s retry worker if not already running for this position.
         if (!pos.pendingClose) {
           pos.pendingClose       = true;
           pos.pendingCloseReason = reason;
           pos.pendingCloseAt     = Date.now();
           pos.pendingCloseRetries = 0;
           await this.cancelAllConditionals(pos.symbol);
-          this.log(`${pos.symbol}: close order accepted but position still open (IOC likely unfilled — low liquidity). Will retry each scan cycle.`, 'warn');
+          this.log(`${pos.symbol}: close order accepted but position still open (IOC likely unfilled — low liquidity). Spawning 30s retry worker.`, 'warn');
           this.persist();
+          // Spawn dedicated retry worker — tries every 30s until position is gone or bot stops.
+          this._spawnCloseRetryWorker(pos);
         }
         return;
       }
@@ -6607,6 +6687,46 @@ function ew() { return {
       }, 2500);
       if (this.bot.running) setTimeout(() => this.runScheduledCycle(), 500);
     } catch(e) { this.log('close: ' + e.message, 'error'); }
+  },
+
+  // ── CLOSE RETRY WORKER ──
+  // Spawns a dedicated interval that retries a close every 30s until the position
+  // is confirmed gone or the bot stops. Prevents relying on the slow scan interval
+  // (15+ min) for illiquid IOC close retries.
+  _spawnCloseRetryWorker(pos) {
+    const posId  = pos.id;
+    const sym    = pos.symbol;
+    // Avoid duplicate workers for the same position
+    if (!this._closeRetryWorkers) this._closeRetryWorkers = {};
+    if (this._closeRetryWorkers[posId]) return;
+
+    const workerId = setInterval(async () => {
+      // Stop if bot stopped or position no longer tracked (already closed)
+      if (!this.bot.running || !this.positions.find(p => p.id === posId)) {
+        clearInterval(workerId);
+        delete this._closeRetryWorkers[posId];
+        return;
+      }
+      const livePos = this.positions.find(p => p.id === posId);
+      if (!livePos || !livePos.pendingClose) {
+        clearInterval(workerId);
+        delete this._closeRetryWorkers[posId];
+        return;
+      }
+      livePos.pendingCloseRetries = (livePos.pendingCloseRetries || 0) + 1;
+      livePos.pendingCloseLastRetry = Date.now();
+      this.log(`${sym}: close retry worker — attempt ${livePos.pendingCloseRetries} (reason: ${livePos.pendingCloseReason || 'force'})`, 'warn');
+      // Re-fetch live mark price before retry to get the freshest limit
+      try {
+        const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+        const td = await tr.json();
+        const mp = parseFloat(td.result?.list?.[0]?.lastPrice || 0);
+        if (mp > 0) livePos.markPrice = mp;
+      } catch(e) { /* non-fatal */ }
+      await this.closePosition(livePos, livePos.pendingCloseReason || 'force');
+    }, 30000); // 30s
+
+    this._closeRetryWorkers[posId] = workerId;
   },
 
   async cancelAllConditionals(symbol) {
