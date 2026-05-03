@@ -2878,6 +2878,36 @@ function ew() { return {
     }
   },
 
+  // One-shot lookback: counts over-extension ticks within the last 3h from 15m kline history.
+  // Called once per symbol on first extenderBump to seed extenderCount with the true
+  // historical value rather than starting from 1. Returns { confirmedTicks, fallback }.
+  // fallback:true means the fetch failed — caller should not overwrite the live count.
+  async _fetchConfirmedExtTicks(symbol) {
+    try {
+      const limit  = 12; // 12 × 15m = 3h of history
+      const url    = `${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=${limit}`;
+      const r      = await fetch(url);
+      const d      = await r.json();
+      if (d.retCode !== 0 || !Array.isArray(d.result?.list)) return { confirmedTicks: 1, fallback: true };
+      const closes = d.result.list.map(k => parseFloat(k[4])).reverse(); // close prices, oldest first
+      const rsiMax = this.cfg.rsi6Max ?? 90;
+      // Count candles whose RSI6-equivalent close indicates over-extension.
+      // We use a simplified check: close > (median of closes × rsiMax/100) proxy.
+      // More practical: count closes where rolling 6-period RSI would be ≥ rsiMax.
+      // Build rolling RSI over closes array (need at least 7 values for one RSI6 reading).
+      if (closes.length < 7) return { confirmedTicks: 1, fallback: true };
+      let count = 0;
+      for (let i = 6; i < closes.length; i++) {
+        const window = closes.slice(i - 6, i + 1);
+        const rsi = calcRSI(window, 6);
+        if (rsi !== null && rsi >= rsiMax) count++;
+      }
+      return { confirmedTicks: Math.max(1, count), fallback: false };
+    } catch(e) {
+      return { confirmedTicks: 1, fallback: true };
+    }
+  },
+
   // Increments over-shorted hit count for a symbol on funding rate trigger.
   // At carryOnThreshold, promotes to carry-on watchlist (tagged _carryOn: true in potFaders).
   overShortedBump(symbol) {
@@ -4242,9 +4272,10 @@ function ew() { return {
                         : t.reason === 'liq'         ? 'LIQ'
                         : t.reason === 'manual'      ? 'MANUAL'
                         : 'CLOSE';
-      const typeBadge = t._advFt ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,255,.55);color:#b464ff;background:rgba(180,100,255,.12);letter-spacing:1px">ADV</span>`
-                      : t._ft    ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(160,100,255,.45);color:#c084fc;background:rgba(160,100,255,.12);letter-spacing:1px">FT</span>`
-                      : t._fade  ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(34,211,238,.45);color:#22d3ee;background:rgba(34,211,238,.08);letter-spacing:1px">FADE</span>`
+      const typeBadge = t._advFt              ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,255,.55);color:#b464ff;background:rgba(180,100,255,.12);letter-spacing:1px">ADV</span>`
+                      : t._ft                 ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(160,100,255,.45);color:#c084fc;background:rgba(160,100,255,.12);letter-spacing:1px">FT</span>`
+                      : t._carryOn            ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(34,211,238,.65);color:#22d3ee;background:rgba(34,211,238,.13);letter-spacing:1px">C-ON</span>`
+                      : t._fade               ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(34,211,238,.45);color:#22d3ee;background:rgba(34,211,238,.08);letter-spacing:1px">FADE</span>`
                       : '';
       const pnl         = t.pnl    ?? 0;
       const pnlPct      = t.pnlPct ?? 0;
@@ -5778,7 +5809,8 @@ function ew() { return {
         while (this.closedTrades.length && this.closedTrades[0].closedAt === closedAt) closedAt++;
         this.closedTrades.unshift({
           id: pos.id, symbol: pos.symbol,
-          _ft: pos._ft || false, _advFt: pos._advFt || false, _exd: pos._exd || false, _fade: pos._fade || false,
+          _ft: pos._ft || false, _advFt: pos._advFt || false, _exd: pos._exd || false,
+          _fade: pos._fade || false, _carryOn: pos._carryOn || false,
           rodeoCount: pos.rodeoCount ?? null,
           entryPrice: pos.entryPrice, originalEntryPrice: pos.originalEntryPrice ?? pos.entryPrice,
           exitPrice: pos.markPrice || pos.entryPrice,
@@ -5816,7 +5848,8 @@ function ew() { return {
         while (this.closedTrades.length && this.closedTrades[0].closedAt === closedAt) closedAt++;
         this.closedTrades.unshift({
           id: pos.id, symbol: pos.symbol,
-          _ft: pos._ft || false, _advFt: pos._advFt || false, _exd: pos._exd || false, _fade: pos._fade || false,
+          _ft: pos._ft || false, _advFt: pos._advFt || false, _exd: pos._exd || false,
+          _fade: pos._fade || false, _carryOn: pos._carryOn || false,
           rodeoCount: pos.rodeoCount ?? null,
           entryPrice: pos.entryPrice, originalEntryPrice: pos.originalEntryPrice ?? pos.entryPrice,
           exitPrice: pos.markPrice || pos.entryPrice,
@@ -5937,7 +5970,8 @@ function ew() { return {
       if (!_isDup) {
         this.closedTrades.unshift({
           id: pos.id, symbol: pos.symbol,
-          _ft: pos._ft || false, _advFt: pos._advFt || false, _exd: pos._exd || false, _fade: pos._fade || false,
+          _ft: pos._ft || false, _advFt: pos._advFt || false, _exd: pos._exd || false,
+          _fade: pos._fade || false, _carryOn: pos._carryOn || false,
           rodeoCount: pos.rodeoCount ?? null,
           entryPrice, originalEntryPrice: pos.originalEntryPrice ?? entryPrice, exitPrice,
           pnl: realisedPnl,
