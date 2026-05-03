@@ -19,7 +19,7 @@ Copyright 2026 Peng Protocol
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>❄ EVERWINTER v1.8.0 — Bybit Short Bot</title>
+<title>❄ EVERWINTER v1.8.1 — Bybit Short Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -2324,6 +2324,7 @@ function ew() { return {
         carryOnGraylist: this.carryOnGraylist,
         vsiCounts: this._vsiCounts,
         exdLastVolMom: this._exdLastVolMom,
+        ftMaxGraylist: this._ftMaxGraylist,
       }));
       this.savedPositions = [...this.positions];
     } catch(e) {}
@@ -2371,6 +2372,14 @@ function ew() { return {
       if (s.carryOnGraylist  && typeof s.carryOnGraylist  === 'object') this.carryOnGraylist  = s.carryOnGraylist;
       if (s.vsiCounts        && typeof s.vsiCounts        === 'object') this._vsiCounts       = s.vsiCounts;
       if (s.exdLastVolMom    && typeof s.exdLastVolMom    === 'object') this._exdLastVolMom   = s.exdLastVolMom;
+      if (s.ftMaxGraylist    && typeof s.ftMaxGraylist    === 'object') {
+        // Load and prune any entries that have already expired
+        const nowGl = Date.now();
+        for (const [sym, expiry] of Object.entries(s.ftMaxGraylist)) {
+          if (expiry > nowGl) this._ftMaxGraylist[sym] = expiry;
+          // expired entries are simply dropped — symbol may re-qualify normally
+        }
+      }
       if (s.bot?.startTime) this.bot.startTime = s.bot.startTime;
       if (s.bot?.lastScan)  this.bot.lastScan  = s.bot.lastScan;
       if (Array.isArray(s.closedTrades)) this.closedTrades = s.closedTrades;
@@ -2803,6 +2812,13 @@ function ew() { return {
       }
 
       this.persist();
+
+      // 8. Ghost position audit — runs once per scan cycle, AFTER all entry logic completes.
+      // Running here (not in syncPositions) prevents racing with ftOpenShort, openShort,
+      // exdEntry, and carryOn position creation, which all happen during steps 1–7.
+      // syncPositions only handles positions it already knows about; new unknowns wait here.
+      await this.auditGhostPositions();
+
     } catch(e) {
       this.log('Cycle error: ' + e.message, 'error');
     } finally {
@@ -3839,6 +3855,8 @@ function ew() { return {
       // Merge new rodeoCreep qualifiers into ftCandidates
       for (const [sym, entry] of Object.entries(this.rodeoCreep)) {
         const count = entry.closedCount || 0;
+        // Do not re-promote a symbol that is still in the max-trades graylist
+        if (this._ftMaxGraylist[sym] && Date.now() < this._ftMaxGraylist[sym]) continue;
         if (count >= this.cfg.ftRodeoThreshold && !this.ftCandidates[sym]) {
           this.ftCandidates[sym] = { count, qualifiedAt: Date.now(), addedAt: Date.now() };
           this.log(`🎯 ${sym}: promoted to FT roster (×${count} rides, scan merge)`, 'debug');
@@ -4253,6 +4271,7 @@ function ew() { return {
           pos._tpAcceptedAt        = null;
           pos._localTpCorrectedKey = null;
           pos._tpReduceAcceptedKey = null;
+          pos._slAcceptedKey       = null; // allow SL re-check after phase transition
           const roiTarget = 0.03;
           const basePrice = pos.entryPrice;
           const nt = basePrice * (1 - (roiTarget / pos.leverage));
@@ -5350,6 +5369,7 @@ function ew() { return {
           p._tpAcceptedAt        = null;
           p._localTpCorrectedKey = null;
           p._tpReduceAcceptedKey = null;
+          p._slAcceptedKey       = null; // allow SL re-check after phase transition
           // 3% ROI TP from the position's cost basis (entryPrice / avgPrice).
           // For a short: price must fall (roiTarget / leverage) below entry.
           // Using markPrice here would be wrong — if mark is above entry (losing),
@@ -5470,6 +5490,29 @@ function ew() { return {
     // Removes persisted positions with zero/missing critical fields that can never
     // be traded or closed correctly, preventing crash loops on the watcher.
     this.purgeInvalidPositions();
+
+    // ── Automatic deduplication — runs before exchange calls ──
+    // If local state has multiple cards for the same symbol (from a previous race condition),
+    // keep only the best one (highest dcaStage, then oldest openedAt). Self-healing, no user action.
+    const _dedupSeen = {};
+    const _dedupRemove = [];
+    for (const pos of this.positions) {
+      if (!_dedupSeen[pos.symbol]) {
+        _dedupSeen[pos.symbol] = pos;
+      } else {
+        const existing = _dedupSeen[pos.symbol];
+        const keepThis = (pos.dcaStage ?? 0) > (existing.dcaStage ?? 0) ||
+                         ((pos.dcaStage ?? 0) === (existing.dcaStage ?? 0) && pos.openedAt < existing.openedAt);
+        if (keepThis) { _dedupRemove.push(existing); _dedupSeen[pos.symbol] = pos; }
+        else          { _dedupRemove.push(pos); }
+      }
+    }
+    if (_dedupRemove.length) {
+      this.positions = this.positions.filter(p => !_dedupRemove.includes(p));
+      for (const r of _dedupRemove) this.log(`❄ ${r.symbol}: duplicate local card auto-removed (stage ${r.dcaStage ?? 0})`, 'warn');
+      this.persist();
+    }
+
     this.log('Reconciling positions with exchange...', 'debug');
     try {
       await this.signedDelay();
@@ -5487,6 +5530,15 @@ function ew() { return {
 
       for (const ep of exPositions) {
         const sym      = ep.symbol;
+        // Find all local entries (dedup above should have cleared extras, but guard anyway)
+        const allLocal = this.positions.filter(p => p.symbol === sym);
+        if (allLocal.length > 1) {
+          // Remove extras — keep the one with highest dcaStage / oldest openedAt
+          allLocal.sort((a, b) => (b.dcaStage ?? 0) - (a.dcaStage ?? 0) || a.openedAt - b.openedAt);
+          const extras = allLocal.slice(1);
+          this.positions = this.positions.filter(p => !extras.includes(p));
+          this.log(`❄ ${sym}: removed ${extras.length} extra local card(s) during reconcile`, 'warn');
+        }
         const existing = this.positions.find(p => p.symbol === sym);
 
         if (existing) {
@@ -5515,6 +5567,14 @@ function ew() { return {
           // deviation-correction loop on every sync cycle for tiny-priced coins.
           const importStage = this.inferStage({ entryPrice, totalSize: size, symbol: sym, orders }, instr);
           const importTpRoi = importStage === 0 ? this.cfg.entryTpRoi : (this.cfg.tpRoi[importStage] ?? this.cfg.tpRoi[1]);
+
+          // Back-fill filled status: fetchOrdersForSymbol only returns open (unfilled) conditionals.
+          // Any DCA add below importStage has already triggered and filled — mark it so the
+          // position card DCA ladder reflects reality instead of showing all adds as pending.
+          for (let i = 0; i < orders.length; i++) {
+            if (orders[i].type === 'cond' && i < importStage) orders[i].filled = true;
+          }
+
           let resolvedTpPrice = tpPrice; // from exchange (may be 0)
           if (!(resolvedTpPrice > 0) && entryPrice > 0) {
             resolvedTpPrice = instr
@@ -5536,8 +5596,7 @@ function ew() { return {
             ({ rsi6, rsi12, rsi24 } = await this.fetchRSIMulti(sym));
           } catch(e) { /* non-fatal — position still imported */ }
 
-          const _importedAt = ep.createdTime ? parseInt(ep.createdTime) : Date.now();
-          const _importAge  = Math.floor((Date.now() - _importedAt) / 3600000 * 10) / 10;
+          const _importedAt = Date.now(); // ep.createdTime is unreliable — clock from import time
           this.positions.push({
             id:             Date.now() + Math.random(),
             symbol:         sym,
@@ -5552,7 +5611,7 @@ function ew() { return {
             fundingRate:    null, // refreshed on first watch cycle
             upnl:           parseFloat(ep.unrealisedPnl || 0),
             openedAt:       _importedAt,
-            phase:          this.calcPhase(_importedAt, 'normal'),
+            phase:          'normal', // watchPositions ages this forward each cycle
             isPending:      false,
             currentTpPrice: resolvedTpPrice,
             tpPct:          resolvedTpPrice > 0 ? parseFloat(((entryPrice - resolvedTpPrice) / entryPrice * leverage * 100).toFixed(1)) : importTpRoi,
@@ -5560,7 +5619,7 @@ function ew() { return {
             orders,
           });
           imported++;
-          this.log(`↓ Imported: ${sym} | Age:${_importAge}h | Size:${size} | Entry:${fmtP(entryPrice)} | TP:${fmtP(tpPrice)} | RSI6:${rsi6?.toFixed(1)??'?'} RSI12:${rsi12?.toFixed(1)??'?'} RSI24:${rsi24?.toFixed(1)??'?'} | ${orders.length} conditional(s)`, 'warn');
+          this.log(`↓ Imported: ${sym} | Size:${size} | Entry:${fmtP(entryPrice)} | TP:${fmtP(tpPrice)} | Stage:${importStage} | RSI6:${rsi6?.toFixed(1)??'?'} RSI12:${rsi12?.toFixed(1)??'?'} RSI24:${rsi24?.toFixed(1)??'?'} | ${orders.length} conditional(s)`, 'warn');
         }
       }
 
@@ -5651,6 +5710,78 @@ function ew() { return {
     return [];
   },
 
+  // ── GHOST POSITION AUDIT ──
+  // Fetches all open Sell positions from the exchange and imports any that aren't
+  // in local state. Called once at the end of each runScheduledCycle (step 8), after
+  // all entry logic (gainers, FT, faders, carry-on, EXD) has completed for that cycle.
+  // This prevents racing with position-creation paths that push to this.positions
+  // asynchronously — by the time we audit, any position opened this cycle is already tracked.
+  //
+  // openedAt is set to Date.now() because ep.createdTime from Bybit is unreliable
+  // (arbitrary exchange timestamps, not actual open time). Ghost positions start their
+  // phase clock from import time; watchPositions will age them forward from there.
+  async auditGhostPositions() {
+    try {
+      await this.signedDelay();
+      const p = 'category=linear&settleCoin=USDT';
+      const h = await signHdr(this.creds.key, this.creds.secret, p, this._tsOffset);
+      const r = await fetch(`${this.base}/v5/position/list?${p}`, {headers:h});
+      const d = await this.safeJson(r);
+      if (!d || d.retCode !== 0) return;
+      const ex = (d.result?.list || []).filter(e => e.side === 'Sell' && parseFloat(e.size) > 0);
+
+      for (const ep of ex) {
+        // Check before and after awaits — entry logic earlier in the cycle may have just pushed this
+        if (this.positions.find(p => p.symbol === ep.symbol)) continue;
+        const sym        = ep.symbol;
+        const entryPrice = parseFloat(ep.avgPrice || ep.markPrice);
+        const size       = parseFloat(ep.size);
+        const leverage   = parseFloat(ep.leverage || this.cfg.leverage);
+        const tpPrice    = parseFloat(ep.takeProfit || 0);
+        const exMargin   = parseFloat(ep.positionIM || ep.positionValue || 0);
+        const margin     = exMargin > 0 ? exMargin : (entryPrice * size) / leverage;
+        const orders     = await this.fetchOrdersForSymbol(sym);
+        const instr      = await this.getInstrInfo(sym);
+        const gStage     = this.inferStage({ entryPrice, totalSize: size, symbol: sym, orders }, instr);
+        const gTpRoi     = gStage === 0 ? this.cfg.entryTpRoi : (this.cfg.tpRoi[gStage] ?? this.cfg.tpRoi[1]);
+
+        // Back-fill filled status for adds that inferStage confirms have already executed.
+        // open orders only returns unfilled conditionals, so completed adds are absent —
+        // mark them filled in local state so the DCA ladder card reflects reality.
+        for (let i = 0; i < orders.length; i++) {
+          if (orders[i].type === 'cond' && i < gStage) orders[i].filled = true;
+        }
+
+        let resolvedTp = tpPrice;
+        if (!(resolvedTp > 0) && entryPrice > 0) {
+          resolvedTp = instr
+            ? this.snapPrice(entryPrice * (1 - (gTpRoi / 100) / leverage), instr)
+            : entryPrice * (1 - (gTpRoi / 100) / leverage);
+        }
+        // Re-check after awaits
+        if (this.positions.find(p => p.symbol === sym)) continue;
+        this.positions.push({
+          id: Date.now() + Math.random(), symbol: sym,
+          entryPrice, originalEntryPrice: entryPrice,
+          markPrice:  parseFloat(ep.markPrice || ep.avgPrice),
+          totalSize: size, leverage, margin,
+          change24h: '?', rsi6: null, rsi12: null, rsi24: null, fundingRate: null,
+          upnl:      parseFloat(ep.unrealisedPnl || 0),
+          openedAt:  Date.now(), // ep.createdTime is unreliable — clock from import time
+          phase:     'normal',   // watchPositions ages this forward each cycle
+          isPending: false,
+          currentTpPrice: resolvedTp,
+          tpPct: resolvedTp > 0
+            ? parseFloat(((entryPrice - resolvedTp) / entryPrice * leverage * 100).toFixed(1))
+            : gTpRoi,
+          dcaStage: gStage, orders,
+        });
+        this.persist();
+        this.log(`⚠ Ghost position detected: ${sym} | imported at stage ${gStage}, TP: ${fmtP(resolvedTp)}`, 'warn');
+      }
+    } catch(e) { this.log('Ghost audit error: ' + e.message, 'warn'); }
+  },
+
   async syncPositions() {
     try {
       await this.signedDelay();
@@ -5699,8 +5830,10 @@ function ew() { return {
             await this.checkSlStage3(pos, newAvgPrice, slInstr);
           }
 
-          // TP drift correction — infers DCA stage from notional, corrects TP if outside 10% tolerance
-          if (pos.phase !== 'reduce') {
+          // TP drift correction — infers DCA stage from notional, corrects TP if outside 10% tolerance.
+          // Only runs for normal phase — reduce has its own 3% TP logic below, and force phase
+          // positions are being closed so TP correction is both wrong and wasteful.
+          if (pos.phase === 'normal') {
             await this.checkTpCorrection(pos, newAvgPrice, newSize, parseFloat(ep.takeProfit || 0));
           } else {
             // Reduce phase: always recompute 3% TP from current avgPrice.
@@ -5803,49 +5936,6 @@ function ew() { return {
         }
       }
       this.acct.upnl=tot;
-      // ── Ghost position detection ──
-      // If the exchange has a live short that we don't track locally, import it now.
-      // This covers the case where a position was opened outside the bot, or where a
-      // reconcilePositions import was missed (e.g. connect during a scan). Without this,
-      // a "ghost" position can run indefinitely past its force-close timer with no watchdog.
-      for (const ep of ex) {
-        if (ep.side !== 'Sell' || !(parseFloat(ep.size) > 0)) continue;
-        if (this.positions.find(p => p.symbol === ep.symbol)) continue; // already tracked
-        const sym        = ep.symbol;
-        const entryPrice = parseFloat(ep.avgPrice || ep.markPrice);
-        const size       = parseFloat(ep.size);
-        const leverage   = parseFloat(ep.leverage || this.cfg.leverage);
-        const tpPrice    = parseFloat(ep.takeProfit || 0);
-        const exMargin   = parseFloat(ep.positionIM || ep.positionValue || 0);
-        const margin     = exMargin > 0 ? exMargin : (entryPrice * size) / leverage;
-        const orders     = await this.fetchOrdersForSymbol(sym);
-        const instr      = await this.getInstrInfo(sym);
-        const gStage     = this.inferStage({ entryPrice, totalSize: size, symbol: sym, orders }, instr);
-        const gTpRoi     = gStage === 0 ? this.cfg.entryTpRoi : (this.cfg.tpRoi[gStage] ?? this.cfg.tpRoi[1]);
-        let resolvedTp   = tpPrice;
-        if (!(resolvedTp > 0) && entryPrice > 0) {
-          resolvedTp = instr
-            ? this.snapPrice(entryPrice * (1 - (gTpRoi / 100) / leverage), instr)
-            : entryPrice * (1 - (gTpRoi / 100) / leverage);
-        }
-        const _importedAt = ep.createdTime ? parseInt(ep.createdTime) : Date.now();
-        this.positions.push({
-          id: Date.now() + Math.random(), symbol: sym,
-          entryPrice, originalEntryPrice: entryPrice, markPrice: parseFloat(ep.markPrice || ep.avgPrice),
-          totalSize: size, leverage, margin,
-          change24h: '?', rsi6: null, rsi12: null, rsi24: null,
-          fundingRate: null,
-          upnl: parseFloat(ep.unrealisedPnl || 0),
-          openedAt: _importedAt,
-          phase: this.calcPhase(_importedAt, 'normal'),
-          isPending: false,
-          currentTpPrice: resolvedTp,
-          tpPct: resolvedTp > 0 ? parseFloat(((entryPrice - resolvedTp) / entryPrice * leverage * 100).toFixed(1)) : gTpRoi,
-          dcaStage: gStage, orders,
-        });
-        this.persist();
-        this.log(`⚠ Ghost position detected: ${sym} | not in local state — imported (age ${Math.floor((Date.now()-_importedAt)/3600000*10)/10}h, phase: ${this.calcPhase(_importedAt,'normal')}, TP: ${fmtP(resolvedTp)})`, 'warn');
-      }
       // ── Pot-gainers housekeeping ──
       // Remove entries where a position already exists (opened by scan this cycle)
       for (const pe of [...this.potGainers]) {
@@ -6291,6 +6381,7 @@ function ew() { return {
         pos._tpAcceptedKey       = null; // clear — our correction was accepted
         pos._tpAcceptedAt        = null;
         pos._localTpCorrectedKey = null; // allow local guard to re-fire if needed
+        pos._slAcceptedKey       = null; // avgPrice shifted — SL target changed too
         pos.currentTpPrice = targetTp;
         pos.tpPct          = targetRoi;
         this.persist();
@@ -6305,6 +6396,11 @@ function ew() { return {
   // Called unconditionally from syncPositions for every open position, regardless of phase.
   // -105% ROI on a short (cross margin): SL price = avgPrice × (1 + 1.05 / leverage)
   // Using avgPrice so SL always reflects the true blended cost basis after all DCA fills.
+  //
+  // _slAcceptedKey pattern: mirrors _tpAcceptedKey in checkTpCorrection.
+  // Once the exchange confirms (or returns not_modified for) a given SL price, stamp the key
+  // so we don't fire setSL again until avgPrice shifts enough to change targetSl meaningfully.
+  // Cleared alongside _tpAcceptedKey on DCA fills and phase transitions.
   async checkSlStage3(pos, avgPrice, instr) {
     if (!instr) return;
     const stage = this.inferStage(pos, instr);
@@ -6325,12 +6421,18 @@ function ew() { return {
       return;
     }
 
+    // Idempotency guard: if we already confirmed this exact SL price with the exchange
+    // this cycle (or it returned not_modified), skip — nothing has changed.
+    const slKey = `sl:${targetSl.toFixed(8)}`;
+    if (pos._slAcceptedKey === slKey) return;
+
     if (!pos.slPrice || !pos.slSet) {
       // First time at stage 3 — set SL for the first time
       this.log(`${pos.symbol}: stage 3 — setting SL @ ${fmtP(targetSl)} (-105% ROI, avg ${fmtP(avgPrice)} lev ${pos.leverage}×, phase: ${pos.phase})`, 'warn');
       await this.setSL(pos.symbol, targetSl);
-      pos.slPrice = targetSl;
-      pos.slSet   = true;
+      pos.slPrice        = targetSl;
+      pos.slSet          = true;
+      pos._slAcceptedKey = slKey; // lock regardless of not_modified — exchange already has it
       this.persist();
     } else {
       // SL already set — drift-guard: reissue if avgPrice shifted target by >10% of SL distance
@@ -6340,8 +6442,12 @@ function ew() { return {
       if (slDeviation > slTolerance) {
         this.log(`${pos.symbol}: SL drift — stored ${fmtP(pos.slPrice)} vs target ${fmtP(targetSl)} (Δ${fmtP(slDeviation)}) — correcting`, 'warn');
         await this.setSL(pos.symbol, targetSl);
-        pos.slPrice = targetSl;
+        pos.slPrice        = targetSl;
+        pos._slAcceptedKey = slKey;
         this.persist();
+      } else {
+        // Within tolerance — stamp key so we stop re-evaluating until avgPrice shifts
+        pos._slAcceptedKey = slKey;
       }
     }
   },
@@ -6602,13 +6708,18 @@ function ew() { return {
   // ── AUDIT OPEN CONDITIONAL ORDERS ──
   // Fetches all open StopOrders across all linear symbols from Bybit.
   // Runs at the start of each scan cycle.
-  // Orphan detection: any conditional found for a symbol NOT in this.positions
-  // is immediately cancelled and prominently warned — this is the scenario where
-  // a ghost DCA order was left behind after a position closed without cleanup.
+  //
+  // Three things happen here:
+  //   1. Orphan detection: conditionals for symbols NOT in this.positions → cancel immediately.
+  //   2. orders[] reconciliation: for known positions, sync the local orders[] array
+  //      against what the exchange actually has open. This fixes the "bot placed duplicate
+  //      conditionals it doesn't recognize" scenario — if exchange order IDs don't match
+  //      any local entry, we replace the local orders[] with the exchange truth.
+  //   3. Duplicate conditional detection: if a symbol has MORE open conditionals than
+  //      expected (> 3), cancel all and re-place from the current position state.
   async fetchAndAuditOpenOrders() {
     try {
       await this.signedDelay();
-      // Bybit v5 order/list supports settleCoin=USDT to batch-fetch all symbols
       const p = 'category=linear&settleCoin=USDT&orderFilter=StopOrder&openOnly=1&limit=50';
       const h = await signHdr(this.creds.key, this.creds.secret, p, this._tsOffset);
       const r = await fetch(`${this.base}/v5/order/list?${p}`, {headers:h});
@@ -6618,33 +6729,86 @@ function ew() { return {
         return;
       }
       const orders = d.result?.list || [];
-      if (!orders.length) {
-        // no open conditional orders — no log needed
-        return;
-      }
+      if (!orders.length) return;
 
       const activeSymbols = new Set(this.positions.map(p => p.symbol));
       const orphans = orders.filter(o => !activeSymbols.has(o.symbol));
       const known   = orders.filter(o =>  activeSymbols.has(o.symbol));
 
-      if (known.length) {
-        const summary = [...new Set(known.map(o => o.symbol))].join(', ');
-        // known conditionals match tracked positions — no log needed
-      }
-
+      // ── 1. Cancel orphan conditionals ──
       if (orphans.length) {
-        // Group orphans by symbol for a cleaner log
         const bySymbol = {};
         for (const o of orphans) {
           (bySymbol[o.symbol] = bySymbol[o.symbol] || []).push(o);
         }
         for (const [sym, symOrphans] of Object.entries(bySymbol)) {
           const ids = symOrphans.map(o => o.orderId).join(', ');
-          this.log(`⚠ ORPHAN ORDER: ${sym} has ${symOrphans.length} open conditional(s) with NO tracked position — cancelling now. OrderId(s): ${ids}`, 'error');
+          this.log(`⚠ ORPHAN ORDER: ${sym} has ${symOrphans.length} open conditional(s) with NO tracked position — cancelling. OrderId(s): ${ids}`, 'error');
           await this.cancelAllConditionals(sym);
         }
-      } else {
-        // all conditionals match tracked positions — no log needed
+      }
+
+      // ── 2 & 3. Reconcile orders[] for known positions ──
+      // Group exchange conditionals by symbol
+      const bySymKnown = {};
+      for (const o of known) {
+        (bySymKnown[o.symbol] = bySymKnown[o.symbol] || []).push(o);
+      }
+
+      for (const [sym, exchOrders] of Object.entries(bySymKnown)) {
+        const pos = this.positions.find(p => p.symbol === sym);
+        if (!pos) continue;
+
+        // ── 3. Duplicate cond detection: more than 3 open conditionals ──
+        if (exchOrders.length > 3) {
+          this.log(`⚠ ${sym}: ${exchOrders.length} open conditionals (expected ≤3) — cancelling duplicates and re-syncing orders[]`, 'warn');
+          await this.cancelAllConditionals(sym);
+          // Rebuild orders[] from exchange position state — entry is known, adds are gone
+          const instr = await this.getInstrInfo(sym);
+          pos.orders = [{ label: 'Entry', price: pos.entryPrice, qty: pos.totalSize, type: 'tp', filled: false, orderId: null }];
+          this.persist();
+          continue;
+        }
+
+        // ── 2. Sync orders[] when local IDs don't match exchange ──
+        const localCondIds = new Set(
+          (pos.orders || []).filter(o => o.type === 'cond' && o.orderId).map(o => o.orderId)
+        );
+        const exchIds = new Set(exchOrders.map(o => o.orderId));
+
+        // If none of the exchange order IDs appear in local state, the local orders[]
+        // is stale (e.g. after a reconnect where old conditionals triggered and new ones
+        // were placed without local tracking). Replace with exchange truth.
+        const anyMatch = exchOrders.some(o => localCondIds.has(o.orderId));
+        if (!anyMatch && exchOrders.length > 0) {
+          this.log(`⚠ ${sym}: local orders[] has no matching exchange IDs — reconciling from exchange (${exchOrders.length} open cond(s))`, 'warn');
+          const entryOrder = (pos.orders || []).find(o => o.type === 'tp') || { label: 'Entry', price: pos.entryPrice, qty: pos.totalSize, type: 'tp', filled: false, orderId: null };
+          pos.orders = [
+            entryOrder,
+            ...exchOrders.map((o, i) => ({
+              label:    `Add${i + 1} (synced)`,
+              price:    parseFloat(o.triggerPrice || o.price || 0),
+              qty:      parseFloat(o.qty),
+              tpPrice:  parseFloat(o.takeProfit || 0),
+              type:     'cond',
+              filled:   false,
+              orderId:  o.orderId,
+            }))
+          ];
+          this.persist();
+        }
+
+        // Check for local cond entries that no longer exist on exchange (triggered/cancelled)
+        // and mark them filled so the card reflects reality
+        let ordersChanged = false;
+        for (const localOrd of (pos.orders || [])) {
+          if (localOrd.type !== 'cond' || !localOrd.orderId || localOrd.filled) continue;
+          if (!exchIds.has(localOrd.orderId)) {
+            localOrd.filled = true;
+            ordersChanged = true;
+          }
+        }
+        if (ordersChanged) this.persist();
       }
     } catch(e) {
       this.log(`Open order audit error: ${e.message}`, 'warn');
