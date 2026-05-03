@@ -1308,18 +1308,6 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             </div>
           </div>
           <div x-show="cfg.funEnabled && cfg.gainersEnabled" class="mt-sep">
-            <!-- Info card: passive filters inherited from Gainers config -->
-            <div style="background:var(--bg-void);border:1px solid rgba(126,232,250,0.15);border-radius:2px;padding:8px 10px;font-family:var(--mono);font-size:9px;line-height:1.7;color:var(--text-lo);margin-bottom:10px">
-              <div style="color:var(--ice);letter-spacing:1.5px;margin-bottom:5px;font-size:9px">ⓘ ENTRY FILTERS — GAINERS CONFIG</div>
-              <div>Over-extension (RSI6 ≥ <span style="color:var(--warn)" x-text="cfg.rsi6Max"></span>): bumps VM creep — entry still allowed, bar rises</div>
-              <div>Over-extension scaling: VM × <span style="color:var(--warn)" x-text="cfg.funOverExtScaling??2"></span><sup>n</sup> per lookback hit</div>
-              <div>Proximity block: RSI6 within <span style="color:var(--warn)" x-text="cfg.rsi6ProximityPct+'%'"></span> of max
-                (≥ <span style="color:var(--warn)" x-text="(cfg.rsi6Max*(1-cfg.rsi6ProximityPct/100)).toFixed(1)"></span>) → skip</div>
-              <div style="margin-top:4px;color:var(--text-lo);font-size:8.5px;line-height:1.5">
-                Adjust thresholds in the <span style="color:var(--ice)">Gainers Strategy</span> accordion.<br>
-                RSI6/12/24 are fetched at entry and stored on each FUN position card.
-              </div>
-            </div>
             <div class="g">
               <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:8px">FUNDING GATE</div>
               <div class="lbl">Min Funding Rate ≥ <b x-text="cfg.funFundingMin.toFixed(3)+'%'"></b></div>
@@ -2333,7 +2321,7 @@ function pw() { return {
     funVolMomLosersEnabled: true,   // require vol momentum floor for FUN loser entries
     funVolMomMin: 10,               // min vol mom % for gainers (default 10%)
     funVolMomLosersMin: -10,        // min vol mom % for losers — negative floor (default -10%)
-    funVolMomCreepPct: 10,          // VM floor tightens by this % per re-entry within 6h window
+    funVolMomCreepPct: 25,          // VM floor tightens by this % per re-entry within 6h window
     funOverExtScaling: 2,           // VM threshold multiplier per over-extension hit within the lookback window
     dcaDoublingEnabled: false, // each DCA add escalates by configured multiplier; faster rescue, higher margin cost
     dcaMultiplier: 2,          // per-stage notional multiplier when dcaDoublingEnabled (e.g. 2 = ×2, ×4; 3 = ×3, ×9)
@@ -3424,11 +3412,27 @@ function pw() { return {
           if (fr === null || fr < this.cfg.funFundingMin) continue;
           const isLoser = !gainerSyms.has(sym);
 
-          // ── RSI6 over-extension: bump VM creep instead of blocking ──
+          // ── Historical over-extension look-back (3h, 15min candles) — must run first ──
+          // Counts how many candles in the 3h window had RSI6 ≥ rsi6Max.
+          // Result is the sole source of truth for the over-ext multiplier; it already
+          // covers the current candle if RSI6 is over-extended right now.
+          const funHistOverExtCount = await this.fetchFunHistOverExtCount(sym);
+
+          // Sync the look-back result into funCreep so the stored overExtCount and the
+          // VM threshold calculation are always in agreement. This replaces the old
+          // incremental funOverExtBump() call which could double-count.
+          if (funHistOverExtCount > 0) {
+            this.funCreepSyncOverExt(sym, funHistOverExtCount);
+          }
+
+          // ── RSI6 proximity check (current candle) ──
           const funRsi6 = await this.fetchRSI(sym, 6);
           if (funRsi6 !== null && funRsi6 >= this.cfg.rsi6Max) {
-            this.funOverExtBump(sym, funRsi6);
-            // fall through — entry still allowed, VM bar is now higher
+            // Over-extended now — already captured in histOverExtCount; just log it
+            const scaling = this.cfg.funOverExtScaling ?? 2;
+            const mult    = Math.pow(scaling, funHistOverExtCount);
+            this.log(`💰 ${sym}: FUN RSI6 ${funRsi6.toFixed(1)} ≥ ${this.cfg.rsi6Max} | lookback hits: ${funHistOverExtCount} → VM ×${mult.toFixed(2)} (${scaling}^${funHistOverExtCount}) — fall through`, 'info');
+            // fall through — entry still allowed, VM bar is higher via histOverExtCount
           } else if (funRsi6 !== null && this.cfg.rsi6ProximityPct > 0) {
             const proxThreshold = this.cfg.rsi6Max * (1 - this.cfg.rsi6ProximityPct / 100);
             if (funRsi6 >= proxThreshold) {
@@ -3440,17 +3444,19 @@ function pw() { return {
           const funRsi12 = await this.fetchRSI(sym, 12);
           const funRsi24 = await this.fetchRSI(sym, 24);
 
-          // ── Historical over-extension count: scale VM threshold before entry ──
-          const funHistOverExtCount = await this.fetchFunHistOverExtCount(sym);
-
           const vmEnabled = isLoser ? this.cfg.funVolMomLosersEnabled : this.cfg.funVolMomGainersEnabled;
           if (vmEnabled) {
             const tickEntry = this._volBaseline[sym];
             const vmResult = this.calcFtVolMom(sym, tickEntry
               ? { symbol: sym, volume24h: tickEntry.volume24h, turnover24h: tickEntry.turnover24h, lastPrice: tickEntry.lastPrice }
               : null);
+            // funVolMomThreshold applies: base × (1 + creep×count) × factor^histOverExtCount
             const vmMin = this.funVolMomThreshold(sym, isLoser, funHistOverExtCount);
             if (vmResult.pct != null && vmResult.pct < vmMin) {
+              const creepCount = this.funCreep[sym]?.count || 0;
+              const scaling    = this.cfg.funOverExtScaling ?? 2;
+              const oeMult     = funHistOverExtCount > 0 ? Math.pow(scaling, funHistOverExtCount) : 1;
+              this.log(`💰 ${sym}: FUN VM blocked — ${vmResult.pct.toFixed(1)}% < ${vmMin.toFixed(1)}% (creep×${creepCount}, OE×${funHistOverExtCount}→×${oeMult.toFixed(2)})`, 'info');
               if (isLoser) vmBlockedLosers++; else vmBlockedGainers++;
               continue;
             }
@@ -6643,6 +6649,34 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const mult         = Math.pow(scaling, overExtCount);
     this.log(`💰 ${symbol}: FUN over-ext bump — RSI6 ${rsi6.toFixed(1)} ≥ ${this.cfg.rsi6Max} | overExt ×${overExtCount} → VM ×${mult.toFixed(2)} (scaling ${scaling}^${overExtCount})`, 'info');
     this.persist();
+  },
+
+  // Syncs the historical look-back over-ext count into funCreep[symbol].overExtCount.
+  // Called once per scan cycle before the VM check. Overwrites the stored count so the
+  // UI, re-entry creep log, and VM threshold calculation all share the same value.
+  // This replaces the old funOverExtBump() incremental approach which could double-count
+  // the current candle on top of the look-back result.
+  funCreepSyncOverExt(symbol, histCount) {
+    const CREEP_TTL = 6 * 3600 * 1000;
+    const now   = Date.now();
+    const entry = this.funCreep[symbol];
+    const prevCount = entry?.overExtCount || 0;
+    if (entry && (now - entry.setAt) < CREEP_TTL) {
+      // Only update if the fresh look-back is higher (monotonically tracks the worst seen)
+      if (histCount > prevCount) {
+        entry.overExtCount = histCount;
+        // Don't refresh setAt here — that's reserved for re-entry creep bumps
+      }
+    } else {
+      // Either no entry or expired window — create/refresh with look-back result
+      this.funCreep[symbol] = { count: entry?.count || 0, overExtCount: histCount, setAt: now };
+    }
+    const scaling = this.cfg.funOverExtScaling ?? 2;
+    const mult    = Math.pow(scaling, histCount);
+    if (histCount > prevCount) {
+      this.log(`💰 ${symbol}: FUN OE sync — lookback ${histCount} candle(s) over-extended → VM ×${mult.toFixed(2)} (${scaling}^${histCount})`, 'info');
+      this.persist();
+    }
   },
 
   // Counts how many 15m candles in the RSI6 lookback window were over-extended (≥ rsi6Max).
