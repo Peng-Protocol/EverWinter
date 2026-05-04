@@ -1372,6 +1372,22 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 </div>
               </div>
             </div>
+            <!-- FUN Loser LSA filter -->
+            <div class="g" style="margin-top:10px">
+              <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:8px">LSA FILTER — LOSERS ONLY</div>
+              <label class="tog" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''" @click="if(!cfgLocked){cfg.funLsaEnabled=!cfg.funLsaEnabled;persist()}">
+                <div class="tog-t" :class="cfg.funLsaEnabled?'on':''"><div class="tog-k"></div></div>
+                <span class="tog-l">Require Normal Volume Spread</span>
+              </label>
+              <div style="font-size:9.5px;color:var(--text-lo);margin-top:5px;line-height:1.6">
+                Block losers when the last candle is a volume spike or drought. Anomalous vol on a loser signals disorder, not opportunity.
+              </div>
+              <div x-show="cfg.funLsaEnabled" style="margin-top:8px">
+                <div class="lbl">LSA Factor ±<b x-text="cfg.funLsaFactor+'%'"></b></div>
+                <input type="range" min="10" max="200" step="10" x-model.number="cfg.funLsaFactor" :disabled="bot.running" @change="persist()">
+                <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Block if last candle vol deviates more than ±<span x-text="cfg.funLsaFactor"></span>% from the window average.</div>
+              </div>
+            </div>
             <div class="g" class="mt-sep">
               <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:6px">SIZING — 3× NOTIONAL</div>
               <div class="sg2 gs">
@@ -1573,6 +1589,21 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                     return '<span style=\'color:'+col+'\'>'+sign+pct.toFixed(1)+'%'+(pct>=thr?' ✓':'')+'</span>'
                          + '<span style=\'color:var(--text-lo);font-size:9px\'> min '+thr.toFixed(1)+'%</span>';
                   }
+                })()"></div>
+              </div>
+              <!-- LSA Ratio — FUN losers only -->
+              <div class="ps" x-show="p._fun && p._funIsLoser && p._funLsaRatio != null" style="grid-column:span 2">
+                <div class="psl">LSA Ratio</div>
+                <div class="psv" style="font-size:10px;white-space:nowrap" x-html="(()=>{
+                  const r = p._funLsaRatio;
+                  if (r == null) return '<span style=\'color:var(--text-lo)\'>—</span>';
+                  const factor = 1 + ((cfg.funLsaFactor ?? 50) / 100);
+                  const isSpike   = r > factor;
+                  const isDrought = r < 1 / factor;
+                  const col = (isSpike || isDrought) ? 'var(--short)' : 'var(--profit)';
+                  const tag = isSpike ? ' ⚡spike' : isDrought ? ' 🌵drought' : ' ✓';
+                  return '<span style=\'color:'+col+'\'>'+r.toFixed(2)+'×'+tag+'</span>'
+                       + '<span style=\'color:var(--text-lo);font-size:9px\'> band ±'+cfg.funLsaFactor+'%</span>';
                 })()"></div>
               </div>
               <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="'−105%  '+fmtP(p.slPrice)"></div></div>
@@ -2315,6 +2346,8 @@ function pw() { return {
     // ── FUN (Fund Chasing) Strategy ──
     funEnabled: false,         // enable fund-chasing strategy
     funFundingMin: 0.1,        // min funding rate % to qualify (e.g. 0.1 = 0.1%)
+    funLsaEnabled: true,       // LSA filter for FUN losers — block if last 15m candle vol deviates too far from avg
+    funLsaFactor:  50,         // % deviation threshold for FUN loser LSA (50 = ±50% from avg)
     funGainerN: 25,            // how many top gainers to evaluate for FUN entries
     funLoserN: 25,             // how many worst losers (-3% to -99%) to evaluate for FUN entries
     funVolMomGainersEnabled: true,  // require vol momentum for FUN gainer entries
@@ -3405,7 +3438,7 @@ function pw() { return {
           .slice(0, this.cfg.funLoserN);
         const funPool = [...addPool(gainers), ...addPool(losers)];
 
-        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0;
+        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, oeGraylisted = 0, proximityBlocked = 0;
         const gainerSyms = new Set(gainers.map(t => t.symbol));
         for (const t of funPool) {
           const sym   = t.symbol;
@@ -3445,6 +3478,7 @@ function pw() { return {
               this.log(`💰 ${sym}: FUN loser OE graylist — ${funHistOverExtCount} candle(s) over-extended in 6h lookback; loser + OE is contradictory → graylisted 6h`, 'warn');
               this.persist();
             }
+            oeGraylisted++;
             continue;
           }
           if (isLoser && this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym]) {
@@ -3452,15 +3486,11 @@ function pw() { return {
           }
           const funRsi6 = await this.fetchRSI(sym, 6);
           if (funRsi6 !== null && funRsi6 >= this.cfg.rsi6Max) {
-            // Over-extended now — already captured in histOverExtCount; just log it
-            const scaling = this.cfg.funOverExtScaling ?? 2;
-            const mult    = Math.pow(scaling, funHistOverExtCount);
-            this.log(`💰 ${sym}: FUN RSI6 ${funRsi6.toFixed(1)} ≥ ${this.cfg.rsi6Max} | lookback hits: ${funHistOverExtCount} → VM ×${mult.toFixed(2)} (${scaling}^${funHistOverExtCount}) — fall through`, 'info');
-            // fall through — entry still allowed, VM bar is higher via histOverExtCount
+            // Over-extended now — already captured in histOverExtCount; VM bar raised, fall through
           } else if (funRsi6 !== null && this.cfg.rsi6ProximityPct > 0) {
             const proxThreshold = this.cfg.rsi6Max * (1 - this.cfg.rsi6ProximityPct / 100);
             if (funRsi6 >= proxThreshold) {
-              this.log(`💰 ${sym}: FUN blocked — RSI6 ${funRsi6.toFixed(1)} within ${this.cfg.rsi6ProximityPct}% of max ${this.cfg.rsi6Max} (proximity)`, 'info');
+              proximityBlocked++;
               continue;
             }
           }
@@ -3477,10 +3507,6 @@ function pw() { return {
             // funVolMomThreshold applies: base × (1 + creep×count) × factor^histOverExtCount
             const vmMin = this.funVolMomThreshold(sym, isLoser, funHistOverExtCount);
             if (vmResult.pct != null && vmResult.pct < vmMin) {
-              const creepCount = this.funCreep[sym]?.count || 0;
-              const scaling    = this.cfg.funOverExtScaling ?? 2;
-              const oeMult     = funHistOverExtCount > 0 ? Math.pow(scaling, funHistOverExtCount) : 1;
-              this.log(`💰 ${sym}: FUN VM blocked — ${vmResult.pct.toFixed(1)}% < ${vmMin.toFixed(1)}% (creep×${creepCount}, OE×${funHistOverExtCount}→×${oeMult.toFixed(2)})`, 'info');
               if (isLoser) vmBlockedLosers++; else vmBlockedGainers++;
               continue;
             }
@@ -3488,13 +3514,42 @@ function pw() { return {
           const change24h = parseFloat(t.price24hPcnt || 0) * 100;
           const funNextFundingTime   = t.nextFundingTime   ? parseInt(t.nextFundingTime,   10) : null;
           const funFundingIntervalMs = t.fundingIntervalHour ? parseInt(t.fundingIntervalHour, 10) * 3600000 : null;
-          const opened = await this.funOpenShort(sym, price, fr, isLoser, change24h, funRsi6, funRsi12, funRsi24, funNextFundingTime, funFundingIntervalMs, funHistOverExtCount);
+
+          // ── FUN loser LSA check ──
+          // Only applies to losers. klineCache[sym_15] is already warm from fetchRSI above — zero extra fetches.
+          // Uses its own toggle (funLsaEnabled) and factor (funLsaFactor), independent of the fader LSA settings.
+          let funLsaRatio = null;
+          if (isLoser && this.cfg.funLsaEnabled) {
+            const cached = this._klineCache[`${sym}_15`];
+            if (cached?.volumes?.length >= 4) {
+              const vols         = cached.volumes;
+              const lastComplete = vols[vols.length - 2];
+              const windowVols   = vols.slice(0, vols.length - 1);
+              const avg          = windowVols.reduce((s, v) => s + v, 0) / windowVols.length;
+              if (avg > 0) {
+                const ratio  = lastComplete / avg;
+                const factor = 1 + (this.cfg.funLsaFactor ?? 50) / 100;
+                funLsaRatio  = ratio; // capture for position card even when passing
+                if (ratio > factor) {
+                  lsaBlockedLosers++;
+                  continue;
+                }
+                if (ratio < 1 / factor) {
+                  lsaBlockedLosers++;
+                  continue;
+                }
+              }
+            }
+          }
+
+          const opened = await this.funOpenShort(sym, price, fr, isLoser, change24h, funRsi6, funRsi12, funRsi24, funNextFundingTime, funFundingIntervalMs, funHistOverExtCount, funLsaRatio);
           if (opened) funOpened++;
         }
-        const vmNote = (vmBlockedGainers + vmBlockedLosers) > 0
-          ? ` | VM blocked: ${vmBlockedGainers}G ${vmBlockedLosers}L`
-          : '';
-        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}.`, 'scan');
+        const vmNote    = (vmBlockedGainers + vmBlockedLosers) > 0 ? ` | VM: ${vmBlockedGainers}G ${vmBlockedLosers}L` : '';
+        const lsaNote   = lsaBlockedLosers   > 0 ? ` | LSA: ${lsaBlockedLosers}L` : '';
+        const oeNote    = oeGraylisted        > 0 ? ` | OE-gray: ${oeGraylisted}L` : '';
+        const proxNote  = proximityBlocked    > 0 ? ` | RSI-prox: ${proximityBlocked}` : '';
+        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${oeNote}${proxNote}.`, 'scan');
       }
 
       await this.refreshBalance();
@@ -4493,7 +4548,7 @@ function pw() { return {
 
   // FUN (Fund Chasing) — opens a 3× notional short on a high-funding-rate gainer.
   // RSI filters bypassed. Vol momentum pre-filtered in scan loop. Tagged _fun: true on the position.
-  async funOpenShort(sym, price, fundingRate, isLoser = false, change24h = null, rsi6 = null, rsi12 = null, rsi24 = null, nextFundingTime = null, fundingIntervalMs = null, histOverExtCount = 0) {
+  async funOpenShort(sym, price, fundingRate, isLoser = false, change24h = null, rsi6 = null, rsi12 = null, rsi24 = null, nextFundingTime = null, fundingIntervalMs = null, histOverExtCount = 0, lsaRatio = null) {
     if (this._symbolBanlist[sym]) return false;
     const instr = await this.getInstrInfo(sym);
     if (!instr) { this.log(`💰 ${sym}: FUN — instrument not supported`, 'warn'); return false; }
@@ -4540,6 +4595,7 @@ function pw() { return {
       rsi6: rsi6 != null ? parseFloat(rsi6.toFixed(2)) : null,
       rsi12: rsi12 != null ? parseFloat(rsi12.toFixed(2)) : null,
       rsi24: rsi24 != null ? parseFloat(rsi24.toFixed(2)) : null,
+      _funLsaRatio: lsaRatio != null ? parseFloat(lsaRatio.toFixed(3)) : null,
       _volMomentum: this._symData[sym]?.volMomPct ?? null,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
       currentTpPrice: tpPrice, tpPct: effTp0, dcaStage: 0, orders,
@@ -6233,6 +6289,17 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
                            || (turnover24h / volume24h);
             const blended = this.calcVolMomPct(volume24h, turnover24h, markPrice);
             if (blended !== null) { fp._volMomentum = blended; fp._volCheckedAt = now; }
+          }
+          // Refresh LSA ratio for FUN losers from the kline cache (populated by the scan pass)
+          if (fp._fun && fp._funIsLoser) {
+            const cached = this._klineCache[`${fp.symbol}_15`];
+            if (cached?.volumes?.length >= 4) {
+              const vols         = cached.volumes;
+              const lastComplete = vols[vols.length - 2];
+              const windowVols   = vols.slice(0, vols.length - 1);
+              const avg          = windowVols.reduce((s, v) => s + v, 0) / windowVols.length;
+              if (avg > 0) fp._funLsaRatio = parseFloat((lastComplete / avg).toFixed(3));
+            }
           }
         } catch(e) { /* non-fatal */ }
       }
