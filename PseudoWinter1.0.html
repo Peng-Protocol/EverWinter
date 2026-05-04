@@ -2025,17 +2025,20 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             <div x-show="cfg.funVolMomGainersEnabled" style="color:var(--text-lo);font-size:9px;margin-top:2px">
               G floor ≥ <span style="color:var(--profit)" x-text="(()=>{
                 const base=cfg.funVolMomMin??10;
-                const creep=base*(1+entry.count*(cfg.funVolMomCreepPct??10)/100);
-                const mult=entry.overExtCount>0?Math.pow(cfg.funOverExtScaling??2,entry.overExtCount):1;
-                return (creep*mult).toFixed(1)+'%'+(entry.overExtCount>0?' (×'+mult.toFixed(2)+' OE)':'');
+                const creeped=base*(1+(entry.count||0)*(cfg.funVolMomCreepPct??10)/100);
+                const oeTighten=(entry.overExtCount||0)*(base*(cfg.funOverExtScaling??50)/100);
+                const threshold=creeped+oeTighten;
+                return threshold.toFixed(1)+'%'+(entry.overExtCount>0?' (+'+oeTighten.toFixed(1)+' OE)':'');
               })()"></span>
             </div>
             <div x-show="cfg.funVolMomLosersEnabled" style="color:var(--text-lo);font-size:9px;margin-top:1px">
               L floor ≥ <span style="color:var(--warn)" x-text="(()=>{
                 const base=cfg.funVolMomLosersMin??-10;
-                const creeped=base+entry.count*(Math.abs(base)*(cfg.funVolMomCreepPct??10)/100);
-                const mult=entry.overExtCount>0?Math.pow(cfg.funOverExtScaling??2,entry.overExtCount):1;
-                return (creeped*mult).toFixed(1)+'%'+(entry.overExtCount>0?' (×'+mult.toFixed(2)+' OE)':'');
+                const creeped=base+(entry.count||0)*(Math.abs(base)*(cfg.funVolMomCreepPct??10)/100);
+                const oe=entry.overExtCount||0;
+                if(oe===0) return creeped.toFixed(1)+'%';
+                const oeBase=1; const oeTighten=oe*(oeBase*(cfg.funOverExtScaling??50)/100);
+                return (oeBase+oeTighten).toFixed(1)+'% (OE×'+oe+')';
               })()"></span>
             </div>
           </div>
@@ -2355,7 +2358,7 @@ function pw() { return {
     funVolMomMin: 10,               // min vol mom % for gainers (default 10%)
     funVolMomLosersMin: -10,        // min vol mom % for losers — negative floor (default -10%)
     funVolMomCreepPct: 25,          // VM floor tightens by this % per re-entry within 6h window
-    funOverExtScaling: 2,           // VM threshold multiplier per over-extension hit within the lookback window
+    funOverExtScaling: 50,           // VM threshold tightening per OE hit: +N% of abs(base) per candle over-extended in lookback
     dcaDoublingEnabled: false, // each DCA add escalates by configured multiplier; faster rescue, higher margin cost
     dcaMultiplier: 2,          // per-stage notional multiplier when dcaDoublingEnabled (e.g. 2 = ×2, ×4; 3 = ×3, ×9)
   },
@@ -3504,7 +3507,7 @@ function pw() { return {
             const vmResult = this.calcFtVolMom(sym, tickEntry
               ? { symbol: sym, volume24h: tickEntry.volume24h, turnover24h: tickEntry.turnover24h, lastPrice: tickEntry.lastPrice }
               : null);
-            // funVolMomThreshold applies: base × (1 + creep×count) × factor^histOverExtCount
+            // funVolMomThreshold applies: base + creep + OE additive stack (+50% of base per hit)
             const vmMin = this.funVolMomThreshold(sym, isLoser, funHistOverExtCount);
             if (vmResult.pct != null && vmResult.pct < vmMin) {
               if (isLoser) vmBlockedLosers++; else vmBlockedGainers++;
@@ -6693,18 +6696,21 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     }
     const count    = this.funCreep[symbol]?.count || 0;
     const creepPct = this.cfg.funVolMomCreepPct ?? 10;
-    const overExtScaling = this.cfg.funOverExtScaling ?? 2;
-    // over-extension multiplier: scaling^histOverExtCount (1 hit = ×2, 2 hits = ×4, etc.)
-    const overExtMult = histOverExtCount > 0 ? Math.pow(overExtScaling, histOverExtCount) : 1;
+    const oeStepPct = this.cfg.funOverExtScaling ?? 50; // % per hit — used for gainers and as the multiplier step for losers
     if (isLoser) {
-      const base = this.cfg.funVolMomLosersMin ?? -10;
-      // creep toward zero: each re-entry relaxes the floor by creepPct% of abs(base)
+      const base    = this.cfg.funVolMomLosersMin ?? -10;
+      // Creep relaxes the floor toward zero each re-entry
       const creeped = base + count * (Math.abs(base) * creepPct / 100);
-      // over-extension scaling: multiply the magnitude (pushes further from zero, can go positive)
-      return creeped >= 0 ? creeped * overExtMult : -(Math.abs(creeped) * overExtMult);
+      if (histOverExtCount === 0) return creeped;
+      // Any OE hit: flip immediately to +1% and scale additively from there
+      const oeBase    = 1;
+      const oeTighten = histOverExtCount * (oeBase * oeStepPct / 100);
+      return oeBase + oeTighten;
     }
-    const base = this.cfg.funVolMomMin ?? 10;
-    return base * (1 + count * creepPct / 100) * overExtMult;
+    const base     = this.cfg.funVolMomMin ?? 10;
+    const creeped  = base * (1 + count * creepPct / 100);
+    const oeTighten = histOverExtCount * (base * oeStepPct / 100);
+    return creeped + oeTighten; // add to push higher (stricter for gainers)
   },
 
   funCreepBump(symbol) {
@@ -6736,9 +6742,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       this.funCreep[symbol] = { count: entry?.count || 0, overExtCount: 1, setAt: now };
     }
     const overExtCount = this.funCreep[symbol].overExtCount;
-    const scaling      = this.cfg.funOverExtScaling ?? 2;
-    const mult         = Math.pow(scaling, overExtCount);
-    this.log(`💰 ${symbol}: FUN over-ext bump — RSI6 ${rsi6.toFixed(1)} ≥ ${this.cfg.rsi6Max} | overExt ×${overExtCount} → VM ×${mult.toFixed(2)} (scaling ${scaling}^${overExtCount})`, 'info');
+    const oeStepPct    = this.cfg.funOverExtScaling ?? 50;
+    const oeTighten    = overExtCount * oeStepPct;
+    this.log(`💰 ${symbol}: FUN over-ext bump — RSI6 ${rsi6.toFixed(1)} ≥ ${this.cfg.rsi6Max} | overExt hits: ${overExtCount} → VM +${oeTighten}% (${overExtCount}×${oeStepPct}%)`, 'info');
     this.persist();
   },
 
@@ -6762,10 +6768,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       // Either no entry or expired window — create/refresh with look-back result
       this.funCreep[symbol] = { count: entry?.count || 0, overExtCount: histCount, setAt: now };
     }
-    const scaling = this.cfg.funOverExtScaling ?? 2;
-    const mult    = Math.pow(scaling, histCount);
+    const oeStepPct = this.cfg.funOverExtScaling ?? 50;
+    const oeTighten = histCount * oeStepPct;
     if (histCount > prevCount) {
-      this.log(`💰 ${symbol}: FUN OE sync — lookback ${histCount} candle(s) over-extended → VM ×${mult.toFixed(2)} (${scaling}^${histCount})`, 'info');
+      this.log(`💰 ${symbol}: FUN OE sync — lookback ${histCount} candle(s) over-extended → VM +${oeTighten}% (${histCount}×${oeStepPct}%)`, 'info');
       this.persist();
     }
   },
