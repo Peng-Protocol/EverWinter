@@ -829,6 +829,30 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
           </div>
           <div class="g" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
             <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+              <span style="color:#ff4560">FUND FADING</span>
+              <label class="tog" style="margin:0" @click.prevent="if(!cfgLocked){cfg.fadeEnabled=!cfg.fadeEnabled;persist()}">
+                <div class="tog-t" :class="cfg.fadeEnabled?'on':''"><div class="tog-k"></div></div>
+                <span class="tog-l" x-text="cfg.fadeEnabled?'ON':'OFF'"></span>
+              </label>
+            </div>
+            <div :style="cfg.fadeEnabled?'':'opacity:.4;pointer-events:none'">
+              <div style="font-size:9.5px;color:var(--text-lo);margin-bottom:8px;line-height:1.5">Short losers with strongly negative funding rates. 1× notional at −FADE threshold, 2× notional at −FADE 2× threshold.</div>
+              <div class="lbl">FADE threshold <b x-text="'-'+cfg.fadeFundingLow.toFixed(2)+'%'"></b></div>
+              <input type="range" min="0.01" max="0.10" step="0.01"
+                :value="cfg.fadeFundingLow"
+                @input="cfg.fadeFundingLow=parseFloat($event.target.value);persist()"
+                :disabled="bot.running||!cfg.fadeEnabled">
+              <div style="font-size:9.5px;color:var(--text-lo);margin-top:3px">Funding ≤ −threshold → FADE (1×).</div>
+              <div class="lbl" style="margin-top:8px">FADE 2× threshold <b x-text="'-'+cfg.fadeFundingHigh.toFixed(2)+'%'"></b></div>
+              <input type="range" min="0.05" max="0.20" step="0.01"
+                :value="cfg.fadeFundingHigh"
+                @input="cfg.fadeFundingHigh=parseFloat($event.target.value);persist()"
+                :disabled="bot.running||!cfg.fadeEnabled">
+              <div style="font-size:9.5px;color:var(--text-lo);margin-top:3px">Funding ≤ −threshold → FADE 2× (2× notional).</div>
+            </div>
+          </div>
+          <div class="g" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+            <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
               <span>FUNDING RATE FILTER</span>
               <label class="tog" style="margin:0" @click.prevent="if(!cfgLocked){cfg.fundingEnabled=!cfg.fundingEnabled;persist()}">
                 <div class="tog-t" :class="cfg.fundingEnabled?'on':''"><div class="tog-k"></div></div>
@@ -1058,6 +1082,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   x-text="p.pendingClose?'RETRY CLOSE':(p.phase==='normal'?'Active':p.phase==='reduce'?'TP → 3%':'CLOSING')"></span>
                 <span x-show="p._ft && !p._advFt" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(160,100,255,.45);color:#c084fc;background:rgba(160,100,255,.12);letter-spacing:1px">FT</span>
                 <span x-show="p._ft && p._advFt" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,255,.55);color:#b464ff;background:rgba(180,100,255,.10);letter-spacing:1px">⚡ ADV</span>
+                <span x-show="p._fade" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,69,96,.45);color:#ff4560;background:rgba(255,69,96,.10);letter-spacing:1px" x-text="p._fadeBadge??'FADE'"></span>
               </div>
               <div class="pos-pnl" :class="p.upnl>=0?'p':'l'"
                    x-text="(p.upnl>=0?'+':'')+p.upnl.toFixed(2)+' USDT'"></div>
@@ -1837,6 +1862,9 @@ function ew() { return {
     laggardProfitOffset: 50,     // EV multiplier offset %: positive = protective, negative = aggressive
     laggardAutoReduce: true,     // auto-push FT positions to TP reduce on congestion
     laggardAutoReduceThreshold: 4, // position count threshold to trigger auto-reduce
+    fadeEnabled: false,
+    fadeFundingLow:  0.05,  // −0.05% per 8hr → FADE (1×)
+    fadeFundingHigh: 0.10,  // −0.10% per 8hr → FADE 2× (2× notional)
   },
   connected: { api:false },
   ui: { connecting:false, connectErr:'', scanning:false, refreshing:false },
@@ -2351,8 +2379,8 @@ function ew() { return {
   // Only gainer closes should call this — FT passes source='gainer' check.
   // source='gainer' is the only value that bumps; all other sources are no-ops.
   rodeoCreepBump(pos) {
-    // FT closes must NOT bump rodeo creep — gainers only.
-    if (pos._ft) return;
+    // FT and FADE closes must NOT bump rodeo creep — gainers only.
+    if (pos._ft || pos._fade) return;
     const sym      = pos.symbol;
     const existing = this.rodeoCreep[sym];
     const newCount = existing ? existing.closedCount + 1 : 1;
@@ -2903,10 +2931,122 @@ function ew() { return {
         this.log(`Max slots reached (${effectivePos}/${this.cfg.maxPos}).`, 'warn');
       }
 
+      if (this.cfg.fadeEnabled) await this.runFadeScan(allTickers);
+
       await this.refreshBalance();
 
     } catch(e) { this.log('Scan error: '+e.message, 'error'); }
     finally { this.ui.scanning=false; }
+  },
+
+  // ── FADE SCAN ──
+  // Runs after the gainers scan. Finds losers (negative 24hr change) with strongly
+  // negative funding rates and opens FADE shorts at 1× or 2× notional.
+  async runFadeScan(allTickers) {
+    const loserPool = allTickers.filter(t =>
+      t.symbol.endsWith('USDT') &&
+      t.symbol !== 'BTCUSDT' &&
+      parseFloat(t.lastPrice || 0) >= 0.001 &&
+      parseFloat(t.price24hPcnt || 0) < 0
+    );
+    for (const t of loserPool) {
+      const sym    = t.symbol;
+      const change = parseFloat(t.price24hPcnt || 0) * 100;
+      const price  = parseFloat(t.lastPrice || 0);
+      if (this.positions.find(p => p.symbol === sym)) continue;
+      if (this._symbolBanlist[sym]) continue;
+      const fr = await this.fetchFundingRate(sym);
+      if (fr === null || fr >= -(this.cfg.fadeFundingLow ?? 0.05)) continue;
+      const fadeMult  = fr <= -(this.cfg.fadeFundingHigh ?? 0.10) ? 2 : 1;
+      const fadeBadge = fadeMult === 2 ? 'FADE 2x' : 'FADE';
+      if (this.freeSlots() < fadeMult) break;
+      const rsi6  = await this.fetchRSI(sym, 6);
+      const rsi12 = await this.fetchRSI(sym, 12);
+      const rsi24 = await this.fetchRSI(sym, 24);
+      if (rsi6 !== null && rsi6 >= this.cfg.rsi6Max) continue; // over-extended
+      await this.fadeOpenShort(sym, price, fr, fadeMult, fadeBadge, change, rsi6, rsi12, rsi24);
+    }
+  },
+
+  // ── FADE OPEN SHORT ──
+  async fadeOpenShort(sym, price, fundingRate, fadeMult, fadeBadge, change24h, rsi6, rsi12, rsi24) {
+    if (this._symbolBanlist[sym]) return;
+    if (this.positions.find(p => p.symbol === sym)) return;
+    const instr = await this.getInstrInfo(sym);
+    if (!instr) { this.log(`${sym}: FADE — instrument not supported, skipping`, 'warn'); return; }
+    if (instr.minPrice > 0 && price < instr.minPrice) return;
+    const levResult = this.resolveEffectiveLeverage(sym, instr);
+    if (!levResult) return;
+    const effectiveLev   = levResult.lev;
+    const entryNotional  = (this.cfg.minNotional ?? 6) * fadeMult;
+    const rawQty         = entryNotional / price;
+    const qty            = this.snapQty(rawQty, instr);
+    if (qty <= 0) {
+      this.log(`${sym}: FADE — qty ${rawQty.toFixed(4)} below minQty — skipping`, 'warn');
+      return;
+    }
+    const actualNotional = qty * price;
+    const marginCost     = actualNotional / effectiveLev;
+    if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) {
+      this.log(`${sym}: FADE — notional $${actualNotional.toFixed(2)} below exchange minimum — skipping`, 'warn');
+      return;
+    }
+    if (!this.checkDcaBalance(sym, effectiveLev)) return;
+    await this.setLeverage(sym, effectiveLev);
+    const oid = await this.placeOrder(sym, 'Sell', 'Market', qty, price);
+    if (oid === 'NOT_LIVE' || !oid) return;
+    this.log(`💸 ▼ ${fadeBadge} SHORT ${sym} @ ~${fmtP(price)} | FR:${fundingRate.toFixed(4)}% | Qty:${qty} | Notional:$${actualNotional.toFixed(2)} | Margin:$${marginCost.toFixed(2)}`, 'trade');
+    const fillPrice = await this.waitForPosition(sym);
+    if (!fillPrice) {
+      await this.cancelAllConditionals(sym);
+      this.log(`${sym}: FADE entry aborted (no fill confirmed) — conditionals cancelled.`, 'warn');
+      return;
+    }
+    const effTp0  = this.cfg.entryTpRoi;
+    const tpPrice = this.snapPrice(fillPrice * (1 - (effTp0 / 100) / effectiveLev), instr);
+    if (instr.minPrice > 0 && tpPrice < instr.minPrice) {
+      this.log(`${sym}: FADE — TP below minPrice, skipping TP set`, 'warn');
+    } else {
+      await this.setTP(sym, tpPrice);
+    }
+    const addNotional = (this.cfg.addNotional ?? 6) * fadeMult;
+    const orders = [{ label:'Entry', price:fillPrice, qty, type:'tp', filled:false, orderId:null }];
+    for (let i = 0; i < 3; i++) {
+      const addPrice      = this.snapPrice(price * (1 + this.cfg.addPcts[i] / 100), instr);
+      const stageNotional = this.cfg.dcaDoublingEnabled
+        ? addNotional * Math.pow(this.cfg.dcaMultiplier ?? 2, i + 1)
+        : addNotional;
+      const addQty = this.snapQty(stageNotional / addPrice, instr);
+      if (addQty <= 0) { this.log(`${sym} FADE Add${i+1}: qty below min, skipping`, 'warn'); continue; }
+      const addTp = this.snapPrice(addPrice * (1 - (this.cfg.tp[i+1] / 100) / effectiveLev), instr);
+      const cid   = await this.placeConditional(sym, 'Sell', addQty, addTp, addPrice);
+      orders.push({ label:`Add${i+1} +${this.cfg.addPcts[i]}%`, price:addPrice, qty:addQty, tpPrice:addTp, type:'cond', filled:false, orderId:cid });
+    }
+    const _existingPos = this.positions.find(p => p.symbol === sym);
+    if (_existingPos) {
+      _existingPos.markPrice  = fillPrice;
+      _existingPos.upnl       = 0;
+      _existingPos._fade      = true;
+      _existingPos._fadeMult  = fadeMult;
+      _existingPos._fadeBadge = fadeBadge;
+      if (orders.length > 1) _existingPos.orders = orders;
+    } else {
+      this.positions.push({
+        id: Date.now() + Math.random(), symbol: sym,
+        _fade: true, _fadeMult: fadeMult, _fadeBadge: fadeBadge,
+        entryPrice: fillPrice, originalEntryPrice: fillPrice, markPrice: fillPrice,
+        totalSize: qty, leverage: effectiveLev, margin: marginCost,
+        change24h: change24h != null ? parseFloat(change24h).toFixed(2) : null,
+        rsi6: rsi6 ?? null, rsi12: rsi12 ?? null, rsi24: rsi24 ?? null,
+        fundingRate: fundingRate ?? null,
+        upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
+        currentTpPrice: tpPrice, tpPct: effTp0, dcaStage: 0, orders,
+        _laggardInitialEV: marginCost * (effTp0 / 100),
+        _laggardLostValue: 0,
+      });
+    }
+    this.persist();
+    await this.refreshBalance();
   },
 
   async fetchRSI(symbol, period) {
@@ -3857,6 +3997,7 @@ function ew() { return {
                         : 'CLOSE';
       const typeBadge = t._advFt              ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,255,.55);color:#b464ff;background:rgba(180,100,255,.12);letter-spacing:1px">ADV</span>`
                       : t._ft                 ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(160,100,255,.45);color:#c084fc;background:rgba(160,100,255,.12);letter-spacing:1px">FT</span>`
+                      : t._fade               ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,69,96,.45);color:#ff4560;background:rgba(255,69,96,.10);letter-spacing:1px">${t._fadeBadge ?? 'FADE'}</span>`
                       : '';
       const pnl         = t.pnl    ?? 0;
       const pnlPct      = t.pnlPct ?? 0;
@@ -5731,7 +5872,8 @@ function ew() { return {
   // ── SLOT ACCOUNTING ──
   // positionSizing: FTs=2 slots, gainers=1. Disabled=all 1.
   posSlotWeight(pos) {
-    if (!this.cfg.positionSizing) return 1;
+    if (pos._fade)                 return pos._fadeMult ?? 1;
+    if (!this.cfg.positionSizing)  return 1;
     if (pos._ft)                   return 2;
     return 1;
   },
