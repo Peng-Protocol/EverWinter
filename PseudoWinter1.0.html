@@ -2151,6 +2151,7 @@ function pw() { return {
     ftVolMomEnabled: true,
     ftVolMomMin: 5,
     ftVolMomCreepPct: 25,  // vol mom req increase % per rodeo/tick above 2
+    tpReduceMins: 45,
     runtimeHours: 12,
     advFtEnabled: true,
     advFtThreshold: 4,     // over-extension hits within 3h to promote to ADV FT
@@ -2364,13 +2365,21 @@ function pw() { return {
       }
       if (s.positions?.length) {
         this.savedPositions = s.positions;
-        this.positions = s.positions.map(p => ({
-          ...p,
-          markPrice: p.markPrice || p.entryPrice,
-          upnl: p.upnl || 0,
-          phase: this.calcPhase(p.openedAt, p.phase),
-          dcaStage: p.dcaStage ?? this.inferStage(p, null),
-        }));
+        this.positions = s.positions.map(p => {
+          const phase = this.calcPhase(p.openedAt, p.phase);
+          const needsReduceTp = phase === 'reduce' && (p.tpPct == null || p.tpPct > 3);
+          return {
+            ...p,
+            markPrice: p.markPrice || p.entryPrice,
+            upnl: p.upnl || 0,
+            phase,
+            dcaStage: p.dcaStage ?? this.inferStage(p, null),
+            ...(needsReduceTp ? {
+              tpPct: 3,
+              currentTpPrice: p.entryPrice * (1 - (0.03 / p.leverage)),
+            } : {}),
+          };
+        });
       }
     } catch(e) {}
     this.$nextTick(() => { this.renderTradeFeed(); this.renderPotGainers(); });
@@ -4178,6 +4187,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
             dcaStage:         pos.dcaStage || 0,
             duration,
             closedAt,
+            ...(pos._fun ? { _fun: true, _funIsLoser: pos._funIsLoser ?? false, _funCreepCount: pos._funCreepCount ?? 0, _funSubType: pos._funSubType ?? 'HFG', _funMult: pos._funMult ?? 3, _funBadge: pos._funBadge ?? '3xx' } : {}),
           });
           this.log(
             `🌑 ${pos.symbol}: gap — closed [${closeReason}] @ ${fmtP(closePrice)} (${new Date(closedAt).toTimeString().slice(0,8)}) | PnL ${pnl>=0?'+':''}${pnl.toFixed(2)} USDT [${isWin?'WIN':'LOSS'}]`,
@@ -4554,6 +4564,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
     if (_auditRunning) return; // gap-fill audit is in progress — defer until it completes
     if (this._watchRunning) return; // prevent concurrent execution
     this._watchRunning = true;
+    try {
     const now = Date.now();
 
     const hasPositions = this.positions.some(p => p._pseudo);
@@ -4754,21 +4765,19 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       if (age >= forceMs && pos.phase !== 'force') {
         pos.phase = 'force';
         this.persist();
-      } else if (age >= reduceMs && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3))) {
+      } else if (age >= reduceMs && pos.phase === 'normal') {
         pos.phase = 'reduce';
-        if (pos.tpPct > 3) {
-          this.sess.tpReduce++;
-          const currentUROI = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
-          if (currentUROI >= 3 || pos.entryPrice * (1-(0.03/pos.leverage)) >= mark) {
-            this.log(`🌑 ${pos.symbol}: ${''}​${this.cfg.tpReduceMins}min — UROI ${currentUROI.toFixed(1)}% — closing now`, 'warn');
-            await this.pseudoClosePosition(pos, 'force');
-            continue;
-          }
-          pos.currentTpPrice = pos.entryPrice * (1 - (0.03 / pos.leverage));
-          pos.tpPct = 3;
-          this.log(`🌑 ${pos.symbol}: ${''}​${this.cfg.tpReduceMins}min — TP reduced to 3% (${fmtP(pos.currentTpPrice)})`, 'warn');
-          this.persist();
+        this.sess.tpReduce++;
+        const currentUROI = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
+        if (currentUROI >= 3 || pos.entryPrice * (1-(0.03/pos.leverage)) >= mark) {
+          this.log(`🌑 ${pos.symbol}: ${''}​${this.cfg.tpReduceMins}min — UROI ${currentUROI.toFixed(1)}% — closing now`, 'warn');
+          await this.pseudoClosePosition(pos, 'force');
+          continue;
         }
+        pos.currentTpPrice = pos.entryPrice * (1 - (0.03 / pos.leverage));
+        pos.tpPct = 3;
+        this.log(`🌑 ${pos.symbol}: ${''}​${this.cfg.tpReduceMins}min — TP reduced to 3% (${fmtP(pos.currentTpPrice)})`, 'warn');
+        this.persist();
       }
 
       if (pos.phase === 'reduce' && this.positions.find(x => x.id === pos.id)) {
@@ -4876,7 +4885,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         this.persist();
       }
     }
-    this._watchRunning = false;
+    } finally {
+      this._watchRunning = false;
+    }
   },
 
   renderTradeFeed() {
