@@ -123,9 +123,6 @@ Lists all symbols currently under active FUN vol momentum creep. Each entry show
 ### Extenders Counter
 Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold the ticker is promoted to the FT candidate roster, and the effective scaled VM threshold is shown.
 
-### Pile-ons Counter
-Similar to the Extenders Counter, but tracks tickers that have returned over-shorted.
-
 ### Activity Log
 A capped reverse-chronological event feed, holding a maximum of (300) entries. Each entry is timestamped and colour-coded by type: `scan` events (light blue) cover scan cycle summaries and FT roster changes; `trade` events (ice blue) record every order open, DCA trigger, and close; `success` entries (green) confirm connections and bot start; `warn` entries (amber) cover Rodeo Creep registrations, TP reductions, and non-fatal anomalies; `error` entries (red) flag API failures and scan errors; and `info` entries (muted) carry general status messages. The log is purely observational — it has no effect on bot state and is cleared on **Clear Stats**.
 
@@ -163,19 +160,25 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 
 ## ChartWinter
 
-**ChartWinter** (`ChartWinter.html`) is a standalone companion charting tool in the same single-file format. It deviates by having a gray/ash visual theme, it has a compatible config schema with EverWinter, but operates entirely independently — no shared state, no inter-app communication.
+**ChartWinter** (`ChartWinter.html`) is a standalone companion charting tool in the same single-file format. It uses a gray/ash visual theme and has a compatible config schema with EverWinter, but operates entirely independently — no shared state, no inter-app communication.
 
 ### Core Function
-ChartWinter runs its own configurable top-gainer scan (identical `topN`, `scanMins`, RSI gate, and funding-rate filter parameters) and renders a candlestick chart with a separate volume pane for the selected ticker. RSI values (RSI6, RSI12, RSI24) are computed client-side using Wilder's method, matching PseudoWinter's implementation exactly.
+ChartWinter runs its own configurable scan (identical `topN`, `scanMins`, RSI gate, and funding-rate filter parameters) and renders a candlestick chart with a separate volume pane for the selected ticker. RSI values (RSI6, RSI12, RSI24) are computed client-side using Wilder's method, matching PseudoWinter's implementation exactly. Auto-scan on load is off by default; the last auto-scan state is persisted across sessions.
 
 ### Scan Results Panel
-The left panel lists scan results with per-symbol price, (24)-hour change, funding rate, and RSI6. Results can be sorted by change or RSI6. A full-text search mode lets you load any Bybit ticker directly, bypassing the scan filter.
+The left panel lists scan results with per-symbol price, 24-hour change, funding rate, RSI6/12/24, and strategy badges. Badges include `GAIN`, `⚡EXT` (over-extended), `🔻Over-shorted`, `💸 FUN` (funding rate ≥ 0.05%), and `🔥 FUN` (funding rate ≥ 0.1%). Results can be sorted by 24h change, RSI6, funding rate, or alphabetically.
+
+### Scan Direction
+A **Gainers / Losers** toggle switches the scan between top gainers (default: +3% to +500%) and top losers (−3% to −99%). The price change range is also manually configurable in Settings and supports negative values. Switching modes presets the range but does not lock it.
+
+### Ticker Search & Pinning
+A full-text search mode loads any Bybit ticker directly, bypassing the scan filter. Individual tickers can be pinned; pinned tickers appear at the top of every scan and search list, separated by a divider. Pins are persisted across sessions. The scan results column shows N candidates (configurable) from the active scan direction.
 
 ### Charting
-Charts are rendered via LightweightCharts. Kline data is cached per symbol and is exportable/importable as JSON. A configurable poll interval auto-refreshes the active chart. Lookback depth and the number of extended candles rendered are configurable.
+Charts are rendered via LightweightCharts. Kline data is cached per symbol and is exportable/importable as JSON. A configurable poll interval auto-refreshes the active chart. Lookback depth and the number of extended candles are configurable.
 
-### Persistent Price Lines
-Users can draw, label, and colour-code horizontal price lines on any ticker. Lines are persisted per symbol in `localStorage` and survive page reloads. A **Manage Lines** modal allows editing and deletion.
+### Persistent Lines
+Users can draw and colour-code **horizontal price lines** and **vertical candle lines** on any chart. Horizontal lines are created directly via the lines modal (no chart click required) and edited by entering a price value. Vertical lines are pinned to a specific candle's timestamp by clicking the chart after activating the `✏️│` button; they re-position correctly on scroll, zoom, and resize. Both line types are persisted per symbol in `localStorage`. A **Lines** modal (opened via `✏️─`) manages horizontal and vertical lines together. The Settings panel shows a read-only summary of saved lines per ticker (`2H 1V` format).
 
 ### Settings Export / Import
 All ChartWinter settings can be exported and re-imported as JSON, independent of EverWinter's state.
