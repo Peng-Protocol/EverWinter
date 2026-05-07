@@ -1335,7 +1335,8 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   })()"></span>
                 <span x-show="p._ft && !p._advFt && !p._pileOnAdvFt" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(160,100,255,.45);color:#c084fc;background:rgba(160,100,255,.12);letter-spacing:1px">FT</span>
                 <span x-show="p._advFt && !p._pileOnAdvFt" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,255,.55);color:#b464ff;background:rgba(180,100,255,.10);letter-spacing:1px">⚡ ADV</span>
-                <span x-show="p._fun" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,40,.55);color:#c47830;background:rgba(160,80,20,.10);letter-spacing:1px"><span style="filter:sepia(1) saturate(0.6) brightness(0.75) hue-rotate(-10deg)">💰</span> FUN <span x-text="p._funBadge??''"></span></span>
+                <span x-show="p._fun && !(p._funBadge&&p._funBadge.startsWith('FADE'))" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,40,.55);color:#c47830;background:rgba(160,80,20,.10);letter-spacing:1px"><span style="filter:sepia(1) saturate(0.6) brightness(0.75) hue-rotate(-10deg)">💰</span> FUN <span x-text="p._funBadge??''"></span></span>
+                <span x-show="p._fun && (p._funBadge&&p._funBadge.startsWith('FADE'))" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,69,96,.45);color:#ff4560;background:rgba(255,69,96,.10);letter-spacing:1px" x-text="p._funBadge??'FADE'"></span>
               </div>
               <div class="pos-pnl" :class="p.upnl>=0?'p':'l'"
                    x-text="(p.upnl>=0?'+':'')+p.upnl.toFixed(2)+' USDT'"></div>
@@ -2921,11 +2922,12 @@ function pw() { return {
           if (this.positions.find(p => p.symbol === sym)) continue;
           const fr = await this.fetchFundingRate(sym).catch(() => null);
           if (fr === null) continue;
-          if (fr <= 0) {
-            frNegativeBlocked++;
-            continue;
-          }
           const isLoser = !gainerSyms.has(sym);
+          if (fr <= 0) {
+            // Allow FADE candidates (negative-FR losers) through to funClassify
+            const loGate = this.cfg.funFundingLow ?? 0.05;
+            if (!isLoser || fr > -loGate) { frNegativeBlocked++; continue; }
+          }
 
           // ── Classify sub-type; skip if below positive low-fund floor ──
           const funClass = this.funClassify(fr, isLoser);
@@ -2936,15 +2938,17 @@ function pw() { return {
           const eff = this.positions.reduce((n, p) => n + (p._fun ? (p._funMult ?? 2) : p._ft ? 2 : 1), 0);
           if (eff + mult > this.cfg.maxPos) break;
 
-          // ── FR creep gate ──
+          // ── FR creep gate — positive-FR entries only; FADE has negative FR so skip ──
           // After the first close of a symbol, frThreshold is seeded at +1.0% and multiplied ×1.5 per close.
           // TTL expiry resets the whole funCreep entry, lifting the gate automatically after 6h.
-          const creepEntry = this.funCreep[sym];
-          const CREEP_TTL  = 6 * 3600 * 1000;
-          if (creepEntry && (Date.now() - creepEntry.setAt) < CREEP_TTL && creepEntry.frThreshold != null) {
-            if (fr < creepEntry.frThreshold) {
-              frCreepBlocked++;
-              continue;
+          if (fr > 0) {
+            const creepEntry = this.funCreep[sym];
+            const CREEP_TTL  = 6 * 3600 * 1000;
+            if (creepEntry && (Date.now() - creepEntry.setAt) < CREEP_TTL && creepEntry.frThreshold != null) {
+              if (fr < creepEntry.frThreshold) {
+                frCreepBlocked++;
+                continue;
+              }
             }
           }
 
@@ -2994,7 +2998,7 @@ function pw() { return {
           const funRsi12 = await this.fetchRSI(sym, 12);
           const funRsi24 = await this.fetchRSI(sym, 24);
 
-          const vmEnabled = isLoser ? this.cfg.funVolMomLosersEnabled : this.cfg.funVolMomGainersEnabled;
+          const vmEnabled = vmBase !== null && (isLoser ? this.cfg.funVolMomLosersEnabled : this.cfg.funVolMomGainersEnabled);
           if (vmEnabled) {
             const tickEntry = this._volBaseline[sym];
             const vmResult = this.calcFtVolMom(sym, tickEntry
@@ -3016,7 +3020,7 @@ function pw() { return {
           // Requires last candle volume to be positive (above average) but below the spike cap (+funLsaFactor%).
           // Droughts (≤ avg), neutral, and spikes are all blocked.
           let funLsaRatio = null;
-          if (isLoser && this.cfg.funLsaEnabled) {
+          if (isLoser && this.cfg.funLsaEnabled && vmBase !== null) {
             const cached = this._klineCache[`${sym}_15`];
             if (cached?.volumes?.length >= 4) {
               const vols         = cached.volumes;
@@ -4965,7 +4969,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         : '';
 
       const funBadge = t._fun
-        ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,40,.55);color:#c47830;background:rgba(160,80,20,.10);letter-spacing:1px"><span style="filter:sepia(1) saturate(0.6) brightness(0.75) hue-rotate(-10deg)">💰</span> FUN ${t._funBadge ?? ''}</span>`
+        ? (t._funBadge?.startsWith('FADE')
+            ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,69,96,.45);color:#ff4560;background:rgba(255,69,96,.10);letter-spacing:1px">${t._funBadge}</span>`
+            : `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,40,.55);color:#c47830;background:rgba(160,80,20,.10);letter-spacing:1px"><span style="filter:sepia(1) saturate(0.6) brightness(0.75) hue-rotate(-10deg)">💰</span> FUN ${t._funBadge ?? ''}</span>`)
         : '';
       const durStr = (() => { try { return this.fmtDur(t.duration); } catch(e) { return '—'; } })();
       const tsStr  = (() => { try { return 'Closed: ' + this.fmtTs(t.closedAt); } catch(e) { return 'Closed: —'; } })();
@@ -5249,11 +5255,18 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   // vmBase: raw VM floor for this sub-type (before creep/OE scaling)
   // badge: display label suffix e.g. '3xx', '2xx', 'x2', 'x1'
   funClassify(fr, isLoser) {
-    if (fr == null || fr <= 0) return null;
-    const hiGate  = this.cfg.funFundingHigh ?? 0.1;
-    const loGate  = this.cfg.funFundingLow  ?? 0.05;
+    if (fr == null) return null;
+    const hiGate    = this.cfg.funFundingHigh ?? 0.1;
+    const loGate    = this.cfg.funFundingLow  ?? 0.05;
     const hfgVmBase = this.cfg.funVolMomMin ?? 10;
     const hflVmBase = this.cfg.funVolMomLosersMin ?? -10;
+    // FADE: negative-funding losers — vmBase null = VM gate skipped
+    if (fr <= 0 && isLoser) {
+      if (fr <= -hiGate) return { subType: 'FADE2x', mult: 2, vmBase: null, badge: 'FADE 2x' };
+      if (fr <= -loGate) return { subType: 'FADE',   mult: 1, vmBase: null, badge: 'FADE' };
+      return null;
+    }
+    if (fr <= 0) return null;
     if (!isLoser) {
       if (fr >= hiGate) return { subType: 'HFG', mult: 3, vmBase: hfgVmBase,       badge: '3xx' };
       if (fr >= loGate) return { subType: 'LFG', mult: 2, vmBase: hfgVmBase * 2,   badge: '2xx' };
