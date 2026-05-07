@@ -2911,7 +2911,7 @@ function pw() { return {
           .slice(0, this.cfg.funLoserN);
         const funPool = [...addPool(gainers), ...addPool(losers)];
 
-        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, oeGraylisted = 0, proximityBlocked = 0, frCreepBlocked = 0;
+        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, oeGraylisted = 0, proximityBlocked = 0, frCreepBlocked = 0, frNegativeBlocked = 0;
         const gainerSyms = new Set(gainers.map(t => t.symbol));
         for (const t of funPool) {
           const sym   = t.symbol;
@@ -2921,9 +2921,13 @@ function pw() { return {
           if (this.positions.find(p => p.symbol === sym)) continue;
           const fr = await this.fetchFundingRate(sym).catch(() => null);
           if (fr === null) continue;
+          if (fr <= 0) {
+            frNegativeBlocked++;
+            continue;
+          }
           const isLoser = !gainerSyms.has(sym);
 
-          // ── Classify sub-type; skip if below low-fund floor ──
+          // ── Classify sub-type; skip if below positive low-fund floor ──
           const funClass = this.funClassify(fr, isLoser);
           if (!funClass) continue;
           const { subType, mult, vmBase, badge } = funClass;
@@ -2933,12 +2937,12 @@ function pw() { return {
           if (eff + mult > this.cfg.maxPos) break;
 
           // ── FR creep gate ──
-          // After the first close of a symbol, frThreshold is seeded at 1.0% and multiplied ×1.5 per close.
+          // After the first close of a symbol, frThreshold is seeded at +1.0% and multiplied ×1.5 per close.
           // TTL expiry resets the whole funCreep entry, lifting the gate automatically after 6h.
           const creepEntry = this.funCreep[sym];
           const CREEP_TTL  = 6 * 3600 * 1000;
           if (creepEntry && (Date.now() - creepEntry.setAt) < CREEP_TTL && creepEntry.frThreshold != null) {
-            if (Math.abs(fr) < creepEntry.frThreshold) {
+            if (fr < creepEntry.frThreshold) {
               frCreepBlocked++;
               continue;
             }
@@ -3040,7 +3044,8 @@ function pw() { return {
         const oeNote      = oeGraylisted        > 0 ? ` | OE-gray: ${oeGraylisted}L` : '';
         const proxNote    = proximityBlocked    > 0 ? ` | RSI-prox: ${proximityBlocked}` : '';
         const frCreepNote = frCreepBlocked      > 0 ? ` | FR-creep: ${frCreepBlocked}` : '';
-        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${oeNote}${proxNote}${frCreepNote}.`, 'scan');
+        const frNegNote   = frNegativeBlocked   > 0 ? ` | FR≤0: ${frNegativeBlocked}` : '';
+        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${oeNote}${proxNote}${frCreepNote}${frNegNote}.`, 'scan');
 
         // Prune expired creep entries so they don't linger in the UI
         const _now = Date.now();
@@ -3435,6 +3440,10 @@ function pw() { return {
 
   async funOpenShort(sym, price, fundingRate, isLoser = false, change24h = null, rsi6 = null, rsi12 = null, rsi24 = null, nextFundingTime = null, fundingIntervalMs = null, histOverExtCount = 0, lsaRatio = null, subType = 'HFG', mult = 3, badge = '3xx') {
     if (this._symbolBanlist[sym]) return false;
+    if (fundingRate == null || fundingRate <= 0) {
+      this.log(`💰 ${sym}: FUN entry blocked — funding rate ${fundingRate == null ? '—' : fundingRate.toFixed(4) + '%'} is not positive`, 'warn');
+      return false;
+    }
     const instr = await this.getInstrInfo(sym);
     if (!instr) { this.log(`💰 ${sym}: FUN — instrument not supported`, 'warn'); return false; }
     const levResult = this.resolveEffectiveLeverage(sym, instr);
@@ -5233,25 +5242,25 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     };
   },
 
-  // Classifies a FUN candidate into one of four sub-types based on funding rate and gainer/loser status.
-  // Returns { subType, mult, vmBase, badge } or null if FR is below the low-fund floor.
+  // Classifies a FUN candidate into one of four sub-types based on positive funding rate and gainer/loser status.
+  // Returns { subType, mult, vmBase, badge } or null if FR is non-positive or below the low-fund floor.
   // subType: 'HFG' | 'LFG' | 'HFL' | 'LFL'
   // mult: notional multiplier (1/2/3) — also equals slot cost
   // vmBase: raw VM floor for this sub-type (before creep/OE scaling)
   // badge: display label suffix e.g. '3xx', '2xx', 'x2', 'x1'
   funClassify(fr, isLoser) {
-    const absFr   = Math.abs(fr);
+    if (fr == null || fr <= 0) return null;
     const hiGate  = this.cfg.funFundingHigh ?? 0.1;
     const loGate  = this.cfg.funFundingLow  ?? 0.05;
     const hfgVmBase = this.cfg.funVolMomMin ?? 10;
     const hflVmBase = this.cfg.funVolMomLosersMin ?? -10;
     if (!isLoser) {
-      if (absFr >= hiGate) return { subType: 'HFG', mult: 3, vmBase: hfgVmBase,       badge: '3xx' };
-      if (absFr >= loGate) return { subType: 'LFG', mult: 2, vmBase: hfgVmBase * 2,   badge: '2xx' };
+      if (fr >= hiGate) return { subType: 'HFG', mult: 3, vmBase: hfgVmBase,       badge: '3xx' };
+      if (fr >= loGate) return { subType: 'LFG', mult: 2, vmBase: hfgVmBase * 2,   badge: '2xx' };
       return null;
     }
-    if (absFr >= hiGate) return { subType: 'HFL', mult: 2, vmBase: hflVmBase,          badge: 'x2'  };
-    if (absFr >= loGate) return { subType: 'LFL', mult: 1, vmBase: hflVmBase / 2,      badge: 'x1'  };
+    if (fr >= hiGate) return { subType: 'HFL', mult: 2, vmBase: hflVmBase,          badge: 'x2'  };
+    if (fr >= loGate) return { subType: 'LFL', mult: 1, vmBase: hflVmBase / 2,      badge: 'x1'  };
     return null;
   },
 
