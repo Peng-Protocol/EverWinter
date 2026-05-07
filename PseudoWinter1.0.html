@@ -2255,10 +2255,14 @@ function pw() { return {
         _watchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
       }
       // Run gap-fill audit on startup (was previously triggered by autoConnect)
-      setTimeout(() => this.pseudoAuditGap(), 500);
+      setTimeout(() => { void this.pseudoAuditGap(); }, 500);
 
       document.addEventListener('visibilitychange', async () => {
         if (document.visibilityState !== 'visible') return;
+
+        if (this.positions.length || this.potGainers.length) {
+          await this.pseudoAuditGap();
+        }
 
         if (this.bot.running) {
           const elapsed = Date.now() - this.bot.lastScanAt;
@@ -2907,7 +2911,7 @@ function pw() { return {
           .slice(0, this.cfg.funLoserN);
         const funPool = [...addPool(gainers), ...addPool(losers)];
 
-        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, oeGraylisted = 0, proximityBlocked = 0, frCreepBlocked = 0;
+        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, oeGraylisted = 0, proximityBlocked = 0, frCreepBlocked = 0, frNegativeBlocked = 0;
         const gainerSyms = new Set(gainers.map(t => t.symbol));
         for (const t of funPool) {
           const sym   = t.symbol;
@@ -2917,9 +2921,13 @@ function pw() { return {
           if (this.positions.find(p => p.symbol === sym)) continue;
           const fr = await this.fetchFundingRate(sym).catch(() => null);
           if (fr === null) continue;
+          if (fr <= 0) {
+            frNegativeBlocked++;
+            continue;
+          }
           const isLoser = !gainerSyms.has(sym);
 
-          // ── Classify sub-type; skip if below low-fund floor ──
+          // ── Classify sub-type; skip if below positive low-fund floor ──
           const funClass = this.funClassify(fr, isLoser);
           if (!funClass) continue;
           const { subType, mult, vmBase, badge } = funClass;
@@ -2929,12 +2937,12 @@ function pw() { return {
           if (eff + mult > this.cfg.maxPos) break;
 
           // ── FR creep gate ──
-          // After the first close of a symbol, frThreshold is seeded at 1.0% and multiplied ×1.5 per close.
+          // After the first close of a symbol, frThreshold is seeded at +1.0% and multiplied ×1.5 per close.
           // TTL expiry resets the whole funCreep entry, lifting the gate automatically after 6h.
           const creepEntry = this.funCreep[sym];
           const CREEP_TTL  = 6 * 3600 * 1000;
           if (creepEntry && (Date.now() - creepEntry.setAt) < CREEP_TTL && creepEntry.frThreshold != null) {
-            if (Math.abs(fr) < creepEntry.frThreshold) {
+            if (fr < creepEntry.frThreshold) {
               frCreepBlocked++;
               continue;
             }
@@ -3036,7 +3044,8 @@ function pw() { return {
         const oeNote      = oeGraylisted        > 0 ? ` | OE-gray: ${oeGraylisted}L` : '';
         const proxNote    = proximityBlocked    > 0 ? ` | RSI-prox: ${proximityBlocked}` : '';
         const frCreepNote = frCreepBlocked      > 0 ? ` | FR-creep: ${frCreepBlocked}` : '';
-        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${oeNote}${proxNote}${frCreepNote}.`, 'scan');
+        const frNegNote   = frNegativeBlocked   > 0 ? ` | FR≤0: ${frNegativeBlocked}` : '';
+        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${oeNote}${proxNote}${frCreepNote}${frNegNote}.`, 'scan');
 
         // Prune expired creep entries so they don't linger in the UI
         const _now = Date.now();
@@ -3431,6 +3440,10 @@ function pw() { return {
 
   async funOpenShort(sym, price, fundingRate, isLoser = false, change24h = null, rsi6 = null, rsi12 = null, rsi24 = null, nextFundingTime = null, fundingIntervalMs = null, histOverExtCount = 0, lsaRatio = null, subType = 'HFG', mult = 3, badge = '3xx') {
     if (this._symbolBanlist[sym]) return false;
+    if (fundingRate == null || fundingRate <= 0) {
+      this.log(`💰 ${sym}: FUN entry blocked — funding rate ${fundingRate == null ? '—' : fundingRate.toFixed(4) + '%'} is not positive`, 'warn');
+      return false;
+    }
     const instr = await this.getInstrInfo(sym);
     if (!instr) { this.log(`💰 ${sym}: FUN — instrument not supported`, 'warn'); return false; }
     const levResult = this.resolveEffectiveLeverage(sym, instr);
@@ -3650,7 +3663,10 @@ function pw() { return {
     let closedAt = Date.now();
     while (this.closedTrades.length && this.closedTrades[0].closedAt === closedAt) closedAt++;
     if (this.isDuplicateClose(pos.entryPrice, exitPrice, pos.margin)) {
-      this.log(`⚠ ${pos.symbol}: duplicate FT close detected — record suppressed.`, 'warn');
+      this.log(`⚠ ${pos.symbol}: duplicate FT close detected — record suppressed, position removed.`, 'warn');
+      this.positions = this.positions.filter(x => x.id !== pos.id);
+      this.persist();
+      this.renderTradeFeed();
       _closingIds.delete(pos.id);
       return;
     }
@@ -4129,10 +4145,12 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
           const age = c.t - pos.openedAt;
           if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
             pos.phase = 'force';
-          } else if (age >= (this.cfg.tpReduceMins * 60000) && pos.phase === 'normal') {
+          } else if (age >= (this.cfg.tpReduceMins * 60000) && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3))) {
             pos.phase = 'reduce';
             const roiTarget = 0.03;
-            pos.currentTpPrice = pos.entryPrice * (1 - (roiTarget / pos.leverage));
+            pos.currentTpPrice = instr
+              ? this.snapPrice(pos.entryPrice * (1 - (roiTarget / pos.leverage)), instr)
+              : parseFloat((pos.entryPrice * (1 - (roiTarget / pos.leverage))).toFixed(8));
             pos.tpPct = 3;
           }
 
@@ -4572,6 +4590,14 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
     try {
     const now = Date.now();
 
+    const auditablePositions = this.positions.filter(p => p._pseudo && !p._ft);
+    const maxAuditGap = auditablePositions.reduce((m, p) => Math.max(m, now - (p._lastSeenAt || p.openedAt || now)), 0);
+    if (maxAuditGap >= 45000) {
+      this.log(`🌑 Gap-fill audit due — ${Math.round(maxAuditGap / 1000)}s since last position audit.`, 'info');
+      await this.pseudoAuditGap();
+      return;
+    }
+
     const hasPositions = this.positions.some(p => p._pseudo);
     const TICKER_THROTTLE_MS = 15000; // at most one full-ticker fetch per 15s
     const tickerStale = (now - (this._lastTickerFetch || 0)) >= TICKER_THROTTLE_MS;
@@ -4665,6 +4691,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
         _extenderDirty = true;
       }
     }
+    let _advGlDirty = false;
     for (const sym of Object.keys(this._advFtGraylist)) {
       if (_now_sweep >= this._advFtGraylist[sym]) {
         delete this._advFtGraylist[sym];
@@ -4770,16 +4797,19 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       if (age >= forceMs && pos.phase !== 'force') {
         pos.phase = 'force';
         this.persist();
-      } else if (age >= reduceMs && pos.phase === 'normal') {
+      } else if (age >= reduceMs && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3))) {
+        const wasReduced = pos.phase === 'reduce';
         pos.phase = 'reduce';
-        this.sess.tpReduce++;
+        if (!wasReduced) this.sess.tpReduce++;
         const currentUROI = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
-        if (currentUROI >= 3 || pos.entryPrice * (1-(0.03/pos.leverage)) >= mark) {
+        const reduceTpPrice = pos.entryPrice * (1 - (0.03 / pos.leverage));
+        if (currentUROI >= 3 || reduceTpPrice >= mark) {
           this.log(`🌑 ${pos.symbol}: ${''}​${this.cfg.tpReduceMins}min — UROI ${currentUROI.toFixed(1)}% — closing now`, 'warn');
           await this.pseudoClosePosition(pos, 'force');
           continue;
         }
-        pos.currentTpPrice = pos.entryPrice * (1 - (0.03 / pos.leverage));
+        const instr = await this.getInstrInfo(pos.symbol);
+        pos.currentTpPrice = instr ? this.snapPrice(reduceTpPrice, instr) : parseFloat(reduceTpPrice.toFixed(8));
         pos.tpPct = 3;
         this.log(`🌑 ${pos.symbol}: ${''}​${this.cfg.tpReduceMins}min — TP reduced to 3% (${fmtP(pos.currentTpPrice)})`, 'warn');
         this.persist();
@@ -5212,25 +5242,25 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     };
   },
 
-  // Classifies a FUN candidate into one of four sub-types based on funding rate and gainer/loser status.
-  // Returns { subType, mult, vmBase, badge } or null if FR is below the low-fund floor.
+  // Classifies a FUN candidate into one of four sub-types based on positive funding rate and gainer/loser status.
+  // Returns { subType, mult, vmBase, badge } or null if FR is non-positive or below the low-fund floor.
   // subType: 'HFG' | 'LFG' | 'HFL' | 'LFL'
   // mult: notional multiplier (1/2/3) — also equals slot cost
   // vmBase: raw VM floor for this sub-type (before creep/OE scaling)
   // badge: display label suffix e.g. '3xx', '2xx', 'x2', 'x1'
   funClassify(fr, isLoser) {
-    const absFr   = Math.abs(fr);
+    if (fr == null || fr <= 0) return null;
     const hiGate  = this.cfg.funFundingHigh ?? 0.1;
     const loGate  = this.cfg.funFundingLow  ?? 0.05;
     const hfgVmBase = this.cfg.funVolMomMin ?? 10;
     const hflVmBase = this.cfg.funVolMomLosersMin ?? -10;
     if (!isLoser) {
-      if (absFr >= hiGate) return { subType: 'HFG', mult: 3, vmBase: hfgVmBase,       badge: '3xx' };
-      if (absFr >= loGate) return { subType: 'LFG', mult: 2, vmBase: hfgVmBase * 2,   badge: '2xx' };
+      if (fr >= hiGate) return { subType: 'HFG', mult: 3, vmBase: hfgVmBase,       badge: '3xx' };
+      if (fr >= loGate) return { subType: 'LFG', mult: 2, vmBase: hfgVmBase * 2,   badge: '2xx' };
       return null;
     }
-    if (absFr >= hiGate) return { subType: 'HFL', mult: 2, vmBase: hflVmBase,          badge: 'x2'  };
-    if (absFr >= loGate) return { subType: 'LFL', mult: 1, vmBase: hflVmBase / 2,      badge: 'x1'  };
+    if (fr >= hiGate) return { subType: 'HFL', mult: 2, vmBase: hflVmBase,          badge: 'x2'  };
+    if (fr >= loGate) return { subType: 'LFL', mult: 1, vmBase: hflVmBase / 2,      badge: 'x1'  };
     return null;
   },
 
@@ -5616,7 +5646,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     let closedAt = Date.now();
     while (this.closedTrades.length && this.closedTrades[0].closedAt === closedAt) closedAt++;
     if (this.isDuplicateClose(pos.entryPrice, exitPrice, pos.margin)) {
-      this.log(`⚠ ${pos.symbol}: duplicate close detected — record suppressed.`, 'warn');
+      this.log(`⚠ ${pos.symbol}: duplicate close detected — record suppressed, position removed.`, 'warn');
+      this.positions = this.positions.filter(x => x.id !== pos.id);
+      this.persist();
+      this.renderTradeFeed();
       _closingIds.delete(pos.id);
       return;
     }
