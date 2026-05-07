@@ -560,7 +560,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
 <!-- ══════════════════════════════════════════════════════════
      LAYER 4 (z:1): APP — visibility:hidden until showApp()
 ══════════════════════════════════════════════════════════ -->
-<div id="pw-app" x-data="pw()" x-init="init()">
+<div id="pw-app" x-data="pw()">
 
   <!-- ── IMPORT CONFIRM MODAL (bridge span — wired to vanilla JS portal below) ── -->
   <span x-effect="
@@ -2114,7 +2114,9 @@ function fmtP(p) {
 const LS_KEY = 'pw_v1';
 
 const _closingIds = new Set();
+const AUDIT_MIN_GAP_MS = 5000;
 let _auditRunning = false;
+let _auditPromise = null;
 
 // Timers stored outside Alpine to prevent proxy mutation
 let _cdTimer       = null;
@@ -2237,6 +2239,8 @@ function pw() { return {
   },
 
   init() {
+    if (this._initDone) return;
+    this._initDone = true;
     try {
       document.getElementById('pw-load-status').textContent = 'LOADING SAVED STATE...';
       this.loadSaved();
@@ -2260,7 +2264,7 @@ function pw() { return {
       document.addEventListener('visibilitychange', async () => {
         if (document.visibilityState !== 'visible') return;
 
-        if (this.positions.length || this.potGainers.length) {
+        if (this.pseudoAuditWorkload().hasWork) {
           await this.pseudoAuditGap();
         }
 
@@ -4080,21 +4084,41 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
     }
   },
 
+  pseudoAuditWorkload(now = Date.now()) {
+    const positions = this.positions.filter(pos => {
+      if (!pos._pseudo || pos._ft) return false; // FT positions are audited by ftWatchPositions
+      const gapFrom = pos._lastSeenAt || pos.openedAt || now;
+      return now - gapFrom >= AUDIT_MIN_GAP_MS;
+    });
+    const hasExpiredPotGainers = this.potGainers.some(pe =>
+      now - pe.placedAt >= this.cfg.potGainerExpireMins * 60000
+    );
+    const hasPositionCollisions = this.potGainers.some(pe =>
+      this.positions.some(pos => pos.symbol === pe.symbol)
+    );
+    return {
+      positions,
+      hasPotGainerWork: hasExpiredPotGainers || hasPositionCollisions,
+      get hasWork() { return positions.length > 0 || this.hasPotGainerWork; },
+    };
+  },
+
   async pseudoAuditGap() {
-    if (_auditRunning) return;
+    if (_auditRunning) return _auditPromise;
     this.correctFtMargins();
     this.purgeInvalidPositions();
-    if (!this.positions.length && !this.potGainers.length) { return; }
-    _auditRunning = true;
     const now = Date.now();
+    const workload = this.pseudoAuditWorkload(now);
+    if (!workload.hasWork) return;
+    _auditRunning = true;
+    _auditPromise = (async () => {
     this.log('🌑 Gap-fill audit starting...', 'info');
     try {
 
-    for (const pos of [...this.positions]) {
-      if (pos._ft) continue; // FT positions don't need gap-fill — they use the same watcher logic
+    for (const pos of [...workload.positions]) {
+      if (!this.positions.find(x => x.id === pos.id)) continue;
       const gapFrom = pos._lastSeenAt || pos.openedAt;
       const gapTo   = now;
-      if (gapTo - gapFrom < 5000) continue; // trivial gap
       if (_closingIds.has(pos.id)) continue;
       _closingIds.add(pos.id);
       this.log(`🌑 ${pos.symbol}: auditing ${Math.round((gapTo-gapFrom)/60000)}min gap...`, 'info');
@@ -4258,7 +4282,10 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
     this.log('🌑 Gap-fill audit complete.', 'success');
     } finally {
       _auditRunning = false; // safety net — ensures flag is always cleared
+      _auditPromise = null;
     }
+    })();
+    return _auditPromise;
   },
 
   async pseudoOpenShort(candidate) {
@@ -4596,9 +4623,12 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
     const auditablePositions = this.positions.filter(p => p._pseudo && !p._ft);
     const maxAuditGap = auditablePositions.reduce((m, p) => Math.max(m, now - (p._lastSeenAt || p.openedAt || now)), 0);
     if (maxAuditGap >= 45000) {
-      this.log(`🌑 Gap-fill audit due — ${Math.round(maxAuditGap / 1000)}s since last position audit.`, 'info');
-      await this.pseudoAuditGap();
-      return;
+      const workload = this.pseudoAuditWorkload(now);
+      if (workload.positions.length) {
+        this.log(`🌑 Gap-fill audit due — ${Math.round(maxAuditGap / 1000)}s since last position audit.`, 'info');
+        await this.pseudoAuditGap();
+        return;
+      }
     }
 
     const hasPositions = this.positions.some(p => p._pseudo);
