@@ -974,8 +974,8 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="lbl">VM Scale % per extra tick <b x-text="cfg.advFtVmScalePct+'%'"></b></div>
               <input type="range" min="0" max="200" step="10" x-model.number="cfg.advFtVmScalePct" :disabled="bot.running" @change="persist()">
               <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">
-                Adds <span x-text="cfg.advFtVmScalePct"></span>% of ftVolMomMin per tick above threshold.
-                E.g. at tick <span x-text="cfg.advFtThreshold+1"></span>: req = <span x-text="(cfg.ftVolMomMin*(1+cfg.advFtVmScalePct/100)).toFixed(1)"></span>%.
+                Multiplies VM by ×<span x-text="(1+cfg.advFtVmScalePct/100).toFixed(2)"></span> per tick above threshold.
+                E.g. at tick <span x-text="cfg.advFtThreshold+1"></span>: req = <span x-text="(cfg.ftVolMomMin*(1+cfg.advFtVmScalePct/100)).toFixed(2)"></span>%.
               </div>
             </div>
 
@@ -1266,7 +1266,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                     const threshold = cfg.advFtThreshold ?? 4;
                     const scalePct  = cfg.advFtVmScalePct ?? 70;
                     const extra     = Math.max(0, extTicks - threshold);
-                    req = base * (1 + (scalePct / 100) * extra);
+                    req = base * Math.pow(1 + (scalePct / 100), extra);
                     const creep = _advFtVmCreep[c.symbol];
                     if (creep && creep.expiresAt > Date.now()) req += base * (creep.bonus / 100);
                   }
@@ -1283,7 +1283,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                     const threshold = cfg.advFtThreshold ?? 4;
                     const scalePct  = cfg.advFtVmScalePct ?? 70;
                     const extra     = Math.max(0, extTicks - threshold);
-                    let req         = base * (1 + (scalePct / 100) * extra);
+                    let req         = base * Math.pow(1 + (scalePct / 100), extra);
                     const creep = _advFtVmCreep[c.symbol];
                     if (creep && creep.expiresAt > Date.now()) req += base * (creep.bonus / 100);
                     const col       = req > base ? 'var(--warn)' : 'var(--text-lo)';
@@ -1328,7 +1328,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                     const threshold = cfg.advFtThreshold ?? 4;
                     const scalePct  = cfg.advFtVmScalePct ?? 70;
                     const extra     = Math.max(0, extTicks - threshold);
-                    req = base * (1 + (scalePct / 100) * extra);
+                    req = base * Math.pow(1 + (scalePct / 100), extra);
                     const creep = _advFtVmCreep[sym];
                     if (creep && creep.expiresAt > Date.now()) req += base * (creep.bonus / 100);
                   }
@@ -1344,7 +1344,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                     const threshold = cfg.advFtThreshold ?? 4;
                     const scalePct  = cfg.advFtVmScalePct ?? 70;
                     const extra     = Math.max(0, extTicks - threshold);
-                    let req         = base * (1 + (scalePct / 100) * extra);
+                    let req         = base * Math.pow(1 + (scalePct / 100), extra);
                     const creep = _advFtVmCreep[sym];
                     if (creep && creep.expiresAt > Date.now()) req += base * (creep.bonus / 100);
                     const col       = req > base ? 'var(--warn)' : 'var(--text-lo)';
@@ -1826,7 +1826,7 @@ function ew() { return {
     ftVolMomCreepPct: 25,
     advFtEnabled: true,
     advFtThreshold: 4,      // over-extension hits within 3h to promote to ADV FT
-    advFtVmScalePct: 70,    // % added to ftVolMomMin per tick above advFtThreshold
+    advFtVmScalePct: 70,    // multiplicative VM threshold % per tick above advFtThreshold
     positionSizing: false,  // true = FT/ADV FT ×2, gainers ×1
     entryTpRoi: 13,         // entry TP ROI % — applies to all position types at stage 0
     dcaDoublingEnabled: false, // each add escalates by dcaMultiplier; faster rescue, heavier margin
@@ -1863,6 +1863,7 @@ function ew() { return {
   ftWatchlist: [],
   extenderCount: {},
   _advFtPollers: {},
+  _advFtPollerBusy: {},
   _extenderGraylist: {},
   _advFtGraylist: {},
   _ftEvictGraylist: {},
@@ -2173,6 +2174,7 @@ function ew() { return {
     clearInterval(this.bot._watchTimer);
     this.bot._watchTimer = null;
     await this.runScheduledCycle();
+    this._syncAdvFtPollers();
     this.scheduleScan();
     this.bot._watchTimer     = setInterval(()=>this.watchPositions(), 15000);
     this.bot._potGainerTimer = setInterval(()=>this.watchPotGainers(), 5000);
@@ -2188,6 +2190,7 @@ function ew() { return {
     clearInterval(this.bot._watchTimer);
     clearInterval(this.bot._refreshTimer);
     clearInterval(this.bot._potGainerTimer);
+    this._stopAllAdvFtPollers();
     this.bot._watchTimer     = null;
     this.bot._refreshTimer   = null;
     this.bot._potGainerTimer = null;
@@ -2441,10 +2444,12 @@ function ew() { return {
         this._ftRosterBump(symbol);
         this.ftCandidates[symbol] = { count, qualifiedAt: now, tradesOpened: 0, _advFt: true };
         this.log(`⚡ ${symbol}: promoted to ADV FT roster (×${count} over-extended hits)`, 'trade');
+        this._startAdvFtPoller(symbol);
       } else if (isUpgrade) {
         this.ftCandidates[symbol]._advFt = true;
         this.ftCandidates[symbol].count  = count;
         this.log(`⚡ ${symbol}: FT roster upgraded to ADV FT (×${count} over-extended)`, 'info');
+        this._startAdvFtPoller(symbol);
       } else if (this.ftCandidates[symbol]) {
         this.ftCandidates[symbol].count = count;
       }
@@ -2472,12 +2477,53 @@ function ew() { return {
     });
     const [evictSym] = roster[0];
     this.log(`🎯 FT roster full (${max}) — evicting ${evictSym} to admit ${incomingSymbol}`, 'info');
+    this._stopAdvFtPoller(evictSym);
     delete this.ftCandidates[evictSym];
+  },
+
+  _syncAdvFtPollers() {
+    if (!this.bot.running || !this.cfg.ftEnabled || !this.cfg.advFtEnabled) return;
+    for (const [sym, entry] of Object.entries(this.ftCandidates)) {
+      if (entry?._advFt) this._startAdvFtPoller(sym);
+    }
+  },
+
+  _startAdvFtPoller(symbol) {
+    if (!symbol || this._advFtPollers[symbol]) return;
+    const tick = async () => {
+      const entry = this.ftCandidates[symbol];
+      if (!this.bot.running || !this.cfg.ftEnabled || !this.cfg.advFtEnabled || !entry?._advFt) {
+        this._stopAdvFtPoller(symbol);
+        return;
+      }
+      if (this._cycleRunning || this._advFtPollerBusy[symbol]) return;
+      this._advFtPollerBusy[symbol] = true;
+      try {
+        delete this._klineCache[`${symbol}_15`];
+        const ticker = await this.fetchTicker(symbol);
+        if (!ticker) return;
+        if (ticker.fundingRate != null) {
+          this._klineCache[`fr_${symbol}`] = { rate: parseFloat(ticker.fundingRate) * 100, ts: Date.now() };
+        }
+        await this.scanFollowThroughs([ticker], { symbols: [symbol], quiet: true });
+      } catch(e) {
+        this.log(`⚡ ${symbol}: ADV FT poll error — ${e.message}`, 'warn');
+      } finally {
+        delete this._advFtPollerBusy[symbol];
+      }
+    };
+    this._advFtPollers[symbol] = setInterval(tick, 60000);
+    setTimeout(tick, 1000);
   },
 
   _stopAdvFtPoller(symbol) {
     const id = this._advFtPollers[symbol];
     if (id) { clearInterval(id); delete this._advFtPollers[symbol]; }
+    if (this._advFtPollerBusy) delete this._advFtPollerBusy[symbol];
+  },
+
+  _stopAllAdvFtPollers() {
+    for (const sym of Object.keys(this._advFtPollers)) this._stopAdvFtPoller(sym);
   },
 
   // Fetches a single ticker row for a symbol.
@@ -2967,11 +3013,11 @@ function ew() { return {
       const base     = this.cfg.ftVolMomMin ?? 5;
       let minPct;
       if (isAdvFt) {
-        // ADV FT scaler: for each tick above advFtThreshold add advFtVmScalePct% of base
+        // ADV FT scaler: for each tick above advFtThreshold multiply by (1 + advFtVmScalePct%).
         const threshold   = this.cfg.advFtThreshold ?? 4;
         const scalePct    = this.cfg.advFtVmScalePct ?? 70;
         const extraTicks  = Math.max(0, confirmedTicks - threshold);
-        minPct = base * (1 + (scalePct / 100) * extraTicks);
+        minPct = base * Math.pow(1 + (scalePct / 100), extraTicks);
         // Post-close creep: each ADV FT close adds 50% of base to the requirement (additive, 3h window)
         const creepEntry = this._advFtVmCreep[symbol];
         if (creepEntry && creepEntry.expiresAt > Date.now()) {
@@ -3225,8 +3271,10 @@ function ew() { return {
     }
   },
 
-  async scanFollowThroughs(tickerList = null) {
-    this.log('🎯 Follow-Through scan...', 'scan');
+  async scanFollowThroughs(tickerList = null, opts = {}) {
+    const onlySymbols = Array.isArray(opts?.symbols) ? new Set(opts.symbols) : null;
+    const quiet = !!opts?.quiet;
+    if (!quiet) this.log('🎯 Follow-Through scan...', 'scan');
     try {
       let tickList = tickerList;
       if (!tickList) {
@@ -3243,6 +3291,7 @@ function ew() { return {
 
       // Merge new rodeoCreep qualifiers into ftCandidates
       for (const [sym, entry] of Object.entries(this.rodeoCreep)) {
+        if (onlySymbols && !onlySymbols.has(sym)) continue;
         const count = entry.closedCount || 0;
         // Do not re-promote a symbol that is still in the max-trades or evict graylist
         if (this._ftMaxGraylist[sym] && Date.now() < this._ftMaxGraylist[sym]) continue;
@@ -3277,7 +3326,9 @@ function ew() { return {
       }
 
       for (const [sym, ftEntry] of Object.entries(this.ftCandidates)) {
+        if (onlySymbols && !onlySymbols.has(sym)) continue;
         ftEntry.tradesOpened = ftEntry.tradesOpened ?? 0;
+        if (ftEntry._advFt) this._startAdvFtPoller(sym);
 
         if (this._ftMaxGraylist[sym] && Date.now() < this._ftMaxGraylist[sym]) continue;
 
@@ -3375,8 +3426,16 @@ function ew() { return {
         await this.ftOpenShort(sym, price, rsi6, rsi12, rsi24, fr, ftEntry.count, !!ftEntry._advFt);
       }
 
-      this.ftWatchlist = candidates;
-      {
+      if (onlySymbols) {
+        const seen = new Set(candidates.map(c => c.symbol));
+        this.ftWatchlist = [
+          ...this.ftWatchlist.filter(c => !seen.has(c.symbol) && !onlySymbols.has(c.symbol)),
+          ...candidates,
+        ];
+      } else {
+        this.ftWatchlist = candidates;
+      }
+      if (!quiet) {
         const _ftReady = candidates.filter(c => c.status === 'ft-ready').length;
         const _ftParts = [];
         if (_ftTally.lowrsi      > 0) _ftParts.push(`${_ftTally.lowrsi} low RSI`);

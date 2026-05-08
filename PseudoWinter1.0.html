@@ -2206,6 +2206,7 @@ function pw() { return {
   extenderCount: {}, // symbol → { count, setAt } — tracks over-extended scan hits per coin, valid 3h (Advanced FT)
   _extenderPollers: {}, // symbol → intervalId — dedicated per-symbol RSI pollers for active extenders
   _advFtPollers:    {}, // symbol → intervalId — dedicated per-symbol entry pollers for ADV FT candidates waiting for RSI to come into range
+  _advFtPollerBusy: {}, // symbol → true while its ADV FT poll tick is evaluating
   _advFtVmCreep:    {}, // symbol → { mult, setAt } — VM gate creep for ADV FT: ×1.5 per close, 3h TTL
   ftCandidates: {},  // symbol → { count, qualifiedAt } — persisted FT watch roster; survives app restarts and rodeo TTL expiry
   _symbolBanlist: {}, // symbol → reason string — permanently excluded from scans; persisted across restarts
@@ -2528,6 +2529,7 @@ function pw() { return {
 
     }
     await this.runScheduledCycle();
+    this._syncAdvFtPollers();
     this.scheduleScan();
     if (_watchTimer) { clearInterval(_watchTimer); _watchTimer = null; }
     _watchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
@@ -3199,8 +3201,10 @@ function pw() { return {
 
   async placeEntryConditional(candidate) { await this.pseudoPlaceEntryConditional(candidate); },
 
-  async scanFollowThroughs(tickerList = null) {
-    this.log('🎯 Follow-Through scan...', 'scan');
+  async scanFollowThroughs(tickerList = null, opts = {}) {
+    const onlySymbols = Array.isArray(opts?.symbols) ? new Set(opts.symbols) : null;
+    const quiet = !!opts?.quiet;
+    if (!quiet) this.log('🎯 Follow-Through scan...', 'scan');
     try {
       let tickList = tickerList;
       if (!tickList) {
@@ -3216,6 +3220,7 @@ function pw() { return {
       }
 
       for (const [sym, entry] of Object.entries(this.rodeoCreep)) {
+        if (onlySymbols && !onlySymbols.has(sym)) continue;
         if (this._ftMaxGraylist[sym] && Date.now() < this._ftMaxGraylist[sym]) continue; // 12h max-trades graylist
         if (this._ftEvictGraylist[sym] && Date.now() < this._ftEvictGraylist[sym]) continue; // RSI eviction window
         if ((entry.count || 0) >= this.cfg.ftRodeoThreshold && !this.ftCandidates[sym]) {
@@ -3250,7 +3255,9 @@ function pw() { return {
       if (_ftTally.expired > 0) this.persist();
 
       for (const [sym, ftEntry] of Object.entries(this.ftCandidates)) {
+        if (onlySymbols && !onlySymbols.has(sym)) continue;
         if (ftEntry.tradesOpened == null) ftEntry.tradesOpened = 0;
+        if (ftEntry._advFt) this._startAdvFtPoller(sym);
 
         if (ftEntry.tradesOpened >= this.cfg.ftMaxTrades) {
           const _glExpiry = Date.now() + 12 * 3600 * 1000;
@@ -3338,15 +3345,16 @@ function pw() { return {
         }
 
         const rsiOk = (
-          rsi6  != null && rsi6  > this.cfg.ftRsiMin && rsi6  < this.cfg.ftRsiMax &&
-          rsi12 != null && rsi12 > this.cfg.ftRsiMin && rsi12 < this.cfg.ftRsiMax &&
-          rsi24 != null && rsi24 > this.cfg.ftRsiMin && rsi24 < this.cfg.ftRsiMax
+          rsi6  != null && rsi6  > this.cfg.ftRsiMin && rsi6  < (ftEntry._advFt ? this.cfg.rsi6Max : this.cfg.ftRsiMax) &&
+          rsi12 != null && rsi12 > this.cfg.ftRsiMin && rsi12 < (ftEntry._advFt ? this.cfg.rsi6Max : this.cfg.ftRsiMax) &&
+          rsi24 != null && rsi24 > this.cfg.ftRsiMin && rsi24 < (ftEntry._advFt ? this.cfg.rsi6Max : this.cfg.ftRsiMax)
         );
 
         if (!rsiOk) {
-          const anyHigh = (rsi6  != null && rsi6  >= this.cfg.ftRsiMax) ||
-                          (rsi12 != null && rsi12 >= this.cfg.ftRsiMax) ||
-                          (rsi24 != null && rsi24 >= this.cfg.ftRsiMax);
+          const ftRsiMax = ftEntry._advFt ? this.cfg.rsi6Max : this.cfg.ftRsiMax;
+          const anyHigh = (rsi6  != null && rsi6  >= ftRsiMax) ||
+                          (rsi12 != null && rsi12 >= ftRsiMax) ||
+                          (rsi24 != null && rsi24 >= ftRsiMax);
           const anyLow  = (rsi6  != null && rsi6  <= this.cfg.ftRsiMin) ||
                           (rsi12 != null && rsi12 <= this.cfg.ftRsiMin) ||
                           (rsi24 != null && rsi24 <= this.cfg.ftRsiMin);
@@ -3398,7 +3406,15 @@ function pw() { return {
         this.persist();
       }
 
-      this.ftWatchlist = candidates;
+      if (onlySymbols) {
+        const seen = new Set(candidates.map(c => c.symbol));
+        this.ftWatchlist = [
+          ...this.ftWatchlist.filter(c => !seen.has(c.symbol) && !onlySymbols.has(c.symbol)),
+          ...candidates,
+        ];
+      } else {
+        this.ftWatchlist = candidates;
+      }
       const ready   = candidates.filter(c => c.status === 'ft-ready').length;
       const waiting = candidates.filter(c => c.status === 'ft-waiting').length;
       const _ftParts = [];
@@ -3410,7 +3426,7 @@ function pw() { return {
       if (_ftTally.expired     > 0) _ftParts.push(`${_ftTally.expired} expired`);
       if (waiting              > 0) _ftParts.push(`${waiting} waiting`);
       const _ftSkip = _ftParts.length ? ` — ${_ftParts.join(', ')}` : '';
-      this.log(`🎯 FT scan done. ${Object.keys(this.ftCandidates).length} on roster, ${ready} opened${_ftSkip}.`, 'scan');
+      if (!quiet) this.log(`🎯 FT scan done. ${Object.keys(this.ftCandidates).length} on roster, ${ready} opened${_ftSkip}.`, 'scan');
     } catch(e) {
       this.log('🎯 FT scan error: ' + e.message, 'error');
     }
@@ -5577,11 +5593,45 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     return evictSym;
   },
 
-  _startAdvFtPoller(symbol) { /* ADV FT entry check now handled by runScheduledCycle — no-op */ },
+  _syncAdvFtPollers() {
+    if (!this.bot.running || !this.cfg.ftEnabled || !this.cfg.advFtEnabled) return;
+    for (const [sym, entry] of Object.entries(this.ftCandidates)) {
+      if (entry?._advFt) this._startAdvFtPoller(sym);
+    }
+  },
+
+  _startAdvFtPoller(symbol) {
+    if (!symbol || this._advFtPollers[symbol]) return;
+    const tick = async () => {
+      const entry = this.ftCandidates[symbol];
+      if (!this.bot.running || !this.cfg.ftEnabled || !this.cfg.advFtEnabled || !entry?._advFt) {
+        this._stopAdvFtPoller(symbol);
+        return;
+      }
+      if (this._cycleRunning || this._advFtPollerBusy[symbol]) return;
+      this._advFtPollerBusy[symbol] = true;
+      try {
+        delete this._klineCache[`${symbol}_15`];
+        const ticker = await this.fetchTicker(symbol);
+        if (!ticker) return;
+        if (ticker.fundingRate != null) {
+          this._klineCache[`fr_${symbol}`] = { rate: parseFloat(ticker.fundingRate) * 100, ts: Date.now() };
+        }
+        await this.scanFollowThroughs([ticker], { symbols: [symbol], quiet: true });
+      } catch(e) {
+        this.log(`⚡ ${symbol}: ADV FT poll error — ${e.message}`, 'warn');
+      } finally {
+        delete this._advFtPollerBusy[symbol];
+      }
+    };
+    this._advFtPollers[symbol] = setInterval(tick, 60000);
+    setTimeout(tick, 1000);
+  },
 
   _stopAdvFtPoller(symbol) {
     const id = this._advFtPollers[symbol];
     if (id) { clearInterval(id); delete this._advFtPollers[symbol]; }
+    if (this._advFtPollerBusy) delete this._advFtPollerBusy[symbol];
   },
 
   _stopAllAdvFtPollers() {
