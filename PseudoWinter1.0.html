@@ -2254,6 +2254,7 @@ function pw() { return {
         : ' Ready — uses public Bybit market data, no API key required.'), 'info');
       setInterval(()=>{
         this.tick++;
+        this.pruneTpIngress();
         if (this.potGainers.length) this.renderPotGainers();
       }, 1000);
 
@@ -2261,15 +2262,8 @@ function pw() { return {
       if (!_watchTimer) {
         _watchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
       }
-      // Run gap-fill audit on startup (was previously triggered by autoConnect)
-      setTimeout(() => { void this.pseudoAuditGap(); }, 500);
-
       document.addEventListener('visibilitychange', async () => {
         if (document.visibilityState !== 'visible') return;
-
-        if (this.pseudoAuditWorkload().hasWork) {
-          await this.pseudoAuditGap();
-        }
 
         if (this.bot.running) {
           const elapsed = Date.now() - this.bot.lastScanAt;
@@ -2293,6 +2287,7 @@ function pw() { return {
   // PERSISTENCE
   persist() {
     try {
+      this.pruneTpIngress();
       localStorage.setItem(LS_KEY, JSON.stringify({
         cfg: this.cfg,
         positions: this.positions,
@@ -2518,6 +2513,7 @@ function pw() { return {
     this.bot.running = true;
     this.bot.startTime = Date.now();
     this.log(`🌑 Sim started — RSI6≥${this.cfg.rsi6Min}/RSI12≥${this.cfg.rsi12Min}/RSI24≥${this.cfg.rsi24Min} (15m) | ${this.cfg.leverage}× lev | $${this.cfg.minNotional} entry`, 'success');
+    await this.pseudoAuditGap();
     this.startKeepalive();
     if (this.cfg.advFtEnabled && this.cfg.gainersEnabled) {
       const EXTENDER_TTL = 3 * 3600 * 1000;
@@ -4623,17 +4619,6 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
     try {
     const now = Date.now();
 
-    const auditablePositions = this.positions.filter(p => p._pseudo && !p._ft);
-    const maxAuditGap = auditablePositions.reduce((m, p) => Math.max(m, now - (p._lastSeenAt || p.openedAt || now)), 0);
-    if (maxAuditGap >= 45000) {
-      const workload = this.pseudoAuditWorkload(now);
-      if (workload.positions.length) {
-        this.log(`🌑 Gap-fill audit due — ${Math.round(maxAuditGap / 1000)}s since last position audit.`, 'info');
-        await this.pseudoAuditGap();
-        return;
-      }
-    }
-
     const hasPositions = this.positions.some(p => p._pseudo);
     const TICKER_THROTTLE_MS = 15000; // at most one full-ticker fetch per 15s
     const tickerStale = (now - (this._lastTickerFetch || 0)) >= TICKER_THROTTLE_MS;
@@ -5323,6 +5308,18 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     return creeped * Math.pow(1 + oeStepPct / 100, histOverExtCount);
   },
 
+  pruneTpIngress(now = Date.now()) {
+    const TP_INGRESS_TTL = 3 * 3600 * 1000;
+    let pruned = false;
+    for (const [symbol, entry] of Object.entries(this._tpIngress || {})) {
+      if (!entry?.setAt || (now - entry.setAt) >= TP_INGRESS_TTL) {
+        delete this._tpIngress[symbol];
+        pruned = true;
+      }
+    }
+    return pruned;
+  },
+
   // Returns the effective entry TP multiplier for a symbol based on ingress history.
   // Each close halves it (0.5^count), floored at tpIngressMin/entryTpRoi.
   // Returns 1.0 if ingress is disabled, not configured, or TTL has expired.
@@ -5330,7 +5327,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     if (!this.cfg.tpIngressEnabled) return 1.0;
     const TP_INGRESS_TTL = 3 * 3600 * 1000;
     const entry = this._tpIngress[symbol];
-    if (!entry || (Date.now() - entry.setAt) >= TP_INGRESS_TTL) return 1.0;
+    if (!entry || (Date.now() - entry.setAt) >= TP_INGRESS_TTL) {
+      if (entry) delete this._tpIngress[symbol];
+      return 1.0;
+    }
     const floor = (this.cfg.tpIngressMin ?? 3) / (this.cfg.entryTpRoi ?? 13);
     return Math.max(floor, Math.pow(0.5, entry.count));
   },
