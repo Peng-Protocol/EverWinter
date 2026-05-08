@@ -57,7 +57,7 @@ Not a tradeable watchlist but a live display of all symbols currently under acti
 
 ## Pollers
 
-EverWinter runs (5) independent `setInterval` loops with different cadences and responsibilities.
+EverWinter runs (6) independent `setInterval` loop groups with different cadences and responsibilities.
 
 ### Scan Countdown (`_cdTimer`)
 Fires every second. Decrements `bot.scanCd` for the UI countdown display and triggers the full scan cycle when it reaches zero. The interval between scans is configurable (`scanMins`, default (15) minutes).
@@ -66,7 +66,11 @@ Fires every second. Decrements `bot.scanCd` for the UI countdown display and tri
 Fires every (5) seconds. Calls `pseudoWatchPositions()` to fetch current mark prices for all open phantom positions. Handles TP drift correction, (12)-hour time-decay phase transitions, (24)-hour force-close, DCA stage progression, and SL placement after DCA3.
 
 ### Potential Entries Poller (`_potEntryTimer`)
-Fires every (5) seconds. For each symbol on the Potential Entries watchlist it fetches a fresh RSI (kline cache is force-evicted per symbol on every tick to prevent stale reads), re-checks all gates including current Rodeo Creep and volume divergence, and opens a phantom short immediately if the symbol qualifies. This is the only routine that can open a position between main scan cycles.
+Fires every (5) seconds. For each symbol on the Potential Entries watchlist it fetches a fresh RSI (kline cache is force-evicted per symbol on every tick to prevent stale reads), re-checks all gates including current Rodeo Creep and volume divergence, and opens a phantom short immediately if the symbol qualifies. This routine can open a gainer position between main scan cycles.
+
+
+### Advanced FT Entry Pollers (`_advFtPollers`)
+Started per Advanced FT roster symbol and fired every (60) seconds. Each tick force-evicts the symbol's RSI kline cache, fetches a fresh ticker/funding snapshot, and re-runs the FT entry gates for only that symbol. This lets ADV FT entries fire as soon as RSI, funding, slot, and vol-momentum gates align instead of waiting for the next full scan interval.
 
 ### Market Refresh
 Manual-only in PseudoWinter, triggered via the **Refresh** button. Calls `pseudoWatchPositions()` and a forced pass of `watchPotentialEntries()` to update prices and re-evaluate the watchlist on demand.
