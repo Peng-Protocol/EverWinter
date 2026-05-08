@@ -89,7 +89,7 @@ A full scan cycle runs at the configured interval or on demand via the **SCAN NO
 ### 2. FUN Scan
 Runs inline within `runScan` after the gainers pass. Evaluates the top `funGainerN` gainers and worst `funLoserN` losers (−3% to −99%) from the same bulk ticker fetch — no additional API calls for price or funding data.
 
-For each candidate, the FUN scan applies: symbol banlist → existing position check → funding rate classification (sub-type and slot cost determined by FR level) → slot check → FR creep gate → historical RSI6 over-extension look-back (3h, 15min candles) → loser OE graylist (losers with any over-extension in the look-back are contradictory and graylisted 6h) → RSI6 proximity block → vol momentum gate (separate thresholds for gainers vs. losers, creeping upward with each close and scaling multiplicatively with over-extension count) → LSA check for losers (last completed candle must show positive but non-spike volume relative to the window average).
+For each candidate, the FUN scan applies: symbol banlist → existing position check → funding rate classification (sub-type and slot cost determined by FR level) → slot check → FR creep gate → historical RSI6 over-extension look-back (3h, 15min candles) → loser OE VM adjustment (over-extended losers stay eligible but switch to the comparable gainer VM floor multiplied by the OE setting) → RSI6 proximity block → vol momentum gate (separate thresholds for gainers vs. losers, creeping upward with each close and scaling multiplicatively with over-extension count) → LSA check for losers (last completed candle must show positive but non-spike volume relative to the window average).
 
 ### 3. FT/ADV FT Scan (`scanFollowThroughs`)
 Runs after `runScan` against the persisted `ftCandidates` roster. Evaluates RSI gates, over-shorted filter, and vol momentum for each candidate; opens FT or ADV FT shorts when conditions are met.
@@ -118,7 +118,7 @@ Displays the computed SL exposure after DCA3 based on current notional and lever
 Lists all symbols currently under active Rodeo Creep with their ride count, current RSI gate offsets, and countdown to reset. Empty when no creep is active.
 
 ### FUN VM Creep
-Lists all symbols currently under active FUN vol momentum creep. Each entry shows the close count, the live effective VM floor for each sub-type (HFG, LFG, HFL, LFL), the current FR re-entry gate (seeded at 1% after first close, scaling ×1.5 per close), and the countdown to the 6h TTL reset. Over-extension hits are displayed inline with an ⚡ counter and their multiplicative effect on the VM threshold. Only visible when FUN vol momentum is enabled.
+Lists all symbols currently under active FUN vol momentum creep. Each entry shows the close count, the live effective VM floor for each sub-type (HFG, LFG, HFL, LFL), the current FR re-entry gate (seeded at 1% after first close, scaling ×1.5 per close), and the countdown to the 6h TTL reset. Over-extension hits are displayed inline with an ⚡ counter and their configurable multiplicative effect on the VM threshold; over-extended losers show the adjusted gainer-style VM floor used for entry. Only visible when FUN vol momentum is enabled.
 
 ### Extenders Counter
 Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold the ticker is promoted to the FT candidate roster, and the effective scaled VM threshold is shown.
