@@ -157,17 +157,17 @@ If the roster is full, the ticker with the **lowest funding rate** (most over-sh
 
 ### Entry Criteria
 
-#### 1. **RSI Cooldown Band: 45-75**
+#### 1. **RSI Cooldown Band: 45-85**
 We wait for the ticker to cool from over-extension into a specific RSI range:
-- **RSI6, RSI12, RSI24**: All must be **between 45-75**
+- **RSI6, RSI12, RSI24**: All must be **between 45-85**
 
 This is wider than Gainers' 70-80 band. We're catching the pullback **after** the parabolic move. The ticker was at RSI6 ≥ 90 repeatedly — now it's cooling, and we enter as the reversal continues.
 
 #### 2. **Volume Momentum Filter** (Optional)
-- **Base threshold**: Configurable (default 5%)
+- **Base threshold**: Configurable (default 2.5%)
 - **Tick scaling**: For each over-extension hit beyond the roster threshold, the VM requirement is multiplied by `(1 + scalePct/100)` per extra tick
 
-  Example at 50% scale: a ticker promoted at 4 hits enters at the base threshold. At 5 hits the requirement is `base × 1.5`; at 6 hits `base × 2.25`.
+  Example at 25% scale: a ticker promoted at 4 hits enters at the base threshold. At 5 hits the requirement is `base × 1.25`; at 6 hits `base × 1.50`.
 
 - **Per-close VM creep**: Each time an ADV FT position closes, the VM gate is multiplied by ×1.5 for that symbol (3-hour TTL). Successive closes keep raising the bar, preventing repeated low-quality re-entries on the same ticker.
 
@@ -197,7 +197,7 @@ Follow-Through is the predecessor to Advanced Follow-Through. Where Advanced FT 
 When a ticker accumulates **2+ rodeo rides** (configurable), it promotes to the Follow-Through roster. We used to set this threshold at 4 rides, but when we raised the Gainers RSI gates and rodeo creep percentage, 2 rides became the more likely outcome.
 
 ### Entry Logic
-Same as Advanced FT: wait for RSI to cool into the 45-75 band, then enter when volume momentum (optional) confirms. The only difference is the **promotion path** — rodeo rides vs. over-extension hits.
+Same as Advanced FT: wait for RSI to cool, except into the 20-60 band, then enter when volume momentum (optional) confirms. The only difference is the **promotion path** — rodeo rides vs. over-extension hits.
 
 ---
 
