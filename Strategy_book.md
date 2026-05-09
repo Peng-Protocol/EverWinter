@@ -307,32 +307,18 @@ The TP percentages **decrease** with each stage because our average entry gets w
 
 **Nearly as Important as DCA**
 
-TP ingress refers to how deeply a re-entered position penetrates toward its take-profit target compared to the first entry. On non-gainer strategies (Follow-Through, Advanced FT, FUN), a position may hit TP cleanly on the first entry, then re-enter and fall short on the second — reaching, say, 80% of the TP distance before reversing.
+On every non-gainer close (FT, ADV FT, FUN), the entry TP for that symbol is halved: `0.5^closeCount`, floored at a configurable minimum (default 3%). The reduction has a 3-hour TTL and applies only to stage 0 — DCA adds are unaffected. Gainers are excluded entirely.
 
-This pattern is a **structural signal**, not noise.
+**Why**: A non-gainer that re-enters quickly is showing **declining sell pressure**. The first entry hit TP because sellers had conviction. The second entry may not reach the same depth — the downside fuel is diminishing. Tightening TP captures what's actually available rather than waiting for a move that may not come.
 
-**What It Means**
+This is the mirror of the gainers rodeo. The rodeo observes rapid re-entries on a gainer and responds by *raising* TP — that pattern signals **declining buy pressure**, i.e. buyers can't hold the pump, so a deeper eventual move is expected. TP ingress on non-gainers does the opposite: declining sell pressure means the move is getting shorter, so TP comes down to meet it.
 
-When a non-gainer position hits TP first time but comes short the second time, the downward move is weakening. Each successive push toward TP reaches a little less — the market is absorbing selling pressure rather than amplifying it. Sellers are losing conviction.
+**Example at default 13% entry TP**:
+- First close → ingress count 1 → entry TP: 6.5%
+- Second close → ingress count 2 → entry TP: 3.25% (approaching the 3% floor)
+- Third close → entry TP: 3% (floor holds)
 
-This is **declining sell pressure**, and it is distinct from the gainers rodeo pattern. In the rodeo, repeated rapid entries and exits indicate **declining buy pressure** — buyers cannot sustain the pump, each bounce is weaker, and the ticker is converging toward a hard breakdown. The rodeo is a bearish fingerprint on an over-bought ticker.
-
-TP ingress on non-gainers is the mirror condition: the short thesis is still intact (the ticker entered the right band, vol momentum confirmed), but the fuel for the move is diminishing. We got the first trade. The second trade is marginal.
-
-**In Practice**
-
-- A re-entry that comes short of TP is not automatically a failure — it may still close profitably via the reduce phase or laggard mechanism
-- But successive re-entries with declining TP penetration are a signal to be wary of additional re-entries on that symbol
-- The FR creep gate (FUN) and ADV FT vol momentum creep already mechanically raise the bar per close; TP ingress is the human-readable explanation for why those gates exist
-
-**The Core Distinction**
-
-| Pattern | Seen In | Signal |
-|---|---|---|
-| Repeated quick wins with declining TP penetration | Non-gainer re-entries | Declining **sell** pressure — downside losing steam |
-| Repeated quick wins with escalating instability | Gainers rodeo | Declining **buy** pressure — upside losing steam |
-
-Both are convergence signals. The rodeo predicts a hard breakdown. TP ingress on non-gainers predicts a floor forming — the ticker is stabilizing rather than continuing to fall.
+After 3 hours the counter resets and full TP is restored.
 
 ---
 
