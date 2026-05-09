@@ -303,6 +303,25 @@ The TP percentages **decrease** with each stage because our average entry gets w
 
 ---
 
+### TP Ingress
+
+**Nearly as Important as DCA**
+
+On every non-gainer close (FT, ADV FT, FUN), the entry TP for that symbol is halved: `0.5^closeCount`, floored at a configurable minimum (default 3%). The reduction has a 3-hour TTL and applies only to stage 0 — DCA adds are unaffected. Gainers are excluded entirely.
+
+**Why**: A non-gainer that re-enters quickly is showing **declining sell pressure**. The first entry hit TP because sellers had conviction. The second entry may not reach the same depth — the downside fuel is diminishing. Tightening TP captures what's actually available rather than waiting for a move that may not come.
+
+This is the mirror of the gainers rodeo. The rodeo observes rapid re-entries on a gainer and responds by *raising* TP — that pattern signals **declining buy pressure**, i.e. buyers can't hold the pump, so a deeper eventual move is expected. TP ingress on non-gainers does the opposite: declining sell pressure means the move is getting shorter, so TP comes down to meet it.
+
+**Example at default 13% entry TP**:
+- First close → ingress count 1 → entry TP: 6.5%
+- Second close → ingress count 2 → entry TP: 3.25% (approaching the 3% floor)
+- Third close → entry TP: 3% (floor holds)
+
+After 3 hours the counter resets and full TP is restored.
+
+---
+
 ### Stop Loss (SL)
 
 **A Contentious Addition**
@@ -379,6 +398,37 @@ As covered in the Gainers section, each rodeo ride increases both TP target and 
 - After 2 rodeos: 13% × 1.5 × 1.5 = 29.25%
 
 The rationale: unstable tickers produce deeper downward wicks and face greater upside resistance — more conviction is justified.
+
+---
+
+### Balance, Max Positions, and Notional Sizing
+
+At the default **$6 notional** with **6× leverage**, each position consumes **$1 margin** at stage 0. The DCA structure can add margin at stage 1 and stage 2, so a position that fully DCA'd to stage 2 has consumed $3 margin total. This is the basis for sizing your starting balance.
+
+**Margin requirements for 10 open positions at $6 notional:**
+
+| Scenario | Stages Used | Margin per Position | Total Margin |
+|---|---|---|---|
+| Pessimistic | 0 → 2 (all three stages) | $3 | $30 |
+| Moderate | 0 → 1 (two stages) | $2 | $20 |
+| Optimistic | 0 only (entry, no adds) | $1 | $10 |
+
+In practice most positions close at stage 0 or 1. Stage 2 is uncommon and stage 3 is an emergency harness — the pessimistic estimate is a true worst case.
+
+**Sizing formula**: `notional = balance × inverse_ratio × leverage`
+
+| Scenario | Inverse Ratio | Balance-to-Margin | Balance-to-Notional |
+|---|---|---|---|
+| Pessimistic | 0.033 (1/30) | 30× (3000%) | 5× (500%) |
+| Moderate | 0.05 (1/20) | 20× (2000%) | 3.3× (333%) |
+| Optimistic | 0.1 (1/10) | 10× (1000%) | 1.7× (167%) |
+
+**Example — $200 balance, moderate settings:**
+`200 × 0.05 × 6 = $60 notional`
+
+At $60 notional / 6× leverage = $10 margin per position. For 10 positions at moderate depth (stage 1): 10 × $2 = $20 committed at any one time — well within the $200 balance.
+
+**Scaling up**: As your balance grows, increase notional proportionally. The ratios above hold at any balance level. Notional is the primary lever — max positions can stay at 10 and the math scales cleanly.
 
 ---
 
