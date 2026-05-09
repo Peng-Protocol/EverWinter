@@ -401,6 +401,37 @@ The rationale: unstable tickers produce deeper downward wicks and face greater u
 
 ---
 
+### Balance, Max Positions, and Notional Sizing
+
+At the default **$6 notional** with **6× leverage**, each position consumes **$1 margin** at stage 0. The DCA structure can add margin at stage 1 and stage 2, so a position that fully DCA'd to stage 2 has consumed $3 margin total. This is the basis for sizing your starting balance.
+
+**Margin requirements for 10 open positions at $6 notional:**
+
+| Scenario | Stages Used | Margin per Position | Total Margin |
+|---|---|---|---|
+| Pessimistic | 0 → 2 (all three stages) | $3 | $30 |
+| Moderate | 0 → 1 (two stages) | $2 | $20 |
+| Optimistic | 0 only (entry, no adds) | $1 | $10 |
+
+In practice most positions close at stage 0 or 1. Stage 2 is uncommon and stage 3 is an emergency harness — the pessimistic estimate is a true worst case.
+
+**Sizing formula**: `notional = balance × inverse_ratio × leverage`
+
+| Scenario | Inverse Ratio | Balance-to-Margin | Balance-to-Notional |
+|---|---|---|---|
+| Pessimistic | 0.033 (1/30) | 30× (3000%) | 5× (500%) |
+| Moderate | 0.05 (1/20) | 20× (2000%) | 3.3× (333%) |
+| Optimistic | 0.1 (1/10) | 10× (1000%) | 1.7× (167%) |
+
+**Example — $200 balance, moderate settings:**
+`200 × 0.05 × 6 = $60 notional`
+
+At $60 notional / 6× leverage = $10 margin per position. For 10 positions at moderate depth (stage 1): 10 × $2 = $20 committed at any one time — well within the $200 balance.
+
+**Scaling up**: As your balance grows, increase notional proportionally. The ratios above hold at any balance level. Notional is the primary lever — max positions can stay at 10 and the math scales cleanly.
+
+---
+
 ## Conclusion
 
 These strategies are designed to be executed by automation, not humans. The mental overhead of manually tracking:
