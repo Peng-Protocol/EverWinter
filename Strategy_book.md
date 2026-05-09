@@ -295,11 +295,11 @@ This contrasts with linear escalation which would yield $24 total at Stage 3. Th
 
 **TP ROI by Stage**: `[13%, 9%, 6%, 4%]`
 
-The TP percentages **decrease** with each stage because our average entry gets worse. The structure is designed so that **at each DCA stage, the TP yields approximately the same dollar amount as the original entry would if it went perfectly**. We aren't looking to make more profit from the DCA — just get out after a better entry.
+The TP percentages **decrease** with each stage because our average entry gets better. The structure is designed so that **at each DCA stage, the TP yields approximately the same dollar amount as the original entry would if it went perfectly**. We aren't looking to make more profit from the DCA — just get out after a better entry.
 
-**Why This Works**: Each pump makes it relatively easier for us to exit. As price moves against us and triggers adds, our average entry price rises and our TP price rises with it. Even really bad strategies can often be validated by our DCA structure.
+**Why This Works**: Each pump makes it relatively easier for us to exit. As price moves against us and triggers adds, our average entry price rises, thus our TP price rises with it. Even really bad strategies can often be validated by our DCA structure.
 
-**DCA Stage 3 = Emergency Harness**: A DCA3 trigger is itself an **invalidation** of the strategy. It exists as an emergency harness, not a planned outcome.
+**DCA Stage 3 = Emergency Harness**: A DCA3 trigger is itself an **invalidation** of a strategy. It exists as an emergency harness, not a planned outcome.
 
 ---
 
@@ -409,7 +409,7 @@ At the default **$6 notional** with **6× leverage**, each position consumes **$
 
 | Scenario | Stages Used | Margin per Position | Total Margin |
 |---|---|---|---|
-| Pessimistic | 0 → 2 (all three stages) | $3 | $30 |
+| Pessimistic | 0 → 2 (three stages) | $3 | $30 |
 | Moderate | 0 → 1 (two stages) | $2 | $20 |
 | Optimistic | 0 only (entry, no adds) | $1 | $10 |
 
@@ -426,9 +426,9 @@ In practice most positions close at stage 0 or 1. Stage 2 is uncommon and stage 
 **Example — $200 balance, moderate settings:**
 `200 × 0.05 × 6 = $60 notional`
 
-At $60 notional / 6× leverage = $10 margin per position. For 10 positions at moderate depth (stage 1): 10 × $2 = $20 committed at any one time — well within the $200 balance.
+At $60 notional / 6× leverage = $10 margin per entry. For 10 positions at moderate depth (stage 1): 10 × $20 = $200 committed at any one time — precisely within the $200 balance.
 
-**Scaling up**: As your balance grows, increase notional proportionally. The ratios above hold at any balance level. Notional is the primary lever — max positions can stay at 10 and the math scales cleanly.
+**Scaling up**: As your balance grows, increase notional proportionally to keep ROI consistent. 
 
 ---
 
