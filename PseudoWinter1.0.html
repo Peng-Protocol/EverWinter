@@ -2062,9 +2062,9 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             @click="$refs.importFileInput.click()">
             ↑ Import Data (JSON)
           </button>
-          <button class="btn btn-ghost" style="font-size:10px;padding:5px;color:var(--warn);border-color:rgba(240,192,96,.35)"
+          <button class="btn btn-ghost" style="font-size:10px;padding:5px"
             @click="showWhiplashModal=true">
-            ⚡ Force Whiplash
+            Force Whiplash
           </button>
 
           <input type="file" accept=".json,application/json" x-ref="importFileInput"
@@ -3600,7 +3600,16 @@ function pw() { return {
     const qty    = this.snapQty(rawQty, instr);
     if (qty <= 0) { this.log(`💰 ${sym}: FUN qty below min`, 'warn'); return false; }
     const actualNotional = qty * price;
-    if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) { this.log(`💰 ${sym}: FUN notional below min`, 'warn'); return false; }
+    if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) {
+      this.log(`💰 ${sym}: FUN notional below exchange min (${actualNotional.toFixed(4)} < ${instr.minOrderAmt}) — BLACKLISTED`, 'warn');
+      this._symbolBanlist[sym] = `FUN notional below exchange minimum (${actualNotional.toFixed(4)} USDT)`;
+      this.gainers = this.gainers.filter(g => g.symbol !== sym);
+      delete this.ftCandidates[sym];
+      this._stopAdvFtPoller(sym);
+      this._stopExtenderPoller(sym);
+      this.persist();
+      return false;
+    }
     const tpPrice = this.snapPrice(price * (1 - (effTp0 / 100) / effectiveLev), instr);
     if (!tpPrice || tpPrice <= 0) { this.log(`💰 ${sym}: FUN TP price invalid — BLACKLISTED`, 'warn'); this._symbolBanlist[sym] = `FUN TP too low`; return false; }
     const margin = actualNotional / effectiveLev;
@@ -4196,19 +4205,20 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
   },
 
   async runForceWhiplash(posId, lookbackMins) {
-    const pos = this.positions.find(p => p.id === posId);
-    if (!pos) { this.log('⚡ Force whiplash: position not found', 'warn'); return; }
-    if (_closingIds.has(posId)) { this.log(`⚡ ${pos.symbol}: force whiplash — position is already closing`, 'warn'); return; }
+    // sel.value is always a string; p.id is a float — use == to coerce
+    const pos = this.positions.find(p => p.id == posId);
+    if (!pos) { this.log('⚡ Force whiplash: position not found (ID mismatch or already closed)', 'warn'); return; }
+    if (_closingIds.has(pos.id)) { this.log(`⚡ ${pos.symbol}: force whiplash — position is already closing`, 'warn'); return; }
     const mins = Math.min(30, Math.max(1, lookbackMins));
     this.log(`⚡ ${pos.symbol}: force whiplash audit started — ${mins}min lookback, TP ${fmtP(pos.currentTpPrice)}`, 'info');
-    _closingIds.add(posId);
+    _closingIds.add(pos.id);
     try {
       const auditTo   = Date.now();
       const auditFrom = auditTo - mins * 60 * 1000;
       const candles   = await this.pseudoFetchKlines(pos.symbol, auditFrom, auditTo);
       if (!candles.length) {
         this.log(`⚡ ${pos.symbol}: force whiplash — no candles returned for ${mins}min window`, 'warn');
-        _closingIds.delete(posId);
+        _closingIds.delete(pos.id);
         return;
       }
       let hit = false;
@@ -4217,15 +4227,19 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
       }
       if (hit) {
         this.log(`⚡ ${pos.symbol}: force whiplash — TP confirmed in klines — closing`, 'warn');
-        _closingIds.delete(posId);
+        _closingIds.delete(pos.id);
         await this.pseudoClosePosition(pos, 'tp', pos.currentTpPrice);
       } else {
-        this.log(`⚡ ${pos.symbol}: force whiplash — TP not touched in ${mins}min lookback (${candles.length} candles) — still open`, 'info');
-        _closingIds.delete(posId);
+        const mark = pos.markPrice || pos.entryPrice;
+        const gapPct = pos.currentTpPrice > 0
+          ? (((mark - pos.currentTpPrice) / pos.entryPrice) * pos.leverage * 100).toFixed(2)
+          : '—';
+        this.log(`⚡ ${pos.symbol}: force whiplash — TP not touched in ${mins}min lookback (${candles.length} candles) — mark ${fmtP(mark)} / TP ${fmtP(pos.currentTpPrice)} (${gapPct}% remaining) — still open`, 'info');
+        _closingIds.delete(pos.id);
       }
     } catch(e) {
       this.log(`⚡ ${pos.symbol}: force whiplash error — ${e.message}`, 'warn');
-      _closingIds.delete(posId);
+      _closingIds.delete(pos.id);
     }
   },
 
