@@ -2663,8 +2663,10 @@ function ew() { return {
       const base    = vmBase ?? (this.cfg.funVolMomLosersMin ?? -10);
       const creeped = base + count * (Math.abs(base) * creepPct / 100);
       if (histOverExtCount === 0) return creeped;
-      const oeBase = 1;
-      return oeBase + histOverExtCount * (oeBase * oeStepPct / 100);
+      // OE losers behave like gainers — use gainer base + compound multiplier
+      const gainerBase    = this.cfg.funVolMomMin ?? 10;
+      const gainerCreeped = gainerBase * (1 + count * creepPct / 100);
+      return gainerCreeped * Math.pow(1 + oeStepPct / 100, histOverExtCount);
     }
     const base    = vmBase ?? (this.cfg.funVolMomMin ?? 10);
     const creeped = base * (1 + count * creepPct / 100);
@@ -2687,6 +2689,15 @@ function ew() { return {
     if (histCount > prevCount) {
       this.log(`💰 ${symbol}: FUN OE sync — lookback ${histCount} candle(s) over-extended → VM ×${mult.toFixed(2)}`, 'info');
       this.persist();
+    }
+    // Seed extender counter from OE lookback so FUN OE tickers are eligible for ADV FT
+    if (this.cfg.advFtEnabled && histCount > 0) {
+      const EXTENDER_TTL = 3 * 3600 * 1000;
+      const extEntry = this.extenderCount[symbol];
+      const extActive = extEntry && (Date.now() - extEntry.setAt) < EXTENDER_TTL;
+      if (!extActive || histCount > extEntry.count) {
+        this.extenderBump(symbol, null, histCount);
+      }
     }
   },
 
@@ -2955,26 +2966,32 @@ function ew() { return {
   },
 
   // Increments extenderCount for a symbol (RSI6 ≥ rsi6Max hit). 3h TTL.
+  // seedCount: if provided, sets count to max(current, seedCount) instead of incrementing by 1.
   // At advFtThreshold promotes (or upgrades) the FT roster entry to _advFt: true.
-  extenderBump(symbol, rsi6 = null) {
+  extenderBump(symbol, rsi6 = null, seedCount = null) {
     const EXTENDER_TTL = 3 * 3600 * 1000;
     const now = Date.now();
     const entry = this.extenderCount[symbol];
-    if (entry && (now - entry.setAt) < EXTENDER_TTL) {
-      entry.count++;
+    const isNewEntry = !entry || (now - entry.setAt) >= EXTENDER_TTL;
+    if (!isNewEntry) {
+      entry.count = seedCount != null ? Math.max(entry.count, seedCount) : entry.count + 1;
     } else {
-      this.extenderCount[symbol] = { count: 1, setAt: now };
+      this.extenderCount[symbol] = { count: seedCount ?? 1, setAt: now };
       const GRAYLIST_DURATION = 3 * 3600 * 1000;
       this._extenderGraylist[symbol] = now + GRAYLIST_DURATION;
-      const rsiNote = rsi6 != null ? ` — RSI6 ${rsi6.toFixed(1)} (max ${this.cfg.rsi6Max})` : '';
-      this.log(`⚡ ${symbol}: over-extended ×1${rsiNote} — graylisted from gainers for 3h`, 'info');
-      // One-time lookback: verify true historical ext-tick count from kline history.
-      this._fetchConfirmedExtTicks(symbol).then(({ confirmedTicks, fallback }) => {
-        if (!fallback && this.extenderCount[symbol] && confirmedTicks > 1) {
-          this.extenderCount[symbol].count = Math.max(this.extenderCount[symbol].count, confirmedTicks);
-          this.log(`⚡ ${symbol}: lookback confirmed ×${confirmedTicks} over-extension ticks`, 'info');
-        }
-      }).catch(() => {});
+      const initialCount = seedCount ?? 1;
+      const rsiNote  = rsi6 != null ? ` — RSI6 ${rsi6.toFixed(1)} (max ${this.cfg.rsi6Max})` : '';
+      const seedNote = seedCount != null && seedCount > 1 ? ` (seeded ×${seedCount} from OE lookback)` : '';
+      this.log(`⚡ ${symbol}: over-extended ×${initialCount}${rsiNote}${seedNote} — graylisted from gainers for 3h`, 'info');
+      // Skip historical lookback when already seeded from OE data
+      if (seedCount == null) {
+        this._fetchConfirmedExtTicks(symbol).then(({ confirmedTicks, fallback }) => {
+          if (!fallback && this.extenderCount[symbol] && confirmedTicks > 1) {
+            this.extenderCount[symbol].count = Math.max(this.extenderCount[symbol].count, confirmedTicks);
+            this.log(`⚡ ${symbol}: lookback confirmed ×${confirmedTicks} over-extension ticks`, 'info');
+          }
+        }).catch(() => {});
+      }
     }
     const count = this.extenderCount[symbol].count;
 
