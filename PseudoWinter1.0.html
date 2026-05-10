@@ -729,13 +729,16 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             <div class="stat"><div class="sl">Leverage</div><div class="sv ice sm"><span x-text="cfg.leverage"></span>×</div></div>
           </div>
 
-          <!-- Whiplash check static indicator -->
+          <!-- Whiplash check config -->
+          <div class="g" style="margin-top:6px">
+            <div class="lbl">Whiplash Proximity <b x-text="(cfg.whiplashProximityPct??20)+'% remaining'"></b></div>
+            <input type="range" min="5" max="50" step="5" x-model.number="cfg.whiplashProximityPct" @change="persist()">
+          </div>
           <div class="sg2 gs" style="margin-top:6px">
-            <div class="stat"><div class="sl">Whiplash Proximity</div><div class="sv ice sm">10%</div></div>
             <div class="stat"><div class="sl">Whiplash Lookback</div><div class="sv ice sm">6 min</div></div>
           </div>
           <div style="font-size:9px;color:var(--text-lo);margin-top:4px;line-height:1.5">
-            Schedules a 5min audit when price reaches within 10% of TP. Checks a 6min kline window for TP touch.
+            Arms a 5min audit when price is within the proximity % of TP. Checks a 6min kline window for TP touch.
           </div>
 
           <!-- Leverage slider -->
@@ -2286,6 +2289,7 @@ function pw() { return {
     laggardProfitOffset: 50,   // EV multiplier offset % (-99 to +200); positive = protective
     laggardAutoReduce: true,
     laggardAutoReduceThreshold: 3,
+    whiplashProximityPct: 20,  // % of TP distance remaining when whiplash audit arms (higher = earlier trigger)
     // ── FUN (Fund Chasing) Strategy ──
     funEnabled: true,          // enable fund-chasing strategy
     funFundingHigh: 0.1,       // high-fund threshold % (HFG/HFL sub-types)
@@ -2334,7 +2338,6 @@ function pw() { return {
   _extenderGraylist: {}, // symbol → expiresAt — graylisted on first over-extension; 3h window
   _ftEvictGraylist:  {}, // symbol → evictedAt — prevents extenderBump re-promoting an evicted FT entry within same window
   _ftMaxGraylist:    {}, // symbol → expiresAt — 12h cooldown after FT max trades reached (all FT types)
-  _funLoserOEGraylist: {}, // symbol → expiresAt — 6h graylist: FUN loser with any RSI6 over-extension in 6h lookback is contradictory and filtered out
   _tpIngress: {},          // symbol → { count, setAt } — per-symbol entry TP reduction: 0.5^count, floor at tpIngressMin%, TTL 3h
   _cycleRunning: false, // re-entry guard for runScheduledCycle
   _volBaseline:   {}, // symbol → { volume24h, turnover24h, lastPrice, ts } — seeded from bulk ticker in runScan
@@ -2425,7 +2428,6 @@ function pw() { return {
         ftMaxGraylist:      this._ftMaxGraylist,
         advFtGraylist:      this._advFtGraylist,
         extenderGraylist:   this._extenderGraylist,
-        funLoserOEGraylist: this._funLoserOEGraylist,
         tpIngress:          this._tpIngress,
       }));
       this.savedPositions = [...this.positions];
@@ -2478,11 +2480,6 @@ function pw() { return {
       if (s.extenderGraylist && typeof s.extenderGraylist === 'object') {
         for (const [sym, expiry] of Object.entries(s.extenderGraylist)) {
           if (expiry > nowGl) this._extenderGraylist[sym] = expiry;
-        }
-      }
-      if (s.funLoserOEGraylist && typeof s.funLoserOEGraylist === 'object') {
-        for (const [sym, expiry] of Object.entries(s.funLoserOEGraylist)) {
-          if (expiry > nowGl) this._funLoserOEGraylist[sym] = expiry;
         }
       }
       if (s.tpIngress && typeof s.tpIngress === 'object') {
@@ -2541,7 +2538,6 @@ function pw() { return {
     this._extenderGraylist = {};
     this._ftEvictGraylist  = {};
     this._ftMaxGraylist    = {};
-    this._funLoserOEGraylist = {};
     this._advFtVmCreep       = {};
     this._tpIngress          = {};
     this._stopAllIftPollers();
@@ -2558,7 +2554,6 @@ function pw() { return {
     this._advFtGraylist    = {};
     this._ftEvictGraylist  = {};
     this._ftMaxGraylist    = {};
-    this._funLoserOEGraylist = {};
     this._advFtVmCreep       = {};
     this._tpIngress          = {};
     this._stopAllCarryOnPollers();
@@ -3038,7 +3033,7 @@ function pw() { return {
           .slice(0, this.cfg.funLoserN);
         const funPool = [...addPool(gainers), ...addPool(losers)];
 
-        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, oeGraylisted = 0, proximityBlocked = 0, frCreepBlocked = 0, frNegativeBlocked = 0;
+        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, proximityBlocked = 0, frCreepBlocked = 0, frNegativeBlocked = 0;
         const gainerSyms = new Set(gainers.map(t => t.symbol));
         for (const t of funPool) {
           const sym   = t.symbol;
@@ -3088,28 +3083,18 @@ function pw() { return {
             this.funCreepSyncOverExt(sym, funHistOverExtCount);
           }
 
-          // ── FUN loser over-extension graylist ──
-          // A loser (price falling) with any RSI6 over-extension in the 3h lookback is
-          // contradictory — momentum is overbought while the 24h move is down, signalling
-          // structural disorder. Filter it out and graylist for 3h so we don't keep paying
-          // API cost to evaluate a coin that shouldn't qualify.
-          if (isLoser && funHistOverExtCount > 0) {
-            const FUN_LOSER_OE_TTL = 6 * 3600 * 1000;
-            const alreadyGraylisted = this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym];
-            if (!alreadyGraylisted) {
-              this._funLoserOEGraylist[sym] = Date.now() + FUN_LOSER_OE_TTL;
-              this.log(`💰 ${sym}: FUN loser OE graylist — ${funHistOverExtCount} candle(s) over-extended in 6h lookback; loser + OE is contradictory → graylisted 6h`, 'warn');
-              this.persist();
-            }
-            oeGraylisted++;
-            continue;
-          }
-          if (isLoser && this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym]) {
-            continue; // still within graylist window (OE cleared but TTL not yet expired)
-          }
           const funRsi6 = await this.fetchRSI(sym, 6);
           if (funRsi6 !== null && funRsi6 >= this.cfg.rsi6Max) {
-            // Over-extended now — already captured in histOverExtCount; VM bar raised, fall through
+            // Over-extended now — VM bar raised by histOverExtCount; register extender tick if not
+            // already bumped this cycle by the gainers scan (lastFetchAt guard prevents double-count)
+            if (this.cfg.advFtEnabled) {
+              const extE = this.extenderCount[sym];
+              const scanMs = (this.cfg.scanMins || 15) * 60 * 1000;
+              if (!(extE?.lastFetchAt && (Date.now() - extE.lastFetchAt) < scanMs)) {
+                this.extenderBump(sym, false, funRsi6);
+                if (this.extenderCount[sym]) this.extenderCount[sym].lastFetchAt = Date.now();
+              }
+            }
           } else if (funRsi6 !== null && this.cfg.rsi6ProximityPct > 0) {
             const proxThreshold = this.cfg.rsi6Max * (1 - this.cfg.rsi6ProximityPct / 100);
             if (funRsi6 >= proxThreshold) {
@@ -3168,11 +3153,10 @@ function pw() { return {
         }
         const vmNote      = (vmBlockedGainers + vmBlockedLosers) > 0 ? ` | VM: ${vmBlockedGainers}G ${vmBlockedLosers}L` : '';
         const lsaNote     = lsaBlockedLosers   > 0 ? ` | LSA: ${lsaBlockedLosers}L` : '';
-        const oeNote      = oeGraylisted        > 0 ? ` | OE-gray: ${oeGraylisted}L` : '';
         const proxNote    = proximityBlocked    > 0 ? ` | RSI-prox: ${proximityBlocked}` : '';
         const frCreepNote = frCreepBlocked      > 0 ? ` | FR-creep: ${frCreepBlocked}` : '';
         const frNegNote   = frNegativeBlocked   > 0 ? ` | FR≤0: ${frNegativeBlocked}` : '';
-        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${oeNote}${proxNote}${frCreepNote}${frNegNote}.`, 'scan');
+        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${proxNote}${frCreepNote}${frNegNote}.`, 'scan');
 
         // Prune expired creep entries so they don't linger in the UI
         const _now = Date.now();
@@ -5085,9 +5069,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         }
         const tpGap  = pos.entryPrice - _wpTpRef; // total price distance to effective TP (short)
         const tpProx = pos.entryPrice - mark;      // price distance already covered
-        if (tpGap > 0 && tpProx >= tpGap * 0.9) {
+        const wpPct  = this.cfg.whiplashProximityPct ?? 20;
+        if (tpGap > 0 && tpProx >= tpGap * (1 - wpPct / 100)) {
           pos._whiplashScheduled = true;
-          this.log(`🌑 ${pos.symbol}: price within 10% of TP (${fmtP(mark)} → TP ${fmtP(_wpTpRef)}) — whiplash audit in 5min`, 'info');
+          this.log(`🌑 ${pos.symbol}: price within ${wpPct}% of TP (${fmtP(mark)} → TP ${fmtP(_wpTpRef)}) — whiplash audit in 5min`, 'info');
           const posId = pos.id;
           setTimeout(async () => {
             const livePos = this.positions.find(p => p.id === posId);
@@ -5519,9 +5504,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const base    = vmBase ?? (this.cfg.funVolMomLosersMin ?? -10);
       const creeped = base + count * (Math.abs(base) * creepPct / 100);
       if (histOverExtCount === 0) return creeped;
-      const oeBase    = 1;
-      const oeTighten = histOverExtCount * (oeBase * oeStepPct / 100);
-      return oeBase + oeTighten;
+      // OE losers behave like gainers — use gainer base + compound multiplier
+      const gainerBase    = this.cfg.funVolMomMin ?? 10;
+      const gainerCreeped = gainerBase * (1 + count * creepPct / 100);
+      return gainerCreeped * Math.pow(1 + oeStepPct / 100, histOverExtCount);
     }
     const base    = vmBase ?? (this.cfg.funVolMomMin ?? 10);
     const creeped = base * (1 + count * creepPct / 100);
@@ -5639,6 +5625,15 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       this.log(`💰 ${symbol}: FUN OE sync — lookback ${histCount} candle(s) over-extended → VM ×${mult.toFixed(2)} (${(1 + oeStepPct/100).toFixed(2)}^${histCount})`, 'info');
       this.persist();
     }
+    // Seed extender counter from OE lookback so FUN OE tickers are eligible for ADV FT
+    if (this.cfg.advFtEnabled && histCount > 0) {
+      const EXTENDER_TTL = 3 * 3600 * 1000;
+      const extEntry = this.extenderCount[symbol];
+      const extActive = extEntry && (Date.now() - extEntry.setAt) < EXTENDER_TTL;
+      if (!extActive || histCount > extEntry.count) {
+        this.extenderBump(symbol, true, null, histCount);
+      }
+    }
   },
 
   // Counts how many 15m candles in the RSI6 lookback window were over-extended (≥ rsi6Max).
@@ -5713,35 +5708,39 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     }
   },
 
-  extenderBump(symbol, fromHistorical = false, rsi6 = null) {
+  // seedCount: if provided, sets count to max(current, seedCount) instead of incrementing by 1.
+  extenderBump(symbol, fromHistorical = false, rsi6 = null, seedCount = null) {
     const EXTENDER_TTL = 3 * 3600 * 1000;
     const now = Date.now();
     const entry = this.extenderCount[symbol];
-    if (entry && (now - entry.setAt) < EXTENDER_TTL) {
-      entry.count++;
+    const isNewEntry = !entry || (now - entry.setAt) >= EXTENDER_TTL;
+    if (!isNewEntry) {
+      entry.count = seedCount != null ? Math.max(entry.count, seedCount) : entry.count + 1;
     } else {
-      this.extenderCount[symbol] = { count: 1, setAt: now };
+      this.extenderCount[symbol] = { count: seedCount ?? 1, setAt: now };
     }
     const count = this.extenderCount[symbol].count;
 
-    if (count === 1 && !this._extenderPollers[symbol]) {
+    if (isNewEntry && !this._extenderPollers[symbol]) {
       this._startExtenderPoller(symbol);
       const GRAYLIST_DURATION = 3 * 3600 * 1000;
       this._extenderGraylist[symbol] = now + GRAYLIST_DURATION;
-      if (fromHistorical) {
-        this.log(`⚡ ${symbol}: missed over-extension — graylisted, extender poller started.`, 'info');
+      if (fromHistorical || seedCount != null) {
+        const seedNote = seedCount != null && seedCount > 1 ? ` (×${seedCount} from OE lookback)` : '';
+        this.log(`⚡ ${symbol}: missed over-extension${seedNote} — graylisted, extender poller started.`, 'info');
       } else {
         const rsiNote = rsi6 != null ? ` — RSI6 ${rsi6.toFixed(1)} (max ${this.cfg.rsi6Max})` : '';
         this.log(`⚡ ${symbol}: over-extended ×1${rsiNote} — graylisted from gainers for 3h, ADV FT window active.`, 'info');
       }
-      // One-time lookback: verify true historical ext-tick count from kline history.
-      // Result is cached into extenderCount so the ADV FT path uses it directly.
-      this._fetchConfirmedExtTicks(symbol).then(({ confirmedTicks, fallback }) => {
-        if (!fallback && this.extenderCount[symbol] && confirmedTicks > 1) {
-          this.extenderCount[symbol].count = Math.max(this.extenderCount[symbol].count, confirmedTicks);
-          this.log(`⚡ ${symbol}: lookback confirmed ×${confirmedTicks} over-extension ticks`, 'info');
-        }
-      }).catch(() => {});
+      // Skip historical lookback when already seeded from OE data
+      if (seedCount == null) {
+        this._fetchConfirmedExtTicks(symbol).then(({ confirmedTicks, fallback }) => {
+          if (!fallback && this.extenderCount[symbol] && confirmedTicks > 1) {
+            this.extenderCount[symbol].count = Math.max(this.extenderCount[symbol].count, confirmedTicks);
+            this.log(`⚡ ${symbol}: lookback confirmed ×${confirmedTicks} over-extension ticks`, 'info');
+          }
+        }).catch(() => {});
+      }
     }
 
     if (count >= this.cfg.advFtThreshold) {
