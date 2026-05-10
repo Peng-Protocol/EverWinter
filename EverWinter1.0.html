@@ -2818,7 +2818,10 @@ function ew() { return {
       if (isLoser && this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym]) continue;
       // RSI6 proximity check
       const funRsi6 = await this.fetchRSI(sym, 6);
-      if (funRsi6 !== null && funRsi6 < this.cfg.rsi6Max && this.cfg.rsi6ProximityPct > 0) {
+      if (funRsi6 !== null && funRsi6 >= this.cfg.rsi6Max) {
+        // Over-extended now — VM bar is raised by histOverExtCount; register an extender tick
+        if (this.cfg.advFtEnabled) this.extenderBump(sym, funRsi6);
+      } else if (funRsi6 !== null && this.cfg.rsi6ProximityPct > 0) {
         const proxThreshold = this.cfg.rsi6Max * (1 - this.cfg.rsi6ProximityPct / 100);
         if (funRsi6 >= proxThreshold) { proxBlocked++; continue; }
       }
@@ -3160,29 +3163,72 @@ function ew() { return {
   // historical value rather than starting from 1. Returns { confirmedTicks, fallback }.
   // fallback:true means the fetch failed — caller should not overwrite the live count.
   async _fetchConfirmedExtTicks(symbol) {
-    try {
-      const limit  = 12; // 12 × 15m = 3h of history
-      const url    = `${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=${limit}`;
-      const r      = await fetch(url);
-      const d      = await r.json();
-      if (d.retCode !== 0 || !Array.isArray(d.result?.list)) return { confirmedTicks: 1, fallback: true };
-      const closes = d.result.list.map(k => parseFloat(k[4])).reverse(); // close prices, oldest first
-      const rsiMax = this.cfg.rsi6Max ?? 90;
-      // Count candles whose RSI6-equivalent close indicates over-extension.
-      // We use a simplified check: close > (median of closes × rsiMax/100) proxy.
-      // More practical: count closes where rolling 6-period RSI would be ≥ rsiMax.
-      // Build rolling RSI over closes array (need at least 7 values for one RSI6 reading).
-      if (closes.length < 7) return { confirmedTicks: 1, fallback: true };
-      let count = 0;
-      for (let i = 6; i < closes.length; i++) {
-        const window = closes.slice(i - 6, i + 1);
-        const rsi = calcRSI(window, 6);
-        if (rsi !== null && rsi >= rsiMax) count++;
-      }
-      return { confirmedTicks: Math.max(1, count), fallback: false };
-    } catch(e) {
-      return { confirmedTicks: 1, fallback: true };
+    const extEntry = this.extenderCount[symbol];
+    if (!extEntry || !extEntry.setAt) {
+      return { confirmedTicks: 1, candlesFetched: 0, elapsed15mBars: 1 };
     }
+    try {
+      const now            = Date.now();
+      const elapsedMs      = now - extEntry.setAt;
+      const elapsed15mBars = Math.max(1, Math.ceil(elapsedMs / (15 * 60 * 1000))) + 1;
+      const WARMUP         = 8; // RSI6 needs at least 7 bars; +1 for stability
+      const limit          = elapsed15mBars + WARMUP;
+      const r = await fetch(
+        `${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=${limit}`
+      );
+      const d = await r.json();
+      if (d.retCode !== 0) throw new Error(d.retMsg || 'kline error');
+      const candles = (d.result?.list || []).reverse();
+      const closes  = candles.map(c => parseFloat(c[4]));
+      if (closes.length < WARMUP + 2) throw new Error('insufficient candles');
+      const startIdx = Math.max(0, closes.length - elapsed15mBars);
+      let confirmedTicks = 0;
+      for (let i = startIdx; i < closes.length; i++) {
+        const slice = closes.slice(0, i + 1);
+        const rsi   = calcRSI(slice, 6);
+        if (rsi !== null && rsi >= this.cfg.rsi6Max) confirmedTicks++;
+      }
+      confirmedTicks = Math.max(1, confirmedTicks);
+      return { confirmedTicks, candlesFetched: candles.length, elapsed15mBars };
+    } catch(e) {
+      this.log(`⚡ ${symbol}: ext-tick audit failed (${e.message}) — falling back to registered count ${extEntry.count}`, 'warn');
+      return { confirmedTicks: extEntry.count || 1, candlesFetched: 0, elapsed15mBars: 0, fallback: true };
+    }
+  },
+
+  // Fetches 3h of 15m candles and returns the highest RSI6 seen in that window.
+  // Uses the _klineCache (same key as fetchFunHistOverExtCount) so no extra fetches when warm.
+  async fetchHistoricalRSI6Peaks(symbol) {
+    try {
+      const LOOKBACK_HOURS   = 3;
+      const LOOKBACK_CANDLES = Math.ceil((LOOKBACK_HOURS * 60) / 15); // 12
+      const WARMUP           = 8;
+      const limit            = LOOKBACK_CANDLES + WARMUP + 6;
+      const cacheKey         = `${symbol}_15`;
+      const cacheTTL         = (this.cfg.scanMins || 15) * 60 * 1000;
+      let closes;
+      const cached = this._klineCache[cacheKey];
+      if (cached && (Date.now() - cached.ts) < cacheTTL) {
+        closes = cached.closes;
+      } else {
+        const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=${limit}`);
+        const d = await r.json();
+        if (d.retCode !== 0) return null;
+        const candles = (d.result?.list || []).reverse();
+        closes = candles.map(c => parseFloat(c[4]));
+        const volumes     = candles.map(c => parseFloat(c[6]));
+        const baseVolumes = candles.map(c => parseFloat(c[5]));
+        this._klineCache[cacheKey] = { closes, volumes, baseVolumes, ts: Date.now() };
+      }
+      if (!closes || closes.length < WARMUP + 2) return null;
+      let peak = null;
+      for (let i = 0; i < LOOKBACK_CANDLES; i++) {
+        const slice = closes.slice(0, closes.length - LOOKBACK_CANDLES + i + 1);
+        const rsi = calcRSI(slice, 6);
+        if (rsi != null && (peak === null || rsi > peak)) peak = rsi;
+      }
+      return peak;
+    } catch { return null; }
   },
 
   async runLaggardCheck() {
@@ -3489,6 +3535,14 @@ function ew() { return {
             const inAdvGl  = this._advFtGraylist[c.symbol]    && now_gl < this._advFtGraylist[c.symbol];
             if (inExtGl || inAdvGl) {
               c.status = 'extgrayed';
+              continue;
+            }
+            // Historical RSI6 peak check — catches OE events between scans using 15m candles
+            const rsi6Peak = await this.fetchHistoricalRSI6Peaks(c.symbol);
+            if (rsi6Peak != null && rsi6Peak >= this.cfg.rsi6Max) {
+              this.log(`⚡ ${c.symbol}: historical RSI6 peak ${rsi6Peak.toFixed(1)} ≥ ${this.cfg.rsi6Max} — missed extender, graylisting`, 'warn');
+              c.status = 'extgrayed';
+              this.extenderBump(c.symbol, rsi6Peak);
               continue;
             }
           }
