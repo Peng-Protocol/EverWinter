@@ -2039,7 +2039,6 @@ function ew() { return {
   _ftEvictGraylist: {},
   _ftMaxGraylist: {},
   _tpIngress: {},          // symbol → { count, setAt } — entry TP reduction: 0.5^count, floor at tpIngressMin%, TTL 3h
-  _funLoserOEGraylist: {}, // symbol → expiresAt — 6h graylist: FUN loser with RSI6 OE in 6h lookback is contradictory
   funCreep:   {},          // symbol → { count, setAt, frThreshold, overExtCount } — FUN re-entry creep, 6h TTL
   _advFtVmCreep: {},   // symbol → { bonus: number (additive % pts), expiresAt: timestamp }
   _volBaseline: {},
@@ -2133,7 +2132,6 @@ function ew() { return {
         extenderCount: this.extenderCount,
         ftMaxGraylist:      this._ftMaxGraylist,
         advFtVmCreep:       this._advFtVmCreep,
-        funLoserOEGraylist: this._funLoserOEGraylist,
         tpIngress:          this._tpIngress,
       }));
       this.savedPositions = [...this.positions];
@@ -2189,12 +2187,6 @@ function ew() { return {
         }
       }
       if (s.funCreep && typeof s.funCreep === 'object') this.funCreep = s.funCreep;
-      if (s.funLoserOEGraylist && typeof s.funLoserOEGraylist === 'object') {
-        const nowGl = Date.now();
-        for (const [sym, expiry] of Object.entries(s.funLoserOEGraylist)) {
-          if (expiry > nowGl) this._funLoserOEGraylist[sym] = expiry;
-        }
-      }
       if (s.tpIngress && typeof s.tpIngress === 'object') {
         const TP_INGRESS_TTL = 3 * 3600 * 1000;
         const nowGl = Date.now();
@@ -2249,7 +2241,6 @@ function ew() { return {
     this._advFtVmCreep = {};
     this._volBaseline = {};
     this.funCreep = {};
-    this._funLoserOEGraylist = {};
     this._tpIngress = {};
     this.log('Saved state cleared.', 'warn');
     this.renderTradeFeed();
@@ -2779,7 +2770,7 @@ function ew() { return {
     const funPool = [...addPool(gainers), ...addPool(losers)];
     const gainerSyms = new Set(gainers.map(t => t.symbol));
 
-    let funOpened = 0, vmBlockedG = 0, vmBlockedL = 0, lsaBlocked = 0, oeGraylisted = 0, proxBlocked = 0, frCreepBlocked = 0, frNegBlocked = 0;
+    let funOpened = 0, vmBlockedG = 0, vmBlockedL = 0, lsaBlocked = 0, proxBlocked = 0, frCreepBlocked = 0, frNegBlocked = 0;
     for (const t of funPool) {
       const sym   = t.symbol;
       const price = parseFloat(t.lastPrice || 0);
@@ -2802,25 +2793,22 @@ function ew() { return {
       if (creepEntry && (Date.now() - creepEntry.setAt) < CREEP_TTL && creepEntry.frThreshold != null) {
         if (fr < creepEntry.frThreshold) { frCreepBlocked++; continue; }
       }
-      // Historical OE look-back
+      // Historical OE look-back — raises VM bar via funVolMomThreshold for both gainers and losers
       const funHistOverExtCount = await this.fetchFunHistOverExtCount(sym);
       if (funHistOverExtCount > 0) this.funCreepSyncOverExt(sym, funHistOverExtCount);
-      // FUN loser OE graylist
-      if (isLoser && funHistOverExtCount > 0) {
-        const FUN_LOSER_OE_TTL = 6 * 3600 * 1000;
-        if (!(this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym])) {
-          this._funLoserOEGraylist[sym] = Date.now() + FUN_LOSER_OE_TTL;
-          this.log(`💰 ${sym}: FUN loser OE graylist — ${funHistOverExtCount} candle(s) over-extended in 6h lookback → graylisted 6h`, 'warn');
-          this.persist();
-        }
-        oeGraylisted++; continue;
-      }
-      if (isLoser && this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym]) continue;
-      // RSI6 proximity check
+      // RSI6 check
       const funRsi6 = await this.fetchRSI(sym, 6);
       if (funRsi6 !== null && funRsi6 >= this.cfg.rsi6Max) {
-        // Over-extended now — VM bar is raised by histOverExtCount; register an extender tick
-        if (this.cfg.advFtEnabled) this.extenderBump(sym, funRsi6);
+        // Over-extended now — VM bar raised by histOverExtCount; register extender tick if not
+        // already bumped this cycle by the gainers scan (lastFetchAt guard prevents double-count)
+        if (this.cfg.advFtEnabled) {
+          const extE = this.extenderCount[sym];
+          const scanMs = (this.cfg.scanMins || 15) * 60 * 1000;
+          if (!(extE?.lastFetchAt && (Date.now() - extE.lastFetchAt) < scanMs)) {
+            this.extenderBump(sym, funRsi6);
+            if (this.extenderCount[sym]) this.extenderCount[sym].lastFetchAt = Date.now();
+          }
+        }
       } else if (funRsi6 !== null && this.cfg.rsi6ProximityPct > 0) {
         const proxThreshold = this.cfg.rsi6Max * (1 - this.cfg.rsi6ProximityPct / 100);
         if (funRsi6 >= proxThreshold) { proxBlocked++; continue; }
@@ -2865,11 +2853,10 @@ function ew() { return {
     }
     const vmNote      = (vmBlockedG + vmBlockedL)  > 0 ? ` | VM: ${vmBlockedG}G ${vmBlockedL}L` : '';
     const lsaNote     = lsaBlocked    > 0 ? ` | LSA: ${lsaBlocked}L` : '';
-    const oeNote      = oeGraylisted  > 0 ? ` | OE-gray: ${oeGraylisted}L` : '';
     const proxNote    = proxBlocked   > 0 ? ` | RSI-prox: ${proxBlocked}` : '';
     const frCreepNote = frCreepBlocked > 0 ? ` | FR-creep: ${frCreepBlocked}` : '';
     const frNegNote   = frNegBlocked  > 0 ? ` | FR≤0: ${frNegBlocked}` : '';
-    this.log(`💰 FUN scan — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${oeNote}${proxNote}${frCreepNote}${frNegNote}`, 'scan');
+    this.log(`💰 FUN scan — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${proxNote}${frCreepNote}${frNegNote}`, 'scan');
     // Prune expired creep entries
     const _now = Date.now();
     for (const sym of Object.keys(this.funCreep)) {

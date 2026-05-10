@@ -2334,7 +2334,6 @@ function pw() { return {
   _extenderGraylist: {}, // symbol → expiresAt — graylisted on first over-extension; 3h window
   _ftEvictGraylist:  {}, // symbol → evictedAt — prevents extenderBump re-promoting an evicted FT entry within same window
   _ftMaxGraylist:    {}, // symbol → expiresAt — 12h cooldown after FT max trades reached (all FT types)
-  _funLoserOEGraylist: {}, // symbol → expiresAt — 6h graylist: FUN loser with any RSI6 over-extension in 6h lookback is contradictory and filtered out
   _tpIngress: {},          // symbol → { count, setAt } — per-symbol entry TP reduction: 0.5^count, floor at tpIngressMin%, TTL 3h
   _cycleRunning: false, // re-entry guard for runScheduledCycle
   _volBaseline:   {}, // symbol → { volume24h, turnover24h, lastPrice, ts } — seeded from bulk ticker in runScan
@@ -2425,7 +2424,6 @@ function pw() { return {
         ftMaxGraylist:      this._ftMaxGraylist,
         advFtGraylist:      this._advFtGraylist,
         extenderGraylist:   this._extenderGraylist,
-        funLoserOEGraylist: this._funLoserOEGraylist,
         tpIngress:          this._tpIngress,
       }));
       this.savedPositions = [...this.positions];
@@ -2478,11 +2476,6 @@ function pw() { return {
       if (s.extenderGraylist && typeof s.extenderGraylist === 'object') {
         for (const [sym, expiry] of Object.entries(s.extenderGraylist)) {
           if (expiry > nowGl) this._extenderGraylist[sym] = expiry;
-        }
-      }
-      if (s.funLoserOEGraylist && typeof s.funLoserOEGraylist === 'object') {
-        for (const [sym, expiry] of Object.entries(s.funLoserOEGraylist)) {
-          if (expiry > nowGl) this._funLoserOEGraylist[sym] = expiry;
         }
       }
       if (s.tpIngress && typeof s.tpIngress === 'object') {
@@ -2541,7 +2534,6 @@ function pw() { return {
     this._extenderGraylist = {};
     this._ftEvictGraylist  = {};
     this._ftMaxGraylist    = {};
-    this._funLoserOEGraylist = {};
     this._advFtVmCreep       = {};
     this._tpIngress          = {};
     this._stopAllIftPollers();
@@ -2558,7 +2550,6 @@ function pw() { return {
     this._advFtGraylist    = {};
     this._ftEvictGraylist  = {};
     this._ftMaxGraylist    = {};
-    this._funLoserOEGraylist = {};
     this._advFtVmCreep       = {};
     this._tpIngress          = {};
     this._stopAllCarryOnPollers();
@@ -3038,7 +3029,7 @@ function pw() { return {
           .slice(0, this.cfg.funLoserN);
         const funPool = [...addPool(gainers), ...addPool(losers)];
 
-        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, oeGraylisted = 0, proximityBlocked = 0, frCreepBlocked = 0, frNegativeBlocked = 0;
+        let funOpened = 0, vmBlockedGainers = 0, vmBlockedLosers = 0, lsaBlockedLosers = 0, proximityBlocked = 0, frCreepBlocked = 0, frNegativeBlocked = 0;
         const gainerSyms = new Set(gainers.map(t => t.symbol));
         for (const t of funPool) {
           const sym   = t.symbol;
@@ -3088,29 +3079,18 @@ function pw() { return {
             this.funCreepSyncOverExt(sym, funHistOverExtCount);
           }
 
-          // ── FUN loser over-extension graylist ──
-          // A loser (price falling) with any RSI6 over-extension in the 3h lookback is
-          // contradictory — momentum is overbought while the 24h move is down, signalling
-          // structural disorder. Filter it out and graylist for 3h so we don't keep paying
-          // API cost to evaluate a coin that shouldn't qualify.
-          if (isLoser && funHistOverExtCount > 0) {
-            const FUN_LOSER_OE_TTL = 6 * 3600 * 1000;
-            const alreadyGraylisted = this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym];
-            if (!alreadyGraylisted) {
-              this._funLoserOEGraylist[sym] = Date.now() + FUN_LOSER_OE_TTL;
-              this.log(`💰 ${sym}: FUN loser OE graylist — ${funHistOverExtCount} candle(s) over-extended in 6h lookback; loser + OE is contradictory → graylisted 6h`, 'warn');
-              this.persist();
-            }
-            oeGraylisted++;
-            continue;
-          }
-          if (isLoser && this._funLoserOEGraylist[sym] && Date.now() < this._funLoserOEGraylist[sym]) {
-            continue; // still within graylist window (OE cleared but TTL not yet expired)
-          }
           const funRsi6 = await this.fetchRSI(sym, 6);
           if (funRsi6 !== null && funRsi6 >= this.cfg.rsi6Max) {
-            // Over-extended now — VM bar raised by histOverExtCount; register an extender tick
-            if (this.cfg.advFtEnabled) this.extenderBump(sym, false, funRsi6);
+            // Over-extended now — VM bar raised by histOverExtCount; register extender tick if not
+            // already bumped this cycle by the gainers scan (lastFetchAt guard prevents double-count)
+            if (this.cfg.advFtEnabled) {
+              const extE = this.extenderCount[sym];
+              const scanMs = (this.cfg.scanMins || 15) * 60 * 1000;
+              if (!(extE?.lastFetchAt && (Date.now() - extE.lastFetchAt) < scanMs)) {
+                this.extenderBump(sym, false, funRsi6);
+                if (this.extenderCount[sym]) this.extenderCount[sym].lastFetchAt = Date.now();
+              }
+            }
           } else if (funRsi6 !== null && this.cfg.rsi6ProximityPct > 0) {
             const proxThreshold = this.cfg.rsi6Max * (1 - this.cfg.rsi6ProximityPct / 100);
             if (funRsi6 >= proxThreshold) {
@@ -3169,11 +3149,10 @@ function pw() { return {
         }
         const vmNote      = (vmBlockedGainers + vmBlockedLosers) > 0 ? ` | VM: ${vmBlockedGainers}G ${vmBlockedLosers}L` : '';
         const lsaNote     = lsaBlockedLosers   > 0 ? ` | LSA: ${lsaBlockedLosers}L` : '';
-        const oeNote      = oeGraylisted        > 0 ? ` | OE-gray: ${oeGraylisted}L` : '';
         const proxNote    = proximityBlocked    > 0 ? ` | RSI-prox: ${proximityBlocked}` : '';
         const frCreepNote = frCreepBlocked      > 0 ? ` | FR-creep: ${frCreepBlocked}` : '';
         const frNegNote   = frNegativeBlocked   > 0 ? ` | FR≤0: ${frNegativeBlocked}` : '';
-        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${oeNote}${proxNote}${frCreepNote}${frNegNote}.`, 'scan');
+        this.log(`💰 FUN scan done — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${proxNote}${frCreepNote}${frNegNote}.`, 'scan');
 
         // Prune expired creep entries so they don't linger in the UI
         const _now = Date.now();
