@@ -105,6 +105,20 @@ The kline cache (`_klineCache`) stores candle arrays keyed by `symbol_15` with a
 
 ---
 
+## Order Execution
+
+### Take Profit Orders
+Take profit targets are placed as **GTC (Good-Till-Cancelled) Limit Buy reduceOnly** orders rather than exchange-native stop orders. This means the TP sits as a passive limit order in the book and fills as a maker when price reaches it — eliminating market-order slippage on trigger.
+
+Each position tracks its active TP order ID (`tpOrderId`). When the TP target changes — due to a DCA stage shift, reduce-phase recalculation, or drift correction — the existing limit order is cancelled and a new one placed at the updated price. Any exchange-native TP already set on a position is cleared when the first limit TP is placed, preventing double-trigger.
+
+On manual or forced close, the TP limit order is cancelled before the close order is sent.
+
+### Entry and Close Orders
+Entry orders are placed as **Market** orders for immediate fill. Forced and manual closes use a **Limit IOC** order at `markPrice × 1.001` (0.1% slippage ceiling above mark), falling back to Market only if no mark price is available. DCA add orders are placed as **conditional limit** orders (stop-limit) triggered at the configured add price.
+
+---
+
 ## Stats Menu
 
 The right-hand column contains several distinct sections.
@@ -125,7 +139,7 @@ Lists all symbols currently under active Rodeo Creep with their ride count, curr
 Lists all symbols currently under active FUN vol momentum creep. Each entry shows the close count, the live effective VM floor for each sub-type (HFG, LFG, HFL, LFL), the current FR re-entry gate (seeded at 1% after first close, scaling ×1.5 per close), and the countdown to the 6h TTL reset. Over-extension hits are displayed inline with an ⚡ counter and their multiplicative effect on the VM threshold. Only visible when FUN vol momentum is enabled.
 
 ### Extenders Counter
-Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold the ticker is promoted to the FT candidate roster, and the effective scaled VM threshold is shown.
+Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold the ticker is promoted to the FT candidate roster, and the effective ADV FT VM floor (flat base + any active creep, capped at max) is shown inline.
 
 ### Activity Log
 A capped reverse-chronological event feed, holding a maximum of (300) entries. Each entry is timestamped and colour-coded by type: `scan` events (light blue) cover scan cycle summaries and FT roster changes; `trade` events (ice blue) record every order open, DCA trigger, and close; `success` entries (green) confirm connections and bot start; `warn` entries (amber) cover Rodeo Creep registrations, TP reductions, and non-fatal anomalies; `error` entries (red) flag API failures and scan errors; and `info` entries (muted) carry general status messages. The log is purely observational — it has no effect on bot state and is cleared on **Clear Stats**.

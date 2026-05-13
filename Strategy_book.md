@@ -164,14 +164,18 @@ We wait for the ticker to cool from over-extension into a specific RSI range:
 This is wider than Gainers' 70-80 band. We're catching the pullback **after** the parabolic move. The ticker was at RSI6 ≥ 90 repeatedly — now it's cooling, and we enter as the reversal continues.
 
 #### 2. **Volume Momentum Filter** (Optional)
-- **Base threshold**: Configurable (default 2.5%)
-- **Tick scaling**: For each over-extension hit beyond the roster threshold, the VM requirement is multiplied by `(1 + scalePct/100)` per extra tick
+- **Base threshold**: Flat floor configurable as `advFtVolMomMin` (default 5%). This replaces the old per-tick escalation system — the floor no longer scales with how many over-extension hits exceed the promotion threshold.
 
-  Example at 25% scale: a ticker promoted at 4 hits enters at the base threshold. At 5 hits the requirement is `base × 1.25`; at 6 hits `base × 1.50`.
+- **Per-close VM creep**: Each time an ADV FT position closes, the VM floor is incremented for that symbol (3-hour TTL), raising the bar for repeated re-entries on the same ticker. The creep is additive to the flat base and capped at a configurable maximum (default 15%). Successive closes keep pushing the floor up until the cap is reached or the TTL expires.
 
-- **Per-close VM creep**: Each time an ADV FT position closes, the VM gate is multiplied by ×1.5 for that symbol (3-hour TTL). Successive closes keep raising the bar, preventing repeated low-quality re-entries on the same ticker.
+#### 3. **LSA (Last-bar Selling Activity) Filter** (Optional)
+Before an ADV FT entry is opened, the last completed 15-minute candle's volume must confirm active selling:
+- **Minimum**: volume must exceed the window average (ratio > 1) — flat or declining volume is blocked
+- **Spike cap**: volume must not exceed the window average by more than the configured limit (default +50%) — a volume blowoff suggests exhaustion rather than continuation
 
-#### 3. **Funding Rate Filter**
+This is the same LSA logic used by FUN losers. Droughts and spikes are both blocked; only measured, sustained sell-side flow passes.
+
+#### 4. **Funding Rate Filter**
 Same as Gainers: funding rate must exceed the configured minimum (default −0.05%).
 
 ---
