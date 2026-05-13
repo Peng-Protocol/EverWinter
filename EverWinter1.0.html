@@ -3017,7 +3017,6 @@ function ew() { return {
     const fillPrice = await this.waitForPosition(sym, oid);
     if (!fillPrice) { await this.cancelAllConditionals(sym); return false; }
     const tpPrice = this.snapPrice(fillPrice * (1 - (effTp0 / 100) / effectiveLev), instr);
-    await this.setTP(sym, tpPrice);
     const orders = [{ label: 'Entry', price: fillPrice, qty, type: 'tp', filled: false, orderId: null }];
     let runNotional = fillPrice * qty, runSize = qty;
     for (let i = 0; i < 3; i++) {
@@ -3058,10 +3057,12 @@ function ew() { return {
       _funLsaRatio: lsaRatio != null ? parseFloat(lsaRatio.toFixed(3)) : null,
       _volMomentum: this._symData[sym]?.volMomPct ?? null,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
-      currentTpPrice: tpPrice, tpPct: effTp0, dcaStage: 0, orders,
+      currentTpPrice: tpPrice, tpOrderId: null, tpPct: effTp0, dcaStage: 0, orders,
       _laggardInitialEV: margin * (effTp0 / 100),
       _laggardLostValue: 0,
     });
+    const _newFunPos = this.positions[this.positions.length - 1];
+    await this.setTP(_newFunPos, tpPrice);
     const g = this.gainers.find(x => x.symbol === sym);
     if (g) g.status = 'active';
     const rsiStr = (rsi6 != null || rsi12 != null || rsi24 != null)
@@ -4238,7 +4239,6 @@ function ew() { return {
     if (!fillPrice) { await this.cancelAllConditionals(sym); return; }
     const effTp0  = this.cfg.entryTpRoi * this.tpIngressMultiplier(sym);
     const tpPrice = this.snapPrice(fillPrice * (1 - (effTp0 / 100) / effectiveLev), instr);
-    await this.setTP(sym, tpPrice);
     const orders = [{ label: 'Entry', price: fillPrice, qty, type: 'tp', filled: false, orderId: null }];
     for (let i = 0; i < 3; i++) {
       const addPrice    = this.snapPrice(fillPrice * (1 + this.cfg.addPcts[i] / 100), instr);
@@ -4267,10 +4267,12 @@ function ew() { return {
       rsi6, rsi12, rsi24,
       fundingRate: fundingRate ?? null, rodeoCount,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
-      currentTpPrice: tpPrice, tpPct: effTp0, dcaStage: 0, orders,
+      currentTpPrice: tpPrice, tpOrderId: null, tpPct: effTp0, dcaStage: 0, orders,
       _laggardInitialEV: margin * (effTp0 / 100),
       _laggardLostValue: 0,
     });
+    const _newFtPos = this.positions[this.positions.length - 1];
+    await this.setTP(_newFtPos, tpPrice);
     if (this.ftCandidates[sym]) {
       if (this.ftCandidates[sym].tradesOpened == null) this.ftCandidates[sym].tradesOpened = 0;
       this.ftCandidates[sym].tradesOpened++;
@@ -4290,6 +4292,11 @@ function ew() { return {
     if (_closingIds.has(pos.id)) return;
     _closingIds.add(pos.id);
     if (!this.positions.find(x => x.id === pos.id)) { _closingIds.delete(pos.id); return; }
+    // Cancel TP limit order before placing close — prevents orphaned GTC order in the book.
+    if (pos.tpOrderId) {
+      await this.cancelTpLimitOrder(pos.symbol, pos.tpOrderId);
+      pos.tpOrderId = null;
+    }
     // Execute real market close
     await this.signedDelay();
     const _ftCloseRef = pos.markPrice || pos.entryPrice || 0;
@@ -4426,7 +4433,7 @@ function ew() { return {
               this.log(`🎯 ${pos.symbol}: FT stage 3 — SL set @ ${fmtP(slPrice)}`, 'warn');
             }
           }
-          await this.setTP(pos.symbol, _ft_tp);
+          await this.setTP(pos, _ft_tp);
           this.log(`🎯 ${pos.symbol}: FT ${add.label} triggered @ ${fmtP(add.price)} | Avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(_ft_tp)} (${_ft_roi}% ROI)`, 'trade');
           this.persist();
         }
@@ -4468,7 +4475,7 @@ function ew() { return {
             await this.closePosition(pos, 'force'); continue;
           }
           pos.currentTpPrice = nt; pos.tpPct = 3;
-          await this.setTP(pos.symbol, nt);
+          await this.setTP(pos, nt);
           this.log(`${pos.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% (${fmtP(nt)})`, 'warn');
           this.persist();
         }
@@ -4884,10 +4891,8 @@ function ew() { return {
     // Guard: TP price above minPrice
     if (instr.minPrice > 0 && tpPrice < instr.minPrice) {
       this.log(`${sym}: TP price ${fmtP(tpPrice)} below instrument minPrice ${instr.minPrice} — skipping TP set`, 'warn');
-    } else if (fillPrice) {
-      await this.setTP(sym, tpPrice);
     }
-    // If fillPrice is null, watcher will retry TP via syncPositions
+    // TP limit order placed after position is pushed below (syncPositions will retry if needed)
 
     const orders = [{label:'Entry', price:fillPrice||price, qty, type:'tp', filled:false, orderId:null}];
 
@@ -4907,6 +4912,7 @@ function ew() { return {
       _existingPos.upnl      = 0;
       _existingPos.orders    = orders.length > 1 ? orders : _existingPos.orders;
       this.log(`${sym}: position already tracked (reconcile race) — updated in place`, 'debug');
+      if (fillPrice && !(instr.minPrice > 0 && tpPrice < instr.minPrice)) await this.setTP(_existingPos, tpPrice);
     } else {
       this.positions.push({
         id:Date.now()+Math.random(), symbol:sym, entryPrice:fillPrice||price, originalEntryPrice:fillPrice||price, markPrice:fillPrice||price,
@@ -4914,10 +4920,13 @@ function ew() { return {
         change24h:candidate.change.toFixed(2), rsi6:candidate.rsi6, rsi12:candidate.rsi12, rsi24:candidate.rsi24,
         fundingRate: candidate.fundingRate ?? null,  // live rate in % — refreshed each watch cycle
         upnl:0, openedAt:Date.now(), phase:'normal', isPending:false,
-        currentTpPrice:tpPrice, tpPct:effTp0, dcaStage:0, orders,
+        currentTpPrice:tpPrice, tpOrderId: null, tpPct:effTp0, dcaStage:0, orders,
         _laggardInitialEV: marginCost * (effTp0 / 100),
         _laggardLostValue: 0,
       });
+      if (fillPrice && !(instr.minPrice > 0 && tpPrice < instr.minPrice)) {
+        await this.setTP(this.positions[this.positions.length - 1], tpPrice);
+      }
     }
     // Update gainer table immediately to reflect new open position
     const g = this.gainers.find(x => x.symbol === sym);
@@ -4971,7 +4980,7 @@ function ew() { return {
             const newTp = pos.entryPrice * (1 - 0.03 / pos.leverage);
             pos.currentTpPrice = newTp;
             pos.tpPct = 3;
-            await this.setTP(pos.symbol, newTp);
+            await this.setTP(pos, newTp);
             this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% (${fmtP(newTp)})`, 'warn');
             this.persist();
           }
@@ -5097,7 +5106,7 @@ function ew() { return {
             await this.closePosition(p, 'force'); continue;
           }
           p.currentTpPrice = nt; p.tpPct = 3;
-          await this.setTP(p.symbol, nt);
+          await this.setTP(p, nt);
           this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% (${fmtP(nt)})`, 'warn');
           this.persist();
         }
@@ -5463,11 +5472,14 @@ function ew() { return {
           phase:     'normal',
           isPending: false,
           currentTpPrice: resolvedTp,
+          tpOrderId: null,
           tpPct: resolvedTp > 0
             ? parseFloat(((entryPrice - resolvedTp) / entryPrice * leverage * 100).toFixed(1))
             : gTpRoi,
           dcaStage: gStage, orders,
         });
+        const _ghostPos = this.positions[this.positions.length - 1];
+        if (resolvedTp > 0) await this.setTP(_ghostPos, resolvedTp);
         this.persist();
         this.log(`⚠ Ghost position detected: ${sym} | imported at stage ${gStage}, TP: ${fmtP(resolvedTp)}${_ghostIsFt ? ` [${_ghostIsAdvFt ? 'ADV ' : ''}FT]` : ''}`, 'warn');
       }
@@ -5523,39 +5535,26 @@ function ew() { return {
           // Only runs for normal phase — reduce has its own 3% TP logic below, and force phase
           // positions are being closed so TP correction is both wrong and wasteful.
           if (pos.phase === 'normal') {
-            await this.checkTpCorrection(pos, newAvgPrice, newSize, parseFloat(ep.takeProfit || 0));
+            await this.checkTpCorrection(pos, newAvgPrice, newSize, pos.currentTpPrice);
           } else {
             // Reduce phase: recompute 3% TP from current avgPrice (cost basis shifts on DCA fills).
             // dcaStage updated for display only.
             pos.dcaStage = this.inferStage(pos, await this.getInstrInfo(pos.symbol));
 
-            const epTp = parseFloat(ep.takeProfit || 0);
-
-            // Sync card display from exchange TP first
-            if (epTp > 0) {
-              pos.currentTpPrice = epTp;
-              pos.tpPct = parseFloat(((newAvgPrice - epTp) / newAvgPrice * pos.leverage * 100).toFixed(1));
-            }
-
             // Recompute correct 3% TP from current avgPrice and reissue if drifted.
-            // _tpReduceAcceptedKey locks once the exchange refuses a correction — same
-            // pattern as checkTpCorrection's _tpAcceptedKey. Key encodes exchangeTp so
-            // the lock lifts automatically if the exchange TP ever changes.
+            // Tracked locally via pos.currentTpPrice (limit TP order, not exchange-native TP).
             const instr = await this.getInstrInfo(pos.symbol);
             if (instr) {
-              const reduceTp     = this.snapPrice(newAvgPrice * (1 - (0.03 / pos.leverage)), instr);
-              const currentMark  = pos.markPrice || newAvgPrice;
-              const activeTp     = epTp > 0 ? epTp : pos.currentTpPrice;
+              const reduceTp    = this.snapPrice(newAvgPrice * (1 - (0.03 / pos.leverage)), instr);
+              const currentMark = pos.markPrice || newAvgPrice;
+              const activeTp    = pos.currentTpPrice;
 
-              // Guard: activeTp=0 means the card was ghost-imported or malformed with no TP.
-              // Don't treat this as a legitimate drift from 0 — the loop would fire setTP
-              // every sync cycle logging "X → 0.000000". Set reduceTp directly instead.
+              // Guard: activeTp=0 means ghost-imported or malformed position with no TP.
               if (!(activeTp > 0)) {
                 if (reduceTp > 0 && reduceTp < currentMark) {
                   this.log(`${pos.symbol}: reduce phase — no TP on card (ghost/malformed import) — setting 3% TP @ ${fmtP(reduceTp)}`, 'warn');
-                  const res = await this.setTP(pos.symbol, reduceTp);
-                  if (res === 'ok' || res === 'not_modified') {
-                    pos.currentTpPrice = reduceTp;
+                  const res = await this.setTP(pos, reduceTp);
+                  if (res === 'ok') {
                     pos.tpPct = 3;
                     pos._tpReduceAcceptedKey = `reduce:${reduceTp}`;
                     this.persist();
@@ -5578,35 +5577,22 @@ function ew() { return {
                   await this.closePosition(pos, 'force');
                 }
               } else if (pos._tpReduceAcceptedKey === reduceAcceptKey) {
-                // Exchange has already refused this exact TP — accept its value as
-                // authoritative and stop retrying until the exchange TP itself changes.
+                // Limit order already set at this price — no drift, skip.
                 if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
               } else {
-                if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null; // condition cleared
+                if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
                 const drift = Math.abs(activeTp - reduceTp);
                 if (drift > instr.tickSize) {
                   this.log(`${pos.symbol}: reduce phase — TP recomputed from avgPrice shift: ${fmtP(activeTp)} → ${fmtP(reduceTp)}`, 'warn');
-                  const res = await this.setTP(pos.symbol, reduceTp);
+                  const res = await this.setTP(pos, reduceTp);
                   if (res === 'ok') {
-                    pos._tpReduceAcceptedKey = null; // correction accepted — clear lock
-                    pos.currentTpPrice = reduceTp;
+                    pos._tpReduceAcceptedKey = null;
                     pos.tpPct = 3;
-                    this.persist();
-                  } else if (res === 'not_modified') {
-                    this.log(`${pos.symbol}: reduce-phase TP correction refused (not_modified) — locking exchange value ${fmtP(activeTp)}`, 'debug');
-                    pos._tpReduceAcceptedKey = reduceAcceptKey;
-                    pos.currentTpPrice = activeTp;
-                    pos.tpPct = parseFloat(((newAvgPrice - activeTp) / newAvgPrice * pos.leverage * 100).toFixed(1));
                     this.persist();
                   }
                 }
               }
             } // end else (activeTp > 0)
-            } else if (epTp <= 0 && pos.currentTpPrice > 0) {
-              // TP missing on exchange and no instrument info — retry stored value as fallback
-              this.log(`${pos.symbol}: TP missing on exchange (reduce phase) — retrying @ ${fmtP(pos.currentTpPrice)}`, 'warn');
-              const res = await this.setTP(pos.symbol, pos.currentTpPrice);
-              if (res === 'not_modified') this.log(`${pos.symbol}: reduce-phase TP reissue refused (not_modified)`, 'debug');
             }
           }
         } else if (!pos.isPending) {
@@ -5988,7 +5974,7 @@ function ew() { return {
         const nullTpKey = `nulltp:${stage}:${reissuePrice.toFixed(8)}`;
         if (pos._tpAcceptedKey === nullTpKey) return; // already tried this cycle — don't spam
         this.log(`${pos.symbol}: TP null on exchange (stage ${stage}) — reissuing @ ${fmtP(reissuePrice)}`, 'warn');
-        const res = await this.setTP(pos.symbol, reissuePrice);
+        const res = await this.setTP(pos, reissuePrice);
         if (res === 'ok') {
           pos._tpAcceptedKey       = null;
           pos._tpAcceptedAt        = null;
@@ -6027,7 +6013,7 @@ function ew() { return {
 
     if (deviation > tolerance) {
       this.log(`${pos.symbol}: TP drift detected (stage ${stage}, ROI target ${targetRoi}%) — exchange ${fmtP(currentTp)} vs target ${fmtP(targetTp)} (Δ${fmtP(deviation)}, tol ${fmtP(tolerance)}) — correcting`, 'warn');
-      const result = await this.setTP(pos.symbol, targetTp);
+      const result = await this.setTP(pos, targetTp);
       if (result === 'not_modified') {
         // Exchange refused — accept its TP as authoritative for this stage+avgPrice combo.
         // Locking via acceptKey prevents the loop from re-firing on every sync cycle.
@@ -6207,27 +6193,52 @@ function ew() { return {
     } catch(e){this.log('placeCond: '+e.message,'error');return null;}
   },
 
-  // Returns 'ok', 'not_modified', or 'error'.
-  // Bybit returns retCode 0 on success. "not modified" comes back as a non-zero retCode
-  // with retMsg "not modified" — it means the exchange already has that TP or refuses the value.
-  async setTP(symbol, tpPrice) {
+  // Places a GTC Limit Buy reduceOnly order at tpPrice (limit TP — no market slippage on trigger).
+  // Cancels any existing pos.tpOrderId first, and clears any exchange-native TP.
+  // Returns 'ok' or 'error'.
+  async setTP(pos, tpPrice) {
     await this.signedDelay();
-    // Instrument tick precision for price serialisation — avoids Bybit "TP above base_price" rejection.
-    const instr     = this._instrCache[symbol];
-    const tick      = instr?.tickSize || 0;
-    const priceDp   = tick > 0
+    const symbol  = pos.symbol;
+    const instr   = this._instrCache[symbol];
+    const tick    = instr?.tickSize || 0;
+    const priceDp = tick > 0
       ? (tick.toString().includes('.') ? tick.toString().split('.')[1].length : 0)
       : 8;
-    const priceStr  = tpPrice.toFixed(priceDp);
-    const b=JSON.stringify({category:'linear',symbol,takeProfit:priceStr,tpTriggerBy:'LastPrice',positionIdx:0});
-    const h=await signHdr(this.creds.key,this.creds.secret,b, this._tsOffset);
+    const priceStr = tpPrice.toFixed(priceDp);
+
+    // Clear any exchange-native TP so it doesn't double-trigger as market on existing positions.
     try {
-      const r=await fetch(`${this.base}/v5/position/trading-stop`,{method:'POST',headers:h,body:b});
-      const d=await this.safeJson(r);
-      if(d&&d.retMsg&&d.retMsg.toLowerCase().includes('not modified')) return 'not_modified';
-      if(d&&d.retCode!==0){ this.log(`setTP (${symbol}): ${d.retMsg}`,'warn'); return 'error'; }
-      return 'ok';
-    } catch(e){ return 'error'; }
+      const nb = JSON.stringify({ category: 'linear', symbol, takeProfit: '0', positionIdx: 0 });
+      const nh = await signHdr(this.creds.key, this.creds.secret, nb, this._tsOffset);
+      await fetch(`${this.base}/v5/position/trading-stop`, { method: 'POST', headers: nh, body: nb });
+    } catch(e) {}
+
+    // Cancel the existing TP limit order if one is tracked.
+    if (pos.tpOrderId) {
+      await this.cancelTpLimitOrder(symbol, pos.tpOrderId);
+      pos.tpOrderId = null;
+    }
+
+    // Place a new GTC Limit Buy reduceOnly order at tpPrice.
+    const b = JSON.stringify({
+      category: 'linear', symbol, side: 'Buy', orderType: 'Limit',
+      qty: String(pos.totalSize), price: priceStr, timeInForce: 'GTC', reduceOnly: true,
+    });
+    const h = await signHdr(this.creds.key, this.creds.secret, b, this._tsOffset);
+    try {
+      const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
+      const d = await this.safeJson(r);
+      if (d && d.retCode === 0) {
+        pos.tpOrderId      = d.result?.orderId || null;
+        pos.currentTpPrice = tpPrice;
+        return 'ok';
+      }
+      this.log(`setTP (${symbol}): ${d?.retMsg || 'no response'}`, 'warn');
+      return 'error';
+    } catch(e) {
+      this.log(`setTP (${symbol}): ${e.message}`, 'error');
+      return 'error';
+    }
   },
 
   // Set position stop loss. slPrice=0 clears existing SL.
@@ -6245,6 +6256,11 @@ function ew() { return {
   },
 
   async closePosition(pos, reason='manual') {
+    // Cancel TP limit order before placing close — prevents orphaned GTC order in the book.
+    if (pos.tpOrderId) {
+      await this.cancelTpLimitOrder(pos.symbol, pos.tpOrderId);
+      pos.tpOrderId = null;
+    }
     await this.signedDelay();
     // 0.1% slippage protection on close — Limit IOC at markPrice*(1+0.001).
     // For a Buy-to-close short, this is the worst price we'll accept (0.1% above mark).
@@ -6372,6 +6388,21 @@ function ew() { return {
     const b=JSON.stringify({category:'linear',symbol,orderFilter:'StopOrder'});
     const h=await signHdr(this.creds.key,this.creds.secret,b, this._tsOffset);
     try { await fetch(`${this.base}/v5/order/cancel-all`,{method:'POST',headers:h,body:b}); this.log(`${symbol}: conditionals cancelled`,'debug'); } catch(e){}
+  },
+
+  async cancelTpLimitOrder(symbol, orderId) {
+    if (!orderId) return;
+    await this.signedDelay();
+    const b = JSON.stringify({ category: 'linear', symbol, orderId });
+    const h = await signHdr(this.creds.key, this.creds.secret, b, this._tsOffset);
+    try {
+      const r = await fetch(`${this.base}/v5/order/cancel`, { method: 'POST', headers: h, body: b });
+      const d = await this.safeJson(r);
+      // retCode 110001 = order not found (already filled or cancelled) — not an error
+      if (d && d.retCode !== 0 && d.retCode !== 110001) {
+        this.log(`cancelTpLimitOrder (${symbol}): ${d.retMsg}`, 'debug');
+      }
+    } catch(e) {}
   },
 
   // ── AUDIT OPEN CONDITIONAL ORDERS ──
