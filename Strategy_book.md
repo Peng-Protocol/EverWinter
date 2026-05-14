@@ -157,9 +157,9 @@ If the roster is full, the ticker with the **lowest funding rate** (most over-sh
 
 ### Entry Criteria
 
-#### 1. **RSI Cooldown Band: 45-85**
+#### 1. **RSI Cooldown Band: 45-80**
 We wait for the ticker to cool from over-extension into a specific RSI range:
-- **RSI6, RSI12, RSI24**: All must be **between 45-85**
+- **RSI6, RSI12, RSI24**: All must be **between 45-80**
 
 This is wider than Gainers' 70-80 band. We're catching the pullback **after** the parabolic move. The ticker was at RSI6 ≥ 90 repeatedly — now it's cooling, and we enter as the reversal continues.
 
@@ -168,12 +168,18 @@ This is wider than Gainers' 70-80 band. We're catching the pullback **after** th
 
 - **Per-close VM creep**: Each time an ADV FT position closes, the VM floor is incremented for that symbol (3-hour TTL), raising the bar for repeated re-entries on the same ticker. The creep is additive to the flat base and capped at a configurable maximum (default 15%). Successive closes keep pushing the floor up until the cap is reached or the TTL expires.
 
-#### 3. **LSA (Last-bar Selling Activity) Filter** (Optional)
-Before an ADV FT entry is opened, the last completed 15-minute candle's volume must confirm active selling:
-- **Minimum**: volume must exceed the window average (ratio > 1) — flat or declining volume is blocked
-- **Spike cap**: volume must not exceed the window average by more than the configured limit (default +50%) — a volume blowoff suggests exhaustion rather than continuation
+#### 3. **LSA (Localized Sell Average) Filter**
 
-This is the same LSA logic used by FUN losers. Droughts and spikes are both blocked; only measured, sustained sell-side flow passes.
+While Volume Momentum (VM) measures the immediate ratio of sellers to buyers to detect a "impending" slump, **LSA** measures the intensity of current selling relative to the ticker's entire day.
+
+* **The Logic**: LSA compares the selling volume of the most recent candle against the historical average for that ticker. It ensures there is enough "downward fuel" to justify an entry without entering a move that has already exhausted itself.
+* **The "Up-ness" Variable**: LSA is highly sensitive to how "up" a token is. Because Advanced FT tickers are coming off massive buying streaks, their "normal" state involves high volume, allowing for a much higher LSA ceiling.
+* **Ideal Ranges**:
+* **For ADV FT (Over-extended)**: We look for a positive LSA with a high ceiling (often **250% or more**). Since these tickers have been dominated by buying all day, a massive spike in selling is often required to actually shift the trend.
+* **For FUN Losers (LFL/HFL)**: These target a much lower ceiling (typically **50%**). Because these tickers are already "down" for the day, their candles naturally skew red; a high LSA here usually indicates the drop is already finished.
+
+
+* **The Exhaustion Cap**: If LSA exceeds these limits, the ticker is skipped. Too much selling volume in a single bar suggests a **volume blowoff**—the "last gasp" of sellers before a potential relief bounce.
 
 #### 4. **Funding Rate Filter**
 Same as Gainers: funding rate must exceed the configured minimum (default −0.05%).
@@ -370,10 +376,10 @@ During reduce phase, TP is lowered to encourage faster exits.
 Only enforced during reduce phase. The **laggard** is the oldest open position.
 
 **The Calculation**:
-1. **Expected Value (EV)**: Initial margin × TP% (what we expected to make when we entered)
+1. **Effective Value (EV)**: Initial margin × TP% (what we expected to make when we entered)
 2. **Lost Value**: Cumulative PnL from other positions that closed while this laggard is still open
 3. **Unrealized PnL**: Current mark-to-market on the laggard
-4. **Expected Deficit (ED)**: `buffedEV - lostValue - unrealizedPnL`
+4. **Effective Debt**: `buffedEV - lostValue - unrealizedPnL`
    - Where `buffedEV = EV × 1.5` (50% buffer, configurable)
 
 **Force Close Logic**: When `ED ≤ 0`, we force-close the laggard.
