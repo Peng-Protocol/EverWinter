@@ -3404,7 +3404,8 @@ function pw() { return {
       seen.add(t.symbol);
       pool.push(t);
     }
-    let opened = 0, lsaBlocked = 0, skipBlocked = 0;
+    let opened = 0, lsaBlocked = 0, rsiBlocked = 0, skipBlocked = 0;
+    const _sfRsiMin = this.cfg.sfRsiMin ?? 25;
     for (const t of pool) {
       const sym   = t.symbol;
       const price = parseFloat(t.lastPrice || 0);
@@ -3417,6 +3418,16 @@ function pw() { return {
         const fr = await this.fetchFundingRate(sym).catch(() => null);
         if (fr !== null && fr <= this.cfg.fundingRateMin) continue;
       }
+      // RSI gate first — cheaper than kline fetch
+      let sfRsi6 = null, sfRsi12 = null, sfRsi24 = null;
+      if (_sfRsiMin > 0) {
+        [sfRsi6, sfRsi12, sfRsi24] = await Promise.all([
+          this.fetchRSI(sym, 6), this.fetchRSI(sym, 12), this.fetchRSI(sym, 24)
+        ]);
+        if ((sfRsi6  !== null && sfRsi6  < _sfRsiMin) ||
+            (sfRsi12 !== null && sfRsi12 < _sfRsiMin) ||
+            (sfRsi24 !== null && sfRsi24 < _sfRsiMin)) { rsiBlocked++; continue; }
+      }
       const kl = await this.getKlines1h(sym);
       if (!kl || !kl.volumes || kl.volumes.length < 4) { skipBlocked++; continue; }
       const vols         = kl.volumes;
@@ -3428,32 +3439,24 @@ function pw() { return {
       const _sfLimit  = this.cfg.sfLsaLimit ?? 50;
       const _sfStep   = _sfLimit * ((this.cfg.sfMedianCreepPct ?? 5) / 100);
       const _sfMedian = _sfLimit / 2;
-      const _sfMaxN   = Math.max(1, Math.floor(_sfMedian / _sfStep) - 1); // stop one step before zero-width
+      const _sfMaxN   = Math.max(1, Math.floor(_sfMedian / _sfStep) - 1);
       const _sfCreepN = this.cfg.sfMedianCreepEnabled ? Math.min(this.salfCreep[sym]?.count || 0, _sfMaxN) : 0;
       const lsaFloor  = _sfCreepN * _sfStep;
       const lsaCap    = _sfLimit  - _sfCreepN * _sfStep;
       const isLoser   = !gainerSyms.has(sym);
       const effFloor  = isLoser ? Math.max(lsaFloor, this.cfg.sfLoserLsaMin ?? 10) : lsaFloor;
       if (lsaRatio <= 1 + effFloor / 100 || lsaRatio >= 1 + lsaCap / 100) { lsaBlocked++; continue; }
-      const _sfRsiMin = this.cfg.sfRsiMin ?? 25;
-      if (_sfRsiMin > 0) {
-        const [rsi6, rsi12, rsi24] = await Promise.all([
-          this.fetchRSI(sym, 6), this.fetchRSI(sym, 12), this.fetchRSI(sym, 24)
-        ]);
-        if ((rsi6  !== null && rsi6  < _sfRsiMin) ||
-            (rsi12 !== null && rsi12 < _sfRsiMin) ||
-            (rsi24 !== null && rsi24 < _sfRsiMin)) { skipBlocked++; continue; }
-      }
       const change24h = parseFloat(t.price24hPcnt || 0) * 100;
-      const ok = await this.salfOpenShort(sym, price, change24h, lsaRatio, isLoser);
+      const ok = await this.salfOpenShort(sym, price, change24h, lsaRatio, isLoser, sfRsi6, sfRsi12, sfRsi24);
       if (ok) opened++;
     }
     const lsaNote  = lsaBlocked  > 0 ? ` | LSA: ${lsaBlocked}` : '';
-    const skipNote = skipBlocked > 0 ? ` | no-data/RSI: ${skipBlocked}` : '';
-    this.log(`🎣 SalF scan — pool ${pool.length} (${gainers.length}G ${losers.length}L) | opened ${opened}${lsaNote}${skipNote}`, 'scan');
+    const rsiNote  = rsiBlocked  > 0 ? ` | RSI: ${rsiBlocked}` : '';
+    const skipNote = skipBlocked > 0 ? ` | no-data: ${skipBlocked}` : '';
+    this.log(`🎣 SalF scan — pool ${pool.length} (${gainers.length}G ${losers.length}L) | opened ${opened}${lsaNote}${rsiNote}${skipNote}`, 'scan');
   },
 
-  async salfOpenShort(sym, price, change24h, lsaRatio, isLoser) {
+  async salfOpenShort(sym, price, change24h, lsaRatio, isLoser, rsi6 = null, rsi12 = null, rsi24 = null) {
     if (this._symbolBanlist[sym]) return false;
     const instr = await this.getInstrInfo(sym);
     if (!instr) { this.log(`🎣 ${sym}: SalF — instrument not supported`, 'warn'); return false; }
@@ -3498,6 +3501,9 @@ function pw() { return {
       id: Date.now() + Math.random(), symbol: sym, _salf: true, _pseudo: true, _salfIsLoser: isLoser,
       change24h: change24h != null ? parseFloat(change24h.toFixed(2)) : null,
       _salfLsaRatio: lsaRatio != null ? parseFloat(lsaRatio.toFixed(3)) : null,
+      rsi6: rsi6 != null ? parseFloat(rsi6.toFixed(2)) : null,
+      rsi12: rsi12 != null ? parseFloat(rsi12.toFixed(2)) : null,
+      rsi24: rsi24 != null ? parseFloat(rsi24.toFixed(2)) : null,
       entryPrice: price, originalEntryPrice: price, markPrice: price, totalSize: qty,
       leverage: effectiveLev, margin,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
