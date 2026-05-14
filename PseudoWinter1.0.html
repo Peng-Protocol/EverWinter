@@ -3367,10 +3367,11 @@ function pw() { return {
     if (!instr) { this.log(`🎣 ${sym}: SalF — instrument not supported`, 'warn'); return false; }
     const levResult = this.resolveEffectiveLeverage(sym, instr);
     if (!levResult) { this.log(`🎣 ${sym}: SalF — leverage resolution failed`, 'warn'); return false; }
-    const effectiveLev   = levResult.lev;
-    const entryNotional  = this.cfg.minNotional * 2;
-    const addNotional    = this.cfg.addNotional  * 2;
-    const effTp0         = this.cfg.entryTpRoi * this.tpIngressMultiplier(sym);
+    const effectiveLev  = levResult.lev;
+    const entryNotional = this.cfg.minNotional * 2;
+    const addNotional   = this.cfg.addNotional  * 2;
+    const effTp0        = this.cfg.entryTpRoi * this.tpIngressMultiplier(sym);
+    const effTpRoi      = this.cfg.tpRoi;
     const rawQty = entryNotional / price;
     const qty    = this.snapQty(rawQty, instr);
     if (qty <= 0) {
@@ -3380,53 +3381,42 @@ function pw() { return {
     }
     const actualNotional = qty * price;
     if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) {
-      this.log(`🎣 ${sym}: SalF notional below exchange min — BLACKLISTED`, 'warn');
+      this.log(`🎣 ${sym}: SalF notional below exchange min (${actualNotional.toFixed(4)} < ${instr.minOrderAmt}) — BLACKLISTED`, 'warn');
       this._symbolBanlist[sym] = `SalF notional below exchange minimum (${actualNotional.toFixed(4)} USDT)`;
       this.persist(); return false;
     }
+    const tpPrice = this.snapPrice(price * (1 - (effTp0 / 100) / effectiveLev), instr);
+    if (!tpPrice || tpPrice <= 0) { this.log(`🎣 ${sym}: SalF TP price invalid — BLACKLISTED`, 'warn'); this._symbolBanlist[sym] = 'SalF TP too low'; return false; }
     const margin = actualNotional / effectiveLev;
-    const oid = await this.placeOrder(sym, 'Sell', 'Market', qty, price);
-    if (oid === 'NOT_LIVE') { this._symbolBanlist[sym] = 'symbol not supported'; this.log(`🎣 ${sym}: SalF order failed — not supported, banned`, 'warn'); return false; }
-    if (!oid) { this.log(`🎣 ${sym}: SalF entry order failed`, 'warn'); return false; }
-    const fillPrice = await this.waitForPosition(sym, oid);
-    if (!fillPrice) { await this.cancelAllConditionals(sym); return false; }
-    const tpPrice = this.snapPrice(fillPrice * (1 - (effTp0 / 100) / effectiveLev), instr);
-    const orders  = [{ label: 'Entry', price: fillPrice, qty, type: 'tp', filled: false, orderId: null }];
-    let runNotional = fillPrice * qty, runSize = qty;
+    const orders = [{ label: 'Entry', price, type: 'tp', filled: false, orderId: null }];
+    let runNotional = price * qty, runSize = qty;
     for (let i = 0; i < 3; i++) {
-      const addPrice = this.snapPrice(fillPrice * (1 + this.cfg.addPcts[i] / 100), instr);
+      const addPrice = this.snapPrice(price * (1 + this.cfg.addPcts[i] / 100), instr);
       if (!addPrice || addPrice <= 0) continue;
       const stageAdd = this.cfg.dcaDoublingEnabled ? addNotional * Math.pow(this.cfg.dcaMultiplier ?? 2, i + 1) : addNotional;
       const addQty   = this.snapQty(stageAdd / addPrice, instr);
-      runNotional   += addPrice * addQty;
-      runSize       += addQty;
+      runNotional += addPrice * addQty;
+      runSize     += addQty;
       const expectedAvg = runSize > 0 ? runNotional / runSize : addPrice;
-      const addTp   = this.snapPrice(expectedAvg * (1 - (this.cfg.tpRoi[i + 1] / 100) / effectiveLev), instr);
-      if (addQty > 0 && addTp > 0) {
-        const cid = await this.placeConditional(sym, 'Sell', addQty, addTp, addPrice);
-        orders.push({ label: `Add${i+1} +${this.cfg.addPcts[i]}%`, price: addPrice, qty: addQty, tpPrice: addTp, type: 'cond', filled: false, orderId: cid });
-      }
+      const addTp = this.snapPrice(expectedAvg * (1 - (effTpRoi[i + 1] / 100) / effectiveLev), instr);
+      if (addQty > 0 && addTp > 0) orders.push({ label: `Add${i+1} +${this.cfg.addPcts[i]}%`, price: addPrice, qty: addQty, tpPrice: addTp, type: 'cond', filled: false, orderId: `salf-${Date.now()}-${i}` });
     }
-    if (this.positions.find(p => p.symbol === sym)) {
-      this.log(`🎣 ${sym}: position already tracked (reconcile race) — SalF skipped`, 'warn');
-      return false;
-    }
+    if (this.positions.find(p => p.symbol === sym)) { this.log(`🎣 ${sym}: SalF entry blocked — position already exists`, 'warn'); return false; }
     this.positions.push({
-      id: Date.now() + Math.random(), symbol: sym, _salf: true, _salfIsLoser: isLoser,
+      id: Date.now() + Math.random(), symbol: sym, _salf: true, _pseudo: true, _salfIsLoser: isLoser,
       change24h: change24h != null ? parseFloat(change24h.toFixed(2)) : null,
       _salfLsaRatio: lsaRatio != null ? parseFloat(lsaRatio.toFixed(3)) : null,
-      entryPrice: fillPrice, originalEntryPrice: fillPrice, markPrice: fillPrice, totalSize: qty,
+      entryPrice: price, originalEntryPrice: price, markPrice: price, totalSize: qty,
       leverage: effectiveLev, margin,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
-      currentTpPrice: tpPrice, tpOrderId: null, tpPct: effTp0, dcaStage: 0, orders,
+      currentTpPrice: tpPrice, tpPct: effTp0, dcaStage: 0, orders,
+      _lastSeenAt: Date.now(),
       _laggardInitialEV: margin * (effTp0 / 100),
       _laggardLostValue: 0,
     });
-    const _newPos = this.positions[this.positions.length - 1];
-    await this.setTP(_newPos, tpPrice);
     const g = this.gainers.find(x => x.symbol === sym);
     if (g) g.status = 'active';
-    this.log(`🎣 ▼ SalF SHORT ${sym} @ ${fmtP(fillPrice)} | LSA:${lsaRatio.toFixed(2)}× | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} [2× notional${isLoser ? ' · loser' : ' · gainer'}]`, 'trade');
+    this.log(`🎣 ▼ SalF SHORT ${sym} @ ${fmtP(price)} | LSA:${lsaRatio.toFixed(2)}× | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} [2× notional${isLoser ? ' · loser' : ' · gainer'}]`, 'trade');
     this.persist();
     return true;
   },
