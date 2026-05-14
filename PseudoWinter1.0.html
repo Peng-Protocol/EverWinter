@@ -1363,6 +1363,16 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Block if last 1h candle volume exceeds avg by more than +<span x-text="cfg.sfLsaLimit"></span>%.</div>
             </div>
             <div class="g" style="margin-top:10px">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                <div class="lbl" style="margin-bottom:0">Median Creep <b x-text="cfg.sfMedianCreepPct+'%'"></b></div>
+                <label class="tog" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''" @click="if(!cfgLocked){cfg.sfMedianCreepEnabled=!cfg.sfMedianCreepEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.sfMedianCreepEnabled?'on':''"><div class="tog-k"></div></div>
+                </label>
+              </div>
+              <input type="range" min="1" max="20" step="1" x-model.number="cfg.sfMedianCreepPct" :disabled="bot.running || !cfg.sfMedianCreepEnabled" @change="persist()">
+              <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Tighten LSA window ±<span x-text="((cfg.sfLsaLimit??50)*((cfg.sfMedianCreepPct??5)/100)).toFixed(1)"></span>% per close, converging to median (<span x-text="((cfg.sfLsaLimit??50)/2).toFixed(0)"></span>%).</div>
+            </div>
+            <div class="g" style="margin-top:10px">
               <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:4px">BAND SIZE</div>
               <div style="font-size:9.5px;color:var(--text-lo)">⌊topN ÷ 2⌋ = <b style="color:var(--ice)" x-text="Math.floor((cfg.topN||25)/2)"></b> gainers + <b style="color:var(--ice)" x-text="Math.floor((cfg.topN||25)/2)"></b> losers</div>
             </div>
@@ -2131,6 +2141,28 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
         <div style="font-size:9px;color:var(--text-lo);margin-top:2px">Resets after 6h. ⚡ = over-extension hits.</div>
       </div>
 
+      <!-- SalF Median Creep active status -->
+      <div class="sec" x-show="cfg.sfEnabled && cfg.sfMedianCreepEnabled && Object.keys(salfCreep).length>0">
+        <div class="sec-ttl">SalF Median Creep <em x-text="Object.keys(salfCreep).length+' active'"></em></div>
+        <template x-for="[sym, entry] in Object.entries(salfCreep)" :key="sym">
+          <div style="margin-bottom:6px;font-family:var(--mono);font-size:10px">
+            <div style="display:flex;justify-content:space-between;color:#2dd4bf">
+              <span x-text="sym"></span>
+              <span x-text="'×'+entry.count"></span>
+            </div>
+            <div style="color:var(--text-lo);font-size:9px;margin-top:2px" x-text="(()=>{
+              const lim=cfg.sfLsaLimit??50;
+              const step=lim*((cfg.sfMedianCreepPct??5)/100);
+              const med=lim/2;
+              const n=entry.count||0;
+              const floor=Math.min(n*step,med).toFixed(1);
+              const cap=Math.max(lim-n*step,med).toFixed(1);
+              return 'LSA window: +'+floor+'% → +'+cap+'%';
+            })()"></div>
+          </div>
+        </template>
+      </div>
+
       <div class="sec" x-show="cfg.advFtEnabled && cfg.gainersEnabled && Object.keys(extenderCount).length>0">
         <div class="sec-ttl">Extenders <em x-text="Object.keys(extenderCount).length+' active'"></em></div>
         <template x-for="[sym, entry] in Object.entries(extenderCount)" :key="sym">
@@ -2428,6 +2460,8 @@ function pw() { return {
     // ── Sale Fishing Strategy ──
     sfEnabled: true,           // enable sale fishing (1h LSA gate, 2× slots/margin)
     sfLsaLimit: 50,            // 1h LSA spike cap % — block if last candle > avg by more than this
+    sfMedianCreepEnabled: true,    // tighten LSA gate after each SalF close on a symbol
+    sfMedianCreepPct: 5,           // % of sfLsaLimit to step per close (creep rate)
     tpIngressEnabled: true,     // on every non-gainer close, cut entry TP target by 50% per close (min tpIngressMin%)
     tpIngressMin: 3,            // floor % for TP ingress reduction
     dcaDoublingEnabled: false, // each DCA add escalates by configured multiplier; faster rescue, higher margin cost
@@ -2451,6 +2485,7 @@ function pw() { return {
   _lastTickerFetch: 0, // timestamp of last full-ticker batch fetch in pseudoWatchPositions
   rodeoCreep: {},    // symbol → { count, setAt } — tracks implied RSI creep per coin, valid 6h
   funCreep:   {},    // symbol → { count, setAt } — tracks FUN VM floor creep per coin, valid 6h
+  salfCreep:  {},    // symbol → { count, setAt } — SalF median creep, no TTL
   extenderCount: {}, // symbol → { count, setAt } — tracks over-extended scan hits per coin, valid 3h (Advanced FT)
   _extenderPollers: {}, // symbol → intervalId — dedicated per-symbol RSI pollers for active extenders
   _advFtPollers:    {}, // symbol → intervalId — dedicated per-symbol entry pollers for ADV FT candidates waiting for RSI to come into range
@@ -2546,6 +2581,7 @@ function pw() { return {
         bot: { startTime: this.bot.startTime, lastScan: this.bot.lastScan, lastScanAt: this.bot.lastScanAt },
         rodeoCreep: this.rodeoCreep,
         funCreep:   this.funCreep,
+        salfCreep:  this.salfCreep,
         extenderCount: this.extenderCount,
         ftCandidates: this.ftCandidates,
         symbolBanlist: this._symbolBanlist,
@@ -2587,6 +2623,7 @@ function pw() { return {
       if (s.potGainers?.length) this.potGainers = s.potGainers;
       if (s.rodeoCreep) this.rodeoCreep = s.rodeoCreep;
       if (s.funCreep && typeof s.funCreep === 'object') this.funCreep = s.funCreep;
+      if (s.salfCreep && typeof s.salfCreep === 'object') this.salfCreep = s.salfCreep;
       if (s.extenderCount && typeof s.extenderCount === 'object') this.extenderCount = s.extenderCount;
       if (s.ftCandidates && typeof s.ftCandidates === 'object') this.ftCandidates = s.ftCandidates;
       if (s.symbolBanlist && typeof s.symbolBanlist === 'object') this._symbolBanlist = s.symbolBanlist;
@@ -2653,6 +2690,7 @@ function pw() { return {
     this.ftWatchlist = [];
     this.rodeoCreep = {};
     this.funCreep   = {};
+    this.salfCreep  = {};
     this.extenderCount = {};
     this._stopAllExtenderPollers();
     this.ftCandidates = {};
@@ -2671,6 +2709,7 @@ function pw() { return {
     this.ftWatchlist       = [];
     this.rodeoCreep        = {};
     this.funCreep          = {};
+    this.salfCreep         = {};
     this._stopAllExtenderPollers();
     this._stopAllIftPollers();
     this._stopAllAdvFtPollers();
@@ -3357,9 +3396,14 @@ function pw() { return {
       const windowVols   = vols.slice(0, vols.length - 1);
       const avg          = windowVols.reduce((s, v) => s + v, 0) / windowVols.length;
       if (avg <= 0) { skipBlocked++; continue; }
-      const lsaRatio = lastComplete / avg;
-      const lsaCap   = 1 + (this.cfg.sfLsaLimit ?? 250) / 100;
-      if (lsaRatio <= 1 || lsaRatio >= lsaCap) { lsaBlocked++; continue; }
+      const lsaRatio  = lastComplete / avg;
+      const _sfLimit  = this.cfg.sfLsaLimit ?? 50;
+      const _sfStep   = _sfLimit * ((this.cfg.sfMedianCreepPct ?? 5) / 100);
+      const _sfMedian = _sfLimit / 2;
+      const _sfCreepN = this.cfg.sfMedianCreepEnabled ? (this.salfCreep[sym]?.count || 0) : 0;
+      const lsaFloor  = Math.min(_sfCreepN * _sfStep, _sfMedian);
+      const lsaCap    = Math.max(_sfLimit  - _sfCreepN * _sfStep, _sfMedian);
+      if (lsaRatio <= 1 + lsaFloor / 100 || lsaRatio >= 1 + lsaCap / 100) { lsaBlocked++; continue; }
       const isLoser   = !gainerSyms.has(sym);
       const change24h = parseFloat(t.price24hPcnt || 0) * 100;
       const ok = await this.salfOpenShort(sym, price, change24h, lsaRatio, isLoser);
@@ -4734,6 +4778,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
           if (!pos._ft && !pos._fun && !pos._salf) this.rodeoCreepBump(pos.symbol);
           if (pos._fun) this.funCreepBump(pos.symbol, pos._funSubType);
           if (pos._ft || pos._fun || pos._salf) this.tpIngressBump(pos.symbol);
+          if (pos._salf && this.cfg.sfMedianCreepEnabled) this.salfCreepBump(pos.symbol);
           _closingIds.delete(pos.id);
           if (this.bot.running) setTimeout(() => this.runScheduledCycle(), 500);
         } else {
@@ -5889,6 +5934,24 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     this.persist();
   },
 
+  salfCreepBump(symbol) {
+    const entry = this.salfCreep[symbol];
+    if (entry) {
+      entry.count++;
+      entry.bumpedAt = Date.now();
+    } else {
+      this.salfCreep[symbol] = { count: 1, setAt: Date.now(), bumpedAt: Date.now() };
+    }
+    const limit  = this.cfg.sfLsaLimit ?? 50;
+    const step   = limit * ((this.cfg.sfMedianCreepPct ?? 5) / 100);
+    const median = limit / 2;
+    const count  = this.salfCreep[symbol].count;
+    const floor  = Math.min(count * step, median).toFixed(1);
+    const cap    = Math.max(limit - count * step, median).toFixed(1);
+    this.log(`🎣 ${symbol}: SalF median creep ×${count} — LSA window now [+${floor}%, +${cap}%]`, 'info');
+    this.persist();
+  },
+
   // Bumps the over-extension counter for a symbol in the funCreep entry.
   // Kept separate from re-entry creep — a different axis of penalty.
   funOverExtBump(symbol, rsi6) {
@@ -6282,8 +6345,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     if (!pos._ft && !pos._fun && !pos._salf) this.rodeoCreepBump(pos.symbol);
     if (pos._fun) this.funCreepBump(pos.symbol, pos._funSubType);
     if (pos._ft || pos._fun || pos._salf) this.tpIngressBump(pos.symbol);
-    
-    
+    if (pos._salf && this.cfg.sfMedianCreepEnabled) this.salfCreepBump(pos.symbol);
+
+
     const feeStr = fundingFee !== 0 ? ` | Funding ${fundingFee>=0?'+':''}${fundingFee.toFixed(3)} USDT` : '';
     this.log(
       `🌑 ${pos.symbol}: closed [${reason}] entry ${fmtP(pos.entryPrice)} → exit ${fmtP(exitPrice)} | PnL ${pnl>=0?'+':''}${pnl.toFixed(2)} USDT (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)${feeStr} | Net ${totalPnl>=0?'+':''}${totalPnl.toFixed(2)} USDT [${isWin?'WIN':'LOSS'}]`,
