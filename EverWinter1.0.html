@@ -2198,6 +2198,8 @@ function ew() { return {
     // ── Sale Fishing Strategy ──
     sfEnabled: true,           // enable sale fishing (1h LSA gate, 2× slots/margin)
     sfLsaLimit: 50,            // 1h LSA spike cap % — block if last candle > avg by more than this
+    sfMedianCreepEnabled: true,    // tighten LSA gate after each SalF close on a symbol
+    sfMedianCreepPct: 5,           // % of sfLsaLimit to step per close (creep rate)
   },
   connected: { api:false },
   ui: { connecting:false, connectErr:'', scanning:false, refreshing:false },
@@ -2232,6 +2234,7 @@ function ew() { return {
   _ftMaxGraylist: {},
   _tpIngress: {},          // symbol → { count, setAt } — entry TP reduction: 0.5^count, floor at tpIngressMin%, TTL 3h
   funCreep:   {},          // symbol → { count, setAt, frThreshold, overExtCount } — FUN re-entry creep, 6h TTL
+  salfCreep:  {},          // symbol → { count, setAt } — SalF median creep, no TTL
   _advFtVmCreep: {},   // symbol → { bonus: number (additive % pts), expiresAt: timestamp }
   _volBaseline: {},
   _symData: {},       // symbol → { rsi6, rsi12, rsi24, volMomPct, ts } — for FT roster display
@@ -2319,6 +2322,7 @@ function ew() { return {
         creds: this.creds,
         rodeoCreep: this.rodeoCreep,
         funCreep:   this.funCreep,
+        salfCreep:  this.salfCreep,
         symbolBanlist: this._symbolBanlist,
         ftCandidates: this.ftCandidates,
         extenderCount: this.extenderCount,
@@ -2379,6 +2383,7 @@ function ew() { return {
         }
       }
       if (s.funCreep && typeof s.funCreep === 'object') this.funCreep = s.funCreep;
+      if (s.salfCreep && typeof s.salfCreep === 'object') this.salfCreep = s.salfCreep;
       if (s.tpIngress && typeof s.tpIngress === 'object') {
         const TP_INGRESS_TTL = 3 * 3600 * 1000;
         const nowGl = Date.now();
@@ -2433,6 +2438,7 @@ function ew() { return {
     this._advFtVmCreep = {};
     this._volBaseline = {};
     this.funCreep = {};
+    this.salfCreep = {};
     this._tpIngress = {};
     this.log('Saved state cleared.', 'warn');
     this.renderTradeFeed();
@@ -2948,6 +2954,24 @@ function ew() { return {
     const thrL  = this.funVolMomThreshold(symbol, true);
     const thrFr = this.funCreep[symbol].frThreshold;
     this.log(`💰 ${symbol}: FUN re-entry bump — creep ×${this.funCreep[symbol].count} → G floor ${thrG.toFixed(1)}% / L floor ${thrL.toFixed(1)}% / FR gate ${thrFr.toFixed(3)}%`, 'info');
+    this.persist();
+  },
+
+  salfCreepBump(symbol) {
+    const entry = this.salfCreep[symbol];
+    if (entry) {
+      entry.count++;
+      entry.bumpedAt = Date.now();
+    } else {
+      this.salfCreep[symbol] = { count: 1, setAt: Date.now(), bumpedAt: Date.now() };
+    }
+    const limit  = this.cfg.sfLsaLimit ?? 50;
+    const step   = limit * ((this.cfg.sfMedianCreepPct ?? 5) / 100);
+    const median = limit / 2;
+    const count  = this.salfCreep[symbol].count;
+    const floor  = Math.min(count * step, median).toFixed(1);
+    const cap    = Math.max(limit - count * step, median).toFixed(1);
+    this.log(`🎣 ${symbol}: SalF median creep ×${count} — LSA window now [+${floor}%, +${cap}%]`, 'info');
     this.persist();
   },
 
@@ -3530,9 +3554,14 @@ function ew() { return {
       const windowVols  = vols.slice(0, vols.length - 1);
       const avg         = windowVols.reduce((s, v) => s + v, 0) / windowVols.length;
       if (avg <= 0) { skipBlocked++; continue; }
-      const lsaRatio = lastComplete / avg;
-      const lsaCap   = 1 + (this.cfg.sfLsaLimit ?? 250) / 100;
-      if (lsaRatio <= 1 || lsaRatio >= lsaCap) { lsaBlocked++; continue; }
+      const lsaRatio  = lastComplete / avg;
+      const _sfLimit  = this.cfg.sfLsaLimit ?? 50;
+      const _sfStep   = _sfLimit * ((this.cfg.sfMedianCreepPct ?? 5) / 100);
+      const _sfMedian = _sfLimit / 2;
+      const _sfCreepN = this.cfg.sfMedianCreepEnabled ? (this.salfCreep[sym]?.count || 0) : 0;
+      const lsaFloor  = Math.min(_sfCreepN * _sfStep, _sfMedian);
+      const lsaCap    = Math.max(_sfLimit  - _sfCreepN * _sfStep, _sfMedian);
+      if (lsaRatio <= 1 + lsaFloor / 100 || lsaRatio >= 1 + lsaCap / 100) { lsaBlocked++; continue; }
       const isLoser   = !gainerSyms.has(sym);
       const change24h = parseFloat(t.price24hPcnt || 0) * 100;
       const ok = await this.salfOpenShort(sym, price, change24h, lsaRatio, isLoser);
