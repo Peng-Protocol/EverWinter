@@ -4767,9 +4767,9 @@ function ew() { return {
     const _ftCloseRef = pos.markPrice || pos.entryPrice || 0;
     let _ftCloseBody;
     if (_ftCloseRef > 0) {
-      const _ftCloseLimit = parseFloat((_ftCloseRef * 1.001).toFixed(this.instrPriceDp(pos.symbol)));
+      const _ftCloseLimit = parseFloat((_ftCloseRef * 1.003).toFixed(this.instrPriceDp(pos.symbol)));
       _ftCloseBody = { category:'linear', symbol:pos.symbol, side:'Buy', orderType:'Limit',
-                       qty:String(pos.totalSize), price:String(_ftCloseLimit), timeInForce:'IOC', reduceOnly:true };
+                       qty:String(pos.totalSize), price:String(_ftCloseLimit), timeInForce:'GTC', reduceOnly:true };
     } else {
       _ftCloseBody = { category:'linear', symbol:pos.symbol, side:'Buy', orderType:'Market',
                        qty:String(pos.totalSize), timeInForce:'IOC', reduceOnly:true };
@@ -4837,6 +4837,7 @@ function ew() { return {
     this._notifyLaggardClose(pos, _ftRoiPct);
     this.persist();
     this.renderTradeFeed();
+    _closingIds.delete(pos.id);
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) await this.runLaggardCheck();
     if (this.cfg.laggardCheckEnabled) {
       clearTimeout(this._postCloseLaggardTimer);
@@ -6810,21 +6811,29 @@ function ew() { return {
   },
 
   async closePosition(pos, reason='manual') {
+    if (_closingIds.has(pos.id)) return;
+    _closingIds.add(pos.id);
+    // Cancel any stale GTC close order from a previous attempt before placing a fresh one.
+    if (pos._closeOrderId) {
+      await this.cancelTpLimitOrder(pos.symbol, pos._closeOrderId);
+      pos._closeOrderId = null;
+    }
     // Cancel TP limit order before placing close — prevents orphaned GTC order in the book.
     if (pos.tpOrderId) {
       await this.cancelTpLimitOrder(pos.symbol, pos.tpOrderId);
       pos.tpOrderId = null;
     }
     await this.signedDelay();
-    // 0.1% slippage protection on close — Limit IOC at markPrice*(1+0.001).
-    // For a Buy-to-close short, this is the worst price we'll accept (0.1% above mark).
-    // Falls back to pure Market if markPrice is unavailable.
+    // Limit GTC at markPrice*(1+0.003). 0.3% above mark acts as a taker for a Buy-to-close short
+    // (fills immediately against asks at or below this level). GTC stays in the book if not
+    // instantly filled, eliminating the IOC zero-fill failure mode.
+    // Falls back to Market if markPrice is unavailable.
     const _closeRef = pos.markPrice || pos.entryPrice || 0;
     let _closeBody;
     if (_closeRef > 0) {
-      const _closeLimit = parseFloat((_closeRef * 1.001).toFixed(this.instrPriceDp(pos.symbol)));
+      const _closeLimit = parseFloat((_closeRef * 1.003).toFixed(this.instrPriceDp(pos.symbol)));
       _closeBody = {category:'linear', symbol:pos.symbol, side:'Buy', orderType:'Limit',
-                    qty:String(pos.totalSize), price:String(_closeLimit), timeInForce:'IOC', reduceOnly:true};
+                    qty:String(pos.totalSize), price:String(_closeLimit), timeInForce:'GTC', reduceOnly:true};
     } else {
       _closeBody = {category:'linear', symbol:pos.symbol, side:'Buy', orderType:'Market',
                     qty:String(pos.totalSize), timeInForce:'IOC', reduceOnly:true};
@@ -6834,12 +6843,11 @@ function ew() { return {
     try {
       const r = await fetch(`${this.base}/v5/order/create`, {method:'POST', headers:h, body:b});
       const d = await this.safeJson(r);
-      if (!d) { this.log(`Close failed (${pos.symbol}): empty response`, 'error'); return; }
-      if (d.retCode !== 0) { this.log(`Close failed (${pos.symbol}): ${d.retMsg}`, 'error'); return; }
+      if (!d) { this.log(`Close failed (${pos.symbol}): empty response`, 'error'); _closingIds.delete(pos.id); return; }
+      if (d.retCode !== 0) { this.log(`Close failed (${pos.symbol}): ${d.retMsg}`, 'error'); _closingIds.delete(pos.id); return; }
+      pos._closeOrderId = d.result?.orderId || null;
 
-      // IOC accepted by exchange — but on illiquid markets (especially testnet) the order
-      // can be accepted yet fill zero contracts. Re-poll the position after a short delay
-      // to confirm it's actually gone before treating the close as done.
+      // Poll after 2.5s to confirm fill.
       await new Promise(res => setTimeout(res, 2500));
       await this.signedDelay();
       const pp = `category=linear&symbol=${pos.symbol}`;
@@ -6850,30 +6858,28 @@ function ew() { return {
         const pd = await this.safeJson(pr);
         const ep = pd ? (pd.result?.list||[]).find(e => e.symbol===pos.symbol && e.side==='Sell' && parseFloat(e.size)>0) : null;
         stillOpen = !!ep;
-        if (ep) {
-          // Update size in case it partially filled
-          pos.totalSize = parseFloat(ep.size);
-        }
+        if (ep) pos.totalSize = parseFloat(ep.size);
       } catch(e) { /* network blip — assume gone, syncPositions will catch it */ }
 
       if (stillOpen) {
-        // IOC filled zero — mark for retry. Cancel conditionals now (they're invalid regardless).
-        // Spawn a dedicated 30s retry worker if not already running for this position.
+        // Limit GTC in book — mark for retry. Worker re-checks every 30s and cancels stale order
+        // before re-placing at a fresher price.
         if (!pos.pendingClose) {
-          pos.pendingClose       = true;
-          pos.pendingCloseReason = reason;
-          pos.pendingCloseAt     = Date.now();
+          pos.pendingClose        = true;
+          pos.pendingCloseReason  = reason;
+          pos.pendingCloseAt      = Date.now();
           pos.pendingCloseRetries = 0;
           await this.cancelAllConditionals(pos.symbol);
-          this.log(`${pos.symbol}: close order accepted but position still open (IOC likely unfilled — low liquidity). Spawning 30s retry worker.`, 'warn');
+          this.log(`${pos.symbol}: close limit in book — awaiting fill. Spawning 30s retry worker.`, 'warn');
           this.persist();
-          // Spawn dedicated retry worker — tries every 30s until position is gone or bot stops.
-          this._spawnCloseRetryWorker(pos);
         }
+        _closingIds.delete(pos.id); // release so retry worker can re-enter
+        this._spawnCloseRetryWorker(pos);
         return;
       }
 
       // Position confirmed gone — clean up locally.
+      pos._closeOrderId = null;
       if (reason === 'force') this.sess.forceClose++;
       this.log(`${pos.symbol}: close confirmed [${reason}]`, 'success');
       await this.cancelAllConditionals(pos.symbol);
@@ -6888,14 +6894,13 @@ function ew() { return {
       if (_closedG) _closedG.status = 'closed';
       this.positions = this.positions.filter(p => p.id !== pos.id);
       this.persist();
-      // Record PnL card with 2.5s delay to let Bybit settle the closed-pnl record,
-      // then trigger a scan so the freed slot is filled immediately.
       const _closedPos = pos;
       setTimeout(() => {
         this.recordClosedPosition(_closedPos);
+        _closingIds.delete(_closedPos.id);
       }, 2500);
       if (this.bot.running) setTimeout(() => this.runScheduledCycle(), 500);
-    } catch(e) { this.log('close: ' + e.message, 'error'); }
+    } catch(e) { this.log('close: ' + e.message, 'error'); _closingIds.delete(pos.id); }
   },
 
   // ── CLOSE RETRY WORKER ──
