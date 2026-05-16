@@ -2854,6 +2854,13 @@ function ew() { return {
       ? (this.cfg.addPcts6 || [1.5, 3, 6, 9, 12, 15])
       : (this.cfg.addPcts  || [3, 9, 15]);
   },
+  // Returns the DCA stage count for a specific position, regardless of current global config.
+  // Prefers the stamped _stageCount field; falls back to counting cond orders in the position.
+  _posStageCount(pos) {
+    if (pos._stageCount) return pos._stageCount;
+    const condCount = (pos.orders || []).filter(o => o.type === 'cond').length;
+    return condCount > 0 ? condCount : this._dcaStageCount();
+  },
 
   // Increments Rodeo Creep for a symbol on close.
   // Only gainer closes should call this — FT passes source='gainer' check.
@@ -3315,6 +3322,7 @@ function ew() { return {
       _volMomentum: this._symData[sym]?.volMomPct ?? null,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
       currentTpPrice: tpPrice, tpOrderId: null, tpPct: effTp0, dcaStage: 0, orders,
+      _stageCount: this._dcaStageCount(),
       _laggardInitialEV: margin * (effTp0 / 100),
       _laggardLostValue: 0,
     });
@@ -3791,6 +3799,7 @@ function ew() { return {
       leverage: effectiveLev, margin,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
       currentTpPrice: tpPrice, tpOrderId: null, tpPct: effTp0, dcaStage: 0, orders,
+      _stageCount: this._dcaStageCount(),
       _laggardInitialEV: margin * (effTp0 / 100),
       _laggardLostValue: 0,
     });
@@ -4706,6 +4715,7 @@ function ew() { return {
       _fundingIntervalMs: this._klineCache[`fr_${sym}`]?.intervalMs ?? 8 * 3600000,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
       currentTpPrice: tpPrice, tpOrderId: null, tpPct: effTp0, dcaStage: 0, orders,
+      _stageCount: this._dcaStageCount(),
       _laggardInitialEV: margin * (effTp0 / 100),
       _laggardLostValue: 0,
     });
@@ -4875,13 +4885,13 @@ function ew() { return {
             : parseFloat((pos.entryPrice * (1 - (_ft_roi / 100) / pos.leverage)).toFixed(8));
           pos.currentTpPrice = _ft_tp;
           pos.tpPct          = _ft_roi;
-          if (pos.dcaStage >= this._dcaStageCount() && !pos.slPrice) {
+          if (pos.dcaStage >= this._posStageCount(pos) && !pos.slPrice) {
             const instr = await this.getInstrInfo(pos.symbol);
             if (instr) {
               const slPrice = this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), instr);
               await this.setSL(pos.symbol, slPrice);
               pos.slPrice = slPrice; pos.slSet = true;
-              this.log(`🎯 ${pos.symbol}: FT stage ${this._dcaStageCount()} — SL set @ ${fmtP(slPrice)}`, 'warn');
+              this.log(`🎯 ${pos.symbol}: FT stage ${this._posStageCount(pos)} — SL set @ ${fmtP(slPrice)}`, 'warn');
             }
           }
           await this.setTP(pos, _ft_tp);
@@ -5380,6 +5390,7 @@ function ew() { return {
         _fundingIntervalMs: this._klineCache[`fr_${sym}`]?.intervalMs ?? 8 * 3600000,
         upnl:0, openedAt:Date.now(), phase:'normal', isPending:false,
         currentTpPrice:tpPrice, tpOrderId: null, tpPct:effTp0, dcaStage:0, orders,
+        _stageCount: this._dcaStageCount(),
         _laggardInitialEV: marginCost * (effTp0 / 100),
         _laggardLostValue: 0,
       });
@@ -5596,7 +5607,7 @@ function ew() { return {
         }
 
         // SL drift guard — local card correction between sync cycles. 10% tolerance.
-        if (p.slSet && p.slPrice > 0 && p.dcaStage >= this._dcaStageCount() && !p.pendingClose) {
+        if (p.slSet && p.slPrice > 0 && p.dcaStage >= this._posStageCount(p) && !p.pendingClose) {
           const instr = await this.getInstrInfo(p.symbol);
           if (instr) {
             const targetSl = this.snapPrice(p.entryPrice * (1 + 1.05 / p.leverage), instr);
@@ -6252,7 +6263,7 @@ function ew() { return {
         pos.pendingCloseReason === 'force'               ? 'force'       :
         (pos.phase === 'force' || pos.phase === 'reduce') ? 'force'      :
         isTpInferred                                     ? 'tp-inferred' :
-        (closeRoiPct !== null && closeRoiPct < 0 && (pos.dcaStage || 0) >= this._dcaStageCount() && closeRoiPct >= -105 * (1 + TP_INFER_BAND) && closeRoiPct <= -105 * (1 - TP_INFER_BAND)) ? 'sl-inferred' :
+        (closeRoiPct !== null && closeRoiPct < 0 && (pos.dcaStage || 0) >= this._posStageCount(pos) && closeRoiPct >= -105 * (1 + TP_INFER_BAND) && closeRoiPct <= -105 * (1 - TP_INFER_BAND)) ? 'sl-inferred' :
         'manual';
 
       // typeLabel used in log only — shows the raw Bybit fields for diagnostics
@@ -6400,7 +6411,7 @@ function ew() { return {
       const actualNotional = avgPrice * size;
 
       // 6-stage extension — check stages 4–6 first (highest wins).
-      if (this.cfg.dcaSixStageEnabled) {
+      if (this._posStageCount(pos) > 3) {
         const _ap6 = this._activeAddPcts();
         const p4 = pos.orders?.[4]?.price || this.snapPrice(p0 * (1 + _ap6[3] / 100), instr);
         const p5 = pos.orders?.[5]?.price || this.snapPrice(p0 * (1 + _ap6[4] / 100), instr);
@@ -6443,7 +6454,7 @@ function ew() { return {
     const add2N    = addN * _addMultFb * Math.pow(_mFb, 2);
     const add3N    = addN * _addMultFb * Math.pow(_mFb, 3);
     const tol      = 0.30;
-    if (this.cfg.dcaSixStageEnabled) {
+    if (this._posStageCount(pos) > 3) {
       const add4N = addN * _addMultFb * Math.pow(_mFb, 4);
       const add5N = addN * _addMultFb * Math.pow(_mFb, 5);
       const add6N = addN * _addMultFb * Math.pow(_mFb, 6);
@@ -6573,7 +6584,7 @@ function ew() { return {
   async checkSlStage3(pos, avgPrice, instr) {
     if (!instr) return;
     const stage = this.inferStage(pos, instr);
-    if (stage < this._dcaStageCount()) return;
+    if (stage < this._posStageCount(pos)) return;
 
     const targetSl    = this.snapPrice(avgPrice * (1 + 1.05 / pos.leverage), instr);
     const currentMark = pos.markPrice || avgPrice;
