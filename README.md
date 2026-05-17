@@ -57,7 +57,7 @@ Not a tradeable watchlist but a live display of all symbols currently under acti
 
 ## Pollers
 
-EverWinter runs (6) independent `setInterval` loop groups with different cadences and responsibilities.
+EverWinter runs (5) independent `setInterval` loop groups with different cadences and responsibilities.
 
 ### Scan Countdown (`_cdTimer`)
 Fires every second. Decrements `bot.scanCd` for the UI countdown display and triggers the full scan cycle when it reaches zero. The interval between scans is configurable (`scanMins`, default (15) minutes).
@@ -68,9 +68,6 @@ Fires every (5) seconds. Calls `pseudoWatchPositions()` to fetch current mark pr
 ### Potential Entries Poller (`_potEntryTimer`)
 Fires every (5) seconds. For each symbol on the Potential Entries watchlist it fetches a fresh RSI (kline cache is force-evicted per symbol on every tick to prevent stale reads), re-checks all gates including current Rodeo Creep and volume divergence, and opens a phantom short immediately if the symbol qualifies. This routine can open a gainer position between main scan cycles.
 
-
-### Advanced FT Entry Pollers (`_advFtPollers`)
-Started per Advanced FT roster symbol and fired every (60) seconds. Each tick force-evicts the symbol's RSI kline cache, fetches a fresh ticker/funding snapshot, and re-runs the FT entry gates for only that symbol. This lets ADV FT entries fire as soon as RSI, funding, slot, ClC, and LSA gates align instead of waiting for the next full scan interval.
 
 ### Market Refresh
 Manual-only in PseudoWinter, triggered via the **Refresh** button. Calls `pseudoWatchPositions()` and a forced pass of `watchPotentialEntries()` to update prices and re-evaluate the watchlist on demand.
@@ -108,7 +105,7 @@ The LSA calculation reads directly from the `_klineCache[${symbol}_15]` entry th
 ### 5. Extender Ticks
 Once per cycle, the extender counter table is polled. Each tracked symbol that is within its 3h TTL and has not been checked this cycle fetches a fresh RSI6; if it is still over-extended the counter is bumped.
 
-The kline cache (`_klineCache`) stores candle arrays keyed by `symbol_15` with a scan-interval TTL. Cache entries are evicted at the start of each scan cycle; the Potential Entries poller force-evicts its own entries on every tick for real-time accuracy.
+The kline cache (`_klineCache`) stores candle arrays keyed by `symbol_15`. Freshness is determined by candle boundary rather than wall-clock TTL: each entry records `lastCompletedTs` (the open timestamp of the last completed candle, i.e. the second-to-last entry in the Bybit response). A cached entry is reused until `lastCompletedTs` falls behind the current 15m boundary, meaning no redundant fetches occur within a candle and a refresh happens automatically as soon as the next candle closes. The Potential Entries poller still force-evicts its own entries on every tick for real-time accuracy.
 
 ---
 

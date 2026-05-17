@@ -2565,8 +2565,6 @@ function pw() { return {
   salfCreep:  {},    // symbol → { count, setAt, bumpedAt } — SalF median creep, 6h TTL from setAt
   extenderCount: {}, // symbol → { count, setAt } — tracks over-extended scan hits per coin, valid 3h (Advanced FT)
   _extenderPollers: {}, // symbol → intervalId — dedicated per-symbol RSI pollers for active extenders
-  _advFtPollers:    {}, // symbol → intervalId — dedicated per-symbol entry pollers for ADV FT candidates waiting for RSI to come into range
-  _advFtPollerBusy: {}, // symbol → true while its ADV FT poll tick is evaluating
   ftCandidates: {},  // symbol → { count, qualifiedAt } — persisted FT watch roster; survives app restarts and rodeo TTL expiry
   _symbolBanlist: {}, // symbol → reason string — permanently excluded from scans; persisted across restarts
   _advFtGraylist:    {}, // symbol → expiresAt — graylisted from gainers when ADV FT threshold reached
@@ -2782,7 +2780,6 @@ function pw() { return {
     this.extenderCount = {};
     this._stopAllExtenderPollers();
     this.ftCandidates = {};
-    this._stopAllAdvFtPollers();
     this._symbolBanlist = {};
     this._advFtGraylist = {};
     this._extenderGraylist = {};
@@ -2799,7 +2796,6 @@ function pw() { return {
     this.salfCreep         = {};
     this._stopAllExtenderPollers();
     this._stopAllIftPollers();
-    this._stopAllAdvFtPollers();
     this._extenderGraylist = {};
     this._advFtGraylist    = {};
     this._ftEvictGraylist  = {};
@@ -2894,7 +2890,6 @@ function pw() { return {
 
     }
     await this.runScheduledCycle();
-    this._syncAdvFtPollers();
     this.scheduleScan();
     if (_watchTimer) { clearInterval(_watchTimer); _watchTimer = null; }
     _watchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
@@ -2920,7 +2915,6 @@ function pw() { return {
     this._symData      = {}; // clear live symbol data — will be repopulated on next scan
     this._stopAllExtenderPollers();
     this._stopAllIftPollers();
-    this._stopAllAdvFtPollers();
     this.renderPotGainers();
     this.log('🌑 Sim stopped.', 'warn');
     this._stopAllCarryOnPollers();
@@ -3433,17 +3427,20 @@ function pw() { return {
 
   async getKlines1h(symbol) {
     try {
-      const cacheKey = `${symbol}_1h`;
-      const cached   = this._klineCache[cacheKey];
-      const cacheTTL = (this.cfg.scanMins || 15) * 60 * 1000;
-      if (cached && (Date.now() - cached.ts) < cacheTTL) return cached;
+      const cacheKey   = `${symbol}_1h`;
+      const cached     = this._klineCache[cacheKey];
+      const BAR_1H_MS  = 60 * 60 * 1000;
+      const expectedLastTs = Math.floor(Date.now() / BAR_1H_MS) * BAR_1H_MS - BAR_1H_MS;
+      if (cached && cached.lastCompletedTs != null && cached.lastCompletedTs >= expectedLastTs) return cached;
       const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=30`);
       const d = await r.json();
       if (d.retCode !== 0) return null;
-      const candles = (d.result?.list || []).reverse();
-      const closes  = candles.map(c => parseFloat(c[4]));
-      const volumes = candles.map(c => parseFloat(c[6]));
-      this._klineCache[cacheKey] = { closes, volumes, ts: Date.now() };
+      const candles        = (d.result?.list || []).reverse();
+      const closes         = candles.map(c => parseFloat(c[4]));
+      const volumes        = candles.map(c => parseFloat(c[6]));
+      const timestamps     = candles.map(c => parseInt(c[0]));
+      const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
+      this._klineCache[cacheKey] = { closes, volumes, timestamps, lastCompletedTs, ts: Date.now() };
       return this._klineCache[cacheKey];
     } catch { return null; }
   },
@@ -3601,10 +3598,11 @@ function pw() { return {
 
   async fetchRSI(symbol, period) {
     try {
-      const cacheKey = `${symbol}_15`;
-      const cached = this._klineCache[cacheKey];
-      const cacheTTL = (this.cfg.scanMins || 15) * 60 * 1000;
-      if (cached && (Date.now() - cached.ts) < cacheTTL) {
+      const cacheKey   = `${symbol}_15`;
+      const cached     = this._klineCache[cacheKey];
+      const BAR_15MS   = 15 * 60 * 1000;
+      const expectedLastTs = Math.floor(Date.now() / BAR_15MS) * BAR_15MS - BAR_15MS;
+      if (cached && cached.lastCompletedTs != null && cached.lastCompletedTs >= expectedLastTs) {
         const val = calcRSI(cached.closes, period);
         if (val != null) this.symDataWrite(symbol, { [`rsi${period}`]: val });
         return val;
@@ -3613,12 +3611,14 @@ function pw() { return {
       const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=${limit}`);
       const d = await r.json();
       if (d.retCode !== 0) return null;
-      const candles     = (d.result?.list || []).reverse();
-      const opens       = candles.map(c => parseFloat(c[1]));
-      const closes      = candles.map(c => parseFloat(c[4]));
-      const volumes     = candles.map(c => parseFloat(c[6])); // [6] = turnover in USDT (quote)
-      const baseVolumes = candles.map(c => parseFloat(c[5])); // [5] = base asset qty (token count)
-      this._klineCache[cacheKey] = { opens, closes, volumes, baseVolumes, ts: Date.now() };
+      const candles        = (d.result?.list || []).reverse();
+      const opens          = candles.map(c => parseFloat(c[1]));
+      const closes         = candles.map(c => parseFloat(c[4]));
+      const volumes        = candles.map(c => parseFloat(c[6])); // [6] = turnover in USDT (quote)
+      const baseVolumes    = candles.map(c => parseFloat(c[5])); // [5] = base asset qty (token count)
+      const timestamps     = candles.map(c => parseInt(c[0]));
+      const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
+      this._klineCache[cacheKey] = { opens, closes, volumes, baseVolumes, timestamps, lastCompletedTs, ts: Date.now() };
       const val = calcRSI(closes, period);
       if (val != null) this.symDataWrite(symbol, { [`rsi${period}`]: val });
       return val;
@@ -3631,11 +3631,12 @@ function pw() { return {
       const LOOKBACK_CANDLES = Math.ceil((LOOKBACK_HOURS * 60) / intervalMin); // 15m→12, 5m→36
       const WARMUP           = 8;  // RSI6 needs period+1=7 minimum; +1 extra for stability
       const limit            = LOOKBACK_CANDLES + WARMUP + 6;
-      const cacheKey         = `${symbol}_${intervalMin}`;
+      const cacheKey   = `${symbol}_${intervalMin}`;
       let closes;
-      const cached   = this._klineCache[cacheKey];
-      const cacheTTL = (this.cfg.scanMins || 15) * 60 * 1000;
-      if (intervalMin === 15 && cached && (Date.now() - cached.ts) < cacheTTL) {
+      const cached     = this._klineCache[cacheKey];
+      const BAR_15MS   = 15 * 60 * 1000;
+      const expectedLastTs = Math.floor(Date.now() / BAR_15MS) * BAR_15MS - BAR_15MS;
+      if (intervalMin === 15 && cached && cached.lastCompletedTs != null && cached.lastCompletedTs >= expectedLastTs) {
         closes = cached.closes;
       } else {
         const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=${intervalMin}&limit=${limit}`);
@@ -3644,9 +3645,11 @@ function pw() { return {
         const candles = (d.result?.list || []).reverse();
         closes = candles.map(c => parseFloat(c[4]));
         if (intervalMin === 15) {
-          const volumes     = candles.map(c => parseFloat(c[6]));
-          const baseVolumes = candles.map(c => parseFloat(c[5]));
-          this._klineCache[cacheKey] = { closes, volumes, baseVolumes, ts: Date.now() };
+          const volumes        = candles.map(c => parseFloat(c[6]));
+          const baseVolumes    = candles.map(c => parseFloat(c[5]));
+          const timestamps     = candles.map(c => parseInt(c[0]));
+          const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
+          this._klineCache[cacheKey] = { closes, volumes, baseVolumes, timestamps, lastCompletedTs, ts: Date.now() };
         }
       }
       if (!closes || closes.length < WARMUP + 2) return null;
@@ -3776,7 +3779,6 @@ function pw() { return {
         if (now_ftexp >= expiresAt) {
           this.log(`🎯 ${sym}: FT candidacy expired (${this.cfg.runtimeHours}h window) — removed from roster`, 'info');
           delete this.ftCandidates[sym];
-          this._stopAdvFtPoller(sym);
           if (this._advFtGraylist[sym]) {
             delete this._advFtGraylist[sym];
             this.log(`⚡ ${sym}: ADV FT gainers graylist cleared (roster expired)`, 'info');
@@ -3789,14 +3791,12 @@ function pw() { return {
       for (const [sym, ftEntry] of Object.entries(this.ftCandidates)) {
         if (onlySymbols && !onlySymbols.has(sym)) continue;
         if (ftEntry.tradesOpened == null) ftEntry.tradesOpened = 0;
-        if (ftEntry._advFt) this._startAdvFtPoller(sym);
 
         if (ftEntry.tradesOpened >= this.cfg.ftMaxTrades) {
           const _glExpiry = Date.now() + 12 * 3600 * 1000;
           this._ftMaxGraylist[sym] = _glExpiry;
           this.log(`🎯 ${sym}: FT max trades reached (${ftEntry.tradesOpened}/${this.cfg.ftMaxTrades}) — removing from roster, 12h re-entry graylist applied`, 'info');
           delete this.ftCandidates[sym];
-          this._stopAdvFtPoller(sym);
           if (this._advFtGraylist[sym]) {
             delete this._advFtGraylist[sym];
             this.log(`⚡ ${sym}: ADV FT gainers graylist cleared (max trades reached)`, 'info');
@@ -3975,7 +3975,6 @@ function pw() { return {
         const _evictWindow = (entry.qualifiedAt || Date.now()) + (this.cfg.runtimeHours * 3600000);
         this._ftEvictGraylist[sym] = _evictWindow;
         delete this.ftCandidates[sym];
-        this._stopAdvFtPoller(sym);
         if (this._advFtGraylist[sym]) delete this._advFtGraylist[sym];
       }
       if (_ftEvict.length > 0) {
@@ -4052,7 +4051,6 @@ function pw() { return {
       this._symbolBanlist[sym] = `FUN notional below exchange minimum (${actualNotional.toFixed(4)} USDT)`;
       this.gainers = this.gainers.filter(g => g.symbol !== sym);
       delete this.ftCandidates[sym];
-      this._stopAdvFtPoller(sym);
       this._stopExtenderPoller(sym);
       this.persist();
       return false;
@@ -4149,7 +4147,6 @@ function pw() { return {
       delete this._advFtGraylist[sym];
       delete this._extenderGraylist[sym];
       this._stopExtenderPoller(sym);
-      this._stopAdvFtPoller(sym);
       this.persist();
       return; 
     }
@@ -4170,7 +4167,6 @@ function pw() { return {
         delete this._advFtGraylist[sym];
         delete this._extenderGraylist[sym];
         this._stopExtenderPoller(sym);
-        this._stopAdvFtPoller(sym);
         this.persist();
         invalidDcaPrice = true;
         break;
@@ -4191,7 +4187,6 @@ function pw() { return {
         delete this._advFtGraylist[sym];
         delete this._extenderGraylist[sym];
         this._stopExtenderPoller(sym);
-        this._stopAdvFtPoller(sym);
         this.persist();
         invalidDcaPrice = true;
         break;
@@ -4327,7 +4322,6 @@ function pw() { return {
         const _evictWindow = (ftEntry.qualifiedAt || Date.now()) + (this.cfg.runtimeHours * 3600000);
         this._ftEvictGraylist[pos.symbol] = _evictWindow;
         delete this.ftCandidates[pos.symbol];
-        this._stopAdvFtPoller(pos.symbol);
         if (this._advFtGraylist[pos.symbol]) delete this._advFtGraylist[pos.symbol];
         delete this.extenderCount[pos.symbol];
         this._stopExtenderPoller(pos.symbol);
@@ -5020,7 +5014,6 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
       delete this._advFtGraylist[sym];
       delete this._extenderGraylist[sym];
       this._stopExtenderPoller(sym);
-      this._stopAdvFtPoller(sym);
       this.persist();
       return; 
     }
@@ -5041,7 +5034,6 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
         delete this._advFtGraylist[sym];
         delete this._extenderGraylist[sym];
         this._stopExtenderPoller(sym);
-        this._stopAdvFtPoller(sym);
         this.persist();
         invalidDcaPrice = true;
         break;
@@ -5062,7 +5054,6 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
         delete this._advFtGraylist[sym];
         delete this._extenderGraylist[sym];
         this._stopExtenderPoller(sym);
-        this._stopAdvFtPoller(sym);
         this.persist();
         invalidDcaPrice = true;
         break;
@@ -6254,21 +6245,24 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const LOOKBACK_CANDLES = Math.ceil((LOOKBACK_HOURS * 60) / 15); // 24
       const WARMUP           = 8;
       const limit            = LOOKBACK_CANDLES + WARMUP + 6;
-      const cacheKey         = `${symbol}_15`;
-      const cacheTTL         = (this.cfg.scanMins || 15) * 60 * 1000;
+      const cacheKey   = `${symbol}_15`;
       let closes;
-      const cached = this._klineCache[cacheKey];
-      if (cached && (Date.now() - cached.ts) < cacheTTL) {
+      const cached     = this._klineCache[cacheKey];
+      const BAR_15MS   = 15 * 60 * 1000;
+      const expectedLastTs = Math.floor(Date.now() / BAR_15MS) * BAR_15MS - BAR_15MS;
+      if (cached && cached.lastCompletedTs != null && cached.lastCompletedTs >= expectedLastTs) {
         closes = cached.closes;
       } else {
         const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=${limit}`);
         const d = await r.json();
         if (d.retCode !== 0) return 0;
-        const candles = (d.result?.list || []).reverse();
-        closes = candles.map(c => parseFloat(c[4]));
-        const volumes     = candles.map(c => parseFloat(c[6]));
-        const baseVolumes = candles.map(c => parseFloat(c[5]));
-        this._klineCache[cacheKey] = { closes, volumes, baseVolumes, ts: Date.now() };
+        const candles        = (d.result?.list || []).reverse();
+        closes               = candles.map(c => parseFloat(c[4]));
+        const volumes        = candles.map(c => parseFloat(c[6]));
+        const baseVolumes    = candles.map(c => parseFloat(c[5]));
+        const timestamps     = candles.map(c => parseInt(c[0]));
+        const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
+        this._klineCache[cacheKey] = { closes, volumes, baseVolumes, timestamps, lastCompletedTs, ts: Date.now() };
       }
       if (!closes || closes.length < WARMUP + 2) return 0;
       let overExtCount = 0;
@@ -6369,12 +6363,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         this._ftRosterBump(symbol);
         this.ftCandidates[symbol] = { count, qualifiedAt: now, tradesOpened: 0, _advFt: true };
         this.log(`⚡ ${symbol}: promoted to Advanced FT roster (×${count} over-extended hits)`, 'trade');
-        this._startAdvFtPoller(symbol);
       } else if (isUpgrade) {
         this.ftCandidates[symbol]._advFt = true;
         this.ftCandidates[symbol].count  = count;
         this.log(`⚡ ${symbol}: FT roster upgraded to Advanced FT (×${count} over-extended)`, 'info');
-        if (!this._advFtPollers[symbol]) this._startAdvFtPoller(symbol);
       } else {
         this.ftCandidates[symbol].count = count;
       }
@@ -6402,57 +6394,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     });
     const [evictSym] = roster[0];
     this.log(`🎯 FT roster full (${max}) — evicting ${evictSym} (FR ${(this._symData[evictSym]?.fundingRate ?? 0).toFixed(4)}%) to admit ${incomingSymbol}`, 'info');
-    this._stopAdvFtPoller(evictSym);
     delete this.ftCandidates[evictSym];
     return evictSym;
   },
 
-  _syncAdvFtPollers() {
-    if (!this.bot.running || !this.cfg.advFtEnabled) return;
-    for (const [sym, entry] of Object.entries(this.ftCandidates)) {
-      if (entry?._advFt) this._startAdvFtPoller(sym);
-    }
-  },
-
-  _startAdvFtPoller(symbol) {
-    if (!symbol || this._advFtPollers[symbol]) return;
-    const tick = async () => {
-      const entry = this.ftCandidates[symbol];
-      if (!this.bot.running || !this.cfg.advFtEnabled || !entry?._advFt) {
-        this._stopAdvFtPoller(symbol);
-        return;
-      }
-      if (this._cycleRunning || this._advFtPollerBusy[symbol]) return;
-      this._advFtPollerBusy[symbol] = true;
-      try {
-        delete this._klineCache[`${symbol}_15`];
-        const ticker = await this.fetchTicker(symbol);
-        if (!ticker) return;
-        if (ticker.fundingRate != null) {
-          this._klineCache[`fr_${symbol}`] = { rate: parseFloat(ticker.fundingRate) * 100, intervalMs: ticker.fundingIntervalHour ? parseInt(ticker.fundingIntervalHour, 10) * 3600000 : 8 * 3600000, ts: Date.now() };
-        }
-        await this.scanFollowThroughs([ticker], { symbols: [symbol], quiet: true });
-      } catch(e) {
-        this.log(`⚡ ${symbol}: ADV FT poll error — ${e.message}`, 'warn');
-      } finally {
-        delete this._advFtPollerBusy[symbol];
-      }
-    };
-    this._advFtPollers[symbol] = setInterval(tick, 60000);
-    setTimeout(tick, 1000);
-  },
-
-  _stopAdvFtPoller(symbol) {
-    const id = this._advFtPollers[symbol];
-    if (id) { clearInterval(id); delete this._advFtPollers[symbol]; }
-    if (this._advFtPollerBusy) delete this._advFtPollerBusy[symbol];
-  },
-
-  _stopAllAdvFtPollers() {
-    for (const sym of Object.keys(this._advFtPollers)) {
-      this._stopAdvFtPoller(sym);
-    }
-  },
 
   _startExtenderPoller(symbol) { /* Extender tracking now handled by runScheduledCycle — no-op */ },
 

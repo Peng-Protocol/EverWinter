@@ -2296,8 +2296,7 @@ function ew() { return {
   ftCandidates: {},
   ftWatchlist: [],
   extenderCount: {},
-  _advFtPollers: {},
-  _advFtPollerBusy: {},
+
   _extenderGraylist: {},
   _advFtGraylist: {},
   _ftEvictGraylist: {},
@@ -2624,7 +2623,6 @@ function ew() { return {
     clearInterval(this.bot._watchTimer);
     this.bot._watchTimer = null;
     await this.runScheduledCycle();
-    this._syncAdvFtPollers();
     this.scheduleScan();
     this.bot._watchTimer     = setInterval(()=>this.watchPositions(), 15000);
     this.bot._potGainerTimer = setInterval(()=>this.watchPotGainers(), 5000);
@@ -2639,8 +2637,6 @@ function ew() { return {
     clearInterval(this.bot._cdTimer);
     clearInterval(this.bot._watchTimer);
     clearInterval(this.bot._refreshTimer);
-    clearInterval(this.bot._potGainerTimer);
-    this._stopAllAdvFtPollers();
     this.bot._watchTimer     = null;
     this.bot._refreshTimer   = null;
     this.bot._potGainerTimer = null;
@@ -3339,13 +3335,9 @@ function ew() { return {
       if (isNewPromotion) {
         this._ftRosterBump(symbol);
         this.ftCandidates[symbol] = { count, qualifiedAt: now, tradesOpened: 0, _advFt: true };
-        this.log(`⚡ ${symbol}: promoted to ADV FT roster (×${count} over-extended hits)`, 'trade');
-        this._startAdvFtPoller(symbol);
       } else if (isUpgrade) {
         this.ftCandidates[symbol]._advFt = true;
         this.ftCandidates[symbol].count  = count;
-        this.log(`⚡ ${symbol}: FT roster upgraded to ADV FT (×${count} over-extended)`, 'info');
-        this._startAdvFtPoller(symbol);
       } else if (this.ftCandidates[symbol]) {
         this.ftCandidates[symbol].count = count;
       }
@@ -3372,54 +3364,7 @@ function ew() { return {
       return (a[1].qualifiedAt || 0) - (b[1].qualifiedAt || 0);
     });
     const [evictSym] = roster[0];
-    this.log(`🎯 FT roster full (${max}) — evicting ${evictSym} to admit ${incomingSymbol}`, 'info');
-    this._stopAdvFtPoller(evictSym);
     delete this.ftCandidates[evictSym];
-  },
-
-  _syncAdvFtPollers() {
-    if (!this.bot.running || !this.cfg.ftEnabled || !this.cfg.advFtEnabled) return;
-    for (const [sym, entry] of Object.entries(this.ftCandidates)) {
-      if (entry?._advFt) this._startAdvFtPoller(sym);
-    }
-  },
-
-  _startAdvFtPoller(symbol) {
-    if (!symbol || this._advFtPollers[symbol]) return;
-    const tick = async () => {
-      const entry = this.ftCandidates[symbol];
-      if (!this.bot.running || !this.cfg.ftEnabled || !this.cfg.advFtEnabled || !entry?._advFt) {
-        this._stopAdvFtPoller(symbol);
-        return;
-      }
-      if (this._cycleRunning || this._advFtPollerBusy[symbol]) return;
-      this._advFtPollerBusy[symbol] = true;
-      try {
-        delete this._klineCache[`${symbol}_15`];
-        const ticker = await this.fetchTicker(symbol);
-        if (!ticker) return;
-        if (ticker.fundingRate != null) {
-          this._klineCache[`fr_${symbol}`] = { rate: parseFloat(ticker.fundingRate) * 100, intervalMs: ticker.fundingIntervalHour ? parseInt(ticker.fundingIntervalHour, 10) * 3600000 : 8 * 3600000, ts: Date.now() };
-        }
-        await this.scanFollowThroughs([ticker], { symbols: [symbol], quiet: true });
-      } catch(e) {
-        this.log(`⚡ ${symbol}: ADV FT poll error — ${e.message}`, 'warn');
-      } finally {
-        delete this._advFtPollerBusy[symbol];
-      }
-    };
-    this._advFtPollers[symbol] = setInterval(tick, 60000);
-    setTimeout(tick, 1000);
-  },
-
-  _stopAdvFtPoller(symbol) {
-    const id = this._advFtPollers[symbol];
-    if (id) { clearInterval(id); delete this._advFtPollers[symbol]; }
-    if (this._advFtPollerBusy) delete this._advFtPollerBusy[symbol];
-  },
-
-  _stopAllAdvFtPollers() {
-    for (const sym of Object.keys(this._advFtPollers)) this._stopAdvFtPoller(sym);
   },
 
   // Fetches a single ticker row for a symbol.
@@ -3541,10 +3486,11 @@ function ew() { return {
       const WARMUP           = 8;
       const limit            = LOOKBACK_CANDLES + WARMUP + 6;
       const cacheKey         = `${symbol}_15`;
-      const cacheTTL         = (this.cfg.scanMins || 15) * 60 * 1000;
+      const BAR_15MS = 15 * 60 * 1000;
+      const expectedLastTs = Math.floor(Date.now() / BAR_15MS) * BAR_15MS - BAR_15MS;
       let closes;
       const cached = this._klineCache[cacheKey];
-      if (cached && (Date.now() - cached.ts) < cacheTTL) {
+      if (cached && cached.lastCompletedTs != null && cached.lastCompletedTs >= expectedLastTs) {
         closes = cached.closes;
       } else {
         const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=${limit}`);
@@ -3554,7 +3500,9 @@ function ew() { return {
         closes = candles.map(c => parseFloat(c[4]));
         const volumes     = candles.map(c => parseFloat(c[6]));
         const baseVolumes = candles.map(c => parseFloat(c[5]));
-        this._klineCache[cacheKey] = { closes, volumes, baseVolumes, ts: Date.now() };
+        const timestamps = candles.map(c => parseInt(c[0]));
+        const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
+        this._klineCache[cacheKey] = { closes, volumes, baseVolumes, timestamps, lastCompletedTs, ts: Date.now() };
       }
       if (!closes || closes.length < WARMUP + 2) return null;
       let peak = null;
@@ -3612,15 +3560,18 @@ function ew() { return {
     try {
       const cacheKey = `${symbol}_1h`;
       const cached   = this._klineCache[cacheKey];
-      const cacheTTL = (this.cfg.scanMins || 15) * 60 * 1000;
-      if (cached && (Date.now() - cached.ts) < cacheTTL) return cached;
+      const BAR_1H_MS = 60 * 60 * 1000;
+      const expectedLastTs = Math.floor(Date.now() / BAR_1H_MS) * BAR_1H_MS - BAR_1H_MS;
+      if (cached && cached.lastCompletedTs != null && cached.lastCompletedTs >= expectedLastTs) return cached;
       const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=30`);
       const d = await r.json();
       if (d.retCode !== 0) return null;
       const candles = (d.result?.list || []).reverse();
       const closes  = candles.map(c => parseFloat(c[4]));
       const volumes = candles.map(c => parseFloat(c[6]));
-      this._klineCache[cacheKey] = { closes, volumes, ts: Date.now() };
+      const timestamps = candles.map(c => parseInt(c[0]));
+      const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
+      this._klineCache[cacheKey] = { closes, volumes, timestamps, lastCompletedTs, ts: Date.now() };
       return this._klineCache[cacheKey];
     } catch { return null; }
   },
@@ -4098,8 +4049,9 @@ function ew() { return {
       // All three periods share one kline fetch per scan cycle via symbol_15 cache key.
       const cacheKey = `${symbol}_15`;
       const cached   = this._klineCache[cacheKey];
-      const cacheTTL = (this.cfg.scanMins || 15) * 60 * 1000;
-      if (cached && (Date.now() - cached.ts) < cacheTTL) {
+      const BAR_15MS = 15 * 60 * 1000;
+      const expectedLastTs = Math.floor(Date.now() / BAR_15MS) * BAR_15MS - BAR_15MS;
+      if (cached && cached.lastCompletedTs != null && cached.lastCompletedTs >= expectedLastTs) {
         const val = calcRSI(cached.closes, period);
         if (val != null) {
           const sd = this._symData[symbol] || {};
@@ -4115,7 +4067,9 @@ function ew() { return {
       const opens   = list.map(c => parseFloat(c[1]));
       const closes  = list.map(c => parseFloat(c[4]));
       const volumes = list.map(c => parseFloat(c[6]));
-      this._klineCache[cacheKey] = { opens, closes, volumes, ts: Date.now() };
+      const timestamps = list.map(c => parseInt(c[0]));
+      const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
+      this._klineCache[cacheKey] = { opens, closes, volumes, timestamps, lastCompletedTs, ts: Date.now() };
       const val = calcRSI(closes, period);
       if (val != null) {
         const sd = this._symData[symbol] || {};
@@ -4441,8 +4395,6 @@ function ew() { return {
         ftEntry.addedAt      = ftEntry.addedAt ?? ftEntry.qualifiedAt ?? now_ftexp;
         if (now_ftexp - ftEntry.addedAt >= ftExpiryMs) {
           this.log(`🎯 ${sym}: FT roster expired (${this.cfg.runtimeHours}h) — expelled`, 'info');
-          delete this.ftCandidates[sym];
-          this._stopAdvFtPoller(sym);
           if (this._advFtGraylist[sym]) delete this._advFtGraylist[sym];
           this.persist();
           _ftTally.expired++;
@@ -4451,8 +4403,6 @@ function ew() { return {
 
       for (const [sym, ftEntry] of Object.entries(this.ftCandidates)) {
         if (onlySymbols && !onlySymbols.has(sym)) continue;
-        ftEntry.tradesOpened = ftEntry.tradesOpened ?? 0;
-        if (ftEntry._advFt) this._startAdvFtPoller(sym);
 
         if (this._ftMaxGraylist[sym] && Date.now() < this._ftMaxGraylist[sym]) continue;
 
@@ -4460,8 +4410,6 @@ function ew() { return {
           const glExpiry = Date.now() + 12 * 3600 * 1000;
           this._ftMaxGraylist[sym] = glExpiry;
           this.log(`🎯 ${sym}: FT max trades (${ftEntry.tradesOpened}/${this.cfg.ftMaxTrades}) — removed, 12h graylist`, 'info');
-          delete this.ftCandidates[sym];
-          this._stopAdvFtPoller(sym);
           if (this._advFtGraylist[sym]) delete this._advFtGraylist[sym];
           this.persist();
           candidates.push({ symbol: sym, rodeoCount: ftEntry.count, status: 'ft-maxed', isAdvFt: !!ftEntry._advFt });
@@ -4520,9 +4468,7 @@ function ew() { return {
             // RSI below min — momentum gone, evict immediately and graylist so
             // the rodeoCreep merge loop doesn't re-promote before next scan
             this.log(`🎯 ${sym}: FT radar evicted — RSI dropped below min (${rsi6?.toFixed(1)}/${rsi12?.toFixed(1)}/${rsi24?.toFixed(1)} ≤ ${rsiMin})`, 'info');
-            delete this.ftCandidates[sym];
-            this._stopAdvFtPoller(sym);
-            if (this._advFtGraylist[sym]) delete this._advFtGraylist[sym];
+              if (this._advFtGraylist[sym]) delete this._advFtGraylist[sym];
             this._ftEvictGraylist[sym] = Date.now() + 15 * 60 * 1000; // 15min cooldown
             this.persist();
             _ftTally.lowrsi++;
