@@ -2233,8 +2233,6 @@ function ew() { return {
   cfg: {
     leverage:6, minNotional:6, addNotional:6,
     rsi6Min:70, rsi12Min:70, rsi24Min:80, rsi6Max:90, maxPos:10, scanMins:15, topN:25,
-    tp:[16,12,16,24,32,40,50], addPcts:[3,9,15],
-    tpRoi:[16,12,9,7,6,5,4],  // effective ROI% seen by user per DCA stage (0=entry,1=Add1..6=Add6)
     gainersEnabled: true,
     potGainerRsiPct: 10,      // RSI shortfall % below gate minimums for watchlist admission
     potGainerExpireMins: 15, // watchlist TTL (minutes)
@@ -2271,8 +2269,7 @@ function ew() { return {
     tpIngressMin: 3,           // floor % for TP ingress reduction
     dcaDoublingEnabled: false, // each add escalates by dcaMultiplier; faster rescue, heavier margin
     dcaMultiplier: 2,          // per-stage notional multiplier when escalation is on (e.g. 2 = ×2, ×4, ×8)
-    dcaSixStageEnabled: true, // 6-stage DCA: adds at 1.5/3/6/9/12/15% — ~2× margin vs 3-stage
-    addPcts6: [1.5, 3, 6, 9, 12, 15], // trigger % above entry for each of 6 DCA adds
+    dcaStages: 6,             // integer stage count; slider allows [3,6,7,...,18]; 4/5 not valid
     runtimeHours: 12,
     tpReduceMins: 25,
     laggardCheckEnabled: true,
@@ -2451,7 +2448,19 @@ function ew() { return {
       const raw = localStorage.getItem(LS_KEY);
       if (!raw) return;
       const s = JSON.parse(raw);
-      if (s.cfg)  Object.assign(this.cfg, s.cfg);
+      if (s.cfg) {
+        // Migrate legacy dcaSixStageEnabled to dcaStages
+        if (s.cfg.dcaSixStageEnabled !== undefined && s.cfg.dcaStages === undefined) {
+          s.cfg.dcaStages = s.cfg.dcaSixStageEnabled ? 6 : 3;
+        }
+        // Remove legacy keys
+        delete s.cfg.dcaSixStageEnabled;
+        delete s.cfg.addPcts;
+        delete s.cfg.addPcts6;
+        delete s.cfg.tp;
+        delete s.cfg.tpRoi;
+        Object.assign(this.cfg, s.cfg);
+      }
       if (this.cfg.ftVolDivEnabled !== undefined && this.cfg.ftVolMomEnabled === undefined) {
         this.cfg.ftVolMomEnabled = this.cfg.ftVolDivEnabled;
       }
@@ -2460,18 +2469,6 @@ function ew() { return {
         this.cfg.entryTpRoi = this.cfg.fadeEntryTpRoi;
       }
       delete this.cfg.fadeEntryTpRoi;
-      // tp and tpRoi are system constants — never allow persisted/stale values to override.
-      // tp[]    = raw TP % placed on exchange per stage (from the add trigger price as base)
-      // tpRoi[] = effective ROI % seen by user per DCA stage (stage 0 uses cfg.entryTpRoi)
-      if (this.cfg.dcaSixStageEnabled) {
-        // Stage:  0(entry) 1    2    3    4    5    6
-        this.cfg.tp    = [16,   12,  16,  24,  32,  40,  50];
-        this.cfg.tpRoi = [16,   12,   9,   7,   6,   5,   4];
-      } else {
-        // Stage:  0(entry) 1    2    3
-        this.cfg.tp    = [16,   14,  36,  24];
-        this.cfg.tpRoi = [16,    9,   6,   4]; // tpRoi[0] preserved for legacy import compatibility
-      }
       if (s.sess) Object.assign(this.sess, s.sess);
       if (s.creds?.key && s.creds?.secret) Object.assign(this.creds, s.creds);
       if (s.rodeoCreep) Object.assign(this.rodeoCreep, s.rodeoCreep);
@@ -2849,13 +2846,26 @@ function ew() { return {
     };
   },
 
-  // Returns number of active DCA add stages (3 or 6).
-  _dcaStageCount() { return this.cfg.dcaSixStageEnabled ? 6 : 3; },
-  // Returns active add-price trigger percentages array.
-  _activeAddPcts() {
-    return this.cfg.dcaSixStageEnabled
-      ? (this.cfg.addPcts6 || [1.5, 3, 6, 9, 12, 15])
-      : (this.cfg.addPcts  || [3, 9, 15]);
+  // Returns number of active DCA add stages.
+  _dcaStageCount() { return this.cfg.dcaStages; },
+  // Returns computed add-price trigger percentages array.
+  // N=3: hardcoded [3,9,15]; N>=6: [1.5, 3, 6, ..., 3*(N-1)]
+  _addPcts() {
+    const n = this.cfg.dcaStages;
+    if (n === 3) return [3, 9, 15];
+    return [1.5, ...Array.from({length: n - 1}, (_, k) => 3 * (k + 1))];
+  },
+  // Alias for backward compat with call sites using _activeAddPcts()
+  _activeAddPcts() { return this._addPcts(); },
+  // Returns computed TP ROI % for stage s (stage 0=entry uses entryTpRoi).
+  // max(entryTpRoi / (s+1), 3)
+  _tpRoi(s) {
+    return Math.max(this.cfg.entryTpRoi / (s + 1), 3);
+  },
+  // Returns the final DCA trigger percent (also the SL trigger).
+  _dcaFinalPct() {
+    const n = this.cfg.dcaStages;
+    return n === 3 ? 15 : 3 * (n - 1);
   },
   // Returns the DCA stage count for a specific position, regardless of current global config.
   // Prefers the stamped _stageCount field; falls back to counting cond orders in the position.
@@ -3293,7 +3303,7 @@ function ew() { return {
       runNotional    += addPrice * addQty;
       runSize        += addQty;
       const expectedAvg = runSize > 0 ? runNotional / runSize : addPrice;
-      const addTp    = this.snapPrice(expectedAvg * (1 - (this.cfg.tpRoi[i + 1] / 100) / effectiveLev), instr);
+      const addTp    = this.snapPrice(expectedAvg * (1 - (this._tpRoi(i + 1) / 100) / effectiveLev), instr);
       if (addQty > 0 && addTp > 0) {
         const cid = await this.placeConditional(sym, 'Sell', addQty, addTp, addPrice);
         orders.push({ label: `Add${i+1} +${_addPcts[i]}%`, price: addPrice, qty: addQty, tpPrice: addTp, type: 'cond', filled: false, orderId: cid });
