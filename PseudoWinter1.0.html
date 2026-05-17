@@ -1402,6 +1402,11 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Skip entry if any 15m RSI is below this threshold — avoids trending-down momentum.</div>
             </div>
             <div class="g" style="margin-top:10px">
+              <div class="lbl">Min Red 15m Candles <b x-text="cfg.sfRedCandleMin"></b><span style="color:var(--text-lo)"> / 4</span></div>
+              <input type="range" min="1" max="4" step="1" x-model.number="cfg.sfRedCandleMin" :disabled="bot.running" @change="persist()">
+              <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Last 4 completed 15m candles — at least <span x-text="cfg.sfRedCandleMin"></span> must close red.</div>
+            </div>
+            <div class="g" style="margin-top:10px">
               <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:4px">BAND SIZE</div>
               <div style="font-size:9.5px;color:var(--text-lo)">⌊topN ÷ 2⌋ = <b style="color:var(--ice)" x-text="Math.floor((cfg.topN||25)/2)"></b> gainers + <b style="color:var(--ice)" x-text="Math.floor((cfg.topN||25)/2)"></b> losers</div>
             </div>
@@ -2518,6 +2523,7 @@ function pw() { return {
     sfGainerLsaMin: 25,            // minimum LSA % required for gainer-band entries
     sfFundingRateMin: -0.00005,    // SalF-specific funding rate floor (separate from main fundingRateMin)
     sfRsiMin: 25,                  // minimum RSI on all timeframes (6/12/24) for SalF entries
+    sfRedCandleMin: 3,             // min red 15m candles (of last 4 completed) for SalF entry; 0 = disabled
     tpIngressEnabled: true,     // on every non-gainer close, cut entry TP target by 50% per close (min tpIngressMin%)
     tpIngressMin: 3,            // floor % for TP ingress reduction
     dcaDoublingEnabled: true, // each DCA add escalates by configured multiplier; faster rescue, higher margin cost
@@ -3435,6 +3441,24 @@ function pw() { return {
     } catch { return null; }
   },
 
+  async getKlines15m(symbol) {
+    try {
+      const cacheKey = `${symbol}_15m`;
+      const cached   = this._klineCache[cacheKey];
+      const cacheTTL = (this.cfg.scanMins || 15) * 60 * 1000;
+      if (cached && (Date.now() - cached.ts) < cacheTTL) return cached;
+      const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=5`);
+      const d = await r.json();
+      if (d.retCode !== 0) return null;
+      const candles = (d.result?.list || []).reverse();
+      const completed = candles.slice(0, candles.length - 1);
+      const opens  = completed.map(c => parseFloat(c[1]));
+      const closes = completed.map(c => parseFloat(c[4]));
+      this._klineCache[cacheKey] = { opens, closes, ts: Date.now() };
+      return this._klineCache[cacheKey];
+    } catch { return null; }
+  },
+
   async runSalfScan(allTickers) {
     const bandN = Math.floor((this.cfg.topN || 25) / 2);
     const base  = (t) => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001;
@@ -3453,8 +3477,9 @@ function pw() { return {
       seen.add(t.symbol);
       pool.push(t);
     }
-    let opened = 0, lsaBlocked = 0, rsiBlocked = 0, skipBlocked = 0;
+    let opened = 0, lsaBlocked = 0, rsiBlocked = 0, redCandleBlocked = 0, skipBlocked = 0;
     const _sfRsiMin = this.cfg.sfRsiMin ?? 25;
+    const _sfRedMin = this.cfg.sfRedCandleMin ?? 3;
     for (const t of pool) {
       const sym   = t.symbol;
       const price = parseFloat(t.lastPrice || 0);
@@ -3478,6 +3503,15 @@ function pw() { return {
             (sfRsi12 !== null && sfRsi12 < _sfRsiMin) ||
             (sfRsi24 !== null && sfRsi24 < _sfRsiMin)) { rsiBlocked++; continue; }
       }
+      // 15m red candle gate — must have ≥ sfRedCandleMin red candles in last 4 completed 15m candles
+      if (_sfRedMin > 0) {
+        const kl15 = await this.getKlines15m(sym);
+        if (!kl15 || kl15.opens.length < 4) { skipBlocked++; continue; }
+        const last4opens  = kl15.opens.slice(-4);
+        const last4closes = kl15.closes.slice(-4);
+        const redCount = last4opens.filter((o, i) => last4closes[i] < o).length;
+        if (redCount < _sfRedMin) { redCandleBlocked++; continue; }
+      }
       const kl = await this.getKlines1h(sym);
       if (!kl || !kl.volumes || kl.volumes.length < 4) { skipBlocked++; continue; }
       const vols         = kl.volumes;
@@ -3500,10 +3534,11 @@ function pw() { return {
       const ok = await this.salfOpenShort(sym, price, change24h, lsaRatio, isLoser, sfRsi6, sfRsi12, sfRsi24);
       if (ok) opened++;
     }
-    const lsaNote  = lsaBlocked  > 0 ? ` | LSA: ${lsaBlocked}` : '';
-    const rsiNote  = rsiBlocked  > 0 ? ` | RSI: ${rsiBlocked}` : '';
-    const skipNote = skipBlocked > 0 ? ` | no-data: ${skipBlocked}` : '';
-    this.log(`🎣 SalF scan — pool ${pool.length} (${gainers.length}G ${losers.length}L) | opened ${opened}${lsaNote}${rsiNote}${skipNote}`, 'scan');
+    const lsaNote  = lsaBlocked       > 0 ? ` | LSA: ${lsaBlocked}` : '';
+    const rsiNote  = rsiBlocked       > 0 ? ` | RSI: ${rsiBlocked}` : '';
+    const redNote  = redCandleBlocked > 0 ? ` | 15m-red: ${redCandleBlocked}` : '';
+    const skipNote = skipBlocked      > 0 ? ` | no-data: ${skipBlocked}` : '';
+    this.log(`🎣 SalF scan — pool ${pool.length} (${gainers.length}G ${losers.length}L) | opened ${opened}${lsaNote}${rsiNote}${redNote}${skipNote}`, 'scan');
   },
 
   async salfOpenShort(sym, price, change24h, lsaRatio, isLoser, rsi6 = null, rsi12 = null, rsi24 = null) {
