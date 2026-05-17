@@ -179,10 +179,11 @@ ADV FT does not use Volume Momentum. Instead, it requires **recent price action 
 **LSA** measures the intensity of current selling relative to the ticker's recent average. For ADV FT, it gates entries to a configurable band — neither too thin (insufficient selling momentum) nor too thick (volume blowoff already spent).
 
 * **The Logic**: LSA compares the volume of the most recent completed 15m candle against the average volume of the preceding candles in the lookback window. A ratio in the target band confirms that selling is elevated but not exhausted.
+* **Why ADV FT Needs a High Floor**: Over-extended tickers are characterized by relentless buying — almost all their recent 15m candles are green. This means their baseline volume is skewed bullish, so even a moderate selling candle will appear dramatically elevated relative to the average. The floor accounts for this: by the time a meaningful reversal is underway, the sell candle's relative volume naturally reads high. A floor of **125%** (default) reflects this structural reality — this is not an aggressive threshold for a normal ticker, but it is realistic for an over-extender that has been running hot.
 * **The Band Gate**: ADV FT uses a **range gate** — the ratio must fall between a configurable floor and cap:
-  * **Floor** (`advFtLsaMin`, default **50%**): The last candle's volume must be at least 50% above the window average, confirming meaningful selling activity is present.
+  * **Floor** (`advFtLsaMin`, default **125%**): The last candle's volume must be at least 125% above the window average, confirming that selling has materially overtaken the prior buying baseline.
   * **Cap** (`advFtLsaLimit`, default **150%**): If the ratio exceeds the cap, the entry is skipped — too much selling in a single bar signals a **volume blowoff**, a potential last-gasp spike before a relief bounce.
-* **For FUN Losers (LFL/HFL)**: These target a lower ceiling (typically **50%**). Because these tickers are already "down" for the day, their candles naturally skew red; a high LSA here usually indicates the drop is already finished.
+* **For FUN Losers (LFL/HFL)**: These target a much lower floor (typically **50%**). Because these tickers are already "down" for the day, their candles naturally skew red; a high LSA here usually indicates the drop is already finished.
 
 #### 4. **Funding Rate Filter**
 Same as Gainers: funding rate must exceed the configured minimum (default −0.05%).

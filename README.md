@@ -70,7 +70,7 @@ Fires every (5) seconds. For each symbol on the Potential Entries watchlist it f
 
 
 ### Advanced FT Entry Pollers (`_advFtPollers`)
-Started per Advanced FT roster symbol and fired every (60) seconds. Each tick force-evicts the symbol's RSI kline cache, fetches a fresh ticker/funding snapshot, and re-runs the FT entry gates for only that symbol. This lets ADV FT entries fire as soon as RSI, funding, slot, and vol-momentum gates align instead of waiting for the next full scan interval.
+Started per Advanced FT roster symbol and fired every (60) seconds. Each tick force-evicts the symbol's RSI kline cache, fetches a fresh ticker/funding snapshot, and re-runs the FT entry gates for only that symbol. This lets ADV FT entries fire as soon as RSI, funding, slot, ClC, and LSA gates align instead of waiting for the next full scan interval.
 
 ### Market Refresh
 Manual-only in PseudoWinter, triggered via the **Refresh** button. Calls `pseudoWatchPositions()` and a forced pass of `watchPotentialEntries()` to update prices and re-evaluate the watchlist on demand.
@@ -96,7 +96,9 @@ Runs inline within `runScan` after the gainers pass. Evaluates the top `funGaine
 For each candidate, the FUN scan applies: symbol banlist → existing position check → funding rate classification (sub-type and slot cost determined by FR level) → slot check → FR creep gate → historical RSI6 over-extension look-back (3h, 15min candles) → loser OE graylist (losers with any over-extension in the look-back are contradictory and graylisted 6h) → RSI6 proximity block → vol momentum gate (separate thresholds for gainers vs. losers, creeping upward with each close and scaling multiplicatively with over-extension count) → LSA check for losers (last completed candle must show positive but non-spike volume relative to the window average).
 
 ### 3. FT/ADV FT Scan (`scanFollowThroughs`)
-Runs after `runScan` against the persisted `ftCandidates` roster. Evaluates RSI gates, over-shorted filter, and vol momentum for each candidate; opens FT or ADV FT shorts when conditions are met.
+Runs after `runScan` against the persisted `ftCandidates` roster. Per symbol, gates are checked in order: funding rate → RSI triplet (45–80 for ADV FT, 20–60 for regular FT) → vol momentum (regular FT only) → Close Confirmation / ClC (ADV FT only: ≥3 of last 4 completed 15m bars must be red) → LSA band gate (ADV FT only: last candle volume ≥ floor% and ≤ cap% of window average). Opens FT or ADV FT shorts when all conditions pass.
+
+Both ClC and LSA read directly from the `_klineCache[${symbol}_15]` entry already populated by the RSI gate check (`fetchRSIMulti`). No additional kline fetch is required — the same 15m candle array is reused for RSI computation, red-candle counting, and volume analysis.
 
 ### 4. SalF Scan (`runSalfScan`)
 Runs as a separate pass each cycle. Evaluates tickers from both the top gainers pool and the worst losers pool for Sale Fishing entries. Per symbol, the scan checks (in order): symbol banlist → existing position check → funding rate gate → over-shorted filter → RSI floor (RSI6/RSI12/RSI24 all above minimum) → red candle count (≥ 3 of the last 4 completed 15m bars must be red) → LSA window (last-hour volume must be within the configured floor/cap relative to the 24h hourly average) → SalF median creep adjustment.
@@ -147,7 +149,7 @@ Lists all symbols currently under active FUN vol momentum creep. Each entry show
 Lists all symbols currently under active SalF median creep. Each entry shows the close count, the effective LSA floor and cap currently in effect for that symbol, and the countdown to the 6h TTL reset. As the close count increases, the floor rises and the cap falls toward the midpoint, tightening the window within which a re-entry can qualify. Only visible when SalF is enabled.
 
 ### Extenders Counter
-Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold the ticker is promoted to the FT candidate roster, and the effective ADV FT VM floor (flat base + any active creep, capped at max) is shown inline.
+Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold the ticker is promoted to the FT candidate roster.
 
 ### Activity Log
 A capped reverse-chronological event feed, holding a maximum of (300) entries. Each entry is timestamped and colour-coded by type: `scan` events (light blue) cover scan cycle summaries and FT roster changes; `trade` events (ice blue) record every order open, DCA trigger, and close; `success` entries (green) confirm connections and bot start; `warn` entries (amber) cover Rodeo Creep registrations, TP reductions, and non-fatal anomalies; `error` entries (red) flag API failures and scan errors; and `info` entries (muted) carry general status messages. The log is purely observational — it has no effect on bot state and is cleared on **Clear Stats**.
