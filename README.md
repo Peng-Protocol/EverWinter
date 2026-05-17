@@ -26,11 +26,11 @@
 
 EverWinter operates (5) distinct position archetypes. All share the same DCA/TP mechanics but differ in how they are entered and how re-entry state is tracked. These are:
 
-* **Standard Gainer Positions**
+* **Standard Gainer (Gainer)**
 * **Follow-Through (FT)**
 * **Advanced Follow-Through (ADV FT)**
-* **Pile-on Follow-Through (P-FT)**
 * **Fund Chasing (FUN)**
+* **Sale Fishing (SalF)**
 
 All of which are explained in the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md).
 
@@ -98,7 +98,12 @@ For each candidate, the FUN scan applies: symbol banlist → existing position c
 ### 3. FT/ADV FT Scan (`scanFollowThroughs`)
 Runs after `runScan` against the persisted `ftCandidates` roster. Evaluates RSI gates, over-shorted filter, and vol momentum for each candidate; opens FT or ADV FT shorts when conditions are met.
 
-### 4. Extender Ticks
+### 4. SalF Scan (`runSalfScan`)
+Runs as a separate pass each cycle. Evaluates tickers from both the top gainers pool and the worst losers pool for Sale Fishing entries. Per symbol, the scan checks (in order): symbol banlist → existing position check → funding rate gate → over-shorted filter → RSI floor (RSI6/RSI12/RSI24 all above minimum) → red candle count (≥ 3 of the last 4 completed 15m bars must be red) → LSA window (last-hour volume must be within the configured floor/cap relative to the 24h hourly average) → SalF median creep adjustment.
+
+The LSA calculation reads directly from the `_klineCache[${symbol}_15]` entry that was already populated by the RSI gate check (`fetchRSIMulti`). No additional kline fetch is required — the 15-minute candle array is reused for both RSI computation and volume analysis.
+
+### 5. Extender Ticks
 Once per cycle, the extender counter table is polled. Each tracked symbol that is within its 3h TTL and has not been checked this cycle fetches a fresh RSI6; if it is still over-extended the counter is bumped.
 
 The kline cache (`_klineCache`) stores candle arrays keyed by `symbol_15` with a scan-interval TTL. Cache entries are evicted at the start of each scan cycle; the Potential Entries poller force-evicts its own entries on every tick for real-time accuracy.
@@ -137,6 +142,9 @@ Lists all symbols currently under active Rodeo Creep with their ride count, curr
 
 ### FUN VM Creep
 Lists all symbols currently under active FUN vol momentum creep. Each entry shows the close count, the live effective VM floor for each sub-type (HFG, LFG, HFL, LFL), the current FR re-entry gate (seeded at 1% after first close, scaling ×1.5 per close), and the countdown to the 6h TTL reset. Over-extension hits are displayed inline with an ⚡ counter and their multiplicative effect on the VM threshold. Only visible when FUN vol momentum is enabled.
+
+### SalF Creep
+Lists all symbols currently under active SalF median creep. Each entry shows the close count, the effective LSA floor and cap currently in effect for that symbol, and the countdown to the 6h TTL reset. As the close count increases, the floor rises and the cap falls toward the midpoint, tightening the window within which a re-entry can qualify. Only visible when SalF is enabled.
 
 ### Extenders Counter
 Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold the ticker is promoted to the FT candidate roster, and the effective ADV FT VM floor (flat base + any active creep, capped at max) is shown inline.

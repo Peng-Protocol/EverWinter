@@ -8,8 +8,9 @@
 2. [Advanced Follow-Through](#advanced-follow-through-strategy)
 3. [Follow-Through](#follow-through-strategy)
 4. [Fund Chasing (FUN)](#fun-fund-chasing-strategy)
-5. [General Mechanics](#general-mechanics)
-6. [Conclusion](#conclusion)
+5. [Sale Fishing (SalF)](#sale-fishing-salf-strategy)
+6. [General Mechanics](#general-mechanics)
+7. [Conclusion](#conclusion)
 
 ---
 
@@ -19,11 +20,13 @@ PseudoWinter employs a **tiered conviction system** where strategies cascade fro
 1. **Direct profit generation** from positions opened
 2. **Data collection** to inform downstream strategies
 
-The strategies are organized around two distinct observation paths:
+The strategies are organized around three distinct observation paths:
 
 **Gainers path** — A ticker showing strong upward momentum is entered by Gainers, accumulates rodeo rides, and promotes to Follow-Through. If it was also extremely over-extended during that run, it may simultaneously qualify for Advanced Follow-Through via the extender counter.
 
 **FUN path** — A parallel, independent scan evaluates tickers with positive funding rates across the top gainers and worst losers pools. FUN entries are funding-rate-driven rather than RSI-driven, and operate on their own conviction tier.
+
+**SalF path** — A separate red-day scan targets tickers already in a consistent, sustained decline. Where all other strategies are designed around upward price action and mean reversion, SalF is the only strategy built to perform when the market is broadly falling.
 
 In the most advantageous scenario, a single ticker flows through the Gainers path as it degrades:
 1. Gainer enters → rodeo → win
@@ -279,6 +282,72 @@ Over-extended tickers (RSI6 ≥ max) are excluded from the Gainers path by desig
 
 ---
 
+## Sale Fishing (SalF) Strategy
+
+### Overview
+
+Sale Fishing is the only **red day** strategy in EverWinter. Every other strategy — Gainers, FT, ADV FT, FUN — is designed around upward price action and mean reversion. SalF works in the opposite direction: it targets tickers that are already falling, looking for consistent and sustained selling pressure that is likely to continue rather than exhaust.
+
+On red market days, SalF is often the dominant source of entries. During a market-wide meltdown, qualifying tickers proliferate across both the gainer and loser pools simultaneously. The bot's default position count was increased partly to accommodate this volume — on a bad day it could legitimately short nearly everything on the board.
+
+On green days SalF is quieter by design. The filters naturally suppress entries when selling pressure is thin and tickers are moving upward. Calibration of those green-day boundaries is ongoing.
+
+---
+
+### Core Philosophy
+
+**"We're not catching a falling knife. We're riding a knife that's already falling."**
+
+SalF is not about picking a top or timing an exhaustion point. It's about identifying tickers that are already in a clean, continuous decline over the past hour and entering while that pressure still has room to run.
+
+The strategy deliberately avoids two failure modes:
+
+1. **Exhaustion entries** — the ticker has already dumped violently in one or two candles, sellers are spent, and a snap-back bounce is likely. The LSA cap gates this out: if the last hour's volume is too far above average, the move has probably already happened.
+
+2. **Squeeze entries** — the ticker is visibly in distress, which attracts late shorts piling in after the fact. Heavy short crowding on a declining ticker increases the probability of a stop-hunt spike. The tighter funding rate gate and the standard over-shorted filter handle this together.
+
+---
+
+### Entry Criteria
+
+#### 1. **Consistent Decline: 3/4 Red Candle Rule**
+
+The last four completed 15-minute candles must contain at least three red closes.
+
+This is a visual quality bar. A 2/4 pattern is crabbing — the ticker is going sideways, not declining. A 1/4 pattern is typically three green candles followed by one outsized red, which looks like a dump but is structurally a single event, not a trend. We want a ticker that has been continuously declining across the past hour, with each candle contributing to the move rather than one dramatic spike pulling the average down.
+
+#### 2. **LSA Window: Floor and Cap**
+
+LSA (Localized Sell Average) compares the last hour's sell volume against the ticker's 24-hour hourly average. This tells us whether current selling activity is elevated relative to the ticker's normal baseline.
+
+- **Floor**: Last-hour volume must be meaningfully above average (default +25%). This confirms active selling pressure is present — the ticker is not just drifting.
+- **Cap**: Last-hour volume must not be excessively above average (default +50%). A volume blowoff — extreme selling crammed into a single window — typically marks exhaustion rather than continuation. We do not want to enter after sellers have already given everything they had.
+
+The window tightens after each SalF close on a symbol (**median creep**): the floor rises and the cap falls toward the midpoint. This prevents repeatedly re-entering the same ticker as its selling pressure weakens over time.
+
+#### 3. **RSI Floor**
+
+All three RSI timeframes (RSI6, RSI12, RSI24) must be above a configurable minimum (default 25). Below this level a ticker is stretched so far oversold that a snap-back becomes more probable than continuation. We gate out the deeply oversold range and look for tickers that still have room to fall.
+
+#### 4. **Funding Rate Gate (Tighter Than Other Strategies)**
+
+SalF applies a stricter funding rate floor than other strategies. Tickers in visible distress are attractive to late shorts — people entering after the move has already started. When short interest builds on a declining ticker, the conditions for a short squeeze improve. A tighter funding rate minimum reduces exposure to tickers that are already over-shorted and susceptible to a squeeze against us.
+
+#### 5. **Gainer vs. Loser Band**
+
+SalF scans both the top gainers pool and the worst losers pool:
+
+- **Gainers selling off ("fresh")**: Tickers that were positive on the day but are now actively declining. The selling pressure is working against the day's positive backdrop — if it's strong enough to push through, the move may have more runway.
+- **Losers selling off ("stale")**: Tickers already down on the day continuing lower. The decline is in the direction of the day's trend, but these tickers may be closer to finding support. Both use the same LSA logic with separately configurable minimums. The gainer/loser distinction is an area of ongoing refinement.
+
+---
+
+### Why SalF Thrives on Red Days
+
+When the broader market is falling, SalF criteria are met simultaneously across many tickers. The over-shorted and LSA filters still constrain entry quality, but the raw supply of qualifying tickers is far greater than on green days. This makes SalF a natural complement to the rest of the system: when Gainers, FT, and FUN go quiet because there are few upward movers, SalF activates and fills the bot's position slots instead.
+
+---
+
 ## General Mechanics
 
 ### DCA (Dollar Cost Averaging) Structure
@@ -291,25 +360,43 @@ The DCA structure is our strongest weapon and allows us to be **a little wrong**
 - Some can pump **9%**
 - Very few can pump **15%**
 
-**Four Stages**: Entry (Stage 0) → Add1 (Stage 1) → Add2 (Stage 2) → Add3 (Stage 3)
+**Stage Structure**: Entry (Stage 0) → Add1 → Add2 → ... → AddN
 
-Each "add" order increases position size by an amount equivalent to the base notional, triggering at progressively higher prices (price moves against us). As a result, each subsequent stage has **less and less weight** on the average entry.
+Each "add" order triggers at a progressively higher price (price moving against us), increasing position size and improving the average entry. As a result, each subsequent stage has less weight on the average than the one before it.
 
-**Experimental Escalation System**: We're exploring a system where each stage adds margin equal to the value of all prior stages. For example, if base notional is $6:
-- Stage 0: $6 (total: $6)
-- Stage 1: add $6 (total: $12)
-- Stage 2: add $12 (total: $24)
-- Stage 3: add $24 (total: $48)
+The configurable stage count determines where add triggers are placed:
 
-This contrasts with linear escalation which would yield $24 total at Stage 3. The advantage: positions rescue **faster and easier** because there's more weight in later entries, so tickers don't need to come down as far to trigger an exit. The disadvantage: we spend more margin trying to rescue one position. This is being implemented as an optional feature.
+- **3 stages**: adds at 3% / 9% / 15% above entry
+- **6 stages**: adds at 1.5% / 3% / 6% / 9% / 12% / 15% above entry
+- **7+ stages**: continues the 3%-step progression beyond 15%
 
-**TP ROI by Stage**: `[13%, 9%, 6%, 4%]`
+The 3-stage and 6-stage final triggers both land at 15%, but 6 stages inserts intermediate steps. This matters in practice: a ticker that pumps to just under the 3% A1 threshold will bounce back and crab, never hitting TP, on a 3-stage setup. On 6 stages, the 1.5% A1 catches that intermediate move. The same dynamic plays out between 9% and 15% — there are regularly tickers that pump to 10–11% and reverse, which 6 stages captures where 3 stages would not.
 
-The TP percentages **decrease** with each stage because our average entry gets better. The structure is designed so that **at each DCA stage, the TP yields approximately the same dollar amount as the original entry would if it went perfectly**. We aren't looking to make more profit from the DCA — just get out after a better entry.
+The trade-off with more stages is that intermediate adds pull the average entry further from the current price, committing more margin at prices that may resolve on their own. Higher stage counts are worth considering for users who frequently see positions stall just short of an add trigger. For most use cases 3 or 6 stages is sufficient — 7+ stages are available for more unusual scenarios.
 
-**Why This Works**: Each pump makes it relatively easier for us to exit. As price moves against us and triggers adds, our average entry price rises, thus our TP price rises with it. Even really bad strategies can often be validated by our DCA structure.
+**TP ROI by Stage**: `entryTpRoi / (stage + 1)`, floored at 3%
 
-**DCA Stage 3 = Emergency Harness**: A DCA3 trigger is itself an **invalidation** of a strategy. It exists as an emergency harness, not a planned outcome.
+The TP percentage decreases with each stage because our average entry gets better. The structure is designed so that at each DCA stage the TP yields approximately the same dollar amount as the original entry would have if it went perfectly. We are not trying to make more profit from the DCA — just exit cleanly from a better average.
+
+**Example at default 13% entry TP**: Stage 0 = 13%, Stage 1 = 6.5%, Stage 2 = 4.3%, Stage 3 = 3.25% → 3% (floor).
+
+**Why This Works**: Each pump makes it relatively easier for us to exit. As price moves against us and triggers adds, our average entry price rises and our TP price rises with it. Even questionable strategies can often be rescued by the DCA structure.
+
+**Final Stage = Emergency Harness**: A trigger on the last DCA add is itself an invalidation of the strategy. It exists as an emergency harness, not a planned outcome.
+
+---
+
+### Add-Sizing Modes
+
+Three modes control how much notional each DCA add contributes:
+
+**Flat** (default): Every add equals the base notional. Simple, predictable, and the foundation the bot is designed to run on. Flat DCA should function well on its own — escalation modes exist to hasten recovery, not to fix a strategy that doesn't work.
+
+**Accumulation**: Each add scales linearly — Add1 = base × 2, Add2 = base × 3, Add3 = base × 4, and so on. This is a middle ground: positions rescue faster than flat because later adds carry more weight, but margin commitment grows gradually rather than explosively. Suited for users who want some of the speed and improved rescue of escalation without committing heavily to every position that goes against them.
+
+**Doubling**: Each add multiplies by a configurable factor (default ×2), compounding exponentially. Positions rescue much faster and the average entry improves more aggressively, but margin usage grows rapidly with each stage. Suited for users comfortable with heavy per-position commitment in exchange for faster exits.
+
+Neither escalation mode is recommended over the other. They are tools for users who want to trade margin for speed.
 
 ---
 
@@ -342,18 +429,18 @@ We long argued against SL, believing that for a ticker to liquidate us, the pric
 
 As a result, we set a hard cap at **-105% loss**. Regardless of what the ticker does afterwards, we must accept that loss and try to understand why it happened.
 
-**When SL Is Set**: Only at **Stage 3** (after all three DCA adds have triggered)
+**When SL Is Set**: After **all configured DCA stages have filled** — the final add has triggered and nothing else can improve the average entry.
 
 **Why Set Late?**
-- Avoids revealing the SL to stop hunters
+- Avoids revealing the SL to stop hunters during the DCA progression
 
 **Why -105% Specifically?**
-- For users on **isolated margin**, the position would be liquidated at -75%, so they'd never enter this path
+- For users on **isolated margin**, the position would be liquidated at -75%, so they'd never reach this path
 - For cross-margin users, the SL prevents total account wipeout
 - Can be missed if the bot goes offline
-- A full SL at Stage 3 requires a **~22% pump after entry** — a complete invalidation of the strategy requiring adjustment
+- On a 3-stage or 6-stage setup (both final at 15% above entry), triggering the final add already represents a meaningful pump — the SL at -105% PnL sits a further distance beyond that
 
-**Philosophy**: If we've DCA'd three times and still need an SL, something is fundamentally wrong with the thesis. The SL exists to prevent catastrophic loss, not as part of normal operation.
+**Philosophy**: If all DCA stages have filled and the position still needs a hard stop, something is fundamentally wrong with the thesis. The SL exists to prevent catastrophic loss, not as part of normal operation.
 
 ---
 
@@ -413,17 +500,21 @@ The rationale: unstable tickers produce deeper downward wicks and face greater u
 
 ### Balance, Max Positions, and Notional Sizing
 
-At the default **$6 notional** with **6× leverage**, each position consumes **$1 margin** at stage 0. The DCA structure can add margin at stage 1 and stage 2, so a position that fully DCA'd to stage 2 has consumed $3 margin total. This is the basis for sizing your starting balance.
+At the default **$6 notional** with **6× leverage**, each position consumes **$1 margin** at stage 0. The DCA structure adds margin at each subsequent stage, so a position that fully DCA'd through all adds has consumed significantly more. This is the basis for sizing your starting balance.
 
-**Margin requirements for 10 open positions at $6 notional:**
+The margin depth depends on stage count and add-sizing mode. The table below assumes 3-stage flat (the conservative baseline):
+
+**Margin requirements for 10 open positions at $6 notional (3-stage flat):**
 
 | Scenario | Stages Used | Margin per Position | Total Margin |
 |---|---|---|---|
 | Pessimistic | 0 → 2 (three stages) | $3 | $30 |
 | Moderate | 0 → 1 (two stages) | $2 | $20 |
-| Optimistic | 0 only (entry, no adds) | $1 | $10 |
+| Optimistic | 0 only (entry) | $1 | $10 |
 
-In practice most positions close at stage 0 or 1. Stage 2 is uncommon and stage 3 is an emergency harness — the pessimistic estimate is a true worst case.
+In practice most positions close at stage 0 or 1. Reaching the final stage is an emergency — the pessimistic estimate is a true worst case.
+
+With 6-stage flat DCA, pessimistic margin per position doubles to $6 (six $1 adds). With accumulation or doubling mode the adds scale further. If running higher stage counts or escalation modes, size your notional downward accordingly — the balance-to-notional ratios below assume flat adds.
 
 **Sizing formula**: `notional = balance × inverse_ratio × leverage`
 
@@ -452,6 +543,7 @@ These strategies are designed to be executed by automation, not humans. The ment
 - DCA stage management and TP recalculation
 - Laggard expected deficit tracking
 - Rodeo counts and creep multipliers
+- SalF LSA ratios and median creep state per symbol
 - Multiple concurrent positions across different strategies
 
 ...would be overwhelming and error-prone. The stress of watching positions in real-time, especially during volatile moves, makes manual execution impractical.
