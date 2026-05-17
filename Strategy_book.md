@@ -166,32 +166,37 @@ We wait for the ticker to cool from over-extension into a specific RSI range:
 
 This is wider than Gainers' 70-80 band. We're catching the pullback **after** the parabolic move. The ticker was at RSI6 ≥ 90 repeatedly — now it's cooling, and we enter as the reversal continues.
 
-#### 2. **Volume Momentum Filter** (Optional)
-- **Base threshold**: Flat floor configurable as `advFtVolMomMin` (default 5%). This replaces the old per-tick escalation system — the floor no longer scales with how many over-extension hits exceed the promotion threshold.
+#### 2. **Close Confirmation (ClC)**
 
-- **Per-close VM creep**: Each time an ADV FT position closes, the VM floor is incremented for that symbol (3-hour TTL), raising the bar for repeated re-entries on the same ticker. The creep is additive to the flat base and capped at a configurable maximum (default 15%). Successive closes keep pushing the floor up until the cap is reached or the TTL expires.
+ADV FT does not use Volume Momentum. Instead, it requires **recent price action to confirm a trend shift** before entering.
+
+* **The Gate**: Of the last 4 completed 15m candles, at least `advFtClcMin` (default: **3**) must have closed red (close < open).
+* **The Rationale**: Over-extended tickers are characterized by relentless green candles right up until they collapse. VM attempts to *predict* that collapse by measuring selling pressure ratios — but ADV FT was never about predicting the collapse. It is about **trailing the continuation** of an already-occurring reversal. ClC requires that the reversal has already begun to show up in price: confirmed red closes are evidence the trend has shifted, not a forecast that it might.
+* **Why not VM**: VM is a forward-looking indicator. ClC is backward-looking — it uses confirmed closes, not inferred pressure. For ADV FT, whose edge is entering *after* a demonstrated reversal into a cooled RSI band, confirmed price action is the right signal.
 
 #### 3. **LSA (Localized Sell Average) Filter**
 
-While Volume Momentum (VM) measures the immediate ratio of sellers to buyers to detect a "impending" slump, **LSA** measures the intensity of current selling relative to the ticker's entire day.
+**LSA** measures the intensity of current selling relative to the ticker's recent average. For ADV FT, it gates entries to a configurable band — neither too thin (insufficient selling momentum) nor too thick (volume blowoff already spent).
 
-* **The Logic**: LSA compares the selling volume of the most recent candle against the historical average for that ticker. It ensures there is enough "downward fuel" to justify an entry without entering a move that has already exhausted itself.
-* **The "Up-ness" Variable**: LSA is highly sensitive to how "up" a token is. Because Advanced FT tickers are coming off massive buying streaks, their "normal" state involves high volume, allowing for a much higher LSA ceiling.
-* **Ideal Ranges**:
-* **For ADV FT (Over-extended)**: We look for a positive LSA with a high ceiling (often **250% or more**). Since these tickers have been dominated by buying all day, a massive spike in selling is often required to actually shift the trend.
-* **For FUN Losers (LFL/HFL)**: These target a much lower ceiling (typically **50%**). Because these tickers are already "down" for the day, their candles naturally skew red; a high LSA here usually indicates the drop is already finished.
-
-
-* **The Exhaustion Cap**: If LSA exceeds these limits, the ticker is skipped. Too much selling volume in a single bar suggests a **volume blowoff**—the "last gasp" of sellers before a potential relief bounce.
+* **The Logic**: LSA compares the volume of the most recent completed 15m candle against the average volume of the preceding candles in the lookback window. A ratio in the target band confirms that selling is elevated but not exhausted.
+* **Why ADV FT Needs a High Floor**: Over-extended tickers are characterized by relentless buying — almost all their recent 15m candles are green. This means their baseline volume is skewed bullish, so even a moderate selling candle will appear dramatically elevated relative to the average. The floor accounts for this: by the time a meaningful reversal is underway, the sell candle's relative volume naturally reads high. A floor of **125%** (default) reflects this structural reality — this is not an aggressive threshold for a normal ticker, but it is realistic for an over-extender that has been running hot.
+* **The Band Gate**: ADV FT uses a **range gate** — the ratio must fall between a configurable floor and cap:
+  * **Floor** (`advFtLsaMin`, default **125%**): The last candle's volume must be at least 125% above the window average, confirming that selling has materially overtaken the prior buying baseline.
+  * **Cap** (`advFtLsaLimit`, default **150%**): If the ratio exceeds the cap, the entry is skipped — too much selling in a single bar signals a **volume blowoff**, a potential last-gasp spike before a relief bounce.
+* **For FUN Losers (LFL/HFL)**: These target a much lower floor (typically **50%**). Because these tickers are already "down" for the day, their candles naturally skew red; a high LSA here usually indicates the drop is already finished.
 
 #### 4. **Funding Rate Filter**
 Same as Gainers: funding rate must exceed the configured minimum (default −0.05%).
 
 ---
 
-### Why Volume Momentum is Optional
+### Why ClC Replaced VM for ADV FT
 
-The **optional nature of vol mom** highlights the reliability of this strategy. Often you can dive in if the over-extension has collapsed into range and the reversal will continue regardless. But occasionally it won't — vol mom provides confirmation when needed without being a prerequisite for every entry.
+ADV FT's edge comes from entering *after* a parabolic over-extension has begun to reverse — not from predicting when it will. Volume Momentum is a forward-looking signal: it tries to anticipate a coming slump by measuring selling pressure ratios. Close Confirmation is backward-looking: it requires the reversal to have already shown up as red closes on the 15m chart.
+
+Over-extended tickers are almost entirely green candles on the way up — right until they aren't. By the time 3 of the last 4 completed 15m candles are red, the trend has demonstrably shifted. That confirmed evidence is a stronger entry basis for ADV FT than a predictive VM score.
+
+VM is retained for regular Follow-Through and FUN, where the prediction context is different.
 
 ---
 
@@ -210,7 +215,7 @@ Follow-Through is the predecessor to Advanced Follow-Through. Where Advanced FT 
 When a ticker accumulates **2+ rodeo rides** (configurable), it promotes to the Follow-Through roster. We used to set this threshold at 4 rides, but when we raised the Gainers RSI gates and rodeo creep percentage, 2 rides became the more likely outcome.
 
 ### Entry Logic
-Same as Advanced FT: wait for RSI to cool, except into the 20-60 band, then enter when volume momentum (optional) confirms. The only difference is the **promotion path** — rodeo rides vs. over-extension hits.
+Same as Advanced FT: wait for RSI to cool, except into the 20-60 band, then enter when volume momentum (optional) and RSI conditions are met. The only difference is the **promotion path** — rodeo rides vs. over-extension hits. Regular FT retains the VM filter; it does not use ClC.
 
 ---
 
