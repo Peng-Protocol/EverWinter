@@ -523,6 +523,8 @@ Psycho Mode is like a bear with a toothache which can only be soothed by blood. 
 - **Laggard check** active from the second open position onward — no reduce phase required
 - **48-hour hard force-close** as the backstop; laggard handles most exits well before that
 
+Because value lost is shared across all open positions, one strong winner can trigger a cascade — a single aggressive dump or sharp reversal on one ticker closes it at a profit, raising lost value for the entire book, which then forces the next weakest position out, and so on until only one or two remain. Conversely, a winning close on a position already in profit increases lost value, while a losing close decreases it, so the system naturally accelerates when things go right and slows when they don't. The real game is just waiting for one or two tickers to move decisively — either dump hard after entry or pump and reverse sharply — and then let the cascade do the rest.
+
 **"Short everything. Let DCA Escalation and Laggard check sort the rest."**
 
 ---
