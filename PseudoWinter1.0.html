@@ -1797,13 +1797,13 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   : ''">
                 <span class="g-sym" x-html="c.symbol + ftRosterExpiry(ftCandidates[c.symbol] || {}, tick)"></span>
                 <span style="color:var(--warn);font-size:9px"
-                  x-html="(()=>{const fc=ftCandidates[c.symbol];if(!fc)return '×'+c.rodeoCount;const isAdv=!!fc._advFt;const t=fc.tradesOpened||0;const m=cfg.ftMaxTrades;const tStr=t>=m?'<span style=\'color:var(--short);font-weight:700\'>MAX</span>':t+'/'+m;return (isAdv?'⚡':'')+'×'+c.rodeoCount+' | '+tStr;})()"></span>
+                  x-html="(()=>{const fc=ftCandidates[c.symbol];const isAdv=!!c.isAdvFt;const t=fc?.tradesOpened||0;const m=cfg.ftMaxTrades;const tStr=t>=m?'<span style=\'color:var(--short);font-weight:700\'>MAX</span>':t+'/'+m;return (isAdv?'⚡':'')+'×'+c.rodeoCount+' | '+tStr;})()"></span>
                 <span class="fs-9" x-html="(()=>{
                   const r6  = c.rsi6  ?? _symData[c.symbol]?.rsi6  ?? null;
                   const r12 = c.rsi12 ?? _symData[c.symbol]?.rsi12 ?? null;
                   const r24 = c.rsi24 ?? _symData[c.symbol]?.rsi24 ?? null;
                   if (r6==null) return '<span style=\'color:var(--text-lo)\'>—</span>';
-                  const isAdv = !!(ftCandidates[c.symbol]?._advFt);
+                  const isAdv = !!c.isAdvFt;
                   const rsiMax = isAdv ? cfg.rsi6Max : cfg.ftRsiMax;
                   const rsiMin = isAdv ? cfg.advFtRsiMin : cfg.ftRsiMin;
                   const vals=[r6,r12,r24];
@@ -1818,7 +1818,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   if (c.status === 'ft-overshorted') {
                     const fr=c.fundingRate; return '<span style=\'color:var(--short);font-weight:700\'>FR '+(fr!=null?(fr>=0?'+':'')+fr.toFixed(4)+'%':'—')+'</span>';
                   }
-                  const isAdv = !!(ftCandidates[c.symbol]?._advFt);
+                  const isAdv = !!c.isAdvFt;
                   if (isAdv) {
                     // ADV FT: show ClC count instead of VM
                     const kl = _klineCache[c.symbol+'_15'];
@@ -1838,14 +1838,14 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <span x-show="cfg.ftVolMomEnabled" style="font-size:9px;color:var(--text-lo)"
                   x-html="(()=>{
                     if (c.status === 'ft-overshorted') return '≥'+cfg.fundingRateMin.toFixed(3)+'%';
-                    const isAdv = !!(ftCandidates[c.symbol]?._advFt);
+                    const isAdv = !!c.isAdvFt;
                     if (isAdv) return '≥'+(cfg.advFtClcMin??3);
                     return cfg.ftVolMomMin.toFixed(1)+'%';
                   })()"></span>
                 <span x-show="cfg.advFtEnabled && cfg.advFtLsaEnabled" style="font-size:9px"
                   x-html="(()=>{
                     const sym = c.symbol;
-                    if (!ftCandidates[sym]?._advFt) return '<span style=\'color:var(--text-lo)\'>—</span>';
+                    if (!c.isAdvFt) return '<span style=\'color:var(--text-lo)\'>—</span>';
                     const vols = _klineCache[sym+'_15']?.volumes;
                     if (!vols || vols.length < 4) return '<span style=\'color:var(--text-lo)\'>—</span>';
                     const last = vols[vols.length - 2];
@@ -3219,11 +3219,11 @@ function pw() { return {
               c.status = 'extgrayed';
               continue;
             }
-            const rsi6Peak = await this.fetchHistoricalRSI6Peaks(c.symbol);
+            const { peak: rsi6Peak, oeCount: histOeCount } = await this.fetchHistoricalRSI6Peaks(c.symbol);
             if (rsi6Peak != null && rsi6Peak >= this.cfg.rsi6Max) {
-              this.log(`⚡ ${c.symbol}: historical RSI6 peak ${rsi6Peak.toFixed(1)} ≥ ${this.cfg.rsi6Max} — missed extender, graylisting`, 'warn');
+              this.log(`⚡ ${c.symbol}: historical RSI6 peak ${rsi6Peak.toFixed(1)} ≥ ${this.cfg.rsi6Max} — missed extender ×${Math.max(1, histOeCount)}, graylisting`, 'warn');
               c.status = 'extgrayed';
-              this.extenderBump(c.symbol, true); // fromHistorical — suppress vol-mom poller
+              this.extenderBump(c.symbol, true, null, Math.max(1, histOeCount));
               continue;
             }
           }
@@ -3640,15 +3640,18 @@ function pw() { return {
           this._klineCache[cacheKey] = { closes, volumes, baseVolumes, timestamps, lastCompletedTs, ts: Date.now() };
         }
       }
-      if (!closes || closes.length < WARMUP + 2) return null;
-      let peak = null;
+      if (!closes || closes.length < WARMUP + 2) return { peak: null, oeCount: 0 };
+      let peak = null, oeCount = 0;
       for (let i = 0; i < LOOKBACK_CANDLES; i++) {
         const slice = closes.slice(0, closes.length - LOOKBACK_CANDLES + i + 1);
         const rsi = calcRSI(slice, 6);
-        if (rsi != null && (peak === null || rsi > peak)) peak = rsi;
+        if (rsi != null) {
+          if (peak === null || rsi > peak) peak = rsi;
+          if (rsi >= this.cfg.rsi6Max) oeCount++;
+        }
       }
-      return peak; // highest RSI6 seen over the past 3h; null if data insufficient
-    } catch { return null; }
+      return { peak, oeCount }; // highest RSI6 and OE tick count over past 3h
+    } catch { return { peak: null, oeCount: 0 }; }
   },
 
   async fetchFundingRate(symbol) {
@@ -5243,13 +5246,13 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
               this.renderPotGainers();
               continue;
             }
-            const rsi6Peak = await this.fetchHistoricalRSI6Peaks(pe.symbol);
+            const { peak: rsi6Peak, oeCount: pgOeCount } = await this.fetchHistoricalRSI6Peaks(pe.symbol);
             if (rsi6Peak != null && rsi6Peak >= this.cfg.rsi6Max) {
               this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
               const g = this.gainers.find(x => x.symbol === pe.symbol);
               if (g) g.status = 'extgrayed';
-              this.log(`◉ ${pe.symbol}: pot gainer entry blocked — historical RSI6 peak ${rsi6Peak.toFixed(1)} ≥ ${this.cfg.rsi6Max} — graylisting`, 'warn');
-              this.extenderBump(pe.symbol, true);
+              this.log(`◉ ${pe.symbol}: pot gainer entry blocked — hist RSI6 peak ${rsi6Peak.toFixed(1)} ≥ ${this.cfg.rsi6Max} (×${Math.max(1, pgOeCount)} OE) — graylisting`, 'warn');
+              this.extenderBump(pe.symbol, true, null, Math.max(1, pgOeCount));
               this.persist();
               this.renderPotGainers();
               continue;
