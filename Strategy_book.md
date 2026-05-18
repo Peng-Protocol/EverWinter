@@ -146,7 +146,7 @@ Advanced Follow-Through activates when a ticker demonstrates **prolonged over-ex
 This strategy is "advanced" because **it doesn't need direct observation to proceed** the way regular Follow-Through does. We enter based on the ticker's accumulated historical behavior (repeated over-extension hits) rather than watching repeated gainer entries succeed against it.
 
 ### Core Philosophy
-A ticker that over-extends three or more times within three hours is not just pumping — it is exhibiting structural instability. When that behavior finally collapses into the RSI cooldown band, the reversal tends to be sustained and reliable.
+A ticker that over-extends within a three-hour window is exhibiting structural instability. We don't need to see it burn repeatedly to act — LSA and ClC are competent enough at timing entries into OE tickers. The first hit is enough for promotion; the entry gates own the rest.
 
 ---
 
@@ -154,7 +154,9 @@ A ticker that over-extends three or more times within three hours is not just pu
 
 The **extender counter** tracks every time a ticker hits RSI6 ≥ the configured maximum during the scan cycle or per-tick polling window. Each hit within the 3-hour TTL increments the counter.
 
-When a ticker's count reaches the **configurable promotion threshold** (default: 3 hits), it graduates to the **Advanced FT roster**. The gainer scan graylists the symbol while it remains on the ADV FT roster, suspending normal gainer entries.
+When a ticker's count reaches the **configurable promotion threshold** (default: **1 hit — immediate promotion**), it graduates to the **Advanced FT roster**. The gainer scan graylists the symbol while it remains on the ADV FT roster, suspending normal gainer entries.
+
+The threshold is configurable upward, but at 1 the ticker is promoted to ADV FT the moment it first over-extends — no repeated burns required.
 
 If the roster is full, the ticker with the **lowest funding rate** (most over-shorted, least desirable) is evicted first, then the oldest entry.
 
@@ -162,11 +164,10 @@ If the roster is full, the ticker with the **lowest funding rate** (most over-sh
 
 ### Entry Criteria
 
-#### 1. **RSI Cooldown Band: 45-80**
-We wait for the ticker to cool from over-extension into a specific RSI range:
-- **RSI6, RSI12, RSI24**: All must be **between 45-80**
+#### 1. **RSI Floor: > 45**
+All three RSI timeframes (RSI6, RSI12, RSI24) must be **above 45**. There is no upper ceiling.
 
-This is wider than Gainers' 70-80 band. We're catching the pullback **after** the parabolic move. The ticker was at RSI6 ≥ 90 repeatedly — now it's cooling, and we enter as the reversal continues.
+The ticker was at RSI6 ≥ 90 during over-extension. The RSI floor ensures momentum hasn't completely collapsed before we enter. The ceiling has been removed — LSA and ClC are competent enough at timing entries into OE tickers. If selling volume is elevated but not exhausted (LSA) and closes are confirming the trend shift (ClC), the entry is valid regardless of how high RSI sits.
 
 #### 2. **Close Confirmation (ClC)**
 
