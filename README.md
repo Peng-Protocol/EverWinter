@@ -48,7 +48,7 @@ Populated during each main scan pass for symbols that are within a configurable 
 This watchlist also evicts any tickers that fail other filters such as over-extension, funding rate, volume divergence etc during the course of their watch.
 
 ### Follow-Through Watchlist (`ftWatchlist`)
-A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its Rodeo/over-extension/Pile-on count and how many FT trades have been opened against it. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
+A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its count and how many FT trades have been opened against it. For regular FT entries the count is Rodeo rides; for ADV FT entries (marked ⚡) the count is over-extension hits within the 3h window. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
 
 
 ---
@@ -142,9 +142,6 @@ Lists all symbols currently under active FUN vol momentum creep. Each entry show
 
 ### SalF Creep
 Lists all symbols currently under active SalF median creep. Each entry shows the close count, the effective LSA floor and cap currently in effect for that symbol, and the countdown to the 6h TTL reset. As the close count increases, the floor rises and the cap falls toward the midpoint, tightening the window within which a re-entry can qualify. Only visible when SalF is enabled.
-
-### Extenders Counter
-Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold (default: 1 — immediate promotion on first hit) the ticker is promoted to the FT candidate roster.
 
 ### Activity Log
 A capped reverse-chronological event feed, holding a maximum of (300) entries. Each entry is timestamped and colour-coded by type: `scan` events (light blue) cover scan cycle summaries and FT roster changes; `trade` events (ice blue) record every order open, DCA trigger, and close; `success` entries (green) confirm connections and bot start; `warn` entries (amber) cover Rodeo Creep registrations, TP reductions, and non-fatal anomalies; `error` entries (red) flag API failures and scan errors; and `info` entries (muted) carry general status messages. The log is purely observational — it has no effect on bot state and is cleared on **Clear Stats**.

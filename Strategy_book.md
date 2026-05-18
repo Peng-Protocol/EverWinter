@@ -152,11 +152,11 @@ A ticker that over-extends within a three-hour window is exhibiting structural i
 
 ### Promotion to Advanced FT Roster
 
-The **extender counter** tracks every time a ticker hits RSI6 ≥ the configured maximum during the scan cycle or per-tick polling window. Each hit within the 3-hour TTL increments the counter.
+When a ticker's RSI6 hits ≥ the configured maximum, it is **immediately promoted** to the ADV FT roster (default threshold: 1 hit). The gainer scan graylists the symbol for the duration of the ADV FT window, suspending normal gainer entries.
 
-When a ticker's count reaches the **configurable promotion threshold** (default: **1 hit — immediate promotion**), it graduates to the **Advanced FT roster**. The gainer scan graylists the symbol while it remains on the ADV FT roster, suspending normal gainer entries.
+The over-extension hit count is tracked within a 3-hour TTL and is visible directly in the FT roster/radar — ADV FT rows are marked with ⚡ and show the OE count in place of the rodeo count. Per-tick polling continues bumping the count while the ticker remains on the roster, but entry decisions are owned entirely by LSA and ClC.
 
-The threshold is configurable upward, but at 1 the ticker is promoted to ADV FT the moment it first over-extends — no repeated burns required.
+The threshold is configurable upward for operators who prefer to require repeated burns before promotion, but the default is immediate.
 
 If the roster is full, the ticker with the **lowest funding rate** (most over-shorted, least desirable) is evicted first, then the oldest entry.
 
