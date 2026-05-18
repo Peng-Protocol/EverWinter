@@ -515,17 +515,15 @@ At $60 notional / 6× leverage = $10 margin per entry. For 10 positions at moder
 
 ## Psycho Mode
 
-**"Short everything. Let DCA and laggard sort it out."**
+Psycho Mode is like a bear with a toothache which can only be soothed by blood. It utilizes no filters save for 24hr change — any ticker moving more than 3% in either direction qualifies. It uses the following settings:
 
-Psycho Mode is directionless by design. Where every other strategy filters hard to find the right moment, Psycho Mode skips the filter and relies on the defenses to do the work. It shorts any ticker showing meaningful movement — gainers and losers both qualify — and keeps doing so until the position limit is full. The entry is not a prediction. It is a bet that, across enough concurrent positions, the mechanics will produce net positive outcomes regardless of direction.
+- **7 DCA stages** at **2× escalation** — each add doubles the last, staggered deeper into the pump
+- **50% entry TP ROI**, decaying per stage (flooring at 3%)
+- **Up to 50 concurrent positions**, 3 new shorts opened per scan cycle
+- **Laggard check** active from the second open position onward — no reduce phase required
+- **48-hour hard force-close** as the backstop; laggard handles most exits well before that
 
-### DCA Escalation
-
-The escalating add structure is the backbone. Each add is double the last, so a ticker that keeps pumping draws in an ever-larger stake at a progressively better average. When it eventually reverts — even partially — the combined position crosses into profit. A ticker does not need to return to the entry price. It only needs to fall enough to clear the blended average.
-
-### Laggard
-
-The laggard is the bouncer. It watches the oldest open position and tracks how much opportunity has been lost while it sat there. Every trade that closes — win or loss — adds its result to the tab. When the tab exceeds what the laggard was ever expected to earn, it gets force-closed. With enough concurrent positions generating throughput, a stuck trade accumulates debt faster than it can recover. The 48-hour hard close is the last resort; laggard is the real exit mechanism.
+**"Short everything. Let DCA Escalation and Laggard check sort the rest."**
 
 ---
 

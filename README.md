@@ -188,9 +188,9 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 |-----------|---------|-------------|
 | `liveMode` | false | Pseudo or live trading |
 | `apiKey` / `apiSecret` | — | Bybit credentials (live mode only) |
-| `testnet` | false | Route live calls to Bybit testnet |
-| `leverage` | 10 | Leverage on all positions |
-| `minNotional` | 0.50 | Entry notional (USDT); DCA stages scale from this |
+| `testnet` | false | Use Bybit testnet endpoints (live mode only) |
+| `leverage` | 6 | Leverage on all positions |
+| `minNotional` | 6 | Entry notional (USDT); DCA stages scale from this |
 | `maxPositions` | 50 | Open position cap; scanning halts at cap |
 | `psychoChangePct` | 3 | Min absolute 24h change % to qualify a ticker |
 | `psychoPerCycle` | 3 | Tickers shorted per scan cycle |
