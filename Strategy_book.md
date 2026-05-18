@@ -177,7 +177,7 @@ ADV FT uses **Close Confirmation** — recent price closes — to confirm a tren
 **LSA** measures the intensity of current selling relative to the ticker's recent average. For ADV FT, it gates entries to a configurable band — neither too thin (insufficient selling momentum) nor too thick (volume blowoff already spent).
 
 * **The Logic**: LSA compares the volume of the most recent completed 15m candle against the average volume of the preceding candles in the lookback window. A ratio in the target band confirms that selling is elevated but not exhausted.
-* **Why ADV FT Needs a High Floor**: Over-extended tickers are characterized by relentless buying — almost all their recent 15m candles are green. This means their baseline volume is skewed bullish, so even a moderate selling candle will appear dramatically elevated relative to the average. The floor accounts for this: by the time a meaningful reversal is underway, the sell candle's relative volume naturally reads high. A floor of **125%** (default) reflects this structural reality — this is not an aggressive threshold for a normal ticker, but it is realistic for an over-extender that has been running hot.
+* **Why the High Floor**: An over-extender's baseline volume is skewed bullish — nearly all recent candles were green. By the time a reversal is underway, the first significant red candle already reads elevated relative to that baseline. A floor of **125%** is not aggressive for a normal ticker, but it is realistic for one that has been running hot.
 * **The Band Gate**: ADV FT uses a **range gate** — the ratio must fall between a configurable floor and cap:
   * **Floor** (default **125%**): The last candle's volume must be at least 125% above the window average, confirming that selling has materially overtaken the prior buying baseline.
   * **Cap** (default **150%**): If the ratio exceeds the cap, the entry is skipped — too much selling in a single bar signals a **volume blowoff**, a potential last-gasp spike before a relief bounce.
@@ -315,9 +315,7 @@ The strategy deliberately avoids two failure modes:
 
 #### 1. **Consistent Decline: 3/4 Red Candle Rule**
 
-The last four completed 15-minute candles must contain at least three red closes.
-
-This is a visual quality bar. A 2/4 pattern is crabbing — the ticker is going sideways, not declining. A 1/4 pattern is typically three green candles followed by one outsized red, which looks like a dump but is structurally a single event, not a trend. We want a ticker that has been continuously declining across the past hour, with each candle contributing to the move rather than one dramatic spike pulling the average down.
+The last four completed 15-minute candles must contain at least three red closes. This confirms a continuous decline across the past hour rather than a single-candle spike pulling the average down.
 
 #### 2. **LSA Window: Floor and Cap**
 
@@ -342,12 +340,6 @@ SalF scans both the top gainers pool and the worst losers pool:
 
 - **Gainers selling off ("fresh")**: Tickers that were positive on the day but are now actively declining. The selling pressure is working against the day's positive backdrop — if it's strong enough to push through, the move may have more runway.
 - **Losers selling off ("stale")**: Tickers already down on the day continuing lower. The decline is in the direction of the day's trend, but these tickers may be closer to finding support. Both use the same LSA logic with separately configurable minimums. The gainer/loser distinction is an area of ongoing refinement.
-
----
-
-### Why SalF Thrives on Red Days
-
-When the broader market is falling, SalF criteria are met simultaneously across many tickers. The over-shorted and LSA filters still constrain entry quality, but the raw supply of qualifying tickers is far greater than on green days. This makes SalF a natural complement to the rest of the system: when Gainers, FT, and FUN go quiet because there are few upward movers, SalF activates and fills the bot's position slots instead.
 
 ---
 
@@ -474,30 +466,11 @@ Only enforced during reduce phase. The **laggard** is the oldest open position.
 
 **Force Close Logic**: When `ED ≤ 0`, we force-close the laggard.
 
-**What This Means**: "If everything else is moving and a ticker is stuck, calculate how much it would've yielded us and how much it would cost to close at the current level. If recent tickers have outperformed that (plus a certain buffer), then close the ticker for any profit or loss."
-
-**Opportunity Cost Tracking**: Every time any position closes (profitable or not), that PnL gets added to the "lost value" tally for all remaining open positions. This tracks opportunity cost — "we could have closed this laggard and taken those gains instead."
+**Opportunity Cost Tracking**: Every time any position closes (profitable or not), that PnL gets added to the "lost value" tally for all remaining open positions. This tracks opportunity cost against remaining open positions.
 
 **Cascade Effect**: This can cause a cascade of closes if many tickers are stuck and one suddenly shows motion.
 
-**In Practice**
-
-The laggard system closes **most positions that would otherwise have hit their targets**, but this forgone profit is acceptable. It also prevents us from lingering in tickers that would spike and either cause a more unfavorable force close or stop us out completely.
-
-The aggressive 45-minute reduce phase means we sacrifice potential gains for risk management — positions close earlier than they "should," but the alternative is exposure to reversals.
-
----
-
-### Rodeo Creep Effects on TP/Notional
-
-As covered in the Gainers section, each rodeo ride increases both TP target and position size by **50%** (default, adjustable). This applies to the **entry TP** (Stage 0) only — the DCA TPs remain at their standard values.
-
-**Example**:
-- Normal entry TP: 13%
-- After 1 rodeo: 13% × 1.5 = 19.5%
-- After 2 rodeos: 13% × 1.5 × 1.5 = 29.25%
-
-The rationale: unstable tickers produce deeper downward wicks and face greater upside resistance — more conviction is justified.
+The laggard system closes most positions that would otherwise have hit their targets, but this forgone profit is acceptable — the alternative is exposure to reversals on a position that has already stalled.
 
 ---
 
@@ -559,7 +532,7 @@ At scale, this system yields **5-50% daily returns**. However, scale is intentio
 
 These caps prevent us from being hunted due to order impact. Larger positions would move the market and attract attention from traders looking to stop-hunt or front-run our exits.
 
-Within these constraints, the strategies can function as a form of **Universal Basic Income** (UBI) — consistent, automated returns that compound over time without requiring active management beyond initial configuration and monitoring.
+Within these constraints, the strategies yield consistent, automated returns that compound over time without requiring active management beyond initial configuration and monitoring.
 
 The system is designed to run continuously, adapting to market conditions through its tiered conviction structure and dynamic filters, making money while you sleep.
 
