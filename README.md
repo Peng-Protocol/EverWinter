@@ -193,11 +193,11 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 | `minNotional` | 6 | Entry notional (USDT, min 6 max 66); DCA stages scale from this |
 | `maxPositions` | 50 | Open position cap; scanning halts at cap |
 | `psychoChangePct` | 3 | Min absolute 24h change % to qualify a ticker |
-| `psychoPerCycle` | 3 | Tickers shorted per scan cycle |
+| `psychoPerCycle` | 12 | Tickers shorted per scan cycle |
 | `scanMins` | 15 | Scan interval in minutes |
 | `dcaStages` | 7 | DCA add stages beyond entry |
 | `dcaMultiplier` | 2 | Notional multiplier per stage |
-| `entryTpRoi` | 50 | Entry-stage TP ROI%; decays per stage, floors at 3% |
+| `entryTpRoi` | 25 | Entry-stage TP ROI%; decays per stage, floors at 3% |
 | `runtimeHours` | 48 | Hard force-close deadline per position |
 | `laggardCheckEnabled` | true | Enable laggard force-close |
 | `laggardProfitOffset` | 50 | Laggard EV buffer % (50 = 1.5× EV) |
