@@ -325,11 +325,6 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           <div class="lbl">Scan Interval <b x-text="cfg.scanMins+'m'"></b></div>
           <input type="range" min="5" max="60" step="5" x-model.number="cfg.scanMins" :disabled="bot.running" @change="persist()">
         </div>
-        <div class="g">
-          <div class="lbl">Whiplash Cooldown <b x-text="cfg.whiplashCooldownMins===0?'off':cfg.whiplashCooldownMins+'m'"></b></div>
-          <input type="range" min="0" max="240" step="15" x-model.number="cfg.whiplashCooldownMins" :disabled="bot.running" @change="persist()">
-          <div class="hint">Block re-entry on a closed ticker for this duration. 0 = disabled.</div>
-        </div>
         <div class="alert a-info" style="margin-top:8px;font-size:9.5px">
           Scanning halts automatically when open positions = max positions. Resumes when positions close.
         </div>
@@ -370,6 +365,11 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           <div class="lbl">Entry TP ROI <b x-text="cfg.entryTpRoi+'%'"></b></div>
           <input type="range" min="5" max="200" step="5" x-model.number="cfg.entryTpRoi" :disabled="bot.running" @change="persist()">
           <div class="hint">ROI % on entry margin. At 10× leverage a 50% ROI requires a 5% price drop.</div>
+        </div>
+        <div class="g">
+          <div class="lbl">Whiplash Proximity <b x-text="cfg.whiplashProximityPct+'% remaining'"></b></div>
+          <input type="range" min="5" max="50" step="5" x-model.number="cfg.whiplashProximityPct" :disabled="bot.running" @change="persist()">
+          <div class="hint">Pseudo only — when this % of TP distance remains, a K-line audit is queued 5 min later to catch missed TPs.</div>
         </div>
         <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
           <div class="stat-ttl">TP SCHEDULE</div>
@@ -769,7 +769,7 @@ function psycho() { return {
     psychoChangePct:      3,
     psychoPerCycle:       3,
     scanMins:             15,
-    whiplashCooldownMins: 60,
+    whiplashProximityPct: 20,
     dcaStages:        7,
     dcaMultiplier:    2,
     entryTpRoi:       25,
@@ -786,7 +786,7 @@ function psycho() { return {
   acct: { upnl: 0 },
   _instrCache:    {},
   _symbolBanlist: {},
-  _whiplashCd:    {},
+  _whiplashScheduled: {},
   _tsOffset:      0,
   _lastSignedAt:  0,
 
@@ -957,7 +957,6 @@ function psycho() { return {
       if (t.symbol === 'BTCUSDT' || t.symbol === 'ETHUSDT') return false; // optional: skip majors
       if (openSymbols.has(t.symbol)) return false;
       if (this._symbolBanlist[t.symbol]) return false;
-      if (this.cfg.whiplashCooldownMins > 0 && this._whiplashCd[t.symbol] && Date.now() - this._whiplashCd[t.symbol] < this.cfg.whiplashCooldownMins * 60000) return false;
       const chg = Math.abs(parseFloat(t.price24hPcnt || 0) * 100);
       return chg >= threshold;
     });
@@ -1270,6 +1269,15 @@ function psycho() { return {
         await this.closePosition(pos, 'tp', pos.currentTpPrice);
         continue;
       }
+
+      // Whiplash check — pseudo only, arms when within proximity% of TP
+      if (!pos._live && pos.currentTpPrice > 0 && !this._whiplashScheduled[pos.id]) {
+        const total = pos.entryPrice - pos.currentTpPrice;
+        const remaining = mark - pos.currentTpPrice;
+        if (total > 0 && remaining / total * 100 <= this.cfg.whiplashProximityPct) {
+          this._scheduleWhiplashCheck(pos);
+        }
+      }
     }
 
     // Laggard check
@@ -1315,7 +1323,7 @@ function psycho() { return {
     if (this.closedTrades.length > 200) this.closedTrades.shift();
 
     this.positions = this.positions.filter(x => x.id !== pos.id);
-    this._whiplashCd[pos.symbol] = Date.now();
+    this._cancelWhiplash(pos.id);
     this._notifyLaggardClose(pos, pnlPct);
 
     if (reason === 'force') {
@@ -1369,7 +1377,7 @@ function psycho() { return {
     if (this.closedTrades.length > 200) this.closedTrades.shift();
 
     this.positions = this.positions.filter(x => x.id !== pos.id);
-    this._whiplashCd[pos.symbol] = Date.now();
+    this._cancelWhiplash(pos.id);
     this._notifyLaggardClose(pos, pnlPct);
 
     if (reason === 'force') {
@@ -1409,6 +1417,39 @@ function psycho() { return {
           await this.closePosition(laggard, 'force');
         }
       }
+    }
+  },
+
+  // ── Whiplash check (pseudo only) ──
+  // Schedules a 1-min K-line audit 5 min after a position comes within
+  // whiplashProximityPct% of its TP. Catches TPs missed due to poll latency.
+  _scheduleWhiplashCheck(pos) {
+    if (this._whiplashScheduled[pos.id]) return;
+    this.log(`🎯 ${pos.symbol}: within ${this.cfg.whiplashProximityPct}% of TP — K-line audit in 5 min`, 'info');
+    this._whiplashScheduled[pos.id] = setTimeout(async () => {
+      delete this._whiplashScheduled[pos.id];
+      if (!this.positions.find(p => p.id === pos.id)) return;
+      try {
+        const url = `${this._baseUrl()}/v5/market/kline?category=linear&symbol=${pos.symbol}&interval=1&limit=6`;
+        const r = await fetch(url);
+        const d = await r.json();
+        const candles = d?.result?.list || [];
+        const tp = pos.currentTpPrice;
+        const hit = candles.some(c => parseFloat(c[3]) <= tp); // index 3 = low
+        if (hit) {
+          this.log(`🎯 ${pos.symbol}: K-line audit — TP ${fmtP(tp)} was touched, closing`, 'success');
+          await this.pseudoClosePosition(pos, 'tp', tp);
+        }
+      } catch(e) {
+        this.log(`🎯 ${pos.symbol}: whiplash audit failed — ${e.message}`, 'error');
+      }
+    }, 5 * 60 * 1000);
+  },
+
+  _cancelWhiplash(posId) {
+    if (this._whiplashScheduled[posId]) {
+      clearTimeout(this._whiplashScheduled[posId]);
+      delete this._whiplashScheduled[posId];
     }
   },
 
