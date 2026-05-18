@@ -515,11 +515,17 @@ At $60 notional / 6× leverage = $10 margin per entry. For 10 positions at moder
 
 ## Psycho Mode
 
-Psycho Mode is a directionless shorting strategy with no entry filters beyond |24h change| ≥ 3%. Each scan cycle it randomly selects 3 tickers from the qualifying pool and shorts them, up to a maximum of 50 concurrent positions. It strips all RSI gates, funding filters, rodeo, FT/FUN/SalF logic, and TP reduce entirely. The idea is to lean into the defensive mechanics rather than the entry filter: DCA escalation and the laggard system do the sorting.
+**"Short everything. Let DCA and laggard sort it out."**
 
-DCA uses 7 stages at 2× escalation — each add is double the last, staggered at 1.5%, 3%, 6%, 9%, 12%, 15%, 18% above entry. The escalating size ensures that when a ticker eventually reverts after a deep pump, even a partial retracement covers the full position. Entry TP ROI is 50%; per-stage TP decays as `max(entryTpRoi / (stage + 1), 3%)`. No reduce phase — the TP only moves on DCA progression.
+Psycho Mode is directionless by design. Where every other strategy filters hard to find the right moment, Psycho Mode skips the filter and relies on the defenses to do the work. It shorts any ticker showing meaningful movement — gainers and losers both qualify — and keeps doing so until the position limit is full. The entry is not a prediction. It is a bet that, across enough concurrent positions, the mechanics will produce net positive outcomes regardless of direction.
 
-The laggard check runs whenever there are ≥ 2 open positions (no reduce-phase gate, unlike EverWinter). It uses the same EV/lost-value/unrealized-PnL math: when `buffedEV − lostValue − uPnL ≤ 0`, the oldest position is force-closed. With 50 positions generating steady throughput, a stuck laggard accumulates opportunity-cost debt quickly. The 48h hard force-close is a last-resort backstop; in practice the laggard clears dead positions well before that.
+### DCA Escalation
+
+The escalating add structure is the backbone. Each add is double the last, so a ticker that keeps pumping draws in an ever-larger stake at a progressively better average. When it eventually reverts — even partially — the combined position crosses into profit. A ticker does not need to return to the entry price. It only needs to fall enough to clear the blended average.
+
+### Laggard
+
+The laggard is the bouncer. It watches the oldest open position and tracks how much opportunity has been lost while it sat there. Every trade that closes — win or loss — adds its result to the tab. When the tab exceeds what the laggard was ever expected to earn, it gets force-closed. With enough concurrent positions generating throughput, a stuck trade accumulates debt faster than it can recover. The 48-hour hard close is the last resort; laggard is the real exit mechanism.
 
 ---
 
