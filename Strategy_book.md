@@ -144,7 +144,7 @@ Advanced Follow-Through activates when a ticker demonstrates **prolonged over-ex
 This strategy is "advanced" because **it doesn't need direct observation to proceed** the way regular Follow-Through does. We enter based on the ticker's accumulated historical behavior (repeated over-extension hits) rather than watching it fail repeated gainer entries.
 
 ### Core Philosophy
-A ticker that over-extends four or more times within three hours is not just pumping — it is exhibiting structural instability. When that behavior finally collapses into the RSI cooldown band, the reversal tends to be sustained and reliable.
+A ticker that over-extends three or more times within three hours is not just pumping — it is exhibiting structural instability. When that behavior finally collapses into the RSI cooldown band, the reversal tends to be sustained and reliable.
 
 ---
 
@@ -152,7 +152,7 @@ A ticker that over-extends four or more times within three hours is not just pum
 
 The **extender counter** tracks every time a ticker hits RSI6 ≥ the configured maximum during the scan cycle or per-tick polling window. Each hit within the 3-hour TTL increments the counter.
 
-When a ticker's count reaches the **configurable promotion threshold** (default: 4 hits), it graduates to the **Advanced FT roster**. The gainer scan graylists the symbol while it remains on the ADV FT roster, suspending normal gainer entries.
+When a ticker's count reaches the **configurable promotion threshold** (default: 3 hits), it graduates to the **Advanced FT roster**. The gainer scan graylists the symbol while it remains on the ADV FT roster, suspending normal gainer entries.
 
 If the roster is full, the ticker with the **lowest funding rate** (most over-shorted, least desirable) is evicted first, then the oldest entry.
 
@@ -168,11 +168,9 @@ This is wider than Gainers' 70-80 band. We're catching the pullback **after** th
 
 #### 2. **Close Confirmation (ClC)**
 
-ADV FT does not use Volume Momentum. Instead, it requires **recent price action to confirm a trend shift** before entering.
+ADV FT uses **Close Confirmation** — recent price closes — to confirm a trend shift before entering.
 
-* **The Gate**: Of the last 4 completed 15m candles, at least `advFtClcMin` (default: **3**) must have closed red (close < open).
-* **The Rationale**: Over-extended tickers are characterized by relentless green candles right up until they collapse. VM attempts to *predict* that collapse by measuring selling pressure ratios — but ADV FT was never about predicting the collapse. It is about **trailing the continuation** of an already-occurring reversal. ClC requires that the reversal has already begun to show up in price: confirmed red closes are evidence the trend has shifted, not a forecast that it might.
-* **Why not VM**: VM is a forward-looking indicator. ClC is backward-looking — it uses confirmed closes, not inferred pressure. For ADV FT, whose edge is entering *after* a demonstrated reversal into a cooled RSI band, confirmed price action is the right signal.
+* **The Gate**: Of the last 4 completed 15m candles, at least **3** must have closed red (close < open).
 
 #### 3. **LSA (Localized Sell Average) Filter**
 
@@ -181,9 +179,9 @@ ADV FT does not use Volume Momentum. Instead, it requires **recent price action 
 * **The Logic**: LSA compares the volume of the most recent completed 15m candle against the average volume of the preceding candles in the lookback window. A ratio in the target band confirms that selling is elevated but not exhausted.
 * **Why ADV FT Needs a High Floor**: Over-extended tickers are characterized by relentless buying — almost all their recent 15m candles are green. This means their baseline volume is skewed bullish, so even a moderate selling candle will appear dramatically elevated relative to the average. The floor accounts for this: by the time a meaningful reversal is underway, the sell candle's relative volume naturally reads high. A floor of **125%** (default) reflects this structural reality — this is not an aggressive threshold for a normal ticker, but it is realistic for an over-extender that has been running hot.
 * **The Band Gate**: ADV FT uses a **range gate** — the ratio must fall between a configurable floor and cap:
-  * **Floor** (`advFtLsaMin`, default **125%**): The last candle's volume must be at least 125% above the window average, confirming that selling has materially overtaken the prior buying baseline.
-  * **Cap** (`advFtLsaLimit`, default **150%**): If the ratio exceeds the cap, the entry is skipped — too much selling in a single bar signals a **volume blowoff**, a potential last-gasp spike before a relief bounce.
-* **For FUN Losers (LFL/HFL)**: These target a much lower floor (typically **50%**). Because these tickers are already "down" for the day, their candles naturally skew red; a high LSA here usually indicates the drop is already finished.
+  * **Floor** (default **125%**): The last candle's volume must be at least 125% above the window average, confirming that selling has materially overtaken the prior buying baseline.
+  * **Cap** (default **150%**): If the ratio exceeds the cap, the entry is skipped — too much selling in a single bar signals a **volume blowoff**, a potential last-gasp spike before a relief bounce.
+* **For FUN Losers (LFL/HFL)**: These use a separate, tighter range gate — the minimum is lower (default **15%**) and the cap is lower (default **50%**). Because these tickers are already declining, their candles naturally skew red, so the threshold for "elevated selling" is lower. The cap prevents entering into what may be a final flush rather than a sustained reversal.
 
 #### 4. **Funding Rate Filter**
 Same as Gainers: funding rate must exceed the configured minimum (default −0.05%).

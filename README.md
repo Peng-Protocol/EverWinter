@@ -26,7 +26,7 @@
 
 EverWinter operates (5) distinct position archetypes. All share the same DCA/TP mechanics but differ in how they are entered and how re-entry state is tracked. These are:
 
-* **Standard Gainer (Gainer)**
+* **Standard Gainer ()**
 * **Follow-Through (FT)**
 * **Advanced Follow-Through (ADV FT)**
 * **Fund Chasing (FUN)**
