@@ -201,14 +201,43 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 | `runtimeHours` | 48 | Hard force-close deadline per position |
 | `laggardCheckEnabled` | true | Enable laggard force-close |
 | `laggardProfitOffset` | 50 | Laggard EV buffer % (50 = 1.5× EV) |
+| `cascadeTriggerEnabled` | true | Enable cascade trigger |
+| `cascadeTriggerUPnL` | 2.50 | Collective uPnL threshold to fire cascade trigger |
 
-### UI Sections
+The **Live Trading** toggle switches between pseudo and live mode. The switch is locked while the bot is running and also respects the config lock. In pseudo mode no API key is required and no real orders are placed — all logic runs against live market data with phantom capital. In live mode, Bybit Contract/Derivatives credentials are required and real orders are placed.
 
-**Config** — parameters above plus mode/credential entry. DCA Ladder shows computed notional, margin, and cumulative totals per stage. TP Schedule shows ROI% and price target per stage.
+A **config lock** button sits above the start/stop controls. When locked, all sliders and fields are disabled regardless of whether the bot is running — useful as a safeguard against accidental changes between sessions.
 
-**Positions** — open position feed: symbol, DCA stage, entry/mark price, unrealised PnL, time open, next add price, TP price, and laggard debt indicator on the oldest position when laggard is active.
+### Positions Menu
 
-**Log** — session counters (opened, closed, wins, losses, PnL, force-closes, laggard-closes) and a capped reverse-chronological activity log (300 entries).
+Open position feed showing symbol, DCA stage indicator, entry/mark price, unrealised PnL and ROI%, time open, next add price, TP price, and a force-close countdown. The oldest position shows a laggard debt indicator when laggard is active.
+
+Two sort buttons appear at the top of the feed:
+
+- **PnL** — sorts open positions by unrealised PnL, toggling descending → ascending → unsorted.
+- **DCA** — sorts by DCA stage triggered (not the band the mark price currently sits in), toggling the same cycle. Switching either sort resets the other.
+
+### Trades Menu
+
+Reverse-chronological feed of all closed positions. Each card shows entry/exit price, DCA stage, duration, PnL, and close reason.
+
+Force closes and laggard closes that occur in rapid succession are **rolled up** into a single grouped entry rather than flooding the feed. Each rollup covers a 15-minute window and summarises: ticker count, net PnL and ROI, win/loss breakdown, average DCA stage, average duration, and best/worst performers by both PnL and ROI. Standalone TP and SL closes always appear as individual entries.
+
+### Log Menu
+
+Session counters at the top: trades, wins, losses, net PnL, win rate, force closes, and cascade closes (visible once at least one cascade has fired).
+
+**Laggard status** — live view of the current laggard candidate: buffered expected value, accumulated lost value, current uPnL, and the buffered expected deficit. Turns red and shows "→ CLOSING" when the deficit hits zero.
+
+**Open Now** — at-a-glance stats across all open positions: best uPnL, worst uPnL, and highest DCA stage reached.
+
+**DCA Spread** — counts how many open positions are currently at each stage (S0–S7). Stages 0–3 display in orange; S4 and above display in red. Only visible when positions are open. This gives an instant read on how deep the book is sitting — something not surfaced in other EverWinter bots.
+
+The **activity log** is a capped reverse-chronological event feed (300 entries) with an internal scroll. Force rollup entries are rendered inline with their full breakdown rather than as plain text.
+
+### Config
+
+Parameters listed above. DCA Ladder shows computed notional, margin, and cumulative totals per stage. TP Schedule shows ROI% and price target per stage.
 
 ### Scan
 
