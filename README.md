@@ -26,7 +26,7 @@
 
 EverWinter operates (5) distinct position archetypes. All share the same DCA/TP mechanics but differ in how they are entered and how re-entry state is tracked. These are:
 
-* **Standard Gainer (Gainer)**
+* **Standard Gainer ()**
 * **Follow-Through (FT)**
 * **Advanced Follow-Through (ADV FT)**
 * **Fund Chasing (FUN)**
@@ -35,13 +35,13 @@ EverWinter operates (5) distinct position archetypes. All share the same DCA/TP 
 All of which are explained in the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md).
 
 ### Position Badges
-Each position type has a unique badge pinned to its header which makes it instantly identifiable.
+FT, ADV FT, FUN, and SalF positions each carry a unique badge pinned to their header. Standard Gainers carry no badge.
 
 ---
 
 ## Watchlists
 
-EverWinter maintains (3) distinct watchlists, each with different entry criteria and lifecycle rules.
+EverWinter maintains (2) distinct watchlists, each with different entry criteria and lifecycle rules.
 
 ### Potential Entries Watchlist
 Populated during each main scan pass for symbols that are within a configurable RSI shortfall percentage of the full entry gate (default 10%). These are near-threshold candidates that aren't yet tradeable. Each entry carries a snapshot of the RSI gates that were in effect at placement time (including any current Rodeo Creep offset) and expires after a configurable window (default set in the Potential Entries config section). The (5)-second RSI poller monitors this list independently; once all gates are cleared, the position opens immediately without waiting for the next full scan.
@@ -50,8 +50,6 @@ This watchlist also evicts any tickers that fail other filters such as over-exte
 ### Follow-Through Watchlist (`ftWatchlist`)
 A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its Rodeo/over-extension/Pile-on count and how many FT trades have been opened against it. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
 
-### Rodeo Creep Panel
-Not a tradeable watchlist but a live display of all symbols currently under active Rodeo Creep, showing the accumulated RSI gate offset and the countdown to expiry. Creep entries expire after (6) hours from the last qualifying close.
 
 ---
 
@@ -90,10 +88,10 @@ A full scan cycle runs at the configured interval or on demand via the **SCAN NO
 ### 2. FUN Scan
 Runs inline within `runScan` after the gainers pass. Evaluates the top `funGainerN` gainers and worst `funLoserN` losers (−3% to −99%) from the same bulk ticker fetch — no additional API calls for price or funding data.
 
-For each candidate, the FUN scan applies: symbol banlist → existing position check → funding rate classification (sub-type and slot cost determined by FR level) → slot check → FR creep gate → historical RSI6 over-extension look-back (3h, 15min candles) → loser OE graylist (losers with any over-extension in the look-back are contradictory and graylisted 6h) → RSI6 proximity block → vol momentum gate (separate thresholds for gainers vs. losers, creeping upward with each close and scaling multiplicatively with over-extension count) → LSA check for losers (last completed candle must show positive but non-spike volume relative to the window average).
+For each candidate, the FUN scan applies: symbol banlist → existing position check → funding rate classification (sub-type and slot cost determined by FR level) → slot check → FR creep gate → historical RSI6 over-extension look-back (3h, 15min candles) → loser OE reclassification (losers with any over-extension in the look-back are evaluated under the gainers gate, as their behavior matches a gainer) → RSI6 proximity block → vol momentum gate (separate thresholds for gainers vs. losers, creeping upward with each close and scaling multiplicatively with over-extension count) → LSA check for losers (last completed candle must show positive but non-spike volume relative to the window average).
 
 ### 3. FT/ADV FT Scan (`scanFollowThroughs`)
-Runs after `runScan` against the persisted `ftCandidates` roster. Per symbol, gates are checked in order: funding rate → RSI triplet (45–80 for ADV FT, 20–60 for regular FT) → vol momentum (regular FT only) → Close Confirmation / ClC (ADV FT only: ≥3 of last 4 completed 15m bars must be red) → LSA band gate (ADV FT only: last candle volume ≥ floor% and ≤ cap% of window average). Opens FT or ADV FT shorts when all conditions pass.
+Runs after `runScan` against the persisted `ftCandidates` roster. Per symbol, gates are checked in order: funding rate → RSI triplet (45–80 for ADV FT, 20–60 for regular FT) → Close Confirmation / ClC (ADV FT only: ≥3 of last 4 completed 15m bars must be red) → LSA band gate (ADV FT only: last candle volume ≥ floor% and ≤ cap% of window average). Opens FT or ADV FT shorts when all conditions pass.
 
 Both ClC and LSA read directly from the `_klineCache[${symbol}_15]` entry already populated by the RSI gate check (`fetchRSIMulti`). No additional kline fetch is required — the same 15m candle array is reused for RSI computation, red-candle counting, and volume analysis.
 
@@ -185,32 +183,10 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 
 ## ChartWinter
 
-**ChartWinter** (`ChartWinter.html`) is a standalone companion charting tool in the same single-file format. It uses a gray/ash visual theme and has a compatible config schema with EverWinter, but operates entirely independently — no shared state, no inter-app communication.
+**ChartWinter** (`ChartWinter.html`) is a standalone companion tool for chart analysis and scan research. It shares EverWinter's config schema but operates entirely independently — no shared state, no inter-app communication.
 
-### Core Function
-ChartWinter runs its own configurable scan (identical `topN`, `scanMins`, RSI gate, and funding-rate filter parameters) and renders a candlestick chart with a separate volume pane for the selected ticker. RSI values (RSI6, RSI12, RSI24) are computed client-side using Wilder's method, matching PseudoWinter's implementation exactly. Auto-scan on load is off by default; the last auto-scan state is persisted across sessions.
+It runs its own configurable scan using the same RSI and funding-rate parameters, renders candlestick charts with a volume pane, and computes RSI6/RSI12/RSI24 client-side using the same Wilder's method as EverWinter. Scan results list price, 24h change, funding rate, and RSI values per symbol with sorting and strategy badge indicators. A Gainers/Losers toggle switches scan direction; the change range is manually configurable.
 
-### Scan Results Panel
-The left panel lists scan results with per-symbol price, 24-hour change, funding rate, RSI6/12/24, and strategy badges. Badges include `GAIN`, `⚡EXT` (over-extended), `🔻Over-shorted`, `💸 FUN` (funding rate ≥ 0.05%), and `🔥 FUN` (funding rate ≥ 0.1%). Results can be sorted by 24h change, RSI6, funding rate, or alphabetically.
-
-### Scan Direction
-A **Gainers / Losers** toggle switches the scan between top gainers (default: +3% to +500%) and top losers (−3% to −99%). The price change range is also manually configurable in Settings and supports negative values. Switching modes presets the range but does not lock it.
-
-### Ticker Search & Pinning
-A full-text search mode loads any Bybit ticker directly, bypassing the scan filter. Individual tickers can be pinned; pinned tickers appear at the top of every scan and search list, separated by a divider. Pins are persisted across sessions. The scan results column shows N candidates (configurable) from the active scan direction.
-
-### Charting
-Charts are rendered via LightweightCharts. Kline data is cached per symbol and is exportable/importable as JSON. A configurable poll interval auto-refreshes the active chart. Lookback depth and the number of extended candles are configurable.
-
-### Persistent Lines
-Users can draw and colour-code **horizontal price lines** and **vertical candle lines** on any chart. Horizontal lines are created directly via the lines modal (no chart click required) and edited by entering a price value. Vertical lines are pinned to a specific candle's timestamp by clicking the chart after activating the `✏️│` button; they re-position correctly on scroll, zoom, and resize. Both line types are persisted per symbol in `localStorage`. A **Lines** modal (opened via `✏️─`) manages horizontal and vertical lines together. The Settings panel shows a read-only summary of saved lines per ticker (`2H 1V` format).
-
-### Settings Export / Import
-All ChartWinter settings can be exported and re-imported as JSON, independent of EverWinter's state.
-
----
-
-## Background Sync
-Same as EverWinter.
+Tickers can be searched directly or pinned — pinned tickers appear at the top of every scan. Persistent horizontal price lines and vertical candle lines can be drawn on any chart and are saved per symbol in `localStorage`. All settings export and import as JSON.
 
 ---

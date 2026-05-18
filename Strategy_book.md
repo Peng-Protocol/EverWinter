@@ -5,8 +5,8 @@
 
 ## Table of Contents
 1. [Gainers Strategy](#gainers-strategy)
-2. [Advanced Follow-Through](#advanced-follow-through-strategy)
-3. [Follow-Through](#follow-through-strategy)
+2. [Advanced Follow-Through (ADV FT)](#advanced-follow-through-strategy)
+3. [Follow-Through (FT)](#follow-through-strategy)
 4. [Fund Chasing (FUN)](#fun-fund-chasing-strategy)
 5. [Sale Fishing (SalF)](#sale-fishing-salf-strategy)
 6. [General Mechanics](#general-mechanics)
@@ -22,15 +22,15 @@ PseudoWinter employs a **tiered conviction system** where strategies cascade fro
 
 The strategies are organized around three distinct observation paths:
 
-**Gainers path** — A ticker showing strong upward momentum is entered by Gainers, accumulates rodeo rides, and promotes to Follow-Through. If it was also extremely over-extended during that run, it may simultaneously qualify for Advanced Follow-Through via the extender counter.
+**Gainers path** — A ticker showing strong upward momentum is entered by Gainers, accumulates rodeo rides, and promotes to Follow-Through. If it was also extremely over-extended during that run, it may alternatively qualify for Advanced Follow-Through via the extender counter.
 
 **FUN path** — A parallel, independent scan evaluates tickers with positive funding rates across the top gainers and worst losers pools. FUN entries are funding-rate-driven rather than RSI-driven, and operate on their own conviction tier.
 
 **SalF path** — A separate red-day scan targets tickers already in a consistent, sustained decline. Where all other strategies are designed around upward price action and mean reversion, SalF is the only strategy built to perform when the market is broadly falling.
 
-In the most advantageous scenario, a single ticker flows through the Gainers path as it degrades:
-1. Gainer enters → rodeo → win
-2. Price/RSI drops → follow-through entry
+In the most advantageous scenario, a single ticker flows through multiple strategies as it degrades:
+1. Gainer enters → rodeo → FT entry → SalF entry
+2. Alternatively: ADV FT entry → SalF entry
 3. **Result**: Multiple trades extracted from one ticker's lifecycle
 
 ---
@@ -63,7 +63,7 @@ We check three RSI timeframes to confirm over-bought conditions:
 - **70-70-75**: Balanced — best risk/reward for most market conditions
 - **70-70-80**: Strictest — fewer positions, cleanest setups
 
-The 70-70-75 configuration remains the **most balanced** for typical operation. The 70-70-80 setting offers far fewer positions but eliminates most problem trades. The third gate (RSI24) at 80 acts as the final **gatekeeper** to ensure the ticker is genuinely over-bought on the daily timeframe.
+The third gate (RSI24) at 80 acts as the final **gatekeeper** to ensure the ticker is genuinely over-bought on the daily timeframe.
 
 #### 2. **Top Gainer Pool**
 - We evaluate a **finite pool of top gainers** (typically 25 candidates, sorted by 24hr% gain descending)
@@ -128,7 +128,9 @@ A ticker providing multiple "rides" is **very erratic and unstable** — this pa
 **Historical Max**: 4 rides (under 3% creep). With 6% creep, this is unlikely to recur.
 
 #### Rodeo Creep Effects:
-For each rodeo ride, we **increase both TP target and position size by 50%** (adjustable):
+For each rodeo ride, the **RSI entry gate creeps upward by a configurable percentage** (default 6%). On a base gate of RSI6 ≥ 70, a single ride raises the requirement to RSI6 ≥ 76; a second ride pushes it to RSI6 ≥ 82. This prevents immediately re-entering a ticker that just dipped — a ticker that closed quickly likely hasn't stabilised and will pump straight back up. The creep ensures re-entry only happens if the ticker has climbed further into over-bought territory, where mean reversion is more probable.
+
+Each ride also increases **TP target and position size by 50%** (adjustable):
 
 - **Why TP Creeps**: Unstable tickers produce deeper downward wicks and face greater upside resistance — more conviction is justified
 - **Why Notional Creeps**: The eventual real move will be larger, justifying increased exposure
@@ -141,10 +143,10 @@ For each rodeo ride, we **increase both TP target and position size by 50%** (ad
 ### Overview
 Advanced Follow-Through activates when a ticker demonstrates **prolonged over-extension** — repeated RSI6 spikes above the configured maximum within a 3-hour window. Rather than entering during the parabolic phase, ADV FT waits for the ticker to cool into a tradeable range, then enters as the reversal continues.
 
-This strategy is "advanced" because **it doesn't need direct observation to proceed** the way regular Follow-Through does. We enter based on the ticker's accumulated historical behavior (repeated over-extension hits) rather than watching it fail repeated gainer entries.
+This strategy is "advanced" because **it doesn't need direct observation to proceed** the way regular Follow-Through does. We enter based on the ticker's accumulated historical behavior (repeated over-extension hits) rather than watching repeated gainer entries succeed against it.
 
 ### Core Philosophy
-A ticker that over-extends four or more times within three hours is not just pumping — it is exhibiting structural instability. When that behavior finally collapses into the RSI cooldown band, the reversal tends to be sustained and reliable.
+A ticker that over-extends three or more times within three hours is not just pumping — it is exhibiting structural instability. When that behavior finally collapses into the RSI cooldown band, the reversal tends to be sustained and reliable.
 
 ---
 
@@ -152,7 +154,7 @@ A ticker that over-extends four or more times within three hours is not just pum
 
 The **extender counter** tracks every time a ticker hits RSI6 ≥ the configured maximum during the scan cycle or per-tick polling window. Each hit within the 3-hour TTL increments the counter.
 
-When a ticker's count reaches the **configurable promotion threshold** (default: 4 hits), it graduates to the **Advanced FT roster**. The gainer scan graylists the symbol while it remains on the ADV FT roster, suspending normal gainer entries.
+When a ticker's count reaches the **configurable promotion threshold** (default: 3 hits), it graduates to the **Advanced FT roster**. The gainer scan graylists the symbol while it remains on the ADV FT roster, suspending normal gainer entries.
 
 If the roster is full, the ticker with the **lowest funding rate** (most over-shorted, least desirable) is evicted first, then the oldest entry.
 
@@ -168,22 +170,20 @@ This is wider than Gainers' 70-80 band. We're catching the pullback **after** th
 
 #### 2. **Close Confirmation (ClC)**
 
-ADV FT does not use Volume Momentum. Instead, it requires **recent price action to confirm a trend shift** before entering.
+ADV FT uses **Close Confirmation** — recent price closes — to confirm a trend shift before entering.
 
-* **The Gate**: Of the last 4 completed 15m candles, at least `advFtClcMin` (default: **3**) must have closed red (close < open).
-* **The Rationale**: Over-extended tickers are characterized by relentless green candles right up until they collapse. VM attempts to *predict* that collapse by measuring selling pressure ratios — but ADV FT was never about predicting the collapse. It is about **trailing the continuation** of an already-occurring reversal. ClC requires that the reversal has already begun to show up in price: confirmed red closes are evidence the trend has shifted, not a forecast that it might.
-* **Why not VM**: VM is a forward-looking indicator. ClC is backward-looking — it uses confirmed closes, not inferred pressure. For ADV FT, whose edge is entering *after* a demonstrated reversal into a cooled RSI band, confirmed price action is the right signal.
+* **The Gate**: Of the last 4 completed 15m candles, at least **3** must have closed red (close < open).
 
 #### 3. **LSA (Localized Sell Average) Filter**
 
 **LSA** measures the intensity of current selling relative to the ticker's recent average. For ADV FT, it gates entries to a configurable band — neither too thin (insufficient selling momentum) nor too thick (volume blowoff already spent).
 
 * **The Logic**: LSA compares the volume of the most recent completed 15m candle against the average volume of the preceding candles in the lookback window. A ratio in the target band confirms that selling is elevated but not exhausted.
-* **Why ADV FT Needs a High Floor**: Over-extended tickers are characterized by relentless buying — almost all their recent 15m candles are green. This means their baseline volume is skewed bullish, so even a moderate selling candle will appear dramatically elevated relative to the average. The floor accounts for this: by the time a meaningful reversal is underway, the sell candle's relative volume naturally reads high. A floor of **125%** (default) reflects this structural reality — this is not an aggressive threshold for a normal ticker, but it is realistic for an over-extender that has been running hot.
+* **Why the High Floor**: An over-extender's baseline volume is skewed bullish — nearly all recent candles were green. By the time a reversal is underway, the first significant red candle already reads elevated relative to that baseline. A floor of **125%** is aggressive for a normal ticker, but realistic for one that has been running hot.
 * **The Band Gate**: ADV FT uses a **range gate** — the ratio must fall between a configurable floor and cap:
-  * **Floor** (`advFtLsaMin`, default **125%**): The last candle's volume must be at least 125% above the window average, confirming that selling has materially overtaken the prior buying baseline.
-  * **Cap** (`advFtLsaLimit`, default **150%**): If the ratio exceeds the cap, the entry is skipped — too much selling in a single bar signals a **volume blowoff**, a potential last-gasp spike before a relief bounce.
-* **For FUN Losers (LFL/HFL)**: These target a much lower floor (typically **50%**). Because these tickers are already "down" for the day, their candles naturally skew red; a high LSA here usually indicates the drop is already finished.
+  * **Floor** (default **125%**): The last candle's volume must be at least 125% above the window average, confirming that selling has materially overtaken the prior buying baseline.
+  * **Cap** (default **150%**): If the ratio exceeds the cap, the entry is skipped — too much selling in a single bar signals a **volume blowoff**, a potential last-gasp spike before a relief bounce.
+* **For FUN Losers (LFL/HFL)**: These use a separate, tighter range gate — the minimum is lower (default **15%**) and the cap is lower (default **50%**). Because these tickers do not have the same financial energy running through them, their candles naturally skew red, so the threshold for "elevated selling" is lower. The cap prevents entering into what may be a final flush rather than a sustained reversal.
 
 #### 4. **Funding Rate Filter**
 Same as Gainers: funding rate must exceed the configured minimum (default −0.05%).
@@ -196,7 +196,7 @@ ADV FT's edge comes from entering *after* a parabolic over-extension has begun t
 
 Over-extended tickers are almost entirely green candles on the way up — right until they aren't. By the time 3 of the last 4 completed 15m candles are red, the trend has demonstrably shifted. That confirmed evidence is a stronger entry basis for ADV FT than a predictive VM score.
 
-VM is retained for regular Follow-Through and FUN, where the prediction context is different.
+VM is retained for FUN, where the prediction context is different.
 
 ---
 
@@ -215,7 +215,7 @@ Follow-Through is the predecessor to Advanced Follow-Through. Where Advanced FT 
 When a ticker accumulates **2+ rodeo rides** (configurable), it promotes to the Follow-Through roster. We used to set this threshold at 4 rides, but when we raised the Gainers RSI gates and rodeo creep percentage, 2 rides became the more likely outcome.
 
 ### Entry Logic
-Same as Advanced FT: wait for RSI to cool, except into the 20-60 band, then enter when volume momentum (optional) and RSI conditions are met. The only difference is the **promotion path** — rodeo rides vs. over-extension hits. Regular FT retains the VM filter; it does not use ClC.
+Same as Advanced FT: wait for RSI to cool, except into the 20-60 band, then enter when RSI conditions are met. The only difference is the **promotion path** — rodeo rides vs. over-extension hits. FT uses RSI gating only; it uses neither VM nor ClC.
 
 ---
 
@@ -232,7 +232,7 @@ FUN runs its own scan pass each cycle, evaluating two distinct pools: the **top 
 
 **"If the market is paying you to be short, that's not nothing."**
 
-A high positive funding rate means longs are paying shorts. Entering when the rate is elevated locks in that carry income and improves the break-even on the position. Combined with vol momentum confirmation, FUN positions are entered when both price action and funding economics favor the short side.
+A high positive funding rate signals that the futures price is trading above spot — longs are paying shorts to hold their positions. The direct carry income is negligible over a typical position duration, but the rate is a reliable structural signal: the gap between futures and spot must close. That closure happens one of two ways — spot rises to meet futures (bad for us), or futures falls to meet spot (good for us). Vol momentum confirmation is how we verify that the downward resolution has already begun.
 
 ---
 
@@ -259,23 +259,23 @@ The funding rate determines the sub-type, slot cost, and base VM threshold. A ti
 #### 2. **FR Creep Gate**
 After the first FUN close on a symbol, a **funding rate re-entry gate** is seeded at 1.0% and multiplied ×1.5 per subsequent close (6-hour TTL). This prevents continuously re-entering the same ticker at a declining funding rate. Once the TTL expires the gate lifts automatically.
 
-#### 3. **Historical Over-Extension Look-back**
+#### 3. **RSI Proximity Block**
+If RSI6 is within the configured proximity band of the maximum (e.g., within 10% of 90), the ticker is skipped. This prevents entering a ticker that may be about to over-extend.
+
+#### 4. **Historical Over-Extension Look-back**
 Before evaluating vol momentum, we count how many 15-minute candles in the past 3 hours had RSI6 ≥ the configured maximum. This count is the **single source of truth** for the over-extension multiplier applied to the VM threshold — it cannot be double-counted.
 
-- **For losers**: any over-extension in the look-back is **contradictory** — a ticker falling hard on the day shouldn't be simultaneously parabolic. These are graylisted for 6 hours.
+- **For losers**: any over-extension in the look-back means the ticker is behaving like a gainer — it is evaluated under the gainers gate instead of the losers gate.
 - **For gainers**: over-extension hits raise the VM floor multiplicatively (see below).
-
-#### 4. **RSI Proximity Block**
-If RSI6 is within the configured proximity band of the maximum (e.g., within 10% of 90), the ticker is skipped. This prevents entering a ticker that may be about to over-extend.
 
 #### 5. **Volume Momentum Gate**
 Vol momentum thresholds differ by sub-type and direction:
 
 - **Gainer sub-types (HFG, LFG)**: Base threshold is configurable (default HFG = 10%, LFG = 20%). Per each re-entry close, the threshold creeps upward by a configurable percentage (default 10% per close). If the look-back found over-extension candles, the creeped threshold is further multiplied by `(1 + OEStepPct/100)^n` where n is the over-extension count.
 
-- **Loser sub-types (HFL, LFL)**: The base threshold is expressed as a negative vol mom minimum (default HFL = −10%, LFL = −5%). Creep tightens the threshold toward zero. Over-extension converts the threshold to an absolute minimum (1% + 50% per OE hit), reflecting that a losing ticker with any parabolic history is structurally suspect.
+- **Loser sub-types (HFL, LFL)**: The base threshold is expressed as a negative vol mom minimum (default HFL = −10%, LFL = −5%). Creep tightens the threshold toward zero. OE losers are reclassified to the gainers gate (see above).
 
-#### 7. **LSA (Localized Sell Average) Check** — Losers Only
+#### 6. **LSA (Localized Sell Average) Check** — Losers Only
 For loser candidates, the last completed 15-minute candle's volume must be **above the window average** but **below the spike cap** (default ±50% from average). This confirms continued selling activity without a volume blowoff that would suggest exhaustion rather than continuation.
 
 Droughts (≤ avg), neutral (at avg), and spikes (> cap) are all blocked.
@@ -283,7 +283,7 @@ Droughts (≤ avg), neutral (at avg), and spikes (> cap) are all blocked.
 
 ### Why FUN Addresses Over-Extended Tickers
 
-Over-extended tickers (RSI6 ≥ max) are excluded from the Gainers path by design. But a gainer can be simultaneously over-extended **and** carrying a positive funding rate — two independent structural conditions. FUN's vol momentum gate, now scaled multiplicatively by the over-extension count, naturally raises the bar for these tickers: the more candles they spent over-extended, the more selling pressure must be confirmed before entry. This means FUN can legitimately capture some over-extended gainers that would be unsafe to enter via the Gainers path, but only when the evidence stack is proportionally stronger.
+Over-extended tickers are excluded from the Gainers path but can still carry a positive funding rate. FUN captures these when vol momentum — scaled by OE count — confirms that selling pressure has begun. The higher the OE count, the more confirmation required before entry.
 
 ---
 
@@ -307,9 +307,9 @@ SalF is not about picking a top or timing an exhaustion point. It's about identi
 
 The strategy deliberately avoids two failure modes:
 
-1. **Exhaustion entries** — the ticker has already dumped violently in one or two candles, sellers are spent, and a snap-back bounce is likely. The LSA cap gates this out: if the last hour's volume is too far above average, the move has probably already happened.
+1. **Exhausted entries** — the ticker has already dumped violently in one or two candles, sellers are spent, and a snap-back bounce is likely. The LSA cap gates this out.
 
-2. **Squeeze entries** — the ticker is visibly in distress, which attracts late shorts piling in after the fact. Heavy short crowding on a declining ticker increases the probability of a stop-hunt spike. The tighter funding rate gate and the standard over-shorted filter handle this together.
+2. **Squeezable entries** — the ticker is visibly in distress, which attracts late shorts piling in after the fact. Heavy short crowding on a declining ticker increases the probability of a stop-hunt spike. The tighter funding rate gate (−0.005%) avoids such entries.
 
 ---
 
@@ -317,9 +317,7 @@ The strategy deliberately avoids two failure modes:
 
 #### 1. **Consistent Decline: 3/4 Red Candle Rule**
 
-The last four completed 15-minute candles must contain at least three red closes.
-
-This is a visual quality bar. A 2/4 pattern is crabbing — the ticker is going sideways, not declining. A 1/4 pattern is typically three green candles followed by one outsized red, which looks like a dump but is structurally a single event, not a trend. We want a ticker that has been continuously declining across the past hour, with each candle contributing to the move rather than one dramatic spike pulling the average down.
+The last four completed 15-minute candles must contain at least three red closes. This confirms a continuous decline across the past hour rather than a single-candle spike pulling the average down.
 
 #### 2. **LSA Window: Floor and Cap**
 
@@ -332,7 +330,7 @@ The window tightens after each SalF close on a symbol (**median creep**): the fl
 
 #### 3. **RSI Floor**
 
-All three RSI timeframes (RSI6, RSI12, RSI24) must be above a configurable minimum (default 25). Below this level a ticker is stretched so far oversold that a snap-back becomes more probable than continuation. We gate out the deeply oversold range and look for tickers that still have room to fall.
+All three RSI timeframes (RSI6, RSI12, RSI24) must be above a configurable minimum (default 25). Below this level a ticker is stretched so far oversold that a snap-back becomes more probable than continuation.
 
 #### 4. **Funding Rate Gate (Tighter Than Other Strategies)**
 
@@ -344,12 +342,6 @@ SalF scans both the top gainers pool and the worst losers pool:
 
 - **Gainers selling off ("fresh")**: Tickers that were positive on the day but are now actively declining. The selling pressure is working against the day's positive backdrop — if it's strong enough to push through, the move may have more runway.
 - **Losers selling off ("stale")**: Tickers already down on the day continuing lower. The decline is in the direction of the day's trend, but these tickers may be closer to finding support. Both use the same LSA logic with separately configurable minimums. The gainer/loser distinction is an area of ongoing refinement.
-
----
-
-### Why SalF Thrives on Red Days
-
-When the broader market is falling, SalF criteria are met simultaneously across many tickers. The over-shorted and LSA filters still constrain entry quality, but the raw supply of qualifying tickers is far greater than on green days. This makes SalF a natural complement to the rest of the system: when Gainers, FT, and FUN go quiet because there are few upward movers, SalF activates and fills the bot's position slots instead.
 
 ---
 
@@ -457,9 +449,9 @@ Through experience (mostly with gainers), we observed positions that would **lin
 
 **Reduce Phase**
 
-After a position has been open for **45 minutes** (configurable, used to be 12 hours, then 6 hours), it enters **reduce phase**.
+After a position has been open for **25 minutes** (configurable, used to be 12 hours, then 6 hours, then 45 minutes), it enters **reduce phase**.
 
-**Rationale**: If a position has been open too long and hasn't hit TP, it will likely start pumping again and we might get stopped out. The 45-minute reduce phase is **very aggressive** and forces positions to close that would otherwise hit regular TP 2-3 hours later. But the stress of waiting and the chances of a spike aren't worth it.
+**Rationale**: If a position has been open too long and hasn't hit TP, it will likely start pumping again and we might get stopped out. The 25-minute reduce phase is **very aggressive** and forces positions to close that would otherwise hit regular TP 2-3 hours later. But the stress of waiting and the chances of a spike aren't worth it.
 
 During reduce phase, TP is lowered to encourage faster exits.
 
@@ -476,30 +468,11 @@ Only enforced during reduce phase. The **laggard** is the oldest open position.
 
 **Force Close Logic**: When `ED ≤ 0`, we force-close the laggard.
 
-**What This Means**: "If everything else is moving and a ticker is stuck, calculate how much it would've yielded us and how much it would cost to close at the current level. If recent tickers have outperformed that (plus a certain buffer), then close the ticker for any profit or loss."
-
-**Opportunity Cost Tracking**: Every time any position closes (profitable or not), that PnL gets added to the "lost value" tally for all remaining open positions. This tracks opportunity cost — "we could have closed this laggard and taken those gains instead."
+**Opportunity Cost Tracking**: Every time any position closes (profitable or not), that PnL gets added to the "lost value" tally for all remaining open positions. This tracks opportunity cost against remaining open positions.
 
 **Cascade Effect**: This can cause a cascade of closes if many tickers are stuck and one suddenly shows motion.
 
-**In Practice**
-
-The laggard system closes **most positions that would otherwise have hit their targets**, but this forgone profit is acceptable. It also prevents us from lingering in tickers that would spike and either cause a more unfavorable force close or stop us out completely.
-
-The aggressive 45-minute reduce phase means we sacrifice potential gains for risk management — positions close earlier than they "should," but the alternative is exposure to reversals.
-
----
-
-### Rodeo Creep Effects on TP/Notional
-
-As covered in the Gainers section, each rodeo ride increases both TP target and position size by **50%** (default, adjustable). This applies to the **entry TP** (Stage 0) only — the DCA TPs remain at their standard values.
-
-**Example**:
-- Normal entry TP: 13%
-- After 1 rodeo: 13% × 1.5 = 19.5%
-- After 2 rodeos: 13% × 1.5 × 1.5 = 29.25%
-
-The rationale: unstable tickers produce deeper downward wicks and face greater upside resistance — more conviction is justified.
+The laggard system closes most positions that would otherwise have hit their targets, but this forgone profit is acceptable — the alternative is exposure to reversals on a position that has already stalled.
 
 ---
 
@@ -561,7 +534,7 @@ At scale, this system yields **5-50% daily returns**. However, scale is intentio
 
 These caps prevent us from being hunted due to order impact. Larger positions would move the market and attract attention from traders looking to stop-hunt or front-run our exits.
 
-Within these constraints, the strategies can function as a form of **Universal Basic Income** (UBI) — consistent, automated returns that compound over time without requiring active management beyond initial configuration and monitoring.
+Within these constraints, the strategies yield consistent, automated returns that compound over time without requiring active management beyond initial configuration and monitoring.
 
 The system is designed to run continuously, adapting to market conditions through its tiered conviction structure and dynamic filters, making money while you sleep.
 
