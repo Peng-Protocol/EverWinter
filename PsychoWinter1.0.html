@@ -641,7 +641,22 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
     <template x-for="entry in logs" :key="entry.id ?? (entry.t+entry.m+Math.random())">
       <div class="log-row" :class="entry.type">
         <span class="log-t" x-text="entry.t"></span>
-        <span x-text="entry.m"></span>
+        <template x-if="!entry.rollup"><span x-text="entry.m"></span></template>
+        <template x-if="entry.rollup">
+          <div style="flex:1;line-height:1.5">
+            <div style="font-weight:700" x-text="'⚡ FORCE ROLLUP ×'+entry.rollup.count+' | Net '+(entry.rollup.netPnl>=0?'+':'')+entry.rollup.netPnl.toFixed(2)+' USDT ('+entry.rollup.netRoi.toFixed(1)+'%)'"></div>
+            <div style="color:var(--text-lo);font-size:8px;word-break:break-all" x-text="entry.rollup.tickers.join(' · ')"></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:1px 10px;font-size:8px;color:var(--text-lo);margin-top:2px">
+              <span>wins <span :class="entry.rollup.wins>0?'profit':'loss'" x-text="entry.rollup.wins+'/'+entry.rollup.count"></span></span>
+              <span>avg DCA <span style="color:var(--text-mid)" x-text="entry.rollup.avgDcaStage.toFixed(1)"></span></span>
+              <span>avg dur <span style="color:var(--text-mid)" x-text="durStr(entry.rollup.avgDuration)"></span></span>
+              <span>↑ ROI <span class="profit" x-text="entry.rollup.bestByRoi.sym+' '+(entry.rollup.bestByRoi.pnlPct>=0?'+':'')+entry.rollup.bestByRoi.pnlPct.toFixed(1)+'%'"></span></span>
+              <span>↓ ROI <span class="loss" x-text="entry.rollup.worstByRoi.sym+' '+(entry.rollup.worstByRoi.pnlPct>=0?'+':'')+entry.rollup.worstByRoi.pnlPct.toFixed(1)+'%'"></span></span>
+              <span>↑ PnL <span class="profit" x-text="entry.rollup.bestByPnl.sym+' '+(entry.rollup.bestByPnl.totalPnl>=0?'+':'')+entry.rollup.bestByPnl.totalPnl.toFixed(2)"></span></span>
+              <span>↓ PnL <span class="loss" x-text="entry.rollup.worstByPnl.sym+' '+(entry.rollup.worstByPnl.totalPnl>=0?'+':'')+entry.rollup.worstByPnl.totalPnl.toFixed(2)"></span></span>
+            </div>
+          </div>
+        </template>
       </div>
     </template>
     <div x-show="logs.length===0" style="padding:12px 14px;font-family:var(--mono);font-size:9.5px;color:var(--text-lo)">No log entries.</div>
@@ -1210,8 +1225,12 @@ function psycho() { return {
     this.positions = this.positions.filter(x => x.id !== pos.id);
     this._notifyLaggardClose(pos, pnlPct);
 
-    const feeStr = fundFee !== 0 ? ` | Fund ${fundFee>=0?'+':''}${fundFee.toFixed(3)}` : '';
-    this.log(`🐻‍❄️ CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)${feeStr} | DCA${pos.dcaStage} | ${durStr(duration)}`, isWin?'success':'warn');
+    if (reason === 'force') {
+      this._addForceRollup({ symbol: pos.symbol, exitPrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin });
+    } else {
+      const feeStr = fundFee !== 0 ? ` | Fund ${fundFee>=0?'+':''}${fundFee.toFixed(3)}` : '';
+      this.log(`🐻‍❄️ CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)${feeStr} | DCA${pos.dcaStage} | ${durStr(duration)}`, isWin?'success':'warn');
+    }
     _closingIds.delete(pos.id);
     this.persist();
   },
@@ -1259,7 +1278,11 @@ function psycho() { return {
     this.positions = this.positions.filter(x => x.id !== pos.id);
     this._notifyLaggardClose(pos, pnlPct);
 
-    this.log(`🐻‍❄️ LIVE CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT | DCA${pos.dcaStage}`, isWin?'success':'warn');
+    if (reason === 'force') {
+      this._addForceRollup({ symbol: pos.symbol, exitPrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin });
+    } else {
+      this.log(`🐻‍❄️ LIVE CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT | DCA${pos.dcaStage}`, isWin?'success':'warn');
+    }
     _closingIds.delete(pos.id);
     this.persist();
   },
@@ -1347,6 +1370,51 @@ function psycho() { return {
 
   addPctDisplay() {
     return this._addPcts().map(p => '+'+p+'%').join(', ');
+  },
+
+  // ── Force-close rollup ──
+  // Groups force/laggard closes within a 15-min sliding window into one log entry.
+  _addForceRollup(item) {
+    if (!this._rollupBuf) this._rollupBuf = [];
+    this._rollupBuf.push(item);
+    if (this._rollupTimer) clearTimeout(this._rollupTimer);
+    this._rollupTimer = setTimeout(() => this._flushRollup(), 15 * 60 * 1000);
+  },
+
+  _flushRollup() {
+    const buf = this._rollupBuf || [];
+    this._rollupBuf = [];
+    this._rollupTimer = null;
+    if (!buf.length) return;
+    if (buf.length === 1) {
+      const b = buf[0];
+      this.log(`🐻‍❄️ CLOSED ${b.symbol} @ ${fmtP(b.exitPrice)} | FORCE | PnL ${b.totalPnl>=0?'+':''}${b.totalPnl.toFixed(3)} USDT (${b.pnlPct>=0?'+':''}${b.pnlPct.toFixed(1)}%) | DCA${b.dcaStage} | ${durStr(b.duration)}`, b.isWin?'success':'warn');
+      return;
+    }
+    const netPnl      = buf.reduce((s,x) => s + x.totalPnl, 0);
+    const totalMargin = buf.reduce((s,x) => s + x.margin, 0);
+    const netRoi      = totalMargin > 0 ? netPnl / totalMargin * 100 : 0;
+    const avgDuration = buf.reduce((s,x) => s + x.duration, 0) / buf.length;
+    const avgDcaStage = buf.reduce((s,x) => s + x.dcaStage, 0) / buf.length;
+    const wins        = buf.filter(x => x.isWin).length;
+    const byRoi       = [...buf].sort((a,b) => b.pnlPct - a.pnlPct);
+    const byPnl       = [...buf].sort((a,b) => b.totalPnl - a.totalPnl);
+    const fmt = x => ({ sym: x.symbol.replace('USDT',''), pnlPct: x.pnlPct, totalPnl: x.totalPnl });
+    const t = new Date().toTimeString().slice(0,8);
+    this._logSeq = (this._logSeq || 0) + 1;
+    this.logs.unshift({
+      t, id: this._logSeq, type: 'warn', m: `FORCE ROLLUP ×${buf.length}`,
+      rollup: {
+        count: buf.length,
+        tickers: buf.map(x => x.symbol.replace('USDT','')),
+        netPnl, netRoi, avgDuration, avgDcaStage, wins,
+        bestByRoi:  fmt(byRoi[0]),
+        worstByRoi: fmt(byRoi[byRoi.length - 1]),
+        bestByPnl:  fmt(byPnl[0]),
+        worstByPnl: fmt(byPnl[byPnl.length - 1]),
+      },
+    });
+    if (this.logs.length > 200) this.logs.pop();
   },
 
   // ── DCA band helper ──
