@@ -515,100 +515,11 @@ At $60 notional / 6× leverage = $10 margin per entry. For 10 positions at moder
 
 ## Psycho Mode
 
-### Overview
+Psycho Mode is a directionless shorting strategy with no entry filters beyond |24h change| ≥ 3%. Each scan cycle it randomly selects 3 tickers from the qualifying pool and shorts them, up to a maximum of 50 concurrent positions. It strips all RSI gates, funding filters, rodeo, FT/FUN/SalF logic, and TP reduce entirely. The idea is to lean into the defensive mechanics rather than the entry filter: DCA escalation and the laggard system do the sorting.
 
-Psycho Mode is a **defense-first, directionless shorting strategy**. It does not attempt to predict market direction, identify momentum, or filter for specific setups. Instead it shorts everything that moves and relies entirely on its defensive mechanics — tiered DCA escalation and the laggard system — to generate net profit.
+DCA uses 7 stages at 2× escalation — each add is double the last, staggered at 1.5%, 3%, 6%, 9%, 12%, 15%, 18% above entry. The escalating size ensures that when a ticker eventually reverts after a deep pump, even a partial retracement covers the full position. Entry TP ROI is 50%; per-stage TP decays as `max(entryTpRoi / (stage + 1), 3%)`. No reduce phase — the TP only moves on DCA progression.
 
-Where all other strategies are conviction-driven (filtering hard to find favorable entries), Psycho Mode leans into its defenses and lets the market do the work. The name is literal: it is a crazed bear with no preference, no filter, and no restraint.
-
-### Core Philosophy
-
-**"Short everything, let DCA and laggard sort it out."**
-
-- **Entry filter**: none beyond ≥ 3% or ≤ −3% 24h price change — the change only ensures the ticker is moving, not that it is moving the right way
-- **No RSI gates, no funding filter, no volume gates, no rodeo, no FT promotion, no FUN/SalF logic**
-- **Directionlessness is a feature**: large max position count (50) means many winners concurrently dislodge any stuck losers
-- **Escalating DCA absorbs adverse moves**: tickers that continue pumping get added into, accumulating a lower average; when they eventually revert (even slightly) the combined position hits TP
-- **Laggard culls the dead weight**: positions that are stuck and costing opportunity are force-closed before they drag further
-
-The strategy is not betting on mean reversion per se — it is betting that, across 50 concurrent positions, enough tickers will revert to cover the ones that do not.
-
-### Entry Mechanism
-
-Each scan cycle, Psycho Mode:
-1. Fetches all USDT Perpetual linear tickers in a single bulk call
-2. Filters for |24h change| ≥ `psychoChangePct` (default 3%) — both gainers and losers qualify
-3. Fisher-Yates shuffles the qualifying pool (true random selection)
-4. Takes the first `psychoPerCycle` (default 3) tickers from the shuffled pool
-5. Opens a SHORT on each, provided total open positions < `maxPositions` (default 50)
-6. Scanning halts when `maxPositions` is reached; resumes when positions close below the cap
-
-There is no entry RSI check, no funding rate filter, no volume requirement. If the ticker exists, has a price, and is moving ≥ 3%, it qualifies.
-
-### DCA Escalation
-
-Psycho Mode uses **7 DCA stages with 2× escalation** — each add is twice the previous notional. Starting from `minNotional` (default $0.50):
-
-| Stage | Add Notional | Cumulative Notional |
-|-------|-------------|---------------------|
-| Entry | $0.50 | $0.50 |
-| DCA 1 | $1.00 | $1.50 |
-| DCA 2 | $2.00 | $3.50 |
-| DCA 3 | $4.00 | $7.50 |
-| DCA 4 | $8.00 | $15.50 |
-| DCA 5 | $16.00 | $31.50 |
-| DCA 6 | $32.00 | $63.50 |
-| DCA 7 | $64.00 | $127.50 |
-
-Target margin utilization per position is **$84–$127** at full depth. In practice most positions close well before DCA 7 — this is the emergency maximum, not the expected outcome.
-
-**Add trigger spacing**: adds are staggered at 1.5%, 3%, 6%, 9%, 12%, 15%, 18% above entry price (short DCA triggers). The spacing grows deliberately: early adds are close (catching brief pops), later adds require the ticker to pump hard, which is exactly when the escalating size is needed to reduce the average cost meaningfully.
-
-### Take Profit
-
-**Entry TP ROI**: 50% by default. The TP price is placed as a **GTC Limit Buy reduceOnly** order. There is no TP reduce phase — the TP only moves due to DCA stage progression.
-
-**Per-stage TP decay**: `TP_ROI(stage) = max(entryTpRoi / (stage + 1), 3%)`. At stage 0 it is 50%; at stage 1 it is 25%; at stage 7 it floors at ~7.1% (never below 3%). Even at the deepest DCA stage, the TP still captures real profit on the combined notional.
-
-**No TP ingress, no rodeo, no reduce phase.** The TP is static per stage and moves only when a new DCA add is triggered.
-
-### Laggard System
-
-The laggard check evaluates the oldest open position whenever `positions.length ≥ 2` — there is no reduce-phase gate. This is the key behavioral difference from EverWinter's laggard: it is always active.
-
-**Calculation** (same math as EverWinter):
-1. **EV**: `margin × (entryTpRoi / 100)` — what the position was expected to earn
-2. **Buffed EV**: `EV × (1 + laggardProfitOffset / 100)` — with a 50% overhead buffer by default
-3. **Lost Value**: cumulative PnL from all positions that closed while this laggard remained open (tracked per-position, updated on every close)
-4. **Unrealized PnL**: current mark-to-market on the laggard
-5. **Effective Debt**: `buffedEV − lostValue − unrealizedPnL`
-6. **Force close** when `ED ≤ 0`
-
-Every position close (win or loss) adds its PnL to the lost-value tally of all remaining open positions. This creates opportunity-cost pressure: the longer a position lingers while others are closing profitably, the heavier its effective debt grows.
-
-With 50 max positions, high throughput of winning trades generates substantial lost-value pressure on stuck positions. A laggard that has been open through 10 profitable closes will have accumulated far more lost value than its initial EV — it gets force-closed aggressively.
-
-### Force Close and Stop Loss
-
-- **48-hour hard stop**: any position still open after 48 hours is force-closed at market. This is a last-resort backstop; the laggard system typically clears stuck positions in hours rather than days.
-- **Stop Loss**: placed only after the final DCA stage (DCA 7) fills. SL is set at `entryPrice × (1 + 1.05 / leverage)` — tight to the fully-averaged entry price. At this point the full notional is deployed; the SL is the final safety valve.
-- No SL before DCA 7 is complete. Premature SLs would cut positions that would otherwise DCA into profit.
-
-### Funding Fees
-
-Funding fees are accrued every 8 hours using the symbol's current funding rate pulled from the bulk ticker response. Each position tracks its last settlement timestamp; when 8h has elapsed, `fee = (fundingRate / 100) × notional` is deducted from the position's simulated PnL.
-
-At 50% entry TP ROI, a single winning entry recovers funding costs for multiple underperforming positions. Funding is a cost of carry, not a primary risk driver in Psycho Mode's expected-value model.
-
-### Sizing and Balance
-
-With `minNotional = $0.50` and `leverage = 10`:
-- **Entry margin**: $0.05
-- **Full DCA margin** (all 7 stages): ~$12.75
-- **50 positions at entry-only**: ~$2.50 committed
-- **50 positions fully DCA'd**: ~$637.50 committed (true worst case, never expected simultaneously)
-
-In practice, balance sizing should target the moderate case: assume 10–20% of open positions reach deep DCA stages at any time.
+The laggard check runs whenever there are ≥ 2 open positions (no reduce-phase gate, unlike EverWinter). It uses the same EV/lost-value/unrealized-PnL math: when `buffedEV − lostValue − uPnL ≤ 0`, the oldest position is force-closed. With 50 positions generating steady throughput, a stuck laggard accumulates opportunity-cost debt quickly. The 48h hard force-close is a last-resort backstop; in practice the laggard clears dead positions well before that.
 
 ---
 
