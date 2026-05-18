@@ -204,14 +204,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
     <span x-show="audioState==='suspended'" style="font-family:var(--mono);font-size:9px;color:var(--warn);cursor:pointer"
       @click="resumeKeepalive()">SYNC</span>
   </div>
-  <div class="nav-right">
-    <button class="btn btn-start" x-show="!bot.running"
-      :disabled="cfg.liveMode && (!cfg.apiKey || !cfg.apiSecret)"
-      @click="startBot()"
-      :title="cfg.liveMode && (!cfg.apiKey||!cfg.apiSecret) ? 'API key required for live mode' : ''">
-      START
-    </button>
-  </div>
+  <div class="nav-right"></div>
 </nav>
 
 <!-- ── MOBILE TABS ── -->
@@ -236,7 +229,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
       </button>
       <div x-show="cfgOpen.mode" class="acc-body">
         <div class="g">
-          <label class="tog" @click.prevent="if(!bot.running){cfg.liveMode=!cfg.liveMode;persist()}">
+          <label class="tog" @click.prevent="switchMode()">
             <div class="tog-t" :class="cfg.liveMode?'on':''"><div class="tog-k"></div></div>
             <span class="tog-l">Live Trading</span>
           </label>
@@ -416,14 +409,20 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
     </div>
 
     <!-- Bot controls -->
-    <div class="sec" x-show="bot.running">
+    <div class="sec">
       <button class="acc-hd" :class="cfgOpen.ctrl?'open':''" @click="cfgOpen.ctrl=!cfgOpen.ctrl">
         <span>BOT CONTROLS</span>
         <span class="acc-arrow" :class="cfgOpen.ctrl?'open':''">▶</span>
       </button>
       <div x-show="cfgOpen.ctrl" class="acc-body">
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn btn-stop" @click="stopBot()">STOP BOT</button>
+          <button class="btn btn-start" x-show="!bot.running"
+            :disabled="cfg.liveMode && (!cfg.apiKey || !cfg.apiSecret)"
+            @click="startBot()"
+            :title="cfg.liveMode && (!cfg.apiKey||!cfg.apiSecret) ? 'API key required for live mode' : ''">
+            START BOT
+          </button>
+          <button class="btn btn-stop" x-show="bot.running" @click="stopBot()">STOP BOT</button>
           <button class="btn btn-scan" @click="runPsychoScan()" :disabled="!bot.running">SCAN NOW</button>
         </div>
       </div>
@@ -745,8 +744,7 @@ function durStr(ms) {
   return h+'h '+m+'m';
 }
 
-const LS_KEY     = 'psychowinter_v1';
-const LS_LOG_KEY = 'psychowinter_v1_log';
+const LS_CFG_KEY = 'psychowinter_v1_cfg';
 const _closingIds = new Set();
 
 let _cdTimer    = null;
@@ -773,7 +771,7 @@ function psycho() { return {
     scanMins:         15,
     dcaStages:        7,
     dcaMultiplier:    2,
-    entryTpRoi:       50,
+    entryTpRoi:       25,
     runtimeHours:     48,
     laggardCheckEnabled: true,
     laggardProfitOffset: 50,
@@ -791,43 +789,98 @@ function psycho() { return {
   _lastSignedAt:  0,
 
   // ── Init ──
-  async init() {
+  _modeKey()    { return 'psychowinter_v1_' + (this.cfg.liveMode ? 'live' : 'pseudo'); },
+  _modeLogKey() { return this._modeKey() + '_log'; },
+
+  _loadModeState() {
+    this.positions    = [];
+    this.closedTrades = [];
+    this.sess         = { trades:0, wins:0, losses:0, pnl:0, forceClose:0 };
+    this.acct         = { upnl:0 };
+    this._symbolBanlist = {};
+    this.logs         = [];
     try {
-      const raw = localStorage.getItem(LS_KEY);
+      const raw = localStorage.getItem(this._modeKey());
       if (raw) {
         const s = JSON.parse(raw);
-        if (s.cfg)           Object.assign(this.cfg, s.cfg);
-        if (s.positions)     this.positions     = s.positions;
-        if (s.closedTrades)  this.closedTrades  = s.closedTrades;
-        if (s.sess)          this.sess          = s.sess;
+        if (s.positions)      this.positions      = s.positions;
+        if (s.closedTrades)   this.closedTrades   = s.closedTrades;
+        if (s.sess)           this.sess           = s.sess;
         if (s._symbolBanlist) this._symbolBanlist = s._symbolBanlist;
       }
-      const logRaw = localStorage.getItem(LS_LOG_KEY);
+      const logRaw = localStorage.getItem(this._modeLogKey());
       if (logRaw) this.logs = JSON.parse(logRaw);
     } catch(e) {}
-    // Restore running positions mark prices from storage
     for (const pos of this.positions) {
-      if (!pos.phase) pos.phase = 'normal';
+      if (!pos.phase)       pos.phase       = 'normal';
       if (!pos._stageCount) pos._stageCount = this.cfg.dcaStages;
     }
+  },
+
+  switchMode() {
+    if (this.bot.running) return;
+    // Save current mode state
+    try {
+      localStorage.setItem(this._modeKey(), JSON.stringify({
+        positions: this.positions, closedTrades: this.closedTrades,
+        sess: this.sess, _symbolBanlist: this._symbolBanlist,
+      }));
+      localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs));
+    } catch(e) {}
+    this.cfg.liveMode = !this.cfg.liveMode;
+    this._loadModeState();
+    this.persist();
+  },
+
+  async init() {
+    try {
+      const cfgRaw = localStorage.getItem(LS_CFG_KEY);
+      if (cfgRaw) { const s = JSON.parse(cfgRaw); if (s.cfg) Object.assign(this.cfg, s.cfg); }
+      this._loadModeState();
+    } catch(e) {}
     this.log('🐻‍❄️ PsychoWinter ready.', 'success');
     setInterval(() => { this.tick++; }, 1000);
   },
 
   persist() {
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify({
-        cfg: this.cfg,
-        positions: this.positions,
-        closedTrades: this.closedTrades,
-        sess: this.sess,
-        _symbolBanlist: this._symbolBanlist,
+      localStorage.setItem(LS_CFG_KEY, JSON.stringify({ cfg: this.cfg }));
+      localStorage.setItem(this._modeKey(), JSON.stringify({
+        positions: this.positions, closedTrades: this.closedTrades,
+        sess: this.sess, _symbolBanlist: this._symbolBanlist,
       }));
-      localStorage.setItem(LS_LOG_KEY, JSON.stringify(this.logs));
+      localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs));
     } catch(e) {}
   },
 
   // ── Bot control ──
+  async _refreshPositionTPs() {
+    let updated = 0;
+    for (const pos of this.positions) {
+      try {
+        const instr = await this.getInstrInfo(pos.symbol);
+        const cond  = pos.orders.filter(o => o.type === 'cond');
+        const stage = pos.dcaStage;
+        const avgEntry = stage > 0 ? (cond[stage - 1]?.avgAfter ?? pos.entryPrice) : pos.entryPrice;
+        const roi  = this._tpRoi(stage);
+        const raw  = avgEntry * (1 - (roi / 100) / pos.leverage);
+        const tp   = instr ? this.snapPrice(raw, instr) : parseFloat(raw.toFixed(6));
+        if (tp && tp > 0) {
+          pos.currentTpPrice = tp;
+          updated++;
+          // Update future stageTp values in unfilled orders
+          for (let i = stage; i < cond.length; i++) {
+            const stageRoi  = this._tpRoi(i + 1);
+            const avgAfter  = cond[i].avgAfter ?? pos.entryPrice;
+            const rawTp     = avgAfter * (1 - (stageRoi / 100) / pos.leverage);
+            cond[i].stageTp = instr ? this.snapPrice(rawTp, instr) : parseFloat(rawTp.toFixed(6));
+          }
+        }
+      } catch(e) {}
+    }
+    if (updated > 0) this.log(`🐻‍❄️ Refreshed TPs on ${updated} position${updated>1?'s':''} from config.`, 'info');
+  },
+
   async startBot() {
     if (this.bot.running) return;
     if (this.cfg.liveMode && (!this.cfg.apiKey || !this.cfg.apiSecret)) {
@@ -836,6 +889,7 @@ function psycho() { return {
     }
     this.bot.running  = true;
     this.bot.startTime = Date.now();
+    await this._refreshPositionTPs();
     this.log('🐻‍❄️ PsychoWinter started' + (this.cfg.liveMode ? ' [LIVE]' : ' [PSEUDO]') + '.', 'success');
     this.startKeepalive();
     await this.runScheduledCycle();
