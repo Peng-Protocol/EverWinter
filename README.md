@@ -178,6 +178,83 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 
 ---
 
+## PsychoWinter
+
+**PsychoWinter** (`PsychoWinter1.0.html`) is a standalone EverWinter variant built exclusively around **Psycho Mode** — a defense-first, directionless shorting strategy. It strips all RSI gates, FT/ADV FT pipelines, FUN, SalF, rodeo, and TP reduce mechanics. The bot shorts anything that moves and relies on 7-stage 2× DCA escalation and the laggard system to generate net profit.
+
+For the underlying strategy rationale — DCA escalation design, laggard math, and the expected-value model — see the [Psycho Mode section of the Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md#psycho-mode).
+
+### Technical Stack
+
+Same as EverWinter: Alpine.js, Bootstrap 5, Bybit V5 REST. Single-file HTML/JS, no build step, no backend. `localStorage` keys are namespaced separately (`psychowinter_v1`) so PsychoWinter state does not collide with EverWinter or PseudoWinter.
+
+### Modes
+
+PsychoWinter runs in two modes, toggled in the Config panel:
+
+| Mode | Description |
+|------|-------------|
+| **Pseudo** (default) | Phantom capital against live Bybit market data. No API key required. All scan, DCA, laggard, and funding logic runs identically to live mode. |
+| **Live** | Real orders on Bybit USDT Perpetuals. Requires a valid API key with Contract/Derivatives read + trade permissions. Bot refuses to start in live mode without credentials. |
+
+### Config Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `liveMode` | false | Toggle between pseudo and live trading |
+| `apiKey` / `apiSecret` | — | Bybit credentials (live mode only) |
+| `testnet` | false | Route live calls to Bybit testnet |
+| `leverage` | 10 | Leverage applied to all positions |
+| `minNotional` | 0.50 | Entry notional in USDT; DCA stages escalate from this base |
+| `maxPositions` | 50 | Hard cap on concurrent open positions; scanning halts at cap |
+| `psychoChangePct` | 3 | Minimum |24h change|% for a ticker to qualify |
+| `psychoPerCycle` | 3 | Tickers to short per scan cycle (randomly selected) |
+| `scanMins` | 15 | Minutes between full scan cycles |
+| `dcaStages` | 7 | Number of DCA add stages |
+| `dcaMultiplier` | 2 | Notional multiplier per DCA stage (2× = doubling) |
+| `entryTpRoi` | 50 | TP ROI% at entry stage; decays per stage, floors at 3% |
+| `runtimeHours` | 48 | Force-close any position open longer than this |
+| `laggardCheckEnabled` | true | Enable/disable laggard force-close check |
+| `laggardProfitOffset` | 50 | Buffer multiplier on laggard EV (50 = 1.5× buffed EV) |
+
+### UI Sections
+
+**Config panel** — all parameters above plus mode toggle and credential entry. DCA Ladder shows computed notional, margin, and cumulative totals per stage. TP Schedule shows ROI% and price target per stage for a hypothetical entry price.
+
+**Positions panel** — live feed of all open positions. Each card shows: symbol, DCA stage, entry price, current mark price, unrealised PnL (USDT and %), time open, next add price, TP price, and laggard effective-debt indicator (shown when the position is the oldest and laggard is active).
+
+**Stats / Log panel** — session counters (positions opened, closed, wins, losses, net PnL), force-close and laggard-close counts, and a reverse-chronological activity log (max 300 entries, colour-coded by event type).
+
+### Scan Dynamics (Psycho Mode)
+
+Each scan cycle:
+1. Fetches all USDT Perpetual linear tickers in a single bulk call (same endpoint as EverWinter)
+2. Filters for `|change24h| ≥ psychoChangePct` — both gainers and losers qualify; BTC is not excluded
+3. Fisher-Yates shuffles the qualifying pool for true random selection
+4. Takes the first `psychoPerCycle` tickers; skips any already held as open positions
+5. Opens a SHORT on each via `pseudoOpenShort` (pseudo) or `liveOpenShort` (live)
+6. If `positions.length ≥ maxPositions`, the cycle exits early without fetching
+
+Scanning resumes automatically on the next cycle once positions close below the cap.
+
+### Position Watcher
+
+Fires every 5 seconds. Per open position:
+- Fetches current mark price from a bulk ticker call
+- Checks whether any DCA add trigger has been breached; places the next add if so and recalculates TP
+- Checks TP hit (mark price ≤ TP price); closes the position and logs the trade
+- Runs the 8h funding fee accrual tick
+- Checks the 48h hard force-close deadline
+- After DCA 7 fills, places a stop-loss at `entryPrice × (1 + 1.05 / leverage)`
+
+After each position close, updates lost-value on all remaining open positions for the laggard calculation.
+
+### Laggard Check
+
+Evaluates the oldest open position whenever `positions.length ≥ 2`. No reduce-phase gate — the laggard check is always active. Force-closes the oldest position when `buffedEV − lostValue − unrealizedPnL ≤ 0`.
+
+---
+
 ## ChartWinter
 
 **ChartWinter** (`ChartWinter.html`) is a standalone companion tool for chart analysis and scan research. It shares EverWinter's config schema but operates entirely independently — no shared state, no inter-app communication.
