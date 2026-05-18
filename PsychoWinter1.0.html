@@ -411,6 +411,19 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           <input type="range" min="-90" max="200" step="10" x-model.number="cfg.laggardProfitOffset" @change="persist()">
           <div class="hint">Positive = more protective (wider buffer before close). Negative = more aggressive.</div>
         </div>
+        <div class="sep"></div>
+        <div class="g">
+          <label class="tog" @click.prevent="cfg.cascadeTriggerEnabled=!cfg.cascadeTriggerEnabled;persist()">
+            <div class="tog-t" :class="cfg.cascadeTriggerEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Cascade Trigger</span>
+          </label>
+          <div class="hint" style="margin-top:4px">When any position's uPnL hits the threshold, force-close the top 2 most profitable positions to seed a laggard cascade. 5-min cooldown between triggers.</div>
+        </div>
+        <div class="g" x-show="cfg.cascadeTriggerEnabled" style="margin-top:8px">
+          <div class="lbl">Trigger Threshold <b x-text="'$'+cfg.cascadeTriggerUPnL.toFixed(2)"></b></div>
+          <input type="range" min="0.50" max="20" step="0.50" x-model.number="cfg.cascadeTriggerUPnL" @change="persist()">
+          <div class="hint">Close top 2 positions by uPnL when any position's uPnL reaches this value.</div>
+        </div>
       </div>
     </div>
 
@@ -656,6 +669,10 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           <div class="sl">FORCE CLOSES</div>
           <div class="sv sm warn" x-text="sess.forceClose"></div>
         </div>
+        <div class="stat-box" x-show="sess.cascadeClose>0">
+          <div class="sl">CASCADE</div>
+          <div class="sv sm" style="color:var(--ice)" x-text="sess.cascadeClose"></div>
+        </div>
       </div>
       <div x-show="bot.startTime" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);margin-top:6px">
         Running: <span style="color:var(--text-mid)" x-text="(()=>{void tick;if(!bot.startTime)return '—';const ms=Date.now()-bot.startTime;const h=Math.floor(ms/3600000);const m=Math.floor((ms%3600000)/60000);return h+'h '+m+'m'})()"></span>
@@ -817,13 +834,15 @@ function psycho() { return {
     runtimeHours:     48,
     laggardCheckEnabled: true,
     laggardProfitOffset: 50,
+    cascadeTriggerEnabled: true,
+    cascadeTriggerUPnL: 2.50,
   },
 
   bot: { running: false, scanning: false, scanCd: 0, scanPct: 100, startTime: null },
   positions:    [],
   closedTrades: [],
   logs:         [],
-  sess: { trades:0, wins:0, losses:0, pnl:0, forceClose:0 },
+  sess: { trades:0, wins:0, losses:0, pnl:0, forceClose:0, cascadeClose:0 },
   acct: { upnl: 0 },
   _instrCache:    {},
   _symbolBanlist: {},
@@ -848,7 +867,7 @@ function psycho() { return {
         const s = JSON.parse(raw);
         if (s.positions)      this.positions      = s.positions;
         if (s.closedTrades)   this.closedTrades   = s.closedTrades;
-        if (s.sess)           this.sess           = s.sess;
+        if (s.sess)           { this.sess = s.sess; if (this.sess.cascadeClose == null) this.sess.cascadeClose = 0; }
         if (s._symbolBanlist) this._symbolBanlist = s._symbolBanlist;
       }
       const logRaw = localStorage.getItem(this._modeLogKey());
@@ -1326,6 +1345,11 @@ function psycho() { return {
       await this.runLaggardCheck();
     }
 
+    // Cascade trigger
+    if (this.cfg.cascadeTriggerEnabled && this.positions.length >= 2) {
+      await this.runCascadeTrigger();
+    }
+
     this.persist();
   },
 
@@ -1352,6 +1376,7 @@ function psycho() { return {
     this.sess.pnl = parseFloat((this.sess.pnl + totalPnl).toFixed(6));
     if (isWin) this.sess.wins++; else this.sess.losses++;
     if (reason === 'force' || reason === 'sl') this.sess.forceClose++;
+    if (reason === 'cascade') this.sess.cascadeClose++;
 
     const closed = {
       id: pos.id, symbol: pos.symbol, reason,
@@ -1371,7 +1396,8 @@ function psycho() { return {
       this._addForceRollup({ symbol: pos.symbol, exitPrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin });
     } else {
       const feeStr = fundFee !== 0 ? ` | Fund ${fundFee>=0?'+':''}${fundFee.toFixed(3)}` : '';
-      this.log(`${isWin?'✅':'❌'} CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)${feeStr} | DCA${pos.dcaStage} | ${durStr(duration)}`, isWin?'success':'warn');
+      const emoji = reason === 'cascade' ? '🌊' : (isWin ? '✅' : '❌');
+      this.log(`${emoji} CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)${feeStr} | DCA${pos.dcaStage} | ${durStr(duration)}`, isWin?'success':'warn');
     }
     _closingIds.delete(pos.id);
     this.persist();
@@ -1413,6 +1439,7 @@ function psycho() { return {
     this.sess.pnl = parseFloat((this.sess.pnl + totalPnl).toFixed(6));
     if (isWin) this.sess.wins++; else this.sess.losses++;
     if (reason === 'force' || reason === 'sl') this.sess.forceClose++;
+    if (reason === 'cascade') this.sess.cascadeClose++;
 
     this.closedTrades.push({ id:pos.id, symbol:pos.symbol, reason, entryPrice:pos.entryPrice, exitPrice, dcaStage:pos.dcaStage, margin:pos.margin, pnl, pnlPct, fundingFee:fundFee, totalPnl, duration, closedAt:Date.now() });
     if (this.closedTrades.length > 200) this.closedTrades.shift();
@@ -1424,7 +1451,8 @@ function psycho() { return {
     if (reason === 'force') {
       this._addForceRollup({ symbol: pos.symbol, exitPrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin });
     } else {
-      this.log(`${isWin?'✅':'❌'} LIVE CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT | DCA${pos.dcaStage}`, isWin?'success':'warn');
+      const emoji = reason === 'cascade' ? '🌊' : (isWin ? '✅' : '❌');
+      this.log(`${emoji} LIVE CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT | DCA${pos.dcaStage}`, isWin?'success':'warn');
     }
     _closingIds.delete(pos.id);
     this.persist();
@@ -1507,6 +1535,29 @@ function psycho() { return {
     if (!this.cfg.laggardCheckEnabled || this.positions.length < 2) return false;
     const oldest = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
     return oldest.id === pos.id;
+  },
+
+  async runCascadeTrigger() {
+    if (!this.cfg.cascadeTriggerEnabled) return;
+    if (this.positions.length < 2) return;
+    const now = Date.now();
+    if (now - (this._lastCascadeFired || 0) < 5 * 60 * 1000) return;
+
+    const threshold = this.cfg.cascadeTriggerUPnL;
+    const profitable = [...this.positions]
+      .filter(p => (p.upnl || 0) >= threshold && !_closingIds.has(p.id))
+      .sort((a, b) => (b.upnl || 0) - (a.upnl || 0));
+
+    if (profitable.length === 0) return;
+
+    this._lastCascadeFired = now;
+    const toClose = profitable.slice(0, 2);
+    this.log(`🌊 Cascade trigger — ${toClose.map(p => p.symbol.replace('USDT','')).join(' + ')} ≥$${threshold.toFixed(2)} uPnL — closing top ${toClose.length} to seed cascade`, 'warn');
+    for (const pos of toClose) {
+      if (this.positions.find(x => x.id === pos.id)) {
+        await this.closePosition(pos, 'cascade', pos.markPrice);
+      }
+    }
   },
 
   psychoLaggardInfo() {
