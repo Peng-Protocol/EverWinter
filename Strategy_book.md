@@ -260,7 +260,7 @@ After the first FUN close on a symbol, a **funding rate re-entry gate** is seede
 #### 3. **Historical Over-Extension Look-back**
 Before evaluating vol momentum, we count how many 15-minute candles in the past 3 hours had RSI6 ≥ the configured maximum. This count is the **single source of truth** for the over-extension multiplier applied to the VM threshold — it cannot be double-counted.
 
-- **For losers**: any over-extension in the look-back is **contradictory** — a ticker falling hard on the day shouldn't be simultaneously parabolic. These are graylisted for 6 hours.
+- **For losers**: any over-extension in the look-back means the ticker is behaving like a gainer — it is evaluated under the gainers gate instead of the losers gate.
 - **For gainers**: over-extension hits raise the VM floor multiplicatively (see below).
 
 #### 4. **RSI Proximity Block**
