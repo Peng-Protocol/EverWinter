@@ -1205,8 +1205,8 @@ function psycho() { return {
       orders,
       _stageCount:          this.cfg.dcaStages,
       fundingRate:          candidate.fundingRate ?? 0,
-      _fundingAccrued:      0,
-      _lastSettlementCheck: Date.now(),
+      _fundingAccrued:  0,
+      _nextFundingTime: 0,
       _laggardInitialEV:    margin * (tpRoi0 / 100),
       _laggardLostValue:    0,
       markPrice:            price,
@@ -1283,7 +1283,7 @@ function psycho() { return {
       openedAt: Date.now(), dcaStage:0, phase:'normal',
       orders, _stageCount: this.cfg.dcaStages,
       fundingRate: candidate.fundingRate ?? 0,
-      _fundingAccrued:0, _lastSettlementCheck: Date.now(),
+      _fundingAccrued:0, _nextFundingTime: 0,
       _laggardInitialEV: margin * (tpRoi0 / 100),
       _laggardLostValue: 0,
       markPrice: fillPrice, upnl:0,
@@ -1306,32 +1306,28 @@ function psycho() { return {
       const r   = await fetch(url);
       const d   = await r.json();
       for (const t of (d?.result?.list || [])) {
-        tickerMap[t.symbol] = { mark: parseFloat(t.lastPrice), fr: parseFloat(t.fundingRate??0)*100 };
+        tickerMap[t.symbol] = { mark: parseFloat(t.lastPrice), fr: parseFloat(t.fundingRate??0)*100, nft: parseInt(t.nextFundingTime||0) };
       }
     } catch(e) { /* keep last known prices */ }
 
     // Update mark prices and settle funding
-    const INTERVAL_MS = 8 * 3600 * 1000;
     for (const pos of this.positions) {
       const td = tickerMap[pos.symbol];
       if (td?.mark) {
         pos.markPrice   = td.mark;
         pos.fundingRate = td.fr ?? pos.fundingRate;
         pos.upnl = (pos.entryPrice - pos.markPrice) / pos.entryPrice * pos.leverage * pos.margin;
+        // Seed _nextFundingTime from ticker on first watch after open
+        if (td.nft && !pos._nextFundingTime) pos._nextFundingTime = td.nft;
       }
-      // Settle funding fees at 8h intervals
-      if (pos.fundingRate != null) {
-        const lastCheck = pos._lastSettlementCheck ?? pos.openedAt;
-        const firstNew  = Math.ceil(lastCheck / INTERVAL_MS);
-        const lastNew   = Math.floor(now / INTERVAL_MS);
-        if (lastNew >= firstNew) {
-          const count    = lastNew - firstNew + 1;
-          const notional = pos.markPrice ? pos.markPrice * pos.totalSize : pos.notional;
-          const fee      = (pos.fundingRate / 100) * notional * count;
-          pos._fundingAccrued      = (pos._fundingAccrued ?? 0) + fee;
-          pos._lastSettlementCheck = lastNew * INTERVAL_MS + 1; // 1ms past settled boundary prevents double-fire
-          if (fee !== 0) this.log(`💸 ${pos.symbol}: ${count}× funding @ ${pos.fundingRate>=0?'+':''}${pos.fundingRate.toFixed(4)}% → ${fee>=0?'+':''}${fee.toFixed(3)} USDT`, 'info');
-        }
+      // Settle when the ticker-reported funding time has passed
+      if (pos._nextFundingTime && now >= pos._nextFundingTime) {
+        const notional = pos.markPrice ? pos.markPrice * pos.totalSize : pos.notional;
+        const fee      = (pos.fundingRate / 100) * notional;
+        pos._fundingAccrued   = (pos._fundingAccrued ?? 0) + fee;
+        // Advance to next funding time; fall back to 1h ahead if API hasn't updated yet
+        pos._nextFundingTime  = (td?.nft && td.nft > now) ? td.nft : now + 3600000;
+        if (fee !== 0) this.log(`💸 ${pos.symbol}: funding @ ${pos.fundingRate>=0?'+':''}${pos.fundingRate.toFixed(4)}% → ${fee>=0?'+':''}${fee.toFixed(3)} USDT`, 'info');
       }
     }
 
