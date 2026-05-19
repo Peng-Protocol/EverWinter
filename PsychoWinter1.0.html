@@ -837,6 +837,8 @@ function durStr(ms) {
 
 const LS_CFG_KEY = 'psychowinter_v1_cfg';
 const _closingIds = new Set();
+let _auditRunning = false;
+let _auditPromise = null;
 
 let _cdTimer    = null;
 let _watchTimer = null;
@@ -1034,6 +1036,9 @@ function psycho() { return {
     this.bot.running  = true;
     this.bot.startTime = Date.now();
     await this._refreshPositionTPs();
+    if (!this.cfg.liveMode && this.positions.length > 0) {
+      await this.pseudoAuditGap();
+    }
     this.log('🐻‍❄️ PsychoWinter started' + (this.cfg.liveMode ? ' [LIVE]' : ' [PSEUDO]') + '.', 'success');
     this.startKeepalive();
     await this.runScheduledCycle();
@@ -1205,6 +1210,7 @@ function psycho() { return {
       markPrice:            price,
       upnl:                 0,
       _pseudo:              true,
+      _lastSeenAt:          Date.now(),
       slSet:                false,
       slPrice:              null,
     };
@@ -1426,6 +1432,12 @@ function psycho() { return {
       }
     }
 
+    // Stamp _lastSeenAt for pseudo positions so gap audit knows how far back to look
+    if (!this.cfg.liveMode) {
+      const seenNow = Date.now();
+      for (const pos of this.positions) { if (!pos._live) pos._lastSeenAt = seenNow; }
+    }
+
     // Laggard check
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 2) {
       await this.runLaggardCheck();
@@ -1626,6 +1638,143 @@ function psycho() { return {
     if (!this.cfg.laggardCheckEnabled || this.positions.length < 2) return false;
     const oldest = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
     return oldest.id === pos.id;
+  },
+
+  async pseudoFetchKlines(symbol, fromTs, toTs) {
+    const CAP_MS = 1800000; // 30-min cap
+    const cappedFrom = Math.max(fromTs, toTs - CAP_MS);
+    try {
+      const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=1&start=${cappedFrom}&end=${toTs}&limit=30`;
+      const r = await fetch(url);
+      const d = await r.json();
+      if (!d || d.retCode !== 0) return [];
+      const raw = d.result?.list || [];
+      return raw
+        .map(c => ({ t: parseInt(c[0]), o: parseFloat(c[1]), h: parseFloat(c[2]), l: parseFloat(c[3]), c: parseFloat(c[4]) }))
+        .filter(c => c.t >= cappedFrom && c.t <= toTs)
+        .sort((a, b) => a.t - b.t);
+    } catch(e) { return []; }
+  },
+
+  async pseudoAuditGap() {
+    if (_auditRunning) return _auditPromise;
+    const now = Date.now();
+    const toAudit = this.positions.filter(p => {
+      if (p._live) return false;
+      const gapFrom = p._lastSeenAt || p.openedAt || now;
+      return now - gapFrom >= 5000;
+    });
+    if (!toAudit.length) return;
+    _auditRunning = true;
+    _auditPromise = (async () => {
+      this.log('🌑 Gap-fill audit starting...', 'info');
+      try {
+        for (const pos of [...toAudit]) {
+          if (!this.positions.find(x => x.id === pos.id)) continue;
+          if (_closingIds.has(pos.id)) continue;
+          const gapFrom = pos._lastSeenAt || pos.openedAt;
+          const gapTo   = now;
+          _closingIds.add(pos.id);
+          this.log(`🌑 ${pos.symbol}: auditing ${Math.round((gapTo - gapFrom) / 60000)}min gap...`, 'info');
+          try {
+            const candles = await this.pseudoFetchKlines(pos.symbol, gapFrom, gapTo);
+            if (!candles.length) {
+              this.log(`🌑 ${pos.symbol}: no kline data for gap — keeping as-is`, 'warn');
+              pos._lastSeenAt = now;
+              _closingIds.delete(pos.id);
+              continue;
+            }
+            const instr = await this.getInstrInfo(pos.symbol);
+            let closed = false, closedAt = null, closePrice = null, closeReason = null;
+
+            for (const c of candles) {
+              if (closed) break;
+              // DCA fill checks
+              for (const add of pos.orders.filter(o => o.type === 'cond' && !o.filled)) {
+                if (c.h >= add.price) {
+                  add.filled = true;
+                  add.filledAt = c.t;
+                  const addQty = add.qty || 0;
+                  if (addQty > 0) {
+                    const newNotional = (pos.entryPrice * pos.totalSize) + (add.price * addQty);
+                    pos.totalSize  = parseFloat((pos.totalSize + addQty).toFixed(8));
+                    pos.entryPrice = newNotional / pos.totalSize;
+                    pos.margin     = (pos.entryPrice * pos.totalSize) / pos.leverage;
+                    pos.dcaStage   = pos.orders.filter(o => o.type === 'cond' && o.filled).length;
+                  }
+                  const stageRoi = this._tpRoi(pos.dcaStage);
+                  const rawTp    = pos.entryPrice * (1 - (stageRoi / 100) / pos.leverage);
+                  pos.currentTpPrice = instr ? this.snapPrice(rawTp, instr) : parseFloat(rawTp.toFixed(8));
+                  pos.tpPct = stageRoi;
+                  const stageCount = pos.orders.filter(o => o.type === 'cond').length;
+                  if (pos.dcaStage >= stageCount && !pos.slPrice && instr) {
+                    pos.slPrice = this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), instr);
+                    pos.slSet   = true;
+                  }
+                  this.log(`🌑 ${pos.symbol}: gap — DCA${pos.dcaStage} @ ${fmtP(add.price)} | avg ${fmtP(pos.entryPrice)} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
+                }
+              }
+              // Runtime force close
+              if (c.t - pos.openedAt >= this.cfg.runtimeHours * 3600000) {
+                closed = true; closedAt = c.t; closePrice = c.c; closeReason = 'force'; break;
+              }
+              // SL check
+              if (pos.slSet && pos.slPrice > 0 && c.h >= pos.slPrice) {
+                closed = true; closedAt = c.t; closePrice = pos.slPrice; closeReason = 'sl'; break;
+              }
+              // TP check
+              if (pos.currentTpPrice > 0 && c.l <= pos.currentTpPrice) {
+                closed = true; closedAt = c.t; closePrice = pos.currentTpPrice; closeReason = 'tp'; break;
+              }
+            }
+
+            if (closed) {
+              const duration = closedAt - pos.openedAt;
+              const pnl      = (pos.entryPrice - closePrice) / pos.entryPrice * pos.leverage * pos.margin;
+              const pnlPct   = (pos.entryPrice - closePrice) / pos.entryPrice * pos.leverage * 100;
+              const fundFee  = pos._fundingAccrued ?? 0;
+              const totalPnl = pnl + fundFee;
+              const isWin    = totalPnl > 0;
+              this.sess.trades++;
+              this.sess.pnl = parseFloat((this.sess.pnl + totalPnl).toFixed(6));
+              if (isWin) this.sess.wins++; else this.sess.losses++;
+              if (closeReason === 'force' || closeReason === 'sl') this.sess.forceClose++;
+              while (this.closedTrades.some(r => r.closedAt === closedAt)) closedAt++;
+              if (closeReason === 'force') {
+                this._addForceRollup({ symbol: pos.symbol, exitPrice: closePrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin, id: pos.id });
+              } else {
+                this.closedTrades.push({ id: pos.id, symbol: pos.symbol, reason: closeReason, entryPrice: pos.entryPrice, exitPrice: closePrice, dcaStage: pos.dcaStage, margin: pos.margin, pnl, pnlPct, fundingFee: fundFee, totalPnl, duration, closedAt });
+                if (this.closedTrades.length > 200) this.closedTrades.shift();
+              }
+              this._notifyLaggardClose(pos, pnlPct);
+              this.positions = this.positions.filter(x => x.id !== pos.id);
+              _closingIds.delete(pos.id);
+              const emoji = isWin ? '✅' : '❌';
+              this.log(`🌑 ${pos.symbol}: gap — closed [${closeReason}] @ ${fmtP(closePrice)} (${new Date(closedAt).toTimeString().slice(0,8)}) | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT [${isWin?'WIN':'LOSS'}]`, isWin ? 'success' : 'warn');
+            } else {
+              const last = candles[candles.length - 1];
+              if (last) {
+                pos.markPrice = last.c;
+                pos.upnl = (pos.entryPrice - last.c) / pos.entryPrice * pos.leverage * pos.margin;
+              }
+              pos._lastSeenAt = now;
+              this.log(`🌑 ${pos.symbol}: gap audit complete — still open. Mark: ${fmtP(pos.markPrice)}`, 'info');
+              _closingIds.delete(pos.id);
+            }
+          } catch(e) {
+            this.log(`🌑 ${pos.symbol}: gap audit error — ${e.message}`, 'error');
+            pos._lastSeenAt = now;
+            _closingIds.delete(pos.id);
+          }
+        }
+        this.persist();
+        this.log('🌑 Gap-fill audit complete.', 'success');
+      } finally {
+        _auditRunning = false;
+        _auditPromise = null;
+      }
+    })();
+    return _auditPromise;
   },
 
   async runCascadeTrigger() {
