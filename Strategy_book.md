@@ -473,7 +473,10 @@ During reduce phase, TP is lowered to encourage faster exits.
 
 **Laggard Check**
 
-Only enforced during reduce phase. The **laggard** is the oldest open position.
+Only enforced during reduce phase. The **laggard** is selected by one of two modes, configurable via the *DCA-Stage Mode* toggle (default: on):
+
+- **DCA-Stage Mode (default)**: the position with the most DCA stages triggered is the laggard. Age breaks ties. This targets the position with the clearest market evidence of difficulty — one that has had capital added into it repeatedly and still hasn't resolved.
+- **Age Mode**: the oldest open position by open time, the original behaviour.
 
 **The Calculation**:
 1. **Effective Value (EV)**: Initial margin × TP% (what we expected to make when we entered)
