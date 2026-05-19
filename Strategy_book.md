@@ -478,18 +478,9 @@ Only enforced during reduce phase. The **laggard** is selected by one of two mod
 - **DCA-Stage Mode (default)**: the position with the most DCA stages triggered is the laggard. Age breaks ties. This targets the position with the clearest market evidence of difficulty — one that has had capital added into it repeatedly and still hasn't resolved.
 - **Age Mode**: the oldest open position by open time, the original behaviour.
 
-**The Calculation**:
-1. **Effective Value (EV)**: Initial margin × TP% (what we expected to make when we entered)
-2. **Lost Value**: Cumulative PnL from other positions that closed while this laggard is still open
-3. **Unrealized PnL**: Current mark-to-market on the laggard
-4. **Effective Debt**: `buffedEV - lostValue - unrealizedPnL`
-   - Where `buffedEV = EV × 1.5` (50% buffer, configurable)
+**The Calculation**: Expected Value (entry margin × TP%) is buffered by 50% (configurable), then reduced by cumulative realized PnL from other closes and the laggard's own unrealized PnL. When that remainder hits zero, the laggard is force-closed.
 
-**Force Close Logic**: When `ED ≤ 0`, we force-close the laggard.
-
-**Opportunity Cost Tracking**: Every time any position closes (profitable or not), that PnL gets added to the "lost value" tally for all remaining open positions. This tracks opportunity cost against remaining open positions.
-
-**Cascade Effect**: This can cause a cascade of closes if many tickers are stuck and one suddenly shows motion.
+Every close — winning or losing — adjusts the tally for all remaining positions, so a strong winner can trigger a chain of laggard closes in sequence.
 
 The laggard system closes most positions that would otherwise have hit their targets, but this forgone profit is acceptable — the alternative is exposure to reversals on a position that has already stalled.
 
@@ -540,33 +531,29 @@ Psycho Mode is like a bear with a toothache which can only be soothed by blood. 
 - **Laggard check** active from the second open position onward — no reduce phase required
 - **48-hour hard force-close** as the backstop; laggard handles most exits well before that
 
-Because value lost is shared across all open positions, one strong winner can trigger a cascade — a single aggressive dump or sharp reversal on one ticker closes it at a profit, raising lost value for the entire book, which then forces the next weakest position out, and so on until only one or two remain. Conversely, a winning close on a position already in profit increases lost value, while a losing close decreases it, so the system naturally accelerates when things go right and slows when they don't. The real game is just waiting for one or two tickers to move decisively — either dump hard after entry or pump and reverse sharply — and then let the cascade do the rest. The flip side is that many positions close as small losses on the way out, so win rate tends to be low; what keeps ROI healthy is that the winning closes, when they come, are large enough to absorb the accumulated dust.
+When a winner closes it raises the lost-value tally for every remaining position, which can push the next-weakest over its threshold and out — and so on. The real game is waiting for one ticker to move decisively and letting the cascade do the rest. Win rate is low; what keeps ROI healthy is that the winners are large enough to absorb the dust.
 
 ### Cascade Triggers
 
-The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement — they intervene directly when the book reaches a condition worth acting on immediately.
+The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement.
 
-**Collective Profit Cascade (CPC)** fires when the book's total unrealized PnL crosses a configurable positive threshold. At that point, the two most profitable positions (above a minimum ROI%) are closed, crystallizing gains and seeding further laggard pressure across the remaining book. The logic: if the book is collectively in profit, lock some of it in rather than waiting for every position to reach TP individually. The 5-minute cooldown prevents repeated firing during a single volatile move.
+**Collective Profit Cascade (CPC)** fires when the book's total unrealized PnL crosses the threshold (2.5× entry margin, derived automatically from notional and leverage). The two most profitable positions are closed to crystallize gains and seed laggard pressure across the remaining book. 5-minute cooldown.
 
-**Position Cascade Trigger (PPC)** fires when any individual position's unrealized loss exceeds a configurable threshold. Rather than waiting for the laggard system to eventually close a badly stuck position, PPC immediately closes the most profitable positions in the book — escalating each successive trigger — to force cascade pressure toward the loser. On the first trigger it closes a configurable base count, doubling (or by the configured multiplier) on each successive fire as long as a trigger position remains. When the trigger position eventually closes or recovers above the threshold, the escalation counter resets to zero and the next trigger cycle starts fresh at the base count. If no profitable positions meet the eligibility threshold when PPC fires, the counter is preserved at its current value so escalation picks up where it left off if targets appear later; a scan runs immediately to seed new candidates, then PPC retries after the cooldown. The escalation count is in-memory only and is not persisted — a bot restart resets it to the base count regardless of where escalation had reached.
+**Position Cascade Trigger (PPC)** fires when any single position's unrealized loss exceeds the same threshold. The most profitable positions are closed immediately — escalating in count on each successive fire — to force cascade pressure toward the loser. Escalation resets when the trigger position recovers or closes. The escalation count is not persisted across restarts.
 
-Both triggers share a configurable minimum ROI% filter for their close targets, preventing barely-positive dust positions from being closed when better candidates exist.
-
-These cascade features are emergent to PsychoWinter's reactive design. They would be redundant in EverWinter, where entry filters do the equivalent work upstream. In PsychoWinter, where entry is intentionally unfiltered, they are the primary mechanism for actively managing a book full of mixed outcomes.
+Both triggers share a minimum ROI% filter so dust positions aren't used as cascade targets when better candidates exist.
 
 ### Anti-Martingale (AMa)
 
-Where DCA escalates into losing positions (Martingale), AMa escalates into winning ones. When enabled, positions open with no take profit. Instead, as price falls in the favorable direction, flat adds are placed at fixed intervals: −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% below entry. At the seventh stage, a TP is set at −22% of the original entry price.
+Where DCA escalates into losing positions, AMa escalates into winning ones. Positions open with no take profit; as price falls in the profitable direction, flat adds are placed at −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% from entry. At the seventh stage a TP is set at −22% from the original entry.
 
-AMa adds are intentionally flat — the same base notional as the initial entry each time. This is a deliberate constraint. Because a full DCA cascade can also be triggered if price reverses, the combined worst-case margin (all AMa adds filled, then all DCA stages filled) must remain manageable. Multiplicative AMa sizing would compound on top of already-multiplicative DCA escalation, producing an unsustainable drawdown profile. Flat sizing keeps the two systems independently bounded.
+Adds are flat (same base notional each time) to keep AMa and DCA margin exposure independently bounded — multiplicative adds on top of multiplicative DCA would be unmanageable in the worst case.
 
-**Cancellation**: If price reverses upward after some AMa stages have filled, a DCA trigger cancels the AMa mode and sets a normal TP based on the current DCA stage and weighted average entry. The position continues from that point as a standard DCA trade. Critically, the AMa adds that already filled remain part of the position and are already factored into `pos.entryPrice` at the moment the DCA TP is calculated — so the TP is computed against a lower average entry than if AMa had never run. A position that went through two AMa stages before reversing is in a marginally better recovery position than a clean entry that went straight into DCA.
+If price reverses and a DCA level triggers, AMa is cancelled and a normal stage-based TP is set against the current weighted average entry — which is already improved by the AMa fills that ran before the reversal.
 
-**The asymmetry**: When a position moves in the profitable direction, AMa enhances it without waiting for a TP that may never be set. When it reverses, DCA absorbs the move. In the cascade context, positions with multiple AMa stages filled are more profitable closes — they close at a larger gain, contributing more to the laggard's lost-value tally and accelerating the cascade further.
+AMa adds count against available margin exactly like DCA fills.
 
-**Note**: AMa adds are recorded in `pos.totalSize` and `pos.margin` exactly like DCA fills. They count against available margin.
-
-**Recommended balance**: minimum **$250** with default settings (50 positions × $6 notional at 6× leverage, with DCA headroom). Maximum practical exposure assuming an average of 2 DCA stages triggered per position: **150 positions × $66 notional × 3 adds = ~$29,700 notional** — approximately **$6,666 in margin** at 6× leverage. This is a pessimistic estimate relative to actual performance; the $6,666 figure is intentionally buffered.
+**Recommended balance**: minimum **$250** with default settings. Maximum practical exposure at 2 DCA stages average: ~**$6,666 in margin** at 6× leverage (pessimistic estimate, intentionally buffered).
 
 **"Short everything. Let DCA Escalation and Laggard check sort the rest."**
 
