@@ -533,6 +533,10 @@ Psycho Mode is like a bear with a toothache which can only be soothed by blood. 
 
 When a winner closes it raises the lost-value tally for every remaining position, which can push the next-weakest over its threshold and out — and so on. The real game is waiting for one ticker to move decisively and letting the cascade do the rest. Win rate is low; what keeps ROI healthy is that the winners are large enough to absorb the dust.
 
+### Swap-Out
+
+When at max positions, each scan looks for up to a configurable number of stagnant positions — those within ±3% ROI (configurable) — and replaces them with fresh tickers from the qualifying pool. Profitable stagnant positions are swapped first, since closing them also seeds lost-value pressure on the remaining book.
+
 ### Cascade Triggers
 
 The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement.

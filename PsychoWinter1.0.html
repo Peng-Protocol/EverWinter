@@ -327,8 +327,25 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           <div class="lbl">Scan Interval <b x-text="cfg.scanMins+'m'"></b></div>
           <input type="range" min="5" max="60" step="5" x-model.number="cfg.scanMins" :disabled="bot.running||cfgLocked" @change="persist()">
         </div>
+        <div class="sep" style="margin-top:10px"></div>
+        <div class="g">
+          <label class="tog" @click.prevent="if(!cfgLocked)cfg.swapOutEnabled=!cfg.swapOutEnabled;if(!cfgLocked)persist()">
+            <div class="tog-t" :class="cfg.swapOutEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Swap-Out at Max</span>
+          </label>
+          <div class="hint" style="margin-top:4px">At max positions, close stagnant positions and replace with fresh tickers. Profitable stagnant positions are swapped first.</div>
+        </div>
+        <div class="g" x-show="cfg.swapOutEnabled" style="margin-top:8px">
+          <div class="lbl">Max Swaps per Scan <b x-text="cfg.swapOutCount"></b></div>
+          <input type="range" min="1" max="10" step="1" x-model.number="cfg.swapOutCount" :disabled="cfgLocked" @change="persist()">
+        </div>
+        <div class="g" x-show="cfg.swapOutEnabled" style="margin-top:8px">
+          <div class="lbl">Stagnant Threshold ±<b x-text="cfg.swapOutRoiPct+'%'"></b></div>
+          <input type="range" min="0.5" max="10" step="0.5" x-model.number="cfg.swapOutRoiPct" :disabled="cfgLocked" @change="persist()">
+          <div class="hint">Positions with |ROI| below this are eligible for replacement.</div>
+        </div>
         <div class="alert a-info" style="margin-top:8px;font-size:9.5px">
-          Scanning halts automatically when open positions = max positions. Resumes when positions close.
+          At max positions, swap-out replaces stagnant positions with fresh tickers each scan. Disable to halt scanning at max instead.
         </div>
       </div>
     </div>
@@ -962,6 +979,9 @@ function psycho() { return {
     maxPositions:     50,
     psychoChangePct:      3,
     psychoPerCycle:       12,
+    swapOutEnabled:       true,
+    swapOutCount:         3,
+    swapOutRoiPct:        3,
     scanMins:             15,
     whiplashProximityPct: 20,
     dcaStages:        7,
@@ -1191,10 +1211,6 @@ function psycho() { return {
   // ── Psycho Scan ──
   async runPsychoScan() {
     if (this.bot.scanning) return;
-    if (this.positions.length >= this.cfg.maxPositions) {
-      this.log(`⚡ Scan skipped — at max positions (${this.positions.length}/${this.cfg.maxPositions})`, 'info');
-      return;
-    }
     this.bot.scanning = true;
     this.log('⚡ Psycho scan starting...', 'scan');
     let tickers = [];
@@ -1203,9 +1219,21 @@ function psycho() { return {
       const r = await fetch(url);
       const d = await r.json();
       tickers = d?.result?.list || [];
-    } catch(e) { this.log('Ticker fetch failed: '+e.message, 'error'); return; }
+    } catch(e) { this.log('Ticker fetch failed: '+e.message, 'error'); this.bot.scanning = false; return; }
 
     const openSymbols = new Set(this.positions.map(p => p.symbol));
+
+    if (this.positions.length >= this.cfg.maxPositions) {
+      if (this.cfg.swapOutEnabled) {
+        await this._runSwapOut(tickers, openSymbols);
+      } else {
+        this.log(`⚡ Scan skipped — at max positions (${this.positions.length}/${this.cfg.maxPositions})`, 'info');
+      }
+      this.bot.scanning = false;
+      this.persist();
+      return;
+    }
+
     const threshold   = this.cfg.psychoChangePct;
     const slots       = this.cfg.maxPositions - this.positions.length;
     const take        = Math.min(this.cfg.psychoPerCycle, slots);
@@ -1243,6 +1271,55 @@ function psycho() { return {
     if (opened < take) this.log(`⚡ Scan done — opened ${opened}/${take} (pool exhausted or max hit)`, 'scan');
     this.bot.scanning = false;
     this.persist();
+  },
+
+  async _runSwapOut(tickers, openSymbols) {
+    const roiThreshold = this.cfg.swapOutRoiPct ?? 3;
+    const maxSwaps     = Math.min(this.cfg.swapOutCount ?? 3, this.positions.length);
+
+    const candidates = this.positions
+      .filter(p => !_closingIds.has(p.id) && !(p._amaActive && !p._amaCancelled))
+      .map(p => ({ pos: p, roi: p.margin > 0 ? (p.upnl / p.margin) * 100 : 0 }))
+      .filter(({ roi }) => Math.abs(roi) < roiThreshold)
+      .sort((a, b) => b.roi - a.roi)
+      .slice(0, maxSwaps);
+
+    if (candidates.length === 0) {
+      this.log(`🔄 Swap-out: no stagnant positions within ±${roiThreshold}%`, 'info');
+      return;
+    }
+
+    const pool = tickers.filter(t => {
+      if (!t.symbol.endsWith('USDT')) return false;
+      if (t.symbol === 'BTCUSDT' || t.symbol === 'ETHUSDT') return false;
+      if (openSymbols.has(t.symbol)) return false;
+      if (this._symbolBanlist[t.symbol]) return false;
+      const chg = Math.abs(parseFloat(t.price24hPcnt || 0) * 100);
+      return chg >= this.cfg.psychoChangePct;
+    });
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+
+    this.log(`🔄 Swap-out: ${candidates.length} candidate${candidates.length !== 1 ? 's' : ''}, ${pool.length} in replacement pool`, 'scan');
+
+    let swapped = 0;
+    for (const { pos, roi } of candidates) {
+      if (pool.length === 0) { this.log('🔄 Swap-out: replacement pool exhausted', 'warn'); break; }
+      if (!this.positions.find(x => x.id === pos.id)) continue;
+      this.log(`🔄 ${pos.symbol.replace('USDT', '')}: swap-out (ROI ${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%)`, 'warn');
+      await this.closePosition(pos, 'swap');
+      const t = pool.shift();
+      const price = parseFloat(t.lastPrice);
+      const fr    = parseFloat(t.fundingRate ?? 0) * 100;
+      if (price > 0) {
+        await this.openShort({ symbol: t.symbol, price, fundingRate: fr });
+        swapped++;
+      }
+      await new Promise(r => setTimeout(r, 300));
+    }
+    this.log(`🔄 Swap-out complete — ${swapped} replaced`, swapped > 0 ? 'trade' : 'info');
   },
 
   // ── Open Short ──
