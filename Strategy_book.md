@@ -36,6 +36,20 @@ In the most advantageous scenario, a single ticker flows through multiple strate
 
 ---
 
+## Proactive vs Reactive
+
+EverWinter and PsychoWinter represent two fundamentally different approaches to the same market.
+
+**EverWinter is proactive.** It expends its design budget at the entry gate — RSI filters across timeframes, volume momentum thresholds, funding rate classification, extension counters, rodeo creep state. The goal is to be selectively right before committing capital. Each strategy tries to identify a specific type of price behavior and enter only when confidence is high. Win rate matters. A missed entry is acceptable; a bad entry is a design failure.
+
+**PsychoWinter is reactive.** It expends almost no energy at the entry gate — a single change% threshold is the only filter. Instead, all design budget goes into the exit system: DCA escalation absorbs adverse moves and improves the average entry, the laggard check applies continuous pressure to the weakest position, and cascade triggers use winners to force resolution on losers. PsychoWinter accepts that many entries will be wrong and plans for it structurally. Win rate is low by design. The exits are where the edge lives.
+
+The practical implication: EverWinter's performance is more regime-dependent — it performs best when the conditions its filters are tuned for are present. PsychoWinter's performance is more consistent across market regimes because it doesn't bet on any signal being valid. It bets instead on the aggregate behavior of a large position book under mechanical pressure. The tradeoff is capital headroom: PsychoWinter requires more margin and tolerates more simultaneous open drawdown than EverWinter.
+
+Neither approach is strictly better. They are different tools for different risk tolerances and market readings.
+
+---
+
 ## Gainers Strategy
 
 ### Overview
@@ -524,6 +538,18 @@ Psycho Mode is like a bear with a toothache which can only be soothed by blood. 
 - **48-hour hard force-close** as the backstop; laggard handles most exits well before that
 
 Because value lost is shared across all open positions, one strong winner can trigger a cascade — a single aggressive dump or sharp reversal on one ticker closes it at a profit, raising lost value for the entire book, which then forces the next weakest position out, and so on until only one or two remain. Conversely, a winning close on a position already in profit increases lost value, while a losing close decreases it, so the system naturally accelerates when things go right and slows when they don't. The real game is just waiting for one or two tickers to move decisively — either dump hard after entry or pump and reverse sharply — and then let the cascade do the rest. The flip side is that many positions close as small losses on the way out, so win rate tends to be low; what keeps ROI healthy is that the winning closes, when they come, are large enough to absorb the accumulated dust.
+
+### Cascade Triggers
+
+The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement — they intervene directly when the book reaches a condition worth acting on immediately.
+
+**Collective Profit Cascade (CPC)** fires when the book's total unrealized PnL crosses a configurable positive threshold. At that point, the two most profitable positions (above a minimum ROI%) are closed, crystallizing gains and seeding further laggard pressure across the remaining book. The logic: if the book is collectively in profit, lock some of it in rather than waiting for every position to reach TP individually. The 5-minute cooldown prevents repeated firing during a single volatile move.
+
+**Position Cascade Trigger (PPC)** fires when any individual position's unrealized loss exceeds a configurable threshold. Rather than waiting for the laggard system to eventually close a badly stuck position, PPC immediately closes the most profitable positions in the book — escalating each successive trigger — to force cascade pressure toward the loser. On the first trigger it closes a configurable base count, doubling (or by the configured multiplier) on each successive fire as long as a trigger position remains. When the trigger position eventually closes or recovers, the escalation counter resets. If no profitable positions meet the eligibility threshold when PPC fires, it scans immediately to seed new candidates, then retries after the cooldown.
+
+Both triggers share a configurable minimum ROI% filter for their close targets, preventing barely-positive dust positions from being closed when better candidates exist.
+
+These cascade features are emergent to PsychoWinter's reactive design. They would be redundant in EverWinter, where entry filters do the equivalent work upstream. In PsychoWinter, where entry is intentionally unfiltered, they are the primary mechanism for actively managing a book full of mixed outcomes.
 
 **Recommended balance**: minimum **$250** with default settings (50 positions × $6 notional at 6× leverage, with DCA headroom). Maximum practical exposure assuming an average of 2 DCA stages triggered per position: **150 positions × $66 notional × 3 adds = ~$29,700 notional** — approximately **$6,666 in margin** at 6× leverage. This is a pessimistic estimate relative to actual performance; the $6,666 figure is intentionally buffered.
 
