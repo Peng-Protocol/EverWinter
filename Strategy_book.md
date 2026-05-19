@@ -543,21 +543,25 @@ The laggard check applies slow, continuous pressure. Cascade triggers are the ag
 
 **Collective Profit Cascade (CPC)** fires when the book's total unrealized PnL crosses the threshold (2.5× entry margin, derived automatically from notional and leverage). The two most profitable positions are closed to crystallize gains and seed laggard pressure across the remaining book. 5-minute cooldown.
 
-**Position Cascade Trigger (PPC)** fires when any single position's unrealized loss exceeds the same threshold. The most profitable positions are closed immediately — escalating in count on each successive fire — to force cascade pressure toward the loser. Escalation resets when the trigger position recovers or closes. The escalation count is not persisted across restarts.
+**Per-Position Cascade (PPC)** fires when any single position's unrealized loss exceeds the same threshold. The most profitable positions are closed immediately — escalating in count on each successive fire — to force cascade pressure toward the laggard. Escalation resets when the trigger position recovers or closes. The escalation count is not persisted across restarts.
 
 Both triggers share a minimum ROI% filter so dust positions aren't used as cascade targets when better candidates exist.
 
 ### Anti-Martingale (AMa)
 
-Where DCA escalates into losing positions, AMa escalates into winning ones. Positions open with no take profit; as price falls in the profitable direction, flat adds are placed at −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% from entry. At the seventh stage a TP is set at −22% from the original entry.
+Where DCA escalates into losing positions, AMa creeps into winning ones. When enabled, positions open with no take profit; as price falls in the profitable direction, flat adds are placed at −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% from entry. At the seventh stage a TP is set at −22% from the original entry.
 
-Adds are flat (same base notional each time) to keep AMa and DCA margin exposure independently bounded — multiplicative adds on top of multiplicative DCA would be unmanageable in the worst case.
+Adds are flat — the same base notional each time. DCA adds are multiplicative; if AMa adds were too, a position that ran through several AMa stages before reversing into full DCA would carry an extreme margin load. Flat AMa sizing keeps the worst-case draw manageable regardless of how far AMa progressed before the reversal.
 
-If price reverses and a DCA level triggers, AMa is cancelled and a normal stage-based TP is set against the current weighted average entry — which is already improved by the AMa fills that ran before the reversal.
+If price reverses and a DCA level triggers, AMa is cancelled and a normal stage-based TP is set against the current weighted average entry. The AMa fills that ran before the reversal pull the average entry slightly lower than the original — marginally less favorable for recovery — but the effect is small since the flat AMa notional is dwarfed by the exponential DCA adds that follow.
+
+A known nuisance: some positions will trigger one or two AMa stages, then retrace just enough to cancel into DCA without a decisive move in either direction. This is expected and not a flaw — the laggard system eventually resolves these.
 
 AMa adds count against available margin exactly like DCA fills.
 
-**Recommended balance**: minimum **$250** with default settings. Maximum practical exposure at 2 DCA stages average: ~**$6,666 in margin** at 6× leverage (pessimistic estimate, intentionally buffered).
+### Sizing
+
+**Recommended balance**: minimum **$250** with default settings (50 max positions, $6 notional, 6× leverage). Maximum practical exposure at 2 DCA stages average: ~**$2,500** in margin — raising max positions to 150 pushes this to ~$6,666.
 
 **"Short everything. Let DCA Escalation and Laggard check sort the rest."**
 
