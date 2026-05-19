@@ -1150,6 +1150,23 @@ function psycho() { return {
     if (!instr) { this.log(`${sym}: no instrument info — skipping`, 'warn'); return; }
 
     const lev = this.cfg.leverage;
+
+    if (instr.maxLeverage > 0 && lev > instr.maxLeverage) {
+      if (instr.maxLeverage <= 5) {
+        this._symbolBanlist[sym] = `maxLeverage ${instr.maxLeverage}× ≤ 5× (below bot minimum)`;
+        this.log(`${sym}: max leverage ${instr.maxLeverage}× ≤ 5× — permanently banned`, 'warn');
+        this.persist();
+      } else {
+        this.log(`${sym}: cfg leverage ${lev}× exceeds symbol max ${instr.maxLeverage}× — skipping`, 'warn');
+      }
+      return;
+    }
+    if (instr.minPrice > 0 && price < instr.minPrice) {
+      this._symbolBanlist[sym] = `price below minPrice ${instr.minPrice}`;
+      this.log(`${sym}: price ${price} below API minPrice ${instr.minPrice} — permanently banned`, 'warn');
+      this.persist(); return;
+    }
+
     const rawQty = this.cfg.minNotional / price;
     const qty    = this.snapQty(rawQty, instr);
     if (qty <= 0) { this.log(`${sym}: qty below min — skipping`, 'warn'); return; }
@@ -1231,6 +1248,31 @@ function psycho() { return {
     if (!instr) { this.log(`${sym}: no instrument info — skipping`, 'warn'); return; }
 
     const lev = this.cfg.leverage;
+
+    if (instr.maxLeverage > 0 && lev > instr.maxLeverage) {
+      if (instr.maxLeverage <= 5) {
+        this._symbolBanlist[sym] = `maxLeverage ${instr.maxLeverage}× ≤ 5× (below bot minimum)`;
+        this.log(`${sym}: max leverage ${instr.maxLeverage}× ≤ 5× — permanently banned`, 'warn');
+        this.persist();
+      } else {
+        this.log(`${sym}: cfg leverage ${lev}× exceeds symbol max ${instr.maxLeverage}× — skipping`, 'warn');
+      }
+      return;
+    }
+    if (instr.minPrice > 0 && price < instr.minPrice) {
+      this._symbolBanlist[sym] = `price below minPrice ${instr.minPrice}`;
+      this.log(`${sym}: price ${price} below API minPrice ${instr.minPrice} — permanently banned`, 'warn');
+      this.persist(); return;
+    }
+
+    // Pre-flight TP validity check before placing market order
+    const preFlight_tpPrice = this.snapPrice(price * (1 - (this.cfg.entryTpRoi / 100) / lev), instr);
+    if (!preFlight_tpPrice || preFlight_tpPrice <= 0) {
+      this._symbolBanlist[sym] = 'TP price invalid';
+      this.log(`${sym}: TP price would be zero/invalid — permanently banned`, 'warn');
+      this.persist(); return;
+    }
+
     try { await this.liveSetLeverage(sym, lev); } catch(e) { /* may already be set */ }
 
     const rawQty = this.cfg.minNotional / price;
@@ -1249,6 +1291,11 @@ function psycho() { return {
     const margin         = actualNotional / lev;
     const tpRoi0         = this.cfg.entryTpRoi;
     const tpPrice        = this.snapPrice(fillPrice * (1 - (tpRoi0 / 100) / lev), instr);
+    if (!tpPrice || tpPrice <= 0) {
+      this._symbolBanlist[sym] = 'TP price invalid';
+      this.log(`${sym}: TP price invalid after fill — position open but symbol banned for future entries`, 'warn');
+      this.persist();
+    }
     const addPcts        = this._addPcts();
 
     // Build orders array (same as pseudo — watcher monitors and executes adds)
@@ -1256,6 +1303,7 @@ function psycho() { return {
     let runNotional = actualNotional, runSize = qty;
     for (let i = 0; i < this.cfg.dcaStages; i++) {
       const addPrice  = this.snapPrice(fillPrice * (1 + addPcts[i] / 100), instr);
+      if (!addPrice || addPrice <= 0) { this.log(`${sym}: DCA stage ${i+1} price invalid — skipping stage`, 'warn'); break; }
       const stageNotional = this.cfg.minNotional * Math.pow(this.cfg.dcaMultiplier, i + 1);
       const addQty    = this.snapQty(stageNotional / addPrice, instr);
       runNotional += addPrice * addQty;
@@ -1263,6 +1311,7 @@ function psycho() { return {
       const avgEntry = runSize > 0 ? runNotional / runSize : addPrice;
       const stageRoi = this._tpRoi(i + 1);
       const stageTp  = this.snapPrice(avgEntry * (1 - (stageRoi / 100) / lev), instr);
+      if (!stageTp || stageTp <= 0) { this.log(`${sym}: DCA stage ${i+1} TP invalid — skipping stage`, 'warn'); break; }
       orders.push({ label:'Add'+(i+1), price:addPrice, type:'cond', filled:false, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
     }
 
@@ -2055,11 +2104,14 @@ function psycho() { return {
       if (!item) return null;
       const fi = item.lotSizeFilter || {};
       const pi = item.priceFilter   || {};
+      const li = item.leverageFilter || {};
       const info = {
         tickSize:    parseFloat(pi.tickSize    || '0.01'),
+        minPrice:    parseFloat(pi.minPrice    || '0'),
         lotSize:     parseFloat(fi.qtyStep     || '0.001'),
         minQty:      parseFloat(fi.minOrderQty || '0'),
-        minOrderAmt: parseFloat(fi.minNotionalValue || '1'),
+        minOrderAmt: parseFloat(fi.minNotionalValue || fi.minOrderAmt || '1'),
+        maxLeverage: parseFloat(li.maxLeverage || '0'),
       };
       this._instrCache[symbol] = info;
       return info;
