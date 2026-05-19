@@ -569,6 +569,14 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
               x-text="(()=>{const roi=pos.margin>0?(pos.upnl||0)/pos.margin*100:0;return (roi>=0?'+':'')+roi.toFixed(1)+'%'})()"></span>
           </div>
           <div class="pc-row"><span class="pc-k">TP</span><span class="pc-v profit" x-text="(()=>{const roi=(pos.entryPrice-pos.currentTpPrice)/pos.entryPrice*pos.leverage*100;return fmtP(pos.currentTpPrice)+(pos.currentTpPrice&&pos.entryPrice?' ('+(roi>=0?'+':'')+roi.toFixed(1)+'%)':'')})()"></span></div>
+          <template x-if="isLaggard(pos) && pos._edaTpPrice">
+            <div class="pc-row">
+              <span class="pc-k" style="color:var(--warn)">EDa TP</span>
+              <span class="pc-v" :class="(pos.markPrice||0)<=(pos._edaTpPrice||0)?'profit':'warn'"
+                x-text="(()=>{const p=pos._edaTpPrice||0;const dist=(pos.markPrice-p)/pos.entryPrice*pos.leverage*100;return fmtP(p)+' ('+(dist>=0?'+':'')+dist.toFixed(1)+'%)'})()">
+              </span>
+            </div>
+          </template>
           <div class="pc-row"><span class="pc-k">Margin</span><span class="pc-v" x-text="'$'+pos.margin.toFixed(2)"></span></div>
           <div class="pc-row">
             <span class="pc-k">Funding</span>
@@ -740,6 +748,11 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
             buffedED:
             <span :class="lag.buffedED<=0?'red':'profit'" x-text="'$'+lag.buffedED.toFixed(2)"></span>
             <span x-show="lag.buffedED<=0" style="color:var(--accent);margin-left:4px">→ CLOSING</span>
+          </div>
+          <div x-show="lag.edaTpPrice" style="font-family:var(--mono);font-size:10px;margin-top:3px">
+            EDa TP:
+            <span :class="lag.markPrice<=lag.edaTpPrice?'profit':'warn'" x-text="fmtP(lag.edaTpPrice)"></span>
+            <span style="color:var(--text-lo)" x-text="lag.edaTpPrice?' (dist '+(((lag.markPrice-lag.edaTpPrice)/lag.markPrice*100)||0).toFixed(2)+'%)':''"></span>
           </div>
         </div>
       </template>
@@ -1473,6 +1486,13 @@ function psycho() { return {
         continue;
       }
 
+      // EDa TP hit check (pseudo laggard only — live uses the standing limit order)
+      if (!pos._live && pos._edaTpPrice && this.isLaggard(pos) && mark <= pos._edaTpPrice && this.positions.find(x => x.id === pos.id)) {
+        this.log(`🎯 ${pos.symbol}: EDa TP hit @ ${fmtP(mark)} — closing laggard`, 'success');
+        await this.closePosition(pos, 'tp', pos._edaTpPrice);
+        continue;
+      }
+
       // TP hit check
       if (pos.currentTpPrice > 0 && mark <= pos.currentTpPrice && this.positions.find(x => x.id === pos.id)) {
         this.log(`✅ ${pos.symbol}: TP hit @ ${fmtP(mark)} — closing`, 'success');
@@ -1496,9 +1516,10 @@ function psycho() { return {
       for (const pos of this.positions) { if (!pos._live) pos._lastSeenAt = seenNow; }
     }
 
-    // Laggard check
+    // Laggard check + EDa TP maintenance
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 2) {
       await this.runLaggardCheck();
+      await this._refreshLaggardEdaTp();
     }
 
     // Cascade trigger (collective uPnL)
@@ -1569,9 +1590,13 @@ function psycho() { return {
     _closingIds.add(pos.id);
     if (!this.positions.find(x => x.id === pos.id)) { _closingIds.delete(pos.id); return; }
 
-    // Cancel TP order
+    // Cancel TP orders
     if (pos.tpOrderId) {
       try { await this.liveCancelOrder(pos.symbol, pos.tpOrderId); } catch(e) {}
+    }
+    if (pos._edaTpOrderId) {
+      try { await this.liveCancelOrder(pos.symbol, pos._edaTpOrderId); } catch(e) {}
+      pos._edaTpOrderId = null;
     }
 
     // Place market close
@@ -1688,6 +1713,46 @@ function psycho() { return {
     const closingPnl = (closingRoiPct / 100) * closingPos.margin;
     for (const pos of this.positions) {
       pos._laggardLostValue = (pos._laggardLostValue || 0) + closingPnl;
+    }
+    this._refreshLaggardEdaTp();
+  },
+
+  _computeEdaTp(pos) {
+    const ev       = pos._laggardInitialEV || 0;
+    const lost     = pos._laggardLostValue || 0;
+    const buffMult = 1 + Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100;
+    const needed   = ev * buffMult - lost; // uPnL needed for buffedED=0
+    // Short: uPnL = (entry - mark) / entry * lev * margin = needed → mark = entry - needed * entry / (lev * margin)
+    return pos.entryPrice - needed * pos.entryPrice / (pos.leverage * pos.margin);
+  },
+
+  async _refreshLaggardEdaTp() {
+    if (!this.cfg.laggardCheckEnabled || this.positions.length < 2) return;
+    const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
+    if (!laggard) return;
+
+    const raw   = this._computeEdaTp(laggard);
+    const instr = await this.getInstrInfo(laggard.symbol).catch(() => null);
+    const snapped = instr ? this.snapPrice(raw, instr) : parseFloat(raw.toFixed(8));
+    laggard._edaTpPrice = snapped;
+
+    if (!laggard._live) return;
+
+    // Only cancel+replace if price moved by at least one tick
+    const tick = instr?.tickSize || 0.001;
+    if (laggard._edaTpOrderId && Math.abs((laggard._edaTpSnapped || 0) - snapped) < tick) return;
+
+    if (laggard._edaTpOrderId) {
+      try { await this.liveCancelOrder(laggard.symbol, laggard._edaTpOrderId); } catch(e) {}
+      laggard._edaTpOrderId = null;
+    }
+    try {
+      const res = await this.livePlaceOrder({ symbol: laggard.symbol, side: 'Buy', orderType: 'Limit', qty: laggard.totalSize.toString(), price: snapped.toString(), timeInForce: 'GTC', reduceOnly: true });
+      laggard._edaTpOrderId  = res.orderId;
+      laggard._edaTpSnapped  = snapped;
+      this.log(`🎯 ${laggard.symbol}: EDa TP → ${fmtP(snapped)}`, 'info');
+    } catch(e) {
+      this.log(`${laggard.symbol}: EDa TP order failed — ${e.message}`, 'warn');
     }
   },
 
@@ -1919,7 +1984,7 @@ function psycho() { return {
     const buffMult     = 1 + (this.cfg.laggardProfitOffset ?? 50) / 100;
     const buffedEV     = ev * buffMult;
     const buffedED     = buffedEV - lostValue - uPnl;
-    return { symbol: laggard.symbol, buffedEV, lostValue, upnl: uPnl, buffedED };
+    return { symbol: laggard.symbol, buffedEV, lostValue, upnl: uPnl, buffedED, edaTpPrice: laggard._edaTpPrice || null, markPrice: laggard.markPrice || 0 };
   },
 
   dcaLadder() {
