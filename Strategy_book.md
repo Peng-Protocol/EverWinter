@@ -525,6 +525,8 @@ Psycho Mode is like a bear with a toothache which can only be soothed by blood. 
 
 Because value lost is shared across all open positions, one strong winner can trigger a cascade — a single aggressive dump or sharp reversal on one ticker closes it at a profit, raising lost value for the entire book, which then forces the next weakest position out, and so on until only one or two remain. Conversely, a winning close on a position already in profit increases lost value, while a losing close decreases it, so the system naturally accelerates when things go right and slows when they don't. The real game is just waiting for one or two tickers to move decisively — either dump hard after entry or pump and reverse sharply — and then let the cascade do the rest. The flip side is that many positions close as small losses on the way out, so win rate tends to be low; what keeps ROI healthy is that the winning closes, when they come, are large enough to absorb the accumulated dust.
 
+**Recommended balance**: minimum **$250** with default settings (50 positions × $6 notional at 6× leverage, with DCA headroom). Maximum practical exposure at **150 positions × $66 notional = ~$9,900 notional** — approximately **$6,666 in margin** at 6× leverage, assuming all DCA stages filled across all positions in the worst case.
+
 **"Short everything. Let DCA Escalation and Laggard check sort the rest."**
 
 ---
