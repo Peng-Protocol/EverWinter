@@ -48,7 +48,7 @@ Populated during each main scan pass for symbols that are within a configurable 
 This watchlist also evicts any tickers that fail other filters such as over-extension, funding rate, volume divergence etc during the course of their watch.
 
 ### Follow-Through Watchlist (`ftWatchlist`)
-A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its Rodeo/over-extension/Pile-on count and how many FT trades have been opened against it. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
+A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its count and how many FT trades have been opened against it. For regular FT entries the count is Rodeo rides; for ADV FT entries (marked ⚡) the count is over-extension hits within the 3h window. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
 
 
 ---
@@ -91,7 +91,7 @@ Runs inline within `runScan` after the gainers pass. Evaluates the top `funGaine
 For each candidate, the FUN scan applies: symbol banlist → existing position check → funding rate classification (sub-type and slot cost determined by FR level) → slot check → FR creep gate → historical RSI6 over-extension look-back (3h, 15min candles) → loser OE reclassification (losers with any over-extension in the look-back are evaluated under the gainers gate, as their behavior matches a gainer) → RSI6 proximity block → vol momentum gate (separate thresholds for gainers vs. losers, creeping upward with each close and scaling multiplicatively with over-extension count) → LSA check for losers (last completed candle must show positive but non-spike volume relative to the window average).
 
 ### 3. FT/ADV FT Scan (`scanFollowThroughs`)
-Runs after `runScan` against the persisted `ftCandidates` roster. Per symbol, gates are checked in order: funding rate → RSI triplet (45–80 for ADV FT, 20–60 for regular FT) → Close Confirmation / ClC (ADV FT only: ≥3 of last 4 completed 15m bars must be red) → LSA band gate (ADV FT only: last candle volume ≥ floor% and ≤ cap% of window average). Opens FT or ADV FT shorts when all conditions pass.
+Runs after `runScan` against the persisted `ftCandidates` roster. Per symbol, gates are checked in order: funding rate → RSI floor (> 45 for ADV FT with no upper ceiling, 20–60 for regular FT) → Close Confirmation / ClC (ADV FT only: ≥3 of last 4 completed 15m bars must be red) → LSA band gate (ADV FT only: last candle volume ≥ floor% and ≤ cap% of window average). Opens FT or ADV FT shorts when all conditions pass. ADV FT carries no RSI ceiling — LSA and ClC are competent enough to time entries into OE tickers.
 
 Both ClC and LSA read directly from the `_klineCache[${symbol}_15]` entry already populated by the RSI gate check (`fetchRSIMulti`). No additional kline fetch is required — the same 15m candle array is reused for RSI computation, red-candle counting, and volume analysis.
 
@@ -143,9 +143,6 @@ Lists all symbols currently under active FUN vol momentum creep. Each entry show
 ### SalF Creep
 Lists all symbols currently under active SalF median creep. Each entry shows the close count, the effective LSA floor and cap currently in effect for that symbol, and the countdown to the 6h TTL reset. As the close count increases, the floor rises and the cap falls toward the midpoint, tightening the window within which a re-entry can qualify. Only visible when SalF is enabled.
 
-### Extenders Counter
-Lists tickers that were recently over-extended, showing the number of times they have returned over-extended. Uses a timestamp-based poll each scan cycle for synced RSI6 fetches. Once the count reaches the ADV FT threshold the ticker is promoted to the FT candidate roster.
-
 ### Activity Log
 A capped reverse-chronological event feed, holding a maximum of (300) entries. Each entry is timestamped and colour-coded by type: `scan` events (light blue) cover scan cycle summaries and FT roster changes; `trade` events (ice blue) record every order open, DCA trigger, and close; `success` entries (green) confirm connections and bot start; `warn` entries (amber) cover Rodeo Creep registrations, TP reductions, and non-fatal anomalies; `error` entries (red) flag API failures and scan errors; and `info` entries (muted) carry general status messages. The log is purely observational — it has no effect on bot state and is cleared on **Clear Stats**.
 
@@ -178,6 +175,81 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 - A **Closed Trades** scorecard records each completed phantom trade with its symbol, DCA stage, duration, and PnL percentage.
 - Latency compensation applies the same slippage model used by the live bot, giving an accurate representation of real execution timing.
 - Operates correctly when opened via the local file system (i.e. `file://` protocol), unlike the Bybit public API which rejects cross-origin requests from file explorer contexts.
+
+---
+
+## PsychoWinter
+
+**PsychoWinter** (`PsychoWinter1.0.html`) is a standalone single-file bot running Psycho Mode exclusively — no RSI gates, FT/ADV FT pipelines, FUN, SalF, rodeo, or TP reduce. Same Alpine.js / Bootstrap 5 / Bybit V5 REST stack as EverWinter. `localStorage` is namespaced separately (`psychowinter_v1`). Runs in **pseudo** mode by default (no API key required); live mode requires Bybit Contract/Derivatives credentials.
+
+### Config Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `liveMode` | false | Pseudo or live trading |
+| `apiKey` / `apiSecret` | — | Bybit credentials (live mode only) |
+| `testnet` | false | Use Bybit testnet endpoints (live mode only) |
+| `leverage` | 6 | Leverage on all positions |
+| `minNotional` | 6 | Entry notional (USDT, min 6 max 66); DCA stages scale from this |
+| `maxPositions` | 50 | Open position cap; scanning halts at cap |
+| `psychoChangePct` | 3 | Min absolute 24h change % to qualify a ticker |
+| `psychoPerCycle` | 12 | Tickers shorted per scan cycle |
+| `scanMins` | 15 | Scan interval in minutes |
+| `dcaStages` | 7 | DCA add stages beyond entry |
+| `dcaMultiplier` | 2 | Notional multiplier per stage |
+| `entryTpRoi` | 25 | Entry-stage TP ROI%; decays per stage, floors at 3% |
+| `runtimeHours` | 48 | Hard force-close deadline per position |
+| `laggardCheckEnabled` | true | Enable laggard force-close |
+| `laggardProfitOffset` | 50 | Laggard EV buffer % (50 = 1.5× EV) |
+| `cascadeTriggerEnabled` | true | Enable cascade trigger |
+| `cascadeTriggerUPnL` | 2.50 | Collective uPnL threshold to fire cascade trigger |
+
+The **Live Trading** toggle switches between pseudo and live mode. The switch is locked while the bot is running and also respects the config lock. In pseudo mode no API key is required and no real orders are placed — all logic runs against live market data with phantom capital. In live mode, Bybit Contract/Derivatives credentials are required and real orders are placed.
+
+A **config lock** button sits above the start/stop controls. When locked, all sliders and fields are disabled regardless of whether the bot is running — useful as a safeguard against accidental changes between sessions.
+
+### Positions Menu
+
+Open position feed showing symbol, DCA stage indicator, entry/mark price, unrealised PnL and ROI%, time open, next add price, TP price, and a force-close countdown. The oldest position shows a laggard debt indicator when laggard is active.
+
+Two sort buttons appear at the top of the feed:
+
+- **PnL** — sorts open positions by unrealised PnL, toggling descending → ascending → unsorted.
+- **DCA** — sorts by DCA stage triggered (not the band the mark price currently sits in), toggling the same cycle. Switching either sort resets the other.
+
+### Trades Menu
+
+Reverse-chronological feed of all closed positions. Each card shows entry/exit price, DCA stage, duration, PnL, and close reason.
+
+Force closes and laggard closes that occur in rapid succession are **rolled up** into a single grouped entry rather than flooding the feed. Each rollup covers a 15-minute window and summarises: ticker count, net PnL and ROI, win/loss breakdown, average DCA stage, average duration, and best/worst performers by both PnL and ROI. Standalone TP and SL closes always appear as individual entries.
+
+### Log Menu
+
+Session counters at the top: trades, wins, losses, net PnL, win rate, force closes, and cascade closes (visible once at least one cascade has fired).
+
+**Laggard status** — live view of the current laggard candidate: buffered expected value, accumulated lost value, current uPnL, and the buffered expected deficit. Turns red and shows "→ CLOSING" when the deficit hits zero.
+
+**Open Now** — at-a-glance stats across all open positions: best uPnL, worst uPnL, and highest DCA stage reached.
+
+**DCA Spread** — counts how many open positions are currently at each stage (S0–S7). Stages 0–3 display in orange; S4 and above display in red. Only visible when positions are open. This gives an instant read on how deep the book is sitting — something not surfaced in other EverWinter bots.
+
+The **activity log** is a capped reverse-chronological event feed (300 entries) with an internal scroll. Force rollup entries are rendered inline with their full breakdown rather than as plain text.
+
+### Config
+
+Parameters listed above. DCA Ladder shows computed notional, margin, and cumulative totals per stage. TP Schedule shows ROI% and price target per stage.
+
+### Scan
+
+Bulk ticker fetch → filter by absolute 24h change ≥ threshold → Fisher-Yates shuffle → take first `psychoPerCycle` not already held → open SHORT on each. Halts early when open positions hit the cap. Resumes on the next scheduled cycle once positions clear.
+
+### Position Watcher
+
+Fires every 5 seconds. Bulk-fetches mark prices for all open positions. Per position: DCA trigger check (places next add and recalculates TP if breached) → TP hit check → 8h funding fee accrual → hard force-close deadline check → SL placement after the final DCA stage fills. After every close, updates the lost-value tally on all remaining open positions.
+
+### Laggard
+
+Active whenever there are at least 2 open positions — no reduce-phase gate. Evaluates the oldest position; force-closes it when `buffedEV − lostValue − unrealizedPnL ≤ 0`. Every position close (win or loss) feeds its PnL into the lost-value tally of all survivors.
 
 ---
 

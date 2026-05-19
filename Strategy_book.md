@@ -10,7 +10,8 @@
 4. [Fund Chasing (FUN)](#fun-fund-chasing-strategy)
 5. [Sale Fishing (SalF)](#sale-fishing-salf-strategy)
 6. [General Mechanics](#general-mechanics)
-7. [Conclusion](#conclusion)
+7. [Psycho Mode](#psycho-mode)
+8. [Conclusion](#conclusion)
 
 ---
 
@@ -32,6 +33,20 @@ In the most advantageous scenario, a single ticker flows through multiple strate
 1. Gainer enters → rodeo → FT entry → SalF entry
 2. Alternatively: ADV FT entry → SalF entry
 3. **Result**: Multiple trades extracted from one ticker's lifecycle
+
+---
+
+## Proactive vs Reactive
+
+EverWinter and PsychoWinter represent two fundamentally different approaches to the same market.
+
+**EverWinter is proactive.** It expends its design budget at the entry gate — RSI filters across timeframes, volume momentum thresholds, funding rate classification, extension counters, rodeo creep state. The goal is to be selectively right before committing capital. Each strategy tries to identify a specific type of price behavior and enter only when confidence is high. Win rate matters. A missed entry is acceptable; a bad entry is a design failure.
+
+**PsychoWinter is reactive.** It expends almost no energy at the entry gate — a single change% threshold is the only filter. Instead, all design budget goes into the exit system: DCA escalation absorbs adverse moves and improves the average entry, the laggard check applies continuous pressure to the weakest position, and cascade triggers use winners to force resolution on losers. PsychoWinter accepts that many entries will be wrong and plans for it structurally. Win rate is low by design. The exits are where the edge lives.
+
+The practical implication: EverWinter's performance is more regime-dependent — it performs best when the conditions its filters are tuned for are present. PsychoWinter's performance is more consistent across market regimes because it doesn't bet on any signal being valid. It bets instead on the aggregate behavior of a large position book under mechanical pressure. The tradeoff is capital headroom: PsychoWinter requires more margin and tolerates more simultaneous open drawdown than EverWinter.
+
+Neither approach is strictly better. They are different tools for different risk tolerances and market readings.
 
 ---
 
@@ -146,15 +161,17 @@ Advanced Follow-Through activates when a ticker demonstrates **prolonged over-ex
 This strategy is "advanced" because **it doesn't need direct observation to proceed** the way regular Follow-Through does. We enter based on the ticker's accumulated historical behavior (repeated over-extension hits) rather than watching repeated gainer entries succeed against it.
 
 ### Core Philosophy
-A ticker that over-extends three or more times within three hours is not just pumping — it is exhibiting structural instability. When that behavior finally collapses into the RSI cooldown band, the reversal tends to be sustained and reliable.
+A ticker that over-extends within a three-hour window is exhibiting structural instability. We don't need to see it burn repeatedly to act — LSA and ClC are competent enough at timing entries into OE tickers. The first hit is enough for promotion; the entry gates own the rest.
 
 ---
 
 ### Promotion to Advanced FT Roster
 
-The **extender counter** tracks every time a ticker hits RSI6 ≥ the configured maximum during the scan cycle or per-tick polling window. Each hit within the 3-hour TTL increments the counter.
+When a ticker's RSI6 hits ≥ the configured maximum, it is **immediately promoted** to the ADV FT roster (default threshold: 1 hit). The gainer scan graylists the symbol for the duration of the ADV FT window, suspending normal gainer entries.
 
-When a ticker's count reaches the **configurable promotion threshold** (default: 3 hits), it graduates to the **Advanced FT roster**. The gainer scan graylists the symbol while it remains on the ADV FT roster, suspending normal gainer entries.
+The over-extension hit count is tracked within a 3-hour TTL and is visible directly in the FT roster/radar — ADV FT rows are marked with ⚡ and show the OE count in place of the rodeo count. Per-tick polling continues bumping the count while the ticker remains on the roster, but entry decisions are owned entirely by LSA and ClC.
+
+The threshold is configurable upward for operators who prefer to require repeated burns before promotion, but the default is immediate.
 
 If the roster is full, the ticker with the **lowest funding rate** (most over-shorted, least desirable) is evicted first, then the oldest entry.
 
@@ -162,11 +179,10 @@ If the roster is full, the ticker with the **lowest funding rate** (most over-sh
 
 ### Entry Criteria
 
-#### 1. **RSI Cooldown Band: 45-80**
-We wait for the ticker to cool from over-extension into a specific RSI range:
-- **RSI6, RSI12, RSI24**: All must be **between 45-80**
+#### 1. **RSI Floor: > 45**
+All three RSI timeframes (RSI6, RSI12, RSI24) must be **above 45**. There is no upper ceiling.
 
-This is wider than Gainers' 70-80 band. We're catching the pullback **after** the parabolic move. The ticker was at RSI6 ≥ 90 repeatedly — now it's cooling, and we enter as the reversal continues.
+The ticker was at RSI6 ≥ 90 during over-extension. The RSI floor ensures momentum hasn't completely collapsed before we enter. The ceiling has been removed — LSA and ClC are competent enough at timing entries into OE tickers. If selling volume is elevated but not exhausted (LSA) and closes are confirming the trend shift (ClC), the entry is valid regardless of how high RSI sits.
 
 #### 2. **Close Confirmation (ClC)**
 
@@ -508,6 +524,48 @@ With 6-stage flat DCA, pessimistic margin per position doubles to $6 (six $1 add
 At $60 notional / 6× leverage = $10 margin per entry. For 10 positions at moderate depth (stage 1): 10 × $20 = $200 committed at any one time — precisely within the $200 balance.
 
 **Scaling up**: As your balance grows, increase notional proportionally to keep ROI consistent. 
+
+---
+
+## Psycho Mode
+
+Psycho Mode is like a bear with a toothache which can only be soothed by blood. It utilizes no filters save for 24hr change — any ticker moving more than 3% in either direction qualifies. It uses the following settings:
+
+- **7 DCA stages** at **2× escalation** — each add doubles the last, staggered deeper into the pump
+- **25% entry TP ROI**, decaying per stage (flooring at 3%)
+- **Up to 50 concurrent positions**, 12 new shorts opened per scan cycle
+- **Laggard check** active from the second open position onward — no reduce phase required
+- **48-hour hard force-close** as the backstop; laggard handles most exits well before that
+
+Because value lost is shared across all open positions, one strong winner can trigger a cascade — a single aggressive dump or sharp reversal on one ticker closes it at a profit, raising lost value for the entire book, which then forces the next weakest position out, and so on until only one or two remain. Conversely, a winning close on a position already in profit increases lost value, while a losing close decreases it, so the system naturally accelerates when things go right and slows when they don't. The real game is just waiting for one or two tickers to move decisively — either dump hard after entry or pump and reverse sharply — and then let the cascade do the rest. The flip side is that many positions close as small losses on the way out, so win rate tends to be low; what keeps ROI healthy is that the winning closes, when they come, are large enough to absorb the accumulated dust.
+
+### Cascade Triggers
+
+The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement — they intervene directly when the book reaches a condition worth acting on immediately.
+
+**Collective Profit Cascade (CPC)** fires when the book's total unrealized PnL crosses a configurable positive threshold. At that point, the two most profitable positions (above a minimum ROI%) are closed, crystallizing gains and seeding further laggard pressure across the remaining book. The logic: if the book is collectively in profit, lock some of it in rather than waiting for every position to reach TP individually. The 5-minute cooldown prevents repeated firing during a single volatile move.
+
+**Position Cascade Trigger (PPC)** fires when any individual position's unrealized loss exceeds a configurable threshold. Rather than waiting for the laggard system to eventually close a badly stuck position, PPC immediately closes the most profitable positions in the book — escalating each successive trigger — to force cascade pressure toward the loser. On the first trigger it closes a configurable base count, doubling (or by the configured multiplier) on each successive fire as long as a trigger position remains. When the trigger position eventually closes or recovers above the threshold, the escalation counter resets to zero and the next trigger cycle starts fresh at the base count. If no profitable positions meet the eligibility threshold when PPC fires, the counter is preserved at its current value so escalation picks up where it left off if targets appear later; a scan runs immediately to seed new candidates, then PPC retries after the cooldown. The escalation count is in-memory only and is not persisted — a bot restart resets it to the base count regardless of where escalation had reached.
+
+Both triggers share a configurable minimum ROI% filter for their close targets, preventing barely-positive dust positions from being closed when better candidates exist.
+
+These cascade features are emergent to PsychoWinter's reactive design. They would be redundant in EverWinter, where entry filters do the equivalent work upstream. In PsychoWinter, where entry is intentionally unfiltered, they are the primary mechanism for actively managing a book full of mixed outcomes.
+
+### Anti-Martingale (AMa)
+
+Where DCA escalates into losing positions (Martingale), AMa escalates into winning ones. When enabled, positions open with no take profit. Instead, as price falls in the favorable direction, flat adds are placed at fixed intervals: −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% below entry. At the seventh stage, a TP is set at −22% of the original entry price.
+
+AMa adds are intentionally flat — the same base notional as the initial entry each time. This is a deliberate constraint. Because a full DCA cascade can also be triggered if price reverses, the combined worst-case margin (all AMa adds filled, then all DCA stages filled) must remain manageable. Multiplicative AMa sizing would compound on top of already-multiplicative DCA escalation, producing an unsustainable drawdown profile. Flat sizing keeps the two systems independently bounded.
+
+**Cancellation**: If price reverses upward after some AMa stages have filled, a DCA trigger cancels the AMa mode and sets a normal TP based on the current DCA stage and weighted average entry. The position continues from that point as a standard DCA trade. Critically, the AMa adds that already filled remain part of the position and are already factored into `pos.entryPrice` at the moment the DCA TP is calculated — so the TP is computed against a lower average entry than if AMa had never run. A position that went through two AMa stages before reversing is in a marginally better recovery position than a clean entry that went straight into DCA.
+
+**The asymmetry**: When a position moves in the profitable direction, AMa enhances it without waiting for a TP that may never be set. When it reverses, DCA absorbs the move. In the cascade context, positions with multiple AMa stages filled are more profitable closes — they close at a larger gain, contributing more to the laggard's lost-value tally and accelerating the cascade further.
+
+**Note**: AMa adds are recorded in `pos.totalSize` and `pos.margin` exactly like DCA fills. They count against available margin.
+
+**Recommended balance**: minimum **$250** with default settings (50 positions × $6 notional at 6× leverage, with DCA headroom). Maximum practical exposure assuming an average of 2 DCA stages triggered per position: **150 positions × $66 notional × 3 adds = ~$29,700 notional** — approximately **$6,666 in margin** at 6× leverage. This is a pessimistic estimate relative to actual performance; the $6,666 figure is intentionally buffered.
+
+**"Short everything. Let DCA Escalation and Laggard check sort the rest."**
 
 ---
 
