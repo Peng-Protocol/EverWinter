@@ -551,6 +551,18 @@ Both triggers share a configurable minimum ROI% filter for their close targets, 
 
 These cascade features are emergent to PsychoWinter's reactive design. They would be redundant in EverWinter, where entry filters do the equivalent work upstream. In PsychoWinter, where entry is intentionally unfiltered, they are the primary mechanism for actively managing a book full of mixed outcomes.
 
+### Anti-Martingale (AMa)
+
+Where DCA escalates into losing positions (Martingale), AMa escalates into winning ones. When enabled, positions open with no take profit. Instead, as price falls in the favorable direction, flat adds are placed at fixed intervals: −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% below entry. At the seventh stage, a TP is set at −22% of the original entry price.
+
+AMa adds are intentionally flat — the same base notional as the initial entry each time. This is a deliberate constraint. Because a full DCA cascade can also be triggered if price reverses, the combined worst-case margin (all AMa adds filled, then all DCA stages filled) must remain manageable. Multiplicative AMa sizing would compound on top of already-multiplicative DCA escalation, producing an unsustainable drawdown profile. Flat sizing keeps the two systems independently bounded.
+
+**Cancellation**: If price reverses upward after some AMa stages have filled, a DCA trigger cancels the AMa mode and sets a normal TP based on the current DCA stage and weighted average entry. The position continues from that point as a standard DCA trade. The AMa adds that already filled remain part of the position — they improve the average entry modestly, which is a slight advantage for the DCA recovery.
+
+**The asymmetry**: When a position moves in the profitable direction, AMa enhances it without waiting for a TP that may never be set. When it reverses, DCA absorbs the move. In the cascade context, positions with multiple AMa stages filled are more profitable closes — they close at a larger gain, contributing more to the laggard's lost-value tally and accelerating the cascade further.
+
+**Note**: AMa adds are recorded in `pos.totalSize` and `pos.margin` exactly like DCA fills. They count against available margin.
+
 **Recommended balance**: minimum **$250** with default settings (50 positions × $6 notional at 6× leverage, with DCA headroom). Maximum practical exposure assuming an average of 2 DCA stages triggered per position: **150 positions × $66 notional × 3 adds = ~$29,700 notional** — approximately **$6,666 in margin** at 6× leverage. This is a pessimistic estimate relative to actual performance; the $6,666 figure is intentionally buffered.
 
 **"Short everything. Let DCA Escalation and Laggard check sort the rest."**
