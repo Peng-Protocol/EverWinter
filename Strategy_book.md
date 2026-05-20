@@ -475,8 +475,8 @@ During reduce phase, TP is lowered to encourage faster exits.
 
 Only enforced during reduce phase. The **laggard** is selected by one of two modes, configurable via the *DCA-Stage Mode* toggle (default: on):
 
-- **DCA-Stage Mode (default)**: the position with the most DCA stages triggered is the laggard. Age breaks ties. This targets the position with the clearest market evidence of difficulty — one that has had capital added into it repeatedly and still hasn't resolved.
-- **Age Mode**: the oldest open position by open time, the original behaviour.
+- **Age Mode (default)**: the oldest open position by open time.
+- **DCA-Stage Mode**: the position with the most DCA stages triggered, age breaks ties.
 
 **The Calculation**: Expected Value (entry margin × TP%) is buffered by 50% (configurable), then reduced by cumulative realized PnL from other closes and the laggard's own unrealized PnL. When that remainder hits zero, the laggard is force-closed.
 
