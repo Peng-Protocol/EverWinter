@@ -22,7 +22,7 @@ PseudoWinter employs a **tiered conviction system** where strategies cascade fro
 
 The strategies are organized around three distinct observation paths:
 
-**Gainers path** — A ticker showing strong upward momentum is entered by Gainers, accumulates rodeo rides for RSI/notional creep, and if it was also extremely over-extended during that run, it qualifies for Advanced Follow-Through via the extender counter.
+**Gainers path** — A ticker showing strong upward momentum is entered by Gainers. If it is simultaneously over-extended (RSI6 hitting the configured maximum), it qualifies for Advanced Follow-Through via the extender counter.
 
 **FUN path** — A parallel, independent scan evaluates tickers with positive funding rates across the top gainers and worst losers pools. FUN entries are funding-rate-driven rather than RSI-driven, and operate on their own conviction tier.
 
@@ -38,7 +38,7 @@ In the most advantageous scenario, a single ticker flows through multiple strate
 
 EverWinter and PsychoWinter represent two fundamentally different approaches to the same market.
 
-**EverWinter is proactive.** It expends its design budget at the entry gate — RSI filters across timeframes, volume momentum thresholds, funding rate classification, extension counters, rodeo creep state. The goal is to be selectively right before committing capital. Each strategy tries to identify a specific type of price behavior and enter only when confidence is high. Win rate matters. A missed entry is acceptable; a bad entry is a design failure.
+**EverWinter is proactive.** It expends its design budget at the entry gate — RSI filters across timeframes, volume momentum thresholds, funding rate classification, extension counters. The goal is to be selectively right before committing capital. Each strategy tries to identify a specific type of price behavior and enter only when confidence is high. Win rate matters. A missed entry is acceptable; a bad entry is a design failure.
 
 **PsychoWinter is reactive.** It expends almost no energy at the entry gate — a single change% threshold is the only filter. Instead, all design budget goes into the exit system: DCA escalation absorbs adverse moves and improves the average entry, the laggard check applies continuous pressure to the weakest position, and cascade triggers use winners to force resolution on losers. PsychoWinter accepts that many entries will be wrong and plans for it structurally. Win rate is low by design. The exits are where the edge lives.
 
@@ -123,34 +123,6 @@ The 3-hour graylist prevents premature re-entry after a parabolic move settles.
 
 ---
 
-### Rodeo Mechanism (Instability Detection)
-
-The **rodeo filter** responds to repeated successful entries.
-
-#### How It Works:
-1. **Entry**: We open a gainer position
-2. **Rapid Close**: Position closes quickly (sometimes within seconds)
-3. **Re-Prime**: Conditions re-appear, we attempt re-entry
-4. **Gate Creep**: RSI gate increases by **6%**
-5. **Repeat Detection**: Multiple rides indicate erratic, unstable behavior
-6. **Repeat**: Continued over-extension may flag the ticker for **ADV FT promotion** (via extender counter)
-
-#### Rationale:
-A ticker providing multiple "rides" is **very erratic and unstable** — this pattern consistently predicts it will **crash very hard shortly**. The rodeo count serves as a behavioral fingerprint for impending collapse, and raises RSI/notional thresholds to filter out premature re-entries.
-
-**Historical Max**: 4 rides (under 3% creep). With 6% creep, this is unlikely to recur.
-
-#### Rodeo Creep Effects:
-For each rodeo ride, the **RSI entry gate creeps upward by a configurable percentage** (default 6%). On a base gate of RSI6 ≥ 70, a single ride raises the requirement to RSI6 ≥ 76; a second ride pushes it to RSI6 ≥ 82. This prevents immediately re-entering a ticker that just dipped — a ticker that closed quickly likely hasn't stabilised and will pump straight back up. The creep ensures re-entry only happens if the ticker has climbed further into over-bought territory, where mean reversion is more probable.
-
-Each ride also increases **TP target and position size by 50%** (adjustable):
-
-- **Why TP Creeps**: Unstable tickers produce deeper downward wicks and face greater upside resistance — more conviction is justified
-- **Why Notional Creeps**: The eventual real move will be larger, justifying increased exposure
-- **Timing**: Creep is applied before the next position opens — rodeos happen fast, so as soon as the gainer closes, we calculate the creep for immediate re-entry
-
-Rodeo creep state is tracked per-symbol with a 6-hour TTL. It informs the Gainers scan RSI/notional thresholds and Advanced FT candidacy (via the extender counter), but does not directly promote to any roster.
-
 ---
 
 ## Advanced Follow-Through Strategy
@@ -169,7 +141,7 @@ A ticker that over-extends within a three-hour window is exhibiting structural i
 
 When a ticker's RSI6 hits ≥ the configured maximum, it is **immediately promoted** to the ADV FT roster (default threshold: 1 hit). The gainer scan graylists the symbol for the duration of the ADV FT window, suspending normal gainer entries.
 
-The over-extension hit count is tracked within a 3-hour TTL and is visible directly in the FT roster/radar — ADV FT rows are marked with ⚡ and show the OE count in place of the rodeo count. Per-tick polling continues bumping the count while the ticker remains on the roster, but entry decisions are owned entirely by LSA and ClC.
+The over-extension hit count is tracked within a 3-hour TTL and is visible directly in the FT roster/radar — ADV FT rows are marked with ⚡ and show the OE count. Per-tick polling continues bumping the count while the ticker remains on the roster, but entry decisions are owned entirely by LSA and ClC.
 
 The threshold is configurable upward for operators who prefer to require repeated burns before promotion, but the default is immediate.
 
@@ -408,7 +380,7 @@ On every non-gainer close (ADV FT, FUN), the entry TP for that symbol is halved:
 
 **Why**: A non-gainer that re-enters quickly is showing **declining sell pressure**. The first entry hit TP because sellers had conviction. The second entry may not reach the same depth — the downside fuel is diminishing. Tightening TP captures what's actually available rather than waiting for a move that may not come.
 
-This is the mirror of the gainers rodeo. The rodeo observes rapid re-entries on a gainer and responds by *raising* TP — that pattern signals **declining buy pressure**, i.e. buyers can't hold the pump, so a deeper eventual move is expected. TP ingress on non-gainers does the opposite: declining sell pressure means the move is getting shorter, so TP comes down to meet it.
+TP ingress on non-gainers does the opposite: declining sell pressure means the move is getting shorter, so TP comes down to meet it.
 
 **Example at default 6% entry TP**:
 - First close → ingress count 1 → entry TP: 3% (floor reached immediately)
@@ -586,7 +558,6 @@ These strategies are designed to be executed by automation, not humans. The ment
 - Funding rate classification and creep state per symbol
 - DCA stage management and TP recalculation
 - Laggard expected deficit tracking
-- Rodeo counts and creep multipliers
 - SalF LSA ratios and median creep state per symbol
 - Multiple concurrent positions across different strategies
 
