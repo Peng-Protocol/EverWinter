@@ -540,17 +540,15 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 ### Sacrifice
 
-When total allocated margin exceeds 4× what all positions would cost at entry stage (no DCA), all scans halt and the system closes one position every 5 minutes until allocation drops back below the threshold. It is a last-resort pressure valve for when the book is overextended.
+When allocated margin exceeds 4× entry-stage cost, scans halt and the most recoverable position closes every 5 minutes until the book is back under the cap.
 
-**Target priority:** The system first looks for positions that have reached at least one DCA stage and are not too deep in loss (PnL > −3% of margin). Within that preferred group it closes the most profitable one first — recovering capital that costs the least in crystallised loss. If no preferred candidate exists it falls back to the most profitable position overall regardless of DCA stage.
+**Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists.
 
-**Retraction (optional, on by default):** A separate trigger that fires independently of allocated margin. If collective unrealised PnL falls below −2.5× entry margin (the same threshold used by the cascade system), scans are halted and sacrifice logic begins even if the margin cap has not been hit. The same priority rules apply. This clause can be too strict in volatile markets — disable it if it fires too aggressively.
+**Retraction (on by default):** Also triggers sacrifice when collective uPnL drops below −2.5× entry margin, regardless of allocation. Disable if it fires too aggressively in volatile markets.
 
-**No position floor:** Both sacrifice and retraction respect a configurable minimum position count (default 5) — they will not close below that floor regardless of how long the trigger condition persists. Outside that floor, they continue closing one position every 5 minutes for as long as the condition is true. Revisit the floor setting if either trigger proves too aggressive in practice.
+**Position floor:** Neither trigger closes below a configurable minimum (default 5 positions).
 
-**Practical character — speed limiters on green days:** In practice, sacrifice and retraction behave like a speed limiter. On green days, the market pumps broadly and many positions accumulate DCA stages simultaneously, pushing allocated margin or collective uPnL toward the trigger thresholds. The system responds by trimming the book — closing the most recoverable positions and pausing new entries. When the market rotates back to selling, the book naturally expands again toward its full position count. Without the limiters, capital would be spread across too many positions just as the good entry conditions return.
-
-Both are optional. Disabling retraction softens the system considerably — sacrifice alone only fires at extreme allocation. Disabling sacrifice entirely removes the cap. Neither is strictly necessary; the bot will function without them, but they make capital deployment more deliberate during crowded markets.
+**Speed limiters on green days:** On broad pump days, DCA accumulation pushes the book toward the thresholds and the system trims it, freeing capital before the next sell cycle. Both are optional — disabling retraction softens the system considerably, disabling sacrifice removes the cap entirely.
 
 ### Cascade Triggers
 
