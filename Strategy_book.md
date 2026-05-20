@@ -554,7 +554,7 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 ### Loss Absorption
 
-An alternative to sacrifice. When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it — 5% of its size every 5 minutes. The goal is slow, steady removal of the dead weight without touching anything else.
+A counterweight to sacrifice. When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it — 5% of its size every 5 minutes. The goal is slow, steady removal of the dead weight without touching anything else.
 
 Cuts continue until remaining margin drops below $20, at which point the position is small enough that cascade, sacrifice, or a natural TP will finish it. The sequence usually ends well before that — either price recovers and the position clears the threshold on its own, or DCA fires first.
 
