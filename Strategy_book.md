@@ -570,6 +570,8 @@ A known nuisance: some positions will trigger one or two AMa stages, then retrac
 
 AMa adds count against available margin exactly like DCA fills.
 
+A perfect run — all seven adds filling and TP hitting at −22% — returns roughly **709% on the original entry margin** at 6× leverage. ROI% on total committed margin is lower (~88.6%) since each subsequent add enters at a less favourable price, but the absolute profit is 5.4× what holding the entry alone to the same TP would yield. AMa is a move-capture tool, not a ROI maximiser.
+
 ### Sizing
 
 **Recommended balance**: minimum **$250** with default settings (50 max positions, $6 notional, 6× leverage). Maximum practical exposure at 2 DCA stages average: ~**$2,500** in margin — raising max positions to 150 pushes this to ~$6,666.
