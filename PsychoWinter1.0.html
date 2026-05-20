@@ -509,6 +509,26 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           <input type="range" min="0.1" max="10" step="0.1" x-model.number="cfg.cascadeMinRoiPct" :disabled="cfgLocked" @change="persist()">
           <div class="hint">Minimum ROI% for a position to be eligible as a cascade close target. Applies to both cascade types.</div>
         </div>
+        <div class="sep" style="margin-top:10px"></div>
+        <div class="g">
+          <label class="tog" @click.prevent="if(!cfgLocked)cfg.sacrificeEnabled=!cfg.sacrificeEnabled;if(!cfgLocked)persist()">
+            <div class="tog-t" :class="cfg.sacrificeEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Sacrifice</span>
+          </label>
+          <div class="hint" style="margin-top:4px">When allocated margin hits the threshold, halts scans and closes the most profitable position every 5 minutes until allocation drops below it.</div>
+        </div>
+        <div class="g" x-show="cfg.sacrificeEnabled" style="margin-top:8px">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);display:flex;justify-content:space-between">
+            <span>Sacrifice threshold</span>
+            <span style="color:var(--ice)" x-text="'$'+(cfg.minNotional/cfg.leverage*cfg.maxPositions*4).toFixed(2)"></span>
+          </div>
+          <div style="font-family:var(--mono);font-size:9px;display:flex;justify-content:space-between;margin-top:3px">
+            <span style="color:var(--text-lo)">Allocated</span>
+            <span :class="positions.reduce((s,p)=>s+(p.margin||0),0)>=(cfg.minNotional/cfg.leverage*cfg.maxPositions*4)?'loss':'profit'"
+              x-text="'$'+positions.reduce((s,p)=>s+(p.margin||0),0).toFixed(2)"></span>
+          </div>
+          <div class="hint">4× full-book entry margin — scales with notional, leverage, and max positions.</div>
+        </div>
       </div>
     </div>
 
@@ -982,6 +1002,7 @@ function psycho() { return {
     swapOutEnabled:       true,
     swapOutCount:         3,
     swapOutRoiPct:        3,
+    sacrificeEnabled:     true,
     scanMins:             15,
     whiplashProximityPct: 20,
     dcaStages:        7,
@@ -1212,6 +1233,13 @@ function psycho() { return {
   async runPsychoScan() {
     if (this.bot.scanning) return;
     this.bot.scanning = true;
+    if (this._isSacrificeActive()) {
+      const alloc  = this._totalAllocated();
+      const thresh = this._sacrificeThreshold();
+      this.log(`🔥 Scan halted — sacrifice active (allocated $${alloc.toFixed(2)} ≥ $${thresh.toFixed(2)})`, 'warn');
+      this.bot.scanning = false;
+      return;
+    }
     this.log('⚡ Psycho scan starting...', 'scan');
     let tickers = [];
     try {
@@ -1790,6 +1818,11 @@ function psycho() { return {
       await this.runPosCascadeTrigger();
     }
 
+    // Sacrifice (allocation cap)
+    if (this.cfg.sacrificeEnabled && this.positions.length > 0) {
+      await this.runSacrificeCheck();
+    }
+
     this.persist();
   },
 
@@ -2241,6 +2274,34 @@ function psycho() { return {
       this.log('⚡ Position cascade — triggering immediate scan', 'scan');
       try { await this.runPsychoScan(); } catch(e) { this.log('Post-cascade scan error: '+e.message, 'error'); }
     }
+  },
+
+  // ── Sacrifice ──
+  _sacrificeThreshold() {
+    return (this.cfg.minNotional / this.cfg.leverage) * this.cfg.maxPositions * 4;
+  },
+
+  _totalAllocated() {
+    return this.positions.reduce((s, p) => s + (p.margin || 0), 0);
+  },
+
+  _isSacrificeActive() {
+    return this.cfg.sacrificeEnabled && this._totalAllocated() >= this._sacrificeThreshold();
+  },
+
+  async runSacrificeCheck() {
+    const now = Date.now();
+    if (now - (this._lastSacrificeFired || 0) < 5 * 60 * 1000) return;
+    const alloc  = this._totalAllocated();
+    const thresh = this._sacrificeThreshold();
+    if (alloc < thresh) return;
+    const target = [...this.positions]
+      .filter(p => !_closingIds.has(p.id))
+      .sort((a, b) => (b.upnl || 0) - (a.upnl || 0))[0];
+    if (!target) return;
+    this._lastSacrificeFired = now;
+    this.log(`🔥 Sacrifice — allocated $${alloc.toFixed(2)} ≥ $${thresh.toFixed(2)} — closing ${target.symbol.replace('USDT', '')} (uPnL ${(target.upnl || 0) >= 0 ? '+' : ''}$${(target.upnl || 0).toFixed(2)})`, 'warn');
+    await this.closePosition(target, 'sacrifice');
   },
 
   psychoLaggardInfo() {
