@@ -75,7 +75,7 @@ body{background:var(--bg);color:var(--text-hi);font-family:system-ui,sans-serif;
 /* ── Main layout ── */
 .main{display:grid;grid-template-columns:280px 1fr 280px;gap:0;height:calc(100vh - 41px)}
 @media(max-width:900px){
-  .main{grid-template-columns:1fr;height:auto}
+  .main{grid-template-columns:1fr;height:calc(100vh - 74px)} /* nav 41px + tab-bar ~33px */
   .col-config,.col-log{display:none}
   .col-config.show,.col-log.show,.col-mid.show{display:block}
   .col-mid{display:none}
@@ -2007,7 +2007,14 @@ function psycho() { return {
     if (!toAudit.length) return;
     _auditRunning = true;
     _auditPromise = (async () => {
-      this.log('🌑 Gap-fill audit starting...', 'info');
+      // Create a single retroactively-updated gapBatch log entry for the entire audit run
+      const _gbStats = { audited: 0, closed: [], stillOpen: [], dcaFills: 0, errors: [] };
+      this._logSeq = (this._logSeq || 0) + 1;
+      const _gbId = this._logSeq;
+      const _gbT  = new Date().toTimeString().slice(0, 8);
+      this.logs = [{ t:_gbT, id:_gbId, type:'info', gapBatch:true, batch:_gbStats }, ...this.logs.slice(0, 299)];
+      try { localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs)); } catch(e) {}
+      this._renderLogs();
       try {
         for (const pos of [...toAudit]) {
           if (!this.positions.find(x => x.id === pos.id)) continue;
@@ -2015,13 +2022,15 @@ function psycho() { return {
           const gapFrom = pos._lastSeenAt || pos.openedAt;
           const gapTo   = now;
           _closingIds.add(pos.id);
-          this.log(`🌑 ${pos.symbol}: auditing ${Math.round((gapTo - gapFrom) / 60000)}min gap...`, 'info');
+          _gbStats.audited++;
+          this._renderLogs();
           try {
             const candles = await this.pseudoFetchKlines(pos.symbol, gapFrom, gapTo);
             if (!candles.length) {
-              this.log(`🌑 ${pos.symbol}: no kline data for gap — keeping as-is`, 'warn');
+              _gbStats.stillOpen.push(pos.symbol.replace('USDT',''));
               pos._lastSeenAt = now;
               _closingIds.delete(pos.id);
+              this._renderLogs();
               continue;
             }
             const instr = await this.getInstrInfo(pos.symbol);
@@ -2051,7 +2060,7 @@ function psycho() { return {
                     pos.slPrice = this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), instr);
                     pos.slSet   = true;
                   }
-                  this.log(`🌑 ${pos.symbol}: gap — DCA${pos.dcaStage} @ ${fmtP(add.price)} | avg ${fmtP(pos.entryPrice)} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
+                  _gbStats.dcaFills++;
                 }
               }
               // Runtime force close
@@ -2089,8 +2098,8 @@ function psycho() { return {
               this._notifyLaggardClose(pos, pnlPct);
               this.positions = this.positions.filter(x => x.id !== pos.id);
               _closingIds.delete(pos.id);
-              const emoji = isWin ? '✅' : '❌';
-              this.log(`🌑 ${pos.symbol}: gap — closed [${closeReason}] @ ${fmtP(closePrice)} (${new Date(closedAt).toTimeString().slice(0,8)}) | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT [${isWin?'WIN':'LOSS'}]`, isWin ? 'success' : 'warn');
+              _gbStats.closed.push({ sym: pos.symbol.replace('USDT',''), totalPnl, pnlPct, reason: closeReason, isWin });
+              this._renderLogs();
             } else {
               const last = candles[candles.length - 1];
               if (last) {
@@ -2098,17 +2107,24 @@ function psycho() { return {
                 pos.upnl = (pos.entryPrice - last.c) / pos.entryPrice * pos.leverage * pos.margin;
               }
               pos._lastSeenAt = now;
-              this.log(`🌑 ${pos.symbol}: gap audit complete — still open. Mark: ${fmtP(pos.markPrice)}`, 'info');
+              _gbStats.stillOpen.push(pos.symbol.replace('USDT',''));
               _closingIds.delete(pos.id);
+              this._renderLogs();
             }
           } catch(e) {
-            this.log(`🌑 ${pos.symbol}: gap audit error — ${e.message}`, 'error');
+            _gbStats.errors.push(pos.symbol.replace('USDT',''));
             pos._lastSeenAt = now;
             _closingIds.delete(pos.id);
+            this._renderLogs();
           }
         }
         this.persist();
-        this.log('🌑 Gap-fill audit complete.', 'success');
+        const _gbEntry = this.logs.find(e => e.id === _gbId);
+        if (_gbEntry) {
+          _gbEntry.type = _gbStats.errors.length ? 'warn' : 'success';
+          try { localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs)); } catch(e) {}
+        }
+        this._renderLogs();
       } finally {
         _auditRunning = false;
         _auditPromise = null;
@@ -2698,6 +2714,22 @@ function psycho() { return {
           return `<span class="${cls}">${b.sym.replace('USDT','')} ${chg>=0?'+':''}${chg.toFixed(1)}%</span>`;
         }).join('<span style="color:var(--text-lo)"> · </span>');
         body = `<div style="flex:1;line-height:1.5"><div style="font-weight:700">📉 ×${e.batch.length} SHORT</div><div style="font-size:8px;line-height:1.7;word-break:break-all">${tickers}</div></div>`;
+      } else if (e.gapBatch) {
+        const b = e.batch || {};
+        const closedN = (b.closed||[]).length;
+        const openN   = (b.stillOpen||[]).length;
+        const errN    = (b.errors||[]).length;
+        const running = b.audited === 0 && !closedN && !openN;
+        const netPnl  = (b.closed||[]).reduce((sum,x) => sum + x.totalPnl, 0);
+        const progStr = running
+          ? 'running…'
+          : `${b.audited} audited · ${closedN} closed · ${openN} open${b.dcaFills ? ' · DCA×'+b.dcaFills : ''}${errN ? ' · '+errN+' err' : ''}`;
+        const netStr  = closedN > 0 ? ` | Net ${s((netPnl>=0?'+':'')+netPnl.toFixed(3)+' USDT', netPnl>=0?'profit':'loss')}` : '';
+        const closedTickers = (b.closed||[]).map(x => `${s(x.sym, x.isWin?'profit':'loss')} ${x.pnlPct>=0?'+':''}${x.pnlPct.toFixed(1)}%`).join(' · ');
+        body = `<div style="flex:1;line-height:1.5">
+          <div style="font-weight:600">🌑 Gap audit — ${progStr}${netStr}</div>
+          ${closedTickers ? `<div style="font-size:8px;line-height:1.7;word-break:break-all;color:var(--text-lo)">${closedTickers}</div>` : ''}
+        </div>`;
       } else if (e.closeBatch || e.cascadeRollup || e.swapRollup) {
         const netPnl   = e.batch.reduce((s, b) => s + b.pnl, 0);
         const netCls   = netPnl >= 0 ? 'profit' : 'loss';
