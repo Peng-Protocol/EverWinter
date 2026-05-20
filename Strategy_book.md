@@ -409,7 +409,7 @@ The TP percentage decreases with each stage because our average entry gets bette
 
 Three modes control how much notional each DCA add contributes:
 
-**Flat** (default): Every add equals the base notional. Simple, predictable, and the foundation the bot is designed to run on. Flat DCA should function well on its own — escalation modes exist to hasten recovery, not to fix a strategy that doesn't work.
+**Flat** (default): Every add equals the base notional. Simple, predictable, and the foundation the strategy is built on. Flat DCA should function well on its own — escalation modes exist to hasten recovery, not to fix a strategy that doesn't work.
 
 **Accumulation**: Each add scales linearly — Add1 = base × 2, Add2 = base × 3, Add3 = base × 4, and so on. This is a middle ground: positions rescue faster than flat because later adds carry more weight, but margin commitment grows gradually rather than explosively. Suited for users who want some of the speed and improved rescue of escalation without committing heavily to every position that goes against them.
 
@@ -532,15 +532,15 @@ Psycho Mode is like a bear with a toothache which can only be soothed by blood. 
 
 - **7 DCA stages** at **2× escalation** — each add doubles the last, staggered deeper into the pump
 - **25% entry TP ROI**, decaying per stage (flooring at 3%)
-- **Up to 50 concurrent positions**, 12 new shorts opened per scan cycle
-- **Laggard check** active from the second open position onward — no reduce phase required
-- **48-hour hard force-close** as the backstop; laggard handles most exits well before that
+- **Up to 50 concurrent positions**, 12 new shorts picked per round
+- **Laggard check** active from the second open position onward
+- **48-hour hard force-close** as the backstop; the laggard system handles most exits well before that
 
 When a winner closes it raises the lost-value tally for every remaining position, which can push the next-weakest over its threshold and out — and so on. The real game is waiting for one ticker to move decisively and letting the cascade do the rest. Win rate is low; what keeps ROI healthy is that the winners are large enough to absorb the dust.
 
 ### Sacrifice
 
-As positions DCA deeper, each one consumes more margin than it did at entry. When the total committed margin across all positions exceeds 4× what opening that same number of positions at entry stage would cost, the book is considered overextended — scans halt and the most recoverable position closes every 5 minutes until allocation drops back under the cap.
+When the total allocated margin exceeds a preset threshold, one must sacrifice tickers — even those in loss — to make room for potentially deeper DCAs on existing positions. New entries pause and the most recoverable position is closed every 5 minutes until allocation drops back under the cap.
 
 **Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists.
 
@@ -554,9 +554,9 @@ As positions DCA deeper, each one consumes more margin than it did at entry. Whe
 
 The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement.
 
-**Collective Profit Cascade (CPC)** fires when the book's total unrealized PnL crosses the threshold (2.5× entry margin, derived automatically from notional and leverage). The two most profitable positions are closed to crystallize gains and seed laggard pressure across the remaining book. 5-minute cooldown.
+**Collective Profit Cascade (CPC)** triggers when the book's total unrealized PnL crosses the threshold (2.5× entry margin). Close the two most profitable positions to crystallize gains and seed laggard pressure across the rest. 5-minute cooldown.
 
-**Per-Position Cascade (PPC)** fires when any single position's unrealized loss exceeds the same threshold. The most profitable positions are closed immediately — escalating in count on each successive fire — to force cascade pressure toward the laggard. Escalation resets when the trigger position recovers or closes. The escalation count is not persisted across restarts.
+**Per-Position Cascade (PPC)** triggers when any single position's unrealized loss exceeds the same threshold. Close the most profitable positions immediately — escalating in count on each successive trigger — to force cascade pressure toward the laggard. Escalation resets when the trigger position recovers or closes; it does not carry over between sessions.
 
 Both triggers share a minimum ROI% filter so dust positions aren't used as cascade targets when better candidates exist.
 
