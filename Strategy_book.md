@@ -537,6 +537,10 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 When at max positions, each scan looks for up to a configurable number of stagnant positions — those within ±3% ROI (configurable) — and replaces them with fresh tickers from the qualifying pool. Profitable stagnant positions are swapped first, since closing them also seeds lost-value pressure on the remaining book.
 
+### Sacrifice
+
+When total allocated margin exceeds a threshold (4× the full-book entry margin, scaling with notional and max positions), all scans halt and the most profitable open position is closed every 5 minutes until allocation drops back below it. It is a last-resort pressure valve for when the book is overextended.
+
 ### Cascade Triggers
 
 The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement.
