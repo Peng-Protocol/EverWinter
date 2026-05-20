@@ -6,12 +6,11 @@
 ## Table of Contents
 1. [Gainers Strategy](#gainers-strategy)
 2. [Advanced Follow-Through (ADV FT)](#advanced-follow-through-strategy)
-3. [Follow-Through (FT)](#follow-through-strategy)
-4. [Fund Chasing (FUN)](#fun-fund-chasing-strategy)
-5. [Sale Fishing (SalF)](#sale-fishing-salf-strategy)
-6. [General Mechanics](#general-mechanics)
-7. [Psycho Mode](#psycho-mode)
-8. [Conclusion](#conclusion)
+3. [Fund Chasing (FUN)](#fun-fund-chasing-strategy)
+4. [Sale Fishing (SalF)](#sale-fishing-salf-strategy)
+5. [General Mechanics](#general-mechanics)
+6. [Psycho Mode](#psycho-mode)
+7. [Conclusion](#conclusion)
 
 ---
 
@@ -23,16 +22,15 @@ PseudoWinter employs a **tiered conviction system** where strategies cascade fro
 
 The strategies are organized around three distinct observation paths:
 
-**Gainers path** — A ticker showing strong upward momentum is entered by Gainers, accumulates rodeo rides, and promotes to Follow-Through. If it was also extremely over-extended during that run, it may alternatively qualify for Advanced Follow-Through via the extender counter.
+**Gainers path** — A ticker showing strong upward momentum is entered by Gainers, accumulates rodeo rides for RSI/notional creep, and if it was also extremely over-extended during that run, it qualifies for Advanced Follow-Through via the extender counter.
 
 **FUN path** — A parallel, independent scan evaluates tickers with positive funding rates across the top gainers and worst losers pools. FUN entries are funding-rate-driven rather than RSI-driven, and operate on their own conviction tier.
 
 **SalF path** — A separate red-day scan targets tickers already in a consistent, sustained decline. Where all other strategies are designed around upward price action and mean reversion, SalF is the only strategy built to perform when the market is broadly falling.
 
 In the most advantageous scenario, a single ticker flows through multiple strategies as it degrades:
-1. Gainer enters → rodeo → FT entry → SalF entry
-2. Alternatively: ADV FT entry → SalF entry
-3. **Result**: Multiple trades extracted from one ticker's lifecycle
+1. Gainer enters → over-extension → ADV FT entry → SalF entry
+2. **Result**: Multiple trades extracted from one ticker's lifecycle
 
 ---
 
@@ -135,10 +133,10 @@ The **rodeo filter** responds to repeated successful entries.
 3. **Re-Prime**: Conditions re-appear, we attempt re-entry
 4. **Gate Creep**: RSI gate increases by **6%**
 5. **Repeat Detection**: Multiple rides indicate erratic, unstable behavior
-6. **Handoff**: After sufficient rides, ticker is flagged for **Follow-Through roster**
+6. **Repeat**: Continued over-extension may flag the ticker for **ADV FT promotion** (via extender counter)
 
 #### Rationale:
-A ticker providing multiple "rides" is **very erratic and unstable** — this pattern consistently predicts it will **crash very hard shortly**. The rodeo count serves as a behavioral fingerprint for impending collapse.
+A ticker providing multiple "rides" is **very erratic and unstable** — this pattern consistently predicts it will **crash very hard shortly**. The rodeo count serves as a behavioral fingerprint for impending collapse, and raises RSI/notional thresholds to filter out premature re-entries.
 
 **Historical Max**: 4 rides (under 3% creep). With 6% creep, this is unlikely to recur.
 
@@ -151,6 +149,8 @@ Each ride also increases **TP target and position size by 50%** (adjustable):
 - **Why Notional Creeps**: The eventual real move will be larger, justifying increased exposure
 - **Timing**: Creep is applied before the next position opens — rodeos happen fast, so as soon as the gainer closes, we calculate the creep for immediate re-entry
 
+Rodeo creep state is tracked per-symbol with a 6-hour TTL. It informs the Gainers scan RSI/notional thresholds and Advanced FT candidacy (via the extender counter), but does not directly promote to any roster.
+
 ---
 
 ## Advanced Follow-Through Strategy
@@ -158,7 +158,7 @@ Each ride also increases **TP target and position size by 50%** (adjustable):
 ### Overview
 Advanced Follow-Through activates when a ticker demonstrates **prolonged over-extension** — repeated RSI6 spikes above the configured maximum within a 3-hour window. Rather than entering during the parabolic phase, ADV FT waits for the ticker to cool into a tradeable range, then enters as the reversal continues.
 
-This strategy is "advanced" because **it doesn't need direct observation to proceed** the way regular Follow-Through does. We enter based on the ticker's accumulated historical behavior (repeated over-extension hits) rather than watching repeated gainer entries succeed against it.
+ADV FT enters based on the ticker's accumulated historical behavior (repeated over-extension hits) rather than requiring repeated gainer entries to succeed against it first.
 
 ### Core Philosophy
 A ticker that over-extends within a three-hour window is exhibiting structural instability. We don't need to see it burn repeatedly to act — LSA and ClC are competent enough at timing entries into OE tickers. The first hit is enough for promotion; the entry gates own the rest.
@@ -219,25 +219,6 @@ VM is retained for FUN, where the prediction context is different.
 ### Why 2× Margin
 
 Advanced FT uses **2× margin**. The ticker has demonstrated extreme behavior through repeated over-extension. When it finally cools into tradeable range, the conviction is high that the downward movement will continue. This justifies higher margin than Gainers (1×).
-
----
-
-## Follow-Through Strategy
-
-### Overview
-Follow-Through is the predecessor to Advanced Follow-Through. Where Advanced FT uses **prolonged over-extension** as an indicator of potential weakness, regular FT uses **verified re-entry** as a weakness indicator — we directly observe the ticker being defeated by repeated gainer entries.
-
-### Promotion to FT Roster
-When a ticker accumulates **2+ rodeo rides** (configurable), it promotes to the Follow-Through roster. We used to set this threshold at 4 rides, but when we raised the Gainers RSI gates and rodeo creep percentage, 2 rides became the more likely outcome.
-
-### Entry Logic
-Same as Advanced FT: wait for RSI to cool, except into the 20-60 band, then enter when RSI conditions are met. The only difference is the **promotion path** — rodeo rides vs. over-extension hits. FT uses RSI gating and optionally Volume Momentum as a floor check.
-
-### Entry Filters
-
-**Volume Momentum (VM)** is on by default — the last completed 15m candle volume must be at least a configurable percentage above the window average before entry fires.
-
-**LSA (Localized Sell Average)** is available as an optional toggle, off by default. It gates entries to a band where selling volume is elevated but not exhausted — the same thresholds used by ADV FT. ClC is not available for regular FT; VM or LSA alone may be sufficient, and leaving both off is a valid configuration if you trust the RSI and rodeo gates alone.
 
 ---
 
@@ -313,7 +294,7 @@ Over-extended tickers are excluded from the Gainers path but can still carry a p
 
 ### Overview
 
-Sale Fishing is the only **red day** strategy in EverWinter. Every other strategy — Gainers, FT, ADV FT, FUN — is designed around upward price action and mean reversion. SalF works in the opposite direction: it targets tickers that are already falling, looking for consistent and sustained selling pressure that is likely to continue rather than exhaust.
+Sale Fishing is the only **red day** strategy in EverWinter. Every other strategy — Gainers, ADV FT, FUN — is designed around upward price action and mean reversion. SalF works in the opposite direction: it targets tickers that are already falling, looking for consistent and sustained selling pressure that is likely to continue rather than exhaust.
 
 On red market days, SalF is often the dominant source of entries. During a market-wide meltdown, qualifying tickers proliferate across both the gainer and loser pools simultaneously. The bot's default position count was increased partly to accommodate this volume — on a bad day it could legitimately short nearly everything on the board.
 
@@ -423,7 +404,7 @@ Neither escalation mode is recommended over the other. They are tools for users 
 
 **Nearly as Important as DCA**
 
-On every non-gainer close (FT, ADV FT, FUN), the entry TP for that symbol is halved: `0.5^closeCount`, floored at a configurable minimum (default 3%). The reduction has a 3-hour TTL and applies only to stage 0 — DCA adds are unaffected. Gainers are excluded entirely.
+On every non-gainer close (ADV FT, FUN), the entry TP for that symbol is halved: `0.5^closeCount`, floored at a configurable minimum (default 3%). The reduction has a 3-hour TTL and applies only to stage 0 — DCA adds are unaffected. Gainers are excluded entirely.
 
 **Why**: A non-gainer that re-enters quickly is showing **declining sell pressure**. The first entry hit TP because sellers had conviction. The second entry may not reach the same depth — the downside fuel is diminishing. Tightening TP captures what's actually available rather than waiting for a move that may not come.
 
