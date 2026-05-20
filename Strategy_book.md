@@ -535,7 +535,7 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 ### Sacrifice
 
-When total allocated margin exceeds a threshold (4× the full-book entry margin, scaling with notional and max positions), all scans halt and the most profitable open position is closed every 5 minutes until allocation drops back below it. It is a last-resort pressure valve for when the book is overextended.
+When total allocated margin exceeds 4× what all positions would cost at entry stage (no DCA), all scans halt and the most profitable open position is closed every 5 minutes until allocation drops back below it. It is a last-resort pressure valve for when the book is overextended.
 
 ### Cascade Triggers
 
