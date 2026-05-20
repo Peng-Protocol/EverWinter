@@ -3407,6 +3407,7 @@ function ew() { return {
       const prev = laggard._edaTpPrev;
       if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
         laggard._edaTpPrev = edaTpPrice;
+        laggard._nativeReduceTpPrice = null; // EDa limit order takes ownership; clear native TP tracking
         this.setTP(laggard, edaTpPrice).catch(() => {});
       }
     }
@@ -4726,8 +4727,12 @@ function ew() { return {
             if (!this.positions.find(x => x.id === pos.id)) continue;
             await this.closePosition(pos, 'force'); continue;
           }
-          // Only commit reduce-phase state once the TP order is confirmed placed
-          const tpResult = await this.setTP(pos, nt);
+          // Cancel existing limit TP order, then set native exchange TP for reduce phase.
+          if (pos.tpOrderId) {
+            await this.cancelTpLimitOrder(pos.symbol, pos.tpOrderId);
+            pos.tpOrderId = null;
+          }
+          const tpResult = await this._setNativeTP(pos.symbol, nt);
           if (tpResult === 'ok') {
             pos.phase = 'reduce';
             if (!wasReduced) this.sess.tpReduce++;
@@ -4735,9 +4740,10 @@ function ew() { return {
             pos._tpAcceptedAt        = null;
             pos._localTpCorrectedKey = null;
             pos._tpReduceAcceptedKey = null;
+            pos._nativeReduceTpPrice = nt;
             pos._slAcceptedKey       = null;
             pos.currentTpPrice = nt; pos.tpPct = 3;
-            this.log(`${pos.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% (${fmtP(nt)})`, 'warn');
+            this.log(`${pos.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% native (${fmtP(nt)})`, 'warn');
             this.persist();
           }
         }
@@ -5298,10 +5304,12 @@ function ew() { return {
               continue;
             }
             const newTp = pos.entryPrice * (1 - 0.03 / pos.leverage);
+            if (pos.tpOrderId) { await this.cancelTpLimitOrder(pos.symbol, pos.tpOrderId); pos.tpOrderId = null; }
+            await this._setNativeTP(pos.symbol, newTp);
+            pos._nativeReduceTpPrice = newTp;
             pos.currentTpPrice = newTp;
             pos.tpPct = 3;
-            await this.setTP(pos, newTp);
-            this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% (${fmtP(newTp)})`, 'warn');
+            this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% native (${fmtP(newTp)})`, 'warn');
             this.persist();
           }
         }
@@ -5434,9 +5442,11 @@ function ew() { return {
             if (!this.positions.find(x => x.id === p.id)) continue; // closed by another path during wait
             await this.closePosition(p, 'force'); continue;
           }
+          if (p.tpOrderId) { await this.cancelTpLimitOrder(p.symbol, p.tpOrderId); p.tpOrderId = null; }
+          await this._setNativeTP(p.symbol, nt);
+          p._nativeReduceTpPrice = nt;
           p.currentTpPrice = nt; p.tpPct = 3;
-          await this.setTP(p, nt);
-          this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% (${fmtP(nt)})`, 'warn');
+          this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% native (${fmtP(nt)})`, 'warn');
           this.persist();
         }
         // Continuous reduce-phase check: close if UROI ≥ 3% since reduce TP was set.
@@ -5885,32 +5895,17 @@ function ew() { return {
               pos.orders.filter(o => o.type === 'cond').forEach((o, i) => { if (i < pos.dcaStage) o.filled = true; });
             }
 
-            // Recompute correct 3% TP from current avgPrice and reissue if drifted.
-            // Tracked locally via pos.currentTpPrice (limit TP order, not exchange-native TP).
+            // Recompute correct 3% TP from current avgPrice and keep exchange native TP in sync.
+            // Uses trading-stop (native TP) — atomic, no order management, no qty requirement.
+            // Exception: when EDa TP (_edaTpPrice > 0) is active, the laggard system owns the
+            // TP via a limit order; skip native TP to avoid overwriting it.
             const instr = await this.getInstrInfo(pos.symbol);
             if (instr) {
               const reduceTp    = this.snapPrice(newAvgPrice * (1 - (0.03 / pos.leverage)), instr);
               const currentMark = pos.markPrice || newAvgPrice;
-              const activeTp    = pos.currentTpPrice;
-
-              // Guard: activeTp=0 means ghost-imported or malformed position with no TP.
-              if (!(activeTp > 0)) {
-                if (reduceTp > 0 && reduceTp < currentMark) {
-                  this.log(`${pos.symbol}: reduce phase — no TP on card (ghost/malformed import) — setting 3% TP @ ${fmtP(reduceTp)}`, 'warn');
-                  const res = await this.setTP(pos, reduceTp);
-                  if (res === 'ok') {
-                    pos.tpPct = 3;
-                    pos._tpReduceAcceptedKey = `reduce:${reduceTp}`;
-                    this.persist();
-                  }
-                }
-              } else {
-              const reduceAcceptKey = `reduce:${activeTp}`;
 
               if (reduceTp >= currentMark) {
-                // TP would be above mark (position still underwater).
-                // Require condition to persist for 15s before closing — avoids
-                // reacting to transient price spikes on the first sync cycle.
+                // TP above mark — position is underwater. Watch for 15s before force-closing.
                 if (!pos._reduceUnderwaterSince) {
                   pos._reduceUnderwaterSince = Date.now();
                   this.log(`${pos.symbol}: reduce phase — TP above mark (${fmtP(reduceTp)} ≥ ${fmtP(currentMark)}) — watching for 15s before close.`, 'warn');
@@ -5920,43 +5915,22 @@ function ew() { return {
                   this.persist();
                   await this.closePosition(pos, 'force');
                 }
-              } else if (pos._tpReduceAcceptedKey === reduceAcceptKey) {
-                // Limit order already set at this price — no drift, skip.
-                if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
               } else {
                 if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
-                const drift = Math.abs(activeTp - reduceTp);
-                if (drift > instr.tickSize) {
-                  // If position is below exchange minimum qty, limit TP orders are impossible.
-                  // Log once and skip — setTP's zero-qty guard will preserve whatever is on the exchange.
-                  if (this.snapQty(pos.totalSize, instr) < instr.minQty) {
-                    if (!pos._tpSizeTooSmall) {
-                      pos._tpSizeTooSmall = true;
-                      const sym = pos.symbol.replace('USDT','');
-                      this.log(`✂️ ${sym}: reduce phase — position size below instrument minimum; TP limit management suspended (existing TP preserved)`, 'warn');
-                    }
-                  } else {
-                    pos._tpSizeTooSmall = false;
-                    const _sameTgt = pos._tpReduceFailedAt === reduceTp;
-                    const _cooling = _sameTgt && pos._tpReduceCooldownUntil && Date.now() < pos._tpReduceCooldownUntil;
-                    if (!_cooling) {
-                      this.log(`${pos.symbol}: reduce phase — TP recomputed from avgPrice shift: ${fmtP(activeTp)} → ${fmtP(reduceTp)}`, 'warn');
-                      const res = await this.setTP(pos, reduceTp);
-                      if (res === 'ok') {
-                        pos._tpReduceAcceptedKey = `reduce:${reduceTp}`;
-                        pos._tpReduceFailedAt = null;
-                        pos._tpReduceCooldownUntil = null;
-                        pos.tpPct = 3;
-                        this.persist();
-                      } else {
-                        pos._tpReduceFailedAt = reduceTp;
-                        pos._tpReduceCooldownUntil = Date.now() + 60000;
-                      }
+                if (!(pos._edaTpPrice > 0)) {
+                  // Native TP dedup: only update when price has actually moved a tick.
+                  const drift = Math.abs(reduceTp - (pos._nativeReduceTpPrice || 0));
+                  if (reduceTp > 0 && (!(pos._nativeReduceTpPrice > 0) || drift > instr.tickSize)) {
+                    const res = await this._setNativeTP(pos.symbol, reduceTp);
+                    if (res === 'ok') {
+                      pos._nativeReduceTpPrice = reduceTp;
+                      pos.currentTpPrice = reduceTp;
+                      pos.tpPct = 3;
+                      this.persist();
                     }
                   }
                 }
               }
-            } // end else (activeTp > 0)
             }
           }
         } else if (!pos.isPending) {
@@ -6580,6 +6554,26 @@ function ew() { return {
       }
       return d.result?.orderId||null;
     } catch(e){this.log('placeCond: '+e.message,'error');return null;}
+  },
+
+  // Sets the exchange-native take-profit on a position via trading-stop.
+  // Atomic — no order ID, no qty requirement, no cancel-before-replace.
+  // Returns 'ok' or 'error'.
+  async _setNativeTP(symbol, tpPrice) {
+    const dp      = this.instrPriceDp(symbol);
+    const priceStr = tpPrice.toFixed(dp);
+    const b = JSON.stringify({ category:'linear', symbol, takeProfit: priceStr, tpTriggerBy:'LastPrice', positionIdx: 0 });
+    const h = await signHdr(this.creds.key, this.creds.secret, b, this._tsOffset);
+    try {
+      const r = await fetch(`${this.base}/v5/position/trading-stop`, { method:'POST', headers:h, body:b });
+      const d = await this.safeJson(r);
+      if (d && d.retCode === 0) return 'ok';
+      this.log(`setNativeTP (${symbol}): ${d?.retMsg || 'no response'}`, 'warn');
+      return 'error';
+    } catch(e) {
+      this.log(`setNativeTP (${symbol}): ${e.message}`, 'error');
+      return 'error';
+    }
   },
 
   // Places a GTC Limit Buy reduceOnly order at tpPrice (limit TP — no market slippage on trigger).
