@@ -5927,20 +5927,31 @@ function ew() { return {
                 if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
                 const drift = Math.abs(activeTp - reduceTp);
                 if (drift > instr.tickSize) {
-                  const _sameTgt = pos._tpReduceFailedAt === reduceTp;
-                  const _cooling = _sameTgt && pos._tpReduceCooldownUntil && Date.now() < pos._tpReduceCooldownUntil;
-                  if (!_cooling) {
-                    this.log(`${pos.symbol}: reduce phase — TP recomputed from avgPrice shift: ${fmtP(activeTp)} → ${fmtP(reduceTp)}`, 'warn');
-                    const res = await this.setTP(pos, reduceTp);
-                    if (res === 'ok') {
-                      pos._tpReduceAcceptedKey = `reduce:${reduceTp}`;
-                      pos._tpReduceFailedAt = null;
-                      pos._tpReduceCooldownUntil = null;
-                      pos.tpPct = 3;
-                      this.persist();
-                    } else {
-                      pos._tpReduceFailedAt = reduceTp;
-                      pos._tpReduceCooldownUntil = Date.now() + 60000;
+                  // If position is below exchange minimum qty, limit TP orders are impossible.
+                  // Log once and skip — setTP's zero-qty guard will preserve whatever is on the exchange.
+                  if (this.snapQty(pos.totalSize, instr) < instr.minQty) {
+                    if (!pos._tpSizeTooSmall) {
+                      pos._tpSizeTooSmall = true;
+                      const sym = pos.symbol.replace('USDT','');
+                      this.log(`✂️ ${sym}: reduce phase — position size below instrument minimum; TP limit management suspended (existing TP preserved)`, 'warn');
+                    }
+                  } else {
+                    pos._tpSizeTooSmall = false;
+                    const _sameTgt = pos._tpReduceFailedAt === reduceTp;
+                    const _cooling = _sameTgt && pos._tpReduceCooldownUntil && Date.now() < pos._tpReduceCooldownUntil;
+                    if (!_cooling) {
+                      this.log(`${pos.symbol}: reduce phase — TP recomputed from avgPrice shift: ${fmtP(activeTp)} → ${fmtP(reduceTp)}`, 'warn');
+                      const res = await this.setTP(pos, reduceTp);
+                      if (res === 'ok') {
+                        pos._tpReduceAcceptedKey = `reduce:${reduceTp}`;
+                        pos._tpReduceFailedAt = null;
+                        pos._tpReduceCooldownUntil = null;
+                        pos.tpPct = 3;
+                        this.persist();
+                      } else {
+                        pos._tpReduceFailedAt = reduceTp;
+                        pos._tpReduceCooldownUntil = Date.now() + 60000;
+                      }
                     }
                   }
                 }
@@ -6573,11 +6584,17 @@ function ew() { return {
 
   // Places a GTC Limit Buy reduceOnly order at tpPrice (limit TP — no market slippage on trigger).
   // Cancels any existing pos.tpOrderId first, and clears any exchange-native TP.
-  // Returns 'ok' or 'error'.
+  // Returns 'ok', 'zero-qty', or 'error'.
   async setTP(pos, tpPrice) {
     await this.signedDelay();
     const symbol  = pos.symbol;
     const instr   = this._instrCache[symbol];
+
+    // Guard: if position size is below instrument minimum, a limit TP order is impossible.
+    // Return early WITHOUT touching the existing TP order — preserving whatever is on the exchange.
+    if (instr && this.snapQty(pos.totalSize, instr) < instr.minQty) {
+      return 'zero-qty';
+    }
     const tick    = instr?.tickSize || 0;
     const priceDp = tick > 0
       ? (tick.toString().includes('.') ? tick.toString().split('.')[1].length : 0)
