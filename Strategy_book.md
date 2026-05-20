@@ -190,9 +190,9 @@ ADV FT uses **Close Confirmation** — recent price closes — to confirm a tren
 
 * **The Gate**: Of the last 4 completed 15m candles, at least **3** must have closed red (close < open).
 
-#### 3. **LSA (Localized Sell Average) Filter**
+#### 3. **LSA (Localized Sell Average) Filter** *(optional, off by default)*
 
-**LSA** measures the intensity of current selling relative to the ticker's recent average. For ADV FT, it gates entries to a configurable band — neither too thin (insufficient selling momentum) nor too thick (volume blowoff already spent).
+**LSA** measures the intensity of current selling relative to the ticker's recent average. For ADV FT, it gates entries to a configurable band — neither too thin (insufficient selling momentum) nor too thick (volume blowoff already spent). ClC alone may be sufficient; LSA is available if you want the extra confirmation layer.
 
 * **The Logic**: LSA compares the volume of the most recent completed 15m candle against the average volume of the preceding candles in the lookback window. A ratio in the target band confirms that selling is elevated but not exhausted.
 * **Why the High Floor**: An over-extender's baseline volume is skewed bullish — nearly all recent candles were green. By the time a reversal is underway, the first significant red candle already reads elevated relative to that baseline. A floor of **125%** is aggressive for a normal ticker, but realistic for one that has been running hot.
@@ -231,7 +231,13 @@ Follow-Through is the predecessor to Advanced Follow-Through. Where Advanced FT 
 When a ticker accumulates **2+ rodeo rides** (configurable), it promotes to the Follow-Through roster. We used to set this threshold at 4 rides, but when we raised the Gainers RSI gates and rodeo creep percentage, 2 rides became the more likely outcome.
 
 ### Entry Logic
-Same as Advanced FT: wait for RSI to cool, except into the 20-60 band, then enter when RSI conditions are met. The only difference is the **promotion path** — rodeo rides vs. over-extension hits. FT uses RSI gating only; it uses neither VM nor ClC.
+Same as Advanced FT: wait for RSI to cool, except into the 20-60 band, then enter when RSI conditions are met. The only difference is the **promotion path** — rodeo rides vs. over-extension hits. FT uses RSI gating and optionally Volume Momentum as a floor check.
+
+### Entry Filters
+
+**Volume Momentum (VM)** is on by default — the last completed 15m candle volume must be at least a configurable percentage above the window average before entry fires.
+
+**LSA (Localized Sell Average)** is available as an optional toggle, off by default. It gates entries to a band where selling volume is elevated but not exhausted — the same thresholds used by ADV FT. ClC is not available for regular FT; VM or LSA alone may be sufficient, and leaving both off is a valid configuration if you trust the RSI and rodeo gates alone.
 
 ---
 
