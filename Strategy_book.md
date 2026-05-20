@@ -397,7 +397,7 @@ The trade-off with more stages is that intermediate adds pull the average entry 
 
 The TP percentage decreases with each stage because our average entry gets better. The structure is designed so that at each DCA stage the TP yields approximately the same dollar amount as the original entry would have if it went perfectly. We are not trying to make more profit from the DCA — just exit cleanly from a better average.
 
-**Example at default 13% entry TP**: Stage 0 = 13%, Stage 1 = 6.5%, Stage 2 = 4.3%, Stage 3 = 3.25% → 3% (floor).
+**Example at default 6% entry TP**: Stage 0 = 6%, Stage 1 = 3% (floor).
 
 **Why This Works**: Each pump makes it relatively easier for us to exit. As price moves against us and triggers adds, our average entry price rises and our TP price rises with it. Even questionable strategies can often be rescued by the DCA structure.
 
@@ -429,10 +429,9 @@ On every non-gainer close (FT, ADV FT, FUN), the entry TP for that symbol is hal
 
 This is the mirror of the gainers rodeo. The rodeo observes rapid re-entries on a gainer and responds by *raising* TP — that pattern signals **declining buy pressure**, i.e. buyers can't hold the pump, so a deeper eventual move is expected. TP ingress on non-gainers does the opposite: declining sell pressure means the move is getting shorter, so TP comes down to meet it.
 
-**Example at default 13% entry TP**:
-- First close → ingress count 1 → entry TP: 6.5%
-- Second close → ingress count 2 → entry TP: 3.25% (approaching the 3% floor)
-- Third close → entry TP: 3% (floor holds)
+**Example at default 6% entry TP**:
+- First close → ingress count 1 → entry TP: 3% (floor reached immediately)
+- Second close onward → entry TP: 3% (floor holds)
 
 After 3 hours the counter resets and full TP is restored.
 
