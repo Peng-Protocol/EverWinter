@@ -544,11 +544,9 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 **Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists.
 
-**Retraction (on by default):** Also triggers sacrifice when collective uPnL drops below −2.5× entry margin, regardless of allocation. Disable if it fires too aggressively in volatile markets.
+**Retraction (Addendum):** A subset of sacrifice that targets collective uPnL below −2.5× entry margin, irrespective of allocated margin. This is a more aggressive form of sacrifice and will usually drop position count to the minimum (5).
 
-**Position floor:** Neither trigger closes below a configurable minimum (default 5 positions).
-
-**Speed limiters on green days:** On broad pump days, DCA accumulation pushes the book toward the thresholds and the system trims it, freeing capital before the next sell cycle. Both are optional — disabling retraction softens the system considerably, disabling sacrifice removes the cap entirely.
+**Sacrifice as a Speed Limiter:** On broadly bullish days, DCA accumulation pushes the book towards the threshold — calculated as max positions multiplied by 4× base margin — sacrifice acts on tickers already showing difficulty, hyper-focusing on them till they correct. In practice this slows the strategy down, preventing more entries when the market is upwardly inclined.
 
 ### Cascade Triggers
 
