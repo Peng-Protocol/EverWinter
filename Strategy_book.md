@@ -556,11 +556,13 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 An alternative to sacrifice. When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it — 5% of its size every 5 minutes. The goal is slow, steady removal of the dead weight without touching anything else.
 
-After roughly 20 cuts (~1.6 hours) the position is fully absorbed if price hasn't moved. In practice the sequence ends earlier — the position recovers, or a DCA add fires against a now-smaller size, improving the weighted entry considerably. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide.
+Cuts continue until remaining margin drops below $20, at which point the position is small enough that cascade, sacrifice, or a natural TP will finish it. The sequence usually ends well before that — either price recovers and the position clears the threshold on its own, or DCA fires first.
+
+When DCA fires into a partially absorbed position the effect compounds favourably: because the pre-existing size has been reduced, the DCA add — which is a fixed notional — carries more weight in the new average. The weighted average entry price rises toward the current mark, pulling the TP up with it and shortening the distance price needs to travel to close. The worse the position was, the bigger the improvement.
+
+Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide.
 
 Every cut realises a small loss. Those losses harden the laggard's EDa TP, so sustained absorption on a large position compounds quietly against the weakest ticker in the book.
-
-Once remaining margin drops below $20, cuts stop. The position is small enough by then that cascade, sacrifice, or a natural TP will finish it.
 
 ### Cascade Triggers
 
