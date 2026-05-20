@@ -541,7 +541,11 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 ### Sacrifice
 
-When total allocated margin exceeds 4× what all positions would cost at entry stage (no DCA), all scans halt and the most profitable open position is closed every 5 minutes until allocation drops back below it. It is a last-resort pressure valve for when the book is overextended.
+When total allocated margin exceeds 4× what all positions would cost at entry stage (no DCA), all scans halt and the system closes one position every 5 minutes until allocation drops back below the threshold. It is a last-resort pressure valve for when the book is overextended.
+
+**Target priority:** The system first looks for positions that have reached at least one DCA stage and are not too deep in loss (PnL > −3% of margin). Within that preferred group it closes the most profitable one first — recovering capital that costs the least in crystallised loss. If no preferred candidate exists it falls back to the most profitable position overall regardless of DCA stage.
+
+**Retraction (optional, on by default):** A separate trigger that fires independently of allocated margin. If collective unrealised PnL falls below −2.5× entry margin (the same threshold used by the cascade system), scans are halted and sacrifice logic begins even if the margin cap has not been hit. The same priority rules apply. This clause can be too strict in volatile markets — disable it if it fires too aggressively.
 
 ### Cascade Triggers
 

@@ -498,7 +498,14 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
             <div class="tog-t" :class="cfg.sacrificeEnabled?'on':''"><div class="tog-k"></div></div>
             <span class="tog-l">Sacrifice</span>
           </label>
-          <div class="hint" style="margin-top:4px">Halts scans and closes the most profitable position every 5 min when allocated margin exceeds 4× what max positions would cost at entry stage.</div>
+          <div class="hint" style="margin-top:4px">Halts scans and closes the highest-priority position every 5 min when allocated margin exceeds 4× what max positions would cost at entry stage. Prioritises positions with ≥1 DCA stage and PnL > −3%.</div>
+        </div>
+        <div class="g">
+          <label class="tog" @click.prevent="if(!cfgLocked)cfg.retractionEnabled=!cfg.retractionEnabled;if(!cfgLocked)persist()">
+            <div class="tog-t" :class="cfg.retractionEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Retraction</span>
+          </label>
+          <div class="hint" style="margin-top:4px">Also triggers sacrifice when collective unrealised PnL falls below −2.5× entry margin, regardless of allocated margin. Halts scans while active.</div>
         </div>
       </div>
     </div>
@@ -971,6 +978,7 @@ function psycho() { return {
     psychoChangePct:      6,
     psychoPerCycle:       12,
     sacrificeEnabled:     true,
+    retractionEnabled:    true,
     scanMins:             15,
     whiplashProximityPct: 20,
     dcaStages:        7,
@@ -1204,7 +1212,14 @@ function psycho() { return {
     if (this._isSacrificeActive()) {
       const alloc  = this._totalAllocated();
       const thresh = this._sacrificeThreshold();
-      this.log(`🔥 Scan halted — sacrifice active (allocated $${alloc.toFixed(2)} ≥ $${thresh.toFixed(2)})`, 'warn');
+      const cuPnL  = this.positions.reduce((s, p) => s + (p.upnl || 0), 0);
+      const retThresh = -2.5 * (this.cfg.minNotional / this.cfg.leverage);
+      const byRetraction = this.cfg.retractionEnabled && cuPnL <= retThresh && alloc < thresh;
+      if (byRetraction) {
+        this.log(`📉 Scan halted — retraction active (cuPnL $${cuPnL.toFixed(2)} ≤ $${retThresh.toFixed(2)})`, 'warn');
+      } else {
+        this.log(`🔥 Scan halted — sacrifice active (allocated $${alloc.toFixed(2)} ≥ $${thresh.toFixed(2)})`, 'warn');
+      }
       this.bot.scanning = false;
       return;
     }
@@ -2218,21 +2233,47 @@ function psycho() { return {
   },
 
   _isSacrificeActive() {
-    return this.cfg.sacrificeEnabled && this._totalAllocated() >= this._sacrificeThreshold();
+    if (!this.cfg.sacrificeEnabled) return false;
+    if (this._totalAllocated() >= this._sacrificeThreshold()) return true;
+    if (this.cfg.retractionEnabled && this.positions.length > 0) {
+      const cuPnL = this.positions.reduce((s, p) => s + (p.upnl || 0), 0);
+      const retractionThresh = -2.5 * (this.cfg.minNotional / this.cfg.leverage);
+      if (cuPnL <= retractionThresh) return true;
+    }
+    return false;
   },
 
   async runSacrificeCheck() {
     const now = Date.now();
     if (now - (this._lastSacrificeFired || 0) < 5 * 60 * 1000) return;
+
     const alloc  = this._totalAllocated();
     const thresh = this._sacrificeThreshold();
-    if (alloc < thresh) return;
-    const target = [...this.positions]
-      .filter(p => !_closingIds.has(p.id))
-      .sort((a, b) => (b.upnl || 0) - (a.upnl || 0))[0];
+    const cuPnL  = this.positions.reduce((s, p) => s + (p.upnl || 0), 0);
+    const retractionThresh = -2.5 * (this.cfg.minNotional / this.cfg.leverage);
+
+    const sacrificeActive  = alloc >= thresh;
+    const retractionActive = this.cfg.retractionEnabled && cuPnL <= retractionThresh;
+    if (!sacrificeActive && !retractionActive) return;
+
+    // Priority: DCA ≥ 1 AND pnlPct > -3% (profit-first within group), else all positions
+    const eligible  = [...this.positions].filter(p => !_closingIds.has(p.id));
+    const preferred = eligible
+      .filter(p => (p.dcaStage || 0) >= 1 && (p.margin > 0 ? (p.upnl || 0) / p.margin * 100 : 0) > -3)
+      .sort((a, b) => (b.upnl || 0) - (a.upnl || 0));
+    const target = preferred.length > 0
+      ? preferred[0]
+      : eligible.sort((a, b) => (b.upnl || 0) - (a.upnl || 0))[0];
     if (!target) return;
+
     this._lastSacrificeFired = now;
-    this.log(`🔥 Sacrifice — allocated $${alloc.toFixed(2)} ≥ $${thresh.toFixed(2)} — closing ${target.symbol.replace('USDT', '')} (uPnL ${(target.upnl || 0) >= 0 ? '+' : ''}$${(target.upnl || 0).toFixed(2)})`, 'warn');
+    const sym   = target.symbol.replace('USDT', '');
+    const upnlStr = `${(target.upnl || 0) >= 0 ? '+' : ''}$${(target.upnl || 0).toFixed(2)}`;
+    if (retractionActive && !sacrificeActive) {
+      this.log(`📉 Retraction — cuPnL $${cuPnL.toFixed(2)} ≤ $${retractionThresh.toFixed(2)} — closing ${sym} (uPnL ${upnlStr})`, 'warn');
+    } else {
+      this.log(`🔥 Sacrifice — allocated $${alloc.toFixed(2)} ≥ $${thresh.toFixed(2)} — closing ${sym} (uPnL ${upnlStr})`, 'warn');
+    }
     await this.closePosition(target, 'sacrifice');
   },
 
