@@ -968,7 +968,7 @@ function psycho() { return {
     leverage:         6,
     minNotional:      6,
     maxPositions:     50,
-    psychoChangePct:      3,
+    psychoChangePct:      6,
     psychoPerCycle:       12,
     sacrificeEnabled:     true,
     scanMins:             15,
@@ -1252,11 +1252,12 @@ function psycho() { return {
     for (const t of pool) {
       if (opened >= take) break;
       if (this.positions.length >= this.cfg.maxPositions) break;
-      const price = parseFloat(t.lastPrice);
-      const fr    = parseFloat(t.fundingRate ?? 0) * 100;
+      const price     = parseFloat(t.lastPrice);
+      const fr        = parseFloat(t.fundingRate ?? 0) * 100;
+      const change24h = parseFloat(t.price24hPcnt ?? 0) * 100;
       if (!price || price <= 0) continue;
       const before = this.positions.length;
-      await this.openShort({ symbol: t.symbol, price, fundingRate: fr });
+      await this.openShort({ symbol: t.symbol, price, fundingRate: fr, change24h });
       if (this.positions.length > before) opened++;
       await new Promise(r => setTimeout(r, 300));
     }
@@ -1382,10 +1383,11 @@ function psycho() { return {
       _amaStage:            0,
       _amaOrders:           amaOrders,
       _amaOrigEntry:        useAma ? price : null,
+      _change24h:           candidate.change24h ?? 0,
     };
 
     this.positions.push(pos);
-    this.log(`📉 SHORT ${sym} @ ${fmtP(price)} | Notional $${actualNotional.toFixed(2)} | Margin $${margin.toFixed(2)} | ${useAma ? 'AMa active — no TP' : 'TP '+fmtP(tpPrice)+' ('+tpRoi0+'% ROI)'} | FR ${(candidate.fundingRate??0)>=0?'+':''}${(candidate.fundingRate??0).toFixed(4)}%`, 'trade');
+    this._logOpenBatch(sym, candidate.change24h ?? 0, price);
     this.persist();
   },
 
@@ -1508,9 +1510,10 @@ function psycho() { return {
       _amaStage:     0,
       _amaOrders:    amaOrders,
       _amaOrigEntry: useAma ? fillPrice : null,
+      _change24h:    candidate.change24h ?? 0,
     };
     this.positions.push(pos);
-    this.log(`📉 LIVE SHORT ${sym} @ ${fmtP(fillPrice)} | Margin $${margin.toFixed(2)} | ${useAma ? 'AMa active — no TP' : 'TP '+fmtP(tpPrice)}`, 'trade');
+    this._logOpenBatch(sym, candidate.change24h ?? 0, fillPrice);
     this.persist();
   },
 
@@ -1784,9 +1787,7 @@ function psycho() { return {
     if (reason === 'force') {
       this._addForceRollup({ symbol: pos.symbol, exitPrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin, id: pos.id });
     } else {
-      const feeStr = fundFee !== 0 ? ` | Fund ${fundFee>=0?'+':''}${fundFee.toFixed(3)}` : '';
-      const emoji = reason === 'cascade' ? '🌊' : reason === 'laggard' ? '🎯' : (isWin ? '✅' : '❌');
-      this.log(`${emoji} CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)${feeStr} | DCA${pos.dcaStage} | ${durStr(duration)}`, isWin?'success':'warn');
+      this._logCloseBatch(pos.symbol, totalPnl, pnlPct, reason, isWin);
     }
     _closingIds.delete(pos.id);
     this.persist();
@@ -1844,8 +1845,7 @@ function psycho() { return {
     if (reason === 'force') {
       this._addForceRollup({ symbol: pos.symbol, exitPrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin, id: pos.id });
     } else {
-      const emoji = reason === 'cascade' ? '🌊' : reason === 'laggard' ? '🎯' : (isWin ? '✅' : '❌');
-      this.log(`${emoji} LIVE CLOSED ${pos.symbol} @ ${fmtP(exitPrice)} | ${reason.toUpperCase()} | PnL ${totalPnl>=0?'+':''}${totalPnl.toFixed(3)} USDT | DCA${pos.dcaStage}`, isWin?'success':'warn');
+      this._logCloseBatch(pos.symbol, totalPnl, pnlPct, reason, isWin);
     }
     _closingIds.delete(pos.id);
     this.persist();
@@ -2613,6 +2613,44 @@ function psycho() { return {
   },
 
   // ── Log ──
+  _logOpenBatch(sym, change24h, price) {
+    const now   = Date.now();
+    const entry = this._openBatchId != null ? this.logs.find(e => e.id === this._openBatchId) : null;
+    if (entry && entry.openBatch && now - (this._openBatchTs || 0) < 15 * 60 * 1000) {
+      entry.batch.push({ sym, change24h, price });
+      try { localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs)); } catch(e) {}
+      this._renderLogs();
+    } else {
+      this._logSeq = (this._logSeq || 0) + 1;
+      const id = this._logSeq;
+      const t  = new Date().toTimeString().slice(0, 8);
+      this.logs = [{ t, id, type:'trade', openBatch:true, batch:[{ sym, change24h, price }] }, ...this.logs.slice(0, 299)];
+      this._openBatchId = id;
+      this._openBatchTs = now;
+      try { localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs)); } catch(e) {}
+      this._renderLogs();
+    }
+  },
+
+  _logCloseBatch(sym, pnl, pnlPct, reason, isWin) {
+    const now   = Date.now();
+    const entry = this._closeBatchId != null ? this.logs.find(e => e.id === this._closeBatchId) : null;
+    if (entry && entry.closeBatch && now - (this._closeBatchTs || 0) < 15 * 60 * 1000) {
+      entry.batch.push({ sym, pnl, pnlPct, reason, isWin });
+      try { localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs)); } catch(e) {}
+      this._renderLogs();
+    } else {
+      this._logSeq = (this._logSeq || 0) + 1;
+      const id = this._logSeq;
+      const t  = new Date().toTimeString().slice(0, 8);
+      this.logs = [{ t, id, type:'trade', closeBatch:true, batch:[{ sym, pnl, pnlPct, reason, isWin }] }, ...this.logs.slice(0, 299)];
+      this._closeBatchId = id;
+      this._closeBatchTs = now;
+      try { localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs)); } catch(e) {}
+      this._renderLogs();
+    }
+  },
+
   log(m, type='info') {
     const t = new Date().toTimeString().slice(0,8);
     this._logSeq = (this._logSeq || 0) + 1;
@@ -2650,6 +2688,22 @@ function psycho() { return {
             <span>↑ PnL ${s(r.bestByPnl.sym+' '+(r.bestByPnl.totalPnl>=0?'+':'')+r.bestByPnl.totalPnl.toFixed(2),'profit')}</span>
             <span>↓ PnL ${s(r.worstByPnl.sym+' '+(r.worstByPnl.totalPnl>=0?'+':'')+r.worstByPnl.totalPnl.toFixed(2),'loss')}</span>
           </div></div>`;
+      } else if (e.openBatch) {
+        const tickers = e.batch.map(b => {
+          const chg = b.change24h || 0;
+          const cls = chg >= 0 ? 'profit' : 'loss';
+          return `<span class="${cls}">${b.sym.replace('USDT','')} ${chg>=0?'+':''}${chg.toFixed(1)}%</span>`;
+        }).join('<span style="color:var(--text-lo)"> · </span>');
+        body = `<div style="flex:1;line-height:1.5"><div style="font-weight:700">📉 ×${e.batch.length} SHORT</div><div style="font-size:8px;line-height:1.7;word-break:break-all">${tickers}</div></div>`;
+      } else if (e.closeBatch) {
+        const netPnl = e.batch.reduce((s, b) => s + b.pnl, 0);
+        const netCls = netPnl >= 0 ? 'profit' : 'loss';
+        const emoji  = netPnl >= 0 ? '✅' : '❌';
+        const tickers = e.batch.map(b => {
+          const cls = b.isWin ? 'profit' : 'loss';
+          return `<span class="${cls}">${b.sym.replace('USDT','')} ${b.pnl>=0?'+':''}${b.pnl.toFixed(2)}</span>`;
+        }).join('<span style="color:var(--text-lo)"> · </span>');
+        body = `<div style="flex:1;line-height:1.5"><div style="font-weight:700">${emoji} ×${e.batch.length} CLOSED | Net <span class="${netCls}">${netPnl>=0?'+':''}${netPnl.toFixed(3)} USDT</span></div><div style="font-size:8px;line-height:1.7;word-break:break-all">${tickers}</div></div>`;
       } else {
         body = `<span>${e.m ?? ''}</span>`;
       }

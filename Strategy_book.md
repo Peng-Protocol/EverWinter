@@ -523,7 +523,7 @@ At $60 notional / 6× leverage = $10 margin per entry. For 10 positions at moder
 
 ## Psycho Mode
 
-Psycho Mode is like a bear with a toothache which can only be soothed by blood. It utilizes no filters save for 24hr change — any ticker moving more than 3% in either direction qualifies. It uses the following settings:
+Psycho Mode is like a bear with a toothache which can only be soothed by blood. It utilizes no filters save for 24hr change — any ticker moving more than 6% in either direction qualifies. It uses the following settings:
 
 - **7 DCA stages** at **2× escalation** — each add doubles the last, staggered deeper into the pump
 - **25% entry TP ROI**, decaying per stage (flooring at 3%)
