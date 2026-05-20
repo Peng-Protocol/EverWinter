@@ -547,7 +547,11 @@ When total allocated margin exceeds 4× what all positions would cost at entry s
 
 **Retraction (optional, on by default):** A separate trigger that fires independently of allocated margin. If collective unrealised PnL falls below −2.5× entry margin (the same threshold used by the cascade system), scans are halted and sacrifice logic begins even if the margin cap has not been hit. The same priority rules apply. This clause can be too strict in volatile markets — disable it if it fires too aggressively.
 
-**No position floor:** Neither sacrifice nor retraction has a hard limit on how many positions it will close. Both continue closing one position every 5 minutes for as long as the triggering condition remains true — potentially down to zero open positions. The 5-minute cooldown is the only brake. This may warrant a minimum-positions guardrail in future; revisit if either trigger proves too destructive in practice.
+**No position floor:** Both sacrifice and retraction respect a configurable minimum position count (default 5) — they will not close below that floor regardless of how long the trigger condition persists. Outside that floor, they continue closing one position every 5 minutes for as long as the condition is true. Revisit the floor setting if either trigger proves too aggressive in practice.
+
+**Practical character — speed limiters on green days:** In practice, sacrifice and retraction behave like a speed limiter. On green days, the market pumps broadly and many positions accumulate DCA stages simultaneously, pushing allocated margin or collective uPnL toward the trigger thresholds. The system responds by trimming the book — closing the most recoverable positions and pausing new entries. When the market rotates back to selling, the book naturally expands again toward its full position count. Without the limiters, capital would be spread across too many positions just as the good entry conditions return.
+
+Both are optional. Disabling retraction softens the system considerably — sacrifice alone only fires at extreme allocation. Disabling sacrifice entirely removes the cap. Neither is strictly necessary; the bot will function without them, but they make capital deployment more deliberate during crowded markets.
 
 ### Cascade Triggers
 
