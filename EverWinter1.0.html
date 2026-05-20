@@ -3264,43 +3264,49 @@ function ew() { return {
       const _absCutIdx = Math.floor(_absElapsed / intervalMs);
       const _absExpectedAt = _absBase + _absCutIdx * intervalMs;
       if ((pos._lastAbsorptionAt || 0) >= _absExpectedAt) continue;
+      pos._lastAbsorptionAt = _absExpectedAt;
       if ((pos.margin || 0) <= baseMargin) {
         const sym = pos.symbol.replace('USDT','');
-        this.log(`✂️ ${sym}: absorption due — already at minimum size ($${(pos.margin||0).toFixed(2)}), no cut`, 'info');
-        pos._lastAbsorptionAt = _absExpectedAt;
+        this.log(`✂️ ${sym}: absorption due — already at minimum size ($${(pos.margin||0).toFixed(2)}), pending next DCA`, 'info');
+        pos._loaPending = true;
         continue;
       }
-      const mark       = pos.markPrice || pos.entryPrice;
-      const cutMgn      = Math.min(baseMargin, pos.margin - baseMargin);
-      const cutFraction = cutMgn / pos.margin;
-      const cutQty     = pos.totalSize * cutFraction;
-      if (cutQty <= 0) continue;
-      const cutPnl = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * cutMgn;
-      try {
-        const instr = await this.getInstrInfo(pos.symbol);
-        if (!instr) continue;
-        const qty = this.snapQty(cutQty, instr);
-        if (qty < instr.minQty) {
-          this.log(`✂️ ${pos.symbol}: absorption skipped — cut below exchange minimum`, 'info');
-          continue;
-        }
-        const body = JSON.stringify({ category:'linear', symbol:pos.symbol, side:'Buy', orderType:'Market', qty:String(qty), timeInForce:'IOC', reduceOnly:true });
-        const h    = await signHdr(this.creds.key, this.creds.secret, body, this._tsOffset);
-        const r    = await fetch(`${this.base}/v5/order/create`, { method:'POST', headers:h, body });
-        const d    = await this.safeJson(r);
-        if (!d || d.retCode !== 0) throw new Error(d?.retMsg || 'no response');
-      } catch(e) {
-        this.log(`${pos.symbol}: absorption cut failed — ${e.message}`, 'error');
-        continue;
-      }
-      pos.totalSize = Math.max(0, pos.totalSize - cutQty);
-      pos.margin    = Math.max(0, pos.margin - cutMgn);
-      pos._lastAbsorptionAt = _absExpectedAt;
-      this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
-      const sym = pos.symbol.replace('USDT','');
-      this.log(`✂️ ${sym}: absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)}`, 'warn');
+      await this._tryAbsorbPos(pos, baseMargin);
+      this.persist();
     }
-    this.persist();
+  },
+
+  async _tryAbsorbPos(pos, baseMargin) {
+    if ((pos.upnl || 0) >= 0) return;
+    if ((pos.margin || 0) <= baseMargin) return;
+    const mark        = pos.markPrice || pos.entryPrice;
+    const cutMgn      = Math.min(baseMargin, pos.margin - baseMargin);
+    const cutFraction = cutMgn / pos.margin;
+    const cutQty      = pos.totalSize * cutFraction;
+    if (cutQty <= 0) return;
+    const cutPnl = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * cutMgn;
+    try {
+      const instr = await this.getInstrInfo(pos.symbol);
+      if (!instr) return;
+      const qty = this.snapQty(cutQty, instr);
+      if (qty < instr.minQty) {
+        this.log(`✂️ ${pos.symbol}: absorption skipped — cut below exchange minimum`, 'info');
+        return;
+      }
+      const body = JSON.stringify({ category:'linear', symbol:pos.symbol, side:'Buy', orderType:'Market', qty:String(qty), timeInForce:'IOC', reduceOnly:true });
+      const h    = await signHdr(this.creds.key, this.creds.secret, body, this._tsOffset);
+      const r    = await fetch(`${this.base}/v5/order/create`, { method:'POST', headers:h, body });
+      const d    = await this.safeJson(r);
+      if (!d || d.retCode !== 0) throw new Error(d?.retMsg || 'no response');
+    } catch(e) {
+      this.log(`${pos.symbol}: absorption cut failed — ${e.message}`, 'error');
+      return;
+    }
+    pos.totalSize = Math.max(0, pos.totalSize - cutQty);
+    pos.margin    = Math.max(0, pos.margin - cutMgn);
+    this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
+    const sym = pos.symbol.replace('USDT','');
+    this.log(`✂️ ${sym}: absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)}`, 'warn');
   },
 
   async runLaggardCheck() {
@@ -4591,6 +4597,13 @@ function ew() { return {
             pos.entryPrice = newTotalNotional / pos.totalSize;
             pos.margin     = (pos.entryPrice * pos.totalSize) / pos.leverage;
             pos.dcaStage   = pos.orders.filter(o => o.type === 'cond' && o.filled).length;
+            if (pos._loaPending && this.cfg.lossAbsorptionEnabled && (pos.upnl || 0) < 0) {
+              const _loaBase = this.cfg.minNotional / this.cfg.leverage;
+              if ((pos.margin || 0) > _loaBase) {
+                pos._loaPending = false;
+                await this._tryAbsorbPos(pos, _loaBase);
+              }
+            }
           }
           const _ft_roi   = this._tpRoi(pos.dcaStage);
           const _ft_instr = await this.getInstrInfo(pos.symbol);
@@ -5733,6 +5746,14 @@ function ew() { return {
           // On testnet avgPrice can lag DCA fills, causing margin to incorrectly stay at stage-0 value.
           const exPosMargin = parseFloat(ep.positionIM || 0);
           pos.margin     = exPosMargin > 0 ? exPosMargin : (newAvgPrice * newSize) / pos.leverage;
+          if (pos._loaPending && this.cfg.lossAbsorptionEnabled && (pos.upnl || 0) < 0) {
+            const _loaBase = this.cfg.minNotional / this.cfg.leverage;
+            if ((pos.margin || 0) > _loaBase) {
+              pos._loaPending = false;
+              await this._tryAbsorbPos(pos, _loaBase);
+              this.persist();
+            }
+          }
           tot += newUpnl;
 
           // SL check — runs for ALL phases so a reduce-phase stage-3 position is not left
