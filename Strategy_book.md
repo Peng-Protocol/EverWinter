@@ -552,6 +552,18 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 **Effect on Laggards:** When multiple positions have closed in loss, they push the ED in the opposite direction — the laggard becomes harder to close. When used with sacrifice, a laggard can become super-hardened, requiring a strong internal or external slump which will either drag mark price to TP or drag TP closer to mark — whichever comes first.
 
+### Loss Absorption
+
+Where sacrifice and retraction punish other positions to relieve pressure on the book, loss absorption punishes the offender directly — in small, repeated increments. If a position's unrealised loss exceeds 2.5× base margin, 5% of its size is closed at market every 5 minutes. No other positions are touched.
+
+Each cut realises a small loss, slightly reducing the position's margin load and easing the drain on the book. After roughly 20 cuts (~1.6 hours) the position is fully absorbed if price hasn't moved in its favour. In practice, the sequence usually ends earlier: either price recovers enough to lift the position clear of the threshold, or a sacrifice or cascade closes it first.
+
+**Interaction with DCA:** If the position DCAs while absorption is active, the next DCA add enters against an already-reduced position size. The lower size means the DCA margin weighs more proportionally, improving the average entry while keeping the total margin load manageable.
+
+**Interaction with Laggards:** Every absorbed cut realises a loss, which increments the laggard ledger. This pushes the laggard's EDa TP slightly lower — hardening it. Loss absorption is therefore a slow but compounding drag on whatever the current laggard is. The effect is minor per cut but accumulates across many absorption cycles.
+
+**Exchange floor:** Each 5% cut is checked against the exchange's minimum order size before placement. Once the remaining position size shrinks to where a 5% cut would fall below that minimum, absorption stops firing. At that point the position is small enough that sacrifice, cascade, or a natural TP will handle the remainder.
+
 ### Cascade Triggers
 
 The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement.
