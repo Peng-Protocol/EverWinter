@@ -547,6 +547,8 @@ When total allocated margin exceeds 4× what all positions would cost at entry s
 
 **Retraction (optional, on by default):** A separate trigger that fires independently of allocated margin. If collective unrealised PnL falls below −2.5× entry margin (the same threshold used by the cascade system), scans are halted and sacrifice logic begins even if the margin cap has not been hit. The same priority rules apply. This clause can be too strict in volatile markets — disable it if it fires too aggressively.
 
+**No position floor:** Neither sacrifice nor retraction has a hard limit on how many positions it will close. Both continue closing one position every 5 minutes for as long as the triggering condition remains true — potentially down to zero open positions. The 5-minute cooldown is the only brake. This may warrant a minimum-positions guardrail in future; revisit if either trigger proves too destructive in practice.
+
 ### Cascade Triggers
 
 The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement.
