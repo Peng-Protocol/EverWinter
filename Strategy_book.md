@@ -489,6 +489,8 @@ Every close — winning or losing — adjusts the tally for all remaining positi
 
 The laggard system closes most positions that would otherwise have hit their targets, but this forgone profit is acceptable — the alternative is exposure to reversals on a position that has already stalled.
 
+**The laggard system can both hasten and prolong closures.** When accumulated closes are profitable, ED burns down quickly and the laggard is pushed out. When closes are in loss, they push ED in the opposite direction — the laggard's EDa TP moves further from the current mark price, effectively becoming a debt that must be paid off by future wins before the position can close. In a literal sense the system is not just an accelerant but a ledger. The most common cause outside Psycho Mode is a laggard closing in loss — its deficit rolls forward and hardens the next laggard after it, requiring a more decisive move to resolve.
+
 ---
 
 ### Balance, Max Positions, and Notional Sizing
