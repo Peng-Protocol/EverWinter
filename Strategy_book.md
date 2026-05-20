@@ -533,10 +533,6 @@ Psycho Mode is like a bear with a toothache which can only be soothed by blood. 
 
 When a winner closes it raises the lost-value tally for every remaining position, which can push the next-weakest over its threshold and out — and so on. The real game is waiting for one ticker to move decisively and letting the cascade do the rest. Win rate is low; what keeps ROI healthy is that the winners are large enough to absorb the dust.
 
-### Swap-Out
-
-When at max positions, each scan looks for up to a configurable number of stagnant positions — those within ±3% ROI (configurable) — and replaces them with fresh tickers from the qualifying pool. Profitable stagnant positions are swapped first, since closing them also seeds lost-value pressure on the remaining book.
-
 ### Sacrifice
 
 When total allocated margin exceeds a threshold (4× the full-book entry margin, scaling with notional and max positions), all scans halt and the most profitable open position is closed every 5 minutes until allocation drops back below it. It is a last-resort pressure valve for when the book is overextended.
