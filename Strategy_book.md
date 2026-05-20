@@ -540,7 +540,7 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 ### Sacrifice
 
-When allocated margin exceeds 4× entry-stage cost, scans halt and the most recoverable position closes every 5 minutes until the book is back under the cap.
+As positions DCA deeper, each one consumes more margin than it did at entry. When the total committed margin across all positions exceeds 4× what opening that same number of positions at entry stage would cost, the book is considered overextended — scans halt and the most recoverable position closes every 5 minutes until allocation drops back under the cap.
 
 **Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists.
 
