@@ -554,15 +554,13 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 ### Loss Absorption
 
-Where sacrifice and retraction punish other positions to relieve pressure on the book, loss absorption punishes the offender directly — in small, repeated increments. If a position's unrealised loss exceeds 2.5× base margin, 5% of its size is closed at market every 5 minutes. No other positions are touched.
+An alternative to sacrifice. When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it — 5% of its size every 5 minutes. The goal is slow, steady removal of the dead weight without touching anything else.
 
-Each cut realises a small loss, slightly reducing the position's margin load and easing the drain on the book. After roughly 20 cuts (~1.6 hours) the position is fully absorbed if price hasn't moved in its favour. In practice, the sequence usually ends earlier: either price recovers enough to lift the position clear of the threshold, or a sacrifice or cascade closes it first.
+After roughly 20 cuts (~1.6 hours) the position is fully absorbed if price hasn't moved. In practice the sequence ends earlier — the position recovers, or a DCA add fires against a now-smaller size, improving the weighted entry considerably. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide.
 
-**Interaction with DCA:** If the position DCAs while absorption is active, the next DCA add enters against an already-reduced position size. The lower size means the DCA margin weighs more proportionally, improving the average entry while keeping the total margin load manageable.
+Every cut realises a small loss. Those losses harden the laggard's EDa TP, so sustained absorption on a large position compounds quietly against the weakest ticker in the book.
 
-**Interaction with Laggards:** Every absorbed cut realises a loss, which increments the laggard ledger. This pushes the laggard's EDa TP slightly lower — hardening it. Loss absorption is therefore a slow but compounding drag on whatever the current laggard is. The effect is minor per cut but accumulates across many absorption cycles.
-
-**Exchange floor:** Each 5% cut is checked against the exchange's minimum order size before placement. Once the remaining position size shrinks to where a 5% cut would fall below that minimum, absorption stops firing. At that point the position is small enough that sacrifice, cascade, or a natural TP will handle the remainder.
+Once remaining margin drops below $20, cuts stop. The position is small enough by then that cascade, sacrifice, or a natural TP will finish it.
 
 ### Cascade Triggers
 
