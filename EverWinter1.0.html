@@ -775,6 +775,17 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <input type="range" min="2" max="10" step="1" x-model.number="cfg.laggardAutoReduceThreshold" :disabled="cfgLocked" @change="persist()">
               <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">When this many positions are open, force all FT into reduce phase.</div>
             </div>
+            <div style="margin-top:12px">
+              <label class="tog" @click.prevent="if(!cfgLocked){cfg.lossAbsorptionEnabled=!cfg.lossAbsorptionEnabled;persist()}" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''">
+                <div class="tog-t" :class="cfg.lossAbsorptionEnabled?'on':''"><div class="tog-k"></div></div>
+                <span class="tog-l">Loss Absorption</span>
+              </label>
+              <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">For losing positions, closes base notional every <b x-text="cfg.lossAbsorptionIntervalMins+'min'"></b> until only base notional remains.</div>
+              <div x-show="cfg.lossAbsorptionEnabled" style="margin-top:8px">
+                <div class="lbl">Interval <b x-text="cfg.lossAbsorptionIntervalMins+'min'"></b></div>
+                <input type="range" min="15" max="180" step="15" x-model.number="cfg.lossAbsorptionIntervalMins" :disabled="cfgLocked" @change="persist()">
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -1276,7 +1287,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="ps" x-html="(()=>{
                 const isLag = cfg.laggardCheckEnabled && p.phase==='reduce'
                   && p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;
-                if (isLag && p._edaTpPrice != null) {
+                if (isLag && p._edaTpPrice > 0) {
                   const roi = (p.entryPrice - p._edaTpPrice) / p.entryPrice * p.leverage * 100;
                   const roiStr = (roi>=0?'+':'')+roi.toFixed(1)+'%';
                   const col = roi>=0?'var(--profit)':'var(--short)';
@@ -2240,6 +2251,8 @@ function ew() { return {
     laggardProfitOffset: 50,     // EV multiplier offset %: positive = protective, negative = aggressive
     laggardAutoReduce: true,     // auto-push FT positions to TP reduce on congestion
     laggardAutoReduceThreshold: 4, // position count threshold to trigger auto-reduce
+    lossAbsorptionEnabled: true,
+    lossAbsorptionIntervalMins: 45,
     // ── FUN (Fund Chasing) Strategy ──
     funEnabled: true,          // enable fund-chasing strategy (requires gainersEnabled)
     funFundingHigh: 0.1,       // high-fund threshold % (HFG = 3× gainer / HFL = 2× loser)
@@ -2759,7 +2772,10 @@ function ew() { return {
 
       this.persist();
 
-      // 6. Ghost position audit — runs once per scan cycle, AFTER all entry logic completes.
+      // 6. Loss absorption
+      if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) await this.runLossAbsorption();
+
+      // 7. Ghost position audit — runs once per scan cycle, AFTER all entry logic completes.
       // Running here (not in syncPositions) prevents racing with ftOpenShort and openShort,
       // which both happen during steps 1–3.
       // syncPositions only handles positions it already knows about; new unknowns wait here.
@@ -3514,6 +3530,47 @@ function ew() { return {
     } catch { return { peak: null, oeCount: 0 }; }
   },
 
+  async runLossAbsorption() {
+    if (!this.cfg.lossAbsorptionEnabled) return;
+    const now        = Date.now();
+    const baseMargin = this.cfg.minNotional / this.cfg.leverage;
+    const intervalMs = (this.cfg.lossAbsorptionIntervalMins ?? 45) * 60 * 1000;
+    for (const pos of [...this.positions]) {
+      if ((pos.upnl || 0) >= 0) continue;
+      if ((pos.margin || 0) <= baseMargin) continue;
+      if (_closingIds.has(pos.id)) continue;
+      if (now - (pos._lastAbsorptionAt || 0) < intervalMs) continue;
+      const mark       = pos.markPrice || pos.entryPrice;
+      const cutFraction = baseMargin / pos.margin;
+      const cutQty     = pos.totalSize * cutFraction;
+      if (cutQty <= 0) continue;
+      const cutPnl = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * baseMargin;
+      try {
+        const instr = await this.getInstrInfo(pos.symbol);
+        if (!instr) continue;
+        const qty = this.snapQty(cutQty, instr);
+        if (qty < instr.minQty) {
+          this.log(`✂️ ${pos.symbol}: absorption skipped — cut below exchange minimum`, 'info');
+          continue;
+        }
+        const body = JSON.stringify({ category:'linear', symbol:pos.symbol, side:'Buy', orderType:'Market', qty:String(qty), timeInForce:'IOC', reduceOnly:true });
+        const h    = await signHdr(this.creds.key, this.creds.secret, body, this._tsOffset);
+        const r    = await fetch(`${this.base}/v5/order/create`, { method:'POST', headers:h, body });
+        const d    = await this.safeJson(r);
+        if (!d || d.retCode !== 0) throw new Error(d?.retMsg || 'no response');
+      } catch(e) {
+        this.log(`${pos.symbol}: absorption cut failed — ${e.message}`, 'error');
+        continue;
+      }
+      pos.totalSize = Math.max(0, pos.totalSize - cutQty);
+      pos.margin    = Math.max(0, pos.margin - baseMargin);
+      pos._lastAbsorptionAt = now;
+      const sym = pos.symbol.replace('USDT','');
+      this.log(`✂️ ${sym}: absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)}`, 'warn');
+    }
+    this.persist();
+  },
+
   async runLaggardCheck() {
     if (!this.cfg.laggardCheckEnabled) return;
     if (this.positions.length < 1) return;
@@ -3533,13 +3590,13 @@ function ew() { return {
     const buffedEV      = ev * buffMul;
 
     // EDa TP: price at which uPnL = buffedEV − lostValue (ED zero point)
-    const edaTpPrice = laggard.entryPrice - (buffedEV - lostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin);
+    const edaTpPrice = Math.max(0, laggard.entryPrice - (buffedEV - lostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin));
     laggard._edaTpPrice = edaTpPrice;
 
-    // Place or update the limit close order when edaTpPrice is below current market
-    if (edaTpPrice < (laggard.markPrice ?? Infinity)) {
+    // Place or update the limit close order when edaTpPrice is valid and below current market
+    if (edaTpPrice > 0 && edaTpPrice < (laggard.markPrice ?? Infinity)) {
       const prev = laggard._edaTpPrev;
-      if (prev == null || Math.abs(edaTpPrice - prev) / prev > 0.0005) {
+      if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
         laggard._edaTpPrev = edaTpPrice;
         this.setTP(laggard, edaTpPrice).catch(() => {});
       }
@@ -3570,10 +3627,10 @@ function ew() { return {
     if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
       const buffMul  = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
       const buffedEV = laggard._laggardInitialEV * buffMul;
-      const edaTp    = laggard.entryPrice - (buffedEV - laggard._laggardLostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin);
+      const edaTp    = Math.max(0, laggard.entryPrice - (buffedEV - laggard._laggardLostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin));
       laggard._edaTpPrice = edaTp;
       laggard._edaTpPrev  = edaTp;
-      if (edaTp < (laggard.markPrice ?? Infinity)) {
+      if (edaTp > 0 && edaTp < (laggard.markPrice ?? Infinity)) {
         this.setTP(laggard, edaTp).catch(() => {});
       }
     }
@@ -4931,20 +4988,13 @@ function ew() { return {
         }
         if (age >= reduceMs && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3))) {
           const wasReduced = pos.phase === 'reduce';
-          pos.phase = 'reduce';
-          if (!wasReduced) this.sess.tpReduce++;
-          pos._tpAcceptedKey       = null;
-          pos._tpAcceptedAt        = null;
-          pos._localTpCorrectedKey = null;
-          pos._tpReduceAcceptedKey = null;
-          pos._slAcceptedKey       = null; // allow SL re-check after phase transition
-          const roiTarget = 0.03;
-          const basePrice = pos.entryPrice;
-          const nt = basePrice * (1 - (roiTarget / pos.leverage));
-
-          const currentMark = pos.markPrice || basePrice;
+          const roiTarget  = 0.03;
+          const nt         = pos.entryPrice * (1 - (roiTarget / pos.leverage));
+          const currentMark = pos.markPrice || pos.entryPrice;
           const currentUROI = (pos.entryPrice - currentMark) / pos.entryPrice * pos.leverage * 100;
           if (currentUROI >= 3 || nt >= currentMark) {
+            pos.phase = 'reduce';
+            if (!wasReduced) this.sess.tpReduce++;
             this.log(`${pos.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — UROI ${currentUROI.toFixed(1)}% / TP above mark — staging close in 5s.`, 'warn');
             pos.pendingClose       = true;
             pos.pendingCloseReason = 'force';
@@ -4954,10 +5004,20 @@ function ew() { return {
             if (!this.positions.find(x => x.id === pos.id)) continue;
             await this.closePosition(pos, 'force'); continue;
           }
-          pos.currentTpPrice = nt; pos.tpPct = 3;
-          await this.setTP(pos, nt);
-          this.log(`${pos.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% (${fmtP(nt)})`, 'warn');
-          this.persist();
+          // Only commit reduce-phase state once the TP order is confirmed placed
+          const tpResult = await this.setTP(pos, nt);
+          if (tpResult === 'ok') {
+            pos.phase = 'reduce';
+            if (!wasReduced) this.sess.tpReduce++;
+            pos._tpAcceptedKey       = null;
+            pos._tpAcceptedAt        = null;
+            pos._localTpCorrectedKey = null;
+            pos._tpReduceAcceptedKey = null;
+            pos._slAcceptedKey       = null;
+            pos.currentTpPrice = nt; pos.tpPct = 3;
+            this.log(`${pos.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% (${fmtP(nt)})`, 'warn');
+            this.persist();
+          }
         }
 
       // Reduce phase continuous check
