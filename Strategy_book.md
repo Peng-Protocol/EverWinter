@@ -417,20 +417,6 @@ Three modes control how much notional each DCA add contributes:
 
 Neither escalation mode is recommended over the other. They are tools for users who want to trade margin for speed.
 
-#### Using ×4 Escalation
-
-The default multiplier is ×2. Raising it to ×4 is viable and changes the character of the book meaningfully:
-
-- Positions close much faster — the heavier adds pull the average entry up quickly, so the TP is reached sooner after fewer pumps. The book turns over more frequently and raw profit per closed position is higher.
-- Because positions resolve faster, the probability of a ticker pumping to extreme levels before the system can act is materially lower. The aggressive defences (sacrifice, retraction, cascade, laggard EDa) further reduce that tail risk.
-- The tradeoff is front-loaded margin commitment. A position that fills three or four ×4 stages carries significantly more margin than the same position at ×2, so the balance floor is higher.
-
-**Balance guidance for ×4:**
-
-The minimum advisable balance roughly doubles relative to ×2 — **$500** for 50 max positions (vs. $250 at ×2). For 150 max positions, **$1,000** is the comfortable floor (vs. $500 at ×2).
-
-Running ×4 at $250 is still possible given how aggressively the defences intervene, but it leaves little headroom if several positions DCA deep simultaneously. Accept the risk only if you are comfortable with the sacrifice system occasionally closing positions at a loss to protect the book.
-
 ---
 
 ### TP Ingress
@@ -587,7 +573,7 @@ AMa adds count against available margin exactly like DCA fills.
 
 ### Sizing
 
-**Recommended balance**: minimum **$250** with default settings (50 max positions, $6 notional, 6× leverage, ×2 DCA escalation). Maximum practical exposure at 2 DCA stages average: ~**$2,500** in margin — raising max positions to 150 pushes this to ~$6,666. At ×4 escalation, double these minimums: **$500** for 50 positions, **$1,000** for 150. Running ×4 at $250 is possible with the defensive systems active but leaves minimal headroom.
+**Recommended balance**: minimum **$250** with default settings (50 max positions, $6 notional, 6× leverage). Maximum practical exposure at 2 DCA stages average: ~**$2,500** in margin — raising max positions to 150 pushes this to ~$6,666.
 
 **"Short everything. Let DCA Escalation and Laggard check sort the rest."**
 
