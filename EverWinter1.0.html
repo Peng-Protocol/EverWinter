@@ -1273,7 +1273,17 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="ps" style="grid-column:span 2"><div class="psl">Opened</div><div class="psv" style="color:var(--text-lo);font-family:var(--mono);font-size:10px" x-text="p.openedAt?(()=>{const d=new Date(p.openedAt);return d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});})():'—'"></div></div>
               <div class="ps"><div class="psl">24h Chg</div><div class="psv short" x-text="(parseFloat(p.change24h)>=0?'+':'')+p.change24h+'%'"></div></div>
               <div class="ps"><div class="psl">RSI6/12/24</div><div class="psv" x-text="(p.rsi6?p.rsi6.toFixed(0):'—')+'/'+(p.rsi12?p.rsi12.toFixed(0):'—')+'/'+(p.rsi24?p.rsi24.toFixed(0):'—')"></div></div>
-              <div class="ps"><div class="psl">Current TP</div><div class="psv" style="color:var(--profit)" x-text="p.tpPct+'%  '+fmtP(p.currentTpPrice)"></div></div>
+              <div class="ps" x-html="(()=>{
+                const isLag = cfg.laggardCheckEnabled && p.phase==='reduce'
+                  && p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;
+                if (isLag && p._edaTpPrice != null) {
+                  const roi = (p.entryPrice - p._edaTpPrice) / p.entryPrice * p.leverage * 100;
+                  const roiStr = (roi>=0?'+':'')+roi.toFixed(1)+'%';
+                  const col = roi>=0?'var(--profit)':'var(--short)';
+                  return '<div class=\'psl\'>EDa TP</div><div class=\'psv\' style=\'color:'+col+'\'>'+roiStr+'&nbsp;&nbsp;'+fmtP(p._edaTpPrice)+'</div>';
+                }
+                return '<div class=\'psl\'>Current TP</div><div class=\'psv\' style=\'color:var(--profit)\'>'+p.tpPct+'%&nbsp;&nbsp;'+fmtP(p.currentTpPrice)+'</div>';
+              })()"></div>
               <!-- Funding rate — shown when available (live, refreshed each watch cycle) -->
               <div class="ps" x-show="p.fundingRate!=null">
                 <div class="psl">Funding Rate</div>
@@ -3520,16 +3530,31 @@ function ew() { return {
     const ev            = laggard._laggardInitialEV || 0;
     const lostValue     = laggard._laggardLostValue || 0;
     const buffMul       = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
-    const buffedED      = ev * buffMul - lostValue - uPnl;
+    const buffedEV      = ev * buffMul;
+
+    // EDa TP: price at which uPnL = buffedEV − lostValue (ED zero point)
+    const edaTpPrice = laggard.entryPrice - (buffedEV - lostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin);
+    laggard._edaTpPrice = edaTpPrice;
+
+    // Place or update the limit close order when edaTpPrice is below current market
+    if (edaTpPrice < (laggard.markPrice ?? Infinity)) {
+      const prev = laggard._edaTpPrev;
+      if (prev == null || Math.abs(edaTpPrice - prev) / prev > 0.0005) {
+        laggard._edaTpPrev = edaTpPrice;
+        this.setTP(laggard, edaTpPrice).catch(() => {});
+      }
+    }
+
+    const buffedED      = buffedEV - lostValue - uPnl;
     if (buffedED <= 0) {
       if (_closingIds.has(laggard.id)) return;
       if (!this.positions.find(x => x.id === laggard.id)) return;
       laggard._laggardClosingAt = Date.now();
-      this.log(`⏳ ${laggard.symbol}: Laggard force-close — ED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${(ev*buffMul).toFixed(2)}, lost $${lostValue.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)})`, 'warn');
+      this.log(`⏳ ${laggard.symbol}: Laggard EDa TP hit — ED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, lost $${lostValue.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)})`, 'warn');
       await new Promise(r => setTimeout(r, 5000));
       if (!this.positions.find(x => x.id === laggard.id)) return; // closed during wait
-      if (laggard._ft) await this.ftClosePosition(laggard, 'force');
-      else             await this.closePosition(laggard, 'force');
+      if (laggard._ft) await this.ftClosePosition(laggard, 'laggard');
+      else             await this.closePosition(laggard, 'laggard');
     }
   },
 
@@ -3539,6 +3564,18 @@ function ew() { return {
     const closingPnl = closingRoiPct / 100 * closingPos.margin;
     for (const pos of this.positions) {
       pos._laggardLostValue = (pos._laggardLostValue || 0) + closingPnl;
+    }
+    // Recompute EDa TP on the current laggard and update its limit order
+    const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
+    if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
+      const buffMul  = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+      const buffedEV = laggard._laggardInitialEV * buffMul;
+      const edaTp    = laggard.entryPrice - (buffedEV - laggard._laggardLostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin);
+      laggard._edaTpPrice = edaTp;
+      laggard._edaTpPrev  = edaTp;
+      if (edaTp < (laggard.markPrice ?? Infinity)) {
+        this.setTP(laggard, edaTp).catch(() => {});
+      }
     }
     this.persist();
   },
@@ -4785,7 +4822,7 @@ function ew() { return {
     this.sess.trades++;
     this.sess.pnl += realisedPnl;
     if (isWin) this.sess.wins++; else this.sess.losses++;
-    if (reason === 'force') this.sess.forceClose++;
+    if (reason === 'force' || reason === 'laggard') this.sess.forceClose++;
 
     // Record in trade feed
     let closedAt = Date.now();
@@ -5131,6 +5168,7 @@ function ew() { return {
                         : t.reason === 'sl'          ? 'SL'
                         : t.reason === 'sl-inferred' ? 'SL~'
                         : t.reason === 'force'       ? 'FORCE'
+                        : t.reason === 'laggard'     ? 'EDa'
                         : t.reason === 'adl'         ? 'ADL'
                         : t.reason === 'liq'         ? 'LIQ'
                         : t.reason === 'manual'      ? 'MANUAL'
@@ -6841,7 +6879,7 @@ function ew() { return {
 
       // Position confirmed gone — clean up locally.
       pos._closeOrderId = null;
-      if (reason === 'force') this.sess.forceClose++;
+      if (reason === 'force' || reason === 'laggard') this.sess.forceClose++;
       this.log(`${pos.symbol}: close confirmed [${reason}]`, 'success');
       await this.cancelAllConditionals(pos.symbol);
       // Rodeo creep must bump synchronously before removing from positions array,

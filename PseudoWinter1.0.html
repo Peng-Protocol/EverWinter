@@ -1518,7 +1518,17 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <div class="psl">LSA at Entry</div>
                 <div class="psv" style="color:#2dd4bf;font-family:var(--mono)" x-text="p._salfLsaRatio!=null?p._salfLsaRatio.toFixed(2)+'×':'—'"></div>
               </div>
-              <div class="ps"><div class="psl">Current TP</div><div class="psv" style="color:var(--profit)" x-text="p.tpPct+'%  '+fmtP(p.currentTpPrice)"></div></div>
+              <div class="ps" x-html="(()=>{
+                const isLag = cfg.laggardCheckEnabled && p.phase==='reduce' && positions.length>=2
+                  && p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;
+                if (isLag && p._edaTpPrice != null) {
+                  const roi = (p.entryPrice - p._edaTpPrice) / p.entryPrice * p.leverage * 100;
+                  const roiStr = (roi>=0?'+':'')+roi.toFixed(1)+'%';
+                  const col = roi>=0?'var(--profit)':'var(--short)';
+                  return '<div class=\'psl\'>EDa TP</div><div class=\'psv\' style=\'color:'+col+'\'>'+roiStr+'&nbsp;&nbsp;'+fmtP(p._edaTpPrice)+'</div>';
+                }
+                return '<div class=\'psl\'>Current TP</div><div class=\'psv\' style=\'color:var(--profit)\'>'+p.tpPct+'%&nbsp;&nbsp;'+fmtP(p.currentTpPrice)+'</div>';
+              })()"></div>
               <!-- Funding Rate + Round countdown -->
               <div class="ps" x-show="p.fundingRate!=null">
                 <div class="psl">Funding Rate</div>
@@ -4313,7 +4323,7 @@ function pw() { return {
     this.sess.pnl += totalPnl;
     this.sess.ftTotalDone = (this.sess.ftTotalDone || 0) + 1;
     if (isWin) this.sess.wins++; else this.sess.losses++;
-    if (reason === 'force') this.sess.forceClose++;
+    if (reason === 'force' || reason === 'laggard') this.sess.forceClose++;
 
     let closedAt = Date.now();
     while (this.closedTrades.length && this.closedTrades[0].closedAt === closedAt) closedAt++;
@@ -5736,7 +5746,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const badgeStyle = isWin
         ? 'color:var(--profit);border-color:rgba(0,229,160,.3);background:var(--profit-dim)'
         : 'color:var(--short);border-color:rgba(255,69,96,.3);background:var(--short-glow)';
-      const reasonLabel = t.reason === 'tp' ? 'TP' : t.reason === 'sl' ? 'SL' : t.reason === 'force' ? 'FORCE' : 'CLOSE';
+      const reasonLabel = t.reason === 'tp' ? 'TP' : t.reason === 'sl' ? 'SL' : t.reason === 'force' ? 'FORCE' : t.reason === 'laggard' ? 'EDa' : 'CLOSE';
       const ftBadge = t._advFt
         ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,255,.55);color:#b464ff;background:rgba(180,100,255,.10);letter-spacing:1px">⚡ ADV</span>`
         : t._ft
@@ -6480,6 +6490,11 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const profitOffsetPct = Math.max(-99, this.cfg.laggardProfitOffset ?? 50); // Default 50% = moderate buffer
     const buffMultiplier  = 1 + (profitOffsetPct / 100);
     const buffedEV        = ev * buffMultiplier;
+
+    // EDa TP: price at which uPnL = buffedEV − lostValue (ED zero point)
+    const edaTpPrice = laggard.entryPrice - (buffedEV - lostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin);
+    laggard._edaTpPrice = edaTpPrice;
+
     const buffedED        = buffedEV - lostValue - uPnl; // ED = buffedEV − lostValue − uPnL
 
     if (buffedED <= 0) {
@@ -6487,11 +6502,11 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       if (!isSelf && this.positions.find(x => x.id === laggard.id)) {
         laggard._laggardClosingAt = Date.now();
         const offsetNote = profitOffsetPct !== 0 ? ` | offset ${profitOffsetPct>=0?'+':''}${profitOffsetPct}% (×${buffMultiplier.toFixed(2)} EV)` : '';
-        this.log(`⏳ ${laggard.symbol}: Laggard force-close — buffedED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, lost $${lostValue.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)}${offsetNote})`, 'warn');
+        this.log(`⏳ ${laggard.symbol}: Laggard EDa TP hit — buffedED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, lost $${lostValue.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)}${offsetNote})`, 'warn');
 
         await new Promise(resolve => setTimeout(resolve, 5000));
         if (!this.positions.find(x => x.id === laggard.id)) return;
-        await this.pseudoClosePosition(laggard, 'force');
+        await this.pseudoClosePosition(laggard, 'laggard');
       }
     }
   },
@@ -6501,12 +6516,22 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     if (this.positions.length < 1) return;
 
     const closingPnl = closingRoiPct / 100 * closingPos.margin;
-    
+
     this.positions.forEach(pos => {
       pos._laggardLostValue = (pos._laggardLostValue || 0) + closingPnl;
       this.log(`⏳ ${pos.symbol}: Value slash +$${closingPnl.toFixed(2)} (${closingPos.symbol} closed @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%) → total lost $${pos._laggardLostValue.toFixed(2)}`, 'info');
     });
-    
+
+    // Recompute EDa TP on the current laggard after lostValue update
+    if (this.positions.length >= 2) {
+      const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
+      if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
+        const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+        const buffedEV = laggard._laggardInitialEV * buffMul;
+        laggard._edaTpPrice = laggard.entryPrice - (buffedEV - laggard._laggardLostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin);
+      }
+    }
+
     this.persist();
   },
 
@@ -6535,7 +6560,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     this.sess.trades++;
     this.sess.pnl += totalPnl;
     if (isWin) this.sess.wins++; else this.sess.losses++;
-    if (reason === 'force') this.sess.forceClose++;
+    if (reason === 'force' || reason === 'laggard') this.sess.forceClose++;
 
     let closedAt = Date.now();
     while (this.closedTrades.length && this.closedTrades[0].closedAt === closedAt) closedAt++;
