@@ -499,6 +499,14 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
         </div>
         <div class="sep" style="margin-top:10px"></div>
         <div class="g">
+          <label class="tog" @click.prevent="if(!cfgLocked)cfg.lossAbsorptionEnabled=!cfg.lossAbsorptionEnabled;if(!cfgLocked)persist()">
+            <div class="tog-t" :class="cfg.lossAbsorptionEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Loss Absorption</span>
+          </label>
+          <div class="hint" style="margin-top:4px">If a position's unrealised loss exceeds 2.5× base margin, closes 5% of its size at market every 5 minutes. Gradually bleeds the loss without waiting for a DCA trigger, and reduces margin load before the next add — fully absorbing in ~1.6 hours if the position stalls.</div>
+        </div>
+        <div class="sep" style="margin-top:10px"></div>
+        <div class="g">
           <label class="tog" @click.prevent="if(!cfgLocked){cfg.sacrificeEnabled=!cfg.sacrificeEnabled;if(!cfg.sacrificeEnabled)cfg.retractionEnabled=false;persist()}">
             <div class="tog-t" :class="cfg.sacrificeEnabled?'on':''"><div class="tog-k"></div></div>
             <span class="tog-l">Sacrifice</span>
@@ -1014,6 +1022,7 @@ function psycho() { return {
     psychoChangePct:      6,
     psychoPerCycle:       12,
     sacrificeEnabled:     true,
+    lossAbsorptionEnabled: true,
     sacrificeFloor:       5,
     retractionEnabled:    true,
     scanMins:             15,
@@ -1798,6 +1807,11 @@ function psycho() { return {
       await this.runPosCascadeTrigger();
     }
 
+    // Loss absorption
+    if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) {
+      await this.runLossAbsorption();
+    }
+
     // Sacrifice (allocation cap)
     if (this.cfg.sacrificeEnabled && this.positions.length > 0) {
       await this.runSacrificeCheck();
@@ -2268,6 +2282,44 @@ function psycho() { return {
       this.log('⚡ Position cascade — triggering immediate scan', 'scan');
       try { await this.runPsychoScan(); } catch(e) { this.log('Post-cascade scan error: '+e.message, 'error'); }
     }
+  },
+
+  // ── Loss Absorption ──
+  async runLossAbsorption() {
+    const now       = Date.now();
+    const threshold = -2.5 * (this.cfg.minNotional / this.cfg.leverage);
+    const fraction  = 0.05;
+    for (const pos of [...this.positions]) {
+      if ((pos.upnl || 0) >= threshold) continue;
+      if (_closingIds.has(pos.id)) continue;
+      if (now - (pos._lastAbsorptionAt || 0) < 5 * 60 * 1000) continue;
+      const mark    = pos.markPrice || pos.entryPrice;
+      const cutQty  = pos.totalSize * fraction;
+      const cutMgn  = pos.margin * fraction;
+      const cutPnl  = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * cutMgn;
+      const cutRoi  = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
+      if (pos._live) {
+        try {
+          const instr = await this.getInstrInfo(pos.symbol);
+          const qty   = this.snapQty(cutQty, instr);
+          await this.livePlaceOrder({ symbol: pos.symbol, side: 'Buy', orderType: 'Market', qty: qty.toString(), timeInForce: 'IOC', reduceOnly: true });
+        } catch(e) {
+          this.log(`${pos.symbol.replace('USDT','')}: absorption cut failed — ${e.message}`, 'error');
+          continue;
+        }
+      }
+      pos.totalSize = Math.max(0, pos.totalSize - cutQty);
+      pos.margin   *= (1 - fraction);
+      if (pos.notional)           pos.notional          *= (1 - fraction);
+      if (pos._laggardInitialEV)  pos._laggardInitialEV *= (1 - fraction);
+      pos._lastAbsorptionAt = now;
+      this.sess.pnl = parseFloat((this.sess.pnl + cutPnl).toFixed(6));
+      for (const p of this.positions) p._laggardLostValue = (p._laggardLostValue || 0) + cutPnl;
+      this._refreshLaggardEdaTp();
+      const sym = pos.symbol.replace('USDT', '');
+      this.log(`✂️ ${sym}: absorption — 5% cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${pos.margin.toFixed(2)}`, 'warn');
+    }
+    this.persist();
   },
 
   // ── Sacrifice ──
