@@ -2459,77 +2459,74 @@ function psycho() { return {
   // ── Period rollup — compacts oldest individual trades when cap is hit ──
   _compactClosedTrades() {
     const KEEP = 100;
-    const individuals  = this.closedTrades.filter(t => t.reason !== 'rollup' && t.reason !== 'period-rollup');
-    if (individuals.length <= KEEP) return;
-
-    const forceRollups = this.closedTrades.filter(t => t.reason === 'rollup');
-    const prevEntry    = this.closedTrades.find(t => t.reason === 'period-rollup');
-    const prev         = prevEntry?.rollup;
+    const individuals = this.closedTrades.filter(t => t.reason !== 'rollup' && t.reason !== 'period-rollup');
+    if (individuals.length <= KEEP && this.closedTrades.length <= 200) return;
 
     const toKeep    = individuals.slice(-KEEP);
     const toCompact = individuals.slice(0, individuals.length - KEEP);
+    // All pre-aggregated entries (force rollups + existing period rollup) get merged in
+    const aggregated = this.closedTrades.filter(t => t.reason === 'rollup' || t.reason === 'period-rollup');
 
-    // Carry forward aggregates from existing period rollup
-    const prevCount  = prev?.count       || 0;
-    const prevNetPnl = prev?.netPnl      || 0;
-    const prevWins   = prev?.wins        || 0;
-    const prevDcaSum = (prev?.avgDcaStage || 0) * prevCount;
-    const prevDurSum = (prev?.avgDuration  || 0) * prevCount;
-
-    // Parse ticker counts from existing rollup (entries may be "SYM" or "SYM#N")
+    // Accumulator state
+    let count = 0, netPnl = 0, roiSum = 0, wins = 0, dcaSum = 0, durSum = 0;
+    let bestRoi = null, worstRoi = null, bestPnl = null, worstPnl = null;
+    let openedAt, closedAt;
     const symCounts = {};
-    (prev?.tickers || []).forEach(t => {
-      const m = t.match(/^(.+?)#(\d+)$/);
-      if (m) symCounts[m[1]] = parseInt(m[2]);
-      else symCounts[t] = (symCounts[t] || 0) + 1;
-    });
 
-    // Accumulate from newly compacted trades
-    toCompact.forEach(t => { const s = t.symbol.replace('USDT',''); symCounts[s] = (symCounts[s]||0)+1; });
-
-    const newCount   = prevCount + toCompact.length;
-    const newNetPnl  = prevNetPnl + toCompact.reduce((s,t) => s+(t.totalPnl||0), 0);
-    const newWins    = prevWins   + toCompact.filter(t => (t.totalPnl||0) > 0).length;
-    const newDcaSum  = prevDcaSum + toCompact.reduce((s,t) => s+(t.dcaStage||0), 0);
-    const newDurSum  = prevDurSum + toCompact.reduce((s,t) => s+(t.duration||0), 0);
-    const newNetRoi  = newCount > 0 ? (toCompact.reduce((s,t) => s+(t.pnlPct||0), 0) + (prev?.netRoi||0)*prevCount) / newCount : 0;
-
-    // Merge best/worst (compare new trades against previous stored extremes)
-    let bestRoi  = prev?.bestByRoi  || null;
-    let worstRoi = prev?.worstByRoi || null;
-    let bestPnl  = prev?.bestByPnl  || null;
-    let worstPnl = prev?.worstByPnl || null;
-    toCompact.forEach(t => {
-      const sym = t.symbol.replace('USDT','');
-      const pp  = t.pnlPct   || 0;
-      const tp  = t.totalPnl || 0;
+    const mergeSym = (raw) => {
+      const m = raw.match(/^(.+?)#(\d+)$/);
+      const sym = m ? m[1] : raw, n = m ? parseInt(m[2]) : 1;
+      symCounts[sym] = (symCounts[sym] || 0) + n;
+    };
+    const updateExtremes = (sym, pp, tp) => {
       if (!bestRoi  || pp > bestRoi.pnlPct)    bestRoi  = { sym, pnlPct: pp };
       if (!worstRoi || pp < worstRoi.pnlPct)   worstRoi = { sym, pnlPct: pp };
       if (!bestPnl  || tp > bestPnl.totalPnl)  bestPnl  = { sym, totalPnl: tp };
       if (!worstPnl || tp < worstPnl.totalPnl) worstPnl = { sym, totalPnl: tp };
+    };
+    const mergeTs = (oa, ca) => {
+      if (oa && (!openedAt || oa < openedAt)) openedAt = oa;
+      if (ca && (!closedAt || ca > closedAt)) closedAt = ca;
+    };
+
+    // Merge pre-aggregated entries
+    aggregated.forEach(entry => {
+      const r = entry.rollup;
+      if (!r) return;
+      const rc = r.count || 0;
+      count  += rc;  netPnl += r.netPnl || 0;  roiSum += (r.netRoi || 0) * rc;
+      wins   += r.wins || 0;  dcaSum += (r.avgDcaStage || 0) * rc;  durSum += (r.avgDuration || 0) * rc;
+      (r.tickers || []).forEach(mergeSym);
+      if (r.bestByRoi)  updateExtremes(r.bestByRoi.sym,  r.bestByRoi.pnlPct,   r.bestByRoi.pnlPct);
+      if (r.worstByRoi) updateExtremes(r.worstByRoi.sym, r.worstByRoi.pnlPct,  r.worstByRoi.pnlPct);
+      if (r.bestByPnl)  { if (!bestPnl  || r.bestByPnl.totalPnl  > bestPnl.totalPnl)  bestPnl  = r.bestByPnl; }
+      if (r.worstByPnl) { if (!worstPnl || r.worstByPnl.totalPnl < worstPnl.totalPnl) worstPnl = r.worstByPnl; }
+      mergeTs(r.openedAt, r.closedAt);
     });
 
-    const openedAts  = toCompact.filter(t=>t.closedAt&&t.duration).map(t=>t.closedAt-t.duration);
-    const closedAts  = toCompact.filter(t=>t.closedAt).map(t=>t.closedAt);
-    const prevOA     = prev?.openedAt ? [prev.openedAt] : [];
-    const prevCA     = prev?.closedAt ? [prev.closedAt] : [];
-    const newOpenedAt = [...openedAts, ...prevOA].length ? Math.min(...openedAts, ...prevOA) : undefined;
-    const newClosedAt = [...closedAts, ...prevCA].length ? Math.max(...closedAts, ...prevCA) : undefined;
+    // Merge individual trades being compacted
+    toCompact.forEach(t => {
+      const sym = t.symbol.replace('USDT','');
+      symCounts[sym] = (symCounts[sym] || 0) + 1;
+      count++;  netPnl += t.totalPnl || 0;  roiSum += t.pnlPct || 0;
+      if ((t.totalPnl || 0) > 0) wins++;
+      dcaSum += t.dcaStage || 0;  durSum += t.duration || 0;
+      updateExtremes(sym, t.pnlPct || 0, t.totalPnl || 0);
+      mergeTs(t.closedAt && t.duration ? t.closedAt - t.duration : undefined, t.closedAt);
+    });
 
     const rollup = {
-      count: newCount, netPnl: newNetPnl, netRoi: newNetRoi,
-      wins: newWins,
-      tickers: Object.entries(symCounts).map(([sym, n]) => n > 1 ? `${sym}#${n}` : sym),
-      avgDcaStage: newCount > 0 ? newDcaSum / newCount : 0,
-      avgDuration: newCount > 0 ? newDurSum / newCount : 0,
+      count, netPnl, netRoi: count > 0 ? roiSum / count : 0, wins,
+      tickers: Object.entries(symCounts).map(([s, n]) => n > 1 ? `${s}#${n}` : s),
+      avgDcaStage: count > 0 ? dcaSum / count : 0,
+      avgDuration: count > 0 ? durSum / count : 0,
       bestByRoi: bestRoi, worstByRoi: worstRoi,
       bestByPnl: bestPnl, worstByPnl: worstPnl,
-      openedAt: newOpenedAt, closedAt: newClosedAt,
+      openedAt, closedAt,
     };
 
     this.closedTrades = [
-      ...forceRollups,
-      { id: 'period_rollup_' + Date.now(), reason: 'period-rollup', closedAt: newClosedAt, totalPnl: newNetPnl, rollup },
+      { id: 'period_rollup_' + Date.now(), reason: 'period-rollup', closedAt, totalPnl: netPnl, rollup },
       ...toKeep,
     ];
   },
