@@ -285,7 +285,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           <div class="stat-ttl">DCA LADDER (at current settings)</div>
           <div class="ladder-row" style="font-size:8.5px;color:var(--text-lo);margin-bottom:3px">
             <span class="stage-lbl">STAGE</span><span class="trig">TRIGGER</span>
-            <span class="notl">NOTIONAL</span><span class="marg">MARGIN</span><span class="cum">CUM. NOTL</span>
+            <span class="notl">NOTIONAL</span><span class="marg">MARGIN</span><span class="cum">CUM. MARGIN</span>
           </div>
           <template x-for="row in dcaLadder()" :key="row.label">
             <div class="ladder-row" :class="row.label==='Entry'?'entry':''">
@@ -293,7 +293,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
               <span class="trig" x-text="row.trigger"></span>
               <span class="notl" x-text="'$'+row.notional.toFixed(2)"></span>
               <span class="marg" x-text="'$'+row.margin.toFixed(2)"></span>
-              <span class="cum" x-text="'$'+row.cumNotional.toFixed(2)"></span>
+              <span class="cum" x-text="'$'+row.cumMargin.toFixed(2)"></span>
             </div>
           </template>
           <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);margin-top:6px;display:flex;justify-content:space-between">
@@ -665,7 +665,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
         </div>
 
         <!-- AMa stage boxes (green) — shown when AMa active and not cancelled -->
-        <div x-show="pos._amaActive && !pos._amaCancelled && pos._amaOrders">
+        <div x-show="pos._amaActive && !pos._amaCancelled && pos._amaOrders && pos.dcaStage === 0">
           <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:2px;margin-bottom:3px">
             <!-- A0: entry stage, always filled -->
             <div style="height:14px;border-radius:2px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:7px;font-weight:700;border:1px solid rgba(56,201,103,.7);background:rgba(56,201,103,.15);color:var(--profit)">A0</div>
@@ -699,7 +699,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
         </div>
 
         <!-- DCA stage boxes: 2×4 grid (0–7) — hidden when AMa active -->
-        <div x-show="!(pos._amaActive && !pos._amaCancelled)">
+        <div x-show="!(pos._amaActive && !pos._amaCancelled && pos.dcaStage === 0)">
           <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:2px;margin-bottom:3px">
             <template x-for="n in [0,1,2,3,4,5,6,7]" :key="n">
               <div :style="(()=>{
@@ -732,7 +732,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
         <!-- Stage progress bar: AMa (green) or DCA (standard) -->
         <div style="height:7px;background:var(--bg-raised);border:1px solid var(--border);border-radius:1px;position:relative;overflow:hidden;margin-bottom:5px">
           <div :style="(()=>{
-            if (pos._amaActive && !pos._amaCancelled) {
+            if (pos._amaActive && !pos._amaCancelled && pos.dcaStage === 0) {
               const ab=_amaBand(pos); return 'position:absolute;left:0;top:0;height:100%;border-radius:1px;transition:width .4s ease;width:'+ab.pct.toFixed(1)+'%;background:'+ab.color;
             }
             const db=_dcaBand(pos); return 'position:absolute;left:0;top:0;height:100%;border-radius:1px;transition:width .4s ease;width:'+db.pct.toFixed(1)+'%;background:'+db.color;
@@ -1411,8 +1411,9 @@ function psycho() { return {
       }
     }
 
-    // Build DCA orders
+    // Build DCA orders — DCA Delay: only stage 1 active, 2+ queued for deferred placement
     const orders = [{ label:'Entry', price, type:'tp', filled:true }];
+    const _dcaDelayQueue = [];
     let runNotional = actualNotional;
     let runSize     = qty;
     let invalid     = false;
@@ -1429,7 +1430,11 @@ function psycho() { return {
       const stageRoi = this._tpRoi(i + 1);
       const stageTp  = this.snapPrice(avgEntry * (1 - (stageRoi / 100) / lev), instr);
       if (!stageTp || stageTp <= 0) { this._symbolBanlist[sym]='DCA TP invalid'; invalid=true; break; }
-      orders.push({ label:'Add'+(i+1), price:addPrice, type:'cond', filled:false, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
+      if (i === 0) {
+        orders.push({ label:'Add1', price:addPrice, type:'cond', filled:false, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
+      } else {
+        _dcaDelayQueue.push({ label:'Add'+(i+1), price:addPrice, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
+      }
     }
     if (invalid) { this.persist(); return; }
 
@@ -1474,6 +1479,8 @@ function psycho() { return {
       _amaStage:            0,
       _amaOrders:           amaOrders,
       _amaOrigEntry:        useAma ? price : null,
+      _dcaDelayQueue:       _dcaDelayQueue,
+      _nextDcaPlaceAt:      null,
       _change24h:           candidate.change24h ?? 0,
     };
 
@@ -1548,8 +1555,9 @@ function psycho() { return {
     }
     const addPcts = this._addPcts();
 
-    // Build DCA orders
+    // Build DCA orders — DCA Delay: only stage 1 active, 2+ queued for deferred placement
     const orders = [{ label:'Entry', price:fillPrice, type:'tp', filled:true }];
+    const _dcaDelayQueueLive = [];
     let runNotional = actualNotional, runSize = qty;
     for (let i = 0; i < this.cfg.dcaStages; i++) {
       const addPrice  = this.snapPrice(fillPrice * (1 + addPcts[i] / 100), instr);
@@ -1562,7 +1570,11 @@ function psycho() { return {
       const stageRoi = this._tpRoi(i + 1);
       const stageTp  = this.snapPrice(avgEntry * (1 - (stageRoi / 100) / lev), instr);
       if (!stageTp || stageTp <= 0) { this.log(`${sym}: DCA stage ${i+1} TP invalid — skipping stage`, 'warn'); break; }
-      orders.push({ label:'Add'+(i+1), price:addPrice, type:'cond', filled:false, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
+      if (i === 0) {
+        orders.push({ label:'Add1', price:addPrice, type:'cond', filled:false, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
+      } else {
+        _dcaDelayQueueLive.push({ label:'Add'+(i+1), price:addPrice, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
+      }
     }
 
     // Build AMa orders
@@ -1601,6 +1613,8 @@ function psycho() { return {
       _amaStage:     0,
       _amaOrders:    amaOrders,
       _amaOrigEntry: useAma ? fillPrice : null,
+      _dcaDelayQueue:  _dcaDelayQueueLive,
+      _nextDcaPlaceAt: null,
       _change24h:    candidate.change24h ?? 0,
     };
     this.positions.push(pos);
@@ -1727,6 +1741,11 @@ function psycho() { return {
           }
           this.log(`📊 ${pos.symbol}: ${add.label} @ ${fmtP(add.price)} | Avg ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(newTp)} (${stageRoi}% ROI)`, 'trade');
           this.persist();
+          // DCA Delay: schedule next stage placement 5 minutes after this fill
+          if (pos._dcaDelayQueue && pos._dcaDelayQueue.length > 0 && !pos._nextDcaPlaceAt) {
+            pos._nextDcaPlaceAt = now + 5 * 60 * 1000;
+            this.log(`📊 ${pos.symbol}: DCA${pos.dcaStage} filled — next stage queued, placing in 5 min`, 'info');
+          }
         }
       }
 
@@ -1771,6 +1790,33 @@ function psycho() { return {
             this.persist();
           }
         }
+      }
+
+      // ── DCA Delay queue processor ──
+      // After the 5-min delay, unlock the next queued DCA stage (or set SL if all underwater)
+      if (pos._nextDcaPlaceAt && now >= pos._nextDcaPlaceAt && pos._dcaDelayQueue && pos._dcaDelayQueue.length > 0) {
+        pos._nextDcaPlaceAt = null;
+        const _ddInstr = await this.getInstrInfo(pos.symbol);
+        let _ddPlaced = false;
+        while (pos._dcaDelayQueue.length > 0) {
+          const _ddNext = pos._dcaDelayQueue[0];
+          if (mark >= _ddNext.price) {
+            this.log(`📊 ${pos.symbol}: DCA Delay — ${_ddNext.label} underwater (${fmtP(mark)} ≥ ${fmtP(_ddNext.price)}) — skipping`, 'warn');
+            pos._dcaDelayQueue.shift();
+            continue;
+          }
+          pos.orders.push({ label: _ddNext.label, price: _ddNext.price, type: 'cond', filled: false, qty: _ddNext.qty, stageTp: _ddNext.stageTp, stageRoi: _ddNext.stageRoi, avgAfter: _ddNext.avgAfter });
+          pos._dcaDelayQueue.shift();
+          _ddPlaced = true;
+          this.log(`📊 ${pos.symbol}: DCA Delay — unlocked ${_ddNext.label} @ ${fmtP(_ddNext.price)}`, 'info');
+          break;
+        }
+        if (!_ddPlaced && pos._dcaDelayQueue.length === 0 && !pos.slSet && _ddInstr) {
+          pos.slPrice = this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), _ddInstr);
+          pos.slSet   = true;
+          this.log(`⚠️ ${pos.symbol}: DCA Delay — all stages underwater, SL @ ${fmtP(pos.slPrice)}`, 'warn');
+        }
+        this.persist();
       }
 
       // Force close check
@@ -2472,13 +2518,16 @@ function psycho() { return {
     const rows = [];
     const addPcts = this._addPcts();
     let cumNotional = 0;
+    let cumMargin   = 0;
     const entryNotional = this.cfg.minNotional;
     cumNotional += entryNotional;
-    rows.push({ label:'Entry', trigger:'Market', notional:entryNotional, margin:entryNotional/this.cfg.leverage, cumNotional });
+    cumMargin   += entryNotional / this.cfg.leverage;
+    rows.push({ label:'Entry', trigger:'Market', notional:entryNotional, margin:entryNotional/this.cfg.leverage, cumNotional, cumMargin });
     for (let i = 0; i < this.cfg.dcaStages; i++) {
       const notional = this.cfg.minNotional * Math.pow(this.cfg.dcaMultiplier, i + 1);
       cumNotional   += notional;
-      rows.push({ label:'DCA'+(i+1), trigger:'+'+(addPcts[i])+'%', notional, margin:notional/this.cfg.leverage, cumNotional });
+      cumMargin     += notional / this.cfg.leverage;
+      rows.push({ label:'DCA'+(i+1), trigger:'+'+(addPcts[i])+'%', notional, margin:notional/this.cfg.leverage, cumNotional, cumMargin });
     }
     return rows;
   },
