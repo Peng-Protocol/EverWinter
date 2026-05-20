@@ -548,6 +548,8 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 **Sacrifice as a Speed Limiter:** On broadly bullish days, DCA accumulation pushes the book towards the threshold — calculated as max positions multiplied by 4× base margin — sacrifice acts on tickers already showing difficulty, hyper-focusing on them till they correct. In practice this slows the strategy down, preventing more entries when the market is upwardly inclined.
 
+**Effect on Laggards:** When multiple positions have closed in loss, they push the ED in the opposite direction — the laggard becomes harder to close. When used with sacrifice, a laggard can become super-hardened, requiring a strong internal or external slump which will either drag mark price to TP or drag TP closer to mark — whichever comes first.
+
 ### Cascade Triggers
 
 The laggard check applies slow, continuous pressure. Cascade triggers are the aggressive complement.
