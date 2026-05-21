@@ -458,7 +458,7 @@ Both bots trim losing positions on a timer to prevent one or two deep-red positi
 
 **EverWinter**: Closes one base-notional worth of size at a fixed interval, unconditionally — no loss threshold check.
 
-**PsychoWinter**: Triggers when a position's unrealized loss exceeds 2.5× its base margin, then cuts every 5 minutes. Each cut is 5% of the remaining margin. Cuts stop when the final DCA stage fires or uPnL drops back below threshold.
+**PsychoWinter**: Triggers when a position's unrealized loss exceeds 2.5× its base margin, then cuts every 5 minutes. Each cut is 5% of the remaining margin. Cuts stop when the final DCA stage fires or uPnL drops back below threshold. If the position has already been absorbed down to minimum notional when the threshold is crossed, it is closed outright rather than cut further — there is nothing left worth trimming.
 
 When DCA fires into a partially absorbed position the effect compounds: the reduced size means the fixed-notional add carries more weight in the new average entry, pulling the TP closer. The worse the position was, the bigger the improvement.
 
