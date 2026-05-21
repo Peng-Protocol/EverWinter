@@ -713,7 +713,8 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
                 const triggered = n===0 || (n>=1 && !!cond[n-1]?.filled);
                 const missed = n>=1 && (pos._dcaMissedStages||[]).includes(n);
                 const set = n>=1 && !!cond[n-1] && !cond[n-1].filled;
-                const queued = n>=1 && !set && pos._dcaDelayQueue?.length>0 && (pos._dcaDelayQueue[0].originalStage??parseInt(pos._dcaDelayQueue[0].label.replace('Add','')))===n;
+                const hasActiveCond = cond.some(o=>!o.filled);
+                const queued = n>=1 && !set && !hasActiveCond && pos._dcaDelayQueue?.length>0 && (pos._dcaDelayQueue[0].originalStage??parseInt(pos._dcaDelayQueue[0].label.replace('Add','')))===n;
                 const db = _dcaBand(pos);
                 const isCurrent = db.band === n && !db.inProfitZone;
                 let border, bg, color;
@@ -1317,6 +1318,7 @@ function psycho() { return {
       await this.pseudoAuditGap();
     }
     // Recovery: fix positions where a blown stage was skipped and a higher conditional placed
+    const _normalisedSyms = [];
     for (const pos of this.positions) {
       if (!pos._dcaMissedStages?.length) continue;
       const _premature = pos.orders.filter(o => o.type === 'cond' && !o.filled);
@@ -1327,7 +1329,6 @@ function psycho() { return {
           pos._dcaDelayQueue = [{ label: c.label, originalStage: parseInt(c.label.replace('Add', '')), price: c.price, qty: c.qty, stageTp: c.stageTp, stageRoi: c.stageRoi, avgAfter: c.avgAfter }, ...(pos._dcaDelayQueue || [])];
         }
       }
-      // Renumber queue items and recompute qty to match each stage's intended notional
       const _nextStage = (pos.dcaStage || 0) + 1;
       (pos._dcaDelayQueue || []).forEach((item, i) => {
         item.originalStage = _nextStage + i;
@@ -1339,16 +1340,20 @@ function psycho() { return {
       });
       pos._dcaMissedStages = [];
       if (!pos._nextDcaPlaceAt) pos._nextDcaPlaceAt = Date.now();
-      this.log(`🔧 ${pos.symbol}: DCA state normalised — ${_premature.length} conditional(s) requeued, retrying from DCA${_nextStage}`, 'warn');
+      _normalisedSyms.push(pos.symbol.replace('USDT', '') + '→DCA' + _nextStage);
     }
+    if (_normalisedSyms.length > 0)
+      this.log(`🔧 DCA state normalised on restart — ${_normalisedSyms.join(', ')}`, 'warn');
     // Retroactive DCA delay recovery — positions that had a fill while offline
-    // but never got a retry timer scheduled
+    const _retroSyms = [];
     for (const pos of this.positions) {
       if (pos._dcaDelayQueue && pos._dcaDelayQueue.length > 0 && !pos._nextDcaPlaceAt && pos.dcaStage > 0) {
         pos._nextDcaPlaceAt = Date.now();
-        this.log(`⏱️ ${pos.symbol}: DCA Delay — retroactive recovery on restart, processing queue immediately`, 'warn');
+        _retroSyms.push(pos.symbol.replace('USDT', ''));
       }
     }
+    if (_retroSyms.length > 0)
+      this.log(`⏱️ DCA Delay — retroactive queue recovery: ${_retroSyms.join(', ')}`, 'warn');
     this.log('🐻‍❄️ PsychoWinter started' + (this.cfg.liveMode ? ' [LIVE]' : ' [PSEUDO]') + '.', 'success');
     this.startKeepalive();
     await this.runScheduledCycle();
@@ -1934,6 +1939,11 @@ function psycho() { return {
       // After 5-min delay: apply reactionary compression (skip underwater stages, shift
       // remaining labels down to stay sequential), then place the next valid stage.
       if (pos._nextDcaPlaceAt && now >= pos._nextDcaPlaceAt && pos._dcaDelayQueue && pos._dcaDelayQueue.length > 0) {
+        // A conditional is already live — clear stale timer, nothing to schedule yet
+        if (pos.orders.some(o => o.type === 'cond' && !o.filled)) {
+          pos._nextDcaPlaceAt = null;
+          continue;
+        }
         pos._nextDcaPlaceAt = null;
         const _ddInstr = await this.getInstrInfo(pos.symbol);
         const _ddNextNum = pos.orders.filter(o => o.type === 'cond').length + 1;
