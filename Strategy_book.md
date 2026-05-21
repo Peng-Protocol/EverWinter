@@ -8,7 +8,7 @@
 2. [Advanced Follow-Through (ADV FT)](#advanced-follow-through-strategy)
 3. [Fund Chasing (FUN)](#fun-fund-chasing-strategy)
 4. [Sale Fishing (SalF)](#sale-fishing-salf-strategy)
-5. [General Mechanics](#general-mechanics) — DCA, TP Ingress, Stop Loss, Loss Absorption, Laddering
+5. [General Mechanics](#general-mechanics)
 6. [Psycho Mode](#psycho-mode)
 7. [Conclusion](#conclusion)
 
