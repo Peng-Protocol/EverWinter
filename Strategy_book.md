@@ -525,9 +525,11 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 ### DCA Delay
 
-Only DCA stage 1 is placed when a position opens; each subsequent stage is queued and placed 5 minutes after the previous fills. If the next queued stage's trigger has already been blown through, the sequence compresses reactively — the blown-through price is considered no longer valid, all remaining queued stage prices are bumped 3% forward, and the stop-loss is recomputed against the new ladder. If multiple stages were blown through in the same check cycle, the 3% bump compounds per missed stage. The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, then updated whenever the sequence compresses.
+Only DCA stage 1 is placed when a position opens; each subsequent stage is queued and placed 5 minutes after the previous fills. If a queued stage's price has already been blown through by the time the bot checks, that price is considered invalid — it is discarded, all remaining queued stage prices are bumped 3% forward, and the stop-loss is recomputed against the revised ladder. If multiple stages were blown in the same check cycle, the 3% bump compounds per miss.
 
-Some tickers can spike over 80% in a single candle before collapsing within minutes — a pre-placed ladder would fill multiple stages simultaneously into a still-moving adverse market, compounding margin commitment before the position has any chance to recover. The reactionary compression ensures the remaining DCA structure is always forward-looking — you can see which levels were skipped and where the sequence picked back up.
+Rather than stopping when all queued stages are exhausted, the bot stacks additional wait time and keeps retrying: each blown stage adds 5 minutes to the next attempt (1 blown = 5min, 6 blown = 30min). If the queue runs completely empty, a new entry is regenerated at the last blown price +3% and the cycle continues indefinitely. This means a ticker can spike 80%+ and the bot will still find a valid DCA level eventually — it just waits longer between attempts as the move extends, reducing capital commitment while the ticker is still in motion. Blown stages are recorded as missed in the position card (grey striped boxes), and a live countdown shows when the next attempt will fire.
+
+The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, then updated on every compression.
 
 ### Sacrifice
 
