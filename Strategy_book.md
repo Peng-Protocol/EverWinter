@@ -501,7 +501,7 @@ Some tickers can spike over 80% in a single candle before collapsing within minu
 
 ### Sacrifice
 
-When the total allocated margin exceeds a preset threshold, one must sacrifice tickers — even those in loss — to make room for potentially deeper DCAs on existing positions. New entries pause and the most recoverable position is closed every 5 minutes until allocation drops back under the cap.
+When the total allocated margin exceeds a preset threshold, one must sacrifice tickers — even those in loss — to make room for potentially deeper DCAs on existing positions. New entries pause and the most recoverable position is closed each watch cycle until allocation drops back under the cap.
 
 **Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists.
 
