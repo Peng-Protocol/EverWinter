@@ -262,6 +262,12 @@ Over-extended tickers are excluded from the Gainers path but can still carry a p
 
 ---
 
+### Super Fun Mode
+
+Super Fun Mode strips FUN back to its original form: only a positive funding rate and positive vol momentum are required, with all VM thresholds, LSA checks, and creep gates replaced by a lock-in that forces the next re-entry to match or beat the last close's funding tier. Loss absorption is what makes this aggressive stance viable — if the ticker turns, the position is absorbed over time rather than force-closed. Over-extended tickers that would normally face a higher VM bar instead enter at 1× margin as the 'OE' sub-type.
+
+---
+
 ## Sale Fishing (SalF) Strategy
 
 ### Overview
