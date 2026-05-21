@@ -448,11 +448,11 @@ The laggard system closes most positions that would otherwise have hit their tar
 
 ### Loss Absorption
 
-Both bots trim losing positions on a timer to prevent one or two deep-red positions from absorbing all available margin and starving new entries or DCA fills.
+Both bots trim losing positions on a timer to prevent one or two deep-red positions from cornering all available margin and starving new entries or DCA fills.
 
 **EverWinter**: Closes one base-notional worth of size at a fixed interval, unconditionally — no loss threshold check.
 
-**PsychoWinter**: Triggers when a position's unrealized loss exceeds 2.5× its base margin, then cuts every 5 minutes. Each cut is the larger of 5% of remaining size or one full entry notional, so absorption stays meaningful even as the position shrinks. Cuts stop when the final DCA stage fires.
+**PsychoWinter**: Triggers when a position's unrealized loss exceeds 2.5× its base margin, then cuts every 5 minutes. Each cut is 5% of the remaining margin. Cuts stop when the final DCA stage fires or uPnL drops back below threshold.
 
 When DCA fires into a partially absorbed position the effect compounds: the reduced size means the fixed-notional add carries more weight in the new average entry, pulling the TP closer. The worse the position was, the bigger the improvement.
 
@@ -513,7 +513,7 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 Only DCA stage 1 is placed when a position opens; each subsequent stage is queued and placed 5 minutes after the previous fills. If the next queued stage's trigger has already been blown through, the sequence compresses reactively — rather than skipping to stage 3 as-is, stage 3 is relabeled Add2 and placed at stage 3's original price, with all subsequent stages shifting down in the same way. The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, then updated whenever the sequence compresses.
 
-Some tickers can spike over 80% in a single candle before collapsing within minutes — a pre-placed ladder would fill multiple stages simultaneously into a still-moving adverse market, compounding margin commitment before the position has any chance to recover. The reactionary compression ensures the remaining DCA structure is always forward-looking: skipped levels show as grayed-out boxes in the position card, and the activity log records each compression event.
+Some tickers can spike over 80% in a single candle before collapsing within minutes — a pre-placed ladder would fill multiple stages simultaneously into a still-moving adverse market, compounding margin commitment before the position has any chance to recover. The reactionary compression ensures the remaining DCA structure is always forward-looking — you can see which levels were skipped and where the sequence picked back up.
 
 ### Sacrifice
 
