@@ -529,7 +529,7 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 ### Loss Absorption
 
-See [Loss Absorption](#loss-absorption) in General Mechanics for the full explanation and the laddering dynamic. In Psycho Mode the cut floor at entry notional keeps absorption running meaningfully even on a deeply-reduced position, and cuts stop at the final DCA stage. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide — and every cut hardens the laggard's EDa TP, so sustained absorption on a large position compounds quietly against the weakest ticker in the book.
+See [Loss Absorption](#loss-absorption) in General Mechanics for the full explanation and the laddering dynamic. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide — and every cut hardens the laggard's EDa TP, so sustained absorption on a large position compounds quietly against the weakest ticker in the book.
 
 ### Cascade Triggers
 
