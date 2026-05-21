@@ -515,9 +515,9 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 A counterweight to sacrifice. The driving concern was margin starvation: one or two deep-red positions can absorb all available capital and choke new entries or block existing positions from DCA-ing. Loss absorption reclaims that margin discretely, a little at a time.
 
-When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it — 5% of its size every 5 minutes. The goal is slow, steady removal of the dead weight without touching anything else.
+When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it every 5 minutes. Each cut is the larger of 5% of the remaining size or a full entry notional worth of size — whichever keeps the absorbed amount meaningful. The goal is slow, steady removal of the dead weight without touching anything else.
 
-Cuts continue until remaining margin drops below $20, at which point the position is small enough that cascade, sacrifice, or a natural TP will finish it. The sequence usually ends well before that — either price recovers and the position clears the threshold on its own, or DCA fires first.
+Cuts continue until the final DCA stage fires, at which point the full position takes priority. The sequence usually ends before that — either price recovers and the position clears the threshold on its own, or DCA fires first.
 
 When DCA fires into a partially absorbed position the effect compounds favourably: because the pre-existing size has been reduced, the DCA add — which is a fixed notional — carries more weight in the new average. The weighted average entry price rises toward the current mark, pulling the TP up with it and shortening the distance price needs to travel to close. The worse the position was, the bigger the improvement.
 
