@@ -197,7 +197,7 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 | `scanMins` | 15 | Scan interval in minutes |
 | `dcaStages` | 7 | DCA add stages beyond entry |
 | `dcaMultiplier` | 2 | Notional multiplier per stage |
-| `entryTpRoi` | 25 | Entry-stage TP ROI%; decays per stage, floors at 3% |
+| `entryTpRoi` | 6 | Entry-stage TP ROI%; decays per stage, floors at 3% |
 | `runtimeHours` | 48 | Hard force-close deadline per position |
 | `laggardCheckEnabled` | true | Enable laggard force-close |
 | `laggardProfitOffset` | 50 | Laggard EV buffer % (50 = 1.5× EV) |
