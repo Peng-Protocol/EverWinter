@@ -3155,19 +3155,23 @@ function pw() { return {
           const eff = this.positions.reduce((n, p) => n + (p._fun ? (p._funMult ?? 2) : p._salf ? 2 : p._ft ? 2 : 1), 0);
           if (eff >= this.cfg.maxPos) break;
           if (c.status !== 'ready') continue;
-          if (this.cfg.advFtEnabled) {
+          // OE graylist gate — unconditional; protects gainers regardless of advFT setting
+          {
+            const _now_ogl = Date.now();
             const alreadyTracked = !!this._extenderGraylist[c.symbol]
                                 || !!this.extenderCount[c.symbol]
                                 || !!this._extenderPollers[c.symbol];
-            if (alreadyTracked) {
+            if (alreadyTracked && this._extenderGraylist[c.symbol] && _now_ogl < this._extenderGraylist[c.symbol]) {
               c.status = 'extgrayed';
               continue;
             }
+            // 3h historical RSI6 look-back — fires before every gainer entry
             const { peak: rsi6Peak, oeCount: histOeCount } = await this.fetchHistoricalRSI6Peaks(c.symbol);
             if (rsi6Peak != null && rsi6Peak >= this.cfg.rsi6Max) {
-              this.log(`⚡ ${c.symbol}: historical RSI6 peak ${rsi6Peak.toFixed(1)} ≥ ${this.cfg.rsi6Max} — missed extender ×${Math.max(1, histOeCount)}, graylisting`, 'warn');
+              this._extenderGraylist[c.symbol] = _now_ogl + 6 * 3600 * 1000;
+              if (this.cfg.advFtEnabled) this.extenderBump(c.symbol, true, null, Math.max(1, histOeCount));
+              this.log(`⚡ ${c.symbol}: OE lookback — RSI6 peak ${rsi6Peak.toFixed(1)} ≥ ${this.cfg.rsi6Max} — graylisted 6h`, 'warn');
               c.status = 'extgrayed';
-              this.extenderBump(c.symbol, true, null, Math.max(1, histOeCount));
               continue;
             }
           }
@@ -5529,6 +5533,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         if (this.bot.running && this.positions.length >= 2) this.runLaggardCheck();
       }, 3000);
     }
+    // Loss absorption — checked every watch cycle so the configured interval fires on time
+    if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) this.runLossAbsorption();
     } finally {
       this._watchRunning = false;
     }
@@ -6158,14 +6164,14 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
     if (isNewEntry && !this._extenderPollers[symbol]) {
       this._startExtenderPoller(symbol);
-      const GRAYLIST_DURATION = 3 * 3600 * 1000;
+      const GRAYLIST_DURATION = 6 * 3600 * 1000;
       this._extenderGraylist[symbol] = now + GRAYLIST_DURATION;
       if (fromHistorical || seedCount != null) {
         const seedNote = seedCount != null && seedCount > 1 ? ` (×${seedCount} from OE lookback)` : '';
         this.log(`⚡ ${symbol}: missed over-extension${seedNote} — graylisted, extender poller started.`, 'info');
       } else {
         const rsiNote = rsi6 != null ? ` — RSI6 ${rsi6.toFixed(1)} (max ${this.cfg.rsi6Max})` : '';
-        this.log(`⚡ ${symbol}: over-extended ×1${rsiNote} — graylisted from gainers for 3h, ADV FT window active.`, 'info');
+        this.log(`⚡ ${symbol}: over-extended ×1${rsiNote} — graylisted from gainers for 6h, ADV FT window active.`, 'info');
       }
       // Skip historical lookback when already seeded from OE data
       if (seedCount == null) {
