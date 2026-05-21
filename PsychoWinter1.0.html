@@ -727,14 +727,14 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
                   color='var(--warn)';
                 } else if (triggered) {
                   border='1px solid var(--accent)'; bg='rgba(255,32,64,.12)'; color='var(--accent)';
-                } else if (missed) {
-                  border='1px dashed rgba(128,128,128,.5)';
-                  bg='repeating-linear-gradient(45deg,rgba(128,128,128,.18) 0px,rgba(128,128,128,.18) 2px,transparent 2px,transparent 5px)';
-                  color='rgba(128,128,128,.55)';
                 } else if (set) {
                   border='1px solid rgba(240,195,40,.7)'; bg='rgba(240,195,40,.06)'; color='rgba(240,195,40,.9)';
                 } else if (queued) {
                   border='1px solid rgba(255,119,48,.5)'; bg='rgba(255,119,48,.07)'; color='rgba(255,119,48,.65)';
+                } else if (missed) {
+                  border='1px dashed rgba(128,128,128,.5)';
+                  bg='repeating-linear-gradient(45deg,rgba(128,128,128,.18) 0px,rgba(128,128,128,.18) 2px,transparent 2px,transparent 5px)';
+                  color='rgba(128,128,128,.55)';
                 } else {
                   border='1px solid var(--border)'; bg='transparent'; color='var(--text-lo)';
                 }
@@ -1315,6 +1315,24 @@ function psycho() { return {
     await this._refreshPositionTPs();
     if (!this.cfg.liveMode && this.positions.length > 0) {
       await this.pseudoAuditGap();
+    }
+    // Recovery: fix positions where a blown stage was skipped and a higher conditional placed
+    for (const pos of this.positions) {
+      if (!pos._dcaMissedStages?.length) continue;
+      const _premature = pos.orders.filter(o => o.type === 'cond' && !o.filled);
+      if (_premature.length > 0) {
+        pos.orders = pos.orders.filter(o => !(o.type === 'cond' && !o.filled));
+        for (let i = _premature.length - 1; i >= 0; i--) {
+          const c = _premature[i];
+          pos._dcaDelayQueue = [{ label: c.label, originalStage: parseInt(c.label.replace('Add', '')), price: c.price, qty: c.qty, stageTp: c.stageTp, stageRoi: c.stageRoi, avgAfter: c.avgAfter }, ...(pos._dcaDelayQueue || [])];
+        }
+      }
+      // Renumber queue items sequentially from next expected stage so no gaps show
+      const _nextStage = (pos.dcaStage || 0) + 1;
+      (pos._dcaDelayQueue || []).forEach((item, i) => { item.originalStage = _nextStage + i; delete item.blownCount; });
+      pos._dcaMissedStages = [];
+      if (!pos._nextDcaPlaceAt) pos._nextDcaPlaceAt = Date.now();
+      this.log(`🔧 ${pos.symbol}: DCA state normalised — ${_premature.length} conditional(s) requeued, retrying from DCA${_nextStage}`, 'warn');
     }
     // Retroactive DCA delay recovery — positions that had a fill while offline
     // but never got a retry timer scheduled
@@ -1911,62 +1929,30 @@ function psycho() { return {
       if (pos._nextDcaPlaceAt && now >= pos._nextDcaPlaceAt && pos._dcaDelayQueue && pos._dcaDelayQueue.length > 0) {
         pos._nextDcaPlaceAt = null;
         const _ddInstr = await this.getInstrInfo(pos.symbol);
-        let _ddPlaced = false;
-        let _ddNextNum = pos.orders.filter(o => o.type === 'cond').length + 1;
-        let _blownCount = 0;
-        let _lastBlownEntry = null;
+        const _ddNextNum = pos.orders.filter(o => o.type === 'cond').length + 1;
+        const _ddNext = pos._dcaDelayQueue[0];
 
-        while (pos._dcaDelayQueue.length > 0) {
-          const _ddNext = pos._dcaDelayQueue[0];
-          if (mark >= _ddNext.price) {
-            // Stage blown through — record, bump remaining 3%, stack delay counter
-            if (!pos._dcaMissedStages) pos._dcaMissedStages = [];
-            const _origStg = _ddNext.originalStage ?? parseInt(_ddNext.label.replace('Add', ''));
-            pos._dcaMissedStages.push(_origStg);
-            _blownCount++;
-            _lastBlownEntry = { ..._ddNext };
-            pos._dcaDelayQueue.shift();
-            if (_ddInstr) {
-              for (const _r of pos._dcaDelayQueue) {
-                _r.price = this.snapPrice(_r.price * 1.03, _ddInstr);
-              }
-            }
-            let _nextLbl = _ddNextNum;
-            for (const _r of pos._dcaDelayQueue) { _r.label = 'Add' + _nextLbl; _nextLbl++; }
-            if (_ddInstr) { pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true; }
-            this.log(`⏭️ ${pos.symbol}: DCA Delay — Add${_origStg} blown @ ${fmtP(mark)}, remaining bumped +3%`, 'warn');
-            continue;
+        if (mark >= _ddNext.price) {
+          // Blown — bump this stage and all remaining in-place, stay at this stage and retry
+          if (!pos._dcaMissedStages) pos._dcaMissedStages = [];
+          const _origStg = _ddNext.originalStage ?? parseInt(_ddNext.label.replace('Add', ''));
+          if (!pos._dcaMissedStages.includes(_origStg)) pos._dcaMissedStages.push(_origStg);
+          _ddNext.blownCount = (_ddNext.blownCount || 0) + 1;
+          if (_ddInstr) {
+            for (const _r of pos._dcaDelayQueue) { _r.price = this.snapPrice(_r.price * 1.03, _ddInstr); }
+            pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true;
           }
-          // Price has not passed this stage — place it
+          pos._nextDcaPlaceAt = now + _ddNext.blownCount * 5 * 60 * 1000;
+          this.log(`⏭️ ${pos.symbol}: DCA Delay — ${_ddNext.label} blown @ ${fmtP(mark)} (×${_ddNext.blownCount}), bumped → ${fmtP(_ddNext.price)}, retry in ${_ddNext.blownCount * 5}min`, 'warn');
+        } else {
+          // Price valid — place conditional and remove from missed list
+          const _origStg = _ddNext.originalStage ?? parseInt(_ddNext.label.replace('Add', ''));
           _ddNext.label = 'Add' + _ddNextNum;
           pos.orders.push({ label: _ddNext.label, price: _ddNext.price, type: 'cond', filled: false, qty: _ddNext.qty, stageTp: _ddNext.stageTp, stageRoi: _ddNext.stageRoi, avgAfter: _ddNext.avgAfter });
           pos._dcaDelayQueue.shift();
-          _ddPlaced = true;
+          if (pos._dcaMissedStages) pos._dcaMissedStages = pos._dcaMissedStages.filter(s => s !== _origStg);
           if (_ddInstr) { pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true; }
           this.log(`⏱️ ${pos.symbol}: DCA Delay — ${_ddNext.label} unlocked @ ${fmtP(_ddNext.price)}`, 'info');
-          break;
-        }
-
-        if (!_ddPlaced && _blownCount > 0) {
-          // Stack delay: 5 min per blown stage — give price time to reverse before committing capital
-          const _stackMs = _blownCount * 5 * 60 * 1000;
-          // If queue emptied, regenerate one entry at last blown price +3% so we keep trying indefinitely
-          if (pos._dcaDelayQueue.length === 0 && _lastBlownEntry && _ddInstr) {
-            const _newPrice = this.snapPrice(_lastBlownEntry.price * 1.03, _ddInstr);
-            pos._dcaDelayQueue.push({
-              label: 'Add' + _ddNextNum,
-              originalStage: _lastBlownEntry.originalStage ?? _ddNextNum,
-              price: _newPrice,
-              qty: _lastBlownEntry.qty,
-              stageTp: _lastBlownEntry.stageTp,
-              stageRoi: _lastBlownEntry.stageRoi,
-              avgAfter: _lastBlownEntry.avgAfter,
-            });
-            this.log(`⏭️ ${pos.symbol}: DCA Delay — all stages blown, regenerated @ ${fmtP(_newPrice)}, retry in ${_blownCount * 5}min`, 'warn');
-          } else {
-            this.log(`⏭️ ${pos.symbol}: DCA Delay — ${_blownCount} stage(s) blown, retry in ${_blownCount * 5}min`, 'info');
-          }
-          pos._nextDcaPlaceAt = now + _stackMs;
         }
         this.persist();
       }
