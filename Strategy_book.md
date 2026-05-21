@@ -8,7 +8,7 @@
 2. [Advanced Follow-Through (ADV FT)](#advanced-follow-through-strategy)
 3. [Fund Chasing (FUN)](#fun-fund-chasing-strategy)
 4. [Sale Fishing (SalF)](#sale-fishing-salf-strategy)
-5. [General Mechanics](#general-mechanics)
+5. [General Mechanics](#general-mechanics) — DCA, TP Ingress, Stop Loss, Loss Absorption, Laddering
 6. [Psycho Mode](#psycho-mode)
 7. [Conclusion](#conclusion)
 
@@ -446,6 +446,26 @@ The laggard system closes most positions that would otherwise have hit their tar
 
 ---
 
+### Loss Absorption
+
+A mechanical pressure valve for positions sitting in sustained drawdown. The design concern: one or two deep-red positions can absorb all available margin, choking new entries or blocking existing positions from DCA-ing. Loss absorption reclaims that margin discretely — a little at a time — without requiring a manual close or triggering the laggard system. Both EverWinter and PsychoWinter implement it, but they differ in cut sizing.
+
+**EverWinter form**: When a position's unrealized loss exceeds the configured threshold, the bot closes one base-notional worth of size at fixed intervals. Simple and proportional — each cut removes the same absolute amount regardless of how much the position has grown through DCA.
+
+**PsychoWinter form**: Same trigger threshold (2.5× base margin in loss), cutting every 5 minutes. The cut size is the larger of 5% of the remaining position or one full entry notional — whichever keeps the absorbed amount meaningful as the position shrinks. This prevents micro-cuts on a deeply-reduced position from becoming financially irrelevant. Cuts stop when the final DCA stage fires, handing full control to the DCA structure at that point.
+
+In both cases, when DCA fires into a partially absorbed position the effect compounds favorably: because the pre-existing size has been reduced, the fixed-notional DCA add carries more weight in the new weighted average. The average entry rises toward the current mark, pulling the TP closer and shortening the distance price needs to travel to close. The worse the position was before the add, the bigger the improvement.
+
+Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide. Every cut realises a small loss — in PsychoWinter these losses harden the laggard's EDa TP, so sustained absorption on a large position compounds quietly against the weakest ticker in the book.
+
+#### Laddering
+
+Laddering is the interaction between DCA and loss absorption over time on a ticker that stalls after a stage fills. After a DCA trigger fires, the position's average entry improves but the total size grows. If price does not recover to TP, absorption resumes trimming. When the next DCA stage triggers it finds a lighter position, which compounds the average improvement further. This pattern can repeat across multiple stages: the position gets progressively heavier from DCA fills and progressively lighter from absorption cuts, until either TP is reached or the stop-loss fires.
+
+In the ideal scenario the SL fires on a position carrying only the initial entry margin plus the small accumulated absorbed losses — a fraction of the full DCA-compounded size the position would have been at its worst. The stop-loss becomes a far less catastrophic outcome. The laddering dynamic is not guaranteed — it depends on the ticker stalling long enough between DCA triggers for absorption to run — but it is the expected behavior on a ticker that keeps grinding slowly against the position rather than spiking abruptly through all stages at once.
+
+---
+
 ### Balance, Max Positions, and Notional Sizing
 
 At the default **$6 notional** with **6× leverage**, each position consumes **$1 margin** at stage 0. The DCA structure adds margin at each subsequent stage, so a position that fully DCA'd through all adds has consumed significantly more. This is the basis for sizing your starting balance.
@@ -513,17 +533,7 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 ### Loss Absorption
 
-A counterweight to sacrifice. The driving concern was margin starvation: one or two deep-red positions can absorb all available capital and choke new entries or block existing positions from DCA-ing. Loss absorption reclaims that margin discretely, a little at a time.
-
-When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it every 5 minutes. Each cut is the larger of 5% of the remaining size or a full entry notional worth of size — whichever keeps the absorbed amount meaningful. The goal is slow, steady removal of the dead weight without touching anything else.
-
-Cuts continue until the final DCA stage fires, at which point the full position takes priority. The sequence usually ends before that — either price recovers and the position clears the threshold on its own, or DCA fires first.
-
-When DCA fires into a partially absorbed position the effect compounds favourably: because the pre-existing size has been reduced, the DCA add — which is a fixed notional — carries more weight in the new average. The weighted average entry price rises toward the current mark, pulling the TP up with it and shortening the distance price needs to travel to close. The worse the position was, the bigger the improvement.
-
-Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide.
-
-Every cut realises a small loss. Those losses harden the laggard's EDa TP, so sustained absorption on a large position compounds quietly against the weakest ticker in the book.
+See [Loss Absorption](#loss-absorption) in General Mechanics for the full explanation and the laddering dynamic. In Psycho Mode the cut floor at entry notional keeps absorption running meaningfully even on a deeply-reduced position, and cuts stop at the final DCA stage. A counterweight to sacrifice — where sacrifice distributes cost across the book, absorption takes it out of the offender's own hide.
 
 ### Cascade Triggers
 
