@@ -254,6 +254,7 @@ Vol momentum thresholds differ by sub-type and direction:
 For loser candidates, the last completed 15-minute candle's volume must be **above the window average** but **below the spike cap** (default ±50% from average). This confirms continued selling activity without a volume blowoff that would suggest exhaustion rather than continuation.
 
 Droughts (≤ avg), neutral (at avg), and spikes (> cap) are all blocked.
+
 ---
 
 ### Why FUN Addresses Over-Extended Tickers
@@ -264,7 +265,9 @@ Over-extended tickers are excluded from the Gainers path but can still carry a p
 
 ### Super Fun Mode
 
-Super Fun Mode strips FUN back to its original form: only a positive funding rate and positive vol momentum are required, with all VM thresholds, LSA checks, and creep gates replaced by a lock-in that forces the next re-entry to match or beat the last close's funding tier. Loss absorption is what makes this aggressive stance viable — if the ticker turns, the position is absorbed over time rather than force-closed. Over-extended tickers that would normally face a higher VM bar instead enter at 1× margin as the 'OE' sub-type.
+Super Fun Mode strips FUN back to its original form: the only hard requirements are a positive funding rate and positive vol momentum. All VM thresholds, LSA checks, and creep gates are replaced by a lock-in gate that forces the next re-entry to match or beat the last close's funding tier, ratcheting upward within a 6-hour window. Loss absorption is what makes this aggressive stance viable — if the ticker turns, the position is absorbed over time rather than force-closed.
+
+Tickers that would normally be blocked by the RSI proximity check or by a historical over-extension count are instead admitted as the **OE sub-type** — 1× margin, requiring FR ≥ the high funding gate (default 0.1%). OE entries carry the same lock-in mechanics as standard FUN entries, and are treated as high-gate sub-types for lock-in ratcheting.
 
 ---
 
@@ -525,11 +528,17 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 ### DCA Delay
 
-Only DCA stage 1 is placed when a position opens; each subsequent stage is queued and placed 5 minutes after the previous fills. If a queued stage's price has already been blown through by the time the bot checks, that price is considered invalid — it is discarded, all remaining queued stage prices are bumped 3% forward, and the stop-loss is recomputed against the revised ladder. If multiple stages were blown in the same check cycle, the 3% bump compounds per miss.
+Only Add1 is placed when a position opens; stages 2 through 7 are queued and placed 5 minutes after the previous stage fills. The delay prevents committing capital to a stage whose price the market has already passed — if a ticker is still moving fast enough to invalidate a stage in the minutes after the previous fill, it is not ready for the next add.
 
-Rather than stopping when all queued stages are exhausted, the bot stacks additional wait time and keeps retrying: each blown stage adds 5 minutes to the next attempt (1 blown = 5min, 6 blown = 30min). If the queue runs completely empty, a new entry is regenerated at the last blown price +3% and the cycle continues indefinitely. This means a ticker can spike 80%+ and the bot will still find a valid DCA level eventually — it just waits longer between attempts as the move extends, reducing capital commitment while the ticker is still in motion. Blown stages are recorded as missed in the position card (grey striped boxes), and a live countdown shows when the next attempt will fire.
+When the timer fires the bot checks whether the next queued stage's price is still valid (mark < stage price). If it is, the stage is placed as a live conditional — shown as **yellow** in the position card. If mark has already passed the stage, the stage is bumped +3% in place, all remaining queued stages are bumped +3% with it, and the bot retries. The stage is never skipped or replaced: it stays at the front of the queue until it can be placed at a valid price.
 
-The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, then updated on every compression.
+Each successive blow on the same stage adds 5 more minutes to the next retry — first blow waits 5 min, second waits 10, third waits 15, and so on. A ticker that keeps running will progressively slow the bot's commitment; a ticker that retraces will find the next attempt places immediately. The grey striped box in the position card is a temporary indicator showing the stage is in its retry countdown — it clears to yellow the moment the stage is placed.
+
+Each DCA stage carries its own independently-sized notional. A blown stage is always retried at the size intended for that stage — Add2 at $4 retries as Add2 at $4, never at Add3's $8. Stages are non-fungible; the bot does not substitute one dart for another.
+
+While a conditional is live (yellow), no future stage is scheduled. The next stage only enters the queue after the current one triggers and its 5-minute fill-wait begins.
+
+The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, and is updated after every bump.
 
 ### Sacrifice
 
