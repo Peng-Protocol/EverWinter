@@ -442,7 +442,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
             <div class="tog-t" :class="cfg.laggardCheckEnabled?'on':''"><div class="tog-k"></div></div>
             <span class="tog-l">Laggard Check</span>
           </label>
-          <div class="hint" style="margin-top:4px">Primes when ≥2 positions open. Force-closes the laggard position when its expected deficit ≤ 0, adjusted for wins/losses of other positions.</div>
+          <div class="hint" style="margin-top:4px">Primes when ≥2 positions open. Closes or absorbs the laggard when its expected deficit ≤ 0, adjusted for wins/losses of other positions.</div>
         </div>
         <div class="g" x-show="cfg.laggardCheckEnabled" style="margin-top:8px">
           <label class="tog" @click.prevent="if(!cfgLocked)cfg.laggardAgeMode=!cfg.laggardAgeMode;if(!cfgLocked)persist()">
@@ -457,6 +457,13 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           </div>
           <input type="range" min="-90" max="200" step="10" x-model.number="cfg.laggardProfitOffset" :disabled="cfgLocked" @change="persist()">
           <div class="hint">Positive = more protective (wider buffer before close). Negative = more aggressive.</div>
+        </div>
+        <div class="g" x-show="cfg.laggardCheckEnabled" style="margin-top:8px">
+          <label class="tog" @click.prevent="if(!cfgLocked)cfg.laggardAbsorptionEnabled=!cfg.laggardAbsorptionEnabled;if(!cfgLocked)persist()">
+            <div class="tog-t" :class="cfg.laggardAbsorptionEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Laggard Absorption</span>
+          </label>
+          <div class="hint" style="margin-top:4px">When ED ≤ 0 and the laggard is in loss, cut it every 5 minutes instead of force-closing. Keeps the position alive while bleeding size toward recovery.</div>
         </div>
         <div class="sep"></div>
         <div class="g">
@@ -1062,6 +1069,7 @@ function psycho() { return {
     laggardCheckEnabled: true,
     laggardAgeMode:      true,
     laggardProfitOffset: 50,
+    laggardAbsorptionEnabled: true,
     cascadeTriggerEnabled: true,
     posCascadeTriggerEnabled: true,
     ppcEscalationMult: 2,
@@ -2101,11 +2109,63 @@ function psycho() { return {
     if (buffedED <= 0) {
       const isSelf = _closingIds.has(laggard.id);
       if (!isSelf && this.positions.find(x => x.id === laggard.id)) {
-        laggard._laggardClosingAt = Date.now();
-        this.log(`⏳ ${laggard.symbol}: Laggard force-close — buffedED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, lost $${lostValue.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)})`, 'warn');
-        await new Promise(r => setTimeout(r, 5000));
-        if (this.positions.find(x => x.id === laggard.id)) {
-          await this.closePosition(laggard, 'force');
+        if (this.cfg.laggardAbsorptionEnabled && uPnl < 0) {
+          // Laggard is in loss with ED ≤ 0 — absorb every 5 min instead of force-closing.
+          const now = Date.now();
+          if (now - (laggard._laggardAbsLastAt || 0) < 5 * 60 * 1000) return;
+          laggard._laggardAbsLastAt = now;
+          const sym      = laggard.symbol.replace('USDT', '');
+          const mark     = laggard.markPrice || laggard.entryPrice;
+          const fraction = 0.05;
+          const entryNotionalQty = this.cfg.minNotional / mark;
+          const cutQty   = Math.max(laggard.totalSize * fraction, entryNotionalQty);
+          if (cutQty >= laggard.totalSize || cutQty <= 0) return;
+          const cutFraction = cutQty / laggard.totalSize;
+          const cutMgn   = laggard.margin * cutFraction;
+          const cutPnl   = (laggard.entryPrice - mark) / laggard.entryPrice * laggard.leverage * cutMgn;
+          const cutRoi   = (laggard.entryPrice - mark) / laggard.entryPrice * laggard.leverage * 100;
+          if (laggard._live) {
+            try {
+              const instr = await this.getInstrInfo(laggard.symbol);
+              const qty   = this.snapQty(cutQty, instr);
+              if (instr && qty < instr.minQty) {
+                this.log(`✂️ ${sym}: laggard absorption skipped — cut below exchange minimum`, 'info');
+                return;
+              }
+              await this.livePlaceOrder({ symbol: laggard.symbol, side: 'Buy', orderType: 'Market', qty: qty.toString(), timeInForce: 'IOC', reduceOnly: true });
+            } catch(e) {
+              this.log(`${sym}: laggard absorption cut failed — ${e.message}`, 'error');
+              return;
+            }
+          }
+          laggard.totalSize = Math.max(0, laggard.totalSize - cutQty);
+          laggard.margin   *= (1 - cutFraction);
+          if (laggard.notional)          laggard.notional          *= (1 - cutFraction);
+          if (laggard._laggardInitialEV) laggard._laggardInitialEV *= (1 - cutFraction);
+          this.sess.pnl = parseFloat((this.sess.pnl + cutPnl).toFixed(6));
+          for (const p of this.positions) p._laggardLostValue = (p._laggardLostValue || 0) + cutPnl;
+          this._refreshLaggardEdaTp();
+          // Record cut in absorption tab for the closed-trades UI
+          const tabId = 'absorption_' + laggard.id;
+          let tab = this.closedTrades.find(t => t.id === tabId);
+          if (!tab) {
+            tab = { id: tabId, posId: laggard.id, reason: 'absorption', symbol: laggard.symbol, openedAt: laggard.openedAt, dcaStage: laggard.dcaStage, cuts: [], totalPnl: 0, finalClose: null, isOpen: true, firstCutAt: now };
+            this.closedTrades.push(tab);
+          }
+          tab.cuts.push({ pnl: cutPnl, roi: cutRoi, mark, cutAt: now });
+          tab.totalPnl  = parseFloat((tab.totalPnl + cutPnl).toFixed(6));
+          tab.dcaStage  = laggard.dcaStage;
+          tab.lastCutAt = now;
+          this.log(`✂️ ${sym}: laggard absorption — ED $${buffedED.toFixed(2)} ≤ 0, 5% cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${laggard.margin.toFixed(2)}`, 'warn');
+          this.persist();
+        } else {
+          // Absorption disabled or laggard is profitable — force-close.
+          laggard._laggardClosingAt = Date.now();
+          this.log(`⏳ ${laggard.symbol}: Laggard force-close — buffedED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, lost $${lostValue.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)})`, 'warn');
+          await new Promise(r => setTimeout(r, 5000));
+          if (this.positions.find(x => x.id === laggard.id)) {
+            await this.closePosition(laggard, 'force');
+          }
         }
       }
     }
@@ -2380,8 +2440,9 @@ function psycho() { return {
     const threshold = (this.cfg.minNotional / this.cfg.leverage) * 2.5;
     if ((this.acct.upnl || 0) < threshold) return;
 
+    const laggardId = this.cfg.laggardCheckEnabled ? this._pickLaggard()?.id : null;
     const profitable = [...this.positions]
-      .filter(p => !_closingIds.has(p.id) && (p.upnl || 0) > 0 && p.margin > 0 && (p.upnl / p.margin) * 100 >= this.cfg.cascadeMinRoiPct)
+      .filter(p => !_closingIds.has(p.id) && p.id !== laggardId && (p.upnl || 0) > 0 && p.margin > 0 && (p.upnl / p.margin) * 100 >= this.cfg.cascadeMinRoiPct)
       .sort((a, b) => (b.upnl || 0) - (a.upnl || 0));
 
     if (profitable.length === 0) return;
@@ -2412,8 +2473,10 @@ function psycho() { return {
     // No trigger position — reset escalation counter
     if (!trigger) { this._ppcCloseCount = 0; return; }
 
+    // Laggard is off-limits as a cascade close target (it can still be the trigger)
+    const laggardId = this.cfg.laggardCheckEnabled ? this._pickLaggard()?.id : null;
     const profitable = [...this.positions]
-      .filter(p => !_closingIds.has(p.id) && (p.upnl || 0) > 0 && p.margin > 0 && (p.upnl / p.margin) * 100 >= this.cfg.cascadeMinRoiPct)
+      .filter(p => !_closingIds.has(p.id) && p.id !== laggardId && (p.upnl || 0) > 0 && p.margin > 0 && (p.upnl / p.margin) * 100 >= this.cfg.cascadeMinRoiPct)
       .sort((a, b) => (b.upnl || 0) - (a.upnl || 0));
 
     // No eligible targets — scan immediately to seed candidates, then let cooldown retry
