@@ -537,7 +537,9 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 ### Loss Absorption
 
-See [Loss Absorption](#loss-absorption) in General Mechanics for the full explanation and the laddering dynamic. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide — and every cut hardens the laggard's EDa TP, so sustained absorption on a large position compounds quietly against the weakest ticker in the book.
+See [Loss Absorption](#loss-absorption) in General Mechanics for the full explanation and the laddering dynamic. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide and compounds quietly against the weakest ticker in the book.
+
+When **Laggard Absorption** is enabled, the laggard's expected deficit reaching zero triggers a different path: instead of a force-close, the laggard is cut 5% every five minutes until it is fully drained. Unlike regular absorption — which respects a minimum notional floor and stops at the final DCA stage — laggard absorption has no floor and will consume the position down to zero over successive cuts, closing it entirely through attrition. EDa TP is suppressed while this mode is active; the slow drain is the exit strategy.
 
 ### Cascade Triggers
 
