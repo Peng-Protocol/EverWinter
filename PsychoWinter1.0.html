@@ -655,9 +655,8 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
               x-text="(()=>{const roi=pos.margin>0?(pos.upnl||0)/pos.margin*100:0;return (roi>=0?'+':'')+roi.toFixed(1)+'%'})()"></span>
           </div>
           <div class="pc-row">
-            <span class="pc-k" :style="isLaggard(pos)&&pos._edaTpPrice?'color:var(--warn)':''" x-text="isLaggard(pos)&&pos._edaTpPrice?'EDa TP':'TP'"></span>
-            <span x-show="!(isLaggard(pos)&&pos._edaTpPrice)" class="pc-v profit" x-text="(()=>{const roi=(pos.entryPrice-pos.currentTpPrice)/pos.entryPrice*pos.leverage*100;return fmtP(pos.currentTpPrice)+(pos.currentTpPrice&&pos.entryPrice?' ('+(roi>=0?'+':'')+roi.toFixed(1)+'%)':'')})()"></span>
-            <span x-show="isLaggard(pos)&&pos._edaTpPrice" class="pc-v" :class="(pos.markPrice||0)<=(pos._edaTpPrice||0)?'profit':'warn'" x-text="(()=>{const p=pos._edaTpPrice||0;const roi=(pos.entryPrice-p)/pos.entryPrice*pos.leverage*100;return fmtP(p)+' ('+(roi>=0?'+':'')+roi.toFixed(1)+'%)'})()"></span>
+            <span class="pc-k" :style="(()=>{void tick;const sl=pos._slFinalSet&&Math.floor(tick/5)%2===1;return sl?'color:var(--short)':(isLaggard(pos)&&pos._edaTpPrice?'color:var(--warn)':'');})()" x-text="(()=>{void tick;const sl=pos._slFinalSet&&Math.floor(tick/5)%2===1;return sl?'SL':(isLaggard(pos)&&pos._edaTpPrice?'EDa TP':'TP')})()"></span>
+            <span class="pc-v" :class="(()=>{void tick;const sl=pos._slFinalSet&&Math.floor(tick/5)%2===1;if(sl)return'loss';if(isLaggard(pos)&&pos._edaTpPrice)return(pos.markPrice||0)<=(pos._edaTpPrice||0)?'profit':'warn';return'profit';})()" x-text="(()=>{void tick;const sl=pos._slFinalSet&&Math.floor(tick/5)%2===1;if(sl){const roi=(pos.entryPrice-pos.slPrice)/pos.entryPrice*pos.leverage*100;return fmtP(pos.slPrice)+(pos.slPrice&&pos.entryPrice?' ('+(roi>=0?'+':'')+roi.toFixed(1)+'%)':'');}if(isLaggard(pos)&&pos._edaTpPrice){const p=pos._edaTpPrice||0;const roi=(pos.entryPrice-p)/pos.entryPrice*pos.leverage*100;return fmtP(p)+' ('+(roi>=0?'+':'')+roi.toFixed(1)+'%)';}const roi=(pos.entryPrice-pos.currentTpPrice)/pos.entryPrice*pos.leverage*100;return fmtP(pos.currentTpPrice)+(pos.currentTpPrice&&pos.entryPrice?' ('+(roi>=0?'+':'')+roi.toFixed(1)+'%)':'');})()"></span>
           </div>
           <div class="pc-row"><span class="pc-k">Margin</span><span class="pc-v" x-text="'$'+pos.margin.toFixed(2)"></span></div>
           <div class="pc-row">
@@ -1840,11 +1839,18 @@ function psycho() { return {
             const _origStg = _ddNext.originalStage ?? parseInt(_ddNext.label.replace('Add', ''));
             pos._dcaMissedStages.push(_origStg);
             pos._dcaDelayQueue.shift();
-            // Reactionary shift: remaining stages keep their prices/qtys but relabel sequentially
+            // Bump all remaining stage prices 3% forward — the blown-through price is no longer
+            // valid, so the remaining ladder shifts deeper into adverse territory each time.
+            if (_ddInstr) {
+              for (const _r of pos._dcaDelayQueue) {
+                _r.price = this.snapPrice(_r.price * 1.03, _ddInstr);
+              }
+            }
+            // Relabel remaining stages sequentially
             let _nextLbl = _ddNextNum;
             for (const _r of pos._dcaDelayQueue) { _r.label = 'Add' + _nextLbl; _nextLbl++; }
             if (_ddInstr) { pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true; }
-            this.log(`⏭️ ${pos.symbol}: DCA Delay — Add${_origStg} blown through @ ${fmtP(mark)}, sequence compressed`, 'warn');
+            this.log(`⏭️ ${pos.symbol}: DCA Delay — Add${_origStg} blown through @ ${fmtP(mark)}, remaining stages bumped +3%, SL recomputed`, 'warn');
             continue;
           }
           // Assign current sequential label before placing
@@ -2143,7 +2149,11 @@ function psycho() { return {
           if (laggard.notional)          laggard.notional          *= (1 - cutFraction);
           if (laggard._laggardInitialEV) laggard._laggardInitialEV *= (1 - cutFraction);
           this.sess.pnl = parseFloat((this.sess.pnl + cutPnl).toFixed(6));
-          for (const p of this.positions) p._laggardLostValue = (p._laggardLostValue || 0) + cutPnl;
+          // Propagate absorbed loss to all OTHER positions — not the laggard itself,
+          // so the laggard's own ED is not hardened by its own absorption cuts.
+          for (const p of this.positions) {
+            if (p.id !== laggard.id) p._laggardLostValue = (p._laggardLostValue || 0) + cutPnl;
+          }
           this._refreshLaggardEdaTp();
           // Record cut in absorption tab for the closed-trades UI
           const tabId = 'absorption_' + laggard.id;
