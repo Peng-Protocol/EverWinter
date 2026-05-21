@@ -254,11 +254,20 @@ Vol momentum thresholds differ by sub-type and direction:
 For loser candidates, the last completed 15-minute candle's volume must be **above the window average** but **below the spike cap** (default ±50% from average). This confirms continued selling activity without a volume blowoff that would suggest exhaustion rather than continuation.
 
 Droughts (≤ avg), neutral (at avg), and spikes (> cap) are all blocked.
+
 ---
 
 ### Why FUN Addresses Over-Extended Tickers
 
 Over-extended tickers are excluded from the Gainers path but can still carry a positive funding rate. FUN captures these when vol momentum — scaled by OE count — confirms that selling pressure has begun. The higher the OE count, the more confirmation required before entry.
+
+---
+
+### Super Fun Mode
+
+Super Fun Mode strips FUN back to its original form: the only hard requirements are a positive funding rate and positive vol momentum. All VM thresholds, LSA checks, and creep gates are replaced by a lock-in gate that forces the next re-entry to match or beat the last close's funding tier, ratcheting upward within a 6-hour window. Loss absorption is what makes this aggressive stance viable — if the ticker turns, the position is absorbed over time rather than force-closed.
+
+Tickers that would normally be blocked by the RSI proximity check or by a historical over-extension count are instead admitted as the **OE sub-type** — 1× margin, requiring FR ≥ the high funding gate (default 0.1%). OE entries carry the same lock-in mechanics as standard FUN entries, and are treated as high-gate sub-types for lock-in ratcheting.
 
 ---
 
@@ -452,13 +461,21 @@ Both bots trim losing positions on a timer to prevent one or two deep-red positi
 
 **EverWinter**: Closes one base-notional worth of size at a fixed interval, unconditionally — no loss threshold check.
 
-**PsychoWinter**: Triggers when a position's unrealized loss exceeds 2.5× its base margin, then cuts every 5 minutes. Each cut is 5% of the remaining margin. Cuts stop when the final DCA stage fires or uPnL drops back below threshold.
+**PsychoWinter**: Triggers when a position's unrealized loss exceeds 2.5× its base margin, then cuts every 5 minutes. Each cut is 5% of the remaining margin. Cuts stop when the final DCA stage fires or uPnL drops back below threshold. If the position has already been absorbed down to minimum notional when the threshold is crossed, it is closed outright rather than cut further — there is nothing left worth trimming.
 
 When DCA fires into a partially absorbed position the effect compounds: the reduced size means the fixed-notional add carries more weight in the new average entry, pulling the TP closer. The worse the position was, the bigger the improvement.
 
 #### Laddering
 
 After a DCA stage fills, the ticker may linger near the new average entry while absorption keeps trimming the position. The next DCA trigger then finds a lighter position and compounds the average improvement further. If the ticker eventually hits the stop-loss, it does so on a position that has been partially unwound — ideally carrying only the initial entry margin plus the small accumulated absorbed losses rather than the full DCA-compounded size.
+
+#### EDa Payback in EverWinter
+
+There is an emergent interaction between loss absorption and the laggard's EDa TP. Every loss crystallized from a closed position flows into the laggard's expected deficit — absorbed positions, when they eventually close, are no exception. This means the laggard is not just managing its own original expected value; it is also carrying the accumulated debt of every loss the book has realized while it was open.
+
+In practice, the laggard must generate enough profit at close to bring the entire deficit — its own buffered EV plus all losses passed down from other closes — to zero. If absorption has been steadily eating away at multiple open positions, each of those realized losses hardens the laggard's EDa TP, pushing the required exit price further from the current mark. The laggard stays open until either a decisive favorable move drives mark price to that target, or enough subsequent winning closes push the accumulated deficit negative and release it. If neither happens before the force-close timer, the backstop takes it.
+
+This is the "payback" the laggard owes: every loss the book has absorbed through its lifetime sits on the laggard's ledger, and the EDa TP moves accordingly until that debt is settled.
 
 ---
 
@@ -511,15 +528,23 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 ### DCA Delay
 
-Only DCA stage 1 is placed when a position opens; each subsequent stage is queued and placed 5 minutes after the previous fills. If the next queued stage's trigger has already been blown through, the sequence compresses reactively — rather than skipping to stage 3 as-is, stage 3 is relabeled Add2 and placed at stage 3's original price, with all subsequent stages shifting down in the same way. The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, then updated whenever the sequence compresses.
+Only Add1 is placed when a position opens; stages 2 through 7 are queued and placed 5 minutes after the previous stage fills. The delay prevents committing capital to a stage whose price the market has already passed — if a ticker is still moving fast enough to invalidate a stage in the minutes after the previous fill, it is not ready for the next add.
 
-Some tickers can spike over 80% in a single candle before collapsing within minutes — a pre-placed ladder would fill multiple stages simultaneously into a still-moving adverse market, compounding margin commitment before the position has any chance to recover. The reactionary compression ensures the remaining DCA structure is always forward-looking — you can see which levels were skipped and where the sequence picked back up.
+When the timer fires the bot checks whether the next queued stage's price is still valid (mark < stage price). If it is, the stage is placed as a live conditional — shown as **yellow** in the position card. If mark has already passed the stage, the stage is bumped +3% in place, all remaining queued stages are bumped +3% with it, and the bot retries. The stage is never skipped or replaced: it stays at the front of the queue until it can be placed at a valid price.
+
+Each successive blow on the same stage adds 5 more minutes to the next retry — first blow waits 5 min, second waits 10, third waits 15, and so on. A ticker that keeps running will progressively slow the bot's commitment; a ticker that retraces will find the next attempt places immediately. The grey striped box in the position card is a temporary indicator showing the stage is in its retry countdown — it clears to yellow the moment the stage is placed.
+
+Each DCA stage carries its own independently-sized notional. A blown stage is always retried at the size intended for that stage — Add2 at $4 retries as Add2 at $4, never at Add3's $8. Stages are non-fungible; the bot does not substitute one dart for another.
+
+While a conditional is live (yellow), no future stage is scheduled. The next stage only enters the queue after the current one triggers and its 5-minute fill-wait begins.
+
+The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, and is updated after every bump.
 
 ### Sacrifice
 
 When the total allocated margin exceeds a preset threshold, one must sacrifice tickers — even those in loss — to make room for potentially deeper DCAs on existing positions. New entries pause and the most recoverable position is closed each watch cycle until allocation drops back under the cap.
 
-**Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists.
+**Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists. Crucially, DCA depth does not exempt a position — a stage 6 position sitting at a small unrealised loss is a *preferred* sacrifice candidate, not a protected one. The logic reasons that a position closer to break-even is cheaper to close than one already in deep loss.
 
 **Retraction (Addendum):** A subset of sacrifice that targets collective uPnL below −2.5× entry margin, irrespective of allocated margin. This is a more aggressive form of sacrifice and will usually drop position count to the minimum (5).
 
@@ -529,7 +554,9 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 ### Loss Absorption
 
-See [Loss Absorption](#loss-absorption) in General Mechanics for the full explanation and the laddering dynamic. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide — and every cut hardens the laggard's EDa TP, so sustained absorption on a large position compounds quietly against the weakest ticker in the book.
+See [Loss Absorption](#loss-absorption) in General Mechanics for the full explanation and the laddering dynamic. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide and compounds quietly against the weakest ticker in the book.
+
+When **Laggard Absorption** is enabled, the laggard's expected deficit reaching zero triggers a different path: instead of a force-close, the laggard is cut 5% every five minutes until it is fully drained. Unlike regular absorption — which respects a minimum notional floor and stops at the final DCA stage — laggard absorption has no floor and will consume the position down to zero over successive cuts, closing it entirely through attrition. EDa TP is suppressed while this mode is active; the slow drain is the exit strategy.
 
 ### Cascade Triggers
 
