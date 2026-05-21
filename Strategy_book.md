@@ -544,7 +544,7 @@ The stop-loss is pre-computed at open by simulating all stages filling and findi
 
 When the total allocated margin exceeds a preset threshold, one must sacrifice tickers — even those in loss — to make room for potentially deeper DCAs on existing positions. New entries pause and the most recoverable position is closed each watch cycle until allocation drops back under the cap.
 
-**Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists.
+**Target priority:** Prefers positions with ≥1 DCA stage and PnL > −3%, sorted profit-first. Falls back to the most profitable position overall if no preferred candidate exists. Crucially, DCA depth does not exempt a position — a stage 6 position sitting at a small unrealised loss is a *preferred* sacrifice candidate, not a protected one. The logic reasons that a position closer to break-even is cheaper to close than one already in deep loss.
 
 **Retraction (Addendum):** A subset of sacrifice that targets collective uPnL below −2.5× entry margin, irrespective of allocated margin. This is a more aggressive form of sacrifice and will usually drop position count to the minimum (5).
 
