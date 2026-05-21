@@ -460,6 +460,14 @@ When DCA fires into a partially absorbed position the effect compounds: the redu
 
 After a DCA stage fills, the ticker may linger near the new average entry while absorption keeps trimming the position. The next DCA trigger then finds a lighter position and compounds the average improvement further. If the ticker eventually hits the stop-loss, it does so on a position that has been partially unwound — ideally carrying only the initial entry margin plus the small accumulated absorbed losses rather than the full DCA-compounded size.
 
+#### EDa Payback in EverWinter
+
+There is an emergent interaction between loss absorption and the laggard's EDa TP. Every loss crystallized from a closed position flows into the laggard's expected deficit — absorbed positions, when they eventually close, are no exception. This means the laggard is not just managing its own original expected value; it is also carrying the accumulated debt of every loss the book has realized while it was open.
+
+In practice, the laggard must generate enough profit at close to bring the entire deficit — its own buffered EV plus all losses passed down from other closes — to zero. If absorption has been steadily eating away at multiple open positions, each of those realized losses hardens the laggard's EDa TP, pushing the required exit price further from the current mark. The laggard stays open until either a decisive favorable move drives mark price to that target, or enough subsequent winning closes push the accumulated deficit negative and release it. If neither happens before the force-close timer, the backstop takes it.
+
+This is the "payback" the laggard owes: every loss the book has absorbed through its lifetime sits on the laggard's ledger, and the EDa TP moves accordingly until that debt is settled.
+
 ---
 
 ### Balance, Max Positions, and Notional Sizing

@@ -1517,8 +1517,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
       </div>
 
       <!-- Laggard Check panel -->
-      <div class="sec" x-show="cfg.laggardCheckEnabled && positions.length > 0"
-           :style="positions.length < 2 ? 'opacity:0.35;pointer-events:none' : ''">
+      <div class="sec" x-show="cfg.laggardCheckEnabled && positions.length > 0">
         <div class="sec-ttl">Laggard Check <em x-show="positions.length>0" x-text="(()=>{const l=positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]);return l?l.symbol:'';})()"></em></div>
         <template x-if="positions.length > 0">
           <div x-data="{}" style="font-family:var(--mono);font-size:10px">
@@ -5902,29 +5901,34 @@ function ew() { return {
               pos.orders.filter(o => o.type === 'cond').forEach((o, i) => { if (i < pos.dcaStage) o.filled = true; });
             }
 
-            // Recompute correct 3% TP from current avgPrice and keep exchange native TP in sync.
+            // Recompute 3% TP from current avgPrice and keep exchange native TP in sync.
             // Uses trading-stop (native TP) — atomic, no order management, no qty requirement.
             // Exception: when EDa TP (_edaTpPrice > 0) is active, the laggard system owns the
-            // TP via a limit order; skip native TP to avoid overwriting it.
+            // exit via a limit order. Skip all reduce-phase TP logic entirely — including the
+            // underwater detection — so the laggard is not force-closed before reaching EDa TP.
             const instr = await this.getInstrInfo(pos.symbol);
             if (instr) {
-              const reduceTp    = this.snapPrice(newAvgPrice * (1 - (0.03 / pos.leverage)), instr);
-              const currentMark = pos.markPrice || newAvgPrice;
-
-              if (reduceTp >= currentMark) {
-                // TP above mark — position is underwater. Watch for 15s before force-closing.
-                if (!pos._reduceUnderwaterSince) {
-                  pos._reduceUnderwaterSince = Date.now();
-                  this.log(`${pos.symbol}: reduce phase — TP above mark (${fmtP(reduceTp)} ≥ ${fmtP(currentMark)}) — watching for 15s before close.`, 'warn');
-                } else if (Date.now() - pos._reduceUnderwaterSince >= 15000) {
-                  this.log(`${pos.symbol}: reduce phase — still underwater after 15s — closing.`, 'warn');
-                  pos._reduceUnderwaterSince = null;
-                  this.persist();
-                  await this.closePosition(pos, 'force');
-                }
-              } else {
+              if (pos._edaTpPrice > 0) {
+                // Laggard with active EDa TP: clear any stale underwater timer and yield fully
+                // to the EDa limit order. No native TP management, no force-close via this path.
                 if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
-                if (!(pos._edaTpPrice > 0)) {
+              } else {
+                const reduceTp    = this.snapPrice(newAvgPrice * (1 - (0.03 / pos.leverage)), instr);
+                const currentMark = pos.markPrice || newAvgPrice;
+
+                if (reduceTp >= currentMark) {
+                  // TP above mark — position is underwater. Watch for 15s before force-closing.
+                  if (!pos._reduceUnderwaterSince) {
+                    pos._reduceUnderwaterSince = Date.now();
+                    this.log(`${pos.symbol}: reduce phase — TP above mark (${fmtP(reduceTp)} ≥ ${fmtP(currentMark)}) — watching for 15s before close.`, 'warn');
+                  } else if (Date.now() - pos._reduceUnderwaterSince >= 15000) {
+                    this.log(`${pos.symbol}: reduce phase — still underwater after 15s — closing.`, 'warn');
+                    pos._reduceUnderwaterSince = null;
+                    this.persist();
+                    await this.closePosition(pos, 'force');
+                  }
+                } else {
+                  if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
                   // Native TP dedup: only update when price has actually moved a tick.
                   const drift = Math.abs(reduceTp - (pos._nativeReduceTpPrice || 0));
                   if (reduceTp > 0 && (!(pos._nativeReduceTpPrice > 0) || drift > instr.tickSize)) {
