@@ -9,9 +9,8 @@
 3. [Fund Chasing (FUN)](#fun-fund-chasing-strategy)
 4. [Sale Fishing (SalF)](#sale-fishing-salf-strategy)
 5. [General Mechanics](#general-mechanics)
-6. [DCA Delay](#dca-delay)
-7. [Psycho Mode](#psycho-mode)
-8. [Conclusion](#conclusion)
+6. [Psycho Mode](#psycho-mode)
+7. [Conclusion](#conclusion)
 
 ---
 
@@ -482,54 +481,6 @@ At $60 notional / 6× leverage = $10 margin per entry. For 10 positions at moder
 
 ---
 
-## DCA Delay
-
-### Overview
-
-DCA Delay is a **position protection mechanic** that staggers the placement of DCA conditional orders rather than pre-creating all of them at position open. Only DCA stage 1 is placed on the exchange at entry. Each subsequent stage is created on demand, 5 minutes after the previous stage fills.
-
-### Motivation
-
-Pre-placing all DCA conditionals immediately has two failure modes:
-
-1. **Market gap-through**: Price can spike past multiple DCA trigger levels in a single candle, filling several stages simultaneously. This compounds margin commitment against a still-moving market rather than spreading exposure over time.
-2. **Premature capital commitment**: Conditionals on Bybit consume margin headroom. Placing 7 orders immediately locks reserved capital even if the position resolves at stage 1.
-
-DCA Delay converts the DCA ladder from a static pre-set structure into a dynamic, event-driven sequence. Capital is committed only after the previous stage has confirmed the move is real and still evolving.
-
-### How It Works
-
-**At position open**: Only DCA1 conditional is placed on the exchange. Stages 2+ are stored in an internal queue (`_dcaDelayQueue`).
-
-**When DCA1 fills**: A 5-minute timer starts (`_nextDcaPlaceAt`). The timer persists across bot restarts — if the bot goes down and comes back up, the clock picks up where it left off.
-
-**When the timer expires**:
-- The bot inspects the current mark price against the DCA2 trigger level.
-- If mark is below the DCA2 trigger (not yet "blown through"): DCA2 is placed on the exchange. DCA3+ remain queued.
-- If mark is already at or above DCA2 trigger ("underwater"): DCA2 is skipped. The bot checks DCA3, then DCA4, and so on.
-- If the first valid non-underwater stage is found: it is placed. The remaining stages stay queued.
-- If all remaining stages are already underwater: the bot sets the stop-loss immediately instead of waiting for the final DCA stage to fill.
-
-**When DCA2 fills**: Another 5-minute timer starts. The same logic repeats for DCA3.
-
-### The "Underwater" Skip
-
-A stage is considered underwater if `mark ≥ trigger_price` at the moment of placement (for a short position — price has already risen past the level where we wanted to add). Setting a conditional at a price that has already been passed is either meaningless (the order would fill immediately at an even worse price) or confusing. Skipping to the next valid level ensures all placed conditionals are genuinely forward-looking.
-
-### Why 5 Minutes
-
-The 5-minute delay is a deliberate cooling-off window. After a DCA fill, the position has just absorbed a loss — the price has moved adversely. In many cases, the market will either:
-- Continue moving the same direction (in which case the next trigger is still valid)
-- Reverse briefly (in which case the delay avoids placing a conditional in a whipsaw)
-
-The delay is not a prediction of reversal. It is a minimum observation window before committing additional margin to the same trade.
-
-### SL Fallback
-
-If all queued DCA stages become underwater simultaneously (a fast, sustained adverse move), the bot sets a stop-loss at the standard `-105% ROI` level from the current average entry. This prevents the position from becoming an unlimited-drawdown open trade with no remaining protection.
-
----
-
 ## Psycho Mode
 
 Psycho Mode is like a bear with a toothache which can only be soothed by blood. It utilizes no filters save for 24hr change — any ticker moving more than 6% in either direction qualifies. It uses the following settings:
@@ -541,6 +492,12 @@ Psycho Mode is like a bear with a toothache which can only be soothed by blood. 
 - **48-hour hard force-close** as the backstop; the laggard system handles most exits well before that
 
 When a winner closes it raises the lost-value tally for every remaining position, which can push the next-weakest over its threshold and out — and so on. The real game is waiting for one ticker to move decisively and letting the cascade do the rest. Win rate is low; what keeps ROI healthy is that the winners are large enough to absorb the dust.
+
+### DCA Delay
+
+Only DCA stage 1 is placed when a position opens; each subsequent stage is queued and placed 5 minutes after the previous fills, skipping levels whose trigger price has already been passed and setting the stop-loss immediately if all remaining levels are blown through. The stop-loss is also set from position open so protection exists before any DCA stage is placed.
+
+Some tickers can spike over 80% in a single candle before collapsing within minutes — a pre-placed ladder would fill multiple stages simultaneously into a still-moving adverse market. DCA Delay converts the ladder from a static structure into an event-driven sequence so capital is committed only after each preceding stage has confirmed the move is real and still evolving.
 
 ### Sacrifice
 
@@ -556,7 +513,9 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 
 ### Loss Absorption
 
-A counterweight to sacrifice. When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it — 5% of its size every 5 minutes. The goal is slow, steady removal of the dead weight without touching anything else.
+A counterweight to sacrifice. The driving concern was margin starvation: one or two deep-red positions can absorb all available capital and choke new entries or block existing positions from DCA-ing. Loss absorption reclaims that margin discretely, a little at a time.
+
+When a position has been sitting in loss greater than 2.5× its base margin, begin trimming it — 5% of its size every 5 minutes. The goal is slow, steady removal of the dead weight without touching anything else.
 
 Cuts continue until remaining margin drops below $20, at which point the position is small enough that cascade, sacrifice, or a natural TP will finish it. The sequence usually ends well before that — either price recovers and the position clears the threshold on its own, or DCA fires first.
 
