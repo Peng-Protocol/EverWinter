@@ -495,9 +495,9 @@ When a winner closes it raises the lost-value tally for every remaining position
 
 ### DCA Delay
 
-Only DCA stage 1 is placed when a position opens; each subsequent stage is queued and placed 5 minutes after the previous fills, skipping levels whose trigger price has already been passed and setting the stop-loss immediately if all remaining levels are blown through. The stop-loss is also set from position open so protection exists before any DCA stage is placed.
+Only DCA stage 1 is placed when a position opens; each subsequent stage is queued and placed 5 minutes after the previous fills. If the next queued stage's trigger has already been blown through, the sequence compresses reactively — rather than skipping to stage 3 as-is, stage 3 is relabeled Add2 and placed at stage 3's original price, with all subsequent stages shifting down in the same way. The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, then updated whenever the sequence compresses.
 
-Some tickers can spike over 80% in a single candle before collapsing within minutes — a pre-placed ladder would fill multiple stages simultaneously into a still-moving adverse market. DCA Delay converts the ladder from a static structure into an event-driven sequence so capital is committed only after each preceding stage has confirmed the move is real and still evolving.
+Some tickers can spike over 80% in a single candle before collapsing within minutes — a pre-placed ladder would fill multiple stages simultaneously into a still-moving adverse market, compounding margin commitment before the position has any chance to recover. The reactionary compression ensures the remaining DCA structure is always forward-looking: skipped levels show as grayed-out boxes in the position card, and the activity log records each compression event.
 
 ### Sacrifice
 

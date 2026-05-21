@@ -705,6 +705,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
               <div :style="(()=>{
                 const cond = pos.orders.filter(x=>x.type==='cond');
                 const triggered = n===0 || (n>=1 && !!cond[n-1]?.filled);
+                const missed = n>=1 && (pos._dcaMissedStages||[]).includes(n);
                 const db = _dcaBand(pos);
                 const isCurrent = db.band === n && !db.inProfitZone;
                 let border, bg, color;
@@ -718,6 +719,8 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
                   color='var(--warn)';
                 } else if (triggered) {
                   border='1px solid var(--accent)'; bg='rgba(255,32,64,.12)'; color='var(--accent)';
+                } else if (missed) {
+                  border='1px dashed rgba(128,128,128,.35)'; bg='rgba(128,128,128,.07)'; color='rgba(128,128,128,.4)';
                 } else {
                   border='1px solid var(--border)'; bg='transparent'; color='var(--text-lo)';
                 }
@@ -1433,10 +1436,16 @@ function psycho() { return {
       if (i === 0) {
         orders.push({ label:'Add1', price:addPrice, type:'cond', filled:false, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
       } else {
-        _dcaDelayQueue.push({ label:'Add'+(i+1), price:addPrice, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
+        _dcaDelayQueue.push({ label:'Add'+(i+1), originalStage:i+1, price:addPrice, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
       }
     }
     if (invalid) { this.persist(); return; }
+
+    // Projected SL — simulate all stages filling to find the true SL level
+    let _slSimN = actualNotional, _slSimS = qty;
+    for (const o of orders) { if (o.type==='cond') { _slSimN += o.price * o.qty; _slSimS += o.qty; } }
+    for (const q of _dcaDelayQueue) { _slSimN += q.price * q.qty; _slSimS += q.qty; }
+    const _initSlPrice = this.snapPrice((_slSimS > 0 ? _slSimN / _slSimS : price) * (1 + 1.05 / lev), instr);
 
     // Build AMa orders when enabled
     const amaLevels = [1.5, 3, 6, 9, 12, 15, 18];
@@ -1473,7 +1482,7 @@ function psycho() { return {
       _pseudo:              true,
       _lastSeenAt:          Date.now(),
       slSet:                true,
-      slPrice:              this.snapPrice(price * (1 + 1.05 / lev), instr),
+      slPrice:              _initSlPrice,
       _slFinalSet:          false,
       _amaActive:           useAma,
       _amaCancelled:        false,
@@ -1481,6 +1490,7 @@ function psycho() { return {
       _amaOrders:           amaOrders,
       _amaOrigEntry:        useAma ? price : null,
       _dcaDelayQueue:       _dcaDelayQueue,
+      _dcaMissedStages:     [],
       _nextDcaPlaceAt:      null,
       _change24h:           candidate.change24h ?? 0,
     };
@@ -1574,9 +1584,15 @@ function psycho() { return {
       if (i === 0) {
         orders.push({ label:'Add1', price:addPrice, type:'cond', filled:false, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
       } else {
-        _dcaDelayQueueLive.push({ label:'Add'+(i+1), price:addPrice, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
+        _dcaDelayQueueLive.push({ label:'Add'+(i+1), originalStage:i+1, price:addPrice, qty:addQty, stageTp, stageRoi, avgAfter:avgEntry });
       }
     }
+
+    // Projected SL — simulate all stages filling to find the true SL level
+    let _slSimN = actualNotional, _slSimS = qty;
+    for (const o of orders) { if (o.type==='cond') { _slSimN += o.price * o.qty; _slSimS += o.qty; } }
+    for (const q of _dcaDelayQueueLive) { _slSimN += q.price * q.qty; _slSimS += q.qty; }
+    const _initSlPriceLive = this.snapPrice((_slSimS > 0 ? _slSimN / _slSimS : fillPrice) * (1 + 1.05 / lev), instr);
 
     // Build AMa orders
     const amaLevels = [1.5, 3, 6, 9, 12, 15, 18];
@@ -1608,15 +1624,16 @@ function psycho() { return {
       _laggardInitialEV: margin * (tpRoi0 / 100),
       _laggardLostValue: 0,
       markPrice: fillPrice, upnl:0,
-      _live: true, slSet:true, slPrice:this.snapPrice(fillPrice * (1 + 1.05 / lev), instr),
+      _live: true, slSet:true, slPrice:_initSlPriceLive,
       _slFinalSet: false,
       _amaActive:    useAma,
       _amaCancelled: false,
       _amaStage:     0,
       _amaOrders:    amaOrders,
       _amaOrigEntry: useAma ? fillPrice : null,
-      _dcaDelayQueue:  _dcaDelayQueueLive,
-      _nextDcaPlaceAt: null,
+      _dcaDelayQueue:   _dcaDelayQueueLive,
+      _dcaMissedStages: [],
+      _nextDcaPlaceAt:  null,
       _change24h:    candidate.change24h ?? 0,
     };
     this.positions.push(pos);
@@ -1735,12 +1752,12 @@ function psycho() { return {
             } catch(e) { this.log(`${pos.symbol}: AMa→TP order failed — ${e.message}`, 'warn'); }
           }
 
-          // Update SL to weighted avg after final stage
+          // Update SL to actual weighted avg after final stage fills
           if (pos.dcaStage >= pos._stageCount && !pos._slFinalSet && instr) {
-            pos.slPrice    = this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), instr);
+            pos.slPrice    = this._projectedSL(pos, instr);
             pos.slSet      = true;
             pos._slFinalSet = true;
-            this.log(`⚠️ ${pos.symbol}: DCA${pos.dcaStage} — SL updated @ ${fmtP(pos.slPrice)}`, 'warn');
+            this.log(`⚠️ ${pos.symbol}: DCA${pos.dcaStage} — SL @ ${fmtP(pos.slPrice)}`, 'warn');
           }
           this.log(`📊 ${pos.symbol}: ${add.label} @ ${fmtP(add.price)} | Avg ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(newTp)} (${stageRoi}% ROI)`, 'trade');
           this.persist();
@@ -1796,29 +1813,44 @@ function psycho() { return {
       }
 
       // ── DCA Delay queue processor ──
-      // After the 5-min delay, unlock the next queued DCA stage (or set SL if all underwater)
+      // After 5-min delay: apply reactionary compression (skip underwater stages, shift
+      // remaining labels down to stay sequential), then place the next valid stage.
       if (pos._nextDcaPlaceAt && now >= pos._nextDcaPlaceAt && pos._dcaDelayQueue && pos._dcaDelayQueue.length > 0) {
         pos._nextDcaPlaceAt = null;
         const _ddInstr = await this.getInstrInfo(pos.symbol);
         let _ddPlaced = false;
+        // Next expected label number = filled cond count + 1
+        let _ddNextNum = pos.orders.filter(o => o.type === 'cond').length + 1;
+
         while (pos._dcaDelayQueue.length > 0) {
           const _ddNext = pos._dcaDelayQueue[0];
           if (mark >= _ddNext.price) {
-            this.log(`📊 ${pos.symbol}: DCA Delay — ${_ddNext.label} underwater (${fmtP(mark)} ≥ ${fmtP(_ddNext.price)}) — skipping`, 'warn');
+            // Stage blown through — record original stage, compress sequence
+            if (!pos._dcaMissedStages) pos._dcaMissedStages = [];
+            const _origStg = _ddNext.originalStage ?? parseInt(_ddNext.label.replace('Add', ''));
+            pos._dcaMissedStages.push(_origStg);
             pos._dcaDelayQueue.shift();
+            // Reactionary shift: remaining stages keep their prices/qtys but relabel sequentially
+            let _nextLbl = _ddNextNum;
+            for (const _r of pos._dcaDelayQueue) { _r.label = 'Add' + _nextLbl; _nextLbl++; }
+            if (_ddInstr) { pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true; }
+            this.log(`⏭️ ${pos.symbol}: DCA Delay — Add${_origStg} blown through @ ${fmtP(mark)}, sequence compressed`, 'warn');
             continue;
           }
+          // Assign current sequential label before placing
+          _ddNext.label = 'Add' + _ddNextNum;
           pos.orders.push({ label: _ddNext.label, price: _ddNext.price, type: 'cond', filled: false, qty: _ddNext.qty, stageTp: _ddNext.stageTp, stageRoi: _ddNext.stageRoi, avgAfter: _ddNext.avgAfter });
           pos._dcaDelayQueue.shift();
           _ddPlaced = true;
-          this.log(`📊 ${pos.symbol}: DCA Delay — unlocked ${_ddNext.label} @ ${fmtP(_ddNext.price)}`, 'info');
+          if (_ddInstr) { pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true; }
+          this.log(`⏱️ ${pos.symbol}: DCA Delay — ${_ddNext.label} unlocked @ ${fmtP(_ddNext.price)}`, 'info');
           break;
         }
         if (!_ddPlaced && pos._dcaDelayQueue.length === 0 && !pos._slFinalSet && _ddInstr) {
-          pos.slPrice    = this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), _ddInstr);
+          pos.slPrice    = this._projectedSL(pos, _ddInstr);
           pos.slSet      = true;
           pos._slFinalSet = true;
-          this.log(`⚠️ ${pos.symbol}: DCA Delay — all stages underwater, SL updated @ ${fmtP(pos.slPrice)}`, 'warn');
+          this.log(`⚠️ ${pos.symbol}: DCA Delay — all stages blown through, SL @ ${fmtP(pos.slPrice)}`, 'warn');
         }
         this.persist();
       }
@@ -2236,7 +2268,7 @@ function psycho() { return {
                   pos.tpPct = stageRoi;
                   const stageCount = pos.orders.filter(o => o.type === 'cond').length;
                   if (pos.dcaStage >= stageCount && !pos._slFinalSet && instr) {
-                    pos.slPrice    = this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), instr);
+                    pos.slPrice    = this._projectedSL(pos, instr);
                     pos.slSet      = true;
                     pos._slFinalSet = true;
                   }
@@ -2885,6 +2917,16 @@ function psycho() { return {
       this._instrCache[symbol] = info;
       return info;
     } catch { return null; }
+  },
+
+  // Simulate all remaining unfilled DCA stages filling and return the resulting SL price.
+  // Used for initial SL and for recomputing after stage skips.
+  _projectedSL(pos, instr) {
+    let sim = pos.entryPrice * pos.totalSize, sz = pos.totalSize;
+    for (const o of pos.orders) { if (o.type === 'cond' && !o.filled) { sim += o.price * o.qty; sz += o.qty; } }
+    for (const q of (pos._dcaDelayQueue || [])) { sim += q.price * q.qty; sz += q.qty; }
+    const raw = (sz > 0 ? sim / sz : pos.entryPrice) * (1 + 1.05 / pos.leverage);
+    return instr ? this.snapPrice(raw, instr) : parseFloat(raw.toFixed(8));
   },
 
   snapQty(q, instr) {
