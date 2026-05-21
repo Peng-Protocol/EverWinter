@@ -751,6 +751,9 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
         </div>
 
         <div class="pc-acts">
+          <span x-show="pos._nextDcaPlaceAt" style="font-family:var(--mono);font-size:8.5px;color:var(--warn)">
+            DCA retry in: <span x-text="(()=>{void tick;const ms=Math.max(0,(pos._nextDcaPlaceAt||0)-Date.now());const m=Math.floor(ms/60000);const s=Math.floor((ms%60000)/1000);return m+'m '+String(s).padStart(2,'0')+'s'})()"></span>
+          </span>
           <span style="font-family:var(--mono);font-size:8.5px;color:var(--text-lo)">
             Force close in: <span style="color:var(--warn)" x-text="(()=>{void tick;const ms=Math.max(0,pos.openedAt+(cfg.runtimeHours*3600000)-Date.now());const h=Math.floor(ms/3600000);const m=Math.floor((ms%3600000)/60000);return h+'h '+m+'m'})()"></span>
           </span>
@@ -1839,32 +1842,32 @@ function psycho() { return {
         pos._nextDcaPlaceAt = null;
         const _ddInstr = await this.getInstrInfo(pos.symbol);
         let _ddPlaced = false;
-        // Next expected label number = filled cond count + 1
         let _ddNextNum = pos.orders.filter(o => o.type === 'cond').length + 1;
+        let _blownCount = 0;
+        let _lastBlownEntry = null;
 
         while (pos._dcaDelayQueue.length > 0) {
           const _ddNext = pos._dcaDelayQueue[0];
           if (mark >= _ddNext.price) {
-            // Stage blown through — record original stage, compress sequence
+            // Stage blown through — record, bump remaining 3%, stack delay counter
             if (!pos._dcaMissedStages) pos._dcaMissedStages = [];
             const _origStg = _ddNext.originalStage ?? parseInt(_ddNext.label.replace('Add', ''));
             pos._dcaMissedStages.push(_origStg);
+            _blownCount++;
+            _lastBlownEntry = { ..._ddNext };
             pos._dcaDelayQueue.shift();
-            // Bump all remaining stage prices 3% forward — the blown-through price is no longer
-            // valid, so the remaining ladder shifts deeper into adverse territory each time.
             if (_ddInstr) {
               for (const _r of pos._dcaDelayQueue) {
                 _r.price = this.snapPrice(_r.price * 1.03, _ddInstr);
               }
             }
-            // Relabel remaining stages sequentially
             let _nextLbl = _ddNextNum;
             for (const _r of pos._dcaDelayQueue) { _r.label = 'Add' + _nextLbl; _nextLbl++; }
             if (_ddInstr) { pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true; }
-            this.log(`⏭️ ${pos.symbol}: DCA Delay — Add${_origStg} blown through @ ${fmtP(mark)}, remaining stages bumped +3%, SL recomputed`, 'warn');
+            this.log(`⏭️ ${pos.symbol}: DCA Delay — Add${_origStg} blown @ ${fmtP(mark)}, remaining bumped +3%`, 'warn');
             continue;
           }
-          // Assign current sequential label before placing
+          // Price has not passed this stage — place it
           _ddNext.label = 'Add' + _ddNextNum;
           pos.orders.push({ label: _ddNext.label, price: _ddNext.price, type: 'cond', filled: false, qty: _ddNext.qty, stageTp: _ddNext.stageTp, stageRoi: _ddNext.stageRoi, avgAfter: _ddNext.avgAfter });
           pos._dcaDelayQueue.shift();
@@ -1873,11 +1876,27 @@ function psycho() { return {
           this.log(`⏱️ ${pos.symbol}: DCA Delay — ${_ddNext.label} unlocked @ ${fmtP(_ddNext.price)}`, 'info');
           break;
         }
-        if (!_ddPlaced && pos._dcaDelayQueue.length === 0 && !pos._slFinalSet && _ddInstr) {
-          pos.slPrice    = this._projectedSL(pos, _ddInstr);
-          pos.slSet      = true;
-          pos._slFinalSet = true;
-          this.log(`⚠️ ${pos.symbol}: DCA Delay — all stages blown through, SL @ ${fmtP(pos.slPrice)}`, 'warn');
+
+        if (!_ddPlaced && _blownCount > 0) {
+          // Stack delay: 5 min per blown stage — give price time to reverse before committing capital
+          const _stackMs = _blownCount * 5 * 60 * 1000;
+          // If queue emptied, regenerate one entry at last blown price +3% so we keep trying indefinitely
+          if (pos._dcaDelayQueue.length === 0 && _lastBlownEntry && _ddInstr) {
+            const _newPrice = this.snapPrice(_lastBlownEntry.price * 1.03, _ddInstr);
+            pos._dcaDelayQueue.push({
+              label: 'Add' + _ddNextNum,
+              originalStage: _lastBlownEntry.originalStage ?? _ddNextNum,
+              price: _newPrice,
+              qty: _lastBlownEntry.qty,
+              stageTp: _lastBlownEntry.stageTp,
+              stageRoi: _lastBlownEntry.stageRoi,
+              avgAfter: _lastBlownEntry.avgAfter,
+            });
+            this.log(`⏭️ ${pos.symbol}: DCA Delay — all stages blown, regenerated @ ${fmtP(_newPrice)}, retry in ${_blownCount * 5}min`, 'warn');
+          } else {
+            this.log(`⏭️ ${pos.symbol}: DCA Delay — ${_blownCount} stage(s) blown, retry in ${_blownCount * 5}min`, 'info');
+          }
+          pos._nextDcaPlaceAt = now + _stackMs;
         }
         this.persist();
       }
