@@ -113,7 +113,7 @@ Despite differences in market cap, tickers with extreme volume divergence in eit
 
 VM measures the ratio of recent volume to a prior baseline. Applied to rising tickers it confirms that active selling pressure has arrived; applied to falling tickers it confirms the decline is continuing rather than exhausting.
 
-The threshold creeps upward with each re-entry on the same symbol — consecutive entries require progressively stronger momentum to qualify. Over-extension history can scale the threshold further: a ticker that has run hot repeatedly demands more selling confirmation before a new entry is taken.
+A volume spike far above baseline signals exhaustion rather than continuation — sellers crammed into one window are spent, not building pressure. VM is most useful applied as a band rather than a floor alone.
 
 VM is a forward-looking signal — it measures current momentum to anticipate a coming move, as distinct from Close Confirmation which requires the reversal to already appear on the chart.
 
