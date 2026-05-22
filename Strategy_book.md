@@ -152,7 +152,7 @@ If the roster is full, the ticker with the **lowest funding rate** (most over-sh
 ### Entry Criteria
 
 #### 1. **RSI Floor: > 45**
-All three RSI timeframes (RSI6, RSI12, RSI24) must be **above 45**. There is no upper ceiling.
+All three RSI timeframes (RSI6, RSI12, RSI24) must be **above 45**. RSI6 must also be **below 75** — this ceiling blocks entries into tickers that are still in an active pump phase rather than a cooling reversal.
 
 The ticker was at RSI6 ≥ 90 during over-extension. The RSI floor ensures momentum hasn't completely collapsed before we enter. The ceiling has been removed — LSA and ClC are competent enough at timing entries into OE tickers. If selling volume is elevated but not exhausted (LSA) and closes are confirming the trend shift (ClC), the entry is valid regardless of how high RSI sits.
 
