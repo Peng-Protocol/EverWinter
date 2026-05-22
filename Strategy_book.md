@@ -111,13 +111,11 @@ Despite differences in market cap, tickers with extreme volume divergence in eit
 
 #### Volume Momentum (VM)
 
-VM measures the ratio of recent volume to the prior baseline. For gainers it confirms active selling pressure has begun. For losers it confirms the decline is continuing at pace.
+VM measures the ratio of recent volume to a prior baseline. Applied to rising tickers it confirms that active selling pressure has arrived; applied to falling tickers it confirms the decline is continuing rather than exhausting.
 
-**Gainer sub-types**: VM threshold is configurable and creeps upward per re-entry close on the same symbol. Over-extension hits multiply the creeped threshold further — the more a ticker has been running, the more selling momentum is required to enter.
+The threshold creeps upward with each re-entry on the same symbol — consecutive entries require progressively stronger momentum to qualify. Over-extension history can scale the threshold further: a ticker that has run hot repeatedly demands more selling confirmation before a new entry is taken.
 
-**Loser sub-types**: A minimum negative VM confirms continuation without exhaustion. Creep tightens the band over successive re-entries.
-
-VM is a forward-looking signal — it tries to anticipate a coming slump by measuring current selling pressure, as distinct from ClC which requires closes to already be red.
+VM is a forward-looking signal — it measures current momentum to anticipate a coming move, as distinct from Close Confirmation which requires the reversal to already appear on the chart.
 
 ---
 
@@ -264,6 +262,16 @@ When a position carries a non-zero absorption history, its regular TP is suspend
 **Each further absorption cut pushes the EH TP lower.** Absorbed loss grows (numerator up) while margin shrinks (denominator down) — both effects widen the required spread. The position needs a more decisive favorable move after every cut.
 
 When an exhumed position becomes the laggard, both laggard force-close and laggard absorption are suspended entirely. The position holds until its EH TP or stop-loss fires. Forcing it out early permanently forfeits the recovery.
+
+---
+
+#### Second Wind
+
+The final DCA stage filling normally arms the stop-loss. But absorption may have spent the position down significantly by that point — a position that reaches stage 7 carrying a fraction of its original margin is not the same risk as one that arrived there intact. Setting SL on a $7 position when stage 7 originally expected $64 is premature: the entry is well-averaged across all seven adds, the remaining exposure is small, and the required adverse move to SL is relatively modest.
+
+Second Wind detects this: if current margin is meaningfully below the expected cumulative margin at the final stage, the stage count is recalibrated to the effective stage that margin represents, and new DCA orders are queued from current price. SL is deferred until the recalibrated count fills.
+
+This repeats — each time the recalibrated final stage fills under the same condition, another wind is granted. The position keeps accumulating stages as long as absorption holds it lean. SL fires when the margin is no longer below the threshold.
 
 ---
 
