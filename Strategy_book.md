@@ -1,5 +1,5 @@
 # Strategy Book
-**Version 2.0 — Trading Strategy Documentation**
+**Trading Strategy Documentation**
 
 ---
 
@@ -66,11 +66,11 @@ RSI calibration history:
 
 RSI6 hitting ≥ the configured maximum (default 90) signals a parabolic, non-mean-reverting state. These tickers are not suitable for standard entry — they require higher-conviction conditions. Two mechanisms track over-extension:
 
-**RSI6 Maximum (Hard Disqualifier)**: When RSI6 ≥ the maximum, a standard Gainers entry is blocked. The ticker is promoted to the ADV FT roster for monitoring.
+**RSI6 Maximum (Hard Disqualifier)**: When RSI6 ≥ the maximum, a standard entry is blocked. The ticker is flagged for monitoring under a more patient entry gate.
 
 **3-Hour Graylist**: Before any entry, a historical check scans 15-minute candles over the past 3 hours. If any candle had RSI6 ≥ the configured maximum, the ticker is graylisted for the rest of the window. A recently over-extended ticker is prone to re-spiking rather than stabilizing — the graylist prevents premature re-entry after a parabolic move.
 
-**Over-Extension Counter**: The count of 15-minute candles at RSI6 ≥ maximum within the 3-hour window is tracked per ticker. For FUN entries this count scales the vol momentum threshold multiplicatively — the more times a ticker has over-extended, the more confirmation required before entry. For ADV FT the count is visible on the roster.
+**Over-Extension Counter**: The count of 15-minute candles at RSI6 ≥ maximum within the 3-hour window is tracked per ticker. This count can scale vol momentum thresholds multiplicatively — the more times a ticker has over-extended, the more confirmation required before entry. The count is also visible in the monitoring roster.
 
 ---
 
@@ -90,11 +90,11 @@ Applied as a band — neither too thin nor too thick:
 - **Floor**: Selling must be above the baseline. The ticker is actively distributing, not just drifting.
 - **Cap**: Selling must not be excessively above the baseline. A volume blowoff — extreme selling crammed into one window — marks exhaustion rather than continuation.
 
-**For ADV FT (post-OE reversals)**: Floor 125%, cap 150% by default. An OE ticker's baseline is heavily bullish — almost all recent candles were green. The first significant red candle reads elevated against that baseline. 125% is aggressive for a normal ticker but realistic for one that has been running hot.
+**Post-OE reversal context**: Floor 125%, cap 150% by default. An OE ticker's baseline is heavily bullish — almost all recent candles were green. The first significant red candle reads elevated against that baseline. 125% is aggressive for a normal ticker but realistic for one that has been running hot.
 
-**For SalF (sustained declines)**: Applied to the last hour's volume versus the 24-hour hourly average. Floor 25%, cap 50% by default.
+**Sustained decline context**: Applied to the last hour's volume versus the 24-hour hourly average. Floor 25%, cap 50% by default.
 
-**For FUN Losers (LFL/HFL)**: Tighter range — floor 15%, cap 50%. Losers naturally produce red candles, so the threshold for "elevated selling" is lower. The cap still prevents entering after a final flush.
+**Funding-rate loser context**: Tighter range — floor 15%, cap 50%. Losers naturally produce red candles, so the threshold for "elevated selling" is lower. The cap still prevents entering after a final flush.
 
 ---
 
@@ -136,15 +136,15 @@ FUN positions are classified by rate level and ticker direction:
 
 Below the low fund floor, no FUN entry is taken regardless of other conditions.
 
-**FR Creep Gate**: After the first FUN close on a symbol, a re-entry gate is seeded at 1.0% funding rate and multiplied ×1.5 per subsequent close, with a 6-hour TTL. This prevents continuously re-entering the same ticker at a declining funding rate.
+**FR Creep Gate**: After the first close on a symbol using this technique, a re-entry gate is seeded at 1.0% funding rate and multiplied ×1.5 per subsequent close, with a 6-hour TTL. This prevents continuously re-entering the same ticker at a declining funding rate.
 
 ---
 
 #### TP Ingress
 
-On every non-Gainers close (ADV FT, FUN), the entry TP for that symbol is halved: the reduction follows 0.5^(close count), floored at a configurable minimum (default 3%). The reduction applies only to stage 0 and has a 3-hour TTL. Gainers are excluded entirely.
+When active, the entry TP for that symbol is halved on every close: the reduction follows 0.5^(close count), floored at a configurable minimum (default 3%). The reduction applies only to stage 0 and has a 3-hour TTL. Not all strategies apply TP Ingress — pure entry-gate strategies that rely on strong directional filters may exclude it.
 
-A non-Gainers entry that re-enters quickly is showing declining sell pressure. The first entry hit TP because sellers had conviction. The second entry may not reach the same depth — downside fuel is diminishing. Tightening TP captures what is actually available rather than waiting for a move that may not come.
+A quick re-entry after a close is showing declining sell pressure. The first entry hit TP because sellers had conviction. The second entry may not reach the same depth — downside fuel is diminishing. Tightening TP captures what is actually available rather than waiting for a move that may not come.
 
 After 3 hours the counter resets and full TP is restored.
 
@@ -357,8 +357,9 @@ The core philosophy: a ticker that over-extends is exhibiting structural instabi
 **Entry assembles:**
 - RSI Gating: floor 45 across all three timeframes; RSI6 ceiling 75 (a ticker promoted via OE sat at RSI6 ≥ 90 — by the time the reversal is confirmed, RSI6 should be meaningfully retreating, not still pinned near the top)
 - Close Confirmation: 3/4 completed 15m candles red
-- LSA (optional): volume within the target band (floor 125%, cap 150%)
 - Funding rate minimum
+
+While ADV FT no longer uses LSA by default, a 125%/150% band remains available as an optional gate if volume confirmation is desired.
 
 **Position management:**
 - DCA structure at 2× margin (higher conviction than Gainers)
