@@ -265,13 +265,21 @@ The **activity log** is a capped reverse-chronological event feed (300 entries) 
 
 Parameters listed above. DCA Ladder shows computed notional, margin, and cumulative totals per stage. TP Schedule shows ROI% and price target per stage.
 
+### Scan Control
+
+**START SCAN** / **STOP SCAN** controls only the entry scanner — whether PsychoWinter is actively looking for and opening new positions. Stopping the scan does not affect the position watcher, loss absorption, outlier acceleration/deceleration, laggard, or cascade trigger; all position management continues running for as long as the page is open and API access is available. This mirrors how EverWinter and PseudoWinter behave — their start/stop controls the scan process, and position management is always-on.
+
+The **SCAN NOW** button manually triggers a scan cycle and is only available while the scan is running.
+
 ### Scan
 
 Bulk ticker fetch → filter by absolute 24h change ≥ threshold → Fisher-Yates shuffle → take first `psychoPerCycle` not already held → open SHORT on each. Halts early when open positions hit the cap. Resumes on the next scheduled cycle once positions clear.
 
 ### Position Watcher
 
-Fires every 5 seconds. Bulk-fetches mark prices for all open positions. Per position: DCA trigger check (places next add and recalculates TP if breached) → TP hit check → 8h funding fee accrual → hard force-close deadline check → SL placement after the final DCA stage fills. After every close, updates the lost-value tally on all remaining open positions.
+Fires every 5 seconds, always — independently of whether the scan is running. Bulk-fetches mark prices for all open positions from a single `/v5/market/tickers?category=linear` call. Per position: DCA trigger check (places next add and recalculates TP if breached) → TP hit check → funding fee accrual → hard force-close deadline check → SL placement after the final DCA stage fills. After every close, updates the lost-value tally on all remaining open positions.
+
+The bulk ticker fetch is the dominant bandwidth cost: one full linear book download every 5 seconds regardless of how many positions are open. At typical response sizes this amounts to roughly 12 requests and 600–1,200 KB per minute while the page is active.
 
 ### Loss Absorption
 
