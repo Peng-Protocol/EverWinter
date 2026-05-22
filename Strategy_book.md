@@ -467,7 +467,7 @@ When DCA fires into a partially absorbed position the effect compounds: the redu
 
 #### Laddering
 
-After a DCA stage fills, the ticker may linger near the new average entry while absorption keeps trimming the position. The next DCA trigger then finds a lighter position and compounds the average improvement further. If the ticker eventually hits the stop-loss, it does so on a position that has been partially unwound — ideally carrying only the initial entry margin plus the small accumulated absorbed losses rather than the full DCA-compounded size. Importantly, because each DCA fill has already pulled the weighted-average entry significantly upward, the SL trigger price itself sits much closer to the current mark than it would on a raw unimproved entry — laddering improves both the size at risk and the price at which the stop fires.
+After a DCA stage fills, the ticker may linger near the new average entry while absorption keeps trimming the position. The next DCA trigger then finds a lighter position and compounds the average improvement further. If the ticker eventually hits the stop-loss, it does so on a position that has been partially unwound — ideally carrying only the initial entry margin plus the small accumulated absorbed losses rather than the full DCA-compounded size. Importantly, because each DCA fill has already pulled the weighted-average entry significantly upward, the SL trigger price itself sits further above the current mark than it would on a raw unimproved entry, giving the position more room before the stop fires — laddering improves both the size at risk and the buffer before the stop triggers.
 
 #### EDa Payback in EverWinter
 
