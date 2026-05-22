@@ -285,6 +285,30 @@ Absorption is paused while a DCA stage is queued for delayed placement; the inco
 
 Active whenever there are at least 2 open positions — no reduce-phase gate. Evaluates the oldest position; force-closes it when `buffedEV − lostValue − unrealizedPnL ≤ 0`. Every position close (win or loss) feeds its PnL into the lost-value tally of all survivors. Loss absorption cuts do the same — each slice realised by absorption is immediately added to every position's lost-value tally, and the EDa TP is recomputed on the spot. If the laggard itself is the absorbed position, the reduced margin is already reflected in that recompute: smaller margin in the denominator widens the required price move, so the EDa TP adjusts proportionally without any separate correction step.
 
+**Age Mode** changes which position is selected as the laggard. Default (off) picks the oldest position by open time. Age Mode on picks the position with the most DCA stages triggered — the one deepest in the hole takes priority regardless of how long it has been open. Age Mode is more aggressive: it targets the position most likely to require a large move to close rather than simply the one that has been open longest.
+
+**Profit Offset** scales the buffered EV target. At +50% (default), the laggard must generate 1.5× its original expected value before the deficit clears — this gives winning closes more time to reduce the accumulated lost value before the laggard is forced out. Negative offsets shrink the buffer, making the laggard trigger faster but with less recovery margin. At −100% the buffer is fully removed and the laggard closes at exactly EV parity.
+
+**Laggard Absorption** changes what happens when the deficit hits zero and the laggard is still in loss: instead of force-closing, the bot trims 5% of its size every 5 minutes, keeping the position alive while gradually reducing its exposure. This is useful when the laggard is deeply underwater but the thesis for a recovery is still intact — full force-close crystallises the maximum loss, while absorption bleeds it down incrementally and gives the price time to correct.
+
+### Cascade Trigger
+
+When the combined unrealised PnL across all open positions exceeds 2.5× the entry margin, the bot force-closes the 2 most profitable positions. This banks the gains immediately and passes their closed PnL into the laggard's lost-value tally — if the wins are large enough, they can push the deficit negative and release the laggard without it needing to reach EDa TP at all. The cascade is the deliberate use of profit-taking to fund the book's debt settlement. A 5-minute cooldown prevents repeated firing on the same event.
+
+The threshold is fixed at 2.5× entry margin and scales automatically with notional and leverage — it is not configurable separately.
+
+### Position Cascade Trigger
+
+Similar intent to the Cascade Trigger but fires from the loss side rather than the profit side. When any single position's unrealised loss drops below −2.5× entry margin, the bot closes the most profitable open position to generate a laggard-seeding close, then immediately runs a scan to replace it. This keeps the book circulating rather than letting a single deep loser stall everything.
+
+Each successive trigger in the same session closes more positions than the last, governed by the **PPC Escalation Multiplier**. At 2× (default), the first trigger closes 1 position, the second closes 2, the third closes 4, and so on. The count resets when no position remains below the trigger threshold. The **Cascade Close Min ROI** floor applies here too — only positions above the minimum ROI qualify as targets, preventing the bot from closing marginal winners that would not meaningfully reduce the deficit.
+
+### Sacrifice and Retraction
+
+Sacrifice monitors the ratio of allocated margin to what the full position cap would cost at entry stage. When allocated margin exceeds 4× that baseline — meaning the book has DCA'd heavily and is carrying far more exposure than a fresh book would — sacrifice halts scans and closes one position per cycle until the ratio drops back. Priority goes to positions that have triggered at least one DCA stage and are within 3% of break-even, since those are the ones most likely to close without a significant loss. The **Position Floor** prevents sacrifice from closing below a minimum number of open positions regardless of the ratio.
+
+**Retraction** adds a second tripwire on top of sacrifice: when the collective unrealised PnL of all open positions falls below −2.5× entry margin, sacrifice mode activates regardless of the margin ratio. Where normal sacrifice is a margin-usage alarm, retraction is a drawdown alarm — it fires on deep collective red even if the book is not particularly over-allocated. Both conditions halt scans while active.
+
 ---
 
 ## ChartWinter
