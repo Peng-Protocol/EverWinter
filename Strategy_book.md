@@ -269,9 +269,9 @@ When an exhumed position becomes the laggard, both laggard force-close and lagga
 
 The final DCA stage filling normally arms the stop-loss. But absorption may have spent the position down significantly by that point — a position that reaches stage 7 carrying a fraction of its original margin is not the same risk as one that arrived there intact. Setting SL on a $7 position when stage 7 originally expected $64 is premature: the entry is well-averaged across all seven adds, the remaining exposure is small, and the required adverse move to SL is relatively modest.
 
-Second Wind detects this: if current margin is meaningfully below the expected cumulative margin at the final stage, the stage count is recalibrated to the effective stage that margin represents, and new DCA orders are queued from current price. SL is deferred until the recalibrated count fills.
+Second Wind detects this: if current margin is meaningfully below the expected cumulative margin at the final stage, the stage count is recalibrated to the effective stage that margin represents, and new DCA orders are queued from current price. SL is deferred until the recalibrated count fills. This repeats — each time the recalibrated final stage fills under the same condition, another wind is granted.
 
-This repeats — each time the recalibrated final stage fills under the same condition, another wind is granted. The position keeps accumulating stages as long as absorption holds it lean. SL fires when the margin is no longer below the threshold.
+**No thunder; no storm. No mountain; no avalanche.** In crypto, most alt pumps do not last longer than a day or two — after which they have to contract. The higher the climb, the more inevitable the fall. Aggressive absorption, DCA delay, exhumation, and second wind are designed together for exactly this: to let a position survive the worst a ticker can throw at it, then ride the reversion the next day or after. Absorption shaves exposure down through the climb. DCA delay refuses to commit capital at the wrong moment. Exhumation holds the exit door shut until the absorbed debt is genuinely settled. Second wind keeps stages alive as long as the position is lean enough to warrant more runway. By the time the avalanche arrives, what remains on the slope is a small, well-averaged position — not the bloated original.
 
 ---
 
