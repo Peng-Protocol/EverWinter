@@ -1677,7 +1677,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <span>Open: <span x-text="fmtAge(p.openedAt, tick)"></span></span>
               <span x-show="p.phase==='normal'">TP reduce in: <span class="hi" x-text="cdTo(p.openedAt+(cfg.tpReduceMins*60000), tick)"></span></span>
               <span x-show="p.phase==='reduce'">Force close in: <span class="hi" x-text="cdTo(p.openedAt+(cfg.runtimeHours*3600000), tick)"></span></span>
-              <span x-show="p.openedAt" style="color:var(--text-lo)" x-text="p.openedAt?(()=>{const d=new Date(p.openedAt);return d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});})():''"></span>
+              <span x-show="p.openedAt" style="color:var(--text-lo)" x-text="p.openedAt?(()=>{const d=new Date(p.openedAt);return 'Opened at: '+d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});})():''"></span>
             </div>
           </div>
         </template>
@@ -1888,9 +1888,9 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
         <div x-show="closedTrades.length===0" style="font-family:var(--mono);font-size:10px;color:var(--text-lo);padding:2px 0">No closed trades yet.</div>
         <div x-show="closedTrades.length>0" style="font-family:var(--mono);font-size:10.5px;line-height:1.8">
           <div>Last: <span style="color:var(--ice)" x-text="closedTrades[0].symbol+' ['+(closedTrades[0].isWin?'WIN':'LOSS')+']'"></span></div>
-          <div>Best: <span style="color:var(--profit)" x-text="'+'+Math.max(...closedTrades.map(t=>t.pnlPct)).toFixed(1)+'%'"></span></div>
-          <div>Worst: <span :style="Math.min(...closedTrades.map(t=>t.pnlPct))>=0?'color:var(--profit)':'color:var(--short)'"
-            x-text="(Math.min(...closedTrades.map(t=>t.pnlPct))>=0?'+':'')+Math.min(...closedTrades.map(t=>t.pnlPct)).toFixed(1)+'%'"></span></div>
+          <div>Best: <span style="color:var(--profit)" x-text="'+'+Math.max(...closedTrades.map(t=>t.pnlPct??0)).toFixed(1)+'%'"></span></div>
+          <div>Worst: <span :style="Math.min(...closedTrades.map(t=>t.pnlPct??0))>=0?'color:var(--profit)':'color:var(--short)'"
+            x-text="(Math.min(...closedTrades.map(t=>t.pnlPct??0))>=0?'+':'')+Math.min(...closedTrades.map(t=>t.pnlPct??0)).toFixed(1)+'%'"></span></div>
         </div>
       </div>
 
@@ -4229,6 +4229,13 @@ function pw() { return {
       _advFt:           !!(pos._advFt),
       oeCount:       pos.oeCount,
     });
+    const _absTabClose = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
+    if (_absTabClose) {
+      _absTabClose.finalClose = { reason, exitPrice, pnl, pnlPct, closedAt };
+      _absTabClose.totalPnl   = parseFloat((_absTabClose.totalPnl + totalPnl).toFixed(6));
+      _absTabClose.isOpen     = false;
+      _absTabClose.closedAt   = closedAt;
+    }
 
     const g = this.gainers.find(x => x.symbol === pos.symbol);
     if (g) g.status = 'closed';
@@ -4358,17 +4365,20 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
         if (pos.tpPct > 3) {
           this.sess.tpReduce++;
           const currentUROI = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
-          // Skip reduce-phase close/TP-cut for laggards with an active EDa TP — EDa owns the exit.
-          if (!(pos._edaTpPrice > 0) && (currentUROI >= 3)) {
+          // Skip reduce-phase close/TP-cut for the active laggard — EDa owns the exit.
+          const _isActiveLaggard = this.cfg.laggardCheckEnabled && (pos._laggardInitialEV > 0) &&
+            this.positions.length >= 1 &&
+            pos.id === this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]).id;
+          if (!_isActiveLaggard && (currentUROI >= 3)) {
             this.log(`🎯 ${pos.symbol}: FT ${this.cfg.tpReduceMins}min — UROI ${currentUROI.toFixed(1)}% — closing`, 'warn');
             await this.ftClosePosition(pos, 'force'); continue;
           }
-          if (!(pos._edaTpPrice > 0)) {
+          if (!_isActiveLaggard) {
             pos.currentTpPrice = pos.entryPrice * (1 - (0.03 / pos.leverage));
             pos.tpPct = 3;
             this.log(`🎯 ${pos.symbol}: FT ${this.cfg.tpReduceMins}min — TP reduced to 3% (${fmtP(pos.currentTpPrice)})`, 'warn');
           } else {
-            pos.tpPct = 3; // close re-entry gate without overwriting currentTpPrice
+            pos.tpPct = 3;
             this.log(`🎯 ${pos.symbol}: FT ${this.cfg.tpReduceMins}min — reduce phase (laggard — EDa TP takes over)`, 'warn');
           }
           this.persist();
@@ -4769,7 +4779,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
                 pos.dcaStage   = pos.orders.filter(o => o.type === 'cond' && o.filled).length;
                 if (pos._loaPending && this.cfg.lossAbsorptionEnabled && (pos.upnl || 0) < 0) {
                   const _loaBase = this.cfg.minNotional / this.cfg.leverage;
-                  if ((pos.margin || 0) > _loaBase) {
+                  if ((pos.margin || 0) > 0) {
                     pos._loaPending = false;
                     this._tryAbsorbPos(pos, _loaBase);
                   }
@@ -5402,7 +5412,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
             pos.dcaStage   = pos.orders.filter(o => o.type === 'cond' && o.filled).length;
             if (pos._loaPending && this.cfg.lossAbsorptionEnabled && (pos.upnl || 0) < 0) {
               const _loaBase = this.cfg.minNotional / this.cfg.leverage;
-              if ((pos.margin || 0) > _loaBase) {
+              if ((pos.margin || 0) > 0) {
                 pos._loaPending = false;
                 this._tryAbsorbPos(pos, _loaBase);
               }
@@ -6337,9 +6347,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     if (!this.cfg.lossAbsorptionEnabled) return;
     const now        = Date.now();
     const baseMargin = this.cfg.minNotional / this.cfg.leverage;
-    const intervalMs = (this.cfg.lossAbsorptionIntervalMins ?? 45) * 60 * 1000;
     for (const pos of [...this.positions]) {
       if ((pos.upnl || 0) >= 0) continue;
+      const posIntervalMins = (pos._funFastAbsorp && this.cfg.funSuperMode) ? 5 : (this.cfg.lossAbsorptionIntervalMins ?? 45);
+      const intervalMs = posIntervalMins * 60 * 1000;
       const _absBase = pos.openedAt || 0;
       const _absElapsed = now - _absBase;
       if (_absElapsed < intervalMs) continue;
@@ -6347,9 +6358,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const _absExpectedAt = _absBase + _absCutIdx * intervalMs;
       if ((pos._lastAbsorptionAt || 0) >= _absExpectedAt) continue;
       pos._lastAbsorptionAt = _absExpectedAt;
-      if ((pos.margin || 0) <= baseMargin) {
+      if ((pos.margin || 0) <= 0) {
         const sym = pos.symbol.replace('USDT','');
-        this.log(`✂️ ${sym}: absorption due — already at minimum size ($${(pos.margin||0).toFixed(2)}), pending next DCA`, 'info');
+        this.log(`✂️ ${sym}: absorption due — position fully absorbed, pending DCA`, 'info');
         pos._loaPending = true;
         continue;
       }
@@ -6360,9 +6371,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   _tryAbsorbPos(pos, baseMargin) {
     if ((pos.upnl || 0) >= 0) return;
-    if ((pos.margin || 0) <= baseMargin) return;
+    if ((pos.margin || 0) <= 0) return;
     const mark        = pos.markPrice || pos.entryPrice;
-    const cutMgn      = Math.min(baseMargin, pos.margin - baseMargin);
+    const cutMgn      = Math.min(baseMargin, pos.margin);
     const cutFraction = cutMgn / pos.margin;
     const cutQty      = pos.totalSize * cutFraction;
     if (cutQty <= 0) return;
@@ -6371,6 +6382,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     pos.margin    = Math.max(0, pos.margin - cutMgn);
     if (pos.notional) pos.notional *= (1 - cutFraction);
     this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
+    if (pos.margin < baseMargin) pos._loaPending = true;
     const sym = pos.symbol.replace('USDT','');
     this.log(`✂️ ${sym}: absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)}`, 'warn');
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
@@ -6384,6 +6396,17 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         laggard._edaTpPrice = Math.max(0, laggard.entryPrice - (buffedEV - laggard._laggardLostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin));
       }
     }
+    const _absNow = Date.now();
+    const _absTabId = 'absorption_' + pos.id;
+    let _absTab = this.closedTrades.find(t => t.id === _absTabId);
+    if (!_absTab) {
+      _absTab = { id: _absTabId, posId: pos.id, reason: 'absorption', symbol: pos.symbol, openedAt: pos.openedAt, dcaStage: pos.dcaStage, cuts: [], totalPnl: 0, finalClose: null, isOpen: true, firstCutAt: _absNow };
+      this.closedTrades.push(_absTab);
+    }
+    _absTab.cuts.push({ pnl: cutPnl, mark, cutAt: _absNow });
+    _absTab.totalPnl = parseFloat((_absTab.totalPnl + cutPnl).toFixed(6));
+    _absTab.dcaStage = pos.dcaStage;
+    _absTab.lastCutAt = _absNow;
   },
 
   async runLaggardCheck() {

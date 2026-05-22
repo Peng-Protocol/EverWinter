@@ -948,6 +948,9 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <input type="range" min="0.01" max="0.5" step="0.005" x-model.number="cfg.funFundingHigh" :disabled="bot.running" @change="persist()">
               <div class="lbl" style="margin-top:8px">Low Fund ≥ <b x-text="cfg.funFundingLow.toFixed(3)+'%'"></b> <span x-show="cfg.positionSizing" style="color:var(--text-lo);font-size:9px">(LFG 2× / LFL x1)</span></div>
               <input type="range" min="0.005" max="0.25" step="0.005" x-model.number="cfg.funFundingLow" :disabled="bot.running" @change="persist()">
+              <div class="lbl" style="margin-top:8px">Re-entry Cooldown <b x-text="(cfg.funCooldownMins??10)+'min'"></b></div>
+              <input type="range" min="0" max="60" step="5" x-model.number="cfg.funCooldownMins" :disabled="bot.running" @change="persist()">
+              <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Minimum time between FUN entries on the same ticker.</div>
             </div>
             <div class="g" style="margin-top:10px">
               <div class="lbl">Top Gainers <b x-text="cfg.funGainerN"></b></div>
@@ -1313,7 +1316,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <span>Open: <span x-text="fmtAge(p.openedAt, tick)"></span></span>
               <span x-show="p.phase==='normal'">TP reduce in: <span class="hi" x-text="cdTo(p.openedAt + $data.tpReduceMs(), tick)"></span></span>
               <span x-show="p.phase==='reduce'">Force close in: <span class="hi" x-text="cdTo(p.openedAt + $data.forceCloseMs(), tick)"></span></span>
-              <span x-show="p.openedAt" style="color:var(--text-lo)" x-text="p.openedAt?(()=>{const d=new Date(p.openedAt);return d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});})():''"></span>
+              <span x-show="p.openedAt" style="color:var(--text-lo)" x-text="p.openedAt?(()=>{const d=new Date(p.openedAt);return 'Opened at: '+d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});})():''"></span>
             </div>
           </div>
         </template>
@@ -2096,6 +2099,7 @@ function ew() { return {
     funVolMomCreepPct: 25,          // VM floor tightens by this % per re-entry within 6h window
     funOEStepPct: 25,          // VM scale-up % per OE hit in 6h lookback
     funSuperMode: false,       // Super Fun Mode — disables all VM/LSA gates, uses lock-in FR gate only
+    funCooldownMins: 10,       // minimum minutes between FUN opens on same ticker
     // ── Sale Fishing Strategy ──
     sfEnabled: true,           // enable sale fishing (1h LSA gate, 2× slots/margin)
     sfLsaLimit: 50,            // 1h LSA spike cap % — block if last candle > avg by more than this
@@ -2138,7 +2142,8 @@ function ew() { return {
   _ftMaxGraylist: {},
   _tpIngress: {},          // symbol → { count, setAt } — entry TP reduction: 0.5^count, floor at tpIngressMin%, TTL 3h
   funCreep:   {},          // symbol → { count, setAt, frThreshold, overExtCount } — FUN re-entry creep, 6h TTL
-  funLockIn:  {},          // symbol → { gate, trades, setAt } — Super Fun Mode lock-in, 6h TTL
+  funLockIn:  {},          // symbol → { gate, trades, setAt, tradeTimes } — Super Fun Mode lock-in, 6h TTL
+  funCooldownAt: {},       // symbol → timestamp of last FUN open, for min-interval enforcement
   salfCreep:  {},          // symbol → { count, setAt, bumpedAt } — SalF median creep, 6h TTL from setAt
   _volBaseline: {},
   _symData: {},       // symbol → { rsi6, rsi12, rsi24, volMomPct, ts } — for FT roster display
@@ -2295,9 +2300,10 @@ function ew() { return {
         closedTrades: this.closedTrades,
         bot: { startTime: this.bot.startTime, lastScan: this.bot.lastScan },
         creds: this.creds,
-        funCreep:   this.funCreep,
-        funLockIn:  this.funLockIn,
-        salfCreep:  this.salfCreep,
+        funCreep:     this.funCreep,
+        funLockIn:    this.funLockIn,
+        funCooldownAt: this.funCooldownAt,
+        salfCreep:    this.salfCreep,
         symbolBanlist: this._symbolBanlist,
         ftCandidates: this.ftCandidates,   // ADV FT roster
         extenderCount: this.extenderCount,
@@ -2362,9 +2368,10 @@ function ew() { return {
           // expired entries are simply dropped — symbol may re-qualify normally
         }
       }
-      if (s.funCreep  && typeof s.funCreep  === 'object') this.funCreep  = s.funCreep;
-      if (s.funLockIn && typeof s.funLockIn === 'object') this.funLockIn = s.funLockIn;
-      if (s.salfCreep && typeof s.salfCreep === 'object') this.salfCreep = s.salfCreep;
+      if (s.funCreep     && typeof s.funCreep     === 'object') this.funCreep     = s.funCreep;
+      if (s.funLockIn    && typeof s.funLockIn    === 'object') this.funLockIn    = s.funLockIn;
+      if (s.funCooldownAt && typeof s.funCooldownAt === 'object') this.funCooldownAt = s.funCooldownAt;
+      if (s.salfCreep    && typeof s.salfCreep    === 'object') this.salfCreep    = s.salfCreep;
       if (s.tpIngress && typeof s.tpIngress === 'object') {
         const TP_INGRESS_TTL = 3 * 3600 * 1000;
         const nowGl = Date.now();
@@ -2417,8 +2424,9 @@ function ew() { return {
     this._ftEvictGraylist = {};
     this._ftMaxGraylist = {};
     this._volBaseline = {};
-    this.funCreep  = {};
-    this.funLockIn = {};
+    this.funCreep      = {};
+    this.funLockIn     = {};
+    this.funCooldownAt = {};
     this.salfCreep = {};
     this._tpIngress = {};
     this.log('Saved state cleared.', 'warn');
@@ -2894,10 +2902,12 @@ function ew() { return {
     const entry = this.funLockIn[symbol];
     if (entry && (now - entry.setAt) < LOCK_TTL) {
       entry.trades++;
-      entry.gate  = Math.max(entry.gate, gate); // ratchet to highest gate seen in window
+      entry.gate  = Math.max(entry.gate, gate);
       entry.setAt = now;
+      if (!entry.tradeTimes) entry.tradeTimes = [];
+      entry.tradeTimes.push(now);
     } else {
-      this.funLockIn[symbol] = { gate, trades: 1, setAt: now };
+      this.funLockIn[symbol] = { gate, trades: 1, setAt: now, tradeTimes: [now] };
     }
     const e = this.funLockIn[symbol];
     this.log(`💰 ${symbol}: FUN lock-in — gate ≥ ${e.gate.toFixed(3)}% | ${e.trades} trade${e.trades === 1 ? '' : 's'} in window`, 'info');
@@ -2972,6 +2982,9 @@ function ew() { return {
       if (!price) continue;
       if (this._symbolBanlist[sym]) continue;
       if (this.positions.find(p => p.symbol === sym)) continue;
+      // FUN cooldown — minimum interval between opens on same ticker
+      const _funCooldownMs = (this.cfg.funCooldownMins ?? 10) * 60 * 1000;
+      if (this.funCooldownAt[sym] && (Date.now() - this.funCooldownAt[sym]) < _funCooldownMs) continue;
       const fr = await this.fetchFundingRate(sym).catch(() => null);
       if (fr === null) continue;
       if (fr <= 0) { frNegBlocked++; continue; }
@@ -2985,8 +2998,21 @@ function ew() { return {
       // FR gate — Super Fun Mode uses lock-in (must re-qualify at same tier or higher),
       // normal mode uses the ratcheting creep gate.
       const CREEP_TTL = 6 * 3600 * 1000;
+      // Super FUN re-entry control: after 2 trades on same ticker in 1h, throttle or defer
+      let _superFunFastAbsorp = false;
       if (this.cfg.funSuperMode) {
         const lockEntry = this.funLockIn[sym];
+        if (lockEntry) {
+          const _oneHourAgo = Date.now() - 3600000;
+          const _tradesInHour = (lockEntry.tradeTimes || []).filter(t => t > _oneHourAgo).length;
+          if (_tradesInHour >= 2) {
+            if (!this.cfg.lossAbsorptionEnabled) {
+              this.log(`💰 ${sym}: Super FUN — ${_tradesInHour} trades in 1h, absorption off → re-entry deferred`, 'info');
+              continue;
+            }
+            _superFunFastAbsorp = true;
+          }
+        }
         if (lockEntry && (Date.now() - lockEntry.setAt) < CREEP_TTL && lockEntry.gate != null) {
           if (fr < lockEntry.gate) { frCreepBlocked++; continue; }
         }
@@ -3069,7 +3095,13 @@ function ew() { return {
         }
       }
       const opened = await this.funOpenShort(sym, price, fr, isLoser, change24h, funRsi6, funRsi12, funRsi24, funNextFundingTime, funFundingIntervalMs, funHistOverExtCount, funLsaRatio, subType, mult, badge);
-      if (opened) funOpened++;
+      if (opened) {
+        funOpened++;
+        if (_superFunFastAbsorp) {
+          const _newPos = this.positions.find(p => p.symbol === sym && p._fun);
+          if (_newPos) _newPos._funFastAbsorp = true;
+        }
+      }
     }
     const vmNote      = (vmBlockedG + vmBlockedL)  > 0 ? ` | VM: ${vmBlockedG}G ${vmBlockedL}L` : '';
     const lsaNote     = lsaBlocked    > 0 ? ` | LSA: ${lsaBlocked}L` : '';
@@ -3077,10 +3109,12 @@ function ew() { return {
     const frCreepNote = frCreepBlocked > 0 ? ` | FR-creep: ${frCreepBlocked}` : '';
     const frNegNote   = frNegBlocked  > 0 ? ` | FR≤0: ${frNegBlocked}` : '';
     this.log(`💰 FUN scan — pool ${funPool.length} (${gainers.length}G ${losers.length}L) | opened ${funOpened}${vmNote}${lsaNote}${proxNote}${frCreepNote}${frNegNote}`, 'scan');
-    // Prune expired creep and lock-in entries
+    // Prune expired creep, lock-in, and cooldown entries
     const _now = Date.now();
-    for (const sym of Object.keys(this.funCreep))   { if (_now - (this.funCreep[sym].setAt  || 0) >= 6 * 3600 * 1000) delete this.funCreep[sym];  }
-    for (const sym of Object.keys(this.funLockIn))  { if (_now - (this.funLockIn[sym].setAt || 0) >= 6 * 3600 * 1000) delete this.funLockIn[sym]; }
+    for (const sym of Object.keys(this.funCreep))     { if (_now - (this.funCreep[sym].setAt  || 0) >= 6 * 3600 * 1000) delete this.funCreep[sym];  }
+    for (const sym of Object.keys(this.funLockIn))    { if (_now - (this.funLockIn[sym].setAt || 0) >= 6 * 3600 * 1000) delete this.funLockIn[sym]; }
+    const _cooldownMs = (this.cfg.funCooldownMins ?? 10) * 60 * 1000;
+    for (const sym of Object.keys(this.funCooldownAt)) { if (_now - (this.funCooldownAt[sym] || 0) >= _cooldownMs) delete this.funCooldownAt[sym]; }
   },
 
   async funOpenShort(sym, price, fundingRate, isLoser = false, change24h = null, rsi6 = null, rsi12 = null, rsi24 = null, nextFundingTime = null, fundingIntervalMs = null, histOverExtCount = 0, lsaRatio = null, subType = 'HFG', mult = 3, badge = '3x') {
@@ -3176,6 +3210,7 @@ function ew() { return {
       ? ` | RSI6:${rsi6?.toFixed(1)??'?'} RSI12:${rsi12?.toFixed(1)??'?'} RSI24:${rsi24?.toFixed(1)??'?'}` : '';
     const lsaStr = isLoser && lsaRatio != null ? ` | LSA:+${Math.round((lsaRatio - 1) * 100)}%` : '';
     this.log(`💰 ▼ FUN ${badge} SHORT ${sym} @ ${fmtP(fillPrice)} | FR:${fundingRate >= 0 ? '+' : ''}${fundingRate.toFixed(4)}% | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)}${rsiStr}${lsaStr} [${funMult}× notional]`, 'trade');
+    this.funCooldownAt[sym] = Date.now();
     this.persist();
     return true;
   },
@@ -3409,10 +3444,11 @@ function ew() { return {
     if (!this.cfg.lossAbsorptionEnabled) return;
     const now        = Date.now();
     const baseMargin = this.cfg.minNotional / this.cfg.leverage;
-    const intervalMs = (this.cfg.lossAbsorptionIntervalMins ?? 45) * 60 * 1000;
     for (const pos of [...this.positions]) {
       if ((pos.upnl || 0) >= 0) continue;
       if (_closingIds.has(pos.id)) continue;
+      const posIntervalMins = (pos._funFastAbsorp && this.cfg.funSuperMode) ? 5 : (this.cfg.lossAbsorptionIntervalMins ?? 45);
+      const intervalMs = posIntervalMins * 60 * 1000;
       const _absBase = pos.openedAt || 0;
       const _absElapsed = now - _absBase;
       if (_absElapsed < intervalMs) continue;
@@ -3420,9 +3456,9 @@ function ew() { return {
       const _absExpectedAt = _absBase + _absCutIdx * intervalMs;
       if ((pos._lastAbsorptionAt || 0) >= _absExpectedAt) continue;
       pos._lastAbsorptionAt = _absExpectedAt;
-      if ((pos.margin || 0) <= baseMargin) {
+      if ((pos.margin || 0) <= 0) {
         const sym = pos.symbol.replace('USDT','');
-        this.log(`✂️ ${sym}: absorption due — already at minimum size ($${(pos.margin||0).toFixed(2)}), pending next DCA`, 'info');
+        this.log(`✂️ ${sym}: absorption due — position fully absorbed, pending DCA`, 'info');
         pos._loaPending = true;
         continue;
       }
@@ -3433,9 +3469,9 @@ function ew() { return {
 
   async _tryAbsorbPos(pos, baseMargin) {
     if ((pos.upnl || 0) >= 0) return;
-    if ((pos.margin || 0) <= baseMargin) return;
+    if ((pos.margin || 0) <= 0) return;
     const mark        = pos.markPrice || pos.entryPrice;
-    const cutMgn      = Math.min(baseMargin, pos.margin - baseMargin);
+    const cutMgn      = Math.min(baseMargin, pos.margin);
     const cutFraction = cutMgn / pos.margin;
     const cutQty      = pos.totalSize * cutFraction;
     if (cutQty <= 0) return;
@@ -3460,6 +3496,7 @@ function ew() { return {
     pos.totalSize = Math.max(0, pos.totalSize - cutQty);
     pos.margin    = Math.max(0, pos.margin - cutMgn);
     this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
+    if (pos.margin < baseMargin) pos._loaPending = true;
     const sym = pos.symbol.replace('USDT','');
     this.log(`✂️ ${sym}: absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)}`, 'warn');
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
@@ -4775,7 +4812,7 @@ function ew() { return {
             pos.dcaStage   = pos.orders.filter(o => o.type === 'cond' && o.filled).length;
             if (pos._loaPending && this.cfg.lossAbsorptionEnabled && (pos.upnl || 0) < 0) {
               const _loaBase = this.cfg.minNotional / this.cfg.leverage;
-              if ((pos.margin || 0) > _loaBase) {
+              if ((pos.margin || 0) > 0) {
                 pos._loaPending = false;
                 await this._tryAbsorbPos(pos, _loaBase);
               }
@@ -5568,9 +5605,10 @@ function ew() { return {
         // and pendingClose not set (retry loop handles outstanding close attempts).
         // Skip if this is the active laggard with EDa TP set — laggard check owns that close.
         if (p.phase === 'reduce' && !p.pendingClose && this.positions.find(x => x.id === p.id)) {
-          const _isLaggard = this.cfg.laggardCheckEnabled && this.positions.length >= 1 &&
+          const _isLaggard = this.cfg.laggardCheckEnabled && (p._laggardInitialEV > 0) &&
+            this.positions.length >= 1 &&
             p.id === this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]).id;
-          if (!(_isLaggard && p._edaTpPrice > 0)) {
+          if (!_isLaggard) {
             const reduceMark = p.markPrice || p.entryPrice;
             const reduceUROI = (p.entryPrice - reduceMark) / p.entryPrice * p.leverage * 100;
             if (reduceUROI >= 3) {
@@ -5986,7 +6024,7 @@ function ew() { return {
           pos.margin     = exPosMargin > 0 ? exPosMargin : (newAvgPrice * newSize) / pos.leverage;
           if (pos._loaPending && this.cfg.lossAbsorptionEnabled && (pos.upnl || 0) < 0) {
             const _loaBase = this.cfg.minNotional / this.cfg.leverage;
-            if ((pos.margin || 0) > _loaBase) {
+            if ((pos.margin || 0) > 0) {
               pos._loaPending = false;
               await this._tryAbsorbPos(pos, _loaBase);
               this.persist();

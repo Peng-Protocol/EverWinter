@@ -294,6 +294,8 @@ A perfect AMa run — all seven adds filling and TP hitting at −22% — return
 
 Each strategy is a specific combination of techniques. The techniques are defined above; below, each strategy describes the problem it solves and which techniques it assembles to solve it.
 
+All strategies except Psycho Mode use Passive Loss Absorption as a reactive technique — positions are trimmed on a fixed interval regardless of current profit state, with gains feeding into the laggard's payback tally alongside crystallized losses.
+
 ---
 
 ### Gainers Strategy
@@ -370,7 +372,11 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 - TP Ingress applies on re-entry
 - Stop-loss
 
+**Re-entry Cooldown**: A configurable minimum interval (default 10 minutes) is enforced between FUN entries on the same ticker. Once opened, the ticker is gated until the cooldown expires.
+
 **Super Fun Mode**: Strips FUN to funding rate + positive VM only. All VM thresholds, LSA checks, and creep gates are replaced by a lock-in ratchet — re-entry must match or beat the last close's funding tier within a 6-hour window. Tickers blocked by RSI proximity or OE count are admitted as the OE sub-type (1× margin, high funding gate required). Aggressive absorption is what makes this stance viable — if the ticker turns, the position is absorbed over time rather than force-closed.
+
+After a ticker accumulates two Super FUN trades within the same hour, the bot responds based on absorption status. If absorption is active, any further re-entry on that ticker is flagged for accelerated absorption — loss cuts fire every 5 minutes rather than the standard interval. If absorption is off, re-entry is deferred entirely until the hour has cleared.
 
 ---
 
