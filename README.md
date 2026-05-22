@@ -162,6 +162,8 @@ The Trades column (mobile: **📋 Trades** tab) is a reverse-chronological feed 
 
 The feed is rendered via a vanilla JS `renderTradeFeed()` function rather than Alpine `x-for` to avoid reactivity performance issues with large lists. A **CLEAR** button truncates the feed and resets the closed-trades array in state and storage.
 
+> **Session PnL vs Trades feed:** The session PnL counter and the sum of all trade cards will often not match — this is expected. Loss absorption cuts are realised and credited to session PnL in real time but do not produce a trade entry in the feed; they are internal book-keeping. The absorbed loss is not forgotten: it is immediately added to the laggard's accumulated deficit, which raises the EDa TP and forces the laggard to earn back the absorbed amount before it can close. Either the laggard closes at a price that covers the full deficit, or subsequent winning closes push the accumulated lost value negative and release it — in both cases the book eventually settles. The discrepancy between session PnL and the trades feed narrows as those resolution events occur.
+
 ---
 
 ## PseudoWinter (Simulation Mode)
