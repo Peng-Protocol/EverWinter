@@ -483,6 +483,8 @@ In practice, the laggard must generate enough profit at close to bring the entir
 
 This is the "payback" the laggard owes: every loss the book has absorbed through its lifetime — whether from a full close or a mid-position trim — sits on the laggard's ledger in real time, and the EDa TP moves accordingly until that debt is settled.
 
+One further point: the EDa TP is always buffered by default. The profit offset (default +50%) means `buffedEV = 1.5 × originalEV`, so even in a clean book with zero accumulated losses the laggard must generate 1.5× its own original expected value before the deficit clears. The buffer is not a penalty — it is built-in headroom that ensures the laggard closes with more profit than a standard TP would have produced, giving the book a systematic surplus on every laggard close. When accumulated losses are present, the buffer means the laggard is already working above baseline before the debt is even counted; the EDa TP rises further on top of that. The laggard is therefore always a net over-performer relative to normal TP closes, and the magnitude of that over-performance scales with how much the book has lost before it.
+
 ---
 
 ### Balance, Max Positions, and Notional Sizing
