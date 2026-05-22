@@ -50,6 +50,8 @@ This watchlist also evicts any tickers that fail other filters such as over-exte
 ### Follow-Through Watchlist (`ftWatchlist`)
 A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its count and how many FT trades have been opened against it. For regular FT entries the count is Rodeo rides; for ADV FT entries (marked ⚡) the count is over-extension hits within the 3h window. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
 
+When the ADV FT roster is full and a new ticker qualifies for promotion, the eviction priority is: lowest funding rate first (most over-shorted, highest squeeze risk), then oldest entry as tiebreaker. The incoming ticker takes the evicted slot immediately.
+
 
 ---
 
@@ -91,7 +93,7 @@ Runs inline within `runScan` after the gainers pass. Evaluates the top `funGaine
 For each candidate, the FUN scan applies: symbol banlist → existing position check → funding rate classification (sub-type and slot cost determined by FR level) → slot check → FR creep gate → historical RSI6 over-extension look-back (3h, 15min candles) → loser OE reclassification (losers with any over-extension in the look-back are evaluated under the gainers gate, as their behavior matches a gainer) → RSI6 proximity block → vol momentum gate (separate thresholds for gainers vs. losers, creeping upward with each close and scaling multiplicatively with over-extension count) → LSA check for losers (last completed candle must show positive but non-spike volume relative to the window average).
 
 ### 3. FT/ADV FT Scan (`scanFollowThroughs`)
-Runs after `runScan` against the persisted `ftCandidates` roster. Per symbol, gates are checked in order: funding rate → RSI floor (> 45 for ADV FT with no upper ceiling, 20–60 for regular FT) → Close Confirmation / ClC (ADV FT only: ≥3 of last 4 completed 15m bars must be red) → LSA band gate (ADV FT only: last candle volume ≥ floor% and ≤ cap% of window average). Opens FT or ADV FT shorts when all conditions pass. ADV FT carries no RSI ceiling — LSA and ClC are competent enough to time entries into OE tickers.
+Runs after `runScan` against the persisted `ftCandidates` roster. Per symbol, gates are checked in order: funding rate → RSI floor (> 45 for ADV FT, 20–60 for regular FT) → RSI6 ceiling (< 75 for ADV FT, blocks entries into still-active pumps) → Close Confirmation / ClC (ADV FT only: ≥3 of last 4 completed 15m bars must be red) → LSA band gate (ADV FT only: last candle volume ≥ floor% and ≤ cap% of window average). Opens FT or ADV FT shorts when all conditions pass.
 
 Both ClC and LSA read directly from the `_klineCache[${symbol}_15]` entry already populated by the RSI gate check (`fetchRSIMulti`). No additional kline fetch is required — the same 15m candle array is reused for RSI computation, red-candle counting, and volume analysis.
 
@@ -140,6 +142,9 @@ Lists all symbols currently under active Rodeo Creep with their ride count, curr
 ### FUN VM Creep
 Lists all symbols currently under active FUN vol momentum creep. Each entry shows the close count, the live effective VM floor for each sub-type (HFG, LFG, HFL, LFL), the current FR re-entry gate (seeded at 1% after first close, scaling ×1.5 per close), and the countdown to the 6h TTL reset. Over-extension hits are displayed inline with an ⚡ counter and their multiplicative effect on the VM threshold. Only visible when FUN vol momentum is enabled.
 
+### TP Ingress
+Per-symbol TP reduction state for non-Gainers strategies. Each close on a symbol seeds or increments `_tpIngressCount[symbol]`, and the effective stage-0 TP for that symbol is multiplied by `0.5^count`, floored at `minTpRoi` (default 3%). The reduction applies only to stage-0 entries and expires after a 3-hour TTL from the first close — after which `_tpIngressCount` is cleared and the full entry TP is restored on the next open.
+
 ### SalF Creep
 Lists all symbols currently under active SalF median creep. Each entry shows the close count, the effective LSA floor and cap currently in effect for that symbol, and the countdown to the 6h TTL reset. As the close count increases, the floor rises and the cap falls toward the midpoint, tightening the window within which a re-entry can qualify. Only visible when SalF is enabled.
 
@@ -161,6 +166,8 @@ The Trades column (mobile: **📋 Trades** tab) is a reverse-chronological feed 
 - For FT positions: the Rodeo count that qualified the entry, rendered in purple
 
 The feed is rendered via a vanilla JS `renderTradeFeed()` function rather than Alpine `x-for` to avoid reactivity performance issues with large lists. A **CLEAR** button truncates the feed and resets the closed-trades array in state and storage.
+
+> **Session PnL vs Trades feed:** The session PnL counter and the sum of all trade cards will often not match — this is expected. Two things cause this. First, loss absorption cuts are realised and credited to session PnL in real time but do not produce a trade entry in the feed; the absorbed loss sits as a deficit on the laggard's ledger until it is recovered. Second, when the laggard eventually closes it does so at a higher profit than a normal TP close would have produced — the EDa TP is buffered by default (+50% profit offset), meaning the laggard must earn at least 1.5× its original expected value before the deficit clears, plus any accumulated losses from the rest of the book. The laggard's trade card will therefore show an unusually large PnL relative to other closes; the excess above a normal TP close is the book's recovered losses appearing as laggard profit in the feed. Session PnL counted those losses early; the trades feed shows the recovery late. The two figures converge as the laggard cycle completes.
 
 ---
 
@@ -217,6 +224,30 @@ Two sort buttons appear at the top of the feed:
 - **PnL** — sorts open positions by unrealised PnL, toggling descending → ascending → unsorted.
 - **DCA** — sorts by DCA stage triggered (not the band the mark price currently sits in), toggling the same cycle. Switching either sort resets the other.
 
+#### DCA Stage Boxes
+
+Each position card shows a 2×4 grid of stage boxes (0–7). Each box reflects the live state of that stage:
+
+- **Triggered** (solid red tint) — the stage has actually filled; stage 0 is always in this state.
+- **Current + triggered** (red hatched) — mark is in this price band and the stage has already filled; the position is actively in danger territory it has already crossed.
+- **Current + not triggered** (orange hatched) — mark is approaching this band but the add hasn't fired yet.
+- **Set** (gold border) — a conditional order for this stage is live on the exchange, waiting to fill.
+- **Queued** (dim orange border) — the stage is pending the 5-minute DCA delay; no conditional has been placed yet but one is scheduled.
+- **Missed** (grey dashed) — price moved through this stage too quickly for the add to be placed; the stage was skipped.
+- **Default** (dim border) — stage not yet reached.
+
+#### Progress Bar
+
+The bar below the stage grid changes meaning depending on where mark sits:
+
+- **Profit zone** (mark ≤ average entry) — green bar showing progress from average entry toward the current TP price.
+- **Loss zone, between stages** (orange, red from stage 5+) — bar spans from the last filled stage's trigger price to the next placed conditional's trigger price, showing how far into the current DCA band mark has travelled.
+- **Loss zone, beyond all placed conditionals** (red) — once mark has cleared every placed conditional, the bar switches to tracking distance from the last conditional's trigger price toward the **estimated SL price**. This is the most important state to understand: the bar is measuring proximity to the stop, not to the next add.
+
+#### SL Timing
+
+The SL price displayed on the card is pre-computed at position open by simulating all stages filling and finding the projected weighted-average entry. It is used as the upper bound of the red progress bar from the start. However, **no actual SL is enforced until the final configured DCA stage fills** — only then does the bot treat the SL as live and close the position if mark reaches it. Before that point, a position can pump well past the displayed SL price without being stopped out; the DCA delay windows and wick recovery are relied on instead. The red bar in this state is therefore a warning indicator, not a live stop distance.
+
 ### Trades Menu
 
 Reverse-chronological feed of all closed positions. Each card shows entry/exit price, DCA stage, duration, PnL, and close reason.
@@ -239,17 +270,93 @@ The **activity log** is a capped reverse-chronological event feed (300 entries) 
 
 Parameters listed above. DCA Ladder shows computed notional, margin, and cumulative totals per stage. TP Schedule shows ROI% and price target per stage.
 
+### Scan Control
+
+**START SCAN** / **STOP SCAN** controls only the entry scanner — whether PsychoWinter is actively looking for and opening new positions. Stopping the scan does not affect the position watcher, loss absorption, outlier acceleration/deceleration, laggard, or cascade trigger; all position management continues running for as long as the page is open and API access is available. This mirrors how EverWinter and PseudoWinter behave — their start/stop controls the scan process, and position management is always-on.
+
+The **SCAN NOW** button manually triggers a scan cycle and is only available while the scan is running.
+
 ### Scan
 
 Bulk ticker fetch → filter by absolute 24h change ≥ threshold → Fisher-Yates shuffle → take first `psychoPerCycle` not already held → open SHORT on each. Halts early when open positions hit the cap. Resumes on the next scheduled cycle once positions clear.
 
 ### Position Watcher
 
-Fires every 5 seconds. Bulk-fetches mark prices for all open positions. Per position: DCA trigger check (places next add and recalculates TP if breached) → TP hit check → 8h funding fee accrual → hard force-close deadline check → SL placement after the final DCA stage fills. After every close, updates the lost-value tally on all remaining open positions.
+Fires every 5 seconds, always — independently of whether the scan is running. Bulk-fetches mark prices for all open positions from a single `/v5/market/tickers?category=linear` call. Per position: DCA trigger check (places next add and recalculates TP if breached) → TP hit check → funding fee accrual → hard force-close deadline check → SL placement after the final DCA stage fills. After every close, updates the lost-value tally on all remaining open positions.
+
+The bulk ticker fetch is the dominant bandwidth cost: one full linear book download every 5 seconds regardless of how many positions are open. At typical response sizes this amounts to roughly 12 requests and 600–1,200 KB per minute while the page is active.
+
+### Loss Absorption
+
+Runs on each position watcher tick. Triggers on any position whose unrealised loss exceeds 2.5× base margin. Each cut closes 5% of the position's current size at market.
+
+The interval between cuts starts at 5 minutes and **halves with every successive cut** — 5 min → 2.5 min → 1.25 min → … down to a 30-second floor. The count is per-position and persists as long as the position stays below the threshold. If the position recovers above the -2.5× threshold at any watcher tick, the cut counter **resets to zero**, so the next cut (if the position falls back below threshold) restarts the full 5-minute interval. There is no gradual ramp-up — recovery snaps the cooldown back to 5 minutes immediately.
+
+Absorption is paused while a DCA stage is queued for delayed placement; the incoming add may improve the average entry enough to lift the position back above threshold, making absorption unnecessary. Absorption stops entirely once the final DCA stage has triggered. If a position is already at minimum notional when a cut is due, it is closed outright rather than trimmed further.
+
+#### Outlier Positions
+
+When **Outlier Acceleration** is enabled, absorption identifies positions that are disproportionate relative to the rest of the book. A position is flagged as an outlier if its margin or absolute unrealised loss exceeds the configured multiplier (default 2.5×) of the average across all other open positions. Outlier positions skip the normal halving schedule and are absorbed at the 30-second minimum cooldown immediately — the book treats them as requiring urgent reduction.
+
+There is a digestibility limit: if the loss that a single 5% cut would crystallise exceeds 2.5× the base notional, the cut is deferred rather than executed. The position is re-examined after 30 seconds, and the bot waits until a cut of digestible size presents itself — either because the mark has partially recovered or because previous cuts have reduced the position size enough to bring the per-cut loss back within range. The minimum cooldown is maintained during the deferral so the check runs as frequently as possible without over-crystallising a single bad entry.
+
+**Outlier Deceleration** is the mirror image of acceleration. Where acceleration trims positions that are too large or too deeply underwater, deceleration adds to positions that are outlier performers or outlier small — either their unrealised profit is 2.5× or more above the average of all others, or their margin is 2.5× or more below the book average. When either condition holds, the bot adds 5% of the position's current margin (minimum base notional) at market, updating the weighted-average entry price. The same cooldown mechanics apply: the interval starts at 5 minutes and halves with each successive add down to a 30-second floor, resetting to zero when the position is no longer an outlier.
+
+Both acceleration and deceleration are paused while a DCA stage is queued for delayed placement, for the same reason as loss absorption: the pending add may shift the position's size, average entry, or unrealised PnL enough to change whether it qualifies, making any action taken during that window premature.
+
+### Exhumation
+
+Runs on each position watcher tick, after loss absorption. For each position the bot reads its absorption tab in closed trades (`id = 'absorption_' + positionId`). If the tab exists and carries net negative PnL, the position is flagged as exhumed and an Exhumed EDa TP is computed:
+
+```
+exhEdaTp = entryPrice − (buffedEV + |absorbedLoss|) × entryPrice / (leverage × margin)
+```
+
+where `buffedEV = _laggardInitialEV × (1 + laggardProfitOffset/100)`. The result is a TP price deeper than the regular stage TP — the level at which the position's unrealised profit covers both the buffered EV target and all absorbed losses.
+
+While a position is exhumed:
+- **Regular TP is blocked.** The stage TP close check is skipped; only the Exhumed EDa TP close fires.
+- **DCA fills recompute it.** After each DCA fill updates `_laggardInitialEV`, the Exhumed EDa TP is recomputed immediately. For live positions, the TP order on exchange is placed at the exhumed price rather than the stage TP price.
+- **Further absorption cuts push it lower.** Each additional cut increases `|absorbedLoss|` in the numerator and shrinks `margin` in the denominator simultaneously — both effects widen the required spread, moving the EH TP price further from entry. The position needs a more decisive downward move to close after every cut.
+- **Laggard rules are suspended.** If the exhumed position is selected as laggard, `runLaggardCheck` returns early — no force-close, no laggard absorption. `_refreshLaggardEdaTp` also returns early and clears any standing EDa TP exchange order.
+- **Stop-loss remains active.** The SL is unaffected; reaching it closes the position normally.
+- **Sacrifice is the only other exit path.** On rare occasions sacrifice may close an exhumed position — in loss or partial profit — if no non-exhumed candidates remain. This is the sole exception to the exhumed hold; all other close paths are blocked until EH TP or SL.
+
+Exhumation clears automatically if `tab.totalPnl` turns non-negative (full recovery). For live positions a dedicated `_exhumedTpOrderId` order tracks the exhumed TP on exchange, separate from `tpOrderId`. A newly exhumed live position has its existing `tpOrderId` order cancelled and replaced with the exhumed order. The position card shows an **EXHUMED** badge (ice/cyan) with "EH TP" on the TP row. The EXHUMED collapsible table in the log panel lists all exhumed positions with absorbed loss, EH TP price, cut count, and distance-to-TP; a ✦ marks positions that are simultaneously the current laggard.
 
 ### Laggard
 
-Active whenever there are at least 2 open positions — no reduce-phase gate. Evaluates the oldest position; force-closes it when `buffedEV − lostValue − unrealizedPnL ≤ 0`. Every position close (win or loss) feeds its PnL into the lost-value tally of all survivors.
+Active whenever there are at least 2 open positions — no reduce-phase gate. Evaluates the oldest position; force-closes it when `buffedEV − lostValue − unrealizedPnL ≤ 0`. Every position close (win or loss) feeds its PnL into the lost-value tally of all survivors. Loss absorption cuts do the same — each slice realised by absorption is immediately added to every position's lost-value tally, and the EDa TP is recomputed on the spot. If the laggard itself is the absorbed position, the reduced margin is already reflected in that recompute: smaller margin in the denominator widens the required price move, so the EDa TP adjusts proportionally without any separate correction step.
+
+**Age Mode** changes which position is selected as the laggard. Default (off) picks the oldest position by open time. Age Mode on picks the position with the most DCA stages triggered — the one deepest in the hole takes priority regardless of how long it has been open. Age Mode is more aggressive: it targets the position most likely to require a large move to close rather than simply the one that has been open longest.
+
+**Profit Offset** scales the buffered EV target. At +50% (default), the laggard must generate 1.5× its original expected value before the deficit clears — this gives winning closes more time to reduce the accumulated lost value before the laggard is forced out. Negative offsets shrink the buffer, making the laggard trigger faster but with less recovery margin. At −100% the buffer is fully removed and the laggard closes at exactly EV parity.
+
+**Laggard Absorption** changes what happens when the deficit hits zero and the laggard is still in loss: instead of force-closing, the bot trims 5% of its size every 5 minutes, keeping the position alive while gradually reducing its exposure. This is useful when the laggard is deeply underwater but the thesis for a recovery is still intact — full force-close crystallises the maximum loss, while absorption bleeds it down incrementally and gives the price time to correct.
+
+### Cascade Trigger
+
+When the combined unrealised PnL across all open positions exceeds 2.5× the entry margin, the bot force-closes the 2 most profitable positions. This banks the gains immediately and passes their closed PnL into the laggard's lost-value tally — if the wins are large enough, they can push the deficit negative and release the laggard without it needing to reach EDa TP at all. The cascade is the deliberate use of profit-taking to fund the book's debt settlement. A 5-minute cooldown prevents repeated firing on the same event.
+
+The threshold is fixed at 2.5× entry margin and scales automatically with notional and leverage — it is not configurable separately.
+
+Cascade targets are selected by profitability — any non-laggard, non-exhumed position with uPnL above the minimum ROI floor qualifies. Exhumed positions are excluded entirely: their EH TP recovery path must not be interrupted by cascade.
+
+### Position Cascade Trigger
+
+Similar intent to the Cascade Trigger but fires from the loss side rather than the profit side. When any single position's unrealised loss drops below −2.5× entry margin, the bot closes the most profitable open position to generate a laggard-seeding close, then immediately runs a scan to replace it. This keeps the book circulating rather than letting a single deep loser stall everything.
+
+Each successive trigger in the same session closes more positions than the last, governed by the **PPC Escalation Multiplier**. At 2× (default), the first trigger closes 1 position, the second closes 2, the third closes 4, and so on. The count resets when no position remains below the trigger threshold. The **Cascade Close Min ROI** floor applies here too — only positions above the minimum ROI qualify as targets, preventing the bot from closing marginal winners that would not meaningfully reduce the deficit.
+
+As with the Cascade Trigger, exhumed positions are excluded as PPC targets — their EH TP recovery path takes priority.
+
+### Sacrifice and Retraction
+
+Sacrifice monitors the ratio of allocated margin to what the full position cap would cost at entry stage. When allocated margin exceeds 4× that baseline — meaning the book has DCA'd heavily and is carrying far more exposure than a fresh book would — sacrifice halts scans and closes one position per cycle until the ratio drops back. Priority goes to positions that have triggered at least one DCA stage and are within 3% of break-even, since those are the ones most likely to close without a significant loss. The **Position Floor** prevents sacrifice from closing below a minimum number of open positions regardless of the ratio.
+
+Exhumed positions are deprioritized for sacrifice: they are only selected if no non-exhumed candidate exists. Sacrificing an exhumed position discards the absorption recovery path — the absorbed losses cannot be reclaimed — so the bot exhausts all other options first. The laggard remains fully excluded as before.
+
+**Retraction** adds a second tripwire on top of sacrifice: when the collective unrealised PnL of all open positions falls below −2.5× entry margin, sacrifice mode activates regardless of the margin ratio. Where normal sacrifice is a margin-usage alarm, retraction is a drawdown alarm — it fires on deep collective red even if the book is not particularly over-allocated. Both conditions halt scans while active.
 
 ---
 
