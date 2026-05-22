@@ -312,10 +312,11 @@ where `buffedEV = _laggardInitialEV × (1 + laggardProfitOffset/100)`. The resul
 While a position is exhumed:
 - **Regular TP is blocked.** The stage TP close check is skipped; only the Exhumed EDa TP close fires.
 - **DCA fills recompute it.** After each DCA fill updates `_laggardInitialEV`, the Exhumed EDa TP is recomputed immediately. For live positions, the TP order on exchange is placed at the exhumed price rather than the stage TP price.
+- **Further absorption cuts push it lower.** Each additional cut increases `|absorbedLoss|` in the numerator and shrinks `margin` in the denominator simultaneously — both effects widen the required spread, moving the EH TP price further from entry. The position needs a more decisive downward move to close after every cut.
 - **Laggard rules are suspended.** If the exhumed position is selected as laggard, `runLaggardCheck` returns early — no force-close, no laggard absorption. `_refreshLaggardEdaTp` also returns early and clears any standing EDa TP exchange order.
 - **Stop-loss remains active.** The SL is unaffected; reaching it closes the position normally.
 
-Exhumation clears automatically if `tab.totalPnl` turns non-negative (full recovery). For live positions a dedicated `_exhumedTpOrderId` order tracks the exhumed TP on exchange, separate from `tpOrderId`. A newly exhumed live position has its existing `tpOrderId` order cancelled and replaced with the exhumed order. The position card shows an **EXHUMED** badge (ice/cyan) with "EXHM TP" on the TP row. The EXHUMED collapsible table in the log panel lists all exhumed positions with absorbed loss, EDa TP price, cut count, and distance-to-TP; a ✦ marks positions that are simultaneously the current laggard.
+Exhumation clears automatically if `tab.totalPnl` turns non-negative (full recovery). For live positions a dedicated `_exhumedTpOrderId` order tracks the exhumed TP on exchange, separate from `tpOrderId`. A newly exhumed live position has its existing `tpOrderId` order cancelled and replaced with the exhumed order. The position card shows an **EXHUMED** badge (ice/cyan) with "EH TP" on the TP row. The EXHUMED collapsible table in the log panel lists all exhumed positions with absorbed loss, EH TP price, cut count, and distance-to-TP; a ✦ marks positions that are simultaneously the current laggard.
 
 ### Laggard
 
