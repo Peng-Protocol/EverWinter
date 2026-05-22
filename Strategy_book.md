@@ -207,7 +207,7 @@ Loss absorption trims positions that are consuming capital without recovering, f
 
 Two modes exist, differing in how aggressively they fire:
 
-**Passive Absorption**: Cuts positions on a fixed interval unconditionally — no loss threshold required. Every active position is trimmed on a regular cadence regardless of its current PnL state. One base-notional equivalent is closed each interval. Passive absorption runs at a steady pace and does not respond to how deep in loss a position sits — it ensures every position shrinks over time regardless of behavior.
+**Passive Absorption**: Cuts positions on a fixed interval unconditionally — no loss threshold required. Every active position is trimmed on a regular cadence regardless of its current PnL state. One base-notional equivalent is closed each interval. Passive absorption runs at a steady pace and does not respond to how deep in loss a position sits — it ensures every position shrinks over time regardless of behavior. Critically, "regardless of PnL state" cuts both ways: a position sitting in profit is trimmed just as readily as a losing one. Those crystallized gains feed into the laggard's payback tally and pull the EDa TP closer, meaning passive absorption chips away at the book's collective deficit from both directions simultaneously.
 
 **Aggressive Absorption**: Threshold-triggered — fires only when a position's unrealized loss exceeds 2.5× its base margin. Each cut is 5% of the remaining margin. The interval between cuts starts at 5 minutes and halves with every successive cut — 5 min → 2.5 min → 1.25 min → down to a 30-second floor. The cut counter is per-position and persists as long as the position stays below threshold. Recovery above threshold snaps the counter back to zero immediately — the full 5-minute interval restarts on the next breach. Cuts stop entirely once the final DCA stage fires.
 
@@ -235,9 +235,9 @@ This is the dance: give a little now in crystallized loss, receive more than tha
 
 ##### EDa Payback
 
-Every absorption cut — not just full closes — immediately feeds into the laggard's accumulated deficit. Each slice is counted the moment it is crystallized, not deferred until the position eventually closes. The laggard carries the debt of every loss trimmed from every other position during its lifetime.
+Every absorption cut feeds immediately into the laggard's accumulated tally — gains reduce the deficit, losses deepen it. Neither is deferred until the position eventually closes; each slice counts the moment it crystallizes. The laggard's required exit reflects the running net of every slice taken across the book during its lifetime.
 
-The consequence is proportional: the more aggressively absorption has run, the further the laggard's EDa TP sits from the current price, and the more decisive the required move to reach it. The default buffer (+50%) ensures even a clean laggard must generate 1.5× its original expected value — headroom so the system is not fragile to a single bad close. When accumulated losses are present, the EDa TP rises further on top of that baseline.
+The consequence is proportional: the more aggressively absorption has run on losing positions, the further the EDa TP sits from the current price. But the reverse holds equally — passive absorption's indiscriminate trimming of profitable positions quietly erodes the deficit from the other side, pulling the EDa TP back in. The default buffer (+50%) ensures even a clean laggard must generate 1.5× its original expected value — headroom so the system is not fragile to a single bad close.
 
 ---
 
