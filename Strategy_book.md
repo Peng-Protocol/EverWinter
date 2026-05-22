@@ -558,6 +558,8 @@ While a conditional is live (yellow), no future stage is scheduled. The next sta
 
 The stop-loss is pre-computed at open by simulating all stages filling and finding the projected weighted-average entry, and is updated after every bump.
 
+**The delay is a boon and a bane.** Fast-moving tickers are sorted correctly — the delay prevents committing capital at a price the market has already dismissed, which is exactly the right call. The failure mode is a ticker that pumps and then retraces while the delay is still counting. The position sits with an unrealised loss locked in, the next DCA is in queue, and the price has already slid back through the zone where that stage should have been placed. If the retrace goes deep enough, the position hits TP unaided. If it only partially retraces, the bot is left with three possibilities: a second pump triggers the DCA and the improved average finds TP before the 48-hour clock; or the clock runs out and it is force-closed at wherever the ticker sits. The delay was correctly avoiding a bad fill during the pump — the exposure that follows is the cost of that caution, not a flaw in the logic. Both outcomes are understood going in.
+
 ### Sacrifice
 
 When the total allocated margin exceeds a preset threshold, one must sacrifice tickers — even those in loss — to make room for potentially deeper DCAs on existing positions. New entries pause and the most recoverable position is closed each watch cycle until allocation drops back under the cap.
@@ -585,6 +587,14 @@ Exhumation makes the debt visible and unpayable until it is genuinely settled. W
 The result is a deeper required exit than an untouched position would need. But it is also a structurally sound requirement: the book absorbed real losses on this position's behalf, and the exit is calibrated to recover those losses through the same position that caused them rather than loading them onto the laggard.
 
 When an exhumed position is also the current laggard, both laggard force-close and laggard absorption are suspended entirely. The position is locked until its EDa TP or stop-loss fires. The conviction is that the recovery, when it arrives, will settle the debt cleanly — forcing it out early permanently forfeits that recovery.
+
+**Why individual tabs rather than the laggard's.** EverWinter loads all absorbed losses onto a single laggard's tab — one position settles the book's full accumulated debt at close. That works because EverWinter's book is small and absorption is moderate. In PsychoWinter, with up to 50 concurrent positions, 2× DCA escalation, and aggressive absorption running simultaneously, losses accumulate at a pace no single laggard could realistically recover. The EH TP would sit so far from current prices it would function as a permanent lock, not an exit. Each position owning its own debt is the only workable model at this scale.
+
+**There is no guarantee a position ever hits its EH TP.** What shifts the math is what absorption has already done by the time the stop fires. A stage 7 position that pumped slowly enough to be trimmed repeatedly may be carrying only a fraction of its original margin — $7 on what was a $64 entry. The realized loss at the stop is a fraction of what a full-size SL would have cost. Exhumation is recovering absorbed slices from a much smaller and much better-entered position, not from the bloated original sizing.
+
+The second factor is DCA escalation. Each absorption cut lightens the position; each 2× add into a lighter position corrects the average entry more aggressively than a standard add would. The two effects compound: cuts reduce size, adds improve the entry on that reduced size, and the required exit moves progressively closer to where the ticker already is. Most problematic positions resolve before the 48-hour clock precisely because of this — the combination works fast when both systems are active. The ones that don't resolve hit the backstop at a cost far lower than they would have carried without absorption.
+
+Tickers that cause rapid problems get handled by the DCA delay and its retry logic before exhumation becomes relevant. Exhumation's domain is the slow movers — tickers that drift against the position gradually enough for absorption to work through them, but not decisively enough for a clean TP. Those are the positions exhumation was built for.
 
 ### Cascade Triggers
 
