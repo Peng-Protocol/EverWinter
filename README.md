@@ -219,6 +219,30 @@ Two sort buttons appear at the top of the feed:
 - **PnL** — sorts open positions by unrealised PnL, toggling descending → ascending → unsorted.
 - **DCA** — sorts by DCA stage triggered (not the band the mark price currently sits in), toggling the same cycle. Switching either sort resets the other.
 
+#### DCA Stage Boxes
+
+Each position card shows a 2×4 grid of stage boxes (0–7). Each box reflects the live state of that stage:
+
+- **Triggered** (solid red tint) — the stage has actually filled; stage 0 is always in this state.
+- **Current + triggered** (red hatched) — mark is in this price band and the stage has already filled; the position is actively in danger territory it has already crossed.
+- **Current + not triggered** (orange hatched) — mark is approaching this band but the add hasn't fired yet.
+- **Set** (gold border) — a conditional order for this stage is live on the exchange, waiting to fill.
+- **Queued** (dim orange border) — the stage is pending the 5-minute DCA delay; no conditional has been placed yet but one is scheduled.
+- **Missed** (grey dashed) — price moved through this stage too quickly for the add to be placed; the stage was skipped.
+- **Default** (dim border) — stage not yet reached.
+
+#### Progress Bar
+
+The bar below the stage grid changes meaning depending on where mark sits:
+
+- **Profit zone** (mark ≤ average entry) — green bar showing progress from average entry toward the current TP price.
+- **Loss zone, between stages** (orange, red from stage 5+) — bar spans from the last filled stage's trigger price to the next placed conditional's trigger price, showing how far into the current DCA band mark has travelled.
+- **Loss zone, beyond all placed conditionals** (red) — once mark has cleared every placed conditional, the bar switches to tracking distance from the last conditional's trigger price toward the **estimated SL price**. This is the most important state to understand: the bar is measuring proximity to the stop, not to the next add.
+
+#### SL Timing
+
+The SL price displayed on the card is pre-computed at position open by simulating all stages filling and finding the projected weighted-average entry. It is used as the upper bound of the red progress bar from the start. However, **no actual SL is enforced until the final configured DCA stage fills** — only then does the bot treat the SL as live and close the position if mark reaches it. Before that point, a position can pump well past the displayed SL price without being stopped out; the DCA delay windows and wick recovery are relied on instead. The red bar in this state is therefore a warning indicator, not a live stop distance.
+
 ### Trades Menu
 
 Reverse-chronological feed of all closed positions. Each card shows entry/exit price, DCA stage, duration, PnL, and close reason.
