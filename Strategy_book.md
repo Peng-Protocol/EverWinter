@@ -307,7 +307,7 @@ Cascade triggers are the aggressive complement to the laggard's slow, continuous
 
 **Per-Position Cascade (PPC)**: When any single position's unrealized loss drops below −2.5× entry margin, the most profitable positions are closed, escalating in count on each successive trigger (default ×2 multiplier). Keeps the book circulating rather than letting a single deep loser stall everything. Escalation resets when the trigger position recovers.
 
-Both triggers share a minimum ROI% floor — marginal winners are not consumed as cascade fuel. Exhumed positions in profit are valid cascade targets; closing them banks the gain and passes it into the debt ledger, which is consistent with cascade's purpose.
+Both triggers share a minimum ROI% floor — marginal winners are not consumed as cascade fuel. Exhumed positions are excluded from both triggers; their EH TP recovery path takes precedence over cascade's debt-settlement role.
 
 ---
 
@@ -459,7 +459,7 @@ Tickers that cause rapid problems are handled by the DCA delay before exhumation
 
 *Sacrifice* manages margin allocation — when the book has DCA'd heavily, sacrifice closes recoverable positions one per cycle until the ratio drops.
 
-*Cascade Triggers* — both CPC and PPC — are available. Exhumed positions in profit are valid cascade targets; closing them passes the gain into the debt ledger.
+*Cascade Triggers* — both CPC and PPC — are available. Exhumed positions are excluded as cascade targets.
 
 *Anti-Martingale (AMa)* is an optional complement: positions open with no TP; flat adds accumulate in the profitable direction until a final TP is set at −22%.
 

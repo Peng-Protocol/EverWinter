@@ -334,7 +334,7 @@ When the combined unrealised PnL across all open positions exceeds 2.5× the ent
 
 The threshold is fixed at 2.5× entry margin and scales automatically with notional and leverage — it is not configurable separately.
 
-Cascade targets are selected purely by profitability — any non-laggard position with uPnL above the minimum ROI floor qualifies, including exhumed positions. An exhumed position in profit is a valid cascade target; closing it banks the gain and passes it into the debt ledger, which is consistent with cascade's purpose.
+Cascade targets are selected by profitability — any non-laggard, non-exhumed position with uPnL above the minimum ROI floor qualifies. Exhumed positions are excluded entirely: their EH TP recovery path must not be interrupted by cascade.
 
 ### Position Cascade Trigger
 
@@ -342,7 +342,7 @@ Similar intent to the Cascade Trigger but fires from the loss side rather than t
 
 Each successive trigger in the same session closes more positions than the last, governed by the **PPC Escalation Multiplier**. At 2× (default), the first trigger closes 1 position, the second closes 2, the third closes 4, and so on. The count resets when no position remains below the trigger threshold. The **Cascade Close Min ROI** floor applies here too — only positions above the minimum ROI qualify as targets, preventing the bot from closing marginal winners that would not meaningfully reduce the deficit.
 
-As with the Cascade Trigger, exhumed positions are not exempted — a profitable exhumed position qualifies as a PPC target.
+As with the Cascade Trigger, exhumed positions are excluded as PPC targets — their EH TP recovery path takes priority.
 
 ### Sacrifice and Retraction
 
