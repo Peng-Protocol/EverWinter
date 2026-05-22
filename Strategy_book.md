@@ -457,6 +457,10 @@ The laggard system closes most positions that would otherwise have hit their tar
 
 ### Loss Absorption
 
+**A Worthy Companion to DCA**
+
+DCA rescues positions by improving their average entry from above. Loss absorption rescues positions by shrinking their exposure from below. Together they work the same problem from opposite ends: DCA improves where a position needs to be to close, and absorption reduces how much of the position still needs to get there. Neither system completes the picture without the other — DCA without absorption leaves oversized losers to consume margin indefinitely, and absorption without DCA leaves positions with deteriorating entries that are difficult to recover cleanly. The two systems are designed to run concurrently and reinforce each other on every adverse move.
+
 Both bots trim losing positions on a timer to prevent one or two deep-red positions from cornering all available margin and starving new entries or DCA fills.
 
 **EverWinter**: Closes one base-notional worth of size at a fixed interval, unconditionally — no loss threshold check.
