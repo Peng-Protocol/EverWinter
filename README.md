@@ -281,6 +281,12 @@ The interval between cuts starts at 5 minutes and **halves with every successive
 
 Absorption is paused while a DCA stage is queued for delayed placement; the incoming add may improve the average entry enough to lift the position back above threshold, making absorption unnecessary. Absorption stops entirely once the final DCA stage has triggered. If a position is already at minimum notional when a cut is due, it is closed outright rather than trimmed further.
 
+#### Outstanding Positions
+
+When **Outstanding Acceleration** is enabled, absorption identifies positions that are disproportionate relative to the rest of the book. A position is flagged as outstanding if its margin or absolute unrealised loss exceeds the configured multiplier (default 2.5×) of the average across all other open positions. Outstanding positions skip the normal halving schedule and are absorbed at the 30-second minimum cooldown immediately — the book treats them as requiring urgent reduction.
+
+There is a digestibility limit: if the loss that a single 5% cut would crystallise exceeds 2.5× the base notional, the cut is deferred rather than executed. The position is re-examined after 30 seconds, and the bot waits until a cut of digestible size presents itself — either because the mark has partially recovered or because previous cuts have reduced the position size enough to bring the per-cut loss back within range. The minimum cooldown is maintained during the deferral so the check runs as frequently as possible without over-crystallising a single bad entry.
+
 ### Laggard
 
 Active whenever there are at least 2 open positions — no reduce-phase gate. Evaluates the oldest position; force-closes it when `buffedEV − lostValue − unrealizedPnL ≤ 0`. Every position close (win or loss) feeds its PnL into the lost-value tally of all survivors. Loss absorption cuts do the same — each slice realised by absorption is immediately added to every position's lost-value tally, and the EDa TP is recomputed on the spot. If the laggard itself is the absorbed position, the reduced margin is already reflected in that recompute: smaller margin in the denominator widens the required price move, so the EDa TP adjusts proportionally without any separate correction step.

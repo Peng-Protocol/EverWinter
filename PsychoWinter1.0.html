@@ -515,6 +515,18 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           <div class="hint" style="margin-top:4px">Trims deep losers (>2.5× base margin loss) at market. Interval halves each cut, resets on recovery. See README.</div>
           <div class="hint" style="margin-top:6px;border-left:2px solid rgba(255,119,48,.45);padding-left:6px">Paused during DCA delay — the incoming add may fix it.</div>
         </div>
+        <div class="g" x-show="cfg.lossAbsorptionEnabled" style="margin-top:8px">
+          <label class="tog" @click.prevent="if(!cfgLocked){cfg.outstandingEnabled=!cfg.outstandingEnabled;persist()}">
+            <div class="tog-t" :class="cfg.outstandingEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Outstanding Acceleration</span>
+          </label>
+          <div class="hint" style="margin-top:4px">Outlier position? Locks absorption to 30s minimum. Defers cuts too large to digest cleanly.</div>
+        </div>
+        <div class="g" x-show="cfg.lossAbsorptionEnabled && cfg.outstandingEnabled" style="margin-top:8px">
+          <div class="lbl">Outstanding Threshold <b x-text="cfg.outstandingMultiplier.toFixed(1)+'×'"></b> <span style="color:var(--text-lo);font-size:9px">avg other positions</span></div>
+          <input type="range" min="1" max="5" step="0.5" x-model.number="cfg.outstandingMultiplier" :disabled="cfgLocked" @change="persist()">
+          <div class="hint">Position qualifies as outstanding if its margin or loss exceeds this multiple of the average across all others.</div>
+        </div>
         <div class="sep" style="margin-top:10px"></div>
         <div class="g">
           <label class="tog" @click.prevent="if(!cfgLocked){cfg.sacrificeEnabled=!cfg.sacrificeEnabled;if(!cfg.sacrificeEnabled)cfg.retractionEnabled=false;persist()}">
@@ -1125,6 +1137,8 @@ function psycho() { return {
     psychoPerCycle:       12,
     sacrificeEnabled:     true,
     lossAbsorptionEnabled: true,
+    outstandingEnabled:    true,
+    outstandingMultiplier: 2.5,
     sacrificeFloor:       5,
     retractionEnabled:    false,
     scanMins:             15,
@@ -2683,18 +2697,36 @@ function psycho() { return {
 
   // ── Loss Absorption ──
   async runLossAbsorption() {
-    const now       = Date.now();
-    const threshold = -2.5 * (this.cfg.minNotional / this.cfg.leverage);
-    const fraction  = 0.05;
+    const now            = Date.now();
+    const threshold      = -2.5 * (this.cfg.minNotional / this.cfg.leverage);
+    const fraction       = 0.05;
+    const baseMargin     = this.cfg.minNotional / this.cfg.leverage;
+    const baseNotional   = this.cfg.minNotional;
+    const outstandingOn  = this.cfg.outstandingEnabled !== false;
+    const outstandingMul = this.cfg.outstandingMultiplier || 2.5;
+
     for (const pos of [...this.positions]) {
-      if ((pos.upnl || 0) >= threshold) { pos._absorptionCount = 0; continue; }
+      if ((pos.upnl || 0) >= threshold) { pos._absorptionCount = 0; pos._absorptionDeferred = false; continue; }
       if (_closingIds.has(pos.id)) continue;
       if ((pos.dcaStage || 0) >= (pos._stageCount || this.cfg.dcaStages)) continue;
-      const _absorpDelay = Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._absorptionCount || 0)));
+
+      // Outstanding check — position's margin or absolute loss exceeds the multiplier × avg of all others
+      let isOutstanding = false;
+      if (outstandingOn && this.positions.length > 1) {
+        const others   = this.positions.filter(p => p.id !== pos.id);
+        const avgMgn   = others.reduce((s, p) => s + (p.margin || 0), 0) / others.length;
+        const avgLoss  = others.reduce((s, p) => s + Math.abs(Math.min(0, p.upnl || 0)), 0) / others.length;
+        if (avgMgn  > 0 && (pos.margin || 0) >= outstandingMul * avgMgn)                      isOutstanding = true;
+        if (avgLoss > 0 && Math.abs(Math.min(0, pos.upnl || 0)) >= outstandingMul * avgLoss)  isOutstanding = true;
+      }
+
+      // Outstanding positions or deferred positions use 30s minimum cooldown
+      const _absorpDelay = (isOutstanding || pos._absorptionDeferred)
+        ? 30 * 1000
+        : Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._absorptionCount || 0)));
       if (now - (pos._lastAbsorptionAt || 0) < _absorpDelay) continue;
       if (pos._nextDcaPlaceAt && pos._nextDcaPlaceAt > now) continue;
-      const mark    = pos.markPrice || pos.entryPrice;
-      const baseMargin = this.cfg.minNotional / this.cfg.leverage;
+      const mark = pos.markPrice || pos.entryPrice;
       if (pos.margin <= baseMargin) {
         this.log(`✂️ ${pos.symbol.replace('USDT','')}: absorption — at minimum notional, closing outright`, 'warn');
         await this.closePosition(pos, 'absorption');
@@ -2708,6 +2740,17 @@ function psycho() { return {
       const cutMgn  = pos.margin * cutFraction;
       const cutPnl  = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * cutMgn;
       const cutRoi  = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
+
+      // Digestibility check — if this single cut would crystallise more than 2.5× base notional
+      // in loss, defer and retry at minimum cooldown once conditions improve
+      if (Math.abs(cutPnl) > 2.5 * baseNotional) {
+        pos._absorptionDeferred = true;
+        pos._lastAbsorptionAt   = now;
+        const sym = pos.symbol.replace('USDT', '');
+        this.log(`✂️ ${sym}: absorption deferred — cut loss $${Math.abs(cutPnl).toFixed(2)} > 2.5× base notional ($${(2.5 * baseNotional).toFixed(2)}) — retrying in 30s`, 'warn');
+        continue;
+      }
+      pos._absorptionDeferred = false;
       if (pos._live) {
         try {
           const instr = await this.getInstrInfo(pos.symbol);
@@ -2743,9 +2786,10 @@ function psycho() { return {
       tab.dcaStage   = pos.dcaStage;
       tab.lastCutAt  = now;
       const sym = pos.symbol.replace('USDT', '');
-      const _nextAbsorpMs  = Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._absorptionCount)));
+      const _nextAbsorpMs  = isOutstanding ? 30 * 1000 : Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._absorptionCount)));
       const _nextAbsorpStr = _nextAbsorpMs >= 60000 ? (_nextAbsorpMs / 60000).toFixed(1) + 'min' : Math.round(_nextAbsorpMs / 1000) + 's';
-      this.log(`✂️ ${sym}: absorption ×${pos._absorptionCount} — 5% cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${pos.margin.toFixed(2)} | next in ${_nextAbsorpStr}`, 'warn');
+      const _outstandingTag = isOutstanding ? ' [OUTSTANDING]' : '';
+      this.log(`✂️ ${sym}: absorption ×${pos._absorptionCount}${_outstandingTag} — 5% cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${pos.margin.toFixed(2)} | next in ${_nextAbsorpStr}`, 'warn');
     }
     this.persist();
   },
