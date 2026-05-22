@@ -151,10 +151,8 @@ If the roster is full, the ticker with the **lowest funding rate** (most over-sh
 
 ### Entry Criteria
 
-#### 1. **RSI Floor: > 45**
-All three RSI timeframes (RSI6, RSI12, RSI24) must be **above 45**. RSI6 must also be **below 75** — this ceiling blocks entries into tickers that are still in an active pump phase rather than a cooling reversal.
-
-The ticker was at RSI6 ≥ 90 during over-extension. The RSI floor ensures momentum hasn't completely collapsed before we enter. The ceiling has been removed — LSA and ClC are competent enough at timing entries into OE tickers. If selling volume is elevated but not exhausted (LSA) and closes are confirming the trend shift (ClC), the entry is valid regardless of how high RSI sits.
+#### 1. **RSI Gates**
+All three timeframes (RSI6, RSI12, RSI24) must be **above 45** — the floor confirms momentum hasn't completely collapsed and there is still directional movement to trade against. RSI6 must also be **below 75** — this ceiling blocks entries into tickers still in an active pump phase rather than a genuine cooling reversal. A ticker promoted via over-extension sat at RSI6 ≥ 90; by the time ClC and LSA confirm a shift, RSI6 should be meaningfully retreating, not still pinned near the top.
 
 #### 2. **Close Confirmation (ClC)**
 
@@ -355,7 +353,7 @@ The 3-stage and 6-stage final triggers both land at 15%, but 6 stages inserts in
 
 The trade-off with more stages is that intermediate adds pull the average entry further from the current price, committing more margin at prices that may resolve on their own. Higher stage counts are worth considering for users who frequently see positions stall just short of an add trigger. For most use cases 3 or 6 stages is sufficient — 7+ stages are available for more unusual scenarios.
 
-**TP ROI by Stage**: `entryTpRoi / (stage + 1)`, floored at 3%
+**TP ROI by Stage**: The entry ROI% is divided by the stage number — stage 0 gets the full target, stage 1 half, stage 2 one-third, and so on — floored at 3%.
 
 The TP percentage decreases with each stage because our average entry gets better. The structure is designed so that at each DCA stage the TP yields approximately the same dollar amount as the original entry would have if it went perfectly. We are not trying to make more profit from the DCA — just exit cleanly from a better average.
 
@@ -445,13 +443,11 @@ Only enforced during reduce phase. The **laggard** is selected by one of two mod
 - **Age Mode (default)**: the oldest open position by open time.
 - **DCA-Stage Mode**: the position with the most DCA stages triggered, age breaks ties.
 
-**The Calculation**: Expected Value (entry margin × TP%) is buffered by 50% (configurable), then reduced by cumulative realized PnL from other closes and the laggard's own unrealized PnL. When that remainder hits zero, the laggard is force-closed.
+**How it works**: Each position opens with an expected profit at close. The laggard's version of that target is buffered by 50% (configurable). Every subsequent close — win or loss — feeds its realized PnL into a shared tally. When the laggard's own unrealized PnL, combined with everything the rest of the book has closed, clears that buffered target, the laggard is released. A streak of strong winners can flip the tally fast enough to trigger a chain of sequential laggard closes.
 
-Every close — winning or losing — adjusts the tally for all remaining positions, so a strong winner can trigger a chain of laggard closes in sequence.
+The forgone profit from positions closed early is acceptable — the alternative is holding through a reversal on a position that has already stalled.
 
-The laggard system closes most positions that would otherwise have hit their targets, but this forgone profit is acceptable — the alternative is exposure to reversals on a position that has already stalled.
-
-**The laggard system can both hasten and prolong closures.** When accumulated closes are profitable, ED burns down quickly and the laggard is pushed out. When closes are in loss, they push ED in the opposite direction — the laggard's EDa TP moves further from the current mark price, effectively becoming a debt that must be paid off by future wins before the position can close. In a literal sense the system is not just an accelerant but a ledger. The most common cause outside Psycho Mode is a laggard closing in loss — its deficit rolls forward and hardens the next laggard after it, requiring a more decisive move to resolve.
+**The system is a ledger as much as an accelerant.** Profitable closes burn the deficit down; losing closes push it the other way. The laggard's required exit — the **EDa TP** (Expected Deficit-zeroing Take Profit) — moves further from the current price, hardening into debt that must be covered by future wins. The most common cause of a hardened laggard is a previous laggard closing in loss: its deficit rolls forward and requires a more decisive move from the next laggard to resolve.
 
 ---
 
@@ -487,19 +483,17 @@ Each absorption cut does two things simultaneously: it crystallises a small loss
 
 When a DCA add fires into a position that has already been partially trimmed, the fixed-notional add represents a larger fraction of the remaining position than it would have on an untouched entry. A heavier add relative to position size means a more aggressive pull on the weighted-average entry — the average improves by more than it would if absorption had never run. The TP moves with it, landing closer to the current mark than it otherwise would. The worse the position was when absorption started, and the more cuts it took before the DCA fired, the larger the per-add improvement becomes. Absorption makes each DCA fill do more work.
 
-The EDa TP side of this is the cost: every crystallised slice immediately adds to the laggard's debt, nudging the required exit price further from the mark. The improvement in average entry and the increase in EDa TP debt happen at the same time — a small step back on the ledger and a step forward on the position. These are not equal and opposite. The absorbed loss is fixed the moment it is crystallised; the improved average entry compounds across every subsequent DCA fill and every tick toward close. Over a full recovery, the gain in entry quality outweighs the debt because the laggard's surplus profit at close — built in by the 50% buffer — absorbs the debt entirely and still closes above parity.
+The cost is on the ledger: each crystallised slice immediately extends the laggard's required exit, nudging its EDa TP further from the current price. The absorbed loss is fixed in that moment; the improved entry compounds across every subsequent add and every tick toward close. Over a full recovery the maths works in your favour — the entry improvement outweighs the ledger debt because the 50% buffer ensures the laggard closes with surplus above parity, enough to absorb the accumulated debt and still return more than a normal TP would have.
 
 This is the dance: give a little now in crystallised loss, receive more than that back later in a closer TP, a lighter position, and a laggard that closes with enough surplus to settle the debt and then some. The temporary cost is real and visible on the ledger; the recovery is gradual and arrives at close. The system is designed so that the buffer makes the eventual reclaim not just possible but structural.
 
-#### EDa Payback in EverWinter
+#### EDa Payback
 
-There is an emergent interaction between loss absorption and the laggard's EDa TP. Every loss crystallized by the book flows into the laggard's expected deficit — and absorption cuts count immediately as each cut is realized, not deferred until the position eventually closes. This means the laggard is not just managing its own original expected value; it is also carrying the accumulated debt of every loss the book has realized while it was open, including each incremental slice trimmed from any underwater position.
+Every absorption cut — not just full closes — immediately feeds into the laggard's expected deficit. Each slice is counted the moment it is crystallised, not deferred until the absorbed position eventually closes. The laggard therefore carries the accumulated debt of every loss trimmed from every other position during its lifetime, not just the losses from full closes.
 
-In practice, the laggard must generate enough profit at close to bring the entire deficit — its own buffered EV plus all losses passed down from other closes and absorption cuts — to zero. If absorption has been steadily eating away at multiple open positions, each of those realized slices hardens the laggard's EDa TP immediately, pushing the required exit price further from the current mark. The laggard stays open until either a decisive favorable move drives mark price to that target, or enough subsequent winning closes push the accumulated deficit negative and release it. If neither happens before the force-close timer, the backstop takes it.
+The practical consequence is proportional: the more aggressively the book has absorbed, the further the laggard's EDa TP sits from the current price, and the more decisive the required move to reach it. The laggard stays open until either a decisive favourable move drives price to that target, or enough subsequent winning closes push the accumulated deficit into surplus and release it. If neither happens before the force-close timer, the backstop takes it.
 
-This is the "payback" the laggard owes: every loss the book has absorbed through its lifetime — whether from a full close or a mid-position trim — sits on the laggard's ledger in real time, and the EDa TP moves accordingly until that debt is settled.
-
-One further point: the EDa TP is always buffered by default. The profit offset (default +50%) means `buffedEV = 1.5 × originalEV`, so even in a clean book with zero accumulated losses the laggard must generate 1.5× its own original expected value before the deficit clears. The buffer is not a penalty — it is built-in headroom that ensures the laggard closes with more profit than a standard TP would have produced, giving the book a systematic surplus on every laggard close. When accumulated losses are present, the buffer means the laggard is already working above baseline before the debt is even counted; the EDa TP rises further on top of that. The laggard is therefore always a net over-performer relative to normal TP closes, and the magnitude of that over-performance scales with how much the book has lost before it.
+The default buffer (+50%) ensures that even a clean laggard with no accumulated losses must generate 1.5× its original expected value before clearing — headroom built in so the system isn't fragile to a single bad close. When losses are present, the EDa TP rises further on top of that baseline. The laggard's eventual exit always produces surplus profit; how much surplus depends on how much the book has lost before it.
 
 ---
 
@@ -521,7 +515,7 @@ In practice most positions close at stage 0 or 1. Reaching the final stage is an
 
 With 6-stage flat DCA, pessimistic margin per position doubles to $6 (six $1 adds). With accumulation or doubling mode the adds scale further. If running higher stage counts or escalation modes, size your notional downward accordingly — the balance-to-notional ratios below assume flat adds.
 
-**Sizing formula**: `notional = balance × inverse_ratio × leverage`
+**Sizing formula**: notional = balance × inverse ratio × leverage
 
 | Scenario | Inverse Ratio | Balance-to-Margin | Balance-to-Notional |
 |---|---|---|---|
@@ -581,6 +575,16 @@ When the total allocated margin exceeds a preset threshold, one must sacrifice t
 See [Loss Absorption](#loss-absorption) in General Mechanics for the full explanation and the laddering dynamic. Unlike sacrifice, which distributes the cost across the book, absorption takes it out of the offender's own hide and compounds quietly against the weakest ticker in the book.
 
 When **Laggard Absorption** is enabled, the laggard's expected deficit reaching zero triggers a different path: instead of a force-close, the laggard is cut 5% every five minutes until it is fully drained. Unlike regular absorption — which respects a minimum notional floor and stops at the final DCA stage — laggard absorption has no floor and will consume the position down to zero over successive cuts, closing it entirely through attrition. EDa TP is suppressed while this mode is active; the slow drain is the exit strategy.
+
+### Exhumation
+
+A position that has suffered absorption cuts has already proven itself difficult — it triggered repeated cuts, each one crystallising a real loss. When it eventually recovers, stopping at the regular TP would mean closing at profit while ignoring the debt those cuts created. The regular TP has no memory of absorption; it closes the position as if nothing happened.
+
+Exhumation makes the debt visible and unpayable until it is genuinely settled. When a position carries a non-zero absorption history, its regular TP is suspended and replaced with a personalised exit price — the Exhumed EDa TP — set at the level where the position's unrealised profit covers both the original buffered expected value and every absorbed loss it has suffered. The position cannot close until it has earned enough to settle its own tab.
+
+The result is a deeper required exit than an untouched position would need. But it is also a structurally sound requirement: the book absorbed real losses on this position's behalf, and the exit is calibrated to recover those losses through the same position that caused them rather than loading them onto the laggard.
+
+When an exhumed position is also the current laggard, both laggard force-close and laggard absorption are suspended entirely. The position is locked until its EDa TP or stop-loss fires. The conviction is that the recovery, when it arrives, will settle the debt cleanly — forcing it out early permanently forfeits that recovery.
 
 ### Cascade Triggers
 

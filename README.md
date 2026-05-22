@@ -299,6 +299,24 @@ There is a digestibility limit: if the loss that a single 5% cut would crystalli
 
 Both acceleration and deceleration are paused while a DCA stage is queued for delayed placement, for the same reason as loss absorption: the pending add may shift the position's size, average entry, or unrealised PnL enough to change whether it qualifies, making any action taken during that window premature.
 
+### Exhumation
+
+Runs on each position watcher tick, after loss absorption. For each position the bot reads its absorption tab in closed trades (`id = 'absorption_' + positionId`). If the tab exists and carries net negative PnL, the position is flagged as exhumed and an Exhumed EDa TP is computed:
+
+```
+exhEdaTp = entryPrice − (buffedEV + |absorbedLoss|) × entryPrice / (leverage × margin)
+```
+
+where `buffedEV = _laggardInitialEV × (1 + laggardProfitOffset/100)`. The result is a TP price deeper than the regular stage TP — the level at which the position's unrealised profit covers both the buffered EV target and all absorbed losses.
+
+While a position is exhumed:
+- **Regular TP is blocked.** The stage TP close check is skipped; only the Exhumed EDa TP close fires.
+- **DCA fills recompute it.** After each DCA fill updates `_laggardInitialEV`, the Exhumed EDa TP is recomputed immediately. For live positions, the TP order on exchange is placed at the exhumed price rather than the stage TP price.
+- **Laggard rules are suspended.** If the exhumed position is selected as laggard, `runLaggardCheck` returns early — no force-close, no laggard absorption. `_refreshLaggardEdaTp` also returns early and clears any standing EDa TP exchange order.
+- **Stop-loss remains active.** The SL is unaffected; reaching it closes the position normally.
+
+Exhumation clears automatically if `tab.totalPnl` turns non-negative (full recovery). For live positions a dedicated `_exhumedTpOrderId` order tracks the exhumed TP on exchange, separate from `tpOrderId`. A newly exhumed live position has its existing `tpOrderId` order cancelled and replaced with the exhumed order. The position card shows an **EXHUMED** badge (ice/cyan) with "EXHM TP" on the TP row. The EXHUMED collapsible table in the log panel lists all exhumed positions with absorbed loss, EDa TP price, cut count, and distance-to-TP; a ✦ marks positions that are simultaneously the current laggard.
+
 ### Laggard
 
 Active whenever there are at least 2 open positions — no reduce-phase gate. Evaluates the oldest position; force-closes it when `buffedEV − lostValue − unrealizedPnL ≤ 0`. Every position close (win or loss) feeds its PnL into the lost-value tally of all survivors. Loss absorption cuts do the same — each slice realised by absorption is immediately added to every position's lost-value tally, and the EDa TP is recomputed on the spot. If the laggard itself is the absorbed position, the reduced margin is already reflected in that recompute: smaller margin in the denominator widens the required price move, so the EDa TP adjusts proportionally without any separate correction step.
