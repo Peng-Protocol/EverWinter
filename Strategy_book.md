@@ -92,9 +92,7 @@ Applied as a band — neither too thin nor too thick:
 
 **Post-OE reversal context**: Floor 125%, cap 150% by default. An OE ticker's baseline is heavily bullish — almost all recent candles were green. The first significant red candle reads elevated against that baseline. 125% is aggressive for a normal ticker but realistic for one that has been running hot.
 
-**Sustained decline context**: Applied to the last hour's volume versus the 24-hour hourly average. Floor 25%, cap 50% by default.
-
-**Funding-rate loser context**: Tighter range — floor 15%, cap 50%. Losers naturally produce red candles, so the threshold for "elevated selling" is lower. The cap still prevents entering after a final flush.
+**Sustained decline context**: A ticker that has been falling for hours already has selling activity baked into its recent baseline. The threshold for "above average" drops accordingly — a 25% elevation against the 24-hour hourly average is enough to confirm selling is still present and not merely drifting. For tickers whose decline is also backed by persistent funding rate pressure, the selling baseline is even more established and 15% suffices. The cap holds in both cases: a volume spike far above even a decline-elevated baseline is still a flush, not continuation.
 
 ---
 
