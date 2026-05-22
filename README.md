@@ -273,6 +273,14 @@ Bulk ticker fetch → filter by absolute 24h change ≥ threshold → Fisher-Yat
 
 Fires every 5 seconds. Bulk-fetches mark prices for all open positions. Per position: DCA trigger check (places next add and recalculates TP if breached) → TP hit check → 8h funding fee accrual → hard force-close deadline check → SL placement after the final DCA stage fills. After every close, updates the lost-value tally on all remaining open positions.
 
+### Loss Absorption
+
+Runs on each position watcher tick. Triggers on any position whose unrealised loss exceeds 2.5× base margin. Each cut closes 5% of the position's current size at market.
+
+The interval between cuts starts at 5 minutes and **halves with every successive cut** — 5 min → 2.5 min → 1.25 min → … down to a 30-second floor. The count is per-position and persists as long as the position stays below the threshold. If the position recovers above the -2.5× threshold at any watcher tick, the cut counter **resets to zero**, so the next cut (if the position falls back below threshold) restarts the full 5-minute interval. There is no gradual ramp-up — recovery snaps the cooldown back to 5 minutes immediately.
+
+Absorption is paused while a DCA stage is queued for delayed placement; the incoming add may improve the average entry enough to lift the position back above threshold, making absorption unnecessary. Absorption stops entirely once the final DCA stage has triggered. If a position is already at minimum notional when a cut is due, it is closed outright rather than trimmed further.
+
 ### Laggard
 
 Active whenever there are at least 2 open positions — no reduce-phase gate. Evaluates the oldest position; force-closes it when `buffedEV − lostValue − unrealizedPnL ≤ 0`. Every position close (win or loss) feeds its PnL into the lost-value tally of all survivors. Loss absorption cuts do the same — each slice realised by absorption is immediately added to every position's lost-value tally, and the EDa TP is recomputed on the spot. If the laggard itself is the absorbed position, the reduced margin is already reflected in that recompute: smaller margin in the denominator widens the required price move, so the EDa TP adjusts proportionally without any separate correction step.
