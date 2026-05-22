@@ -50,6 +50,8 @@ This watchlist also evicts any tickers that fail other filters such as over-exte
 ### Follow-Through Watchlist (`ftWatchlist`)
 A display-only list rebuilt each scan cycle from the persisted `ftCandidates` roster. Shows the current status of every FT candidate — `LOW RSI`, `HIGH RSI`, `OVER-SHORTED`, `WAITING`, `MAX TRADES`, `VOL MOM`, or `READY` — along with its count and how many FT trades have been opened against it. For regular FT entries the count is Rodeo rides; for ADV FT entries (marked ⚡) the count is over-extension hits within the 3h window. The roster itself (`ftCandidates`) is persisted and survives restarts; the watchlist display is ephemeral.
 
+When the ADV FT roster is full and a new ticker qualifies for promotion, the eviction priority is: lowest funding rate first (most over-shorted, highest squeeze risk), then oldest entry as tiebreaker. The incoming ticker takes the evicted slot immediately.
+
 
 ---
 
@@ -139,6 +141,9 @@ Lists all symbols currently under active Rodeo Creep with their ride count, curr
 
 ### FUN VM Creep
 Lists all symbols currently under active FUN vol momentum creep. Each entry shows the close count, the live effective VM floor for each sub-type (HFG, LFG, HFL, LFL), the current FR re-entry gate (seeded at 1% after first close, scaling ×1.5 per close), and the countdown to the 6h TTL reset. Over-extension hits are displayed inline with an ⚡ counter and their multiplicative effect on the VM threshold. Only visible when FUN vol momentum is enabled.
+
+### TP Ingress
+Per-symbol TP reduction state for non-Gainers strategies. Each close on a symbol seeds or increments `_tpIngressCount[symbol]`, and the effective stage-0 TP for that symbol is multiplied by `0.5^count`, floored at `minTpRoi` (default 3%). The reduction applies only to stage-0 entries and expires after a 3-hour TTL from the first close — after which `_tpIngressCount` is cleared and the full entry TP is restored on the next open.
 
 ### SalF Creep
 Lists all symbols currently under active SalF median creep. Each entry shows the close count, the effective LSA floor and cap currently in effect for that symbol, and the countdown to the 6h TTL reset. As the close count increases, the floor rises and the cap falls toward the midpoint, tightening the window within which a re-entry can qualify. Only visible when SalF is enabled.
