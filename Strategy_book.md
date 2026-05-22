@@ -68,9 +68,7 @@ RSI6 hitting ≥ the configured maximum (default 90) signals a parabolic, non-me
 
 **RSI6 Maximum (Hard Disqualifier)**: When RSI6 ≥ the maximum, a standard entry is blocked. The ticker is flagged for monitoring under a more patient entry gate.
 
-**3-Hour Graylist**: Before any entry, a historical check scans 15-minute candles over the past 3 hours. If any candle had RSI6 ≥ the configured maximum, the ticker is graylisted for the rest of the window. A recently over-extended ticker is prone to re-spiking rather than stabilizing — the graylist prevents premature re-entry after a parabolic move.
-
-**Over-Extension Counter**: The count of 15-minute candles at RSI6 ≥ maximum within the 3-hour window is tracked per ticker. This count can scale vol momentum thresholds multiplicatively — the more times a ticker has over-extended, the more confirmation required before entry. The count is also visible in the monitoring roster.
+**3-Hour Graylist**: Before any entry, a historical check is advised across 15-minute candles over the past 3 hours — if any candle had RSI6 ≥ the configured maximum, the ticker is graylisted for the rest of the window. A recently over-extended ticker is prone to re-spiking rather than stabilizing — the graylist prevents premature re-entry after a parabolic move.
 
 ---
 
