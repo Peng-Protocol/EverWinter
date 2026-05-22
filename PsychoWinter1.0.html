@@ -541,6 +541,13 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           </label>
           <div class="hint" style="margin-top:4px">Positions that absorb losses get a personalised EDa TP — regular TP suspended until absorbed losses are recovered. When an exhumed position becomes laggard it is locked: no force-close, no laggard absorption.</div>
         </div>
+        <div class="g" x-show="cfg.lossAbsorptionEnabled" style="margin-top:8px">
+          <label class="tog" @click.prevent="if(!cfgLocked){cfg.secondWindEnabled=!cfg.secondWindEnabled;persist()}">
+            <div class="tog-t" :class="cfg.secondWindEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Second Wind</span>
+          </label>
+          <div class="hint" style="margin-top:4px">When the final DCA stage fills but absorption has reduced the position below expected margin, SL is delayed — stage count is recalibrated to the effective stage the reduced margin represents, and new DCA orders are queued from current price. One-time per position.</div>
+        </div>
         <div class="sep" style="margin-top:10px"></div>
         <div class="g">
           <label class="tog" @click.prevent="if(!cfgLocked){cfg.sacrificeEnabled=!cfg.sacrificeEnabled;if(!cfg.sacrificeEnabled)cfg.retractionEnabled=false;persist()}">
@@ -669,6 +676,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
             <span class="badge" :style="pos.phase==='force'?'color:var(--accent);border-color:rgba(255,32,64,.4)':'color:var(--text-lo);border-color:var(--border)'"
               x-show="pos.phase==='force'">FORCE</span>
             <span class="badge" style="color:var(--ice);border-color:rgba(80,220,220,.35)" x-show="pos._exhumed && cfg.exhumationEnabled!==false">EXHUMED</span>
+            <span class="badge" style="color:#aabbff;border-color:rgba(150,180,255,.35)" x-show="pos._secondWindApplied && cfg.secondWindEnabled!==false">2ND WIND</span>
             <span class="badge" style="color:var(--warn);border-color:rgba(255,119,48,.35)" x-show="isLaggard(pos) && !(pos._exhumed && cfg.exhumationEnabled!==false)">LAGGARD</span>
           </div>
         </div>
@@ -1221,6 +1229,7 @@ function psycho() { return {
     cascadeMinRoiPct: 3,
     amaEnabled: false,
     exhumationEnabled: true,
+    secondWindEnabled: true,
   },
 
   bot: { running: false, scanning: false, scanCd: 0, scanPct: 100, startTime: null },
@@ -1966,10 +1975,14 @@ function psycho() { return {
 
           // Update SL to actual weighted avg after final stage fills
           if (pos.dcaStage >= pos._stageCount && !pos._slFinalSet && instr) {
-            pos.slPrice    = this._projectedSL(pos, instr);
-            pos.slSet      = true;
-            pos._slFinalSet = true;
-            this.log(`⚠️ ${pos.symbol}: DCA${pos.dcaStage} — SL @ ${fmtP(pos.slPrice)}`, 'warn');
+            if (this.cfg.secondWindEnabled !== false && !pos._secondWindApplied && this._applySecondWind(pos, mark, instr)) {
+              // Second Wind applied — SL deferred, new stages queued
+            } else {
+              pos.slPrice    = this._projectedSL(pos, instr);
+              pos.slSet      = true;
+              pos._slFinalSet = true;
+              this.log(`⚠️ ${pos.symbol}: DCA${pos.dcaStage} — SL @ ${fmtP(pos.slPrice)}`, 'warn');
+            }
           }
           this.log(`📊 ${pos.symbol}: ${add.label} @ ${fmtP(add.price)} | Avg ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(newTp)} (${stageRoi}% ROI)`, 'trade');
           this.persist();
@@ -2183,6 +2196,11 @@ function psycho() { return {
     // Exhumation EDa TP refresh
     if (this.cfg.exhumationEnabled !== false && this.positions.length > 0) {
       await this.runExhumationCheck();
+    }
+
+    // Second Wind — legacy scan for positions at final stage with reduced margin
+    if (this.cfg.secondWindEnabled !== false && this.positions.length > 0) {
+      await this.runSecondWindCheck();
     }
 
     // Sacrifice (allocation cap)
@@ -2638,9 +2656,13 @@ function psycho() { return {
                   pos.tpPct = stageRoi;
                   pos._laggardInitialEV = pos.margin * (stageRoi / 100);
                   if (pos.dcaStage >= (pos._stageCount || this.cfg.dcaStages) && !pos._slFinalSet && instr) {
-                    pos.slPrice    = this._projectedSL(pos, instr);
-                    pos.slSet      = true;
-                    pos._slFinalSet = true;
+                    if (this.cfg.secondWindEnabled !== false && !pos._secondWindApplied && this._applySecondWind(pos, c.c, instr)) {
+                      // Second Wind applied — SL deferred, new stages queued
+                    } else {
+                      pos.slPrice    = this._projectedSL(pos, instr);
+                      pos.slSet      = true;
+                      pos._slFinalSet = true;
+                    }
                   }
                   _gbStats.dcaFills++;
                 }
@@ -2962,6 +2984,69 @@ function psycho() { return {
       const _tag     = profitOutlier ? '[PROFIT OUTLIER]' : '[MARGIN OUTLIER]';
       const sym      = pos.symbol.replace('USDT', '');
       this.logRollup(`decel_${pos.symbol}`, `📉 ${sym}: deceleration ×${pos._decelerationCount} ${_tag} — +${addMgn.toFixed(2)} margin @ ${fmtP(mark)} | new avg entry ${fmtP(pos.entryPrice)} | next in ${_nextStr}`, 'warn');
+    }
+  },
+
+  // ── Second Wind ──
+  // When the final DCA stage fills on a position whose margin has been reduced by absorption,
+  // recalibrate the stage count to match the effective stage the reduced margin represents
+  // and queue new DCA orders from current price rather than setting SL immediately.
+
+  _expectedMarginAtStage(k) {
+    const mult = this.cfg.dcaMultiplier || 1;
+    let cum = 0;
+    for (let i = 0; i <= k; i++) cum += this.cfg.minNotional * Math.pow(mult, i);
+    return cum / this.cfg.leverage;
+  },
+
+  _applySecondWind(pos, mark, instr) {
+    const origMax       = pos._originalStageCount || pos._stageCount;
+    const expectedFinal = this._expectedMarginAtStage(origMax);
+    if (pos.margin >= expectedFinal * 0.90) return false;
+
+    // Highest stage K where cumulative expected margin <= current margin
+    let effectiveStage = 0;
+    for (let k = 1; k <= origMax; k++) {
+      if (this._expectedMarginAtStage(k) <= pos.margin * 1.01) effectiveStage = k;
+      else break;
+    }
+    const giftedStages = origMax - effectiveStage;
+    if (giftedStages <= 0) return false;
+
+    if (!pos._originalStageCount) pos._originalStageCount = origMax;
+    pos._stageCount = pos.dcaStage + giftedStages;
+
+    if (!pos._dcaDelayQueue) pos._dcaDelayQueue = [];
+    const addPcts = this._addPcts();
+    for (let i = 0; i < giftedStages; i++) {
+      const addPct        = addPcts[Math.min(i, addPcts.length - 1)];
+      const addPrice      = instr ? this.snapPrice(mark * (1 + addPct / 100), instr) : parseFloat((mark * (1 + addPct / 100)).toFixed(8));
+      const stageNotional = this.cfg.minNotional * Math.pow(this.cfg.dcaMultiplier || 1, i + 1);
+      const addQty        = instr ? this.snapQty(stageNotional / addPrice, instr) : parseFloat((stageNotional / addPrice).toFixed(8));
+      const stageNum      = pos.dcaStage + i + 1;
+      pos._dcaDelayQueue.push({ label: 'Add' + stageNum, originalStage: stageNum, price: addPrice, qty: addQty, stageRoi: this._tpRoi(stageNum), stageTp: null, avgAfter: null, _secondWind: true });
+    }
+    if (!pos._nextDcaPlaceAt) pos._nextDcaPlaceAt = Date.now() + 5 * 60 * 1000;
+
+    pos._secondWindApplied = true;
+    const sym = pos.symbol.replace('USDT', '');
+    this.log(`💨 ${sym}: Second Wind — margin $${pos.margin.toFixed(2)} vs expected $${expectedFinal.toFixed(2)}, recalibrated to stage ${effectiveStage}, +${giftedStages} stage${giftedStages > 1 ? 's' : ''} queued`, 'warn');
+    this.persist();
+    return true;
+  },
+
+  async runSecondWindCheck() {
+    for (const pos of [...this.positions]) {
+      if (pos._secondWindApplied) continue;
+      const origMax = pos._originalStageCount || pos._stageCount;
+      if (pos.dcaStage < origMax) continue;
+      const expectedFinal = this._expectedMarginAtStage(origMax);
+      if (pos.margin >= expectedFinal * 0.90) continue;
+      const mark  = pos.markPrice || pos.entryPrice;
+      const instr = await this.getInstrInfo(pos.symbol);
+      if (!instr) continue;
+      const applied = this._applySecondWind(pos, mark, instr);
+      if (applied && pos._slFinalSet) pos._slFinalSet = false;
     }
   },
 
