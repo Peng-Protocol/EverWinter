@@ -334,15 +334,21 @@ When the combined unrealised PnL across all open positions exceeds 2.5× the ent
 
 The threshold is fixed at 2.5× entry margin and scales automatically with notional and leverage — it is not configurable separately.
 
+Cascade targets are selected purely by profitability — any non-laggard position with uPnL above the minimum ROI floor qualifies, including exhumed positions. An exhumed position in profit is a valid cascade target; closing it banks the gain and passes it into the debt ledger, which is consistent with cascade's purpose.
+
 ### Position Cascade Trigger
 
 Similar intent to the Cascade Trigger but fires from the loss side rather than the profit side. When any single position's unrealised loss drops below −2.5× entry margin, the bot closes the most profitable open position to generate a laggard-seeding close, then immediately runs a scan to replace it. This keeps the book circulating rather than letting a single deep loser stall everything.
 
 Each successive trigger in the same session closes more positions than the last, governed by the **PPC Escalation Multiplier**. At 2× (default), the first trigger closes 1 position, the second closes 2, the third closes 4, and so on. The count resets when no position remains below the trigger threshold. The **Cascade Close Min ROI** floor applies here too — only positions above the minimum ROI qualify as targets, preventing the bot from closing marginal winners that would not meaningfully reduce the deficit.
 
+As with the Cascade Trigger, exhumed positions are not exempted — a profitable exhumed position qualifies as a PPC target.
+
 ### Sacrifice and Retraction
 
 Sacrifice monitors the ratio of allocated margin to what the full position cap would cost at entry stage. When allocated margin exceeds 4× that baseline — meaning the book has DCA'd heavily and is carrying far more exposure than a fresh book would — sacrifice halts scans and closes one position per cycle until the ratio drops back. Priority goes to positions that have triggered at least one DCA stage and are within 3% of break-even, since those are the ones most likely to close without a significant loss. The **Position Floor** prevents sacrifice from closing below a minimum number of open positions regardless of the ratio.
+
+Exhumed positions are deprioritized for sacrifice: they are only selected if no non-exhumed candidate exists. Sacrificing an exhumed position discards the absorption recovery path — the absorbed losses cannot be reclaimed — so the bot exhausts all other options first. The laggard remains fully excluded as before.
 
 **Retraction** adds a second tripwire on top of sacrifice: when the collective unrealised PnL of all open positions falls below −2.5× entry margin, sacrifice mode activates regardless of the margin ratio. Where normal sacrifice is a margin-usage alarm, retraction is a drawdown alarm — it fires on deep collective red even if the book is not particularly over-allocated. Both conditions halt scans while active.
 
