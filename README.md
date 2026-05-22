@@ -281,11 +281,13 @@ The interval between cuts starts at 5 minutes and **halves with every successive
 
 Absorption is paused while a DCA stage is queued for delayed placement; the incoming add may improve the average entry enough to lift the position back above threshold, making absorption unnecessary. Absorption stops entirely once the final DCA stage has triggered. If a position is already at minimum notional when a cut is due, it is closed outright rather than trimmed further.
 
-#### Outstanding Positions
+#### Outlier Positions
 
-When **Outstanding Acceleration** is enabled, absorption identifies positions that are disproportionate relative to the rest of the book. A position is flagged as outstanding if its margin or absolute unrealised loss exceeds the configured multiplier (default 2.5×) of the average across all other open positions. Outstanding positions skip the normal halving schedule and are absorbed at the 30-second minimum cooldown immediately — the book treats them as requiring urgent reduction.
+When **Outlier Acceleration** is enabled, absorption identifies positions that are disproportionate relative to the rest of the book. A position is flagged as an outlier if its margin or absolute unrealised loss exceeds the configured multiplier (default 2.5×) of the average across all other open positions. Outlier positions skip the normal halving schedule and are absorbed at the 30-second minimum cooldown immediately — the book treats them as requiring urgent reduction.
 
 There is a digestibility limit: if the loss that a single 5% cut would crystallise exceeds 2.5× the base notional, the cut is deferred rather than executed. The position is re-examined after 30 seconds, and the bot waits until a cut of digestible size presents itself — either because the mark has partially recovered or because previous cuts have reduced the position size enough to bring the per-cut loss back within range. The minimum cooldown is maintained during the deferral so the check runs as frequently as possible without over-crystallising a single bad entry.
+
+**Outlier Deceleration** is the mirror image of acceleration. Where acceleration trims positions that are too large or too deeply underwater, deceleration adds to positions that are outlier performers or outlier small — either their unrealised profit is 2.5× or more above the average of all others, or their margin is 2.5× or more below the book average. When either condition holds, the bot adds 5% of the position's current margin (minimum base notional) at market, updating the weighted-average entry price. The same cooldown mechanics apply: the interval starts at 5 minutes and halves with each successive add down to a 30-second floor, resetting to zero when the position is no longer an outlier.
 
 ### Laggard
 
