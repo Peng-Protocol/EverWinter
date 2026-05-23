@@ -361,6 +361,7 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 
   Below the low fund floor, no entry is taken regardless of other conditions. Re-entry requires an escalating funding rate after each close on the same symbol — the gate seeds at 1.0% and multiplies ×1.5 per close, with a 6-hour TTL.
 - RSI Proximity Block (RSI6 within the configured proximity of the maximum is skipped — prevents entering a ticker about to over-extend)
+- RSI Minimum Gate (RSI6, RSI12, and RSI24 must all be ≥ the configured floor, default 25 — coins already oversold on any timeframe are skipped; applies in both normal and Super FUN mode)
 - Historical OE Look-back (counts 15m candles at RSI6 ≥ maximum in the past 3 hours)
   - Losers with any OE hit are reclassified to the gainers gate
   - OE count scales the VM threshold multiplicatively for gainers
