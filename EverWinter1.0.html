@@ -1196,8 +1196,8 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="ps"><div class="psl">24h Chg</div><div class="psv short" x-text="(parseFloat(p.change24h)>=0?'+':'')+p.change24h+'%'"></div></div>
               <div class="ps"><div class="psl">RSI6/12/24</div><div class="psv" x-text="(p.rsi6?p.rsi6.toFixed(0):'—')+'/'+(p.rsi12?p.rsi12.toFixed(0):'—')+'/'+(p.rsi24?p.rsi24.toFixed(0):'—')"></div></div>
               <div class="ps" style="min-width:0;overflow:hidden">
-                <div class="psl" x-text="(()=>{const isLag=cfg.laggardCheckEnabled&&p.phase==='reduce'&&p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;return(isLag&&p._edaTpPrice>0)?'EDa TP':'Current TP';})()"></div>
-                <div class="psv" style="color:var(--profit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" x-text="(()=>{const isLag=cfg.laggardCheckEnabled&&p.phase==='reduce'&&p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;if(isLag&&p._edaTpPrice>0){const roi=(p.entryPrice-p._edaTpPrice)/p.entryPrice*p.leverage*100;return roi.toFixed(1)+'%  '+fmtP(p._edaTpPrice);}return p.tpPct+'%  '+fmtP(p.currentTpPrice);})()"></div>
+                <div class="psl" x-text="(()=>{const isLag=cfg.laggardCheckEnabled&&p.phase==='reduce'&&p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;const isFFA=p._fun&&p._funFastAbsorp&&cfg.funSuperMode&&p.phase==='reduce'&&p._edaTpPrice>0;return((isLag&&p._edaTpPrice>0)||isFFA)?'EDa TP':'Current TP';})()"></div>
+                <div class="psv" style="color:var(--profit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" x-text="(()=>{const isLag=cfg.laggardCheckEnabled&&p.phase==='reduce'&&p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;const isFFA=p._fun&&p._funFastAbsorp&&cfg.funSuperMode&&p.phase==='reduce'&&p._edaTpPrice>0;if((isLag&&p._edaTpPrice>0)||isFFA){const roi=(p.entryPrice-p._edaTpPrice)/p.entryPrice*p.leverage*100;return roi.toFixed(1)+'%  '+fmtP(p._edaTpPrice);}return p.tpPct+'%  '+fmtP(p.currentTpPrice);})()"></div>
               </div>
               <!-- Funding rate — shown when available (live, refreshed each watch cycle) -->
               <div class="ps" x-show="p.fundingRate!=null">
@@ -3557,6 +3557,21 @@ function ew() { return {
         if (newEdaTp === 0) laggard._edaTpPrice = 0;
       }
     }
+    // Recompute EDa TP limit order for fast-FUN positions already in reduce phase.
+    const _lagId = this.cfg.laggardCheckEnabled && this.positions.length >= 1
+      ? this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]).id : null;
+    if (pos._fun && pos._funFastAbsorp && this.cfg.funSuperMode &&
+        pos.phase === 'reduce' && pos._laggardInitialEV && pos.id !== _lagId) {
+      const newEdaTp = Math.max(0, pos.entryPrice - pos._laggardInitialEV * pos.entryPrice / (pos.leverage * pos.margin));
+      if (newEdaTp === 0) {
+        pos._edaTpPrice = 0;
+      } else {
+        pos._edaTpPrev = newEdaTp;
+        if (newEdaTp > 0 && newEdaTp < (pos.markPrice ?? Infinity)) {
+          this.setTP(pos, newEdaTp).then(r => { if (r === 'ok') pos._edaTpPrice = newEdaTp; }).catch(() => {});
+        }
+      }
+    }
   },
 
   // ── Passive Second Wind ──
@@ -5677,7 +5692,7 @@ function ew() { return {
           this.log(`${p.symbol}: ${this.cfg.runtimeHours}h — force closing`, 'warn');
           await this.closePosition(p,'force'); continue;
         }
-        if (age>=this.tpReduceMs()&&(p.phase==='normal'||(p.phase==='reduce'&&p.tpPct>3))) {
+        if ((age>=this.tpReduceMs() || (p._fun && p._funFastAbsorp && this.cfg.funSuperMode)) && (p.phase==='normal'||(p.phase==='reduce'&&p.tpPct>3))) {
           const _wasReduced = p.phase === 'reduce';
           p.phase='reduce'; if (!_wasReduced) this.sess.tpReduce++;
           // Clear normal-phase TP lock keys so the reduce-phase drift correction in
@@ -5698,15 +5713,16 @@ function ew() { return {
 
           const _isLaggardPos = this.cfg.laggardCheckEnabled && this.positions.length >= 1 &&
             p.id === this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]).id;
+          const _isFastFunPos = p._fun && p._funFastAbsorp && this.cfg.funSuperMode;
 
           // If position is already at ≥3% UROI (short is profitable), close immediately.
           // Also close if computed TP is above current mark (can't fill a rising market).
           // UROI% = (entryPrice - markPrice) / entryPrice * leverage * 100  (for a short)
-          // Exception: if this is the active laggard, let runLaggardCheck own the close —
-          // the 3% floor may cut it short of the EDa TP payback target.
+          // Exception: laggard and fast-absorption FUN defer to EDa TP — 3% floor would
+          // cut them short of the recovery target.
           const currentMark = p.markPrice || basePrice;
           const currentUROI = (p.entryPrice - currentMark) / p.entryPrice * p.leverage * 100;
-          if (!_isLaggardPos && (currentUROI >= 3 || nt >= currentMark)) {
+          if (!_isLaggardPos && !_isFastFunPos && (currentUROI >= 3 || nt >= currentMark)) {
             this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — UROI ${currentUROI.toFixed(1)}% / TP above mark — staging close in 5s.`, 'warn');
             // Flag UI immediately so card shows CLOSING badge, then wait before executing.
             p.phase = 'reduce';
@@ -5719,11 +5735,27 @@ function ew() { return {
             await this.closePosition(p, 'force'); continue;
           }
           if (p.tpOrderId) { await this.cancelTpLimitOrder(p.symbol, p.tpOrderId); p.tpOrderId = null; }
-          if (!_isLaggardPos) {
+          if (!_isLaggardPos && !_isFastFunPos) {
             await this._setNativeTP(p.symbol, nt);
             p._nativeReduceTpPrice = nt;
             p.currentTpPrice = nt; p.tpPct = 3;
             this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% native (${fmtP(nt)})`, 'warn');
+          } else if (_isFastFunPos && !_isLaggardPos) {
+            const edaEV = p._laggardInitialEV || 0;
+            if (edaEV > 0) {
+              const edaTp = Math.max(0, p.entryPrice - edaEV * p.entryPrice / (p.leverage * p.margin));
+              p._edaTpPrev = edaTp;
+              p._nativeReduceTpPrice = null;
+              if (edaTp > 0 && edaTp < (p.markPrice ?? Infinity)) {
+                this.setTP(p, edaTp).then(r => { if (r === 'ok') p._edaTpPrice = edaTp; }).catch(() => {});
+              }
+              this.log(`${p.symbol}: fast absorption — reduce phase (EDa TP ${fmtP(edaTp)})`, 'warn');
+            } else {
+              await this._setNativeTP(p.symbol, nt);
+              p._nativeReduceTpPrice = nt;
+              p.currentTpPrice = nt; p.tpPct = 3;
+              this.log(`${p.symbol}: fast absorption — reduce phase (3% TP fallback)`, 'warn');
+            }
           } else {
             p.tpPct = 3; // close the re-entry gate without placing a native TP
             this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — reduce phase (laggard — EDa TP takes over)`, 'warn');
@@ -5733,12 +5765,13 @@ function ew() { return {
         // Continuous reduce-phase check: close if UROI ≥ 3% since reduce TP was set.
         // Guards: position still exists (phase transition above may have already closed it),
         // and pendingClose not set (retry loop handles outstanding close attempts).
-        // Skip if this is the active laggard with EDa TP set — laggard check owns that close.
+        // Skip laggard (EDa check owns close) and fast-FUN positions with EDa TP active.
         if (p.phase === 'reduce' && !p.pendingClose && this.positions.find(x => x.id === p.id)) {
           const _isLaggard = this.cfg.laggardCheckEnabled && (p._laggardInitialEV > 0) &&
             this.positions.length >= 1 &&
             p.id === this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]).id;
-          if (!_isLaggard) {
+          const _isFastFunEda = p._fun && p._funFastAbsorp && this.cfg.funSuperMode && p._edaTpPrice > 0;
+          if (!_isLaggard && !_isFastFunEda) {
             const reduceMark = p.markPrice || p.entryPrice;
             const reduceUROI = (p.entryPrice - reduceMark) / p.entryPrice * p.leverage * 100;
             if (reduceUROI >= 3) {
