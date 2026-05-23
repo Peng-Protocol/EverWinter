@@ -176,7 +176,15 @@ Loss absorption trims positions that are consuming capital without recovering, f
 
 Two modes exist, differing in how aggressively they fire:
 
-**Passive Absorption**: Cuts positions on a fixed interval unconditionally — no loss threshold required. Every active position is trimmed on a regular cadence regardless of its current PnL state. One base-notional equivalent is closed each interval. Passive absorption runs at a steady pace and does not respond to how deep in loss a position sits — it ensures every position shrinks over time regardless of behavior. Critically, "regardless of PnL state" cuts both ways: a position sitting in profit is trimmed just as readily as a losing one. Those crystallized gains feed into the laggard's payback tally and pull the EDa TP closer, meaning passive absorption chips away at the book's collective deficit from both directions simultaneously.
+**Passive Absorption**: Cuts positions on a fixed interval unconditionally — no loss threshold required. Every active position is trimmed on a regular cadence regardless of its current PnL state. One base-notional equivalent is closed each interval. Critically, "regardless of PnL state" cuts both ways: a position sitting in profit is trimmed just as readily as a losing one. Those crystallized gains feed into the laggard's payback tally and pull the EDa TP closer, meaning passive absorption chips away at the book's collective deficit from both directions simultaneously.
+
+The interval is not fixed for the life of the position. As DCA stages fill, the clock tightens: stage 1 shortens the interval to ⅔ of the configured baseline, stage 2 to ⅓, and stage 3 to a hard 5-minute floor. A position moving against the strategy fast enough to trigger deeper DCA fills is moving fast enough to warrant faster cuts. Each cut's crystallized margin is tracked as *saved margin* — the amount that would otherwise have remained in a now-smaller position.
+
+When a cut is due but the position is already at minimum notional, it cannot absorb further. If saved margin has accumulated, the **Passive Second Wind** fires instead: the saved margin is divided into full base-margin units, each funding one additional DCA stage placed 3% above the prior stage (compounding from the last first-wind stage). Any surplus below one full unit is added to the final new stage's notional. The existing stop-loss is cancelled immediately; it re-arms when the new highest second-wind stage fills. The DCA stage counter advances into the new stages naturally — stage 4, 5, and so on — and the SL formula applies to the new maximum as it would to any terminal stage.
+
+Once Passive Second Wind fires, the acceleration schedule resets. The stage count used to determine the absorption interval is measured relative to the stage at which second wind activated — so the position returns to the full base interval immediately after second wind, and the clock only tightens again as further second-wind DCA stages fill. This prevents the position from entering the 5-minute floor continuously from the moment second wind fires; it must re-earn the acceleration by continuing to stage deeper.
+
+The result is a direct conversion of margin the position has already shed into continued runway. Capital that would have remained locked in a shrinking position instead funds multiple conditional entries at progressively less favorable prices — a controlled extension of the DCA ladder, funded entirely from prior cuts, costing no new capital from the book.
 
 **Aggressive Absorption**: Threshold-triggered — fires only when a position's unrealized loss exceeds 2.5× its base margin. Each cut is 5% of the remaining margin. The interval halves with every successive cut down to a 30-second floor; recovery above threshold resets the counter. Cuts stop once the final DCA stage fires.
 
@@ -245,6 +253,14 @@ The final DCA stage filling normally arms the stop-loss. But absorption may have
 Second Wind detects this: if current margin is meaningfully below the expected cumulative margin at the final stage, the stage count is recalibrated to the effective stage that margin represents, and new DCA orders are queued from current price. SL is deferred until the recalibrated count fills. This repeats — each time the recalibrated final stage fills under the same condition, another wind is granted.
 
 **No thunder; no storm. No mountain; no avalanche.** In crypto, most alt pumps do not last longer than a day or two — after which they have to contract. The higher the climb, the more inevitable the fall. Aggressive absorption, DCA delay, exhumation, and second wind are designed together for exactly this: to let a position survive the worst a ticker can throw at it, then ride the reversion the next day or after. Absorption shaves exposure down through the climb. DCA delay refuses to commit capital at the wrong moment. Exhumation holds the exit door shut until the absorbed debt is genuinely settled. Second wind keeps stages alive as long as the position is lean enough to warrant more runway. By the time the avalanche arrives, what remains on the slope is a small, well-averaged position — not the bloated original.
+
+---
+
+#### Passive Second Wind
+
+Where regular Second Wind fires on final-stage fill, Passive Second Wind fires when the absorption clock fires but the position is already at minimum notional and has accumulated saved margin. Saved margin is divided into full-stage units placed as conditionals 3% above the prior stage (compounding from the last first-wind trigger), each carrying its own TP; any remainder tops up the final new stage's notional. The SL recomputes to the new highest second-wind stage; the absorption interval resets to the full base on activation, re-earning acceleration only as second-wind stages fill.
+
+With **Infinite Second Wind** enabled (default), this cycle has no cap — every time the absorption clock fires and enough margin has been saved since the last activation, another batch of stages is placed. More significantly, savings from every other absorbing position in the book are pooled into the laggard's saved-margin balance: each absorption cut on any non-laggard position credits that same dollar amount to the laggard, making the whole book's attrition work toward one champion's comeback. The laggard's `runtimeHours` force-close is suspended while this feature is active, allowing the position to run until its EDa TP is organically hit. Crypto pumps do not last forever — the longer the laggard holds, the more runway it accumulates from the rest of the book, and the more likely the eventual reversion clears its debt.
 
 ---
 
@@ -361,6 +377,7 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 
   Below the low fund floor, no entry is taken regardless of other conditions. Re-entry requires an escalating funding rate after each close on the same symbol — the gate seeds at 1.0% and multiplies ×1.5 per close, with a 6-hour TTL.
 - RSI Proximity Block (RSI6 within the configured proximity of the maximum is skipped — prevents entering a ticker about to over-extend)
+- RSI Minimum Gate (RSI6, RSI12, and RSI24 must all be ≥ the configured floor, default 25 — coins already oversold on any timeframe are skipped; applies in both normal and Super FUN mode)
 - Historical OE Look-back (counts 15m candles at RSI6 ≥ maximum in the past 3 hours)
   - Losers with any OE hit are reclassified to the gainers gate
   - OE count scales the VM threshold multiplicatively for gainers
@@ -374,9 +391,9 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 
 **Re-entry Cooldown**: A configurable minimum interval (default 10 minutes) is enforced between FUN entries on the same ticker. Once opened, the ticker is gated until the cooldown expires.
 
-**Super Fun Mode**: Strips FUN to funding rate + positive VM only. All VM thresholds, LSA checks, and creep gates are replaced by a lock-in ratchet — re-entry must match or beat the last close's funding tier within a 6-hour window. Tickers blocked by RSI proximity or OE count are admitted as the OE sub-type (1× margin, high funding gate required). Aggressive absorption is what makes this stance viable — if the ticker turns, the position is absorbed over time rather than force-closed.
+**Super Fun Mode**: Strips FUN to funding rate + positive VM only. All VM thresholds, LSA checks, and creep gates are replaced by a lock-in ratchet — re-entry must match or beat the last close's funding tier within a 6-hour window. Tickers blocked by RSI proximity or OE count are admitted as the OE sub-type (1× margin, high funding gate required). Passive absorption is what makes this stance viable — if the ticker turns, the position is absorbed over time rather than force-closed.
 
-After a ticker accumulates two Super FUN trades within the same hour, the bot responds based on absorption status. If absorption is active, any further re-entry on that ticker is flagged for accelerated absorption — loss cuts fire every 5 minutes rather than the standard interval. If absorption is off, re-entry is deferred entirely until the hour has cleared.
+After two Super FUN trades on the same ticker within the hour, the trader should keep absorption active — re-entry is then flagged for accelerated cuts, firing every 5 minutes rather than the standard interval. With absorption off, re-entry is deferred until the window clears.
 
 ---
 

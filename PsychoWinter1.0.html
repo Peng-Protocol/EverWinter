@@ -548,6 +548,13 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           </label>
           <div class="hint" style="margin-top:4px">When the final DCA stage fills but absorption has reduced the position below expected margin, SL is delayed — stage count is recalibrated to the effective stage the reduced margin represents, and new DCA orders are queued from current price. Repeats each time the recalibrated final stage fills under the same condition.</div>
         </div>
+        <div class="g" x-show="cfg.lossAbsorptionEnabled" style="margin-top:8px">
+          <label class="tog" @click.prevent="if(!cfgLocked){cfg.passiveSecondWindEnabled=!cfg.passiveSecondWindEnabled;persist()}">
+            <div class="tog-t" :class="(cfg.passiveSecondWindEnabled!==false)?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Passive Second Wind</span>
+          </label>
+          <div class="hint" style="margin-top:4px">Accelerates absorption at DCA stages 1/2/3 (⅔× · ⅓× · 30s). After second wind activates, interval resets to 5 min using the second-wind stage as relative stage 0, then hastens again if further stages trigger.</div>
+        </div>
         <div class="sep" style="margin-top:10px"></div>
         <div class="g">
           <label class="tog" @click.prevent="if(!cfgLocked){cfg.sacrificeEnabled=!cfg.sacrificeEnabled;if(!cfg.sacrificeEnabled)cfg.retractionEnabled=false;persist()}">
@@ -1230,6 +1237,7 @@ function psycho() { return {
     amaEnabled: false,
     exhumationEnabled: true,
     secondWindEnabled: true,
+    passiveSecondWindEnabled: true,
   },
 
   bot: { running: false, scanning: false, scanCd: 0, scanPct: 100, startTime: null },
@@ -2463,20 +2471,23 @@ function psycho() { return {
   // whiplashProximityPct% of its TP. Catches TPs missed due to poll latency.
   _scheduleWhiplashCheck(pos) {
     if (this._whiplashScheduled[pos.id]) return;
+    const _snapTp = pos.currentTpPrice; // snapshot at schedule time — must match at fire time
     this.log(`🎯 ${pos.symbol}: within ${this.cfg.whiplashProximityPct}% of TP — K-line audit in 5 min`, 'info');
     this._whiplashScheduled[pos.id] = setTimeout(async () => {
       delete this._whiplashScheduled[pos.id];
       if (!this.positions.find(p => p.id === pos.id)) return;
+      // If TP changed since scheduling (e.g. a DCA stage filled), abort — the regular
+      // position watcher owns the new TP and will close at the correct price when hit.
+      if (pos.currentTpPrice !== _snapTp) return;
       try {
         const url = `${this._baseUrl()}/v5/market/kline?category=linear&symbol=${pos.symbol}&interval=1&limit=6`;
         const r = await fetch(url);
         const d = await r.json();
         const candles = d?.result?.list || [];
-        const tp = pos.currentTpPrice;
-        const hit = candles.some(c => parseFloat(c[3]) <= tp); // index 3 = low
+        const hit = candles.some(c => parseFloat(c[3]) <= _snapTp); // index 3 = low
         if (hit) {
-          this.log(`🎯 ${pos.symbol}: K-line audit — TP ${fmtP(tp)} was touched, closing`, 'success');
-          await this.pseudoClosePosition(pos, 'tp', tp);
+          this.log(`🎯 ${pos.symbol}: K-line audit — TP ${fmtP(_snapTp)} was touched, closing`, 'success');
+          await this.pseudoClosePosition(pos, 'tp', _snapTp);
         }
       } catch(e) {
         this.log(`🎯 ${pos.symbol}: whiplash audit failed — ${e.message}`, 'error');
@@ -2836,6 +2847,8 @@ function psycho() { return {
     const outlierOn  = this.cfg.outlierEnabled !== false;
     const outlierMul = this.cfg.outlierMultiplier || 2.5;
 
+    const _absLog = [];      // collects per-action data for end-of-loop batch rollup
+
     for (const pos of [...this.positions]) {
       if ((pos.upnl || 0) >= threshold) { pos._absorptionCount = 0; pos._absorptionDeferred = false; continue; }
       if (_closingIds.has(pos.id)) continue;
@@ -2851,10 +2864,25 @@ function psycho() { return {
         if (avgLoss > 0 && Math.abs(Math.min(0, pos.upnl || 0)) >= outlierMul * avgLoss)  isOutlier = true;
       }
 
-      // Outlier positions or deferred positions use 30s minimum cooldown
-      const _absorpDelay = (isOutlier || pos._absorptionDeferred)
-        ? 30 * 1000
-        : Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._absorptionCount || 0)));
+      // Absorption interval — stage-aware when passiveSecondWindEnabled, legacy halving otherwise.
+      // After second wind, DCA stage is measured relative to the stage at activation.
+      const _baseAbsorpMs = 5 * 60 * 1000;
+      let _absorpDelay;
+      if (this.cfg.passiveSecondWindEnabled !== false) {
+        const _absStageAbs = pos.dcaStage || 0;
+        const _absStageRel = (pos._secondWindApplied && pos._secondWindBaseStage != null)
+          ? Math.max(0, _absStageAbs - pos._secondWindBaseStage)
+          : _absStageAbs;
+        if      (_absStageRel >= 3) _absorpDelay = 30 * 1000;
+        else if (_absStageRel >= 2) _absorpDelay = Math.max(30 * 1000, Math.round(_baseAbsorpMs / 3));
+        else if (_absStageRel >= 1) _absorpDelay = Math.max(30 * 1000, Math.round(_baseAbsorpMs * 2 / 3));
+        else                        _absorpDelay = _baseAbsorpMs;
+        if (isOutlier || pos._absorptionDeferred) _absorpDelay = 30 * 1000;
+      } else {
+        _absorpDelay = (isOutlier || pos._absorptionDeferred)
+          ? 30 * 1000
+          : Math.max(30 * 1000, Math.round(_baseAbsorpMs / Math.pow(2, pos._absorptionCount || 0)));
+      }
       if (now - (pos._lastAbsorptionAt || 0) < _absorpDelay) continue;
       if (pos._nextDcaPlaceAt && pos._nextDcaPlaceAt > now) continue;
       const mark = pos.markPrice || pos.entryPrice;
@@ -2878,7 +2906,7 @@ function psycho() { return {
         pos._absorptionDeferred = true;
         pos._lastAbsorptionAt   = now;
         const sym = pos.symbol.replace('USDT', '');
-        this.logRollup(`absorb_${pos.symbol}`, `✂️ ${sym}: absorption deferred — cut loss $${Math.abs(cutPnl).toFixed(2)} > 2.5× base notional ($${(2.5 * baseNotional).toFixed(2)}) — retrying in 30s`, 'warn');
+        _absLog.push({ sym, deferred: true, cutPnl });
         continue;
       }
       pos._absorptionDeferred = false;
@@ -2919,9 +2947,22 @@ function psycho() { return {
       const sym = pos.symbol.replace('USDT', '');
       const _nextAbsorpMs  = isOutlier ? 30 * 1000 : Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._absorptionCount)));
       const _nextAbsorpStr = _nextAbsorpMs >= 60000 ? (_nextAbsorpMs / 60000).toFixed(1) + 'min' : Math.round(_nextAbsorpMs / 1000) + 's';
-      const _outlierTag = isOutlier ? ' [OUTLIER]' : '';
-      this.logRollup(`absorb_${pos.symbol}`, `✂️ ${sym}: absorption ×${pos._absorptionCount}${_outlierTag} — 5% cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${pos.margin.toFixed(2)} | next in ${_nextAbsorpStr}`, 'warn');
+      _absLog.push({ sym, deferred: false, cutPnl, cutRoi, mark, count: pos._absorptionCount, isOutlier, nextStr: _nextAbsorpStr });
     }
+
+    // Retroactive batch rollup — one log entry for all absorption activity this cycle
+    if (_absLog.length > 0) {
+      const cuts      = _absLog.filter(a => !a.deferred);
+      const deferreds = _absLog.filter(a =>  a.deferred);
+      const totalPnl  = cuts.reduce((s, a) => s + a.cutPnl, 0);
+      const symParts  = [
+        ...cuts.map(a => `${a.sym}${a.isOutlier ? '[OUT]' : ''}×${a.count}`),
+        ...deferreds.map(a => `${a.sym}(deferred)`),
+      ].join(' · ');
+      const minNext   = cuts.length ? cuts[cuts.length - 1].nextStr : '30s';
+      this.logRollup('absorb_batch', `✂️ Absorption ×${cuts.length}${deferreds.length ? ` +${deferreds.length} deferred` : ''} — ${symParts} | total ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(3)} USDT | next ${minNext}`, 'warn');
+    }
+
     this.persist();
   },
 
@@ -2930,6 +2971,8 @@ function psycho() { return {
     const now        = Date.now();
     const outlierMul = this.cfg.outlierMultiplier || 2.5;
     const baseMargin = this.cfg.minNotional / this.cfg.leverage;
+
+    const _decelLog = [];    // collects per-action data for end-of-loop batch rollup
 
     for (const pos of [...this.positions]) {
       if (_closingIds.has(pos.id)) continue;
@@ -2994,9 +3037,16 @@ function psycho() { return {
 
       const _nextMs  = Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._decelerationCount)));
       const _nextStr = _nextMs >= 60000 ? (_nextMs / 60000).toFixed(1) + 'min' : Math.round(_nextMs / 1000) + 's';
-      const _tag     = profitOutlier ? '[PROFIT OUTLIER]' : '[MARGIN OUTLIER]';
       const sym      = pos.symbol.replace('USDT', '');
-      this.logRollup(`decel_${pos.symbol}`, `📉 ${sym}: deceleration ×${pos._decelerationCount} ${_tag} — +${addMgn.toFixed(2)} margin @ ${fmtP(mark)} | new avg entry ${fmtP(pos.entryPrice)} | next in ${_nextStr}`, 'warn');
+      _decelLog.push({ sym, count: pos._decelerationCount, addMgn, profitOutlier, marginOutlier, nextStr: _nextStr });
+    }
+
+    // Retroactive batch rollup — one log entry for all deceleration activity this cycle
+    if (_decelLog.length > 0) {
+      const totalAdd  = _decelLog.reduce((s, a) => s + a.addMgn, 0);
+      const symParts  = _decelLog.map(a => `${a.sym}${a.profitOutlier ? '[P]' : '[M]'}×${a.count}`).join(' · ');
+      const minNext   = _decelLog[_decelLog.length - 1].nextStr;
+      this.logRollup('decel_batch', `📉 Deceleration ×${_decelLog.length} — ${symParts} | +${totalAdd.toFixed(2)} margin total | next ${minNext}`, 'warn');
     }
   },
 
@@ -3041,7 +3091,8 @@ function psycho() { return {
     }
     if (!pos._nextDcaPlaceAt) pos._nextDcaPlaceAt = Date.now() + 5 * 60 * 1000;
 
-    pos._secondWindApplied = true;
+    pos._secondWindApplied    = true;
+    pos._secondWindBaseStage  = pos.dcaStage || 0;
     const sym = pos.symbol.replace('USDT', '');
     this.log(`💨 ${sym}: Second Wind — margin $${pos.margin.toFixed(2)} vs expected $${expectedFinal.toFixed(2)}, recalibrated to stage ${effectiveStage}, +${giftedStages} stage${giftedStages > 1 ? 's' : ''} queued`, 'warn');
     this.persist();
