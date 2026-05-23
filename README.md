@@ -123,6 +123,66 @@ Entry orders are placed as **Market** orders for immediate fill. Forced and manu
 
 ---
 
+## Loss Absorption
+
+Runs on every position-watcher tick for all open positions. When unrealised loss on a position exceeds 2.5× base margin, EverWinter cuts 5% of the position's current size at market, crystallising a small slice of the loss rather than letting it grow.
+
+### Stage-Aware Interval
+
+The interval between absorption cuts shortens automatically as the position DCA-stages deeper. The base interval is set in config (`lossAbsorptionIntervalMins`, default 45 min). When **Passive Second Wind** is enabled the effective interval compresses per stage:
+
+| DCA Stage | Effective Interval |
+|-----------|-------------------|
+| 0 | base (45 min default) |
+| 1 | ⅔ × base (30 min at default) |
+| 2 | ⅓ × base, min 5 min (15 min at default) |
+| 3+ | 5 min (hard floor) |
+
+If mark exceeds the new shorter interval on the same watcher tick that a stage transition is detected, the cut fires immediately on that tick rather than waiting for the next cycle. FUN Super Mode positions with `_funFastAbsorp` set always use the 5-minute floor regardless of stage.
+
+### Saved Margin Accumulation
+
+Each successful cut records how much margin was crystallised into `pos._savedMargin`. This accumulates across all cuts for the lifetime of the position:
+
+```
+pos._savedMargin += cutMgn   // cutMgn = cutQty × entryPrice / leverage
+```
+
+The activity log entry for each cut includes `| saved $X.XX` so the running total is visible in the feed.
+
+### Passive Second Wind
+
+When absorption fires but the position is already at minimum margin (cannot cut further), EverWinter checks whether `_savedMargin > 0` and `_secondWindActive` is not yet set. If both conditions hold, `_tryPassiveSecondWind` runs.
+
+**Stage calculation:**
+```
+extraStages = Math.floor(_savedMargin / baseMargin)
+surplus      = _savedMargin - extraStages × baseMargin   // added to last SW stage qty
+```
+
+`baseMargin` is `minNotional / leverage` — the per-stage margin floor for the position's strategy.
+
+**Order placement:**
+- Finds the highest trigger price among existing conditional orders not already flagged `_secondWind: true` (`lastStagePrice`).
+- Places `extraStages` new conditional orders at 3% compounding increments above `lastStagePrice`:
+  ```
+  swTrigger[i] = snapPrice(prevTrigger × 1.03, instr)
+  ```
+- Each order carries the correct `tpRoi` for its expanded stage index (`_tpRoi(baseStageCount + i + 1)`).
+- Orders are stamped `_secondWind: true` so the duplicate-conditional guard does not cancel them.
+
+**Position state updates:**
+- `pos._stageCount` is expanded to `baseStageCount + swOrders.length`.
+- `pos._secondWindActive = true` — suppresses any further second-wind attempt and blocks the regular SL enforcement path (the SL is moved to the new highest stage instead).
+- `pos._savedMargin = 0` — consumed.
+- Any existing SL order is cancelled: `setSL(symbol, 0)`, `pos.slPrice = null`, `pos.slSet = false`, `pos._slAcceptedKey = null`.
+
+**Duplicate-conditional guard:** The guard that cancels excess conditional orders compares `exchOrders.length > _posStageCount(pos)` rather than the global config stage count. This ensures second-wind orders are not treated as duplicates after `_stageCount` is expanded.
+
+**Config flag:** `passiveSecondWindEnabled` (default `true`). Toggle exposed in General Settings below the absorption interval slider. When disabled, stage-aware interval compression also deactivates and base interval applies at all stages.
+
+---
+
 ## Stats Menu
 
 The right-hand column contains several distinct sections.

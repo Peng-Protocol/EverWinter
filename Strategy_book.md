@@ -178,6 +178,12 @@ Two modes exist, differing in how aggressively they fire:
 
 **Passive Absorption**: Cuts positions on a fixed interval unconditionally — no loss threshold required. Every active position is trimmed on a regular cadence regardless of its current PnL state. One base-notional equivalent is closed each interval. Passive absorption runs at a steady pace and does not respond to how deep in loss a position sits — it ensures every position shrinks over time regardless of behavior. Critically, "regardless of PnL state" cuts both ways: a position sitting in profit is trimmed just as readily as a losing one. Those crystallized gains feed into the laggard's payback tally and pull the EDa TP closer, meaning passive absorption chips away at the book's collective deficit from both directions simultaneously.
 
+The interval is not fixed for the life of the position. As DCA stages fill, the clock tightens: stage 1 shortens the interval to ⅔ of the configured baseline, stage 2 to ⅓, and stage 3 to a hard 5-minute floor. A position moving against the strategy fast enough to trigger deeper DCA fills is moving fast enough to warrant faster cuts. Each cut's crystallized margin is tracked as *saved margin* — the amount that would otherwise have remained in a now-smaller position.
+
+When a cut is due but the position is already at minimum notional, it cannot absorb further. If saved margin has accumulated, the **Passive Second Wind** fires instead: the saved margin is divided into full base-margin units, each funding one additional DCA stage placed 3% above the prior stage (compounding from the last first-wind stage). Any surplus below one full unit is added to the final new stage's notional. The existing stop-loss is cancelled immediately; it re-arms when the new highest second-wind stage fills. The DCA stage counter advances into the new stages naturally — stage 4, 5, and so on — and the SL formula applies to the new maximum as it would to any terminal stage.
+
+The result is a direct conversion of margin the position has already shed into continued runway. Capital that would have remained locked in a shrinking position instead funds multiple conditional entries at progressively less favorable prices — a controlled extension of the DCA ladder, funded entirely from prior cuts, costing no new capital from the book.
+
 **Aggressive Absorption**: Threshold-triggered — fires only when a position's unrealized loss exceeds 2.5× its base margin. Each cut is 5% of the remaining margin. The interval halves with every successive cut down to a 30-second floor; recovery above threshold resets the counter. Cuts stop once the final DCA stage fires.
 
 If a position has been reduced to minimum notional when a cut is due, it is closed outright rather than trimmed further.
@@ -245,6 +251,18 @@ The final DCA stage filling normally arms the stop-loss. But absorption may have
 Second Wind detects this: if current margin is meaningfully below the expected cumulative margin at the final stage, the stage count is recalibrated to the effective stage that margin represents, and new DCA orders are queued from current price. SL is deferred until the recalibrated count fills. This repeats — each time the recalibrated final stage fills under the same condition, another wind is granted.
 
 **No thunder; no storm. No mountain; no avalanche.** In crypto, most alt pumps do not last longer than a day or two — after which they have to contract. The higher the climb, the more inevitable the fall. Aggressive absorption, DCA delay, exhumation, and second wind are designed together for exactly this: to let a position survive the worst a ticker can throw at it, then ride the reversion the next day or after. Absorption shaves exposure down through the climb. DCA delay refuses to commit capital at the wrong moment. Exhumation holds the exit door shut until the absorbed debt is genuinely settled. Second wind keeps stages alive as long as the position is lean enough to warrant more runway. By the time the avalanche arrives, what remains on the slope is a small, well-averaged position — not the bloated original.
+
+---
+
+#### Passive Second Wind
+
+Where Second Wind is triggered by the final stage filling under reduced margin, **Passive Second Wind** is triggered by the absorption clock running — a cut is due, but the position is already at minimum notional and cannot absorb further. The system asks: *how much margin did we save getting here?*
+
+Each successful absorption cut accumulates its crystallized margin into a running saved-margin tally for the position. When the tally is large enough to fund at least one additional base-margin stage, Passive Second Wind activates. The saved margin is divided into whole stage units; the remainder is added to the final new stage's notional. Each new stage is placed as a conditional 3% above the prior one, compounding from the last first-wind stage price. This is the same conditional infrastructure as DCA — it triggers on mark price, carries its own TP, and fills seamlessly into the position's stage tracking.
+
+The existing stop-loss is cancelled on activation. The SL will re-arm automatically when the new highest second-wind stage fills, applying the same formula it would to any terminal stage. Until that fill, the position carries no SL — but it also has no margin left to lose from absorption, and the extended stages now represent the only remaining runway.
+
+Passive Second Wind costs no new capital from the book. It is entirely self-funded: the margin that left the position through earlier cuts returns as conditional entries. The position shrinks, is deemed unworthy of further capital, and then quietly converts its own debris into multiple new chances at recovery.
 
 ---
 
