@@ -2836,6 +2836,8 @@ function psycho() { return {
     const outlierOn  = this.cfg.outlierEnabled !== false;
     const outlierMul = this.cfg.outlierMultiplier || 2.5;
 
+    const _absLog = [];      // collects per-action data for end-of-loop batch rollup
+
     for (const pos of [...this.positions]) {
       if ((pos.upnl || 0) >= threshold) { pos._absorptionCount = 0; pos._absorptionDeferred = false; continue; }
       if (_closingIds.has(pos.id)) continue;
@@ -2878,7 +2880,7 @@ function psycho() { return {
         pos._absorptionDeferred = true;
         pos._lastAbsorptionAt   = now;
         const sym = pos.symbol.replace('USDT', '');
-        this.logRollup(`absorb_${pos.symbol}`, `✂️ ${sym}: absorption deferred — cut loss $${Math.abs(cutPnl).toFixed(2)} > 2.5× base notional ($${(2.5 * baseNotional).toFixed(2)}) — retrying in 30s`, 'warn');
+        _absLog.push({ sym, deferred: true, cutPnl });
         continue;
       }
       pos._absorptionDeferred = false;
@@ -2919,9 +2921,22 @@ function psycho() { return {
       const sym = pos.symbol.replace('USDT', '');
       const _nextAbsorpMs  = isOutlier ? 30 * 1000 : Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._absorptionCount)));
       const _nextAbsorpStr = _nextAbsorpMs >= 60000 ? (_nextAbsorpMs / 60000).toFixed(1) + 'min' : Math.round(_nextAbsorpMs / 1000) + 's';
-      const _outlierTag = isOutlier ? ' [OUTLIER]' : '';
-      this.logRollup(`absorb_${pos.symbol}`, `✂️ ${sym}: absorption ×${pos._absorptionCount}${_outlierTag} — 5% cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${pos.margin.toFixed(2)} | next in ${_nextAbsorpStr}`, 'warn');
+      _absLog.push({ sym, deferred: false, cutPnl, cutRoi, mark, count: pos._absorptionCount, isOutlier, nextStr: _nextAbsorpStr });
     }
+
+    // Retroactive batch rollup — one log entry for all absorption activity this cycle
+    if (_absLog.length > 0) {
+      const cuts      = _absLog.filter(a => !a.deferred);
+      const deferreds = _absLog.filter(a =>  a.deferred);
+      const totalPnl  = cuts.reduce((s, a) => s + a.cutPnl, 0);
+      const symParts  = [
+        ...cuts.map(a => `${a.sym}${a.isOutlier ? '[OUT]' : ''}×${a.count}`),
+        ...deferreds.map(a => `${a.sym}(deferred)`),
+      ].join(' · ');
+      const minNext   = cuts.length ? cuts[cuts.length - 1].nextStr : '30s';
+      this.logRollup('absorb_batch', `✂️ Absorption ×${cuts.length}${deferreds.length ? ` +${deferreds.length} deferred` : ''} — ${symParts} | total ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(3)} USDT | next ${minNext}`, 'warn');
+    }
+
     this.persist();
   },
 
@@ -2930,6 +2945,8 @@ function psycho() { return {
     const now        = Date.now();
     const outlierMul = this.cfg.outlierMultiplier || 2.5;
     const baseMargin = this.cfg.minNotional / this.cfg.leverage;
+
+    const _decelLog = [];    // collects per-action data for end-of-loop batch rollup
 
     for (const pos of [...this.positions]) {
       if (_closingIds.has(pos.id)) continue;
@@ -2994,9 +3011,16 @@ function psycho() { return {
 
       const _nextMs  = Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._decelerationCount)));
       const _nextStr = _nextMs >= 60000 ? (_nextMs / 60000).toFixed(1) + 'min' : Math.round(_nextMs / 1000) + 's';
-      const _tag     = profitOutlier ? '[PROFIT OUTLIER]' : '[MARGIN OUTLIER]';
       const sym      = pos.symbol.replace('USDT', '');
-      this.logRollup(`decel_${pos.symbol}`, `📉 ${sym}: deceleration ×${pos._decelerationCount} ${_tag} — +${addMgn.toFixed(2)} margin @ ${fmtP(mark)} | new avg entry ${fmtP(pos.entryPrice)} | next in ${_nextStr}`, 'warn');
+      _decelLog.push({ sym, count: pos._decelerationCount, addMgn, profitOutlier, marginOutlier, nextStr: _nextStr });
+    }
+
+    // Retroactive batch rollup — one log entry for all deceleration activity this cycle
+    if (_decelLog.length > 0) {
+      const totalAdd  = _decelLog.reduce((s, a) => s + a.addMgn, 0);
+      const symParts  = _decelLog.map(a => `${a.sym}${a.profitOutlier ? '[P]' : '[M]'}×${a.count}`).join(' · ');
+      const minNext   = _decelLog[_decelLog.length - 1].nextStr;
+      this.logRollup('decel_batch', `📉 Deceleration ×${_decelLog.length} — ${symParts} | +${totalAdd.toFixed(2)} margin total | next ${minNext}`, 'warn');
     }
   },
 
