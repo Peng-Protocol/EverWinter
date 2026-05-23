@@ -174,8 +174,11 @@ surplus      = _savedMargin - extraStages × baseMargin   // added to last SW st
 **Position state updates:**
 - `pos._stageCount` is expanded to `baseStageCount + swOrders.length`.
 - `pos._secondWindActive = true` — suppresses any further second-wind attempt and blocks the regular SL enforcement path (the SL is moved to the new highest stage instead).
+- `pos._secondWindBaseStage = pos.dcaStage` — records which absolute stage second wind fired at; used to compute the relative stage for subsequent absorption intervals.
 - `pos._savedMargin = 0` — consumed.
 - Any existing SL order is cancelled: `setSL(symbol, 0)`, `pos.slPrice = null`, `pos.slSet = false`, `pos._slAcceptedKey = null`.
+
+**Interval reset after second wind:** Once `_secondWindActive` is set, the stage-aware interval schedule restarts from relative stage 0. The effective stage fed into the ⅔×/⅓×/5-min table is `pos.dcaStage − pos._secondWindBaseStage`, so the bot waits the full base interval before the first post-second-wind cut, then hastens again only as further second-wind conditionals fill.
 
 **Duplicate-conditional guard:** The guard that cancels excess conditional orders compares `exchOrders.length > _posStageCount(pos)` rather than the global config stage count. This ensures second-wind orders are not treated as duplicates after `_stageCount` is expanded.
 
@@ -350,7 +353,18 @@ The bulk ticker fetch is the dominant bandwidth cost: one full linear book downl
 
 Runs on each position watcher tick. Triggers on any position whose unrealised loss exceeds 2.5× base margin. Each cut closes 5% of the position's current size at market.
 
-The interval between cuts starts at 5 minutes and **halves with every successive cut** — 5 min → 2.5 min → 1.25 min → … down to a 30-second floor. The count is per-position and persists as long as the position stays below the threshold. If the position recovers above the -2.5× threshold at any watcher tick, the cut counter **resets to zero**, so the next cut (if the position falls back below threshold) restarts the full 5-minute interval. There is no gradual ramp-up — recovery snaps the cooldown back to 5 minutes immediately.
+**When Passive Second Wind is enabled**, the interval is determined by how many DCA stages have filled rather than by a per-cut halving counter:
+
+| DCA Stage (relative) | Effective Interval |
+|----------------------|-------------------|
+| 0 | 5 min (base) |
+| 1 | ⅔ × 5 min ≈ 3 min 20 s |
+| 2 | ⅓ × 5 min ≈ 1 min 40 s (min 30 s) |
+| 3+ | 30 s (hard floor) |
+
+After Second Wind activates, the stage counter resets to a relative stage 0 measured from the stage at which second wind fired (`pos._secondWindBaseStage`). The full 5-minute base interval applies again immediately, then hastens only if further second-wind DCA stages fill.
+
+**When Passive Second Wind is disabled**, the legacy halving schedule applies: interval starts at 5 minutes and halves with every successive cut down to a 30-second floor. The cut counter resets to zero if the position recovers above the −2.5× threshold.
 
 Absorption is paused while a DCA stage is queued for delayed placement; the incoming add may improve the average entry enough to lift the position back above threshold, making absorption unnecessary. Absorption stops entirely once the final DCA stage has triggered. If a position is already at minimum notional when a cut is due, it is closed outright rather than trimmed further.
 

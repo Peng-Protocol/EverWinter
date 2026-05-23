@@ -548,6 +548,13 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           </label>
           <div class="hint" style="margin-top:4px">When the final DCA stage fills but absorption has reduced the position below expected margin, SL is delayed — stage count is recalibrated to the effective stage the reduced margin represents, and new DCA orders are queued from current price. Repeats each time the recalibrated final stage fills under the same condition.</div>
         </div>
+        <div class="g" x-show="cfg.lossAbsorptionEnabled" style="margin-top:8px">
+          <label class="tog" @click.prevent="if(!cfgLocked){cfg.passiveSecondWindEnabled=!cfg.passiveSecondWindEnabled;persist()}">
+            <div class="tog-t" :class="(cfg.passiveSecondWindEnabled!==false)?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Passive Second Wind</span>
+          </label>
+          <div class="hint" style="margin-top:4px">Accelerates absorption at DCA stages 1/2/3 (⅔× · ⅓× · 30s). After second wind activates, interval resets to 5 min using the second-wind stage as relative stage 0, then hastens again if further stages trigger.</div>
+        </div>
         <div class="sep" style="margin-top:10px"></div>
         <div class="g">
           <label class="tog" @click.prevent="if(!cfgLocked){cfg.sacrificeEnabled=!cfg.sacrificeEnabled;if(!cfg.sacrificeEnabled)cfg.retractionEnabled=false;persist()}">
@@ -1230,6 +1237,7 @@ function psycho() { return {
     amaEnabled: false,
     exhumationEnabled: true,
     secondWindEnabled: true,
+    passiveSecondWindEnabled: true,
   },
 
   bot: { running: false, scanning: false, scanCd: 0, scanPct: 100, startTime: null },
@@ -2853,10 +2861,25 @@ function psycho() { return {
         if (avgLoss > 0 && Math.abs(Math.min(0, pos.upnl || 0)) >= outlierMul * avgLoss)  isOutlier = true;
       }
 
-      // Outlier positions or deferred positions use 30s minimum cooldown
-      const _absorpDelay = (isOutlier || pos._absorptionDeferred)
-        ? 30 * 1000
-        : Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._absorptionCount || 0)));
+      // Absorption interval — stage-aware when passiveSecondWindEnabled, legacy halving otherwise.
+      // After second wind, DCA stage is measured relative to the stage at activation.
+      const _baseAbsorpMs = 5 * 60 * 1000;
+      let _absorpDelay;
+      if (this.cfg.passiveSecondWindEnabled !== false) {
+        const _absStageAbs = pos.dcaStage || 0;
+        const _absStageRel = (pos._secondWindApplied && pos._secondWindBaseStage != null)
+          ? Math.max(0, _absStageAbs - pos._secondWindBaseStage)
+          : _absStageAbs;
+        if      (_absStageRel >= 3) _absorpDelay = 30 * 1000;
+        else if (_absStageRel >= 2) _absorpDelay = Math.max(30 * 1000, Math.round(_baseAbsorpMs / 3));
+        else if (_absStageRel >= 1) _absorpDelay = Math.max(30 * 1000, Math.round(_baseAbsorpMs * 2 / 3));
+        else                        _absorpDelay = _baseAbsorpMs;
+        if (isOutlier || pos._absorptionDeferred) _absorpDelay = 30 * 1000;
+      } else {
+        _absorpDelay = (isOutlier || pos._absorptionDeferred)
+          ? 30 * 1000
+          : Math.max(30 * 1000, Math.round(_baseAbsorpMs / Math.pow(2, pos._absorptionCount || 0)));
+      }
       if (now - (pos._lastAbsorptionAt || 0) < _absorpDelay) continue;
       if (pos._nextDcaPlaceAt && pos._nextDcaPlaceAt > now) continue;
       const mark = pos.markPrice || pos.entryPrice;
@@ -3065,7 +3088,8 @@ function psycho() { return {
     }
     if (!pos._nextDcaPlaceAt) pos._nextDcaPlaceAt = Date.now() + 5 * 60 * 1000;
 
-    pos._secondWindApplied = true;
+    pos._secondWindApplied    = true;
+    pos._secondWindBaseStage  = pos.dcaStage || 0;
     const sym = pos.symbol.replace('USDT', '');
     this.log(`💨 ${sym}: Second Wind — margin $${pos.margin.toFixed(2)} vs expected $${expectedFinal.toFixed(2)}, recalibrated to stage ${effectiveStage}, +${giftedStages} stage${giftedStages > 1 ? 's' : ''} queued`, 'warn');
     this.persist();
