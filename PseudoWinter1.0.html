@@ -938,6 +938,13 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="lbl">Interval <b x-text="cfg.lossAbsorptionIntervalMins+'min'"></b></div>
               <input type="range" min="15" max="180" step="15" x-model.number="cfg.lossAbsorptionIntervalMins" :disabled="cfgLocked" @change="persist()">
             </div>
+            <div x-show="cfg.lossAbsorptionEnabled" style="margin-top:10px">
+              <label class="tog" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''" @click.prevent="if(!cfgLocked){cfg.passiveSecondWindEnabled=!cfg.passiveSecondWindEnabled;persist()}">
+                <div class="tog-t" :class="(cfg.passiveSecondWindEnabled!==false)?'on':''"><div class="tog-k"></div></div>
+                <span class="tog-l">Passive Second Wind</span>
+              </label>
+              <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Accelerates absorption at DCA stages 1/2/3 (⅔× · ⅓× · 5 min). Deploys saved margin as extra DCA stages when position reaches minimum, then moves SL to the new highest stage. After second wind fires, interval resets to base using relative stage 0.</div>
+            </div>
           </div>
 
         </div>
@@ -2371,6 +2378,7 @@ function pw() { return {
     laggardAutoReduceThreshold: 3,
     lossAbsorptionEnabled: true,
     lossAbsorptionIntervalMins: 45,
+    passiveSecondWindEnabled: true,
     whiplashProximityPct: 20,  // % of TP distance remaining when whiplash audit arms (higher = earlier trigger)
     // ── FUN (Fund Chasing) Strategy ──
     funEnabled: true,          // enable fund-chasing strategy
@@ -2965,7 +2973,7 @@ function pw() { return {
       }
 
       // Loss absorption
-      if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) this.runLossAbsorption();
+      if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) await this.runLossAbsorption();
 
     } catch(e) { this.log('Cycle error: ' + e.message, 'error'); }
     finally { this._cycleRunning = false; }
@@ -6354,7 +6362,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       this._stopExtenderPoller(sym);
     }
   },
-  runLossAbsorption() {
+  async runLossAbsorption() {
     if (!this.cfg.lossAbsorptionEnabled) return;
     const now        = Date.now();
     const baseMargin = this.cfg.minNotional / this.cfg.leverage;
@@ -6366,22 +6374,34 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           this.log(`💰 ${pos.symbol.replace('USDT','')}: Super FUN ×${_li.trades} — fast absorption enabled (5 min)`, 'info');
         }
       }
-      const posIntervalMins = (pos._funFastAbsorp && this.cfg.funSuperMode) ? 5 : (this.cfg.lossAbsorptionIntervalMins ?? 45);
-      const intervalMs = posIntervalMins * 60 * 1000;
-      const _absBase = pos.openedAt || 0;
-      const _absElapsed = now - _absBase;
-      if (_absElapsed < intervalMs) continue;
-      const _absCutIdx = Math.floor(_absElapsed / intervalMs);
-      const _absExpectedAt = _absBase + _absCutIdx * intervalMs;
-      if ((pos._lastAbsorptionAt || 0) >= _absExpectedAt) continue;
-      pos._lastAbsorptionAt = _absExpectedAt;
+      // Stage-aware interval: tightens at DCA stages 1/2/3 when passiveSecondWindEnabled.
+      // After second wind fires, stage is measured relative to _secondWindBaseStage.
+      const baseIntervalMs = (this.cfg.lossAbsorptionIntervalMins ?? 45) * 60 * 1000;
+      const _absStageAbs = pos.dcaStage || 0;
+      const _absStageRel = (pos._secondWindActive && pos._secondWindBaseStage != null)
+        ? Math.max(0, _absStageAbs - pos._secondWindBaseStage)
+        : _absStageAbs;
+      let effectiveIntervalMs = baseIntervalMs;
+      if (this.cfg.passiveSecondWindEnabled !== false) {
+        if      (_absStageRel >= 3) effectiveIntervalMs = 5 * 60 * 1000;
+        else if (_absStageRel >= 2) effectiveIntervalMs = Math.max(5 * 60 * 1000, Math.round(baseIntervalMs / 3));
+        else if (_absStageRel >= 1) effectiveIntervalMs = Math.max(5 * 60 * 1000, Math.round(baseIntervalMs * 2 / 3));
+      }
+      if (pos._funFastAbsorp && this.cfg.funSuperMode) effectiveIntervalMs = 5 * 60 * 1000;
+      const _lastRef = pos._lastAbsorptionAt || pos.openedAt || 0;
+      if (now - _lastRef < effectiveIntervalMs) continue;
       if ((pos.margin || 0) <= baseMargin) {
-        const sym = pos.symbol.replace('USDT','');
-        this.log(`✂️ ${sym}: absorption due — position at minimum margin, pending DCA`, 'info');
+        if (this.cfg.passiveSecondWindEnabled !== false && !pos._secondWindActive && (pos._savedMargin || 0) > 0) {
+          await this._tryPassiveSecondWind(pos, baseMargin);
+        } else {
+          const sym = pos.symbol.replace('USDT','');
+          this.log(`✂️ ${sym}: absorption due — position at minimum margin, pending DCA`, 'info');
+        }
         pos._loaPending = true;
         continue;
       }
       this._tryAbsorbPos(pos, baseMargin);
+      pos._lastAbsorptionAt = now;
     }
     this.persist();
   },
@@ -6397,10 +6417,16 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     pos.totalSize = Math.max(0, pos.totalSize - cutQty);
     pos.margin    = Math.max(0, pos.margin - cutMgn);
     if (pos.notional) pos.notional *= (1 - cutFraction);
+    pos._savedMargin = parseFloat(((pos._savedMargin || 0) + cutMgn).toFixed(6));
     this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
     if (pos.margin < baseMargin) pos._loaPending = true;
     const sym = pos.symbol.replace('USDT','');
-    this.log(`✂️ ${sym}: absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)}`, 'warn');
+    const _s = pos.dcaStage || 0;
+    const _speedTag = (pos._funFastAbsorp && this.cfg.funSuperMode) ? ' [FUN⚡5min]'
+      : (pos._fun && _s >= 1) ? ` [FUN DCA${_s} speedup]`
+      : _s >= 1 ? ` [DCA${_s} speedup]`
+      : '';
+    this.log(`✂️ ${sym}:${_speedTag} absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)} | saved $${pos._savedMargin.toFixed(2)}`, 'warn');
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
       for (const p of this.positions) {
         p._laggardLostValue = (p._laggardLostValue || 0) + cutPnl;
@@ -6423,6 +6449,70 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     _absTab.totalPnl = parseFloat((_absTab.totalPnl + cutPnl).toFixed(6));
     _absTab.dcaStage = pos.dcaStage;
     _absTab.lastCutAt = _absNow;
+  },
+
+  async _tryPassiveSecondWind(pos, baseMargin) {
+    const savedMargin = pos._savedMargin || 0;
+    if (savedMargin <= 0) return;
+    const sym = pos.symbol.replace('USDT', '');
+
+    const extraStages = Math.floor(savedMargin / baseMargin);
+    const surplus     = savedMargin - extraStages * baseMargin;
+    if (extraStages <= 0) {
+      this.log(`✂️ ${sym}: at minimum — saved $${savedMargin.toFixed(2)} insufficient for second wind (need $${baseMargin.toFixed(2)}/stage)`, 'info');
+      return;
+    }
+
+    const instr = await this.getInstrInfo(pos.symbol);
+    if (!instr) return;
+
+    const firstWindOrders = (pos.orders || []).filter(o => o.type === 'cond' && !o._secondWind);
+    const lastStagePrice  = firstWindOrders.reduce((mx, o) => o.price > mx ? o.price : mx, 0);
+    if (lastStagePrice <= 0) {
+      this.log(`✂️ ${sym}: passive second wind skipped — no first-wind stage reference`, 'info');
+      return;
+    }
+
+    let runNotional = pos.entryPrice * pos.totalSize;
+    let runSize     = pos.totalSize;
+    const baseStageCount = this._posStageCount(pos);
+    const swOrders = [];
+    let prevPrice  = lastStagePrice;
+
+    for (let i = 0; i < extraStages; i++) {
+      const swTrigger    = this.snapPrice(prevPrice * 1.03, instr);
+      const isLast       = i === extraStages - 1;
+      const stageMargin  = baseMargin + (isLast ? surplus : 0);
+      const stageNotional = stageMargin * pos.leverage;
+      const addQty       = this.snapQty(stageNotional / swTrigger, instr);
+      if (addQty < instr.minQty) { prevPrice = swTrigger; continue; }
+
+      runNotional += swTrigger * addQty;
+      runSize     += addQty;
+      const expectedAvg = runNotional / runSize;
+      const tpRoi   = this._tpRoi(baseStageCount + i + 1);
+      const tpPrice = this.snapPrice(expectedAvg * (1 - tpRoi / 100 / pos.leverage), instr);
+      if (tpPrice <= 0) { prevPrice = swTrigger; continue; }
+
+      swOrders.push({ label: `SW${i + 1}`, price: swTrigger, qty: addQty, tpPrice, type: 'cond', filled: false, _secondWind: true });
+      prevPrice = swTrigger;
+    }
+
+    if (swOrders.length === 0) {
+      this.log(`✂️ ${sym}: passive second wind — no stages placed (all below exchange minimum)`, 'info');
+      return;
+    }
+
+    pos.orders            = [...(pos.orders || []), ...swOrders];
+    pos._stageCount       = baseStageCount + swOrders.length;
+    pos._secondWindActive = true;
+    pos._secondWindBaseStage = pos.dcaStage || 0;
+    pos._savedMargin      = 0;
+
+    // Cancel SL — re-arms when the new highest stage fills
+    pos.slPrice = null; pos.slSet = false;
+
+    this.log(`💨 ${sym}: Passive Second Wind ×${swOrders.length} — ${swOrders.map(o => fmtP(o.price)).join(' · ')} | $${savedMargin.toFixed(2)} saved → ${swOrders.length} stage${swOrders.length > 1 ? 's' : ''} (stage ${baseStageCount + 1}–${pos._stageCount})`, 'warn');
   },
 
   async runLaggardCheck() {
