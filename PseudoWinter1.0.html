@@ -3510,8 +3510,8 @@ function pw() { return {
       // 15m red candle gate — must have ≥ sfRedCandleMin red candles in last 4 completed 15m candles
       if (_sfRedMin > 0) {
         if (!kl15 || kl15.opens.length < 4) { skipBlocked++; continue; }
-        const last4opens  = kl15.opens.slice(-4);
-        const last4closes = kl15.closes.slice(-4);
+        const last4opens  = kl15.opens.slice(-5, -1);
+        const last4closes = kl15.closes.slice(-5, -1);
         const redCount = last4opens.filter((o, i) => last4closes[i] < o).length;
         if (redCount < _sfRedMin) { redCandleBlocked++; continue; }
       }
@@ -3873,8 +3873,8 @@ function pw() { return {
           const _clcMin = this.cfg.advFtClcMin ?? 3;
           const _kl15   = this.getKlines15m(sym);
           if (_kl15 && _kl15.opens.length >= 4) {
-            const _opens    = _kl15.opens.slice(-4);
-            const _closes   = _kl15.closes.slice(-4);
+            const _opens    = _kl15.opens.slice(-5, -1);
+            const _closes   = _kl15.closes.slice(-5, -1);
             const _redCount = _opens.filter((o, i) => _closes[i] < o).length;
             if (_redCount < _clcMin) {
               this.log(`⚡ ${sym}: ADV FT ClC blocked — ${_redCount}/4 red closes (need >=${_clcMin})`, 'debug');
@@ -4246,6 +4246,7 @@ function pw() { return {
       leverage:         pos.leverage,
       dcaStage:         pos.dcaStage || 0,
       _stageCount:      this._posStageCount(pos),
+            _swStageCount:    ((pos.orders || []).filter(o => o.type === 'cond' && o._secondWind).length || 0),
       duration,
       closedAt,
       _ft:              true,
@@ -4880,6 +4881,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force') {
             leverage:         pos.leverage,
             dcaStage:         pos.dcaStage || 0,
             _stageCount:      this._posStageCount(pos),
+      _swStageCount:    ((pos.orders || []).filter(o => o.type === 'cond' && o._secondWind).length || 0),
             duration,
             closedAt,
             ...(pos._fun  ? { _fun: true, _funIsLoser: pos._funIsLoser ?? false, _funCreepCount: pos._funCreepCount ?? 0, _funSubType: pos._funSubType ?? 'HFG', _funMult: pos._funMult ?? 3, _funBadge: pos._funBadge ?? '3x' } : {}),
@@ -5742,6 +5744,13 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         : '';
       const durStr    = (() => { try { return this.fmtDur(t.duration); } catch(e) { return '—'; } })();
       const openedStr = (() => { try { const oa = t.openedAt ?? (t.closedAt - (t.duration || 0)); return oa ? 'Opened: ' + this.fmtTs(oa) : ''; } catch(e) { return ''; } })();
+      const stageTotal = (() => {
+        const n = Number(t._stageCount);
+        if (Number.isFinite(n) && n > 0) return Math.floor(n);
+        const sw = Number(t._swStageCount || t.swStageCount || 0);
+        const dca = Number(t.dcaStage || 0);
+        return Math.max(3, dca + Math.max(0, sw));
+      })();
       const tsStr     = (() => { try { return 'Closed: ' + this.fmtTs(t.closedAt); } catch(e) { return 'Closed: —'; } })();
       const pnl     = t.pnl    ?? 0;
       const pnlPct  = t.pnlPct ?? 0;
@@ -5784,7 +5793,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:5px">
               <div class="ps"><div class="psl">Entry</div><div class="psv">${fmtP(t.originalEntryPrice ?? t.entryPrice)}</div></div>
               <div class="ps"><div class="psl">Exit</div><div class="psv">${fmtP(t.exitPrice)}</div></div>
-              <div class="ps"><div class="psl">DCA Stage</div><div class="psv">${t.dcaStage ?? 0}/${t._stageCount ?? 3}${t.dcaStage ? ` <span style="font-size:8px;color:var(--text-lo)">(avg ${fmtP(t.entryPrice)})</span>` : ''}</div></div>
+              <div class="ps"><div class="psl">DCA Stage</div><div class="psv">${t.dcaStage ?? 0}/${stageTotal}${t.dcaStage ? ` <span style="font-size:8px;color:var(--text-lo)">(avg ${fmtP(t.entryPrice)})</span>` : ''}</div></div>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:5px">
               <div class="ps"><div class="psl">Margin</div><div class="psv">$${(t.margin ?? 0).toFixed(2)}</div></div>
@@ -6448,7 +6457,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     pos.totalSize = Math.max(0, pos.totalSize - cutQty);
     pos.margin    = Math.max(0, pos.margin - cutMgn);
     if (pos.notional) pos.notional *= (1 - cutFraction);
-    pos._savedMargin = parseFloat(((pos._savedMargin || 0) + cutMgn).toFixed(6));
+    // Reusable margin is net of realized loss on this cut; absorption also runs while in profit.
+    const netSavedMgn = Math.max(0, cutMgn + Math.min(0, cutPnl));
+    pos._savedMargin = parseFloat(((pos._savedMargin || 0) + netSavedMgn).toFixed(6));
     this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
     const sym = pos.symbol.replace('USDT','');
     const _s = pos.dcaStage || 0;
@@ -6456,7 +6467,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       : (pos._fun && _s >= 1) ? ` [FUN DCA${_s} speedup]`
       : _s >= 1 ? ` [DCA${_s} speedup]`
       : '';
-    this.log(`✂️ ${sym}:${_speedTag} absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)} | saved $${pos._savedMargin.toFixed(2)}`, 'warn');
+    this.log(`✂️ ${sym}:${_speedTag} absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)} | reusable $${pos._savedMargin.toFixed(2)}`, 'warn');
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
       for (const p of this.positions) {
         p._laggardLostValue = (p._laggardLostValue || 0) + cutPnl;
@@ -6469,7 +6480,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       }
       // Pool this cut's saved margin into the laggard so it can build extra SW stages.
       if (laggard && laggard.id !== pos.id && this.cfg.passiveSecondWindEnabled !== false) {
-        laggard._savedMargin = parseFloat(((laggard._savedMargin || 0) + cutMgn).toFixed(6));
+        laggard._savedMargin = parseFloat(((laggard._savedMargin || 0) + netSavedMgn).toFixed(6));
       }
     }
     const _absNow = Date.now();
@@ -6514,7 +6525,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     let prevPrice  = lastStagePrice;
 
     for (let i = 0; i < extraStages; i++) {
-      const swTrigger    = this.snapPrice(prevPrice * 1.03, instr);
+      let swTrigger    = this.snapPrice(prevPrice * 1.03, instr);
+      if (swTrigger <= prevPrice) swTrigger = this.snapPrice(prevPrice + (instr.tickSize || 0), instr);
       const isLast       = i === extraStages - 1;
       const stageMargin  = baseMargin + (isLast ? surplus : 0);
       const stageNotional = stageMargin * pos.leverage;
@@ -6672,6 +6684,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       leverage:         pos.leverage,
       dcaStage:         pos.dcaStage || 0,
       _stageCount:      this._posStageCount(pos),
+      _swStageCount:    ((pos.orders || []).filter(o => o.type === 'cond' && o._secondWind).length || 0),
       duration,
       closedAt,
       ...(pos._fun  ? { _fun: true, _funIsLoser: pos._funIsLoser ?? false, _funCreepCount: pos._funCreepCount ?? 0, _funSubType: pos._funSubType ?? 'HFG', _funMult: pos._funMult ?? 3, _funBadge: pos._funBadge ?? '3x' } : {}),
