@@ -3510,7 +3510,7 @@ function ew() { return {
       this.log(`${pos.symbol}: absorption cut failed — ${e.message}`, 'error');
       return;
     }
-    pos.totalSize = Math.max(0, pos.totalSize - cutQty);
+    pos.totalSize = Math.max(0, pos.totalSize - qty);   // use snapped qty — mirrors what the exchange executed
     pos.margin    = Math.max(0, pos.margin - cutMgn);
     this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
     if (pos.margin < baseMargin) pos._loaPending = true;
@@ -3524,7 +3524,11 @@ function ew() { return {
       if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
         const buffMul  = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
         const buffedEV = laggard._laggardInitialEV * buffMul;
-        laggard._edaTpPrice = Math.max(0, laggard.entryPrice - (buffedEV - laggard._laggardLostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin));
+        const newEdaTp = Math.max(0, laggard.entryPrice - (buffedEV - laggard._laggardLostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin));
+        // Only clear the gate — the confirmed _edaTpPrice is updated by runLaggardCheck
+        // after a successful setTP. Keeping the old confirmed value until then preserves
+        // laggard protection during the one-cycle gap before the updated order is placed.
+        if (newEdaTp === 0) laggard._edaTpPrice = 0;
       }
     }
   },
@@ -3549,7 +3553,9 @@ function ew() { return {
 
     // EDa TP: price at which uPnL = buffedEV − lostValue (ED zero point)
     const edaTpPrice = Math.max(0, laggard.entryPrice - (buffedEV - lostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin));
-    laggard._edaTpPrice = edaTpPrice;
+    // _edaTpPrice is only updated on confirmed setTP success below — do not set it here.
+    // If the formula collapses to zero, clear the gate so the regular TP can take over.
+    if (edaTpPrice === 0) laggard._edaTpPrice = 0;
 
     // Place or update the limit close order when edaTpPrice is valid and below current market
     if (edaTpPrice > 0 && edaTpPrice < (laggard.markPrice ?? Infinity)) {
@@ -3557,7 +3563,9 @@ function ew() { return {
       if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
         laggard._edaTpPrev = edaTpPrice;
         laggard._nativeReduceTpPrice = null; // EDa limit order takes ownership; clear native TP tracking
-        this.setTP(laggard, edaTpPrice).catch(() => {});
+        this.setTP(laggard, edaTpPrice).then(r => {
+          if (r === 'ok') laggard._edaTpPrice = edaTpPrice;
+        }).catch(() => {});
       }
     }
 
@@ -3587,10 +3595,12 @@ function ew() { return {
       const buffMul  = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
       const buffedEV = laggard._laggardInitialEV * buffMul;
       const edaTp    = Math.max(0, laggard.entryPrice - (buffedEV - laggard._laggardLostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin));
-      laggard._edaTpPrice = edaTp;
+      if (edaTp === 0) laggard._edaTpPrice = 0;
       laggard._edaTpPrev  = edaTp;
       if (edaTp > 0 && edaTp < (laggard.markPrice ?? Infinity)) {
-        this.setTP(laggard, edaTp).catch(() => {});
+        this.setTP(laggard, edaTp).then(r => {
+          if (r === 'ok') laggard._edaTpPrice = edaTp;
+        }).catch(() => {});
       }
     }
     this.persist();
@@ -6766,14 +6776,17 @@ function ew() { return {
   async setTP(pos, tpPrice) {
     await this.signedDelay();
     const symbol  = pos.symbol;
-    const instr   = this._instrCache[symbol];
+    const instr   = await this.getInstrInfo(symbol);
+    if (!instr) return 'error';
 
     // Guard: if position size is below instrument minimum, a limit TP order is impossible.
     // Return early WITHOUT touching the existing TP order — preserving whatever is on the exchange.
-    if (instr && this.snapQty(pos.totalSize, instr) < instr.minQty) {
-      return 'zero-qty';
-    }
-    const tick    = instr?.tickSize || 0;
+    // Always use the snapped qty — pos.totalSize may carry float fractions from absorptions
+    // that Bybit would truncate to zero when the raw string is parsed.
+    const orderQty = this.snapQty(pos.totalSize, instr);
+    if (orderQty < instr.minQty) return 'zero-qty';
+
+    const tick    = instr.tickSize || 0;
     const priceDp = tick > 0
       ? (tick.toString().includes('.') ? tick.toString().split('.')[1].length : 0)
       : 8;
@@ -6795,7 +6808,7 @@ function ew() { return {
     // Place a new GTC Limit Buy reduceOnly order at tpPrice.
     const b = JSON.stringify({
       category: 'linear', symbol, side: 'Buy', orderType: 'Limit',
-      qty: String(pos.totalSize), price: priceStr, timeInForce: 'GTC', reduceOnly: true,
+      qty: String(orderQty), price: priceStr, timeInForce: 'GTC', reduceOnly: true,
     });
     const h = await signHdr(this.creds.key, this.creds.secret, b, this._tsOffset);
     try {
