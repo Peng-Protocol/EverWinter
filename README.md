@@ -98,7 +98,7 @@ Entries are **Market**. Force/manual closes are **Limit IOC** at `markPrice × 1
 
 ## Loss Absorption
 
-Triggers when unrealised loss exceeds 2.5× base margin; cuts 5% of current size at market. The base interval (`lossAbsorptionIntervalMins`, default 45 min) shortens per DCA stage when Passive Second Wind is enabled:
+Passive, timer-based — fires every base interval (default 45 min) regardless of loss depth; cuts 5% of current size at market. No loss threshold is required; the cut fires whenever the interval elapses and the position has margin above the base floor. The base interval (`lossAbsorptionIntervalMins`) shortens per DCA stage when Passive Second Wind is enabled:
 
 | DCA Stage | Interval |
 |-----------|----------|
@@ -144,7 +144,7 @@ Full-state export/import (config, stats, trades, positions). Import overwrites a
 
 ## Trades Menu
 
-Reverse-chronological feed of closed positions: symbol, entry/exit price, DCA stage, duration, PnL, close reason. Rendered via `renderTradeFeed()`, not Alpine `x-for`, to avoid reactivity issues on large lists.
+Reverse-chronological feed of closed positions: symbol, entry/exit price, DCA stage, duration, PnL, close reason. Rendered via `renderTradeFeed()`, not Alpine `x-for`, to avoid reactivity issues on large lists. Old cards are rolled up into a period card as the list grows.
 
 > **Session PnL vs Trades:** These won't match — expected. Absorption cuts credit PnL immediately without a trade card. The laggard's EDa TP close shows inflated PnL because it includes recovered book losses; session PnL booked those losses early and the trades feed shows the recovery late.
 
@@ -199,7 +199,7 @@ Legacy halving (second wind off): starts at 5 min, halves per cut, floors at 30 
 
 **Outlier Acceleration** — positions whose margin or absolute loss exceeds 2.5× the book average absorb at the 30 s floor. Deferred if a single 5% cut would crystallise > 2.5× base notional.
 
-**Outlier Deceleration** — positions whose profit or margin is 2.5× the book average have 5% added at market. Same cooldown as acceleration.
+**Outlier Deceleration** — positions whose profit or margin deficit is 2.5× the book average have 5% added at market. Same cooldown as acceleration.
 
 ### Exhumation
 
