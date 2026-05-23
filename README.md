@@ -113,7 +113,7 @@ FUN Super Mode positions with `_funFastAbsorp` always use the 5-min floor.
 Each cut accumulates `cutMgn = cutQty × entryPrice / leverage` into `pos._savedMargin`. Visible in the activity log as `| saved $X.XX`.
 
 ### Passive Second Wind
-Fires when absorption is due but the position is at minimum margin and `_savedMargin > 0`. Computes `extraStages = floor(_savedMargin / baseMargin)` and places that many conditional orders above the last stage trigger at 3% compounding increments, each stamped `_secondWind: true`. After activation: `_stageCount` expands, SL is cancelled, and the interval resets to relative stage 0 from `_secondWindBaseStage` — the bot re-earns faster intervals as second-wind stages fill. The duplicate-conditional guard compares against `_posStageCount(pos)`, not the config default, to avoid cancelling second-wind orders.
+Fires when absorption is due but the position is at minimum margin and `_savedMargin > 0`. Computes `extraStages = floor(_savedMargin / baseMargin)` and places that many conditional orders above the last stage trigger at 3% compounding increments, each stamped `_secondWind: true`. After activation: `_stageCount` expands, SL is recomputed to the new highest stage, and the interval resets to relative stage 0 from `_secondWindBaseStage` — the bot re-earns faster intervals as second-wind stages fill. The duplicate-conditional guard compares against `_posStageCount(pos)`, not the config default, to avoid cancelling second-wind orders.
 
 ---
 
