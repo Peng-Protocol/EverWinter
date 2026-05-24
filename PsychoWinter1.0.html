@@ -2156,12 +2156,13 @@ function psycho() { return {
         continue;
       }
 
-      // Whiplash check — pseudo only, arms when within proximity% of TP
-      if (!pos._live && pos.currentTpPrice > 0 && !(pos._amaActive && !pos._amaCancelled) && !this._whiplashScheduled[pos.id]) {
-        const total = pos.entryPrice - pos.currentTpPrice;
-        const remaining = mark - pos.currentTpPrice;
+      // Whiplash check — pseudo only, arms when within proximity% of active TP (regular or EDa)
+      const _activeTp = this._activeTpForPos(pos);
+      if (!pos._live && _activeTp.price > 0 && !(pos._amaActive && !pos._amaCancelled) && !this._whiplashScheduled[pos.id]) {
+        const total = pos.entryPrice - _activeTp.price;
+        const remaining = mark - _activeTp.price;
         if (total > 0 && remaining / total * 100 <= this.cfg.whiplashProximityPct) {
-          this._scheduleWhiplashCheck(pos);
+          this._scheduleWhiplashCheck(pos, _activeTp.price, _activeTp.kind);
         }
       }
     }
@@ -2469,16 +2470,17 @@ function psycho() { return {
   // ── Whiplash check (pseudo only) ──
   // Schedules a 1-min K-line audit 5 min after a position comes within
   // whiplashProximityPct% of its TP. Catches TPs missed due to poll latency.
-  _scheduleWhiplashCheck(pos) {
+  _scheduleWhiplashCheck(pos, tpRef = null, tpKind = 'tp') {
     if (this._whiplashScheduled[pos.id]) return;
-    const _snapTp = pos.currentTpPrice; // snapshot at schedule time — must match at fire time
-    this.log(`🎯 ${pos.symbol}: within ${this.cfg.whiplashProximityPct}% of TP — K-line audit in 5 min`, 'info');
+    const _snapTp = tpRef ?? this._activeTpForPos(pos).price; // snapshot at schedule time — must match at fire time
+    const _snapKind = tpKind === 'eda' ? 'EDa TP' : 'TP';
+    this.log(`🎯 ${pos.symbol}: within ${this.cfg.whiplashProximityPct}% of ${_snapKind} — K-line audit in 5 min`, 'info');
     this._whiplashScheduled[pos.id] = setTimeout(async () => {
       delete this._whiplashScheduled[pos.id];
       if (!this.positions.find(p => p.id === pos.id)) return;
-      // If TP changed since scheduling (e.g. a DCA stage filled), abort — the regular
-      // position watcher owns the new TP and will close at the correct price when hit.
-      if (pos.currentTpPrice !== _snapTp) return;
+      // If active TP changed since scheduling (e.g. DCA fill or EDa recompute), abort — watcher owns the new TP.
+      const _liveTp = this._activeTpForPos(pos).price;
+      if (_liveTp !== _snapTp) return;
       try {
         const url = `${this._baseUrl()}/v5/market/kline?category=linear&symbol=${pos.symbol}&interval=1&limit=6`;
         const r = await fetch(url);
@@ -2486,7 +2488,7 @@ function psycho() { return {
         const candles = d?.result?.list || [];
         const hit = candles.some(c => parseFloat(c[3]) <= _snapTp); // index 3 = low
         if (hit) {
-          this.log(`🎯 ${pos.symbol}: K-line audit — TP ${fmtP(_snapTp)} was touched, closing`, 'success');
+          this.log(`🎯 ${pos.symbol}: K-line audit — ${_snapKind} ${fmtP(_snapTp)} was touched, closing`, 'success');
           await this.pseudoClosePosition(pos, 'tp', _snapTp);
         }
       } catch(e) {
@@ -3561,11 +3563,21 @@ function psycho() { return {
     return { pct: total > 0 ? Math.min(100, Math.max(0, (lo - mark) / total * 100)) : 0, color: 'var(--profit)' };
   },
 
+
+  _activeTpForPos(pos) {
+    if (!pos) return { price: 0, kind: 'tp' };
+    const isExhumed = this.cfg.exhumationEnabled !== false && pos._exhumed && (pos._exhumedEdaTpPrice || 0) > 0;
+    if (isExhumed) return { price: pos._exhumedEdaTpPrice || 0, kind: 'eda' };
+    const isLaggard = this.isLaggard(pos);
+    if (isLaggard && (pos._edaTpPrice || 0) > 0) return { price: pos._edaTpPrice || 0, kind: 'eda' };
+    return { price: pos.currentTpPrice || 0, kind: 'tp' };
+  },
+
   _dcaBand(pos) {
     const cond = pos.orders.filter(o => o.type === 'cond');
     const mark = pos.markPrice;
     const avgEntry = pos.entryPrice;
-    const tp = pos.currentTpPrice;
+    const tp = this._activeTpForPos(pos).price;
     if (!mark || !tp) return { band: 0, pct: 0, color: 'var(--profit)', inProfitZone: true };
     if (mark <= avgEntry) {
       const total = avgEntry - tp;
