@@ -212,6 +212,16 @@ exhEdaTp = entryPrice − (buffedEV + |absorbedLoss|) × entryPrice / (leverage 
 ```
 Exhumed positions block regular TP, recompute EH TP on each DCA fill or absorption cut, and suspend laggard force-close. Only SL or EH TP can close them (sacrifice as last resort). Clears when `tab.totalPnl ≥ 0`.
 
+### Congestion Auto-Reduce
+
+When **Laggard Auto-Reduce** is enabled and open positions reach `laggardAutoReduceThreshold` (or `maxPos`), positions are pushed into reduce phase early.
+
+- Positions already at effective TP ROI `≤ 3%` (including TP ingress-reduced entries) are skipped — they are already at reduce-floor TP.
+- For eligible positions, the bot attempts **global EDa TP** first (using global lost value).
+- If EDa is not valid/placeable on that tick, it falls back to native **3% TP**.
+
+This means congestion can fire correctly while making no visible TP change on positions already at 3%.
+
 ### Laggard
 
 Evaluates oldest position (or deepest-stage with **Age Mode**); force-closes when `buffedEV − lostValue − uPnL ≤ 0`. Every close and absorption cut feeds into the lost-value tally. **80% margin floor**: cuts skipped if they'd leave < 80% of base margin, preventing EDa TP from computing negative. **Profit Offset** scales the EV buffer (default +50% = 1.5× EV); **Laggard Absorption** trims 5% every 5 min instead of force-closing.
