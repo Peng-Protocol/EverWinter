@@ -774,7 +774,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                     <div class="tog-t" :class="(cfg.infiniteSecondWindEnabled!==false)?'on':''"><div class="tog-k"></div></div>
                     <span class="tog-l">Infinite Second Wind</span>
                   </label>
-                  <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Re-fires second wind whenever enough margin has been saved since the last activation. Savings from any position are pooled into the laggard. The laggard's force-close is suspended so it can run indefinitely.</div>
+                  <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Re-fires second wind whenever enough margin has been saved since the last activation. Savings from any position are pooled across all open positions. Each position can spend pooled runway for additional second-wind stages; the laggard still keeps force-close exemption while infinite second wind is active.</div>
                 </div>
               </div>
             </div>
@@ -1203,8 +1203,8 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="ps"><div class="psl">24h Chg</div><div class="psv short" x-text="(parseFloat(p.change24h)>=0?'+':'')+p.change24h+'%'"></div></div>
               <div class="ps"><div class="psl">RSI6/12/24</div><div class="psv" x-text="(p.rsi6?p.rsi6.toFixed(0):'—')+'/'+(p.rsi12?p.rsi12.toFixed(0):'—')+'/'+(p.rsi24?p.rsi24.toFixed(0):'—')"></div></div>
               <div class="ps" style="min-width:0;overflow:hidden">
-                <div class="psl" x-text="(()=>{const isLag=cfg.laggardCheckEnabled&&p.phase==='reduce'&&p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;const isFFA=p._fun&&p._funFastAbsorp&&cfg.funSuperMode&&p.phase==='reduce'&&p._edaTpPrice>0;return((isLag&&p._edaTpPrice>0)||isFFA)?'EDa TP':'Current TP';})()"></div>
-                <div class="psv" style="color:var(--profit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" x-text="(()=>{const isLag=cfg.laggardCheckEnabled&&p.phase==='reduce'&&p.id===positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o,positions[0]).id;const isFFA=p._fun&&p._funFastAbsorp&&cfg.funSuperMode&&p.phase==='reduce'&&p._edaTpPrice>0;if((isLag&&p._edaTpPrice>0)||isFFA){const roi=(p.entryPrice-p._edaTpPrice)/p.entryPrice*p.leverage*100;return roi.toFixed(1)+'%  '+fmtP(p._edaTpPrice);}return p.tpPct+'%  '+fmtP(p.currentTpPrice);})()"></div>
+                <div class="psl" x-text="(()=>{const isGlobalEda=cfg.laggardCheckEnabled&&p.phase==='reduce'&&p._edaTpPrice>0;const isFFA=p._fun&&p._funFastAbsorp&&cfg.funSuperMode&&p.phase==='reduce'&&p._edaTpPrice>0;return(isGlobalEda||isFFA)?'EDa TP':'Current TP';})()"></div>
+                <div class="psv" style="color:var(--profit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" x-text="(()=>{const isGlobalEda=cfg.laggardCheckEnabled&&p.phase==='reduce'&&p._edaTpPrice>0;const isFFA=p._fun&&p._funFastAbsorp&&cfg.funSuperMode&&p.phase==='reduce'&&p._edaTpPrice>0;if(isGlobalEda||isFFA){const roi=(p.entryPrice-p._edaTpPrice)/p.entryPrice*p.leverage*100;return roi.toFixed(1)+'%  '+fmtP(p._edaTpPrice);}return p.tpPct+'%  '+fmtP(p.currentTpPrice);})()"></div>
               </div>
               <!-- Funding rate — shown when available (live, refreshed each watch cycle) -->
               <div class="ps" x-show="p.fundingRate!=null">
@@ -2104,7 +2104,7 @@ function ew() { return {
     lossAbsorptionEnabled: true,
     lossAbsorptionIntervalMins: 45,
     passiveSecondWindEnabled: true, // accelerates absorption by DCA stage; deploys saved margin as extra stages at minimum
-    infiniteSecondWindEnabled: true, // re-fires SW each time enough margin is saved; pools savings from all positions into laggard; suspends laggard force-close
+    infiniteSecondWindEnabled: true, // re-fires SW each time enough margin is saved; pools savings from all positions across the whole book; suspends laggard force-close
     // ── FUN (Fund Chasing) Strategy ──
     funEnabled: true,          // enable fund-chasing strategy (requires gainersEnabled)
     funRsiMin:      25,        // minimum RSI floor for FUN entries — all three timeframes must be ≥ this
@@ -2146,6 +2146,7 @@ function ew() { return {
   showDebug: false,
   closedTrades: [],  // history of closed positions — rendered by renderTradeFeed()
   sess: { trades:0, wins:0, losses:0, pnl:0, forceClose:0, tpReduce:0, ftTotalDone:0 },
+  _globalLostValue: 0,
   mobTab: 'config',
   tick: 0,           // increments every second — forces Alpine to re-evaluate timer expressions
   _lastSignedCall: 0, // timestamp of last signed API call — enforces minimum spacing
@@ -3500,8 +3501,17 @@ function ew() { return {
         else if (_absStageRel >= 1) effectiveIntervalMs = Math.max(5 * 60 * 1000, Math.round(baseIntervalMs * 2 / 3));
       }
       if (pos._funFastAbsorp && this.cfg.funSuperMode) effectiveIntervalMs = 5 * 60 * 1000;
-      const _lastRef = pos._lastAbsorptionAt || pos.openedAt || 0;
-      if (now - _lastRef < effectiveIntervalMs) continue;
+      // Absolute absorption timeline (anchored to position open time):
+      // fire only on exact interval boundaries, and do not catch up missed slots.
+      const openedAtMs = Number(pos.openedAt || 0);
+      if (!openedAtMs || openedAtMs > now) continue;
+      const elapsedMs = now - openedAtMs;
+      const slotIdx = Math.floor(elapsedMs / effectiveIntervalMs);
+      if (slotIdx <= 0) continue;
+      const slotStartMs = openedAtMs + (slotIdx * effectiveIntervalMs);
+      const watchWindowMs = 16 * 1000; // watch loop is 15s; allow slight drift
+      if (now - slotStartMs >= watchWindowMs) continue;
+      if ((pos._lastAbsorptionSlot ?? -1) >= slotIdx) continue;
       const _posMult     = pos._fun ? (pos._funMult ?? 2) : pos._salf ? 2 : 1;
       const posBaseMargin = baseMargin * _posMult;
       if ((pos.margin || 0) <= posBaseMargin) {
@@ -3511,9 +3521,11 @@ function ew() { return {
           await this._tryPassiveSecondWind(pos, posBaseMargin);
         }
         pos._lastAbsorptionAt = now;
+        pos._lastAbsorptionSlot = slotIdx;
         continue;
       }
       await this._tryAbsorbPos(pos, posBaseMargin);
+      pos._lastAbsorptionSlot = slotIdx;
       this.persist();
     }
   },
@@ -3530,7 +3542,11 @@ function ew() { return {
     // target exceeds the entry price (negative result clamped to zero), which silently
     // disables the EDa protection gate and allows the 3% reduce TP to trigger instead.
     if (pos.margin - cutMgn < baseMargin * 0.80) {
-      this.log(`✂️ ${pos.symbol.replace('USDT','')}: absorption skipped — cut would breach 80% base-margin floor ($${(baseMargin * 0.80).toFixed(2)} min)`, 'info');
+      const _floorLogKey = `${Math.floor(Date.now() / 60000)}:${(baseMargin * 0.80).toFixed(2)}`;
+      if (pos._lastAbsorptionFloorLogKey !== _floorLogKey) {
+        this.log(`✂️ ${pos.symbol.replace('USDT','')}: absorption skipped — cut would breach 80% base-margin floor ($${(baseMargin * 0.80).toFixed(2)} min)`, 'info');
+        pos._lastAbsorptionFloorLogKey = _floorLogKey;
+      }
       return;
     }
     const cutPnl = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * cutMgn;
@@ -3569,6 +3585,7 @@ function ew() { return {
       for (const p of this.positions) {
         p._laggardLostValue = (p._laggardLostValue || 0) + cutPnl;
       }
+      this._globalLostValue = (this._globalLostValue || 0) + cutPnl;
       const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
       if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
         const buffMul  = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
@@ -3579,10 +3596,14 @@ function ew() { return {
         // laggard protection during the one-cycle gap before the updated order is placed.
         if (newEdaTp === 0) laggard._edaTpPrice = 0;
       }
-      // Pool this cut's saved margin into the laggard so it can build extra SW stages.
-      if (laggard && laggard.id !== pos.id && this.cfg.passiveSecondWindEnabled !== false) {
-        laggard._savedMargin = parseFloat(((laggard._savedMargin || 0) + netSavedMgn).toFixed(6));
-        laggard._savedMarginPooled = parseFloat(((laggard._savedMarginPooled || 0) + netSavedMgn).toFixed(6));
+      // Global debt mode: pool this cut's saved margin into every other open position
+      // so all reduce-phase candidates can build passive second-wind runway.
+      if (this.cfg.passiveSecondWindEnabled !== false) {
+        for (const peer of this.positions) {
+          if (!peer || peer.id === pos.id) continue;
+          peer._savedMargin = parseFloat(((peer._savedMargin || 0) + netSavedMgn).toFixed(6));
+          peer._savedMarginPooled = parseFloat(((peer._savedMarginPooled || 0) + netSavedMgn).toFixed(6));
+        }
       }
     }
     // Recompute EDa TP limit order for fast-FUN positions already in reduce phase.
@@ -3713,48 +3734,34 @@ function ew() { return {
     if (!this.cfg.laggardCheckEnabled) return;
     if (this.positions.length < 1) return;
     const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
-    if (!laggard || laggard.phase !== 'reduce') return;
-    // Dedup: if a close was already triggered for this position within the last 30s, skip.
-    if (laggard._laggardClosingAt && Date.now() - laggard._laggardClosingAt < 30000) {
-      this.log(`⏳ ${laggard.symbol}: Laggard close cooldown — ${Math.round((30000-(Date.now()-laggard._laggardClosingAt))/1000)}s remaining`, 'debug');
-      return;
-    }
-    const uPnl          = laggard.markPrice
-      ? (laggard.entryPrice - laggard.markPrice) / laggard.entryPrice * laggard.leverage * laggard.margin
-      : 0;
-    const ev            = laggard._laggardInitialEV || 0;
-    const lostValue     = laggard._laggardLostValue || 0;
-    const buffMul       = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
-    const buffedEV      = ev * buffMul;
-
-    // EDa TP: price at which uPnL = buffedEV − lostValue (ED zero point)
-    const edaTpPrice = Math.max(0, laggard.entryPrice - (buffedEV - lostValue) * laggard.entryPrice / (laggard.leverage * laggard.margin));
-    // _edaTpPrice is only updated on confirmed setTP success below — do not set it here.
-    // If the formula collapses to zero, clear the gate so the regular TP can take over.
-    if (edaTpPrice === 0) laggard._edaTpPrice = 0;
-
-    // Place or update the limit close order when edaTpPrice is valid and below current market
-    if (edaTpPrice > 0 && edaTpPrice < (laggard.markPrice ?? Infinity)) {
-      const prev = laggard._edaTpPrev;
-      if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
-        laggard._edaTpPrev = edaTpPrice;
-        laggard._nativeReduceTpPrice = null; // EDa limit order takes ownership; clear native TP tracking
-        this.setTP(laggard, edaTpPrice).then(r => {
-          if (r === 'ok') laggard._edaTpPrice = edaTpPrice;
-        }).catch(() => {});
+    const debt = this._globalLostValue || 0;
+    for (const pos of this.positions) {
+      if (!pos || pos.phase !== 'reduce' || !pos._laggardInitialEV) continue;
+      if (pos._laggardClosingAt && Date.now() - pos._laggardClosingAt < 30000) continue;
+      const uPnl = pos.markPrice ? (pos.entryPrice - pos.markPrice) / pos.entryPrice * pos.leverage * pos.margin : 0;
+      const ev = pos._laggardInitialEV || 0;
+      const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+      const buffedEV = ev * buffMul;
+      const edaTpPrice = Math.max(0, pos.entryPrice - (buffedEV - debt) * pos.entryPrice / (pos.leverage * pos.margin));
+      if (edaTpPrice === 0) pos._edaTpPrice = 0;
+      if (edaTpPrice > 0 && edaTpPrice < (pos.markPrice ?? Infinity)) {
+        const prev = pos._edaTpPrev;
+        if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
+          pos._edaTpPrev = edaTpPrice;
+          pos._nativeReduceTpPrice = null;
+          this.setTP(pos, edaTpPrice).then(r => { if (r === 'ok') pos._edaTpPrice = edaTpPrice; }).catch(() => {});
+        }
       }
-    }
-
-    const buffedED      = buffedEV - lostValue - uPnl;
-    if (buffedED <= 0) {
-      if (_closingIds.has(laggard.id)) return;
-      if (!this.positions.find(x => x.id === laggard.id)) return;
-      laggard._laggardClosingAt = Date.now();
-      this.log(`⏳ ${laggard.symbol}: Laggard EDa TP hit — ED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, lost $${lostValue.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)})`, 'warn');
-      await new Promise(r => setTimeout(r, 5000));
-      if (!this.positions.find(x => x.id === laggard.id)) return; // closed during wait
-      if (laggard._ft) await this.ftClosePosition(laggard, 'laggard');
-      else             await this.closePosition(laggard, 'laggard');
+      const buffedED = buffedEV - debt - uPnl;
+      if (buffedED <= 0) {
+        if (_closingIds.has(pos.id) || !this.positions.find(x => x.id === pos.id)) continue;
+        pos._laggardClosingAt = Date.now();
+        const role = (laggard && pos.id === laggard.id) ? 'Laggard' : 'Reduce';
+        this.log(`⏳ ${pos.symbol}: ${role} EDa TP hit — ED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, global lost $${debt.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)})`, 'warn');
+        await new Promise(r => setTimeout(r, 5000));
+        if (!this.positions.find(x => x.id === pos.id)) continue;
+        if (pos._ft) await this.ftClosePosition(pos, 'laggard'); else await this.closePosition(pos, 'laggard');
+      }
     }
   },
 
@@ -3767,6 +3774,7 @@ function ew() { return {
     for (const pos of this.positions) {
       pos._laggardLostValue = (pos._laggardLostValue || 0) + closingPnl;
     }
+    this._globalLostValue = (this._globalLostValue || 0) + closingPnl;
     // Recompute EDa TP on the current laggard and update its limit order
     const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
     if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
@@ -5641,7 +5649,8 @@ function ew() { return {
           for (const pos of [...this.positions]) {
             if (!this.positions.find(x => x.id === pos.id)) continue;
             if (pos.phase === 'reduce') continue;
-            if (pos.tpPct <= 3) continue;
+            const _tpPctNow = Number.isFinite(pos.tpPct) ? pos.tpPct : (this.cfg.entryTpRoi || 0);
+            if (_tpPctNow <= 3) continue;
             const mark       = pos.markPrice || pos.entryPrice;
             const currentROI = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * 100;
             pos.phase = 'reduce';
@@ -5655,11 +5664,25 @@ function ew() { return {
             }
             const newTp = pos.entryPrice * (1 - 0.03 / pos.leverage);
             if (pos.tpOrderId) { await this.cancelTpLimitOrder(pos.symbol, pos.tpOrderId); pos.tpOrderId = null; }
-            await this._setNativeTP(pos.symbol, newTp);
-            pos._nativeReduceTpPrice = newTp;
-            pos.currentTpPrice = newTp;
-            pos.tpPct = 3;
-            this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% native (${fmtP(newTp)})`, 'warn');
+            const debt = this._globalLostValue || 0;
+            const ev = pos._laggardInitialEV || 0;
+            const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+            const buffedEV = ev * buffMul;
+            const edaTp = (ev > 0 && pos.margin > 0)
+              ? Math.max(0, pos.entryPrice - (buffedEV - debt) * pos.entryPrice / (pos.leverage * pos.margin))
+              : 0;
+            if (edaTp > 0 && edaTp < (mark ?? Infinity)) {
+              pos._edaTpPrev = edaTp;
+              pos._nativeReduceTpPrice = null;
+              this.setTP(pos, edaTp).then(r => { if (r === 'ok') pos._edaTpPrice = edaTp; }).catch(() => {});
+              this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — EDa TP (${fmtP(edaTp)})`, 'warn');
+            } else {
+              await this._setNativeTP(pos.symbol, newTp);
+              pos._nativeReduceTpPrice = newTp;
+              pos.currentTpPrice = newTp;
+              pos.tpPct = 3;
+              this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% native (${fmtP(newTp)})`, 'warn');
+            }
             this.persist();
           }
         }
@@ -5781,6 +5804,7 @@ function ew() { return {
           const _isLaggardPos = this.cfg.laggardCheckEnabled && this.positions.length >= 1 &&
             p.id === this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]).id;
           const _isFastFunPos = p._fun && p._funFastAbsorp && this.cfg.funSuperMode;
+          const _useGlobalEda = this.cfg.laggardCheckEnabled && p.phase === 'reduce' && (p._laggardInitialEV || 0) > 0;
 
           // If position is already at ≥3% UROI (short is profitable), close immediately.
           // Also close if computed TP is above current mark (can't fill a rising market).
@@ -5789,7 +5813,7 @@ function ew() { return {
           // cut them short of the recovery target.
           const currentMark = p.markPrice || basePrice;
           const currentUROI = (p.entryPrice - currentMark) / p.entryPrice * p.leverage * 100;
-          if (!_isLaggardPos && !_isFastFunPos && (currentUROI >= 3 || nt >= currentMark)) {
+          if (!_useGlobalEda && !_isFastFunPos && (currentUROI >= 3 || nt >= currentMark)) {
             this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — UROI ${currentUROI.toFixed(1)}% / TP above mark — staging close in 5s.`, 'warn');
             // Flag UI immediately so card shows CLOSING badge, then wait before executing.
             p.phase = 'reduce';
@@ -5802,12 +5826,12 @@ function ew() { return {
             await this.closePosition(p, 'force'); continue;
           }
           if (p.tpOrderId) { await this.cancelTpLimitOrder(p.symbol, p.tpOrderId); p.tpOrderId = null; }
-          if (!_isLaggardPos && !_isFastFunPos) {
+          if (!_useGlobalEda && !_isFastFunPos) {
             await this._setNativeTP(p.symbol, nt);
             p._nativeReduceTpPrice = nt;
             p.currentTpPrice = nt; p.tpPct = 3;
             this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% native (${fmtP(nt)})`, 'warn');
-          } else if (_isFastFunPos && !_isLaggardPos) {
+          } else if (_isFastFunPos && !_useGlobalEda) {
             const edaEV = p._laggardInitialEV || 0;
             if (edaEV > 0) {
               const edaTp = Math.max(0, p.entryPrice - edaEV * p.entryPrice / (p.leverage * p.margin));
@@ -5834,9 +5858,7 @@ function ew() { return {
         // and pendingClose not set (retry loop handles outstanding close attempts).
         // Skip laggard (EDa check owns close) and fast-FUN positions with EDa TP active.
         if (p.phase === 'reduce' && !p.pendingClose && this.positions.find(x => x.id === p.id)) {
-          const _isLaggard = this.cfg.laggardCheckEnabled && (p._laggardInitialEV > 0) &&
-            this.positions.length >= 1 &&
-            p.id === this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]).id;
+          const _isLaggard = this.cfg.laggardCheckEnabled && (p._laggardInitialEV > 0);
           const _isFastFunEda = p._fun && p._funFastAbsorp && this.cfg.funSuperMode && p._edaTpPrice > 0;
           if (!_isLaggard && !_isFastFunEda) {
             const reduceMark = p.markPrice || p.entryPrice;
