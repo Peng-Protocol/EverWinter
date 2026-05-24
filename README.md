@@ -116,7 +116,7 @@ Each cut accumulates `cutMgn = cutQty × entryPrice / leverage` into `pos._saved
 Fires when absorption is due but the position is at minimum margin and `_savedMargin > 0`. Computes `extraStages = floor(_savedMargin / baseMargin)` and places that many conditional orders above the last stage trigger at 3% compounding increments, each stamped `_secondWind: true`. After activation: `_stageCount` expands, SL is recomputed to the new highest stage, and the interval resets to relative stage 0 from `_secondWindBaseStage` — the bot re-earns faster intervals as second-wind stages fill.
 
 ### Infinite Second Wind (toggle, default on)
-When enabled, second wind re-fires each time enough margin has been saved since the last activation — there is no single-use cap. Savings from every absorbing position are pooled into the laggard's `_savedMargin`, so the worst-performing position accumulates runway funded by the whole book. The laggard's `runtimeHours` force-close is suspended, letting it run until its EDa TP is hit.
+When enabled, second wind re-fires each time enough margin has been saved since the last activation — there is no single-use cap. Savings from every absorbing position are pooled across all open positions' `_savedMargin`, so every position can accumulate second-wind runway funded by the whole book. The laggard's `runtimeHours` force-close is suspended, letting it run until its EDa TP is hit.
 
 ---
 
