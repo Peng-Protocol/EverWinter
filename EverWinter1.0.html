@@ -1571,6 +1571,9 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               const buffedEV = ev * buffMul;
               const buffedED = buffedEV - lostVal - uPnl;
               const isActive = laggard.phase === 'reduce';
+              const savedTotal = laggard._savedMargin ?? 0;
+              const savedSelf  = laggard._savedMarginSelf ?? 0;
+              const savedPool  = laggard._savedMarginPooled ?? 0;
               const opacity  = isActive ? 1 : 0.4;
               const evCol    = 'var(--ice)';
               const lostCol  = lostVal < 0 ? 'var(--profit)' : lostVal > 0 ? 'var(--short)' : 'var(--text-lo)';
@@ -1583,6 +1586,8 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 + '<div style=\'opacity:' + opacity + '\'>'
                 + '<div style=\'display:flex;justify-content:space-between;color:var(--text-lo);margin-bottom:2px\'><span>EV (buffed)</span><span style=\'color:' + evCol + '\'>\$' + buffedEV.toFixed(2) + '</span></div>'
                 + '<div style=\'display:flex;justify-content:space-between;color:var(--text-lo);margin-bottom:2px\'><span>Value lost</span><span style=\'color:' + lostCol + '\'>' + lostStr + '</span></div>'
+                + '<div style=\'display:flex;justify-content:space-between;color:var(--text-lo);margin-bottom:2px\'><span>Saved margin (SW fuel)</span><span style=\'color:var(--profit)\'>$' + savedTotal.toFixed(2) + '</span></div>'
+                + '<div style=\'display:flex;justify-content:space-between;color:var(--text-lo);margin-bottom:2px;font-size:9px\'><span>└ self / pooled</span><span style=\'color:var(--text-mid)\'>$' + savedSelf.toFixed(2) + ' / $' + savedPool.toFixed(2) + '</span></div>'
                 + '<div style=\'display:flex;justify-content:space-between;color:var(--text-lo);border-top:1px solid #182030;padding-top:3px\'><span style=\'font-weight:600\'>ED</span><span style=\'color:' + edCol + ';font-weight:600\'>\$' + buffedED.toFixed(2) + '</span></div>'
                 + '</div>';
             })()"></div>
@@ -3551,6 +3556,7 @@ function ew() { return {
     // Only net recovered margin is reusable for SW staging; realized loss from the cut reduces savings.
     const netSavedMgn = Math.max(0, cutMgn + Math.min(0, cutPnl));
     pos._savedMargin = parseFloat(((pos._savedMargin || 0) + netSavedMgn).toFixed(6));
+    pos._savedMarginSelf = parseFloat(((pos._savedMarginSelf || 0) + netSavedMgn).toFixed(6));
     this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
     const sym = pos.symbol.replace('USDT','');
     const _s = pos.dcaStage || 0;
@@ -3576,6 +3582,7 @@ function ew() { return {
       // Pool this cut's saved margin into the laggard so it can build extra SW stages.
       if (laggard && laggard.id !== pos.id && this.cfg.passiveSecondWindEnabled !== false) {
         laggard._savedMargin = parseFloat(((laggard._savedMargin || 0) + netSavedMgn).toFixed(6));
+        laggard._savedMarginPooled = parseFloat(((laggard._savedMarginPooled || 0) + netSavedMgn).toFixed(6));
       }
     }
     // Recompute EDa TP limit order for fast-FUN positions already in reduce phase.
@@ -3617,7 +3624,10 @@ function ew() { return {
 
     // Highest trigger price among first-wind conditional orders (last stage = deepest against us)
     const firstWindOrders = (pos.orders || []).filter(o => o.type === 'cond' && !o._secondWind);
-    const lastStagePrice  = firstWindOrders.reduce((mx, o) => o.price > mx ? o.price : mx, 0);
+    const existingSw      = (pos.orders || []).filter(o => o.type === 'cond' && !!o._secondWind);
+    const lastFirstWind   = firstWindOrders.reduce((mx, o) => o.price > mx ? o.price : mx, 0);
+    const lastExistingSw  = existingSw.reduce((mx, o) => o.price > mx ? o.price : mx, 0);
+    const lastStagePrice  = Math.max(lastFirstWind, lastExistingSw);
     if (lastStagePrice <= 0) {
       this.log(`✂️ ${sym}: passive second wind skipped — no first-wind stage reference`, 'info');
       return;
@@ -3626,6 +3636,7 @@ function ew() { return {
     let runNotional = pos.entryPrice * pos.totalSize;
     let runSize     = pos.totalSize;
     const baseStageCount = this._posStageCount(pos);
+    const swLabelOffset  = existingSw.length;
     const swOrders = [];
     let prevPrice  = lastStagePrice;
 
@@ -3645,8 +3656,12 @@ function ew() { return {
       const tpPrice = this.snapPrice(expectedAvg * (1 - tpRoi / 100 / pos.leverage), instr);
       if (tpPrice <= 0) { prevPrice = swTrigger; continue; }
 
+      if ((pos.orders || []).some(o => o.type === 'cond' && Math.abs((o.price || 0) - swTrigger) < ((instr.tickSize || 0) / 2))) {
+        prevPrice = swTrigger;
+        continue;
+      }
       const cid = await this.placeConditional(pos.symbol, 'Sell', addQty, tpPrice, swTrigger);
-      swOrders.push({ label: `SW${i + 1}`, price: swTrigger, qty: addQty, tpPrice, type: 'cond', filled: false, orderId: cid, _secondWind: true });
+      swOrders.push({ label: `SW${swLabelOffset + i + 1}`, price: swTrigger, qty: addQty, tpPrice, type: 'cond', filled: false, orderId: cid, _secondWind: true });
       prevPrice = swTrigger;
     }
 
@@ -3660,6 +3675,8 @@ function ew() { return {
     pos._secondWindActive    = true;
     pos._secondWindBaseStage = pos.dcaStage || 0;
     pos._savedMargin         = 0;
+    pos._savedMarginSelf     = 0;
+    pos._savedMarginPooled   = 0;
 
     // Cancel existing SL — will re-arm naturally when the new highest stage fills
     if (pos.slSet || pos.slPrice) {
@@ -3668,6 +3685,28 @@ function ew() { return {
     }
 
     this.log(`💨 ${sym}: Passive Second Wind ×${swOrders.length} — ${swOrders.map(o => fmtP(o.price)).join(' · ')} | $${savedMargin.toFixed(2)} saved → ${swOrders.length} stage${swOrders.length > 1 ? 's' : ''} (stage ${baseStageCount + 1}–${pos._stageCount})`, 'warn');
+  },
+
+  async clearSecondWindStages(posId) {
+    const pos = this.positions.find(p => p.id === posId);
+    if (!pos) return;
+    const pendingSw = (pos.orders || []).filter(o => o.type === 'cond' && o._secondWind && !o.filled);
+    const sym = pos.symbol.replace('USDT', '');
+    if (pendingSw.length === 0) {
+      this.log(`🧹 ${sym}: no pending SW stages to clear`, 'info');
+      return;
+    }
+    for (const o of pendingSw) {
+      if (o.orderId) {
+        try { await this.cancelOrder(pos.symbol, o.orderId); } catch(e) {}
+      }
+    }
+    pos.orders = (pos.orders || []).filter(o => !(o.type === 'cond' && o._secondWind && !o.filled));
+    pos._stageCount = this._posStageCount(pos);
+    const remainingSw = pos.orders.filter(o => o.type === 'cond' && o._secondWind);
+    remainingSw.forEach((o, i) => { o.label = `SW${i + 1}`; });
+    this.log(`🧹 ${sym}: cleared ${pendingSw.length} pending SW stage${pendingSw.length > 1 ? 's' : ''}`, 'warn');
+    this.persist();
   },
 
   async runLaggardCheck() {
