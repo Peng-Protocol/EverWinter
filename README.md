@@ -120,6 +120,18 @@ When enabled, second wind re-fires each time enough margin has been saved since 
 
 ---
 
+
+## Congestion Auto-Reduce
+
+When **Laggard Auto-Reduce** is enabled and open positions reach `laggardAutoReduceThreshold` (or `maxPos`), positions are pushed into reduce phase early.
+
+- Positions already at effective TP ROI `≤ 3%` (including TP ingress-reduced entries) are skipped — they are already at reduce-floor TP.
+- If EDa is not valid/placeable on that tick, it falls back to native **3% TP**.
+
+This means congestion can fire correctly while making no visible TP change on positions already at 3%.
+
+---
+
 ## Stats Menu
 
 ### Session
@@ -211,16 +223,6 @@ If a position's absorption tab shows net negative PnL, it is exhumed and assigne
 exhEdaTp = entryPrice − (buffedEV + |absorbedLoss|) × entryPrice / (leverage × margin)
 ```
 Exhumed positions block regular TP, recompute EH TP on each DCA fill or absorption cut, and suspend laggard force-close. Only SL or EH TP can close them (sacrifice as last resort). Clears when `tab.totalPnl ≥ 0`.
-
-### Congestion Auto-Reduce
-
-When **Laggard Auto-Reduce** is enabled and open positions reach `laggardAutoReduceThreshold` (or `maxPos`), positions are pushed into reduce phase early.
-
-- Positions already at effective TP ROI `≤ 3%` (including TP ingress-reduced entries) are skipped — they are already at reduce-floor TP.
-- For eligible positions, the bot attempts **global EDa TP** first (using global lost value).
-- If EDa is not valid/placeable on that tick, it falls back to native **3% TP**.
-
-This means congestion can fire correctly while making no visible TP change on positions already at 3%.
 
 ### Laggard
 
