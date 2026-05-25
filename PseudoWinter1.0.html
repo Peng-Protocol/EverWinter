@@ -2641,7 +2641,9 @@ function pw() { return {
         this.savedPositions = s.positions;
         this.positions = s.positions.map(p => {
           const phase = this.calcPhase(p, p.phase, s.positions || []);
-          const needsReduceTp = phase === 'reduce' && (p.tpPct == null || p.tpPct > 3) && !(p._edaTpPrice > 0);
+          const _isLaggardPos = this.cfg.laggardCheckEnabled && (s.positions||[]).length >= 1 && p.id === (s.positions||[]).reduce((o,x)=>x.openedAt<o.openedAt?x:o,(s.positions||[])[0])?.id;
+          const _laggardHasPositiveDebt = _isLaggardPos && (p._laggardLostValue || 0) > 0;
+          const needsReduceTp = phase === 'reduce' && (p.tpPct == null || p.tpPct > 3) && !(p._edaTpPrice > 0) && !_laggardHasPositiveDebt;
           return {
             ...p,
             markPrice: p.markPrice || p.entryPrice,
@@ -6686,11 +6688,13 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
       if (pos.phase !== 'reduce') continue;
 
+      const isLaggardPos = laggard && pos.id === laggard.id;
       if (edaTpPrice === 0) {
         pos._edaTpPrice = 0;
-      } else if (debt < 0) {
-        // Only stamp EDa TP when there is actual collective debt — otherwise the profitOffset
-        // buffer alone tightens the price below the natural reduce TP with no real debt to justify it.
+      } else if (debt < 0 || (isLaggardPos && edaTpPrice < pos.entryPrice)) {
+        // Stamp EDa TP when there is actual collective debt (any position), OR when this is
+        // the laggard with positive value-lost debt and the computed price is still profitable.
+        // Non-laggards with zero/positive debt skip stamping to avoid phantom tightening.
         const prev = pos._edaTpPrev;
         if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
           pos._edaTpPrev = edaTpPrice;
@@ -6702,12 +6706,16 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           }
         }
       } else {
-        // No debt — clear any stale EDa stamp so the position uses its natural reduce TP.
+        // No qualifying debt — clear any stale EDa stamp so the position uses its natural reduce TP.
         pos._edaTpPrice = 0;
       }
       const buffedED = buffedEV - debt - uPnl;
       if (buffedED <= 0) {
         if (_closingIds.has(pos.id) || !this.positions.find(x => x.id === pos.id)) continue;
+        // Non-laggards may only close via EDa if the TP price is profitable (>0% ROI)
+        // AND the position is currently in profit. Laggard has no such restriction —
+        // closing at a loss to free margin is the original purpose of the system.
+        if (!isLaggardPos && (edaTpPrice >= pos.entryPrice || uPnl <= 0)) continue;
         pos._laggardClosingAt = Date.now();
         const role = (laggard && pos.id === laggard.id) ? 'Laggard' : 'Reduce';
         this.log(`⏳ ${pos.symbol}: ${role} EDa TP hit — ED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, lost $${debt.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)})`, 'warn');
