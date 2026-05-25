@@ -2285,11 +2285,12 @@ let _auditRunning = false;
 let _auditPromise = null;
 
 // Timers stored outside Alpine to prevent proxy mutation
-let _cdTimer       = null;
-let _watchTimer    = null;
-let _potEntryTimer = null;
-let _refreshTimer  = null;
-let _audioTimer    = null;
+let _cdTimer          = null;
+let _watchTimer       = null;
+let _potEntryTimer    = null;
+let _refreshTimer     = null;
+let _audioTimer       = null;
+let _laggardInterval  = null;
 
 function pw() { return {
   showSetup: false,
@@ -2809,6 +2810,8 @@ function pw() { return {
     if (_watchTimer) { clearInterval(_watchTimer); _watchTimer = null; }
     _watchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
     _potEntryTimer = setInterval(() => this.watchPotentialEntries(), 5000);
+    if (_laggardInterval) { clearInterval(_laggardInterval); _laggardInterval = null; }
+    _laggardInterval = setInterval(() => { if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) this.runLaggardCheck(); }, 60000);
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 2) {
       await this.runLaggardCheck();
     }
@@ -2822,6 +2825,7 @@ function pw() { return {
     clearInterval(_refreshTimer);
     clearInterval(_potEntryTimer);
     _potEntryTimer = null;
+    clearInterval(_laggardInterval); _laggardInterval = null;
     this.stopKeepalive();
     this.bot.scanCd = 0; this.bot.scanPct = 100;
     this.bot.startTime = null;
@@ -6626,7 +6630,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     if (this.positions.length < 1) return;
     const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
     for (const pos of this.positions) {
-      if (!pos || pos.phase !== 'reduce' || !pos._laggardInitialEV) continue;
+      if (!pos || !pos._laggardInitialEV) continue;
       if (pos._laggardClosingAt && Date.now() - pos._laggardClosingAt < 30000) continue;
       const debt = pos._laggardLostValue || 0;
       const uPnl = pos.markPrice ? (pos.entryPrice - pos.markPrice) / pos.entryPrice * pos.leverage * pos.margin : 0;
@@ -6634,6 +6638,27 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
       const buffedEV = ev * buffMul;
       const edaTpPrice = Math.max(0, pos.entryPrice - (buffedEV - debt) * pos.entryPrice / (pos.leverage * pos.margin));
+
+      if (pos.phase === 'normal') {
+        // Normal-phase: apply EDa only if it demands more ROI (lower price = edaTpPrice < currentTpPrice).
+        // Never close in normal phase — just seed the target so the position isn't capped at 3% ingress floor.
+        if (edaTpPrice > 0 && edaTpPrice < pos.currentTpPrice) {
+          const prev = pos._edaTpPrev;
+          if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
+            pos._edaTpPrev = edaTpPrice;
+            pos._edaTpPrice = edaTpPrice;
+            pos.currentTpPrice = edaTpPrice;
+            const edaRoi = (pos.entryPrice - edaTpPrice) / pos.entryPrice * pos.leverage * 100;
+            pos.tpPct = parseFloat(edaRoi.toFixed(2));
+            this.log(`⏳ ${pos.symbol}: EDa TP seeded in normal phase — ${edaRoi.toFixed(1)}% (debt $${debt.toFixed(2)}) → ${fmtP(edaTpPrice)}`, 'info');
+            this.persist();
+          }
+        }
+        continue; // no ED closure check in normal phase
+      }
+
+      if (pos.phase !== 'reduce') continue;
+
       if (edaTpPrice === 0) pos._edaTpPrice = 0;
       if (edaTpPrice > 0 && edaTpPrice < (pos.markPrice ?? Infinity)) {
         const prev = pos._edaTpPrev;
