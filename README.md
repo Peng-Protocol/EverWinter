@@ -89,14 +89,14 @@ Once per cycle, tracked symbols within their 3h TTL fetch a fresh RSI6 and bump 
 ## Order Execution
 
 ### Take Profit Orders
-TPs are placed as **GTC Limit Buy reduceOnly** orders — fills as maker, no market-order slippage on trigger. Each position tracks `tpOrderId`; the order is cancelled and replaced whenever the TP target changes. Any exchange-native TP on a position is cleared on first limit-TP placement.
+TPs are placed as **GTC Limit Buy reduceOnly** orders — fills as maker, no market-order slippage on trigger. Each position tracks `tpOrderId`; the order is cancelled and replaced whenever the TP target changes. Any exchange-native TP on a position is cleared on first limit-TP placement. (Note; The bots use exchange native TPs as a precaution, then cancel them when a limit can be successfully placed). 
 
 ### Entry and Close Orders
 Entries are **Market**. Force/manual closes are **Limit IOC** at `markPrice × 1.001`, falling back to Market if no mark is available. DCA adds are **conditional limit** (stop-limit) at the configured add price.
 
 ---
 
-## Loss Absorption
+## Loss Absorption (Passive)
 
 Passive, timer-based — fires every base interval (default 45 min) regardless of loss depth; cuts 5% of current size at market. No loss threshold is required; the cut fires whenever the interval elapses and the position has margin above the base floor. The base interval (`lossAbsorptionIntervalMins`) shortens per DCA stage when Passive Second Wind is enabled:
 
@@ -110,7 +110,7 @@ Passive, timer-based — fires every base interval (default 45 min) regardless o
 FUN Super Mode positions with `_funFastAbsorp` always use the 5-min floor.
 
 ### Saved Margin (`_savedMargin`)
-Each cut accumulates `cutMgn = cutQty × entryPrice / leverage` into `pos._savedMargin`. Visible in the activity log as `| saved $X.XX`.
+Each cut accumulates `cutMgn = cutQty × entryPrice / leverage` into `pos._savedMargin` after subtracting absorbed loss. Visible in the activity log as `| saved $X.XX`.
 
 ### Passive Second Wind
 Fires when absorption is due but the position is at minimum margin and `_savedMargin > 0`. Computes `extraStages = floor(_savedMargin / baseMargin)` and places that many conditional orders above the last stage trigger at 3% compounding increments, each stamped `_secondWind: true`. After activation: `_stageCount` expands, SL is recomputed to the new highest stage, and the interval resets to relative stage 0 from `_secondWindBaseStage` — the bot re-earns faster intervals as second-wind stages fill.
@@ -138,7 +138,7 @@ This means congestion can fire correctly while making no visible TP change on po
 Trade count, wins, losses, win rate, net PnL, Force Closes, and TP Reduces. Resets on **Clear Stats** or bot restart; survives page reload.
 
 ### FUN Lock-in
-Super FUN mode only. Each FUN close stamps a minimum FR re-entry gate for that symbol (`funFundingHigh` for HFG/HFL/OE, `funFundingLow` for LFG/LFL). At 2+ closes in the 6h window: fast absorption activates on any open FUN position; with absorption off, re-entry is deferred entirely.
+Super FUN mode only. Each FUN close stamps a minimum FR re-entry gate for that symbol (`funFundingHigh` for HFG/HFL/OE, `funFundingLow` for LFG/LFL). At 1+ closes in the 6h window: fast absorption activates on any open FUN position; with absorption off, re-entry is deferred entirely.
 
 ### FUN VM Creep
 Per-symbol VM floor creep in normal FUN mode. Shows close count, effective VM floor per sub-type, FR re-entry gate, and 6h TTL countdown. OE hits shown inline with multiplicative VM effect.
@@ -181,11 +181,11 @@ Open position feed. Sort buttons: **PnL**, **DCA** (by triggered stage, not curr
 
 ### Trades Menu
 
-Reverse-chronological closed feed. Rapid force/laggard closes roll up per 15-minute window: ticker count, net PnL/ROI, wins, common DCA, avg duration, best/worst performers.
+Reverse-chronological closed feed. Rapid force/laggard closes roll up per 15-minute window: ticker count, net PnL/ROI, wins, common DCA, avg duration, best/worst performers. Rolls up old trades into a period roll-up to avoid the 200 max entries cap. 
 
 ### Log Menu
 
-Session counters, laggard status (buffered EV, lost value, deficit; "→ CLOSING" when deficit hits zero), Open Now snapshot, DCA Spread (S0–S7), Conditionals table, EXHUMED table (absorbed loss, EH TP, cut count, distance-to-TP; ✦ = also laggard). Activity log capped at 300 entries.
+Session counters, laggard status (buffered EV, lost value, deficit; "→ CLOSING" when deficit hits zero), Open Now snapshot, DCA Spread (S0–S7), Conditionals table, EXHUMED table (absorbed loss, EH TP, cut count, distance-to-TP; ✦ = also laggard). Activity log capped at 300 entries. Rolls up similar messages within 15 minute window. 
 
 ### Scan Control
 
@@ -199,22 +199,22 @@ Bulk ticker fetch → filter by absolute 24h change ≥ threshold → Fisher-Yat
 
 Fires every 5 seconds regardless of scan state; single bulk mark-price fetch per tick. Per position: DCA trigger → TP check → funding accrual → force-close deadline → SL after final stage. One full linear book download every 5 seconds (~12 req, 600–1,200 KB/min).
 
-### Loss Absorption
+### Loss Absorption (Aggressive)
 
-Triggers at 2.5× base margin loss; cuts 5% at market. Stage-aware interval (relative to `_secondWindBaseStage` after second wind):
+Triggers at 2.5× base margin loss; cuts 5% at market. Speeds up with each uninterrupted round. 
 
-| Stage (rel) | Interval |
+| Round (rel) | Interval |
 |-------------|----------|
 | 0 | 5 min |
 | 1 | ~3 min 20 s |
 | 2 | ~1 min 40 s (min 30 s) |
 | 3+ | 30 s |
 
-Legacy halving (second wind off): starts at 5 min, halves per cut, floors at 30 s. Paused during pending DCA delay windows.
+Resets if the ticker falls below threshold, floors at 30 s. Paused during pending DCA delay windows and when stage 7 is placed or triggered.
 
-**Outlier Acceleration** — positions whose margin or absolute loss exceeds 2.5× the book average absorb at the 30 s floor. Deferred if a single 5% cut would crystallise > 2.5× base notional.
+**Outlier Acceleration** — positions whose margin or absolute loss exceeds 2.5× the book average absorb at the 30 s floor. Deferred if a single 5% cut would crystallise > 2.5× base notional. Updates average entry price and TP. 
 
-**Outlier Deceleration** — positions whose profit or margin deficit is 2.5× the book average have 5% added at market. Same cooldown as acceleration.
+**Outlier Deceleration** — positions whose  margin deficit is 2.5× the book average have 5% added at market. Same cooldown as acceleration.
 
 ### Exhumation
 
