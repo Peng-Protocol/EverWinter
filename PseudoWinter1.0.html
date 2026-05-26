@@ -4334,7 +4334,11 @@ function pw() { return {
             const newTotalNotional = (pos.entryPrice * pos.totalSize) + (add.price * addQty);
             pos.totalSize  = parseFloat((pos.totalSize + addQty).toFixed(8));
             pos.entryPrice = newTotalNotional / pos.totalSize;
-            pos.margin     = (pos.entryPrice * pos.totalSize) / pos.leverage;
+            // Add only the notional delta for this DCA buy rather than reconstructing
+            // margin from scratch — wholesale reconstruction would undo any prior
+            // absorption cuts, making the position instantly re-eligible for absorption.
+            const addMarginDelta = (add.price * addQty) / pos.leverage;
+            pos.margin = parseFloat((pos.margin + addMarginDelta).toFixed(6));
             pos.dcaStage   = pos.orders.filter(o => o.type === 'cond' && o.filled).length;
           }
           {
@@ -4781,7 +4785,11 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
                 const newTotalNotional = (pos.entryPrice * pos.totalSize) + (add.price * addQty);
                 pos.totalSize  = parseFloat((pos.totalSize + addQty).toFixed(8));
                 pos.entryPrice = newTotalNotional / pos.totalSize;
-                pos.margin     = (pos.entryPrice * pos.totalSize) / pos.leverage;
+                // Add only the notional delta for this DCA buy rather than reconstructing
+                // margin from scratch — wholesale reconstruction would undo any prior
+                // absorption cuts, making the position instantly re-eligible for absorption.
+                const addMarginDelta = (add.price * addQty) / pos.leverage;
+                pos.margin = parseFloat((pos.margin + addMarginDelta).toFixed(6));
                 pos.dcaStage   = pos.orders.filter(o => o.type === 'cond' && o.filled).length;
               }
               {
@@ -5424,7 +5432,11 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
             const newTotalNotional = (pos.entryPrice * pos.totalSize) + (add.price * addQty);
             pos.totalSize  = parseFloat((pos.totalSize + addQty).toFixed(8));
             pos.entryPrice = newTotalNotional / pos.totalSize;
-            pos.margin     = (pos.entryPrice * pos.totalSize) / pos.leverage;
+            // Add only the notional delta for this DCA buy rather than reconstructing
+            // margin from scratch — wholesale reconstruction would undo any prior
+            // absorption cuts, making the position instantly re-eligible for absorption.
+            const addMarginDelta = (add.price * addQty) / pos.leverage;
+            pos.margin = parseFloat((pos.margin + addMarginDelta).toFixed(6));
             pos.dcaStage   = pos.orders.filter(o => o.type === 'cond' && o.filled).length;
           }
           {
@@ -6461,6 +6473,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       if (pos._funFastAbsorp && this.cfg.funSuperMode) effectiveIntervalMs = 5 * 60 * 1000;
       // Absolute absorption timeline (anchored to position open time):
       // fire only on exact interval boundaries, and do not catch up missed slots.
+      // Guard is time-based (not slot-index) so it survives interval changes after DCA —
+      // a slot-index comparison breaks when effectiveIntervalMs shrinks at higher stages
+      // because the old index (written in the wider interval's space) becomes smaller than
+      // the new slotIdx, causing immediate re-fire on the very next watch cycle.
       const openedAtMs = Number(pos.openedAt || 0);
       if (!openedAtMs || openedAtMs > now) continue;
       const elapsedMs = now - openedAtMs;
@@ -6469,7 +6485,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const slotStartMs = openedAtMs + (slotIdx * effectiveIntervalMs);
       const watchWindowMs = 16 * 1000; // watch loop is 15s; allow slight drift
       if (now - slotStartMs >= watchWindowMs) continue;
-      if ((pos._lastAbsorptionSlot ?? -1) >= slotIdx) continue;
+      if ((pos._lastAbsorptionAt ?? 0) >= slotStartMs) continue;
       const _posMult      = pos._fun ? (pos._funMult ?? 2) : (pos._salf || pos._ft) ? 2 : 1;
       const posBaseMargin = baseMargin * _posMult;
       if ((pos.margin || 0) <= posBaseMargin) {
@@ -6478,13 +6494,11 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
             (pos._savedMargin || 0) > 0) {
           await this._tryPassiveSecondWind(pos, posBaseMargin);
         }
-        pos._lastAbsorptionAt = now;
-        pos._lastAbsorptionSlot = slotIdx;
+        pos._lastAbsorptionAt = slotStartMs;
         continue;
       }
       this._tryAbsorbPos(pos, posBaseMargin);
-      pos._lastAbsorptionAt = now;
-      pos._lastAbsorptionSlot = slotIdx;
+      pos._lastAbsorptionAt = slotStartMs;
     }
     this.persist();
   },
@@ -6691,10 +6705,13 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const isLaggardPos = laggard && pos.id === laggard.id;
       if (edaTpPrice === 0) {
         pos._edaTpPrice = 0;
-      } else if (debt < 0 || (isLaggardPos && edaTpPrice < pos.entryPrice)) {
+      } else if (debt < 0 || (isLaggardPos && edaTpPrice > 0)) {
         // Stamp EDa TP when there is actual collective debt (any position), OR when this is
-        // the laggard with positive value-lost debt and the computed price is still profitable.
-        // Non-laggards with zero/positive debt skip stamping to avoid phantom tightening.
+        // the laggard and the computed price is a valid positive number — including above-entry
+        // prices that represent a loss-exit, which is the original purpose of the laggard system.
+        // The old guard (edaTpPrice < pos.entryPrice) incorrectly blocked the most important case:
+        // deeply positive debt where buffedEV - debt goes negative, pushing edaTpPrice above entry.
+        // Non-laggards with zero/positive debt still skip stamping to avoid phantom tightening.
         const prev = pos._edaTpPrev;
         if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
           pos._edaTpPrev = edaTpPrice;
