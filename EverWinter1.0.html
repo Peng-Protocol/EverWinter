@@ -2940,8 +2940,8 @@ function ew() { return {
     }
     const e = this.funLockIn[symbol];
     this.log(`💰 ${symbol}: FUN lock-in — gate ≥ ${e.gate.toFixed(3)}% | ${e.trades} trade${e.trades === 1 ? '' : 's'} in window`, 'info');
-    // Super FUN re-entry control: from first re-entry onward (trade #2), apply fast absorption to any open position
-    if (this.cfg.funSuperMode && this.cfg.lossAbsorptionEnabled && e.trades >= 1) {
+    // Super FUN re-entry control: when trades reach 2+, apply fast absorption to any open position
+    if (this.cfg.funSuperMode && this.cfg.lossAbsorptionEnabled && e.trades >= 2) {
       const _openPos = this.positions.find(p => p.symbol === symbol && p._fun);
       if (_openPos && !_openPos._funFastAbsorp) {
         _openPos._funFastAbsorp = true;
@@ -3035,10 +3035,10 @@ function ew() { return {
       // FR gate — Super Fun Mode uses lock-in (must re-qualify at same tier or higher),
       // normal mode uses the ratcheting creep gate.
       const CREEP_TTL = 6 * 3600 * 1000;
-      // Super FUN re-entry control: from first re-entry onward, defer if absorption is off
+      // Super FUN re-entry control: after 2 trades on ticker in window, defer if absorption off
       if (this.cfg.funSuperMode && !this.cfg.lossAbsorptionEnabled) {
         const lockEntry = this.funLockIn[sym];
-        if (lockEntry && (Date.now() - lockEntry.setAt) < CREEP_TTL && (lockEntry.trades || 0) >= 1) {
+        if (lockEntry && (Date.now() - lockEntry.setAt) < CREEP_TTL && (lockEntry.trades || 0) >= 2) {
           this.log(`💰 ${sym}: Super FUN — ${lockEntry.trades} trades in window, absorption off → re-entry deferred`, 'info');
           continue;
         }
@@ -3496,7 +3496,7 @@ function ew() { return {
       if (_closingIds.has(pos.id)) continue;
       if (this.cfg.funSuperMode && pos._fun && !pos._funFastAbsorp) {
         const _li = this.funLockIn[pos.symbol];
-        if (_li && _li.trades >= 1) {
+        if (_li && _li.trades >= 2) {
           pos._funFastAbsorp = true;
           this.log(`💰 ${pos.symbol.replace('USDT','')}: Super FUN ×${_li.trades} — fast absorption enabled (5 min)`, 'info');
         }
@@ -3526,7 +3526,7 @@ function ew() { return {
       const watchWindowMs = 16 * 1000; // watch loop is 15s; allow slight drift
       if (now - slotStartMs >= watchWindowMs) continue;
       if ((pos._lastAbsorptionSlot ?? -1) >= slotIdx) continue;
-      const _posMult     = pos._fun ? (pos._funMult ?? 2) : (pos._salf || pos._ft) ? 2 : 1;
+      const _posMult     = pos._fun ? (pos._funMult ?? 2) : pos._salf ? 2 : 1;
       const posBaseMargin = baseMargin * _posMult;
       if ((pos.margin || 0) <= posBaseMargin) {
         if (this.cfg.passiveSecondWindEnabled !== false &&
@@ -3797,14 +3797,29 @@ function ew() { return {
 
       if (pos.phase !== 'reduce') continue;
 
-      // Reduce phase — Change 4: stamp optimistically, gate setTP on markPrice only
-      if (edaTpPrice === 0) {
-        pos._edaTpPrice = 0;
+      // Reduce phase — laggard (oldest position) uses EDa TP unconditionally, even sub-3%.
+      // Non-laggards use EDa TP only when it implies ≥ 3% ROI; otherwise they fall back to
+      // the standard 3% reduce TP managed by syncPositions. This preserves EDa recovery for
+      // the laggard while ensuring other positions still exit at a meaningful profit floor.
+      const _isThisLaggard = laggard && pos.id === laggard.id;
+      const edaRoiPct = pos.entryPrice > 0
+        ? (pos.entryPrice - edaTpPrice) / pos.entryPrice * pos.leverage * 100
+        : 0;
+      const _edaAllowed = _isThisLaggard || edaRoiPct >= 3;
+
+      if (edaTpPrice === 0 || !_edaAllowed) {
+        // EDa not applicable — clear any previously stamped EDa price.
+        // syncPositions will (re-)place the standard 3% native TP on the next cycle.
+        if (pos._edaTpPrice !== 0) {
+          pos._edaTpPrice          = 0;
+          pos._edaTpPrev           = null;
+          pos._nativeReduceTpPrice = null; // force syncPositions to re-place 3% TP
+        }
       } else {
         const prev = pos._edaTpPrev;
         if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
           pos._edaTpPrev           = edaTpPrice;
-          pos._edaTpPrice          = edaTpPrice; // Change 4 — optimistic stamp
+          pos._edaTpPrice          = edaTpPrice; // optimistic stamp
           pos._nativeReduceTpPrice = null;
           if (edaTpPrice < (pos.markPrice ?? Infinity)) {
             this.setTP(pos, edaTpPrice).catch(() => {});
@@ -5159,7 +5174,7 @@ function ew() { return {
             if (!this.positions.find(x => x.id === pos.id)) continue;
             await this.closePosition(pos, 'force'); continue;
           }
-          // Cancel existing limit TP order, then set native exchange TP for reduce phase.
+          // Cancel existing limit TP order, then place a new limit TP for reduce phase.
           // Skip if EDa owns the limit order — it will manage TP from runLaggardCheck.
           if (pos._edaTpPrice > 0) {
             pos.phase = 'reduce';
@@ -5172,7 +5187,7 @@ function ew() { return {
             await this.cancelTpLimitOrder(pos.symbol, pos.tpOrderId);
             pos.tpOrderId = null;
           }
-          const tpResult = await this._setNativeTP(pos.symbol, nt);
+          const tpResult = await this.setTP(pos, nt);
           if (tpResult === 'ok') {
             pos.phase = 'reduce';
             if (!wasReduced) this.sess.tpReduce++;
@@ -5183,7 +5198,7 @@ function ew() { return {
             pos._nativeReduceTpPrice = nt;
             pos._slAcceptedKey       = null;
             pos.currentTpPrice = nt; pos.tpPct = 3;
-            this.log(`${pos.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% native (${fmtP(nt)})`, 'warn');
+            this.log(`${pos.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% limit (${fmtP(nt)})`, 'warn');
             this.persist();
           }
           }
@@ -5781,11 +5796,13 @@ function ew() { return {
               this.setTP(pos, edaTp).catch(() => {});
               this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — EDa TP (${fmtP(edaTp)})`, 'warn');
             } else {
-              await this._setNativeTP(pos.symbol, newTp);
-              pos._nativeReduceTpPrice = newTp;
-              pos.currentTpPrice = newTp;
-              pos.tpPct = 3;
-              this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% native (${fmtP(newTp)})`, 'warn');
+              const _arRes = await this.setTP(pos, newTp);
+              if (_arRes === 'ok') {
+                pos._nativeReduceTpPrice = newTp;
+                pos.currentTpPrice = newTp;
+                pos.tpPct = 3;
+              }
+              this.log(`⏳ ${pos.symbol}: auto-reduce congestion (${posCount} positions/${this.cfg.maxPos} slots) — TP → 3% limit (${fmtP(newTp)})`, 'warn');
             }
             this.persist();
           }
@@ -5932,10 +5949,12 @@ function ew() { return {
           }
           if (p.tpOrderId) { await this.cancelTpLimitOrder(p.symbol, p.tpOrderId); p.tpOrderId = null; }
           if (!_useGlobalEda && !_isFastFunPos) {
-            await this._setNativeTP(p.symbol, nt);
-            p._nativeReduceTpPrice = nt;
-            p.currentTpPrice = nt; p.tpPct = 3;
-            this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% native (${fmtP(nt)})`, 'warn');
+            const _ntRes = await this.setTP(p, nt);
+            if (_ntRes === 'ok') {
+              p._nativeReduceTpPrice = nt;
+              p.currentTpPrice = nt; p.tpPct = 3;
+            }
+            this.log(`${p.symbol}: ${Math.round(this.cfg.tpReduceMins)}min — TP → 3% limit (${fmtP(nt)})`, 'warn');
           } else if (_isFastFunPos && !_useGlobalEda) {
             const edaEV = p._laggardInitialEV || 0;
             if (edaEV > 0) {
@@ -5947,10 +5966,12 @@ function ew() { return {
               }
               this.log(`${p.symbol}: fast absorption — reduce phase (EDa TP ${fmtP(edaTp)})`, 'warn');
             } else {
-              await this._setNativeTP(p.symbol, nt);
-              p._nativeReduceTpPrice = nt;
-              p.currentTpPrice = nt; p.tpPct = 3;
-              this.log(`${p.symbol}: fast absorption — reduce phase (3% TP fallback)`, 'warn');
+              const _ffRes = await this.setTP(p, nt);
+              if (_ffRes === 'ok') {
+                p._nativeReduceTpPrice = nt;
+                p.currentTpPrice = nt; p.tpPct = 3;
+              }
+              this.log(`${p.symbol}: fast absorption — reduce phase (3% TP fallback, limit)`, 'warn');
             }
           } else {
             p.tpPct = 3; // close the re-entry gate without placing a native TP
@@ -5963,7 +5984,13 @@ function ew() { return {
         // and pendingClose not set (retry loop handles outstanding close attempts).
         // Skip laggard (EDa check owns close) and fast-FUN positions with EDa TP active.
         if (p.phase === 'reduce' && !p.pendingClose && this.positions.find(x => x.id === p.id)) {
-          const _isLaggard = this.cfg.laggardCheckEnabled && (p._laggardInitialEV > 0);
+          // Laggard identity: only the oldest open position is exempt from the 3% close floor.
+          // Previously this used _laggardInitialEV > 0 which is true for every position,
+          // effectively suppressing the 3% close on all of them.
+          const _laggardPos   = this.cfg.laggardCheckEnabled && this.positions.length >= 1
+            ? this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0])
+            : null;
+          const _isLaggard    = _laggardPos != null && p.id === _laggardPos.id;
           const _isFastFunEda = p._fun && p._funFastAbsorp && this.cfg.funSuperMode && p._edaTpPrice > 0;
           if (!_isLaggard && !_isFastFunEda) {
             const reduceMark = p.markPrice || p.entryPrice;
@@ -6417,15 +6444,16 @@ function ew() { return {
               pos.orders.filter(o => o.type === 'cond').forEach((o, i) => { if (i < pos.dcaStage) o.filled = true; });
             }
 
-            // Recompute 3% TP from current avgPrice and keep exchange native TP in sync.
-            // Uses trading-stop (native TP) — atomic, no order management, no qty requirement.
+            // Recompute 3% TP from current avgPrice and keep a limit TP order in sync.
+            // Uses setTP (GTC limit reduceOnly) — no native exchange TP so there is no
+            // concurrent market-order race against the limit order.
             // Exception: when EDa TP (_edaTpPrice > 0) is active, the laggard system owns the
             // exit via a limit order. Skip all reduce-phase TP logic entirely — including the
             // underwater detection — so the laggard is not force-closed before reaching EDa TP.
             const instr = await this.getInstrInfo(pos.symbol);
             if (instr) {
               if (pos._edaTpPrice > 0) {
-                // Laggard with active EDa TP: clear any stale underwater timer and yield fully
+                // EDa TP active: clear any stale underwater timer and yield fully
                 // to the EDa limit order. No native TP management, no force-close via this path.
                 if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
               } else {
@@ -6445,10 +6473,10 @@ function ew() { return {
                   }
                 } else {
                   if (pos._reduceUnderwaterSince) pos._reduceUnderwaterSince = null;
-                  // Native TP dedup: only update when price has actually moved a tick.
+                  // Limit TP dedup: only update when price has actually moved a tick.
                   const drift = Math.abs(reduceTp - (pos._nativeReduceTpPrice || 0));
                   if (reduceTp > 0 && (!(pos._nativeReduceTpPrice > 0) || drift > instr.tickSize)) {
-                    const res = await this._setNativeTP(pos.symbol, reduceTp);
+                    const res = await this.setTP(pos, reduceTp);
                     if (res === 'ok') {
                       pos._nativeReduceTpPrice = reduceTp;
                       pos.currentTpPrice = reduceTp;
@@ -7130,11 +7158,15 @@ function ew() { return {
     const priceStr = tpPrice.toFixed(priceDp);
 
     // Clear any exchange-native TP so it doesn't double-trigger as market on existing positions.
+    // Failure is non-fatal but logged — a silent failure here is the root cause of the
+    // concurrent native-TP + limit-order race that produces near-zero-margin close records.
     try {
       const nb = JSON.stringify({ category: 'linear', symbol, takeProfit: '0', positionIdx: 0 });
       const nh = await signHdr(this.creds.key, this.creds.secret, nb, this._tsOffset);
-      await fetch(`${this.base}/v5/position/trading-stop`, { method: 'POST', headers: nh, body: nb });
-    } catch(e) {}
+      const nr = await fetch(`${this.base}/v5/position/trading-stop`, { method: 'POST', headers: nh, body: nb });
+      const nd = await this.safeJson(nr);
+      if (nd && nd.retCode !== 0) this.log(`setTP (${symbol}): native-TP clear failed — ${nd.retMsg}`, 'warn');
+    } catch(e) { this.log(`setTP (${symbol}): native-TP clear error — ${e.message}`, 'warn'); }
 
     // Cancel the existing TP limit order if one is tracked.
     if (pos.tpOrderId) {
