@@ -2643,7 +2643,7 @@ function pw() { return {
           const phase = this.calcPhase(p, p.phase, s.positions || []);
           const _isLaggardPos = this.cfg.laggardCheckEnabled && (s.positions||[]).length >= 1 && p.id === (s.positions||[]).reduce((o,x)=>x.openedAt<o.openedAt?x:o,(s.positions||[])[0])?.id;
           const _laggardHasPositiveDebt = _isLaggardPos && (p._laggardLostValue || 0) > 0;
-          const needsReduceTp = phase === 'reduce' && (p.tpPct == null || p.tpPct > 3) && !(p._edaTpPrice > 0) && !_laggardHasPositiveDebt;
+          const needsReduceTp = phase === 'reduce' && (p.tpPct == null || p.tpPct > 3) && !(p._edaTpPrice > 0) && !_laggardHasPositiveDebt && !((p._laggardLostValue || 0) < 0);
           return {
             ...p,
             markPrice: p.markPrice || p.entryPrice,
@@ -3259,8 +3259,6 @@ function pw() { return {
           if (this.cfg.funSuperMode) {
             const lockEntry = this.funLockIn[sym];
             if (lockEntry && (Date.now() - lockEntry.setAt) < CREEP_TTL) {
-              const bufMs = (lockEntry.trades || 1) * 60 * 1000;
-              if (Date.now() - lockEntry.setAt < bufMs) { reEntryBuffered++; continue; }
               if (lockEntry.gate != null && fr < lockEntry.gate) { frCreepBlocked++; continue; }
             }
           } else {
@@ -3538,11 +3536,22 @@ function pw() { return {
     if (this.positions.find(p => p.symbol === sym)) { this.log(`🎣 ${sym}: SalF entry blocked — position already exists`, 'warn'); return false; }
     let _laggardSeedDebt = 0;
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
-      const _laggardRef = this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]);
-      const _laggardDebt = _laggardRef?._laggardLostValue || 0;
-      _laggardSeedDebt = _laggardDebt < 0 ? _laggardDebt / 2 : 0;
-      _laggardRef._laggardLostValue = _laggardDebt - _laggardSeedDebt;
+      const _newWeight    = 2; // SalF = 2 slots
+      const _totalDebt    = this.positions.reduce((s, p) => s + (p._laggardLostValue || 0), 0);
+      const _existSlots   = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
+      const _totalSlots   = _existSlots + _newWeight;
+      const _debtPerSlot  = _totalDebt / _totalSlots;
+      _laggardSeedDebt    = parseFloat((_debtPerSlot * _newWeight).toFixed(6));
+      const _remainDebt   = _totalDebt - _laggardSeedDebt;
+      const _remainPerSlot = _existSlots > 0 ? _remainDebt / _existSlots : 0;
+      for (const p of this.positions) {
+        p._laggardLostValue = parseFloat((_remainPerSlot * this._posSlotWeight(p)).toFixed(6));
+      }
     }
+    const _salfInitialEV  = margin * (effTp0 / 100);
+    const _salfEdaTpPrice = _laggardSeedDebt < 0
+      ? Math.max(0, price - (_salfInitialEV * (1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100)) - _laggardSeedDebt) * price / (effectiveLev * margin))
+      : 0;
     this.positions.push({
       id: Date.now() + Math.random(), symbol: sym, _salf: true, _pseudo: true, _salfIsLoser: isLoser,
       change24h: change24h != null ? parseFloat(change24h.toFixed(2)) : null,
@@ -3554,15 +3563,22 @@ function pw() { return {
       entryPrice: price, originalEntryPrice: price, markPrice: price, totalSize: qty,
       leverage: effectiveLev, margin,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
-      currentTpPrice: tpPrice, tpPct: effTp0, dcaStage: 0, orders,
+      currentTpPrice: _salfEdaTpPrice > 0 && _salfEdaTpPrice < tpPrice ? _salfEdaTpPrice : tpPrice,
+      tpPct: _salfEdaTpPrice > 0 && _salfEdaTpPrice < tpPrice
+        ? parseFloat(((price - _salfEdaTpPrice) / price * effectiveLev * 100).toFixed(2))
+        : effTp0,
+      dcaStage: 0, orders,
       _stageCount: this._dcaStageCount(),
       _lastSeenAt: Date.now(),
-      _laggardInitialEV: margin * (effTp0 / 100),
+      _laggardInitialEV: _salfInitialEV,
       _laggardLostValue: _laggardSeedDebt,
+      _edaTpPrice: _salfEdaTpPrice,
+      _edaTpPrev:  _salfEdaTpPrice > 0 ? _salfEdaTpPrice : null,
     });
     const g = this.gainers.find(x => x.symbol === sym);
     if (g) g.status = 'active';
-    this.log(`🎣 ▼ SalF SHORT ${sym} @ ${fmtP(price)} | LSA:${lsaRatio.toFixed(2)}× | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} [2× notional${isLoser ? ' · loser' : ' · gainer'}]`, 'trade');
+    const _salfDebtTag = _laggardSeedDebt < 0 ? ` | Debt seed $${_laggardSeedDebt.toFixed(2)} → EDa TP ${fmtP(_salfEdaTpPrice)}` : '';
+    this.log(`🎣 ▼ SalF SHORT ${sym} @ ${fmtP(price)} | LSA:${lsaRatio.toFixed(2)}× | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)}${_salfDebtTag} [2× notional${isLoser ? ' · loser' : ' · gainer'}]`, 'trade');
     this.persist();
     if (this.cfg.laggardCheckEnabled) setTimeout(() => { if (this.bot.running) this.runLaggardCheck(); }, 500);
     return true;
@@ -3948,7 +3964,13 @@ function pw() { return {
     const effectiveLev  = levResult.lev;
     const entryNotional = this.cfg.minNotional * mult;
     const addNotional   = this.cfg.addNotional  * mult;
-    const effTp0        = this.cfg.entryTpRoi * this.tpIngressMultiplier(sym);
+    // Super Fun re-entry: double the TP to slow re-entry cadence and capture more profit.
+    // A re-entry is identified by an existing funLockIn entry for this symbol within its TTL.
+    // First entries and non-Super-Fun paths use the standard ingress-multiplied TP.
+    const _sfReEntry = this.cfg.funSuperMode && !!this.funLockIn[sym] && (Date.now() - (this.funLockIn[sym].setAt || 0)) < 6 * 3600 * 1000;
+    const effTp0     = _sfReEntry
+      ? this.cfg.entryTpRoi * 2
+      : this.cfg.entryTpRoi * this.tpIngressMultiplier(sym);
     const rawQty = entryNotional / price;
     const qty    = this.snapQty(rawQty, instr);
     if (qty <= 0) { this.log(`💰 ${sym}: FUN qty below min`, 'warn'); return false; }
@@ -3982,11 +4004,22 @@ function pw() { return {
     if (this.positions.find(p => p.symbol === sym)) { this.log(`💰 ${sym}: FUN entry blocked — position already exists`, 'warn'); return false; }
     let _laggardSeedDebt = 0;
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
-      const _laggardRef = this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]);
-      const _laggardDebt = _laggardRef?._laggardLostValue || 0;
-      _laggardSeedDebt = _laggardDebt < 0 ? _laggardDebt / 2 : 0;
-      _laggardRef._laggardLostValue = _laggardDebt - _laggardSeedDebt;
+      const _newWeight    = mult; // FUN uses its classified slot cost (1/2/3)
+      const _totalDebt    = this.positions.reduce((s, p) => s + (p._laggardLostValue || 0), 0);
+      const _existSlots   = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
+      const _totalSlots   = _existSlots + _newWeight;
+      const _debtPerSlot  = _totalDebt / _totalSlots;
+      _laggardSeedDebt    = parseFloat((_debtPerSlot * _newWeight).toFixed(6));
+      const _remainDebt   = _totalDebt - _laggardSeedDebt;
+      const _remainPerSlot = _existSlots > 0 ? _remainDebt / _existSlots : 0;
+      for (const p of this.positions) {
+        p._laggardLostValue = parseFloat((_remainPerSlot * this._posSlotWeight(p)).toFixed(6));
+      }
     }
+    const _funInitialEV  = margin * (effTp0 / 100);
+    const _funEdaTpPrice = _laggardSeedDebt < 0
+      ? Math.max(0, price - (_funInitialEV * (1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100)) - _laggardSeedDebt) * price / (effectiveLev * margin))
+      : 0;
     this.positions.push({
       id: Date.now() + Math.random(), symbol: sym, _fun: true, _pseudo: true,
       _funIsLoser: isLoser,
@@ -4008,18 +4041,26 @@ function pw() { return {
       _funLsaRatio: lsaRatio != null ? parseFloat(lsaRatio.toFixed(3)) : null,
       _volMomentum: this._symData[sym]?.volMomPct ?? null,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
-      currentTpPrice: tpPrice, tpPct: effTp0, dcaStage: 0, orders,
+      currentTpPrice: _funEdaTpPrice > 0 && _funEdaTpPrice < tpPrice ? _funEdaTpPrice : tpPrice,
+      tpPct: _funEdaTpPrice > 0 && _funEdaTpPrice < tpPrice
+        ? parseFloat(((price - _funEdaTpPrice) / price * effectiveLev * 100).toFixed(2))
+        : effTp0,
+      dcaStage: 0, orders,
       _stageCount: this._dcaStageCount(),
       _lastSeenAt: Date.now(),
-      _laggardInitialEV: margin * (effTp0 / 100),
+      _laggardInitialEV: _funInitialEV,
       _laggardLostValue: _laggardSeedDebt,
+      _edaTpPrice: _funEdaTpPrice,
+      _edaTpPrev:  _funEdaTpPrice > 0 ? _funEdaTpPrice : null,
     });
     const g = this.gainers.find(x => x.symbol === sym);
     if (g) g.status = 'active';
     const rsiStr = (rsi6 != null || rsi12 != null || rsi24 != null)
       ? ` | RSI6:${rsi6?.toFixed(1)??'?'} RSI12:${rsi12?.toFixed(1)??'?'} RSI24:${rsi24?.toFixed(1)??'?'}` : '';
     const lsaStr = isLoser && lsaRatio != null ? ` | LSA:+${Math.round((lsaRatio - 1) * 100)}%` : '';
-    this.log(`💰 ▼ FUN ${badge} SHORT ${sym} @ ${fmtP(price)} | FR:${fundingRate >= 0 ? '+' : ''}${fundingRate.toFixed(4)}% | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)}${rsiStr}${lsaStr} [${mult}× notional]`, 'trade');
+    const _funDebtTag = _laggardSeedDebt < 0 ? ` | Debt seed $${_laggardSeedDebt.toFixed(2)} → EDa TP ${fmtP(_funEdaTpPrice)}` : '';
+    const _sfReEntryTag = _sfReEntry ? ` [⚡SF re-entry TP ×2 → ${effTp0.toFixed(1)}%]` : '';
+    this.log(`💰 ▼ FUN ${badge} SHORT ${sym} @ ${fmtP(price)} | FR:${fundingRate >= 0 ? '+' : ''}${fundingRate.toFixed(4)}% | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)}${rsiStr}${lsaStr}${_funDebtTag}${_sfReEntryTag} [${mult}× notional]`, 'trade');
     this.persist();
     if (this.cfg.laggardCheckEnabled) setTimeout(() => { if (this.bot.running) this.runLaggardCheck(); }, 500);
     return true;
@@ -4121,11 +4162,22 @@ function pw() { return {
 
     let _laggardSeedDebt = 0;
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
-      const _laggardRef = this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]);
-      const _laggardDebt = _laggardRef?._laggardLostValue || 0;
-      _laggardSeedDebt = _laggardDebt < 0 ? _laggardDebt / 2 : 0;
-      _laggardRef._laggardLostValue = _laggardDebt - _laggardSeedDebt;
+      const _newWeight    = 2; // FT/ADV FT = 2 slots
+      const _totalDebt    = this.positions.reduce((s, p) => s + (p._laggardLostValue || 0), 0);
+      const _existSlots   = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
+      const _totalSlots   = _existSlots + _newWeight;
+      const _debtPerSlot  = _totalDebt / _totalSlots;
+      _laggardSeedDebt    = parseFloat((_debtPerSlot * _newWeight).toFixed(6));
+      const _remainDebt   = _totalDebt - _laggardSeedDebt;
+      const _remainPerSlot = _existSlots > 0 ? _remainDebt / _existSlots : 0;
+      for (const p of this.positions) {
+        p._laggardLostValue = parseFloat((_remainPerSlot * this._posSlotWeight(p)).toFixed(6));
+      }
     }
+    const _ftInitialEV  = margin * (effTp0 / 100);
+    const _ftEdaTpPrice = _laggardSeedDebt < 0
+      ? Math.max(0, price - (_ftInitialEV * (1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100)) - _laggardSeedDebt) * price / (effectiveLev * margin))
+      : 0;
     this.positions.push({
       id: Date.now() + Math.random(), symbol: sym, _ft: true, _advFt: isAdvFt, _pseudo: true,
       entryPrice: price, originalEntryPrice: price, markPrice: price, totalSize: qty, leverage: effectiveLev, margin,
@@ -4135,11 +4187,17 @@ function pw() { return {
       oeCount,
       _volMomentum: this._symData[sym]?.volMomPct ?? null,
       upnl: 0, openedAt: Date.now(), phase: 'normal', isPending: false,
-      currentTpPrice: tpPrice, tpPct: effTp0, dcaStage: 0, orders,
+      currentTpPrice: _ftEdaTpPrice > 0 && _ftEdaTpPrice < tpPrice ? _ftEdaTpPrice : tpPrice,
+      tpPct: _ftEdaTpPrice > 0 && _ftEdaTpPrice < tpPrice
+        ? parseFloat(((price - _ftEdaTpPrice) / price * effectiveLev * 100).toFixed(2))
+        : effTp0,
+      dcaStage: 0, orders,
       _stageCount: this._dcaStageCount(),
       _lastSeenAt: Date.now(),
-      _laggardInitialEV: margin * (effTp0 / 100),
+      _laggardInitialEV: _ftInitialEV,
       _laggardLostValue: _laggardSeedDebt,
+      _edaTpPrice: _ftEdaTpPrice,
+      _edaTpPrev:  _ftEdaTpPrice > 0 ? _ftEdaTpPrice : null,
     });
     const g = this.gainers.find(x => x.symbol === sym);
     if (g) g.status = 'active';
@@ -4163,7 +4221,8 @@ function pw() { return {
         }
       }
     }
-    this.log(`⚡ ▼ ADV FT SHORT ${sym} @ ${fmtP(price)} | OE×${oeCount} | Qty:${qty} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} | RSI:${rsi6?.toFixed(1)}/${rsi12?.toFixed(1)}/${rsi24?.toFixed(1)}${_ftLsaStr}`, 'trade');
+    const _ftDebtTag = _laggardSeedDebt < 0 ? ` | Debt seed $${_laggardSeedDebt.toFixed(2)} → EDa TP ${fmtP(_ftEdaTpPrice)}` : '';
+    this.log(`⚡ ▼ ADV FT SHORT ${sym} @ ${fmtP(price)} | OE×${oeCount} | Qty:${qty} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} | RSI:${rsi6?.toFixed(1)}/${rsi12?.toFixed(1)}/${rsi24?.toFixed(1)}${_ftLsaStr}${_ftDebtTag}`, 'trade');
     this.persist();
     if (this.cfg.laggardCheckEnabled) setTimeout(() => { if (this.bot.running) this.runLaggardCheck(); }, 500);
     return true;
@@ -4243,7 +4302,7 @@ function pw() { return {
     this._notifyLaggardClose(pos, pnlPct, pnl);
     this.positions = this.positions.filter(x => x.id !== pos.id);
     // Rodeo creep is gainer-only; FT/ADV FT use margin premium + graylist instead
-    this.tpIngressBump(pos.symbol);
+    if (!(pos._fun && this.cfg.funSuperMode)) this.tpIngressBump(pos.symbol);
 
 
     if (pos._advFt && this.ftCandidates[pos.symbol]) {
@@ -4891,7 +4950,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
           this._notifyLaggardClose(pos, pnlPct, pnl);
           this.positions = this.positions.filter(x => x.id !== pos.id);
           if (pos._fun) { if (this.cfg.funSuperMode) this.funLockInBump(pos.symbol, pos._funSubType); else this.funCreepBump(pos.symbol, pos._funSubType); }
-          if (pos._ft || pos._fun || pos._salf) this.tpIngressBump(pos.symbol);
+          if (pos._ft || pos._fun || pos._salf) { if (!(pos._fun && this.cfg.funSuperMode)) this.tpIngressBump(pos.symbol); }
           if (pos._salf && this.cfg.sfMedianCreepEnabled) this.salfCreepBump(pos.symbol);
           _closingIds.delete(pos.id);
           if (this.bot.running) setTimeout(() => this.runScheduledCycle(), 500);
@@ -5027,11 +5086,26 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
     
     let _laggardSeedDebt = 0;
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
-      const _laggardRef = this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]);
-      const _laggardDebt = _laggardRef?._laggardLostValue || 0;
-      _laggardSeedDebt = _laggardDebt < 0 ? _laggardDebt / 2 : 0;
-      _laggardRef._laggardLostValue = _laggardDebt - _laggardSeedDebt;
+      // Sum all existing debt across the pool, then divide by (existingSlots + newPosSlots)
+      // to compute the equal per-slot share the new position should enter with.
+      // The new position object isn't pushed yet, so we approximate its slot weight here.
+      const _newWeight    = 1; // standard gainer = 1 slot
+      const _totalDebt    = this.positions.reduce((s, p) => s + (p._laggardLostValue || 0), 0);
+      const _existSlots   = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
+      const _totalSlots   = _existSlots + _newWeight;
+      const _debtPerSlot  = _totalDebt / _totalSlots;
+      _laggardSeedDebt    = parseFloat((_debtPerSlot * _newWeight).toFixed(6));
+      // Redistribute remaining debt equally across existing positions
+      const _remainDebt   = _totalDebt - _laggardSeedDebt;
+      const _remainPerSlot = _existSlots > 0 ? _remainDebt / _existSlots : 0;
+      for (const p of this.positions) {
+        p._laggardLostValue = parseFloat((_remainPerSlot * this._posSlotWeight(p)).toFixed(6));
+      }
     }
+    const _psInitialEV   = margin * (effTp0 / 100);
+    const _psEdaTpPrice  = _laggardSeedDebt < 0
+      ? Math.max(0, price - (_psInitialEV * (1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100)) - _laggardSeedDebt) * price / (effectiveLev * margin))
+      : 0;
     this.positions.push({
       id:Date.now()+Math.random(), symbol:sym,
       entryPrice:price, originalEntryPrice:price, markPrice:price, totalSize:qty, leverage:effectiveLev, margin,
@@ -5039,16 +5113,23 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
       fundingRate: candidate.fundingRate ?? null,
       _fundingIntervalMs: this._klineCache[`fr_${sym}`]?.intervalMs || 8 * 3600000,
       upnl:0, openedAt:Date.now(), phase:'normal', isPending:false,
-      currentTpPrice:tpPrice, tpPct:effTp0, dcaStage:0, orders,
+      currentTpPrice: _psEdaTpPrice > 0 && _psEdaTpPrice < tpPrice ? _psEdaTpPrice : tpPrice,
+      tpPct: _psEdaTpPrice > 0 && _psEdaTpPrice < tpPrice
+        ? parseFloat(((price - _psEdaTpPrice) / price * effectiveLev * 100).toFixed(2))
+        : effTp0,
+      dcaStage:0, orders,
       _stageCount: this._dcaStageCount(),
       _pseudo:true, _lastSeenAt:Date.now(),
-      _laggardInitialEV: margin * (effTp0 / 100),
+      _laggardInitialEV: _psInitialEV,
       _laggardLostValue: _laggardSeedDebt,
+      _edaTpPrice: _psEdaTpPrice,
+      _edaTpPrev:  _psEdaTpPrice > 0 ? _psEdaTpPrice : null,
     });
     const g = this.gainers.find(x=>x.symbol===sym);
     if (g) g.status='active';
     const creepTag = nThresh.count > 0 ? ` | 🎠 Rodeo×${nThresh.count} — notional ×${nThresh.mult.toFixed(2)}` : '';
-    this.log(`🌑 ▼ PSEUDO SHORT ${sym} @ ${fmtP(price)} | Qty:${qty} | Notional:$${actualNotional.toFixed(2)} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} | RSI6:${candidate.rsi6?.toFixed(1)} RSI12:${candidate.rsi12?.toFixed(1)} RSI24:${candidate.rsi24?.toFixed(1)}${creepTag}`, 'trade');
+    const _psDebtTag = _laggardSeedDebt < 0 ? ` | Debt seed $${_laggardSeedDebt.toFixed(2)} → EDa TP ${fmtP(_psEdaTpPrice)}` : '';
+    this.log(`🌑 ▼ PSEUDO SHORT ${sym} @ ${fmtP(price)} | Qty:${qty} | Notional:$${actualNotional.toFixed(2)} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} | RSI6:${candidate.rsi6?.toFixed(1)} RSI12:${candidate.rsi12?.toFixed(1)} RSI24:${candidate.rsi24?.toFixed(1)}${creepTag}${_psDebtTag}`, 'trade');
     this.persist();
     if (this.cfg.laggardCheckEnabled) setTimeout(() => { if (this.bot.running) this.runLaggardCheck(); }, 500);
   },
@@ -6050,6 +6131,36 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     return condCount > 0 ? condCount : this._dcaStageCount();
   },
 
+  // Returns the effective slot weight for a position — mirrors the slot-cost logic used
+  // throughout the bot (FUN uses its recorded funMult, SalF and FT cost 2, everything else 1).
+  // Used by the collective-debt system to distribute debt proportionally to slot footprint
+  // rather than raw position count, so a 3× FUN position absorbs 3× the debt of a 1× gainer.
+  _posSlotWeight(pos) {
+    if (!pos) return 1;
+    if (pos._fun)  return pos._funMult ?? 2;
+    if (pos._salf) return 2;
+    if (pos._ft)   return 2;
+    return 1;
+  },
+
+  // Redistributes collective debt equally across all open positions weighted by slot cost.
+  // Call this after any event that changes the debt pool (position open, close, or absorption loss).
+  // Each position's _laggardLostValue is set to: (totalDebt / totalSlots) * ownSlots,
+  // ensuring a 3× FUN position absorbs 3× the burden of a 1× gainer.
+  _rebalanceDebtPool() {
+    if (!this.cfg.laggardCheckEnabled) return;
+    const positions = this.positions;
+    if (!positions || positions.length === 0) return;
+    const totalDebt  = positions.reduce((s, p) => s + (p._laggardLostValue || 0), 0);
+    if (totalDebt === 0) return; // nothing to rebalance
+    const totalSlots = positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
+    if (totalSlots <= 0) return;
+    const debtPerSlot = totalDebt / totalSlots;
+    for (const p of positions) {
+      p._laggardLostValue = parseFloat((debtPerSlot * this._posSlotWeight(p)).toFixed(6));
+    }
+  },
+
 
   // Classifies a FUN candidate into one of four sub-types based on positive funding rate and gainer/loser status.
   // Returns { subType, mult, vmBase, badge } or null if FR is non-positive or below the low-fund floor.
@@ -6537,9 +6648,16 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     })();
     this.log(`✂️ ${sym}:${_rateLabel} absorption — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)} | reusable $${pos._savedMargin.toFixed(2)}`, 'warn');
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
-      for (const p of this.positions) {
-        p._laggardLostValue = (p._laggardLostValue || 0) + cutPnl;
+      // Distribute absorption loss across all positions weighted by slot cost,
+      // then do a full pool rebalance to keep everyone in equilibrium.
+      const _abs_totalSlots = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
+      if (_abs_totalSlots > 0) {
+        const _abs_pnlPerSlot = cutPnl / _abs_totalSlots;
+        for (const p of this.positions) {
+          p._laggardLostValue = parseFloat(((p._laggardLostValue || 0) + _abs_pnlPerSlot * this._posSlotWeight(p)).toFixed(6));
+        }
       }
+      this._rebalanceDebtPool();
       const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
       if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
         const buffMul  = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
@@ -6760,10 +6878,18 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       ? closingPnlUsdt
       : (closingRoiPct / 100 * (closingPos.margin || 0));
 
-    this.positions.forEach(pos => {
-      pos._laggardLostValue = (pos._laggardLostValue || 0) + closingPnl;
-      this.log(`⏳ ${pos.symbol}: Value slash ${closingPnl>=0?'+':'−'}$${Math.abs(closingPnl).toFixed(2)} (${closingPos.symbol} closed @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%) → total lost $${pos._laggardLostValue.toFixed(2)}`, 'info');
-    });
+    // Distribute the closing PnL across surviving positions weighted by slot cost.
+    // A 3× FUN position absorbs 3× the share of a 1× gainer — debt is proportional
+    // to how many slots each position occupies, not raw position count.
+    const totalSlots = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
+    if (totalSlots > 0) {
+      const pnlPerSlot = closingPnl / totalSlots;
+      this.positions.forEach(pos => {
+        const share = pnlPerSlot * this._posSlotWeight(pos);
+        pos._laggardLostValue = parseFloat(((pos._laggardLostValue || 0) + share).toFixed(6));
+        this.log(`⏳ ${pos.symbol}: Debt share ${share>=0?'+':'−'}$${Math.abs(share).toFixed(2)} [${this._posSlotWeight(pos)}/${totalSlots} slots] (${closingPos.symbol} closed @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%) → total $${pos._laggardLostValue.toFixed(2)}`, 'info');
+      });
+    }
 
     // Recompute EDa TP on the current laggard after lostValue update
     if (this.positions.length >= 1) {
@@ -6848,7 +6974,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     this._notifyLaggardClose(pos, pnlPct, pnl);
     this.positions = this.positions.filter(x => x.id !== pos.id);
     if (pos._fun) { if (this.cfg.funSuperMode) this.funLockInBump(pos.symbol, pos._funSubType); else this.funCreepBump(pos.symbol, pos._funSubType); }
-    if (pos._ft || pos._fun || pos._salf) this.tpIngressBump(pos.symbol);
+    if (pos._ft || pos._fun || pos._salf) { if (!(pos._fun && this.cfg.funSuperMode)) this.tpIngressBump(pos.symbol); }
     if (pos._salf && this.cfg.sfMedianCreepEnabled) this.salfCreepBump(pos.symbol);
 
 
