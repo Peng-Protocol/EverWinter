@@ -116,7 +116,10 @@ Passive, timer-based — fires every base interval (default 45 min) regardless o
 | 3+ | 5 min |
 
 During re-entries in Super FUN mode the system uses "uPnL Absorption" which absorbs at a 30s interval if uPnL is; 
-$$ -(\text{baseMargin} \times 0.20) $$
+
+$$
+-(\text{baseMargin} \times 0.20) 
+$$
 
 ### Saved Margin (`_savedMargin`)
 Each cut accumulates `cutMgn = cutQty × entryPrice / leverage` into `pos._savedMargin` after subtracting absorbed loss. Visible in the activity log as `| saved $X.XX`.
