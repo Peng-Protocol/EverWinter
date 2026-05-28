@@ -1,5 +1,5 @@
 # Winter Strategy Book
-**A Guide For Bears**
+**A Comprehensive Guide For All Bears**
 
 ---
 
@@ -190,6 +190,8 @@ Two modes exist, differing in how aggressively they fire:
 **Passive Absorption**: Cuts positions on a fixed interval unconditionally — no loss threshold required. Every active position is trimmed on a regular cadence regardless of its current PnL state. One base-notional equivalent is closed each interval. Critically, "regardless of PnL state" cuts both ways: a position sitting in profit is trimmed just as readily as a losing one. 
 
 The interval is not fixed for the life of the position. As DCA stages fill, the clock tightens: stage 1 shortens the interval to ⅔ of the configured baseline, stage 2 to ⅓, and stage 3 to a hard 5-minute floor. A position moving against the strategy fast enough to trigger deeper DCA fills warrants faster cuts. Each cut's crystallized margin is tracked as *saved margin* — the amount that would otherwise have remained in a now-smaller position.
+
+At stage 1 or below, respect the strategy's relative sizing, at stage 2 or above cut till base margin is reached, this ensures a better entry price if another DCA or SW is triggered, but deepens the required TP due to the smaller overall margin. 
 
 **Aggressive Absorption**: Threshold-triggered — fires only when a position's unrealized loss exceeds 2.5× its base margin. Each cut is 5% of the remaining margin. The interval halves with every successive cut down to a 30-second floor; recovery above threshold resets the counter. Cuts pause when the final DCA stage is unlocked or triggered.
 
@@ -409,9 +411,11 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 
 All Super FUN re-entries on the same ticker have TP Ingress deferred and use 2x the standard entry TP. 
 
-After one Super FUN trade on the same ticker within the hour, re-entry is flagged for accelerated loss absorption, firing every 30 seconds if uPnL is; $$
+After one Super FUN trade on the same ticker within the hour, re-entry is flagged for accelerated loss absorption, firing every 30 seconds if uPnL is; 
+$$
 -(\text{baseMargin} \times 0.20)
 $$.
+
 However, If absorption is off, re-entry is deferred until the window clears.
 
 ---
