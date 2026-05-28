@@ -195,6 +195,8 @@ The interval is not fixed for the life of the position. As DCA stages fill, the 
 
 If a position has been reduced to minimum notional when a cut is due, it is closed outright rather than trimmed further.
 
+When a newly opened position is hovering just above or below initial entry (Stage 1 or lower) maintain minimun margin relative to strategy sizing, but once the position crosses into Stage 2 or deeper start "cutting to the bone" to absorb loss down to the base notional, this further enhances the entry price if future DCA stages are triggered but increases the distance to TP needed to cover debt, due to the overall margin being much smaller. 
+
 **Digestibility limit**: If a single 5% cut would crystallize more than 2.5× the base notional in loss, the cut is deferred. Forcing an oversized crystallization in one interval creates a disorderly sequence of realized losses. Deferral continues at minimum cooldown until either partial recovery or continued absorption brings the per-cut loss back within range.
 
 DCA and absorption work the same problem from opposite ends: DCA improves where a position needs to be to close; absorption reduces how much of the position still needs to get there. Neither system completes the picture without the other.
@@ -203,7 +205,7 @@ DCA and absorption work the same problem from opposite ends: DCA improves where 
 
 When a position is disproportionate relative to the rest of the book — its margin or absolute loss exceeds a configured multiple (default 2.5×) of the average across all others — its absorption interval must be hastened to the minimum, until morale improves.
 
-**Outlier Deceleration** is the mirror: a profit or margin outlier in the other direction (unrealized profit ≥ 2.5× average of others, or margin ≤ average/2.5) receives an add rather than a cut — 5% of current margin (minimum base notional) — updating the weighted-average entry. The same halving cooldown applies, resetting when the position is no longer an outlier.
+**Outlier Deceleration** is the mirror: a margin outlier in the other direction (margin ≤ average/2.5) receives an add rather than a cut — 5% of current margin (minimum base notional) — updating the weighted-average entry. The same halving cooldown applies, resetting when the position is no longer an outlier. (Should be deferred if AMa is in effect). 
 
 ##### The Absorption–Entry Cycle
 
@@ -405,7 +407,12 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 
 **Super Fun Mode**: Strips FUN to funding rate + positive VM only. All VM thresholds, LSA checks, and creep gates are replaced by a lock-in ratchet — re-entry must match or beat the last close's funding tier within a 6-hour window. Tickers blocked by RSI proximity or OE count are admitted as the OE sub-type (1× slot cost, high funding gate required). Passive absorption is what makes this stance viable — if the ticker turns, the position is absorbed over time rather than force-closed.
 
-After two Super FUN trades on the same ticker within the hour, re-entry is then flagged for accelerated cuts, firing every 5 minutes rather than the standard interval. However, If absorption is off, re-entry is deferred until the window clears.
+All Super FUN re-entries on the same ticker have TP Ingress deferred and use 2x the standard entry TP. 
+
+After one Super FUN trade on the same ticker within the hour, re-entry is flagged for accelerated loss absorption, firing every 30 seconds if uPnL is; $$
+-(\text{baseMargin} \times 0.20)
+$$.
+However, If absorption is off, re-entry is deferred until the window clears.
 
 ---
 

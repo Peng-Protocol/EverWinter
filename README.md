@@ -89,10 +89,18 @@ Once per cycle, tracked symbols within their 3h TTL fetch a fresh RSI6 and bump 
 ## Order Execution
 
 ### Take Profit Orders
-TPs are placed as **GTC Limit Buy reduceOnly** orders — fills as maker, no market-order slippage on trigger. Each position tracks `tpOrderId`; the order is cancelled and replaced whenever the TP target changes. Any exchange-native TP on a position is cleared on first limit-TP placement. (Note; The bots use exchange native TPs as a precaution, then cancel them when a limit can be successfully placed). 
+TPs are placed as **GTC Limit Buy reduceOnly** orders — fills as maker, no market-order slippage on trigger. Each position tracks `tpOrderId`; the order is cancelled and replaced whenever the TP target changes. Any exchange-native TP on a position is cleared on first limit-TP placement. (Note; The bots use exchange native TPs as a precaution, then cancel them when a limit can be successfully placed. The exception is reduce phase which purely uses limit orders to prevent race conditions if immediately triggered). 
 
 ### Entry and Close Orders
 Entries are **Market**. Force/manual closes are **Limit IOC** at `markPrice × 1.001`, falling back to Market if no mark is available. DCA adds are **conditional limit** (stop-limit) at the configured add price.
+
+### Phase Management
+
+**Take Profit Configuration & Debt Management**
+Target profit boundaries are established dynamically, but execution logic heavily depends on the presence of collective debt and the active lifecycle phase. The bot adheres to the following procedural hierarchy:
+* **Entry Phase:** The initial TP is set strictly at the time of position creation based on the configured ROI parameter.
+* **Reduce Phase (No Debt):** If there is no collective debt, the `reduce` phase is respected and the profit target is overridden to a hard 3% floor to facilitate safe exits.
+* **Debt Override (EDa TP):** If collective debt exists, the Effective Debt adjusted (EDa) TP configuration acts as an absolute override. The EDa TP is enforced across all phases (including normal and reduce), ensuring systemic debt recovery takes priority over standard lifecycle targets.
 
 ---
 
@@ -107,10 +115,16 @@ Passive, timer-based — fires every base interval (default 45 min) regardless o
 | 2 | ⅓ × base, min 5 min |
 | 3+ | 5 min |
 
-FUN Super Mode positions with `_funFastAbsorp` always use the 5-min floor.
+During re-entries in Super FUN mode the system uses "uPnL Absorption" which absorbs at a 30s interval if uPnL is; 
+$$ -(\text{baseMargin} \times 0.20) $$
 
 ### Saved Margin (`_savedMargin`)
 Each cut accumulates `cutMgn = cutQty × entryPrice / leverage` into `pos._savedMargin` after subtracting absorbed loss. Visible in the activity log as `| saved $X.XX`.
+
+**Ruleset**
+The bot employs a staged approach to unrealized loss absorption to optimize capital efficiency. Execution scales based on the current DCA depth of the position:
+* **Stage 1 or Lower:** The bot(s) maintain the relative position minimum margin. Absorption logic is throttled to prevent unnecessary capital drain on positions hovering near the entry price.
+* **Stage 2 and Beyond:** The system aggressively escalates to "cutting to the bone." The bot absorbs the position down to the base notional, minimizing exposure on deeply extended trades.
 
 ### Passive Second Wind
 Fires when absorption is due but the position is at minimum margin and `_savedMargin > 0`. Computes `extraStages = floor(_savedMargin / baseMargin)` and places that many conditional orders above the last stage trigger at 3% compounding increments, each stamped `_secondWind: true`. After activation: `_stageCount` expands, SL is recomputed to the new highest stage, and the interval resets to relative stage 0 from `_secondWindBaseStage` — the bot re-earns faster intervals as second-wind stages fill.
