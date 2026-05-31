@@ -37,6 +37,8 @@ Neither is strictly better. They are different tools for different risk toleranc
 
 Techniques are the building blocks. Each strategy assembles a specific combination of them. This section defines what each technique does and why, strategy descriptions reference techniques.
 
+Display convention: UI surfaces, watchlists, position cards, trade menus, and activity logs show compact ticker symbols without the `USDT` suffix; full exchange symbols remain internal for API calls and persistence.
+
 ---
 
 ### Proactive Techniques
@@ -107,9 +109,9 @@ Despite differences in market cap, tickers with extreme volume divergence in eit
 
 VM measures the ratio of recent volume, comparing 24 hour buy and sell pressure, a positive VM is when selling overwhelms buying at the current point in time relative to the entire day. When applied to rising tickers it confirms that active selling pressure has arrived, when applied to falling tickers it confirms the decline is continuing rather than exhausting.
 
-VM is most useful applied as a band rather than a floor alone, a volume spike far above baseline signals exhaustion rather than continuation — sellers crammed into one window are spent, not building pressure. 
+VM is most useful applied as a band rather than a floor alone, a volume spike far above baseline signals exhaustion rather than continuation — sellers crammed into one window are spent, not building pressure.
 
-VM is a forward-looking signal — it measures current momentum to anticipate a coming move, as distinct from Close Confirmation which requires the reversal to already appear on the chart. Both VM and LSA are predictive, but LSA must be used in conjuncture with other filters to be useful. 
+VM is a forward-looking signal — it measures current momentum to anticipate a coming move, as distinct from Close Confirmation which requires the reversal to already appear on the chart. Both VM and LSA are predictive, but LSA must be used in conjuncture with other filters to be useful.
 
 ---
 
@@ -127,8 +129,8 @@ When funding rates drop significantly negative, longs are being paid to hold —
 
 ---
 
-#### Margin Size Hierarchy 
-Each strategy receives a different "slot" usage based on its perceived effectiveness, positions that perform faster and use fewer stages are more secure and therefore deserve more margin. positions are scaled at; 1x, 2x, and 3x slot usage, this implies a 2x or 3x sized position will use 2x or 3x the standard margin you are willing to use. This allows you to maximize gains on strategies you are more certain of. 
+#### Margin Size Hierarchy
+Each strategy receives a different "slot" usage based on its perceived effectiveness, positions that perform faster and use fewer stages are more secure and therefore deserve more margin. positions are scaled at; 1x, 2x, and 3x slot usage, this implies a 2x or 3x sized position will use 2x or 3x the standard margin you are willing to use. This allows you to maximize gains on strategies you are more certain of.
 
 ---
 
@@ -183,31 +185,21 @@ If the final stage has filled and the position still needs a hard stop, somethin
 
 #### Loss Absorption
 
-Loss absorption trims positions that are consuming capital without recovering, freeing margin for healthier positions and progressively reducing exposure on the worst performers.
+Loss absorption trims positions that are consuming capital without recovering, freeing margin for healthier positions and progressively reducing exposure on the worst performers. EverWinter now uses **uPnL-based absorption** rather than a timer-based cadence: a cut is considered only when the position's unrealized loss breaches its configured threshold.
 
-Two modes exist, differing in how aggressively they fire:
+**Trigger model**: FUN/Super FUN absorbs when uPnL reaches `-(baseMargin × 0.25)`. Follow-Through, ADV FT, and SalF scale their loss threshold by slot weight so larger-slot entries have proportionally larger loss budgets. A per-position cooldown prevents repeated cuts from firing back-to-back; the scan loop can notice the condition late, but it no longer creates or misses eligibility by being early or late.
 
-**Passive Absorption**: Cuts positions on a fixed interval unconditionally — no loss threshold required. Every active position is trimmed on a regular cadence regardless of its current PnL state. One base-notional equivalent is closed each interval. Critically, "regardless of PnL state" cuts both ways: a position sitting in profit is trimmed just as readily as a losing one. 
+**Cut sizing and floors**: Absorption cuts from the offending position, tracks the realized loss as saved/debt margin, and stops before violating the stage-aware floor. Stage 1 and below preserve the strategy's relative sizing; stage 2 and deeper can cut down toward base margin so future DCA or Second Wind adds have more average-entry leverage. If the position cannot absorb further, saved margin becomes Second Wind fuel instead of forcing a scan-timed trim.
 
-The interval is not fixed for the life of the position. As DCA stages fill, the clock tightens: stage 1 shortens the interval to ⅔ of the configured baseline, stage 2 to ⅓, and stage 3 to a hard 5-minute floor. A position moving against the strategy fast enough to trigger deeper DCA fills warrants faster cuts. Each cut's crystallized margin is tracked as *saved margin* — the amount that would otherwise have remained in a now-smaller position.
-
-At stage 1 or below, respect the strategy's relative sizing, at stage 2 or above cut till base margin is reached, this ensures a better entry price if another DCA or SW is triggered, but deepens the required TP due to the smaller overall margin. 
-
-**Aggressive Absorption**: Threshold-triggered — fires only when a position's unrealized loss exceeds 2.5× its base margin. Each cut is 5% of the remaining margin. The interval halves with every successive cut down to a 30-second floor; recovery above threshold resets the counter. Cuts pause when the final DCA stage is unlocked or triggered.
-
-If a position has been reduced to minimum notional when a cut is due, it is closed outright rather than trimmed further.
-
-When a newly opened position is hovering just above or below initial entry (Stage 1 or lower) maintain minimun margin relative to strategy sizing, but once the position crosses into Stage 2 or deeper start "cutting to the bone" to absorb loss down to the base notional, this further enhances the entry price if future DCA stages are triggered but increases the distance to TP needed to cover debt, due to the overall margin being much smaller. 
-
-**Digestibility limit**: If a single 5% cut would crystallize more than 2.5× the base notional in loss, the cut is deferred. Forcing an oversized crystallization in one interval creates a disorderly sequence of realized losses. Deferral continues at minimum cooldown until either partial recovery or continued absorption brings the per-cut loss back within range.
+**Accounting**: EverWinter records absorption cuts as PnL cards so the trade feed and session accounting include the realized slices rather than hiding them inside position state. Each cut also feeds the debt ledger immediately, keeping EDa TP targets honest.
 
 DCA and absorption work the same problem from opposite ends: DCA improves where a position needs to be to close; absorption reduces how much of the position still needs to get there. Neither system completes the picture without the other.
 
 ##### Outlier Positions
 
-When a position is disproportionate relative to the rest of the book — its margin or absolute loss exceeds a configured multiple (default 2.5×) of the average across all others — its absorption interval must be hastened to the minimum, until morale improves.
+Outlier handling remains a discretionary safety valve: a position that is disproportionate relative to the rest of the book can be prioritized for attention, but the active EverWinter absorption trigger is still the uPnL threshold, not a wall-clock interval.
 
-**Outlier Deceleration** is the mirror: a margin outlier in the other direction (margin ≤ average/2.5) receives an add rather than a cut — 5% of current margin (minimum base notional) — updating the weighted-average entry. The same halving cooldown applies, resetting when the position is no longer an outlier. (Should be deferred if AMa is in effect). 
+**Outlier Deceleration** is the mirror: a margin outlier in the other direction (margin ≤ average/2.5) receives an add rather than a cut — 5% of current margin (minimum base notional) — updating the weighted-average entry. The same cooldown discipline applies, resetting when the position is no longer an outlier. (Should be deferred if AMa is in effect).
 
 ##### The Absorption–Entry Cycle
 
@@ -225,9 +217,11 @@ The forgone profit from positions closed early is acceptable — the alternative
 
 **The system is a ledger as much as an accelerant.** Profitable closes burn the deficit down; losing closes push it the other way. The laggard's required exit — the **EDa TP** (Effective Debt Adjusted Take Profit) — moves further from the current price, hardening into debt that future wins must cover. Loss absorption cuts feed directly into this tally — each crystallized loss shifts the EDa TP further, each crystallized gain pulls it back.
 
-**EDa Payback**: Each absorbed loss is counted — it shifts the book's (or Laggard's) Effective Debt and therefore every position's (or Laggard's) EDa TP, accumulating like a bar tab the book must settle through collective effort. 
+**EDa Payback**: Each absorbed loss is counted — it shifts the book's (or Laggard's) Effective Debt and therefore every position's (or Laggard's) EDa TP, accumulating like a bar tab the book must settle through collective effort.
 
-**Laggard Absorption**: When the laggard's deficit reaches zero and the position is still in loss, an alternative to force-closing is available: trim 5% every 5 minutes until the position is fully drained through attrition. Unlike regular absorption, laggard absorption has no floor and will consume the position to zero. EDa TP is suppressed while this mode is active; the slow drain is the exit strategy.
+**Debt distribution note**: Closing positions must not receive their own debt share. Realized PnL is distributed only across surviving positions, non-laggards are capped at their maximum debt, and capped overflow rolls into the laggard as the debt repository. Activity logs should be treated as rollups: repeated debt-share and ADV FT ClC-blocked events describe the latest sample and count rather than one noisy line per ticker.
+
+**Laggard handling**: The laggard is the uncapped debt repository. When non-laggard positions hit their maximum debt, overflow is pushed back onto the laggard and expressed through EDa TP rather than a separate time-based trim loop.
 
 ---
 
@@ -267,9 +261,9 @@ Second Wind detects this: if current margin is meaningfully below the expected c
 
 #### Passive Second Wind
 
-When a cut is due but the position is already at minimum notional, it cannot absorb further. If saved margin has accumulated, the **Passive Second Wind** fires instead: the saved margin is divided into full base-margin units, each funding one additional DCA stage placed 3% above the prior stage (compounding from the last first-wind stage). Any surplus below one full unit is added to the final new stage's notional. The existing stop-loss is cancelled immediately; it re-arms when the new highest second-wind stage fills. The DCA stage counter advances into the new stages naturally — stage 4, 5, and so on — and the SL formula applies to the new maximum as it would to any terminal stage.
+When absorption has spent a position down to its floor, it cannot absorb further. If saved margin has accumulated, the **Passive Second Wind** fires instead: the saved margin is divided into full base-margin units, each funding one additional DCA stage placed 6% above the prior stage. Intervals already exceeded before Second Wind is placed are skipped, and the ladder advances by the same cadence so new orders do not appear behind the current mark. Any surplus below one full unit is added to the final new stage's notional. The existing stop-loss is cancelled immediately; it re-arms when the new highest second-wind stage fills. The DCA stage counter advances into the new stages naturally — stage 4, 5, and so on — and the SL formula applies to the new maximum as it would to any terminal stage.
 
-Once Passive Second Wind fires, the loss acceleration acceleration schedule resets. The stage count used to determine the absorption interval is measured relative to the stage at which second wind activated — so the position returns to the full base interval immediately after second wind, and the clock only tightens again as further second-wind DCA stages fill. This prevents the position from entering the 5-minute floor continuously from the moment second wind fires; it must re-earn the acceleration by continuing to stage deeper.
+Once Passive Second Wind fires, absorption remains uPnL-gated. Additional second-wind stages simply increase the future runway and the stage-aware floor; they do not reintroduce a timer dependency.
 
 The result is a direct conversion of margin the position has already shed into continued runway. Capital that would have remained locked in a shrinking position instead funds multiple conditional entries at progressively less favorable prices — a controlled extension of the DCA ladder, funded entirely from prior cuts, costing no new capital from the book.
 
@@ -315,7 +309,7 @@ A perfect AMa run — all seven adds filling and TP hitting at −22% — return
 
 Each strategy is a specific combination of techniques. The techniques are defined above; below, each strategy describes the problem it solves and which techniques it assembles to solve it.
 
-All strategies except Psycho Mode use Passive Loss Absorption as a reactive technique — positions are trimmed on a fixed interval regardless of current profit state, with gains feeding into the book's payback tally alongside crystallized losses.
+All strategies except Psycho Mode use Passive Loss Absorption as a reactive technique — positions are trimmed only after uPnL breaches the configured strategy threshold, with crystallized cuts and closes feeding the book's payback tally.
 
 ---
 
@@ -388,17 +382,17 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 | LFL (Low-Fund Loser) | FR ≥ low gate, loser | 1× |
 
   Below the low fund floor, no entry is taken regardless of other conditions. Re-entry requires an escalating funding rate after each close on the same symbol — the gate seeds at 1.0% and multiplies ×1.5 per close, with a 6-hour TTL.
-  
+
 - RSI Proximity Block (RSI6 within the configured proximity of the maximum is skipped — prevents entering a ticker about to over-extend)
 - RSI Minimum Gate (RSI6, RSI12, and RSI24 must all be ≥ the configured floor, default 25 — coins already oversold on any timeframe are skipped; applies in both normal and Super FUN mode)
 - Historical OE Look-back (counts 15m candles at RSI6 ≥ maximum in the past 3 hours)
   - Losers with any OE hit are reclassified to the gainers gate
   - OE count scales the VM threshold multiplicatively for gainers
-- Volume Momentum (threshold differs by sub-type [HFG : 10%, LFG : 20%, HFL : -10%, LFL : -5%] High fund does not require as much VM as low fund, losers demonstrate negative VMs due to having already sold off heavily), creeps upward per close on the same symbol. 
+- Volume Momentum (threshold differs by sub-type [HFG : 10%, LFG : 20%, HFL : -10%, LFL : -5%] High fund does not require as much VM as low fund, losers demonstrate negative VMs due to having already sold off heavily), creeps upward per close on the same symbol.
 - LSA for losers only: volume within floor/cap band confirms continued selling
 
 **Position management:**
-- DCA structure 
+- DCA structure
 - TP Ingress applies on re-entry
 - Stop-loss
 - Passive loss absorption
@@ -407,16 +401,9 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 
 **Re-entry Cooldown**: A configurable minimum interval (default one minute) is enforced between FUN entries on the same ticker. This interval scales +1 with each re-entry.
 
-**Super Fun Mode**: Strips FUN to funding rate + positive VM only. All VM thresholds, LSA checks, and creep gates are replaced by a lock-in ratchet — re-entry must match or beat the last close's funding tier within a 6-hour window. Tickers blocked by RSI proximity or OE count are admitted as the OE sub-type (1× slot cost, high funding gate required). Passive absorption is what makes this stance viable — if the ticker turns, the position is absorbed over time rather than force-closed.
+**Super FUN Mode**: EverWinter has replaced regular FUN with Super FUN entirely. It focuses on funding rate plus positive VM, while the lock-in ratchet requires re-entry to match or beat the last close's funding tier within a 6-hour window. Tickers blocked by RSI proximity or OE count are admitted as the OE sub-type (1× slot cost, high funding gate required). Passive absorption is what makes this stance viable — if the ticker turns, the position is absorbed by uPnL threshold rather than force-closed on a timer.
 
-All Super FUN re-entries on the same ticker have TP Ingress deferred and use 2x the standard entry TP. 
-
-After one Super FUN trade on the same ticker within the hour, re-entry is flagged for accelerated loss absorption, firing every 30 seconds if uPnL is; 
-$$
--(\text{baseMargin} \times 0.20)
-$$.
-
-However, If absorption is off, re-entry is deferred until the window clears.
+All Super FUN re-entries on the same ticker have TP Ingress deferred and use 2x the standard entry TP. After one Super FUN trade on the same ticker within the hour, re-entry is flagged for accelerated absorption, but the loss threshold remains `-(baseMargin × 0.25)`. If absorption is off, re-entry is deferred until the window clears.
 
 ---
 
@@ -464,7 +451,7 @@ Psycho Mode is the reactive approach in its purest form — no RSI gates, no vol
 **Techniques in use:**
 
 - *Aggressive Absorption* — threshold-triggered, halving cooldown; cuts directly from the offending position
-- *Laggard Absorption* (optional) — trim 5% every 5 minutes through attrition when deficit clears but position remains in loss
+- *Laggard debt repository* — uncapped debt holder; non-laggard caps push overflow back to the laggard and EDa resolves the balance
 - *Exhumation* — absorbed positions receive a personalized EH TP; regular TP and laggard rules suspended while active
 - *DCA Delay* — prevents premature stage commitment on fast-moving tickers
 - *Second Wind* — defers SL when absorption has reduced the position below expected margin; recalibrates and queues new stages

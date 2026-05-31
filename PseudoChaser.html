@@ -883,7 +883,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="tog-t" :class="cfg.lossAbsorptionEnabled?'on':''"><div class="tog-k"></div></div>
               <span class="tog-l">Loss Absorption</span>
             </label>
-            <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Closes base notional whenever a position's uPnL crosses −25% of base margin (−50% for 2× strategies: Adv FT, FT, SalF, FUN HFG/HFL). 30s cooldown between cuts. Stops at stage-based minimum margin floor. Only fires in loss.</div>
+            <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Closes base notional whenever uPnL crosses −25% of base margin (FT/AdvFT/SalF scale by slot weight; FUN stays fixed at −25%). 30s cooldown between cuts. Stops at the stage-based minimum margin floor and only fires in loss.</div>
             <div x-show="cfg.lossAbsorptionEnabled" style="margin-top:10px">
               <label class="tog" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''" @click.prevent="if(!cfgLocked){cfg.passiveSecondWindEnabled=!cfg.passiveSecondWindEnabled;persist()}">
                 <div class="tog-t" :class="(cfg.passiveSecondWindEnabled!==false)?'on':''"><div class="tog-k"></div></div>
@@ -2108,6 +2108,7 @@ function fmtP(p) {
 }
 
 const LS_KEY = 'pc_v1';
+const BANLIST_TTL_MS = 7 * 24 * 3600 * 1000;
 
 const _closingIds = new Set();
 const AUDIT_MIN_GAP_MS = 5000;
@@ -2209,7 +2210,7 @@ function pw() { return {
   extenderCount: {}, // symbol → { count, setAt } — tracks over-extended scan hits per coin, valid 3h (Advanced FT)
   _extenderPollers: {}, // symbol → intervalId — dedicated per-symbol RSI pollers for active extenders
   ftCandidates: {},  // symbol → { count, qualifiedAt } — persisted FT watch roster; survives app restarts and rodeo TTL expiry
-  _symbolBanlist: {}, // symbol → reason string — permanently excluded from scans; persisted across restarts
+  _symbolBanlist: {}, // symbol → { reason, setAt } — temporary one-week scan exclusion
   _advFtGraylist:    {}, // symbol → expiresAt — graylisted from gainers when ADV FT threshold reached
   _extenderGraylist: {}, // symbol → expiresAt — graylisted on first over-extension; 3h window
   _ftEvictGraylist:  {}, // symbol → evictedAt — prevents extenderBump re-promoting an evicted FT entry within same window
@@ -2352,6 +2353,46 @@ function pw() { return {
     ];
   },
 
+  // ── TEMPORARY SYMBOL BANLIST ──
+  // New entries expire after one week. Legacy string-only entries are intentionally
+  // not migrated on load so previously permanent bans are re-evaluated next launch.
+  _normalizeBanEntry(entry) {
+    if (!entry || typeof entry !== 'object') return null;
+    const setAt = Number(entry.setAt);
+    if (!Number.isFinite(setAt)) return null;
+    if ((Date.now() - setAt) >= BANLIST_TTL_MS) return null;
+    return { reason: String(entry.reason || 'banned'), setAt };
+  },
+
+  _loadSymbolBanlist(saved) {
+    this._symbolBanlist = {};
+    if (!saved || typeof saved !== 'object') return;
+    for (const [symbol, entry] of Object.entries(saved)) {
+      const normalized = this._normalizeBanEntry(entry);
+      if (normalized) this._symbolBanlist[symbol] = normalized;
+    }
+  },
+
+  _banSymbol(symbol, reason) {
+    if (!symbol) return;
+    this._symbolBanlist[symbol] = { reason: String(reason || 'banned'), setAt: Date.now() };
+  },
+
+  _banReason(symbol) {
+    const entry = this._symbolBanlist?.[symbol];
+    const normalized = this._normalizeBanEntry(entry);
+    if (!normalized) {
+      if (entry) delete this._symbolBanlist[symbol];
+      return null;
+    }
+    if (entry !== normalized) this._symbolBanlist[symbol] = normalized;
+    return normalized.reason;
+  },
+
+  _isSymbolBanned(symbol) {
+    return !!this._banReason(symbol);
+  },
+
   // PERSISTENCE
   persist() {
     try {
@@ -2434,7 +2475,7 @@ function pw() { return {
       if (s.salfCreep && typeof s.salfCreep === 'object') this.salfCreep = s.salfCreep;
       if (s.extenderCount && typeof s.extenderCount === 'object') this.extenderCount = s.extenderCount;
       if (s.ftCandidates && typeof s.ftCandidates === 'object') this.ftCandidates = s.ftCandidates;
-      if (s.symbolBanlist && typeof s.symbolBanlist === 'object') this._symbolBanlist = s.symbolBanlist;
+      if (s.symbolBanlist && typeof s.symbolBanlist === 'object') this._loadSymbolBanlist(s.symbolBanlist);
       const nowGl = Date.now();
       if (s.ftMaxGraylist && typeof s.ftMaxGraylist === 'object') {
         for (const [sym, expiry] of Object.entries(s.ftMaxGraylist)) {
@@ -2821,8 +2862,8 @@ function pw() { return {
       for (const t of tickers.slice(0, this.cfg.topN)) {
         const sym=t.symbol, change=parseFloat(t.price24hPcnt||0)*100, price=parseFloat(t.lastPrice||0);
 
-        if (this._symbolBanlist[sym]) {
-          candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate:null,status:'banned',skipReason:this._symbolBanlist[sym]});
+        if (this._isSymbolBanned(sym)) {
+          candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate:null,status:'banned',skipReason:this._banReason(sym)});
           continue;
         }
 
@@ -3065,7 +3106,7 @@ function pw() { return {
           const sym   = t.symbol;
           const price = parseFloat(t.lastPrice || 0);
           if (!price) continue;
-          if (this._symbolBanlist[sym]) continue;
+          if (this._isSymbolBanned(sym)) continue;
           if (this.positions.find(p => p.symbol === sym)) continue;
           const fr = await this.fetchFundingRate(sym).catch(() => null);
           if (fr === null) continue;
@@ -3212,7 +3253,7 @@ function pw() { return {
       const sym   = t.symbol;
       const price = parseFloat(t.lastPrice || 0);
       if (!price) continue;
-      if (this._symbolBanlist[sym]) continue;
+      if (this._isSymbolBanned(sym)) continue;
       if (this.positions.find(p => p.symbol === sym)) continue;
       const eff = this.positions.reduce((n, p) => n + (p._fun ? (p._funMult ?? 2) : p._salf ? 2 : p._ft ? 2 : 1), 0);
       if (eff + 2 > this.cfg.maxPos) break;
@@ -3271,7 +3312,7 @@ function pw() { return {
   },
 
   async salfOpenShort(sym, price, change24h, lsaRatio, isLoser, rsi6 = null, rsi12 = null, rsi24 = null) {
-    if (this._symbolBanlist[sym]) return false;
+    if (this._isSymbolBanned(sym)) return false;
     const instr = await this.getInstrInfo(sym);
     if (!instr) { this.log(`🎣 ${sym}: SalF — instrument not supported`, 'warn'); return false; }
     const levResult = this.resolveEffectiveLeverage(sym, instr);
@@ -3284,17 +3325,17 @@ function pw() { return {
     const qty    = this.snapQty(rawQty, instr);
     if (qty <= 0) {
       this.log(`🎣 ${sym}: SalF qty below min — BLACKLISTED`, 'warn');
-      this._symbolBanlist[sym] = 'SalF qty below min (notional too small for instrument)';
+      this._banSymbol(sym, 'SalF qty below min (notional too small for instrument)');
       this.persist(); return false;
     }
     const actualNotional = qty * price;
     if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) {
       this.log(`🎣 ${sym}: SalF notional below exchange min (${actualNotional.toFixed(4)} < ${instr.minOrderAmt}) — BLACKLISTED`, 'warn');
-      this._symbolBanlist[sym] = `SalF notional below exchange minimum (${actualNotional.toFixed(4)} USDT)`;
+      this._banSymbol(sym, `SalF notional below exchange minimum (${actualNotional.toFixed(4)} USDT)`);
       this.persist(); return false;
     }
     const tpPrice = this.snapPrice(price * (1 + (effTp0 / 100) / effectiveLev), instr);
-    if (!tpPrice || tpPrice <= 0) { this.log(`🎣 ${sym}: SalF TP price invalid — BLACKLISTED`, 'warn'); this._symbolBanlist[sym] = 'SalF TP invalid'; return false; }
+    if (!tpPrice || tpPrice <= 0) { this.log(`🎣 ${sym}: SalF TP price invalid — BLACKLISTED`, 'warn'); this._banSymbol(sym, 'SalF TP invalid'); return false; }
     const margin = actualNotional / effectiveLev;
     const orders = [{ label: 'Entry', price, type: 'tp', filled: false, orderId: null }];
     let runNotional = price * qty, runSize = qty;
@@ -3582,8 +3623,8 @@ function pw() { return {
           continue;
         }
 
-        if (this._symbolBanlist[sym]) {
-          this.log(`⚡ ${sym}: ADV FT skipped — banned (${this._symbolBanlist[sym]}) — evicting from roster`, 'info');
+        if (this._isSymbolBanned(sym)) {
+          this.log(`⚡ ${sym}: ADV FT skipped — banned (${this._banReason(sym)}) — evicting from roster`, 'info');
           delete this.ftCandidates[sym];
           delete this.extenderCount[sym];
           this.persist();
@@ -3729,7 +3770,7 @@ function pw() { return {
   },
 
   async funOpenShort(sym, price, fundingRate, isLoser = false, change24h = null, rsi6 = null, rsi12 = null, rsi24 = null, nextFundingTime = null, fundingIntervalMs = null, histOverExtCount = 0, subType = 'HFG', mult = 1, badge = '1x') {
-    if (this._symbolBanlist[sym]) return false;
+    if (this._isSymbolBanned(sym)) return false;
     if (fundingRate == null || fundingRate >= 0) {
       this.log(`💰 ${sym}: FUN entry blocked — funding rate ${fundingRate == null ? '—' : fundingRate.toFixed(4) + '%'} is not negative (LONG requires FR < 0)`, 'warn');
       return false;
@@ -3748,7 +3789,7 @@ function pw() { return {
     const actualNotional = qty * price;
     if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) {
       this.log(`💰 ${sym}: FUN notional below exchange min (${actualNotional.toFixed(4)} < ${instr.minOrderAmt}) — BLACKLISTED`, 'warn');
-      this._symbolBanlist[sym] = `FUN notional below exchange minimum (${actualNotional.toFixed(4)} USDT)`;
+      this._banSymbol(sym, `FUN notional below exchange minimum (${actualNotional.toFixed(4)} USDT)`);
       this.gainers = this.gainers.filter(g => g.symbol !== sym);
       delete this.ftCandidates[sym];
       this._stopExtenderPoller(sym);
@@ -3756,7 +3797,7 @@ function pw() { return {
       return false;
     }
     const tpPrice = this.snapPrice(price * (1 + (effTp0 / 100) / effectiveLev), instr);
-    if (!tpPrice || tpPrice <= 0) { this.log(`💰 ${sym}: FUN TP price invalid — BLACKLISTED`, 'warn'); this._symbolBanlist[sym] = `FUN TP invalid`; return false; }
+    if (!tpPrice || tpPrice <= 0) { this.log(`💰 ${sym}: FUN TP price invalid — BLACKLISTED`, 'warn'); this._banSymbol(sym, `FUN TP invalid`); return false; }
     const margin = actualNotional / effectiveLev;
     const orders = [{ label: 'Entry', price, type: 'tp', filled: false, orderId: null }];
     let runNotional = price * qty, runSize = qty;
@@ -3836,7 +3877,7 @@ function pw() { return {
   },
 
   async ftOpenShort(sym, price, rsi6, rsi12, rsi24, fundingRate, oeCount, isAdvFt = false) {
-    if (this._symbolBanlist[sym]) { this.log(`🎯 ${sym}: banned — skipping FT entry (${this._symbolBanlist[sym]})`, 'warn'); return; }
+    if (this._isSymbolBanned(sym)) { this.log(`🎯 ${sym}: banned — skipping FT entry (${this._banReason(sym)})`, 'warn'); return; }
     // Rodeo creep is gainer-only; ADV FT uses fixed 2× margin premium
     const _rodnMult      = 1;
     const entryNotional  = this.cfg.minNotional * 2;
@@ -3851,21 +3892,21 @@ function pw() { return {
     const qty    = this.snapQty(rawQty, instr);
     if (qty <= 0) {
       this.log(`🎯 ${sym}: FT qty below min — BLACKLISTED`, 'warn');
-      this._symbolBanlist[sym] = 'FT qty below min (notional too small for instrument)';
+      this._banSymbol(sym, 'FT qty below min (notional too small for instrument)');
       delete this.ftCandidates[sym]; delete this.extenderCount[sym]; delete this._advFtGraylist[sym];
       this.persist(); return;
     }
     const actualNotional = qty * price;
     if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) {
       this.log(`🎯 ${sym}: FT notional below min — BLACKLISTED`, 'warn');
-      this._symbolBanlist[sym] = 'FT notional below min (notional too small for instrument)';
+      this._banSymbol(sym, 'FT notional below min (notional too small for instrument)');
       delete this.ftCandidates[sym]; delete this.extenderCount[sym]; delete this._advFtGraylist[sym];
       this.persist(); return;
     }
     const tpPrice = this.snapPrice(price * (1 + (effTp0 / 100) / effectiveLev), instr);
     if (!tpPrice || tpPrice <= 0) { 
       this.log(`🎯 ${sym}: FT TP price invalid (${tpPrice}) — BLACKLISTED`, 'warn'); 
-      this._symbolBanlist[sym] = `FT TP price invalid (${tpPrice})`;
+      this._banSymbol(sym, `FT TP price invalid (${tpPrice})`);
       this.gainers = this.gainers.filter(g => g.symbol !== sym);
       delete this.ftCandidates[sym];
       delete this.extenderCount[sym];
@@ -3885,7 +3926,7 @@ function pw() { return {
       const addPrice  = this.snapPrice(price * (1 - _ftAddPcts[i] / 100), instr);
       if (!addPrice || addPrice <= 0) {
         this.log(`🎯 ${sym}: FT DCA Add${i+1} price invalid (${addPrice}) — BLACKLISTED`, 'warn');
-        this._symbolBanlist[sym] = `FT DCA Add${i+1} price too low for API precision (${addPrice})`;
+        this._banSymbol(sym, `FT DCA Add${i+1} price too low for API precision (${addPrice})`);
         this.gainers = this.gainers.filter(g => g.symbol !== sym);
         delete this.ftCandidates[sym];
         delete this.extenderCount[sym];
@@ -3905,7 +3946,7 @@ function pw() { return {
       const addTp = this.snapPrice(expectedAvg * (1 + (this._tpRoi(i+1) / 100) / effectiveLev), instr);
       if (!addTp || addTp <= 0) {
         this.log(`🎯 ${sym}: FT DCA Add${i+1} TP invalid (${addTp}) — BLACKLISTED`, 'warn');
-        this._symbolBanlist[sym] = `FT DCA Add${i+1} TP invalid (${addTp})`;
+        this._banSymbol(sym, `FT DCA Add${i+1} TP invalid (${addTp})`);
         this.gainers = this.gainers.filter(g => g.symbol !== sym);
         delete this.ftCandidates[sym];
         delete this.extenderCount[sym];
@@ -4397,8 +4438,8 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
     const max  = instr?.maxLeverage;
     if (max && max > 0 && want > max) {
       if (max <= 5) {
-        if (!this._symbolBanlist[symbol]) {
-          this._symbolBanlist[symbol] = `maxLeverage ${max}× ≤ 5× (below bot minimum)`;
+        if (!this._isSymbolBanned(symbol)) {
+          this._banSymbol(symbol, `maxLeverage ${max}× ≤ 5× (below bot minimum)`);
           this.log(`${symbol}: max leverage ${max}× ≤ 5× — permanently banned from scans`, 'warn');
           this.persist();
         }
@@ -4570,7 +4611,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
     if (invalid.length) {
       for (const { sym, reasons } of invalid) {
         const reason = `invalid position (${reasons.join(', ')})`;
-        this._symbolBanlist[sym] = reason;
+        this._banSymbol(sym, reason);
         this.log(`☀️ ${sym}: invalid position purged — banned from future scans (${reasons.join(', ')})`, 'warn');
         const g = this.gainers.find(x => x.symbol === sym);
         if (g) g.status = 'skip';
@@ -4806,7 +4847,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
 
   async pseudoOpenShort(candidate) {
     const sym = candidate.symbol, price = candidate.price;
-    if (this._symbolBanlist[sym]) { this.log(`${sym}: banned — skipping entry (${this._symbolBanlist[sym]})`, 'warn'); return; }
+    if (this._isSymbolBanned(sym)) { this.log(`${sym}: banned — skipping entry (${this._banReason(sym)})`, 'warn'); return; }
     const nowOs = Date.now();
     if (this._advFtGraylist[sym] && nowOs < this._advFtGraylist[sym]) {
       this.log(`${sym}: entry blocked — ADV FT gainers graylist active`, 'warn'); return;
@@ -4832,7 +4873,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
     const tpPrice = this.snapPrice(price * (1 + (effTp0 / 100) / effectiveLev), instr);
     if (!tpPrice || tpPrice <= 0) { 
       this.log(`${sym}: Pseudo TP price invalid (${tpPrice}) — BLACKLISTED`, 'warn'); 
-      this._symbolBanlist[sym] = `Pseudo TP price invalid (${tpPrice})`;
+      this._banSymbol(sym, `Pseudo TP price invalid (${tpPrice})`);
       this.gainers = this.gainers.filter(g => g.symbol !== sym);
       delete this.ftCandidates[sym];
       delete this.extenderCount[sym];
@@ -4852,7 +4893,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
       const addPrice  = this.snapPrice(price * (1 - _psAddPcts[i]/100), instr);
       if (!addPrice || addPrice <= 0) {
         this.log(`${sym}: Pseudo DCA Add${i+1} price invalid (${addPrice}) — BLACKLISTED`, 'warn');
-        this._symbolBanlist[sym] = `Pseudo DCA Add${i+1} price too low for API precision (${addPrice})`;
+        this._banSymbol(sym, `Pseudo DCA Add${i+1} price too low for API precision (${addPrice})`);
         this.gainers = this.gainers.filter(g => g.symbol !== sym);
         delete this.ftCandidates[sym];
         delete this.extenderCount[sym];
@@ -4872,7 +4913,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
       const addTp = this.snapPrice(expectedAvg * (1 + (effTpRoi[i+1] / 100) / effectiveLev), instr);
       if (!addTp || addTp <= 0) {
         this.log(`${sym}: Pseudo DCA Add${i+1} TP invalid (${addTp}) — BLACKLISTED`, 'warn');
-        this._symbolBanlist[sym] = `Pseudo DCA Add${i+1} TP invalid (${addTp})`;
+        this._banSymbol(sym, `Pseudo DCA Add${i+1} TP invalid (${addTp})`);
         this.gainers = this.gainers.filter(g => g.symbol !== sym);
         delete this.ftCandidates[sym];
         delete this.extenderCount[sym];
@@ -4948,7 +4989,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
   async pseudoPlaceEntryConditional(candidate) {
     const sym  = candidate.symbol;
     const g    = this.gainers.find(x => x.symbol === sym);
-    if (this._symbolBanlist[sym]) { this.log(`${sym}: banned — skipping potential entry (${this._symbolBanlist[sym]})`, 'warn'); if (g) g.status='skip'; return; }
+    if (this._isSymbolBanned(sym)) { this.log(`${sym}: banned — skipping potential entry (${this._banReason(sym)})`, 'warn'); if (g) g.status='skip'; return; }
     const nowPe = Date.now();
     if (this._advFtGraylist[sym] && nowPe < this._advFtGraylist[sym]) {
       if (g) g.status = 'ADV';
@@ -5013,7 +5054,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
           this.renderPotGainers();
           continue;
         }
-        if (this._symbolBanlist[pe.symbol]) {
+        if (this._isSymbolBanned(pe.symbol)) {
           this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
           const g = this.gainers.find(x => x.symbol === pe.symbol);
           if (g) g.status = 'skip';
@@ -6559,9 +6600,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         continue;
       }
 
-      // Threshold = -(baseMargin * 0.25 * slotMult).
-      // A 2x position must lose 0.50× baseMargin before a cut fires; 1x requires 0.25×.
-      const _uPnlThreshold = -(baseMargin * 0.25 * _slotMult);
+      // FUN uses a fixed base-margin threshold; other sized strategies scale by slots.
+      const _uPnlThreshold = pos._fun
+        ? -(baseMargin * 0.25)
+        : -(baseMargin * 0.25 * _slotMult);
       // Compute uPnL live from markPrice — pos.upnl is a reactive display property that
       // can lag by a full tick, causing absorption to miss the threshold until the next cycle.
       const _posUPnl = pos.markPrice

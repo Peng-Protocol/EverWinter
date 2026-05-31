@@ -4,6 +4,13 @@
 
 ---
 
+
+## PseudoWinter and PseudoChaser
+
+`PseudoWinter1.0.html` is the browser/paper-style counterpart used to stage strategy changes before they are ported back into EverWinter. `PseudoChaser.html` is intentionally very close to PseudoWinter, but flips the short-biased thresholds/directions into a chaser variant so the same watchlists, ADV FT, FUN, SalF, absorption, and banlist mechanics can be compared with mirrored values.
+
+---
+
 ## Technical Stack
 
 - **Frontend:** Alpine.js, Bootstrap 5, "Glacier-Void" CSS theme
@@ -37,8 +44,12 @@ All explained in the [Strategy Guide](https://github.com/Peng-Protocol/EverWinte
 
 ## Watchlists
 
+
+### Temporary Symbol Banlist
+Banlist entries now store `{ reason, setAt }`, expire after one week, and are pruned as they are checked. Legacy string-only banlist entries are intentionally dropped on the next app launch so previously permanent bans are re-evaluated against current exchange tradability.
+
 ### Potential Entries Watchlist
-Symbols within a configurable RSI shortfall of the full entry gate (default 10%). The 5-second poller re-checks all gates and opens immediately on qualification — no waiting for the next full scan. Tickers failing other filters (OE, funding, volume divergence) are evicted mid-watch.
+Symbols within a configurable RSI shortfall of the full entry gate (default 3%). The 5-second poller re-checks all gates and opens immediately on qualification — no waiting for the next full scan. Tickers failing other filters (OE, funding, volume divergence) are evicted mid-watch.
 
 ### Follow-Through Watchlist
 ADV FT candidates only, rebuilt each scan from the persisted `ftCandidates` roster. Shows status per candidate with OE hit count (⚡) and trades opened. When full, eviction priority is lowest FR first, then oldest.
@@ -106,20 +117,7 @@ Target profit boundaries are established dynamically, but execution logic heavil
 
 ## Loss Absorption (Passive)
 
-Passive, timer-based — fires every base interval (default 45 min) regardless of loss depth; cuts 5% of current size at market. No loss threshold is required; the cut fires whenever the interval elapses and the position has margin above the base floor. The base interval (`lossAbsorptionIntervalMins`) shortens per DCA stage when Passive Second Wind is enabled:
-
-| DCA Stage | Interval |
-|-----------|----------|
-| 0 | base |
-| 1 | ⅔ × base |
-| 2 | ⅓ × base, min 5 min |
-| 3+ | 5 min |
-
-During re-entries in Super FUN mode the system uses "uPnL Absorption" which absorbs at a 30s interval if uPnL is; 
-
-$$
--(\text{baseMargin} \times 0.20) 
-$$
+Passive absorption is now **uPnL-based**, not timer-based. On each position-management tick, a position is eligible for one base-margin cut only when unrealized PnL is below its loss threshold and the 30s per-position cooldown has elapsed. FUN positions use a fixed threshold of `-(baseMargin × 0.25)`; FT/AdvFT/SalF scale by slot weight (`-(baseMargin × 0.25 × slots)`). Cuts stop at the stage-based minimum margin floor: below DCA stage 2 the floor scales with strategy size, and at stage 2+ it collapses to one base margin.
 
 ### Saved Margin (`_savedMargin`)
 Each cut accumulates `cutMgn = cutQty × entryPrice / leverage` into `pos._savedMargin` after subtracting absorbed loss. Visible in the activity log as `| saved $X.XX`.
@@ -130,7 +128,7 @@ The bot employs a staged approach to unrealized loss absorption to optimize capi
 * **Stage 2 and Beyond:** The system aggressively escalates to "cutting to the bone." The bot absorbs the position down to the base notional, minimizing exposure on deeply extended trades.
 
 ### Passive Second Wind
-Fires when absorption is due but the position is at minimum margin and `_savedMargin > 0`. Computes `extraStages = floor(_savedMargin / baseMargin)` and places that many conditional orders above the last stage trigger at 3% compounding increments, each stamped `_secondWind: true`. After activation: `_stageCount` expands, SL is recomputed to the new highest stage, and the interval resets to relative stage 0 from `_secondWindBaseStage` — the bot re-earns faster intervals as second-wind stages fill.
+Fires when absorption is due but the position is at minimum margin and `_savedMargin > 0`. Computes `extraStages = floor(_savedMargin / baseMargin)` and places that many conditional orders above the last stage trigger at 6% compounding increments, each stamped `_secondWind: true`. After activation: `_stageCount` expands, SL is recomputed to the new highest stage, and the interval resets to relative stage 0 from `_secondWindBaseStage` — the bot re-earns faster intervals as second-wind stages fill.
 
 ### Infinite Second Wind (toggle, default on)
 When enabled, second wind re-fires each time enough margin has been saved since the last activation — there is no single-use cap. Savings from every absorbing position are pooled across all open positions' `_savedMargin`, so every position can accumulate second-wind runway funded by the whole book. The laggard's `runtimeHours` force-close is suspended, letting it run until its EDa TP is hit.
@@ -155,10 +153,7 @@ This means congestion can fire correctly while making no visible TP change on po
 Trade count, wins, losses, win rate, net PnL, Force Closes, and TP Reduces. Resets on **Clear Stats** or bot restart; survives page reload.
 
 ### FUN Lock-in
-Super FUN mode only. Each FUN close stamps a minimum FR re-entry gate for that symbol (`funFundingHigh` for HFG/HFL/OE, `funFundingLow` for LFG/LFL). At 1+ closes in the 6h window: fast absorption activates on any open FUN position; with absorption off, re-entry is deferred entirely.
-
-### FUN VM Creep
-Per-symbol VM floor creep in normal FUN mode. Shows close count, effective VM floor per sub-type, FR re-entry gate, and 6h TTL countdown. OE hits shown inline with multiplicative VM effect.
+FUN now runs as Super FUN only. Each FUN close stamps a minimum FR re-entry gate for that symbol (`funFundingHigh` for HFG/HFL/OE, `funFundingLow` for LFG/LFL). At 1+ closes in the 6h window: fast absorption activates on any open FUN position; with absorption off, re-entry is deferred entirely.
 
 ### TP Ingress
 Per-symbol TP reduction for non-Gainer strategies. Each close multiplies the stage-0 TP by `0.5^count`, floored at `minTpRoi` (default 3%). Resets after a 3h TTL.
@@ -243,7 +238,7 @@ Exhumed positions block regular TP, recompute EH TP on each DCA fill or absorpti
 
 ### Laggard
 
-Evaluates oldest position (or deepest-stage with **Age Mode**); force-closes when `buffedEV − lostValue − uPnL ≤ 0`. Every close and absorption cut feeds into the lost-value tally. **80% margin floor**: cuts skipped if they'd leave < 80% of base margin, preventing EDa TP from computing negative. **Profit Offset** scales the EV buffer (default +50% = 1.5× EV); **Laggard Absorption** trims 5% every 5 min instead of force-closing.
+Evaluates oldest position (or deepest-stage with **Age Mode**); force-closes when `buffedEV − lostValue − uPnL ≤ 0`. Every close and absorption cut feeds into the lost-value tally. **80% margin floor**: cuts skipped if they'd leave < 80% of base margin, preventing EDa TP from computing negative. **Profit Offset** scales the EV buffer (default +50% = 1.5× EV); non-laggards cap negative lost-value at `laggardDebtCapPct` (default 150%) of slot-weighted base EV with overflow pushed to the laggard; **Laggard Absorption** trims 5% every 5 min instead of force-closing.
 
 ### Cascade Trigger
 
