@@ -4,13 +4,6 @@
 
 ---
 
-
-## PseudoWinter and PseudoChaser
-
-`PseudoWinter1.0.html` is the browser/paper-style counterpart used to stage strategy changes before they are ported back into EverWinter. `PseudoChaser.html` is intentionally very close to PseudoWinter, but flips the short-biased thresholds/directions into a chaser variant so the same watchlists, ADV FT, FUN, SalF, absorption, and banlist mechanics can be compared with mirrored values.
-
----
-
 ## Technical Stack
 
 - **Frontend:** Alpine.js, Bootstrap 5, "Glacier-Void" CSS theme
@@ -182,6 +175,12 @@ Reverse-chronological feed of closed positions: symbol, entry/exit price, DCA st
 PseudoWinter runs the complete EverWinter logic against live market data with phantom capital — no API key required, no real orders. Funding fees are deducted from simulated PnL. Works from `file://` protocol where Bybit's public API would reject cross-origin requests.
 
 ---
+
+## PseudoChaser
+
+ `PseudoChaser.html` is an intentional imitation of PseudoWinter but with a longs-only bias and flipped criteria for entry. It uses the same strategies but with a few tweaks; standard gainers still enter at overbought levels but use over-extension as an entry criteria rather than a pass. Adv FT enter when ClC has 3 or more green candles, rather than red. Fund Chasing uses negative funding rates, all funding rates across the app are flipped. SalF uses inverted LSA (LBA) and green ClC. The UI is color flipped as well, going from icy blue/teal to dim tan/orange. 
+
+ ---
 
 ## PsychoWinter
 
