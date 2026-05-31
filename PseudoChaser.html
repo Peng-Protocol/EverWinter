@@ -385,8 +385,8 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
 .g-st.notlive    { color: #3d5a78; }
 .g-st.proxmax    { color: #3d5a78; }
 .g-st.maxlev     { color: var(--warn); }
-.g-st.overshorted { color: var(--warn); }
-.g-st.overextended { color: var(--short); }
+.g-st.overlonged { color: var(--warn); }
+.g-st.overextended { color: var(--ice); }
 .g-st.ADV          { color: var(--text-lo); } /* graylisted — ADV FT roster active */
 .g-st.extgrayed    { color: var(--text-lo); opacity: .7; } /* graylisted — first over-extension, awaiting extender poller window */
 .g-st.divvolume  { color: var(--warn); }
@@ -525,7 +525,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   </div>
 </div>
 
-<!-- LAYER 3: KEY ENTRY MODAL REMOVED — PseudoWinter uses public Bybit endpoints only -->
+<!-- LAYER 3: KEY ENTRY MODAL REMOVED — PseudoChaser uses public Bybit endpoints only -->
 
 <!-- ══════════════════════════════════════════════════════════
      LAYER 3b (z:5002): EXPORT MENU MODAL
@@ -1567,7 +1567,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               :class="g.fundingRate==null?'':(g.fundingRate>=cfg.fundingRateMax?'g-fr-neg':g.fundingRate<0?'g-fr-pos':'g-fr-warn')"
               x-text="g.fundingRate!=null?(g.fundingRate>=0?'+':'')+g.fundingRate.toFixed(4)+'%':'—'"></span>
             <span class="g-st"  :class="g.status"
-              x-text="g.status==='ready'?(g._hasDivVol?'▲ READY ⚡DIV':'▲ READY'):g.status==='watch'?'◉ POTENTIAL':g.status==='active'?'● OPEN':g.status==='maxed'?'— MAX POS':g.status==='invalid'?'— INVALID':g.status==='notlive'?'— NOT LIVE':g.status==='maxlev'?'⚠ MAX LEV':g.status==='closed'?'✓ CLOSED':g.status==='lowbal'?'✕ LOW BAL':g.status==='lowbalcond'?'✕ LOW BAL':g.status==='overshorted'?'⚠ OVER-LONGED':g.status==='overextended'?'⚡ OVER-EXTENDED':g.status==='proxmax'?'— NEAR MAX RSI':g.status==='divvolume'?'🔊 DIV VOLUME':g.status==='lowdivvolume'?'🔉 DIV VOLUME':g.status==='ADV'?'⚡ ADV FT':g.status==='extgrayed'?'✕ NO OE HISTORY':g.status==='skip'?'✕ LOW RSI':'⚠ LOW RSI'"></span>
+              x-text="g.status==='ready'?(g._hasDivVol?'▲ READY ⚡DIV':'▲ READY'):g.status==='watch'?'◉ POTENTIAL':g.status==='active'?'● OPEN':g.status==='maxed'?'— MAX POS':g.status==='invalid'?'— INVALID':g.status==='notlive'?'— NOT LIVE':g.status==='maxlev'?'⚠ MAX LEV':g.status==='closed'?'✓ CLOSED':g.status==='lowbal'?'✕ LOW BAL':g.status==='lowbalcond'?'✕ LOW BAL':g.status==='overlonged'?'⚠ OVER-LONGED':g.status==='overextended'?'⚡ OE TARGET':g.status==='proxmax'?'— NEAR MAX RSI':g.status==='divvolume'?'🔊 DIV VOLUME':g.status==='lowdivvolume'?'🔉 DIV VOLUME':g.status==='ADV'?'⚡ ADV FT':g.status==='extgrayed'?'✕ NO OE HISTORY':g.status==='skip'?'✕ LOW RSI':'⚠ LOW RSI'"></span>
           </div>
         </template>
       </div>
@@ -2121,6 +2121,7 @@ let _potEntryTimer    = null;
 let _refreshTimer     = null;
 let _audioTimer       = null;
 let _laggardInterval  = null;
+let _absorpTimer      = null;
 
 function pw() { return {
   showSetup: false,
@@ -2634,6 +2635,15 @@ function pw() { return {
     _potEntryTimer = setInterval(() => this.watchPotentialEntries(), 5000);
     if (_laggardInterval) { clearInterval(_laggardInterval); _laggardInterval = null; }
     _laggardInterval = setInterval(() => { if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) this.runLaggardCheck(); }, 60000);
+    // Loss absorption runs on its own 15s timer, independent of the watch cycle lock.
+    // Previously it was called from inside pseudoWatchPositions, which meant it could be
+    // starved when long watch cycles (1s delay × N positions) blocked the re-entry guard.
+    if (_absorpTimer) { clearInterval(_absorpTimer); _absorpTimer = null; }
+    _absorpTimer = setInterval(() => {
+      if (this.bot.running && this.cfg.lossAbsorptionEnabled && this.positions.length > 0) {
+        this.runLossAbsorption().catch(() => {});
+      }
+    }, 15000);
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 2) {
       await this.runLaggardCheck();
     }
@@ -2648,6 +2658,7 @@ function pw() { return {
     clearInterval(_potEntryTimer);
     _potEntryTimer = null;
     clearInterval(_laggardInterval); _laggardInterval = null;
+    clearInterval(_absorpTimer); _absorpTimer = null;
     this.stopKeepalive();
     this.bot.scanCd = 0; this.bot.scanPct = 100;
     this.bot.startTime = null;
@@ -2755,7 +2766,8 @@ function pw() { return {
         } catch(e) { this.log(`⚡ ${sym}: extender tick error — ${e.message}`, 'warn'); }
       }
 
-      // Loss absorption
+      // Loss absorption also runs on its own dedicated timer (_absorpTimer, 15s).
+      // This call ensures a final pass at end-of-cycle in case the timer hasn't fired yet.
       if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) await this.runLossAbsorption();
 
     } catch(e) { this.log('Cycle error: ' + e.message, 'error'); }
@@ -2814,13 +2826,19 @@ function pw() { return {
           continue;
         }
 
-        if (this._advFtGraylist[sym]) {
-          if (Date.now() < this._advFtGraylist[sym]) {
-            candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate:null,status:'ADV',skipReason:`ADV FT roster active — gainers entry suspended`});
+        if (this._advFtGraylist[sym] && Date.now() < this._advFtGraylist[sym]) {
+          // ADV FT roster active — only defer to ADV FT if RSI6 is below rsi6Max
+          // (i.e. ticker is in the normal gainer entry window).
+          // If RSI6 is at or above rsi6Max the ticker is over-extended and gainers
+          // would not have entered it anyway — no conflict, let normal flow continue.
+          const _glRsi6 = await this.fetchRSI(sym, 6);
+          if (_glRsi6 === null || _glRsi6 < this.cfg.rsi6Max) {
+            candidates.push({symbol:sym,change,price,rsi6:_glRsi6,rsi12:null,rsi24:null,fundingRate:null,status:'ADV',skipReason:`ADV FT roster active — RSI6 ${_glRsi6 != null ? _glRsi6.toFixed(1) : '?'} < max ${this.cfg.rsi6Max}, gainers entry deferred`});
             continue;
-          } else {
-            delete this._advFtGraylist[sym]; // expired — clean up
           }
+          // RSI6 >= rsi6Max — over-extended, gainers would skip anyway; fall through
+        } else if (this._advFtGraylist[sym]) {
+          delete this._advFtGraylist[sym]; // expired — clean up
         }
 
         if (this._extenderGraylist[sym]) {
@@ -2837,9 +2855,8 @@ function pw() { return {
           const fr = await this.fetchFundingRate(sym);
           entryFundingRate = fr;
           if (this.cfg.fundingFilter && fr !== null && fr >= this.cfg.fundingRateMax) {
-            // Over-longed tickers are frequently simultaneously over-extended. Still check RSI6
-            // so they accumulate extender ticks and can reach the ADV FT threshold despite being
-            // ineligible for gainer entries.
+            // Over-longed: longs are paying shorts — bad for a longs-only strategy.
+            // Still check RSI6 for ADV FT extender ticks if enabled.
             if (this.cfg.advFtEnabled) {
               const _frRsi6 = await this.fetchRSI(sym, 6);
               if (_frRsi6 !== null && _frRsi6 >= this.cfg.rsi6Max) {
@@ -2847,7 +2864,7 @@ function pw() { return {
                 if (this.extenderCount[sym]) this.extenderCount[sym].lastFetchAt = Date.now();
               }
             }
-            candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate:fr,status:'overshorted',skipReason:`funding ${fr.toFixed(4)}%`});
+            candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate:fr,status:'overlonged',skipReason:`funding ${fr.toFixed(4)}%`});
             continue;
           }
         } catch(e) { /* non-fatal */ }
@@ -4052,8 +4069,10 @@ function pw() { return {
 
     const g = this.gainers.find(x => x.symbol === pos.symbol);
     if (g) g.status = 'closed';
-    this._notifyLaggardClose(pos, pnlPct, pnl);
+    // Filter the closing position out BEFORE notifying so debt is distributed
+    // only to survivors — not to the position being closed (which would orphan its share).
     this.positions = this.positions.filter(x => x.id !== pos.id);
+    this._notifyLaggardClose(pos, pnlPct, pnl);
     // Rodeo creep is gainer-only; FT/ADV FT use margin premium + graylist instead
     this.tpIngressBump(pos.symbol);
 
@@ -4241,10 +4260,24 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
         await this.ftClosePosition(pos, 'sl', pos.slPrice); continue;
       }
 
-      // LONG: TP hit when price rises to or above TP price
-      if (pos.currentTpPrice > 0 && !(pos._edaTpPrice > 0) && mark >= pos.currentTpPrice) {
-        this.log(`🎯 ${pos.symbol}: FT TP hit @ ${fmtP(mark)} — closing`, 'success');
-        await this.ftClosePosition(pos, 'tp', pos.currentTpPrice); continue;
+      // ── EDa TP inline recalc (single source of truth) ─────────────────
+      if (this.cfg.laggardCheckEnabled && pos._laggardInitialEV) {
+        const _fs_debt    = pos._laggardLostValue || 0;
+        const _fs_buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+        const _fs_buffedEV = pos._laggardInitialEV * _fs_buffMul;
+        pos._edaTpPrice = _fs_debt < 0
+          ? pos.entryPrice + (-_fs_debt) * pos.entryPrice / (pos.leverage * pos.margin)
+          : (_fs_debt > 0
+              ? pos.entryPrice + (_fs_buffedEV - _fs_debt) * pos.entryPrice / (pos.leverage * pos.margin)
+              : 0);
+        if (pos._edaTpPrice < 0) pos._edaTpPrice = 0;
+      }
+      // ── Unified TP close: prefer EDa TP when set, else currentTpPrice ──
+      const _ftEffTpClose = (pos._edaTpPrice > 0) ? pos._edaTpPrice : pos.currentTpPrice;
+      if (_ftEffTpClose > 0 && mark >= _ftEffTpClose) {
+        const _ftTpLabel = (pos._edaTpPrice > 0) ? 'EDa TP' : 'TP';
+        this.log(`🎯 ${pos.symbol}: FT ${_ftTpLabel} hit @ ${fmtP(mark)} ≥ ${fmtP(_ftEffTpClose)} — closing`, 'success');
+        await this.ftClosePosition(pos, 'tp', _ftEffTpClose); continue;
       }
     }
   },
@@ -4642,7 +4675,9 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
             pos.id === this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]).id;
           if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_gapIsLaggardForceSuspended) {
             pos.phase = 'force';
-          } else if (age >= (this.cfg.tpReduceMins * 60000) && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3))) {
+          } else if (age >= (this.cfg.tpReduceMins * 60000) && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3)) && !_gapIsLaggardForceSuspended) {
+            // _gapIsLaggardForceSuspended guards the laggard from having its EDa TP
+            // overwritten to a flat 3% during gap replay — same guard used for force-phase.
             pos.phase = 'reduce';
             const roiTarget = 0.03;
             // LONG: reduce TP is above entry
@@ -4719,8 +4754,10 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
           this.renderTradeFeed();
           const g = this.gainers.find(x => x.symbol === pos.symbol);
           if (g) g.status = 'closed';
-          this._notifyLaggardClose(pos, pnlPct, pnl);
+          // Filter the closing position out BEFORE notifying so debt is distributed
+          // only to survivors — not to the position being closed (which would orphan its share).
           this.positions = this.positions.filter(x => x.id !== pos.id);
+          this._notifyLaggardClose(pos, pnlPct, pnl);
           if (pos._fun) this.funLockInBump(pos.symbol, pos._funSubType);
           if (pos._ft || pos._fun || pos._salf) this.tpIngressBump(pos.symbol);
           if (pos._salf && this.cfg.sfMedianCreepEnabled) this.salfCreepBump(pos.symbol);
@@ -5018,13 +5055,55 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
           continue;
         }
         if (rsi6 >= this.cfg.rsi6Max) {
-          this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
-          const g = this.gainers.find(x => x.symbol === pe.symbol);
-          if (g && g.status === 'watch') g.status = 'overextended';
-          this.persist();
-          this.renderPotGainers();
+          // OE reached — this is the entry trigger for PseudoChaser gainers (bounce candidate).
+          // Fall through to the entry path rather than ejecting.
           if (this.cfg.advFtEnabled) {
             this.extenderBump(pe.symbol);
+          }
+          // Treat as RSI gate met: proceed to OE lookback + entry below.
+          // Override rsi values so gate checks pass (OE implies RSI ≥ all minimums).
+          const gate6oe  = this.cfg.rsi6Min;
+          const gate12oe = this.cfg.rsi12Min;
+          const gate24oe = this.cfg.rsi24Min;
+          // Only attempt entry if all RSI values are available and minimums are met
+          if (rsi12 !== null && rsi24 !== null && rsi6 >= gate6oe && rsi12 >= gate12oe && rsi24 >= gate24oe) {
+            const alreadyTracked = !!this._extenderGraylist[pe.symbol]
+                                || !!this.extenderCount[pe.symbol]
+                                || !!this._extenderPollers[pe.symbol]
+                                || !!this._advFtGraylist[pe.symbol]
+                                || !!this.ftCandidates[pe.symbol];
+            if (alreadyTracked) {
+              this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
+              const g = this.gainers.find(x => x.symbol === pe.symbol);
+              if (g) g.status = this._advFtGraylist[pe.symbol] ? 'ADV' : 'extgrayed';
+              this.log(`◉ ${pe.symbol}: OE entry blocked — on ADV FT / extender path`, 'warn');
+              this.persist();
+              this.renderPotGainers();
+              continue;
+            }
+            const { peak: rsi6PeakOe, oeCount: oeCountOe } = await this.fetchHistoricalRSI6Peaks(pe.symbol);
+            if (rsi6PeakOe != null && rsi6PeakOe >= this.cfg.rsi6Max) {
+              if (this.cfg.advFtEnabled) this.extenderBump(pe.symbol, true, null, Math.max(1, oeCountOe));
+            }
+            this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
+            this.persist();
+            this.renderPotGainers();
+            const effOe = this.positions.reduce((n, p) => n + (p._fun ? (p._funMult ?? 2) : p._salf ? 2 : p._ft ? 2 : 1), 0);
+            if (effOe >= this.cfg.maxPos) {
+              this.log(`◉ ${pe.symbol}: OE entry — slots full`, 'warn');
+              const g = this.gainers.find(x => x.symbol === pe.symbol);
+              if (g && g.status === 'watch') g.status = 'maxed';
+              continue;
+            }
+            let entryPriceOe = 0;
+            try { const tk = await this.fetchTicker(pe.symbol); entryPriceOe = parseFloat(tk?.lastPrice || 0); } catch(e) {}
+            if (!entryPriceOe) { this.log(`◉ ${pe.symbol}: OE entry — could not fetch price`, 'warn'); continue; }
+            this.log(`◉ ${pe.symbol}: OE entry triggered — RSI6 ${rsi6.toFixed(1)} ≥ ${this.cfg.rsi6Max} @ ${fmtP(entryPriceOe)}`, 'trade');
+            let fundingRateOe = null;
+            try { fundingRateOe = await this.fetchFundingRate(pe.symbol); } catch(e) {}
+            await this.openShort({ symbol: pe.symbol, price: entryPriceOe, change: 0, rsi6, rsi12, rsi24, fundingRate: fundingRateOe });
+          } else {
+            // RSI minimums not yet met even at OE — keep watching
           }
           continue;
         }
@@ -5044,7 +5123,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
           if (fr !== null && fr >= this.cfg.fundingRateMax) {
             this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
             const g = this.gainers.find(x => x.symbol === pe.symbol);
-            if (g && g.status === 'watch') g.status = 'overshorted';
+            if (g && g.status === 'watch') g.status = 'overlonged';
             this.persist();
             this.renderPotGainers();
             continue;
@@ -5409,10 +5488,26 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         continue;
       }
 
-      // LONG: TP hit when mark rises to or above TP price
-      if (pos.currentTpPrice > 0 && !(pos._edaTpPrice > 0) && mark >= pos.currentTpPrice) {
-        this.log(`☀️ ${pos.symbol}: TP hit @ ${fmtP(mark)} ≥ ${fmtP(pos.currentTpPrice)} — closing`, 'success');
-        await this.pseudoClosePosition(pos, 'tp', pos.currentTpPrice);
+      // ── EDa TP inline recalc (single source of truth) ─────────────────
+      // Recompute _edaTpPrice every tick so it is always current without
+      // relying on runLaggardCheck timer or the _edaTpPrev throttle.
+      if (this.cfg.laggardCheckEnabled && pos._laggardInitialEV) {
+        const _s_debt    = pos._laggardLostValue || 0;
+        const _s_buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+        const _s_buffedEV = pos._laggardInitialEV * _s_buffMul;
+        pos._edaTpPrice = _s_debt < 0
+          ? pos.entryPrice + (-_s_debt) * pos.entryPrice / (pos.leverage * pos.margin)
+          : (_s_debt > 0
+              ? pos.entryPrice + (_s_buffedEV - _s_debt) * pos.entryPrice / (pos.leverage * pos.margin)
+              : 0);
+        if (pos._edaTpPrice < 0) pos._edaTpPrice = 0;
+      }
+      // ── Unified TP close: prefer EDa TP when set, else currentTpPrice ──
+      const _effTpClose = (pos._edaTpPrice > 0) ? pos._edaTpPrice : pos.currentTpPrice;
+      if (_effTpClose > 0 && mark >= _effTpClose) {
+        const _tpLabel = (pos._edaTpPrice > 0) ? 'EDa TP' : 'TP';
+        this.log(`☀️ ${pos.symbol}: ${_tpLabel} hit @ ${fmtP(mark)} ≥ ${fmtP(_effTpClose)} — closing`, 'success');
+        await this.pseudoClosePosition(pos, 'tp', _effTpClose);
         continue;
       }
 
@@ -5527,8 +5622,6 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         if (this.bot.running && this.positions.length >= 1) this.runLaggardCheck();
       }, 3000);
     }
-    // Loss absorption — checked every watch cycle so the configured interval fires on time
-    if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) this.runLossAbsorption();
     } finally {
       this._watchRunning = false;
     }
@@ -5800,7 +5893,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const url  = URL.createObjectURL(blob);
       const a    = document.createElement('a');
       a.href     = url;
-      a.download = `pseudowinter_${suffix}_${ts}.json`;
+      a.download = `pseudochaser_${suffix}_${ts}.json`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -5846,7 +5939,16 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           this.closedTrades = d.closedTrades;
         }
         if (Array.isArray(d.positions)) {
-          this.positions = d.positions;
+          this.positions = d.positions.map(p => {
+            // Normalise special-type flags: only carry them if they were explicitly true.
+            // Guards against stale / cross-version exports that stored a truthy non-boolean
+            // value (e.g. 1, "true") and prevents phantom FUN/FT/SalF badges on import.
+            const norm = { ...p };
+            if (norm._fun  !== true) { delete norm._fun;  delete norm._funSubType; delete norm._funBadge; delete norm._funMult; delete norm._funIsLoser; }
+            if (norm._ft   !== true) { delete norm._ft;   delete norm._advFt; delete norm._pileOnAdvFt; }
+            if (norm._salf !== true) { delete norm._salf; delete norm._salfIsLoser; delete norm._salfLsaRatio; }
+            return norm;
+          });
         } else {
           this.positions = [];
         }
@@ -6439,29 +6541,40 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         ? (pos._funMult ?? 1)
         : (pos._salf || pos._ft) ? 2 : 1;
 
-      // Threshold = -(baseMargin * 0.25 * slotMult).
-      // A 2x position must lose 0.50× baseMargin before a cut fires; 1x requires 0.25×.
-      const _uPnlThreshold = -(baseMargin * 0.25 * _slotMult);
-      const _posUPnl = pos.upnl ?? 0;
-
-      // Only fire in loss and respect 30s cooldown between cuts.
-      if (_posUPnl > _uPnlThreshold) continue;
-      const _lastAbsorp = pos._lastAbsorpAt ?? 0;
-      if ((now - _lastAbsorp) < 30 * 1000) continue;
-
       // Stage-based minimum margin floor:
       // Below DCA stage 2: floor scales with sizing (2x position stops at 2x base margin).
       // At stage 2+: floor collapses to 1x — damage control over capital preservation.
       const _posMult = (pos.dcaStage ?? 0) < 2 ? _slotMult : 1;
       const posBaseMargin = baseMargin * _posMult;
 
+      // SW attempt is independent of the uPnL loss threshold — a position at floor margin
+      // with saved margin should deploy SW regardless of whether it has recovered above the
+      // cut threshold. Without this, positions that absorbed down to minimum and then
+      // partially recovered never get SW stages placed.
+      if ((pos.margin || 0) <= posBaseMargin &&
+          this.cfg.passiveSecondWindEnabled !== false &&
+          (this.cfg.infiniteSecondWindEnabled !== false || !pos._secondWindActive) &&
+          (pos._savedMargin || 0) > 0) {
+        await this._tryPassiveSecondWind(pos, baseMargin);
+        continue;
+      }
+
+      // Threshold = -(baseMargin * 0.25 * slotMult).
+      // A 2x position must lose 0.50× baseMargin before a cut fires; 1x requires 0.25×.
+      const _uPnlThreshold = -(baseMargin * 0.25 * _slotMult);
+      // Compute uPnL live from markPrice — pos.upnl is a reactive display property that
+      // can lag by a full tick, causing absorption to miss the threshold until the next cycle.
+      const _posUPnl = pos.markPrice
+        ? (pos.markPrice - pos.entryPrice) / pos.entryPrice * pos.leverage * pos.margin
+        : (pos.upnl ?? 0);
+
+      // Only fire in loss and respect 30s cooldown between cuts.
+      if (_posUPnl > _uPnlThreshold) continue;
+      const _lastAbsorp = pos._lastAbsorpAt ?? 0;
+      if ((now - _lastAbsorp) < 30 * 1000) continue;
+
       if ((pos.margin || 0) <= posBaseMargin) {
-        // At floor — attempt second wind if available, then skip the cut.
-        if (this.cfg.passiveSecondWindEnabled !== false &&
-            (this.cfg.infiniteSecondWindEnabled !== false || !pos._secondWindActive) &&
-            (pos._savedMargin || 0) > 0) {
-          await this._tryPassiveSecondWind(pos, posBaseMargin);
-        }
+        // At floor with no saved margin (already handled SW above) — nothing to do.
         continue;
       }
 
@@ -6496,13 +6609,25 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const _stratTag = pos._fun ? 'FUN' : pos._advFt ? 'AdvFT' : pos._ft ? 'FT' : pos._salf ? 'SalF' : 'gainer';
     this.log(`✂️ ${sym}: [uPnL] absorption (${_stratTag}) — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)} | reusable $${pos._savedMargin.toFixed(2)}`, 'warn');
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
-      // Distribute absorption loss across all positions weighted by slot cost,
-      // then do a full pool rebalance to keep everyone in equilibrium.
+      // Distribute absorption loss across all positions weighted by slot cost.
+      // Non-laggard positions are capped at _posMaxDebt; overflow goes to the laggard.
+      // Applying the cap here (not relying on _rebalanceDebtPool alone) ensures the laggard
+      // acts as the debt repository from the first write, not just after a second pass.
       const _abs_totalSlots = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
       if (_abs_totalSlots > 0) {
         const _abs_pnlPerSlot = cutPnl / _abs_totalSlots;
+        const _abs_laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
+        let _abs_overflow = 0;
         for (const p of this.positions) {
-          p._laggardLostValue = parseFloat(((p._laggardLostValue || 0) + _abs_pnlPerSlot * this._posSlotWeight(p)).toFixed(6));
+          const share   = _abs_pnlPerSlot * this._posSlotWeight(p);
+          const raw     = parseFloat(((p._laggardLostValue || 0) + share).toFixed(6));
+          const maxDebt = this._posMaxDebt(p); // Infinity for laggard
+          const capped  = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
+          if (raw < capped) _abs_overflow += (capped - raw);
+          p._laggardLostValue = capped;
+        }
+        if (_abs_overflow > 0 && _abs_laggard) {
+          _abs_laggard._laggardLostValue = parseFloat(((_abs_laggard._laggardLostValue || 0) - _abs_overflow).toFixed(6));
         }
       }
       this._rebalanceDebtPool();
@@ -6557,9 +6682,13 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const existingSw      = (pos.orders || []).filter(o => o.type === 'cond' && !!o._secondWind);
     const lastFirstWind   = firstWindOrders.reduce((mn, o) => o.price < mn ? o.price : mn, Infinity);
     const lastExistingSw  = existingSw.reduce((mn, o) => o.price < mn ? o.price : mn, Infinity);
-    const lastStagePrice  = Math.min(lastFirstWind === Infinity ? 0 : lastFirstWind, lastExistingSw === Infinity ? 0 : lastExistingSw);
+    // When all cond orders have been consumed (filled and cleared), both reduces return Infinity
+    // and the min collapses to 0, causing an early bail. Fall back to markPrice so positions
+    // that have exhausted all DCA stages can still receive SW stages anchored to current price.
+    const _orderRef = Math.min(lastFirstWind === Infinity ? Infinity : lastFirstWind, lastExistingSw === Infinity ? Infinity : lastExistingSw);
+    const lastStagePrice  = _orderRef === Infinity ? (pos.markPrice || pos.entryPrice) : _orderRef;
     if (lastStagePrice <= 0) {
-      this.log(`✂️ ${sym}: passive second wind skipped — no first-wind stage reference`, 'info');
+      this.log(`✂️ ${sym}: passive second wind skipped — no stage price reference`, 'info');
       return;
     }
 
@@ -6669,12 +6798,24 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const ev = pos._laggardInitialEV || 0;
       const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
       const buffedEV = ev * buffMul;
-      // LONG: EDa TP is above entry; price goes up to close
-      const edaTpPrice = pos.entryPrice + (buffedEV - debt) * pos.entryPrice / (pos.leverage * pos.margin);
+      // LONG: EDa TP is above entry; price goes up to close.
+      // For negative debt (loss absorption), exclude EV so it does not inflate the target —
+      // the TP only needs to recover the debt itself, not the full expected value.
+      // For positive debt (bail-out / laggard), include EV as before so laggards remain
+      // hard to dislodge without many other positions closing.
+      const edaTpPrice = debt < 0
+        ? pos.entryPrice + (-debt) * pos.entryPrice / (pos.leverage * pos.margin)
+        : pos.entryPrice + (buffedEV - debt) * pos.entryPrice / (pos.leverage * pos.margin);
 
       if (pos.phase === 'normal') {
         // Normal-phase: only apply EDa when there is actual collective debt (lostValue < 0).
         // For longs: EDa TP is above entry. "Tighter" means lower than current TP (closer to entry).
+        // Reset prev-guard on debt sign flip so recalculation is never suppressed by a stale value.
+        const normalDebtSign = debt < 0 ? -1 : 1;
+        if (pos._edaTpDebtSign !== normalDebtSign) {
+          pos._edaTpDebtSign = normalDebtSign;
+          pos._edaTpPrev = null;
+        }
         if (debt < 0 && edaTpPrice > 0 && edaTpPrice > pos.entryPrice && edaTpPrice < pos.currentTpPrice) {
           const prev = pos._edaTpPrev;
           if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
@@ -6693,6 +6834,13 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       if (pos.phase !== 'reduce') continue;
 
       const isLaggardPos = laggard && pos.id === laggard.id;
+      // Reset the prev-guard whenever the debt sign flips so the next cycle always
+      // recalculates fresh instead of being suppressed by a stale _edaTpPrev value.
+      const debtSign = debt < 0 ? -1 : 1;
+      if (pos._edaTpDebtSign !== debtSign) {
+        pos._edaTpDebtSign = debtSign;
+        pos._edaTpPrev = null;
+      }
       if (edaTpPrice === 0) {
         pos._edaTpPrice = 0;
       } else if (debt < 0 || (isLaggardPos && edaTpPrice > 0)) {
@@ -6745,12 +6893,21 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const _debtParts = [];
       this.positions.forEach(pos => {
         const share    = pnlPerSlot * this._posSlotWeight(pos);
-        const raw      = parseFloat(((pos._laggardLostValue || 0) + share).toFixed(6));
+        const current  = pos._laggardLostValue || 0;
+        // Sign-lock: once a position carries negative debt (loss absorption) it can only
+        // go more negative — positive shares (winning closes) must not reduce it back
+        // toward zero. Conversely, positive debt (bail-out credit) can only increase;
+        // negative shares must not erode it. Zero is the mediator and accepts both.
+        const signBlocked = (current < 0 && share > 0); // negative debt only: wins cannot reduce it
+        const raw      = signBlocked
+          ? current
+          : parseFloat((current + share).toFixed(6));
         const maxDebt  = this._posMaxDebt(pos); // Infinity for laggard
         const capped   = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
         if (raw < capped) overflow += (capped - raw); // debt shed = positive overflow
         pos._laggardLostValue = capped;
-        _debtParts.push(`${pos.symbol} ${share>=0?'+':'−'}$${Math.abs(share).toFixed(2)}→$${capped.toFixed(2)}${raw < capped ? '*' : ''}`);
+        const shareNote = signBlocked ? '(sign-locked)' : (share>=0?'+':'−') + '$' + Math.abs(share).toFixed(2);
+        _debtParts.push(`${pos.symbol} ${shareNote}→$${capped.toFixed(2)}${raw < capped ? '*' : ''}`);
       });
       // Push any capped overflow to the laggard (it is the debt repository and has no cap).
       if (overflow > 0 && laggard) {
@@ -6760,16 +6917,30 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       this.log(`⏳ Debt share (${closingPos.symbol} @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%): ${_debtParts.join(' | ')}${overflow > 0 ? ' [* capped → laggard]' : ''}`, 'info');
     }
 
-    // Recompute EDa TP on the current laggard after lostValue update
+    // Recompute EDa TP on ALL surviving positions after lostValue update so every
+    // position is in sync immediately — not just the laggard. Uses the same two-clause
+    // formula as runLaggardCheck: negative debt (loss absorption) excludes EV; positive
+    // debt (bail-out) includes buffedEV so the laggard stays sticky.
     if (this.positions.length >= 1) {
       const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
-      if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
-        const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
-        const buffedEV = laggard._laggardInitialEV * buffMul;
-        const _notify_debt = laggard._laggardLostValue || 0;
-        laggard._edaTpPrice = _notify_debt < 0
-          ? Math.max(0, laggard.entryPrice - (buffedEV - _notify_debt) * laggard.entryPrice / (laggard.leverage * laggard.margin))
-          : 0;
+      const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+      for (const survivor of this.positions) {
+        if (!survivor._laggardInitialEV) continue;
+        const buffedEV = survivor._laggardInitialEV * buffMul;
+        const _notify_debt = survivor._laggardLostValue || 0;
+        const isLaggardPos = laggard && survivor.id === laggard.id;
+        if (_notify_debt < 0) {
+          // Loss absorption: TP only needs to recover the debt, not the full EV.
+          survivor._edaTpPrice = Math.max(0,
+            survivor.entryPrice + (-_notify_debt) * survivor.entryPrice / (survivor.leverage * survivor.margin)
+          );
+        } else if (isLaggardPos && _notify_debt >= 0) {
+          // Bail-out laggard: include buffedEV so it remains hard to dislodge.
+          survivor._edaTpPrice = survivor.entryPrice + (buffedEV - _notify_debt) * survivor.entryPrice / (survivor.leverage * survivor.margin);
+        } else {
+          // Non-laggard with zero or positive debt: no EDa TP override.
+          survivor._edaTpPrice = 0;
+        }
       }
     }
 
@@ -6840,8 +7011,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
     const g = this.gainers.find(x => x.symbol === pos.symbol);
     if (g) g.status = 'closed';
-    this._notifyLaggardClose(pos, pnlPct, pnl);
+    // Filter the closing position out BEFORE notifying so debt is distributed
+    // only to survivors — not to the position being closed (which would orphan its share).
     this.positions = this.positions.filter(x => x.id !== pos.id);
+    this._notifyLaggardClose(pos, pnlPct, pnl);
     if (pos._fun) this.funLockInBump(pos.symbol, pos._funSubType);
     if (pos._ft || pos._fun || pos._salf) this.tpIngressBump(pos.symbol);
     if (pos._salf && this.cfg.sfMedianCreepEnabled) this.salfCreepBump(pos.symbol);
