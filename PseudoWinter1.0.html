@@ -2109,6 +2109,7 @@ let _potEntryTimer    = null;
 let _refreshTimer     = null;
 let _audioTimer       = null;
 let _laggardInterval  = null;
+let _absorpTimer      = null;
 
 function pw() { return {
   showSetup: false,
@@ -2453,6 +2454,7 @@ function pw() { return {
           const needsReduceTp = phase === 'reduce' && (p.tpPct == null || p.tpPct > 3) && !(p._edaTpPrice > 0) && !_laggardHasPositiveDebt && !((p._laggardLostValue || 0) < 0);
           return {
             ...p,
+            _fun: p._fun === true,
             markPrice: p.markPrice || p.entryPrice,
             upnl: p.upnl || 0,
             phase,
@@ -2621,6 +2623,13 @@ function pw() { return {
     _potEntryTimer = setInterval(() => this.watchPotentialEntries(), 5000);
     if (_laggardInterval) { clearInterval(_laggardInterval); _laggardInterval = null; }
     _laggardInterval = setInterval(() => { if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) this.runLaggardCheck(); }, 60000);
+    if (_absorpTimer) { clearInterval(_absorpTimer); _absorpTimer = null; }
+    _absorpTimer = setInterval(async () => {
+      if (!this.bot.running) return;
+      if (!this.cfg.lossAbsorptionEnabled) return;
+      if (!this.positions.length) return;
+      await this.runLossAbsorption();
+    }, 15000);
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 2) {
       await this.runLaggardCheck();
     }
@@ -2635,6 +2644,7 @@ function pw() { return {
     clearInterval(_potEntryTimer);
     _potEntryTimer = null;
     clearInterval(_laggardInterval); _laggardInterval = null;
+    clearInterval(_absorpTimer); _absorpTimer = null;
     this.stopKeepalive();
     this.bot.scanCd = 0; this.bot.scanPct = 100;
     this.bot.startTime = null;
@@ -2744,6 +2754,10 @@ function pw() { return {
 
       // Loss absorption
       if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) await this.runLossAbsorption();
+
+      // EDa TP recompute — refresh _edaTpPrice and currentTpPrice for all positions after
+      // absorption may have shifted debt, and to catch any drift since the last laggard tick.
+      if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) await this.runLaggardCheck();
 
     } catch(e) { this.log('Cycle error: ' + e.message, 'error'); }
     finally { this._cycleRunning = false; }
@@ -4634,11 +4648,15 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
             pos.phase = 'force';
           } else if (age >= (this.cfg.tpReduceMins * 60000) && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3))) {
             pos.phase = 'reduce';
-            const roiTarget = 0.03;
-            pos.currentTpPrice = instr
-              ? this.snapPrice(pos.entryPrice * (1 - (roiTarget / pos.leverage)), instr)
-              : parseFloat((pos.entryPrice * (1 - (roiTarget / pos.leverage))).toFixed(8));
-            pos.tpPct = 3;
+            // If this position is the laggard and EDa owns its TP, do not overwrite with the
+            // standard 3% reduce price — EDa manages the TP directly via _edaTpPrice.
+            if (!_gapIsLaggardForceSuspended || !(pos._edaTpPrice > 0)) {
+              const roiTarget = 0.03;
+              pos.currentTpPrice = instr
+                ? this.snapPrice(pos.entryPrice * (1 - (roiTarget / pos.leverage)), instr)
+                : parseFloat((pos.entryPrice * (1 - (roiTarget / pos.leverage))).toFixed(8));
+              pos.tpPct = 3;
+            }
           }
 
           if (pos.slSet && pos.slPrice > 0 && c.h >= pos.slPrice) {
@@ -5356,7 +5374,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           await this.pseudoClosePosition(pos, 'force');
           continue;
         }
-        if (!_useGlobalEda) {
+        // If EDa owns this position's TP, do not overwrite with the standard 3% reduce price.
+        // Mirror the gap-audit guard: _isLaggardForce covers force-suspension; _useGlobalEda
+        // covers the reduce phase where EDa is actively managing the TP.
+        if (!_useGlobalEda && !(_isLaggardPos && pos._edaTpPrice > 0)) {
           const instr = await this.getInstrInfo(pos.symbol);
           pos.currentTpPrice = instr ? this.snapPrice(reduceTpPrice, instr) : parseFloat(reduceTpPrice.toFixed(8));
           pos.tpPct = 3;
@@ -5835,7 +5856,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           this.closedTrades = d.closedTrades;
         }
         if (Array.isArray(d.positions)) {
-          this.positions = d.positions;
+          this.positions = d.positions.map(p => ({ ...p, _fun: p._fun === true }));
         } else {
           this.positions = [];
         }
@@ -6427,6 +6448,25 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         ? (pos._funMult ?? 1)
         : (pos._salf || pos._ft) ? 2 : 1;
 
+      // Stage-based minimum margin floor:
+      // Below DCA stage 2: floor scales with sizing (2x position stops at 2x base margin).
+      // At stage 2+: floor collapses to 1x — damage control over capital preservation.
+      const _posMult = (pos.dcaStage ?? 0) < 2 ? _slotMult : 1;
+      const posBaseMargin = baseMargin * _posMult;
+
+      // Floor check comes first — a position already at minimum margin cannot be cut further,
+      // but may still be eligible for a passive second-wind if saved margin is available.
+      // This must run independently of the uPnL threshold so at-floor positions are not
+      // silently skipped just because their current uPnL is above the cut threshold.
+      if ((pos.margin || 0) <= posBaseMargin) {
+        if (this.cfg.passiveSecondWindEnabled !== false &&
+            (this.cfg.infiniteSecondWindEnabled !== false || !pos._secondWindActive) &&
+            (pos._savedMargin || 0) > 0) {
+          await this._tryPassiveSecondWind(pos, posBaseMargin);
+        }
+        continue;
+      }
+
       // Threshold = -(baseMargin * 0.25 * slotMult).
       // A 2x position must lose 0.50× baseMargin before a cut fires; 1x requires 0.25×.
       const _uPnlThreshold = -(baseMargin * 0.25 * _slotMult);
@@ -6436,22 +6476,6 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       if (_posUPnl > _uPnlThreshold) continue;
       const _lastAbsorp = pos._lastAbsorpAt ?? 0;
       if ((now - _lastAbsorp) < 30 * 1000) continue;
-
-      // Stage-based minimum margin floor:
-      // Below DCA stage 2: floor scales with sizing (2x position stops at 2x base margin).
-      // At stage 2+: floor collapses to 1x — damage control over capital preservation.
-      const _posMult = (pos.dcaStage ?? 0) < 2 ? _slotMult : 1;
-      const posBaseMargin = baseMargin * _posMult;
-
-      if ((pos.margin || 0) <= posBaseMargin) {
-        // At floor — attempt second wind if available, then skip the cut.
-        if (this.cfg.passiveSecondWindEnabled !== false &&
-            (this.cfg.infiniteSecondWindEnabled !== false || !pos._secondWindActive) &&
-            (pos._savedMargin || 0) > 0) {
-          await this._tryPassiveSecondWind(pos, posBaseMargin);
-        }
-        continue;
-      }
 
       pos._lastAbsorpAt = now;
       this._tryAbsorbPos(pos, baseMargin, posBaseMargin);
@@ -6494,14 +6518,30 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         }
       }
       this._rebalanceDebtPool();
-      const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
-      if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
-        const buffMul  = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
-        const buffedEV = laggard._laggardInitialEV * buffMul;
-        const _abs_debt = laggard._laggardLostValue || 0;
-        laggard._edaTpPrice = _abs_debt < 0
-          ? Math.max(0, laggard.entryPrice - (buffedEV - _abs_debt) * laggard.entryPrice / (laggard.leverage * laggard.margin))
-          : 0;
+      // Recompute EDa TP on all positions after debt pool update, using the two-clause formula.
+      // Absorption always produces negative debt, so every affected position will use the
+      // debt-only formula (no EV inflation) immediately — runLaggardCheck will re-evaluate
+      // on its next tick and may adjust further.
+      const _abs_buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+      for (const p of this.positions) {
+        if (!p._laggardInitialEV) continue;
+        const _ad = p._laggardLostValue || 0;
+        let _absEdaTp;
+        if (_ad < 0) {
+          _absEdaTp = Math.max(0, p.entryPrice - Math.abs(_ad) * p.entryPrice / (p.leverage * p.margin));
+        } else {
+          const _absBuffedEV = p._laggardInitialEV * _abs_buffMul;
+          _absEdaTp = Math.max(0, p.entryPrice - (_absBuffedEV - _ad) * p.entryPrice / (p.leverage * p.margin));
+        }
+        if (_absEdaTp > 0 && (_ad < 0 || p.phase === 'reduce')) {
+          p._edaTpPrice    = _absEdaTp;
+          p._edaTpPrev     = _absEdaTp;
+          p.currentTpPrice = _absEdaTp;
+          const _absRoi = (p.entryPrice - _absEdaTp) / p.entryPrice * p.leverage * 100;
+          p.tpPct = parseFloat(_absRoi.toFixed(2));
+        } else if (_ad >= 0 && p.phase !== 'reduce') {
+          p._edaTpPrice = 0;
+        }
       }
       // Global debt mode: pool this cut's saved margin into every other open position
       // so all reduce-phase candidates can build passive second-wind runway.
@@ -6657,7 +6697,27 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const ev = pos._laggardInitialEV || 0;
       const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
       const buffedEV = ev * buffMul;
-      const edaTpPrice = Math.max(0, pos.entryPrice - (buffedEV - debt) * pos.entryPrice / (pos.leverage * pos.margin));
+
+      // ── EDa TP formula — two separate clauses ──────────────────────────────
+      // NEGATIVE debt (absorption-driven): debt is a direct USDT shortfall that must be
+      // recovered at close. EV is NOT included — adding it inflates the target beyond what
+      // is actually owed and makes the laggard unnecessarily hard to exit.
+      // Formula: entryPrice - |debt| * entryPrice / (leverage * margin)
+      // i.e. exactly the price move needed to realise the missing USDT, nothing more.
+      //
+      // POSITIVE debt (laggard owed value from profitable closers): the original bail-out
+      // mode. EV stays in the formula so the profitOffset buffer is preserved, keeping the
+      // laggard hard to dislodge until enough winners have closed to build real runway.
+      // Formula: entryPrice - (buffedEV - debt) * entryPrice / (leverage * margin)
+      // ───────────────────────────────────────────────────────────────────────
+      let edaTpPrice;
+      if (debt < 0) {
+        // Absorption debt — recover the shortfall only, no EV inflation.
+        edaTpPrice = Math.max(0, pos.entryPrice - Math.abs(debt) * pos.entryPrice / (pos.leverage * pos.margin));
+      } else {
+        // Positive / zero debt — original bail-out formula with profitOffset buffer.
+        edaTpPrice = Math.max(0, pos.entryPrice - (buffedEV - debt) * pos.entryPrice / (pos.leverage * pos.margin));
+      }
 
       if (pos.phase === 'normal') {
         // Normal-phase: only apply EDa when there is actual collective debt (lostValue < 0).
@@ -6666,8 +6726,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         if (debt < 0 && edaTpPrice > 0 && edaTpPrice < pos.currentTpPrice) {
           const prev = pos._edaTpPrev;
           if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
-            pos._edaTpPrev = edaTpPrice;
+            pos._edaTpPrev  = edaTpPrice;
             pos._edaTpPrice = edaTpPrice;
+            // currentTpPrice is the single source of truth for TP checks — always keep it
+            // in sync with _edaTpPrice so no code path can act on a stale native value.
             pos.currentTpPrice = edaTpPrice;
             const edaRoi = (pos.entryPrice - edaTpPrice) / pos.entryPrice * pos.leverage * 100;
             pos.tpPct = parseFloat(edaRoi.toFixed(2));
@@ -6682,19 +6744,22 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
       const isLaggardPos = laggard && pos.id === laggard.id;
       if (edaTpPrice === 0) {
-        pos._edaTpPrice = 0;
+        pos._edaTpPrice    = 0;
+        // Do not touch currentTpPrice here — it may hold a valid native reduce TP.
       } else if (debt < 0 || (isLaggardPos && edaTpPrice > 0)) {
         // Stamp EDa TP when there is actual collective debt (any position), OR when this is
         // the laggard and the computed price is a valid positive number — including above-entry
         // prices that represent a loss-exit, which is the original purpose of the laggard system.
-        // The old guard (edaTpPrice < pos.entryPrice) incorrectly blocked the most important case:
-        // deeply positive debt where buffedEV - debt goes negative, pushing edaTpPrice above entry.
         // Non-laggards with zero/positive debt still skip stamping to avoid phantom tightening.
         const prev = pos._edaTpPrev;
         if (prev == null || Math.abs(edaTpPrice - prev) / Math.abs(prev) > 0.0005) {
-          pos._edaTpPrev = edaTpPrice;
+          pos._edaTpPrev  = edaTpPrice;
           pos._edaTpPrice = edaTpPrice;
-          pos._nativeReduceTpPrice = null;
+          // Single source of truth: currentTpPrice always mirrors _edaTpPrice while EDa is
+          // active. Nothing else sets currentTpPrice on an EDa-managed position.
+          pos.currentTpPrice = edaTpPrice;
+          const edaRoi = (pos.entryPrice - edaTpPrice) / pos.entryPrice * pos.leverage * 100;
+          pos.tpPct = parseFloat(edaRoi.toFixed(2));
           // Only push to the exchange when the price is actually reachable.
           if (edaTpPrice < (pos.markPrice ?? Infinity)) {
             this.setTP(pos, edaTpPrice).catch(() => {});
@@ -6704,6 +6769,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         // No qualifying debt — clear any stale EDa stamp so the position uses its natural reduce TP.
         pos._edaTpPrice = 0;
       }
+      // buffedED uses buffedEV regardless of debt sign — it is the closure trigger, not the TP
+      // price. The original EV-based accounting tells us when total expected value is exhausted.
       const buffedED = buffedEV - debt - uPnl;
       if (buffedED <= 0) {
         if (_closingIds.has(pos.id) || !this.positions.find(x => x.id === pos.id)) continue;
@@ -6732,17 +6799,33 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     // A 3× FUN position absorbs 3× the share of a 1× gainer — debt is proportional
     // to how many slots each position occupies, not raw position count.
     // Non-laggard positions are capped at _posMaxDebt; any overflow is pushed to the laggard.
-    const laggard = this.positions.length >= 1
-      ? this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0])
+    // NOTE: closingPos is excluded — it is about to be removed from this.positions and any
+    // debt assigned to it would be immediately orphaned.
+    //
+    // ONE-WAY DEBT RULE: if a position already carries negative lostValue (absorption debt),
+    // a positive share from a winning close is NOT applied — debt only trends more negative
+    // from there, protecting the recovery system from being silently unwound by profitable
+    // peers closing. If lostValue is positive (or zero), negative shares still apply so we
+    // remain biased towards debt recovery. Losing closes always add debt regardless of sign.
+    const survivors = this.positions.filter(p => p.id !== closingPos.id);
+    const laggard = survivors.length >= 1
+      ? survivors.reduce((o, p) => p.openedAt < o.openedAt ? p : o, survivors[0])
       : null;
-    const totalSlots = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
+    const totalSlots = survivors.reduce((s, p) => s + this._posSlotWeight(p), 0);
     if (totalSlots > 0) {
       const pnlPerSlot = closingPnl / totalSlots;
       let overflow = 0;
       const _debtParts = [];
-      this.positions.forEach(pos => {
+      survivors.forEach(pos => {
         const share    = pnlPerSlot * this._posSlotWeight(pos);
-        const raw      = parseFloat(((pos._laggardLostValue || 0) + share).toFixed(6));
+        const current  = pos._laggardLostValue || 0;
+        // Block positive share (winning close) from reducing existing negative debt.
+        // Negative share (losing close) always applies — debt recovery is the priority.
+        if (share > 0 && current < 0) {
+          _debtParts.push(`${pos.symbol} skipped +$${share.toFixed(2)} (in debt $${current.toFixed(2)})`);
+          return; // leave lostValue unchanged for this position
+        }
+        const raw      = parseFloat((current + share).toFixed(6));
         const maxDebt  = this._posMaxDebt(pos); // Infinity for laggard
         const capped   = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
         if (raw < capped) overflow += (capped - raw); // debt shed = positive overflow
@@ -6757,16 +6840,32 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       this.log(`⏳ Debt share (${closingPos.symbol} @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%): ${_debtParts.join(' | ')}${overflow > 0 ? ' [* capped → laggard]' : ''}`, 'info');
     }
 
-    // Recompute EDa TP on the current laggard after lostValue update
-    if (this.positions.length >= 1) {
-      const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
-      if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
-        const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
-        const buffedEV = laggard._laggardInitialEV * buffMul;
-        const _notify_debt = laggard._laggardLostValue || 0;
-        laggard._edaTpPrice = _notify_debt < 0
-          ? Math.max(0, laggard.entryPrice - (buffedEV - _notify_debt) * laggard.entryPrice / (laggard.leverage * laggard.margin))
-          : 0;
+    // Recompute EDa TP on all survivors after lostValue update, using the same two-clause
+    // formula as runLaggardCheck. This keeps _edaTpPrice and currentTpPrice in sync
+    // immediately after a close rather than waiting for the next laggard check interval.
+    const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
+    for (const pos of survivors) {
+      if (!pos._laggardInitialEV) continue;
+      const _nd = pos._laggardLostValue || 0;
+      const buffedEV = pos._laggardInitialEV * buffMul;
+      let edaTp;
+      if (_nd < 0) {
+        edaTp = Math.max(0, pos.entryPrice - Math.abs(_nd) * pos.entryPrice / (pos.leverage * pos.margin));
+      } else {
+        edaTp = Math.max(0, pos.entryPrice - (buffedEV - _nd) * pos.entryPrice / (pos.leverage * pos.margin));
+      }
+      // Only stamp if the position is already in a phase where EDa is active, or if there is
+      // fresh negative debt (absorption case which can apply in normal phase too).
+      if (_nd < 0 || pos.phase === 'reduce') {
+        if (edaTp > 0) {
+          pos._edaTpPrice    = edaTp;
+          pos._edaTpPrev     = edaTp;
+          pos.currentTpPrice = edaTp;
+          const edaRoi = (pos.entryPrice - edaTp) / pos.entryPrice * pos.leverage * 100;
+          pos.tpPct = parseFloat(edaRoi.toFixed(2));
+        } else {
+          pos._edaTpPrice = 0;
+        }
       }
     }
 
