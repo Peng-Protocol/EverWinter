@@ -83,7 +83,7 @@ Runs inline after the gainers pass using the same bulk fetch. Per candidate: sym
 Runs against `ftCandidates` after `runScan`. Per symbol: funding → RSI floor (> 45) → RSI6 ceiling (< 75) → Close Confirmation (≥3 of last 4 15m bars red) → LSA band. ClC and LSA reuse `_klineCache[${symbol}_15]` — no extra fetch.
 
 ### 4. SalF Scan (`runSalfScan`)
-Separate pass each cycle; evaluates gainers and losers pools. Per symbol: banlist → position check → funding → over-shorted filter → RSI floor → red candle count (≥3 of last 4) → LSA window → SalF median creep. Reuses cached 15m candles.
+Separate pass each cycle; evaluates gainers and losers pools. Per symbol: banlist → position check → funding → RSI floor → red candle count (≥3 of last 4) → LBA gate (VM ≥ `sfLbaMin` floor, raised per close by LBA Creep). VM sourced from `_symData` seeded by bulk ticker pass — no extra fetch.
 
 ### 5. Extender Ticks
 Once per cycle, tracked symbols within their 3h TTL fetch a fresh RSI6 and bump if still extended. Kline cache freshness is candle-boundary based: entries reuse until `lastCompletedTs` falls behind the current 15m boundary, then refresh automatically on the next close.
@@ -152,7 +152,7 @@ FUN now runs as Super FUN only. Each FUN close stamps a minimum FR re-entry gate
 Per-symbol TP reduction for non-Gainer strategies. Each close multiplies the stage-0 TP by `0.5^count`, floored at `minTpRoi` (default 3%). Resets after a 3h TTL.
 
 ### SalF Creep
-Per-symbol LSA window tightening after SalF closes. Floor rises and cap falls toward midpoint per close count. 6h TTL.
+Per-symbol LBA floor raising after SalF closes. Floor increases by `sfLbaMin × sfMedianCreepPct%` per close — re-entry requires stronger buying conviction as selling pressure weakens. 6h TTL.
 
 ### Activity Log
 300-entry capped feed; colour-coded: `scan` (light blue), `trade` (ice blue), `success` (green), `warn` (amber), `error` (red), `info` (muted). Cleared on **Clear Stats**.
@@ -178,7 +178,7 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 
 ## PseudoChaser
 
- `PseudoChaser.html` is an intentional imitation of PseudoWinter but with a longs-only bias and flipped criteria for entry. It uses the same strategies but with a few tweaks; standard gainers still enter at overbought levels but use over-extension as an entry criteria rather than a pass. Adv FT enter when ClC has 3 or more green candles, rather than red. Fund Chasing uses negative funding rates, all funding rates across the app are flipped. SalF uses inverted LSA (LBA) and green ClC. The UI is color flipped as well, going from icy blue/teal to dim tan/orange. 
+ `PseudoChaser.html` is an intentional imitation of PseudoWinter but with a longs-only bias and flipped criteria for entry. It uses the same strategies but with a few tweaks; standard gainers still enter at overbought levels but use over-extension as an entry criteria rather than a pass. Adv FT enter when ClC has 3 or more green candles, rather than red. Fund Chasing uses negative funding rates, all funding rates across the app are flipped. SalF uses inverted LBA (LSA — selling volume anomaly) and green ClC. The UI is color flipped as well, going from icy blue/teal to dim tan/orange. 
 
  ---
 

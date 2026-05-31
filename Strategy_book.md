@@ -90,7 +90,19 @@ Applied as a band — neither too thin nor too thick:
 
 **Post-OE reversal context**: Floor 125%, cap 150% by default. An OE ticker's baseline is heavily bullish — almost all recent candles were green. The first significant red candle reads elevated against that baseline. 125% is aggressive for a normal ticker but realistic for one that has been running hot.
 
-**Sustained decline context**: A ticker that has been falling for hours already has selling activity baked into its recent baseline. The threshold for "above average" drops accordingly — a 25% elevation against the 24-hour hourly average is enough to confirm selling is still present and not merely drifting, capped at 50% to block exhaustion flushes even on a declining baseline.
+---
+
+#### Localized Buy Average (LBA)
+
+LBA measures current buying intensity relative to the ticker's recent baseline. It compares recent USDT volume against the average hourly USDT volume derived from the 24-hour turnover.
+
+The signal is directionally counterintuitive but mechanically sound: when a ticker is declining, people buy on the way down. They buy when it looks cheap, when they think it's bottoming, when they're averaging into longs. Active buying during a decline does not stop the decline — it provides liquidity for continued selling. The sellers have willing counterparties, which means they can keep distributing without a vacuum snap-back.
+
+Applied as a band — neither too thin nor too thick:
+- **Floor**: Buying must be above the baseline. Active dip-buyers are present, giving sellers counterparties to distribute into.
+- **Cap**: Buying must not be excessively above the baseline. An extreme buy blowoff — panic buying or a short squeeze starting — marks potential exhaustion of the selling side rather than continuation.
+
+**SalF context**: Floor 25%, cap 50% by default vs. 24-hour hourly average. A ticker already in sustained decline has buying activity baked into its recent baseline; a 25% elevation confirms dip-buyers are active. LBA Creep narrows the window after each close on the same symbol, tightening re-entry as the selloff matures.
 
 ---
 
@@ -415,16 +427,16 @@ SalF is our premier red-day strategy. All previous strategies are designed aroun
 
 On broadly declining days, SalF is often the primary source of entries — qualifying tickers proliferate across both pools simultaneously as selling pressure spreads. On green days SalF is quiet by design; the filters naturally suppress entries when selling pressure is thin.
 
-SalF deliberately avoids two failure modes: **exhausted entries** (the ticker has already dumped violently, sellers are spent, and a snap-back is likely — the LSA cap gates this out) and **squeezable entries** (heavy short crowding on a declining ticker — a tighter funding rate gate avoids over-shorted tickers).
+SalF deliberately avoids two failure modes: **exhausted entries** (the ticker has already dumped violently, sellers are spent, and a snap-back is likely) and **squeezable entries** (heavy short crowding on a declining ticker — a tighter funding rate gate avoids over-shorted tickers).
 
 **Entry assembles:**
 - Close Confirmation: 3/4 completed 15m candles red (continuous decline across the past hour, not a single-candle spike)
-- LSA: last-hour volume within floor/cap band (floor 25%, cap 50% vs. 24-hour hourly average)
-  - The floor confirms active selling; the cap blocks entry into an exhaustion blowoff
+- LBA: last-hour volume within floor/cap band (floor 25%, cap 50% vs. 24-hour hourly average)
+  - The floor confirms active dip-buying; the cap blocks entry when buying is so extreme sellers may be exhausted
+  - Gainer vs. Loser pool: separately configurable minimums
+  - LBA Creep: the window narrows after each close on the same symbol, tightening re-entry as the selloff matures
 - RSI Floor: all three timeframes above the minimum (default 25); below this, snap-back probability exceeds continuation probability
 - Funding rate gate (tighter than other strategies — reduces exposure to over-shorted tickers)
-- Gainer vs. Loser pool: both are evaluated with the same LSA logic and separately configurable minimums
-- Median Creep: the LSA floor rises and cap narrows after each close on the same symbol, tightening re-entry conditions as selling pressure weakens
 
 **Position management:**
 - DCA structure
