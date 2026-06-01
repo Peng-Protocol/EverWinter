@@ -139,6 +139,8 @@ A quick re-entry after a close is showing declining sell pressure. The first ent
 
 When funding rates drop significantly negative, longs are being paid to hold — an incentive that draws fresh long entries and can cause sudden price spikes. For short positions already in drawdown, this is an elevated squeeze environment. Deeply negative funding is not a neutral condition; it is an active tailwind for the opposing side, and entries or further commitment made into it carry disproportionate risk.
 
+**FR-Drop exit**: PseudoWinter and EverWinter now close open short positions immediately when live funding falls below `-0.05%`, regardless of whether the position is currently profitable or losing. PnL cards label these exits as `FR-Drop` so they can be audited separately from TP, SL, force-close, and EDa exits.
+
 ---
 
 #### Margin Size Hierarchy
