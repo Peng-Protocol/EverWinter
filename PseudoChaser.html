@@ -1987,19 +1987,16 @@ function pw() { return {
   // ── PERIOD ROLLUP — compacts oldest individual trades when cap is hit ──
   _compactClosedTrades() {
     const KEEP = 50;
-    const realCloses    = this.closedTrades.filter(t => t.reason !== 'period-rollup' && t.reason !== 'absorption');
-    const absorpCards   = this.closedTrades.filter(t => t.reason === 'absorption');
-    if (realCloses.length <= KEEP) return;
+    const realCloses  = this.closedTrades.filter(t => t.reason !== 'period-rollup' && t.reason !== 'absorption');
+    const absorpCards = this.closedTrades.filter(t => t.reason === 'absorption');
+    // Combined cap: total visible cards across both types triggers compaction.
+    const allCards = [...realCloses, ...absorpCards].sort((a, b) =>
+      (b.closedAt ?? b.time ?? 0) - (a.closedAt ?? a.time ?? 0)
+    );
+    if (allCards.length <= KEEP) return;
 
-    // Only real closes count toward the cap; absorption cards compact alongside the overflow.
-    const toKeepReal    = realCloses.slice(0, KEEP);
-    const toCompactReal = realCloses.slice(KEEP);
-    // Absorption cards older than the oldest kept real close also compact; newer ones stay visible.
-    const oldestKept    = toKeepReal.length > 0 ? (toKeepReal[toKeepReal.length - 1].closedAt ?? 0) : Infinity;
-    const toKeepAbsorp  = absorpCards.filter(a => (a.closedAt ?? a.time ?? 0) >= oldestKept);
-    const toCompactAbsorp = absorpCards.filter(a => (a.closedAt ?? a.time ?? 0) < oldestKept);
-    const toKeep    = [...toKeepReal, ...toKeepAbsorp];
-    const toCompact = [...toCompactReal, ...toCompactAbsorp];
+    const toKeep    = allCards.slice(0, KEEP);
+    const toCompact = allCards.slice(KEEP);
     const existing  = this.closedTrades.find(t => t.reason === 'period-rollup');
 
     let count = 0, netPnl = 0, totalMargin = 0, wins = 0, dcaSum = 0, durSum = 0;
@@ -2040,7 +2037,8 @@ function pw() { return {
       const tp = t.totalPnl ?? t.pnl ?? 0, pp = t.pnlPct ?? 0;
       netPnl += tp;
       if (t.reason === 'absorption') {
-        // absorption cuts: fold PnL only — not counted as closed trades, no win/dca/dur/extremes
+        // absorption cuts: count as losses, include margin for ROI; no dca/dur/extremes
+        count++; totalMargin += t.margin ?? 0;
         mergeTs(t.closedAt, t.closedAt);
         return;
       }
@@ -5426,7 +5424,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     } catch { return 0; }
   },
 
-  _recordAbsorptionCut(pos, cutPnl, mark, cutAt = Date.now()) {
+  _recordAbsorptionCut(pos, cutPnl, mark, cutAt = Date.now(), cutMgn = 0) {
     // Fire-and-forget: one individual card per cut event, inserted chronologically in the trade feed.
     // count = relative cut number for this position (1st cut = 1, 2nd cut = 2, …)
     const prevCuts = this.closedTrades.filter(t => t.reason === 'absorption' && t.posId === pos.id).length;
@@ -5436,6 +5434,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       symbol:   pos.symbol,
       posId:    pos.id,
       pnl:      parseFloat(cutPnl.toFixed(6)),
+      margin:   cutMgn,
       mark,
       cutAt,
       openedAt: cutAt,
@@ -5584,7 +5583,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         }
       }
     }
-    this._recordAbsorptionCut(pos, cutPnl, mark);
+    this._recordAbsorptionCut(pos, cutPnl, mark, Date.now(), cutMgn);
   },
 
   async _tryPassiveSecondWind(pos, baseMargin) {
@@ -5597,7 +5596,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const surplus     = savedMargin - extraStages * baseMargin;
     if (extraStages <= 0) return;
 
-    const SW_COND_MAX = 6;
+    const SW_COND_MAX = 3;
     const pendingSwThisPos = (pos.orders || []).filter(o => o.type === 'cond' && !o.filled && o._secondWind).length;
     if (pendingSwThisPos >= SW_COND_MAX) {
       this.log(`💨 ${sym}: passive Second Wind paused — ${pendingSwThisPos} pending SW stages already placed (max ${SW_COND_MAX}); waiting for a fill`, 'warn');
