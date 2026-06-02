@@ -799,13 +799,6 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <input type="range" min="70" max="100" x-model.number="cfg.rsi6Max" :disabled="bot.running" @change="persist()">
               <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">RSI6 ≥ this → excluded. ADV FT scouts handle it instead.</div>
             </div>
-            <div class="g" style="margin-top:8px">
-              <label class="tog" @click.prevent="if(!cfgLocked){cfg.gainerOeLookbackEnabled=!cfg.gainerOeLookbackEnabled;persist()}" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''">
-                <div class="tog-t" :class="cfg.gainerOeLookbackEnabled?'on':''"><div class="tog-k"></div></div>
-                <span class="tog-l">Historical OE Look-back</span>
-              </label>
-              <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">OFF = skip historical RSI6 OE look-back for gainers; current OE and proximity checks still apply.</div>
-            </div>
             <div class="g"><div class="lbl">RSI6 Proximity Avoidance <b x-text="cfg.rsi6ProximityPct+'%'"></b></div>
               <input type="range" min="0" max="10" step="0.5" x-model.number="cfg.rsi6ProximityPct" :disabled="bot.running" @change="persist()">
               <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">RSI6 within this % of rsi6Max routes to watchlist instead of immediate entry.</div>
@@ -1569,7 +1562,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               const laggard = positions.reduce((o,x)=>x.openedAt<o.openedAt?x:o, positions[0]);
               if (!laggard) return '—';
               const ev      = laggard._laggardInitialEV ?? 0;
-              const lostVal = laggard._laggardLostValue ?? 0;
+              const lostVal = Math.abs(laggard._laggardLostValue ?? 0) < 0.005 ? 0 : (laggard._laggardLostValue ?? 0);
               const uPnl    = laggard.markPrice
                 ? (laggard.entryPrice - laggard.markPrice) / laggard.entryPrice * laggard.leverage * laggard.margin
                 : 0;
@@ -1746,7 +1739,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               const step=lim*((cfg.sfMedianCreepPct??5)/100);
               const med=lim/2;
               const n=entry.count||0;
-              const lMin=cfg.sfLoserLsaMin??25;
+              const lMin=cfg.sfLoserLsaMin??10;
               const cap=Math.max(lim-n*step,med).toFixed(1);
               const lFloor=(lMin>=med?lMin:Math.min(lMin+n*step,med)).toFixed(1);
               return 'L: +'+lFloor+'% ↔ +'+cap+'%';
@@ -2072,15 +2065,13 @@ function ew() { return {
   creds: { key:'', secret:'' },
   cfg: {
     leverage:6, minNotional:6, addNotional:6,
-    rsi6Min:70, rsi12Min:70, rsi24Min:80, rsi6Max:90, maxPos:10, scanMins:15, topN:25,
+    rsi6Min:70, rsi12Min:70, rsi24Min:70, rsi6Max:90, maxPos:10, scanMins:15, topN:25,
     gainersEnabled: true,
-    gainerOeLookbackEnabled: false, // optional historical OE look-back for gainers
     potGainerRsiPct: 10,      // RSI shortfall % below gate minimums for watchlist admission
     potGainerExpireMins: 15, // watchlist TTL (minutes)
     rsi6ProximityPct: 3,     // proximity avoidance: % of rsi6Max below which RSI6 routes to watchlist
     fundingEnabled: true,
     fundingRateMin: -0.0005,
-    frDropFundingRateMin: -0.05, // FR-Drop exit threshold in % — close any short below this rate
     volDivFilter: true,      // skip coins whose turnover is divergent vs top peers (capital-injection signal)
     volDivPct: 50,           // % by which subject must exceed top-bracket peer turnover on 2/3 to flag
     volLowDivFilter: true,   // skip coins with suspiciously low turnover vs bottom peers (thin-book signal)
@@ -2743,7 +2734,7 @@ function ew() { return {
       if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) await this.runLaggardCheck();
 
     } catch(e) {
-      this.log('[EW-CYCLE-01] Cycle error: ' + e.message, 'error');
+      this.log('Cycle error: ' + e.message, 'error');
     } finally {
       this._cycleRunning = false;
     }
@@ -3322,8 +3313,10 @@ function ew() { return {
       const isUpgrade      = this.ftCandidates[symbol] && !this.ftCandidates[symbol]._advFt && !_ftMaxBlocked;
 
       if (isNewPromotion) {
+        if ((this.cfg.ftRosterMax ?? 10) < 1) { this.persist(); return; }
         this._ftRosterBump(symbol);
         this.ftCandidates[symbol] = { count, qualifiedAt: now, tradesOpened: 0, _advFt: true };
+        this.log(`⚡ ${symbol}: promoted to Advanced FT roster (×${count} over-extended hits)`, 'trade');
       } else if (isUpgrade) {
         this.ftCandidates[symbol]._advFt = true;
         this.ftCandidates[symbol].count  = count;
@@ -3343,17 +3336,27 @@ function ew() { return {
 
   // Enforce ftRosterMax. Evicts lowest FR then oldest to admit incoming symbol.
   _ftRosterBump(incomingSymbol) {
-    const max = this.cfg.ftRosterMax ?? 10;
+    const max = Math.max(0, this.cfg.ftRosterMax ?? 10);
+    if (max < 1) {
+      this.log(`🎯 FT roster disabled (max ${max}) — cannot admit ${incomingSymbol}`, 'warn');
+      return null;
+    }
     const roster = Object.entries(this.ftCandidates).filter(([s]) => s !== incomingSymbol);
-    if (roster.length < max) return;
+    if (roster.length < max) return null;
     roster.sort((a, b) => {
       const frA = this._klineCache[`fr_${a[0]}`]?.rate ?? 0;
       const frB = this._klineCache[`fr_${b[0]}`]?.rate ?? 0;
       if (frA !== frB) return frA - frB;
       return (a[1].qualifiedAt || 0) - (b[1].qualifiedAt || 0);
     });
-    const [evictSym] = roster[0];
+    const [evictSym] = roster[0] || [];
+    if (!evictSym) return null;
+    const evictWindow = (this.ftCandidates[evictSym]?.qualifiedAt || Date.now()) + this.forceCloseMs();
+    this._ftEvictGraylist[evictSym] = evictWindow;
+    if (this._advFtGraylist[evictSym]) delete this._advFtGraylist[evictSym];
+    this.log(`🎯 FT roster full (${max}) — evicting ${evictSym} to admit ${incomingSymbol}`, 'info');
     delete this.ftCandidates[evictSym];
+    return evictSym;
   },
 
   // Fetches a single ticker row for a symbol.
@@ -3507,60 +3510,89 @@ function ew() { return {
     } catch { return { peak: null, oeCount: 0 }; }
   },
 
-  _absorptionCutCard(pos, cutPnl, mark, cutAt = Date.now(), extra = {}) {
-    const id = extra.id || `absorption_${extra.posId || pos?.id || 'legacy'}_${cutAt}_${Math.random().toString(36).slice(2, 8)}`;
-    const symbol = extra.symbol || pos?.symbol || 'LOSS ABSORPTION';
-    const pnl = Number(extra.pnl ?? cutPnl ?? 0);
-    return {
-      id,
-      reason: 'absorption',
-      symbol,
-      posId: extra.posId || pos?.id || null,
-      pnl,
-      totalPnl: pnl,
-      cutPnl: pnl,
-      mark: extra.mark ?? mark ?? null,
-      cuts: [{ posId: extra.posId || pos?.id || null, symbol, pnl, mark: extra.mark ?? mark ?? null, cutAt }],
-      isOpen: false,
-      firstCutAt: cutAt,
-      lastCutAt: cutAt,
-      closedAt: cutAt,
-    };
+
+  async _checkOeDrop(pos) {
+    try {
+      if (!pos || pos._oeDropCheckedStage === pos.dcaStage) return false;
+      pos._oeDropCheckedStage = pos.dcaStage;
+      const { peak, oeCount } = await this.fetchHistoricalRSI6Peaks(pos.symbol);
+      if (peak != null && peak > 90) {
+        this.log(`⚡ OE DROP ${pos.symbol}: RSI6 peak ${peak.toFixed(1)} > 90 in preceding 3h (${oeCount || 1} candle${(oeCount || 1) === 1 ? '' : 's'}) — closing immediately`, 'warn');
+        pos._oeDrop = true;
+        if (pos._ft) await this.ftClosePosition(pos, 'oe-drop');
+        else await this.closePosition(pos, 'oe-drop');
+        return true;
+      }
+    } catch(e) {
+      this.log(`⚡ ${pos.symbol}: OE Drop check failed — ${e.message}`, 'warn');
+    }
+    return false;
   },
 
-  _migratePinnedAbsorptionCards() {
-    const legacy = this.closedTrades.filter(t => t.reason === 'absorption' && (t.id === 'absorption_pinned' || (t.cuts || []).length !== 1 || t.finalCloses || t.finalClose || t.isOpen !== false));
-    if (!legacy.length) return false;
-    const migrated = [];
-    for (const card of legacy) {
-      const cuts = (card.cuts && card.cuts.length)
-        ? card.cuts
-        : [{ posId: card.posId, symbol: card.symbol, pnl: card.totalPnl ?? card.pnl ?? 0, mark: card.mark, cutAt: card.lastCutAt || card.closedAt || card.firstCutAt || Date.now() }];
-      for (const cut of cuts) {
-        const cutAt = cut.cutAt || card.lastCutAt || card.closedAt || card.firstCutAt || Date.now();
-        migrated.push(this._absorptionCutCard(null, cut.pnl ?? 0, cut.mark ?? null, cutAt, {
-          id: `absorption_${cut.posId || card.posId || 'legacy'}_${cutAt}`,
-          posId: cut.posId || card.posId || null,
-          symbol: cut.symbol || card.symbol || 'LOSS ABSORPTION',
-          pnl: cut.pnl ?? card.totalPnl ?? card.pnl ?? 0,
-          mark: cut.mark ?? card.mark ?? null,
-        }));
-      }
+  async _checkSpeedDrop(pos, now = Date.now()) {
+    if (!pos || (pos.dcaStage || 0) < 2) return false;
+    const SPEED_DROP_MS = 30 * 60 * 1000;
+    const filled = (pos.orders || []).filter(o => o.type === 'cond' && o.filled && o.filledAt != null)
+      .sort((a, b) => (a.filledAt || 0) - (b.filledAt || 0));
+    if (filled.length < 2) return false;
+    const prevFill = filled[filled.length - 2];
+    const thisFill = filled[filled.length - 1];
+    const gap = (thisFill.filledAt || now) - (prevFill.filledAt || now);
+    if (gap < SPEED_DROP_MS) {
+      const gapMins = (gap / 60000).toFixed(1);
+      this.log(`⚡ SPEED DROP ${pos.symbol}: ${prevFill.label} → ${thisFill.label} in ${gapMins}min (<30min) — closing immediately`, 'warn');
+      pos._speedDrop = true;
+      if (pos._ft) await this.ftClosePosition(pos, 'speed');
+      else await this.closePosition(pos, 'speed');
+      return true;
     }
-    this.closedTrades = this.closedTrades.filter(t => !legacy.includes(t));
-    this.closedTrades.unshift(...migrated.sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0)));
-    return true;
+    return false;
   },
 
   _recordAbsorptionCut(pos, cutPnl, mark, cutAt = Date.now()) {
-    this._migratePinnedAbsorptionCards();
-    this.closedTrades.unshift(this._absorptionCutCard(pos, cutPnl, mark, cutAt));
+    const cardId = 'absorption_pinned';
+    let card = this.closedTrades.find(t => t.id === cardId && t.reason === 'absorption');
+    if (!card) {
+      const legacyCards = this.closedTrades.filter(t => t.reason === 'absorption');
+      const legacyCuts = legacyCards.flatMap(t => (t.cuts || []).map(c => ({ ...c, symbol: c.symbol || t.symbol, posId: c.posId || t.posId })));
+      const legacyTotal = legacyCards.reduce((s, t) => s + (t.totalPnl ?? t.pnl ?? 0), 0);
+      const legacyFirst = legacyCards.reduce((min, t) => Math.min(min, t.firstCutAt || t.openedAt || Infinity), Infinity);
+      const legacyLast = legacyCards.reduce((max, t) => Math.max(max, t.lastCutAt || t.closedAt || 0), 0);
+      this.closedTrades = this.closedTrades.filter(t => t.reason !== 'absorption');
+      card = {
+        id: cardId,
+        reason: 'absorption',
+        symbol: 'LOSS ABSORPTION',
+        cuts: legacyCuts,
+        totalPnl: parseFloat(legacyTotal.toFixed(6)),
+        finalCloses: {},
+        isOpen: true,
+        firstCutAt: Number.isFinite(legacyFirst) ? legacyFirst : cutAt,
+        lastCutAt: legacyLast || null,
+      };
+      this.closedTrades.unshift(card);
+    }
+    card.cuts.push({ posId: pos.id, symbol: pos.symbol, pnl: cutPnl, mark, cutAt });
+    card.totalPnl = parseFloat(((card.totalPnl || 0) + cutPnl).toFixed(6));
+    card.lastCutAt = cutAt;
+    if (!card.firstCutAt) card.firstCutAt = cutAt;
+    card.isOpen = true;
   },
 
   _settleAbsorptionCard(pos, close = {}) {
-    // Loss absorption cards are intentionally standalone cut events. Do not attach final
-    // position closes; that made the pinned card overstate what the cut itself absorbed.
-    return;
+    const closedAt = close.closedAt || Date.now();
+    const pinned = this.closedTrades.find(t => t.id === 'absorption_pinned' && t.reason === 'absorption');
+    if (pinned) {
+      if (!pinned.finalCloses) pinned.finalCloses = {};
+      pinned.finalCloses[pos.id] = { ...close, closedAt };
+      pinned.lastCloseAt = closedAt;
+      return;
+    }
+    const card = this.closedTrades.find(t => t.id === 'absorption_' + pos.id && t.reason === 'absorption');
+    if (!card) return;
+    card.finalClose = { ...close, closedAt };
+    card.isOpen = false;
+    card.closedAt = closedAt;
   },
 
   async runLossAbsorption() {
@@ -3870,13 +3902,16 @@ function ew() { return {
       //   Only allow the value to move more negative (further into debt), never less.
       // — If still positive (laggard dislodge territory), negative injections apply normally
       //   so the position can cross into recovery debt as expected.
-      p._laggardLostValue = prev < 0 ? Math.min(prev, next) : next;
+      p._laggardLostValue = prev < -0.005 ? Math.min(prev, next) : (Math.abs(next) < 0.005 ? 0 : next);
     }
   },
 
   async runLaggardCheck() {
     if (!this.cfg.laggardCheckEnabled) return;
     if (this.positions.length < 1) return;
+    for (const p of this.positions) {
+      if (Math.abs(p._laggardLostValue || 0) < 0.005) p._laggardLostValue = 0;
+    }
     const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
 
     // Change 9 — backfill _laggardInitialEV for legacy positions that have debt but no EV anchor.
@@ -3984,6 +4019,9 @@ function ew() { return {
   _notifyLaggardClose(closingPos, closingRoiPct, closingPnlUsdt = null) {
     if (!this.cfg.laggardCheckEnabled) return;
     if (!this.positions.length) return;
+    for (const p of this.positions) {
+      if (Math.abs(p._laggardLostValue || 0) < 0.005) p._laggardLostValue = 0;
+    }
     const closingPnl = Number.isFinite(closingPnlUsdt)
       ? closingPnlUsdt
       : (closingRoiPct / 100 * (closingPos.margin || 0));
@@ -4107,7 +4145,7 @@ function ew() { return {
       const _sfCreepN = this.cfg.sfMedianCreepEnabled ? Math.min(this.salfCreep[sym]?.count || 0, _sfMaxN) : 0;
       const lsaCap    = _sfLimit  - _sfCreepN * _sfStep;
       const isLoser   = !gainerSyms.has(sym);
-      const _bandMin  = isLoser ? (this.cfg.sfLoserLsaMin ?? 25) : (this.cfg.sfGainerLsaMin ?? 25);
+      const _bandMin  = isLoser ? (this.cfg.sfLoserLsaMin ?? 10) : (this.cfg.sfGainerLsaMin ?? 25);
       const effFloor  = _bandMin >= _sfMedian ? _bandMin : Math.min(_bandMin + _sfCreepN * _sfStep, _sfMedian);
       if (lsaRatio <= 1 + effFloor / 100 || lsaRatio >= 1 + lsaCap / 100) { lsaBlocked++; continue; }
       const change24h = parseFloat(t.price24hPcnt || 0) * 100;
@@ -4492,12 +4530,13 @@ function ew() { return {
         for (const c of candidates) {
           if (this.freeSlots() < this.nextSlotCost('gainer')) break;
           if (c.status !== 'ready') continue;
-          // Optional historical OE look-back; current RSI6 OE/proximity checks remain enforced above.
-          if (this.cfg.gainerOeLookbackEnabled) {
+          // OE graylist gate — unconditional; enforces regardless of advFT setting
+          {
             const now_gl = Date.now();
             const inExtGl = this._extenderGraylist[c.symbol] && now_gl < this._extenderGraylist[c.symbol];
             const inAdvGl = this._advFtGraylist[c.symbol]    && now_gl < this._advFtGraylist[c.symbol];
             if (inExtGl || inAdvGl) { c.status = 'extgrayed'; continue; }
+            // 3h historical RSI6 look-back — fires before every gainer entry
             const { peak: rsi6Peak, oeCount: histOeCount } = await this.fetchHistoricalRSI6Peaks(c.symbol);
             if (rsi6Peak != null && rsi6Peak >= this.cfg.rsi6Max) {
               this._extenderGraylist[c.symbol] = now_gl + 6 * 3600 * 1000;
@@ -4523,7 +4562,7 @@ function ew() { return {
 
       await this.refreshBalance();
 
-    } catch(e) { this.log('[EW-SCAN-01] Scan error: '+e.message, 'error'); }
+    } catch(e) { this.log('Scan error: '+e.message, 'error'); }
     finally { this.ui.scanning=false; }
   },
 
@@ -4564,12 +4603,12 @@ function ew() { return {
 
   // Returns funding rate as %. Reads from _klineCache[fr_SYMBOL] seeded during bulk ticker fetch.
   // Falls back to targeted ticker fetch on cache miss.
-  async fetchFundingRate(symbol, forceRefresh = false) {
+  async fetchFundingRate(symbol) {
     try {
       const cacheKey = `fr_${symbol}`;
       const cached   = this._klineCache[cacheKey];
       const FR_TTL   = (this.cfg.scanMins || 15) * 60 * 1000;
-      if (!forceRefresh && cached && (Date.now() - cached.ts) < FR_TTL) return cached.rate;
+      if (cached && (Date.now() - cached.ts) < FR_TTL) return cached.rate;
       const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${symbol}`);
       const d = await r.json();
       if (d.retCode !== 0) return null;
@@ -4590,19 +4629,18 @@ function ew() { return {
       return;
     }
 
-    // Optional historical over-extension gate before admitting to watchlist.
-    if (this.cfg.gainerOeLookbackEnabled) {
-      const EXTENDER_TTL_PG = 3 * 3600 * 1000;
-      const pgExtEntry = this.extenderCount[sym];
-      if (pgExtEntry && (Date.now() - (pgExtEntry.setAt || 0)) < EXTENDER_TTL_PG) {
-        const nowPg = Date.now();
-        const inAdvGl = this._advFtGraylist[sym]    && nowPg < this._advFtGraylist[sym];
-        const inExtGl = this._extenderGraylist[sym] && nowPg < this._extenderGraylist[sym];
-        if (inAdvGl || inExtGl) {
-          this.log(`◉ ${sym}: pot-gainer rejected — hist over-ext ×${pgExtEntry.count} (${inAdvGl ? 'ADV FT' : 'extender'} graylist)`, 'info');
-          if (g) g.status = 'overextended';
-          return;
-        }
+    // ── Historical over-extension gate — must pass before admitting to watchlist ──
+    // If extenderCount is live within 3h TTL, this coin is on the extender/ADV FT path.
+    const EXTENDER_TTL_PG = 3 * 3600 * 1000;
+    const pgExtEntry = this.extenderCount[sym];
+    if (pgExtEntry && (Date.now() - (pgExtEntry.setAt || 0)) < EXTENDER_TTL_PG) {
+      const nowPg = Date.now();
+      const inAdvGl = this._advFtGraylist[sym]    && nowPg < this._advFtGraylist[sym];
+      const inExtGl = this._extenderGraylist[sym] && nowPg < this._extenderGraylist[sym];
+      if (inAdvGl || inExtGl) {
+        this.log(`◉ ${sym}: pot-gainer rejected — hist over-ext ×${pgExtEntry.count} (${inAdvGl ? 'ADV FT' : 'extender'} graylist)`, 'info');
+        if (g) g.status = 'overextended';
+        return;
       }
     }
 
@@ -4691,25 +4729,28 @@ function ew() { return {
           continue;
         }
 
-        // Optional historical OE look-back before RSI entry gate.
-        if (this.cfg.gainerOeLookbackEnabled) {
-          const EXTENDER_TTL_PG = 3 * 3600 * 1000;
-          const pgExtEntry_w = this.extenderCount[pe.symbol];
-          if (pgExtEntry_w && (Date.now() - (pgExtEntry_w.setAt || 0)) < EXTENDER_TTL_PG) {
-            const nowPgW = Date.now();
-            const inAdvGlW = this._advFtGraylist[pe.symbol]    && nowPgW < this._advFtGraylist[pe.symbol];
-            const inExtGlW = this._extenderGraylist[pe.symbol] && nowPgW < this._extenderGraylist[pe.symbol];
-            if (inAdvGlW || inExtGlW) {
-              this.log(`◉ ${pe.symbol}: pot-gainer evicted — hist over-ext ×${pgExtEntry_w.count} (${inAdvGlW ? 'ADV FT' : 'extender'} graylist)`, 'info');
-              this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
-              const g = this.gainers.find(x => x.symbol === pe.symbol);
-              if (g && g.status === 'watch') g.status = 'overextended';
-              this.persist();
-              this.renderPotGainers();
-              continue;
-            }
+        // ── Historical over-extension check (lookback) — runs before RSI entry gate ──
+        // If extenderCount is live, this coin is on the ADV FT / extender path and must
+        // not enter via the gainer path. Evict from watchlist.
+        const EXTENDER_TTL_PG = 3 * 3600 * 1000;
+        const pgExtEntry_w = this.extenderCount[pe.symbol];
+        if (pgExtEntry_w && (Date.now() - (pgExtEntry_w.setAt || 0)) < EXTENDER_TTL_PG) {
+          const nowPgW = Date.now();
+          const inAdvGlW = this._advFtGraylist[pe.symbol]    && nowPgW < this._advFtGraylist[pe.symbol];
+          const inExtGlW = this._extenderGraylist[pe.symbol] && nowPgW < this._extenderGraylist[pe.symbol];
+          if (inAdvGlW || inExtGlW) {
+            this.log(`◉ ${pe.symbol}: pot-gainer evicted — hist over-ext ×${pgExtEntry_w.count} (${inAdvGlW ? 'ADV FT' : 'extender'} graylist)`, 'info');
+            this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
+            const g = this.gainers.find(x => x.symbol === pe.symbol);
+            if (g && g.status === 'watch') g.status = 'overextended';
+            this.persist();
+            this.renderPotGainers();
+            continue;
           }
+        }
 
+        // Historical OE look-back — evict if ticker over-extended since watchlist placement (unconditional)
+        {
           const { peak: pgRsi6Peak, oeCount: pgOeCount } = await this.fetchHistoricalRSI6Peaks(pe.symbol);
           if (pgRsi6Peak != null && pgRsi6Peak >= this.cfg.rsi6Max) {
             this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
@@ -5172,7 +5213,7 @@ function ew() { return {
     this.sess.trades++;
     this.sess.pnl += realisedPnl;
     if (isWin) this.sess.wins++; else this.sess.losses++;
-    if (reason === 'force' || reason === 'laggard') this.sess.forceClose++;
+    if (reason === 'force' || reason === 'laggard' || reason === 'speed' || reason === 'oe-drop') this.sess.forceClose++;
 
     // Record in trade feed
     let closedAt = Date.now();
@@ -5267,6 +5308,8 @@ function ew() { return {
           await this.setTP(pos, _ft_tp);
           this.log(`🎯 ${pos.symbol}: FT ${add.label} triggered @ ${fmtP(add.price)} | Avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(_ft_tp)} (${_ft_roi}% ROI)`, 'trade');
           this.persist();
+          if (await this._checkOeDrop(pos)) break;
+          if (await this._checkSpeedDrop(pos, now)) break;
         }
       }
 
@@ -5495,7 +5538,6 @@ function ew() { return {
   renderTradeFeed() {
     const el = document.getElementById('ew-trade-feed');
     if (!el) return;
-    if (this._migratePinnedAbsorptionCards?.()) this.persist();
     const hdrCount = document.getElementById('ew-trade-count');
     const hdrMeta  = document.getElementById('ew-trade-meta');
     const _ru       = this.closedTrades.find(t => t.reason === 'period-rollup');
@@ -5528,7 +5570,7 @@ function ew() { return {
       const pnl = t.totalPnl ?? 0;
       const pnlCol = pnl >= 0 ? 'var(--profit)' : 'var(--short)';
       const cutsCount = (t.cuts || []).length;
-      const statusLabel = '✂️ ABSORBED';
+      const statusLabel = t.isOpen !== false ? '✂️ ABSORBING' : '✂️ SETTLED';
       const firstAt = t.firstCutAt ? _fmtDate(t.firstCutAt) : '—';
       const lastAt  = t.lastCutAt  ? _fmtDate(t.lastCutAt)  : '—';
       return `<div style="background:var(--bg-raised);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:3px;overflow:hidden;margin-bottom:0">
@@ -5594,7 +5636,8 @@ function ew() { return {
                         : t.reason === 'adl'         ? 'ADL'
                         : t.reason === 'liq'         ? 'LIQ'
                         : t.reason === 'manual'      ? 'MANUAL'
-                        : t.reason === 'FR-drop'     ? 'FR-Drop'
+                        : t.reason === 'speed'       ? 'SPEED'
+                        : t.reason === 'oe-drop'     ? 'OE Drop'
                         : 'CLOSE';
       const typeBadge = t._advFt ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,255,.55);color:#b464ff;background:rgba(180,100,255,.12);letter-spacing:1px">ADV</span>`
                       : t._ft   ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(160,100,255,.45);color:#c084fc;background:rgba(160,100,255,.12);letter-spacing:1px">FT</span>`
@@ -5645,7 +5688,7 @@ function ew() { return {
             <div style="display:flex;align-items:center;gap:6px">
               <span style="font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text-hi)">${t.symbol}</span>
               <span style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid;${badgeStyle}">${isWin ? 'WIN' : 'LOSS'}</span>
-              <span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px ${ (t.reason === 'tp' || t.reason === 'tp-inferred') ? 'solid;color:var(--profit);border-color:rgba(0,229,160,.4);background:var(--profit-dim)' : (t.reason === 'sl' || t.reason === 'sl-inferred') ? 'solid;color:var(--short);border-color:rgba(255,69,96,.4);background:var(--short-glow)' : (t.reason === 'force' || t.reason === 'FR-drop') ? 'solid;color:var(--warn);border-color:rgba(240,192,96,.4);background:var(--warn-dim)' : 'solid var(--border);color:var(--text-lo)' }">${reasonLabel}</span>
+              <span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px ${ (t.reason === 'tp' || t.reason === 'tp-inferred') ? 'solid;color:var(--profit);border-color:rgba(0,229,160,.4);background:var(--profit-dim)' : (t.reason === 'sl' || t.reason === 'sl-inferred') ? 'solid;color:var(--short);border-color:rgba(255,69,96,.4);background:var(--short-glow)' : t.reason === 'force' ? 'solid;color:var(--warn);border-color:rgba(240,192,96,.4);background:var(--warn-dim)' : 'solid var(--border);color:var(--text-lo)' }">${reasonLabel}</span>
               ${typeBadge}
             </div>
             <span style="font-family:var(--mono);font-size:9px;color:var(--text-lo)">${durStr}</span>
@@ -5977,21 +6020,9 @@ function ew() { return {
       // Refresh funding rates for all open positions (usually cache hit, seeded each scan).
       for (const pos of this.positions) {
         try {
-          const fr = await this.fetchFundingRate(pos.symbol, true);
+          const fr = await this.fetchFundingRate(pos.symbol);
           if (fr !== null) pos.fundingRate = fr;
-        } catch(e) { this.log(`[EW-FR-01] ${pos.symbol}: funding refresh failed — ${e.message}`, 'warn'); }
-      }
-
-      // FR-Drop close: deeply negative funding is an immediate exit, regardless of PnL.
-      for (const pos of [...this.positions]) {
-        if (!this.positions.find(x => x.id === pos.id)) continue;
-        if (pos.pendingClose || _closingIds.has(pos.id)) continue;
-        if (pos.fundingRate == null) continue;
-        const _frDropGate = this.cfg.frDropFundingRateMin ?? -0.05;
-        if (pos.fundingRate < _frDropGate) {
-          this.log(`💰 ${pos.symbol}: FR-Drop close — FR ${pos.fundingRate.toFixed(4)}% < ${_frDropGate.toFixed(3)}%`, 'warn');
-          await (pos._ft ? this.ftClosePosition(pos, 'FR-drop') : this.closePosition(pos, 'FR-drop'));
-        }
+        } catch(e) { /* non-fatal */ }
       }
 
       // ── Refresh live vol mom and LSA for FT, ADV FT, and fader positions ──
@@ -6409,7 +6440,7 @@ function ew() { return {
       this.persist();
       this.renderPotGainers();
 
-    } catch(e) { this.log('[EW-RECON-01] Reconcile failed: ' + e.message, 'error'); }
+    } catch(e) { this.log('Reconcile failed: ' + e.message, 'error'); }
   },
 
   // Fetch open conditional orders for a specific symbol (used during import)
@@ -6532,7 +6563,7 @@ function ew() { return {
         this.persist();
         this.log(`⚠ Ghost position detected: ${sym} | imported at stage ${gStage}, TP: ${fmtP(resolvedTp)}${_ghostIsFt ? ` [${_ghostIsAdvFt ? 'ADV ' : ''}FT]` : ''}`, 'warn');
       }
-    } catch(e) { this.log('[EW-GHOST-01] Ghost audit error: ' + e.message, 'warn'); }
+    } catch(e) { this.log('Ghost audit error: ' + e.message, 'warn'); }
   },
 
   async syncPositions() {
@@ -6663,7 +6694,7 @@ function ew() { return {
           this.renderPotGainers();
         }
       }
-    } catch(e) { this.log('[EW-SYNC-01] Sync: '+e.message,'error'); }
+    } catch(e) { this.log('Sync: '+e.message,'error'); }
   },
 
   // ── RECORD CLOSED POSITION ──
@@ -6809,7 +6840,6 @@ function ew() { return {
         stopOrderType === 'trailingstop' ? 'sl'          :
         execType      === 'adltrade'     ? 'adl'         :
         execType      === 'busttrade'    ? 'liq'         :
-        pos.pendingCloseReason === 'FR-drop'             ? 'FR-drop'     :
         pos.pendingCloseReason === 'force'               ? 'force'       :
         (pos.phase === 'force' || pos.phase === 'reduce') ? 'force'      :
         isTpInferred                                     ? 'tp-inferred' :
@@ -7008,6 +7038,7 @@ function ew() { return {
     const filledCondCount = pos.orders
       ? pos.orders.filter(o => o.type === 'cond' && o.filled).length
       : 0;
+    const prevStage = pos.dcaStage || 0;
     const stage  = this.inferStage(pos, instr);
     // Log a warning if orders[] thinks more stages filled than notional confirms
     if (filledCondCount > stage) {
@@ -7016,7 +7047,17 @@ function ew() { return {
     pos.dcaStage = stage; // always keep card in sync
     // Sync filled flags so the progress-bar highlights match the inferred stage
     if (pos.orders) {
-      pos.orders.filter(o => o.type === 'cond').forEach((o, i) => { if (i < stage) o.filled = true; });
+      pos.orders.filter(o => o.type === 'cond').forEach((o, i) => {
+        if (i < stage) {
+          o.filled = true;
+          if (!o.filledAt) o.filledAt = Date.now();
+        }
+      });
+    }
+    if (stage > prevStage) {
+      this.log(`${pos.symbol}: DCA stage advanced ${prevStage}→${stage} from exchange position notional`, 'trade');
+      if (await this._checkOeDrop(pos)) return;
+      if (await this._checkSpeedDrop(pos)) return;
     }
 
     // Stage 0: use stored tpPct as authoritative ROI for all entry types — it captures ingress
@@ -7309,7 +7350,6 @@ function ew() { return {
   async closePosition(pos, reason='manual') {
     if (_closingIds.has(pos.id)) return;
     _closingIds.add(pos.id);
-    pos.pendingCloseReason = reason;
     // Cancel any stale GTC close order from a previous attempt before placing a fresh one.
     if (pos._closeOrderId) {
       try {
@@ -7376,7 +7416,7 @@ function ew() { return {
 
       // Position confirmed gone — clean up locally.
       pos._closeOrderId = null;
-      if (reason === 'force' || reason === 'laggard') this.sess.forceClose++;
+      if (reason === 'force' || reason === 'laggard' || reason === 'speed' || reason === 'oe-drop') this.sess.forceClose++;
       this.log(`${pos.symbol}: close confirmed [${reason}]`, 'success');
       await this.cancelAllConditionals(pos.symbol);
       if (pos._fun) { if (this.cfg.funSuperMode) this.funLockInBump(pos.symbol, pos._funSubType); else this.funCreepBump(pos.symbol, pos._funSubType); }
@@ -7392,7 +7432,7 @@ function ew() { return {
         _closingIds.delete(_closedPos.id);
       }, 2500);
       if (this.bot.running) setTimeout(() => this.runScheduledCycle(), 500);
-    } catch(e) { this.log('[EW-CLOSE-01] close: ' + e.message, 'error'); _closingIds.delete(pos.id); }
+    } catch(e) { this.log('close: ' + e.message, 'error'); _closingIds.delete(pos.id); }
   },
 
   // ── CLOSE RETRY WORKER ──
