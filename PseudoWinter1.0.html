@@ -2532,6 +2532,15 @@ function pw() { return {
             } : {}),
           };
         });
+        // _closingIds is module-level in-memory and resets on every page load, so any
+        // persisted _laggardClosingAt timestamps from the prior session must be cleared to
+        // prevent the 30s cooldown gate from blocking re-evaluation on startup.
+        // Also snap persisted near-zero _laggardLostValue so stale floating-point residue
+        // doesn't keep a position permanently locked in debt state.
+        this.positions.forEach(p => {
+          delete p._laggardClosingAt;
+          if (Math.abs(p._laggardLostValue || 0) < 0.001) p._laggardLostValue = 0;
+        });
       }
     } catch(e) {}
     this.$nextTick(() => { this.renderTradeFeed(); this.renderPotGainers(); });
@@ -4088,7 +4097,7 @@ function pw() { return {
     this.sess.pnl += totalPnl;
     this.sess.ftTotalDone = (this.sess.ftTotalDone || 0) + 1;
     if (isWin) this.sess.wins++; else this.sess.losses++;
-    if (reason === 'force' || reason === 'laggard') this.sess.forceClose++;
+    if (reason === 'force' || reason === 'laggard' || reason === 'speed') this.sess.forceClose++;
 
     let closedAt = Date.now();
     while (this.closedTrades.length && this.closedTrades[0].closedAt === closedAt) closedAt++;
@@ -4260,8 +4269,28 @@ function pw() { return {
           }
           this.log(`🎯 ${pos.symbol}: FT ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
           this.persist();
+
+          // ── SPEED DROP: close if 2 consecutive DCA stages trigger within 30 minutes ──
+          if (pos.dcaStage >= 2) {
+            const SPEED_DROP_MS = 30 * 60 * 1000;
+            const filledOrders = pos.orders.filter(o => o.type === 'cond' && o.filled && o.filledAt != null)
+              .sort((a, b) => (a.filledAt || 0) - (b.filledAt || 0));
+            if (filledOrders.length >= 2) {
+              const prevFill = filledOrders[filledOrders.length - 2];
+              const thisFill = filledOrders[filledOrders.length - 1];
+              const gap = (thisFill.filledAt || now) - (prevFill.filledAt || now);
+              if (gap < SPEED_DROP_MS) {
+                const gapMins = (gap / 60000).toFixed(1);
+                this.log(`⚡ SPEED DROP ${pos.symbol}: FT ${prevFill.label} → ${thisFill.label} in ${gapMins}min (<30min) — closing immediately`, 'warn');
+                pos._speedDrop = true;
+                await this.ftClosePosition(pos, 'speed');
+                break;
+              }
+            }
+          }
         }
       }
+      if (_closingIds.has(pos.id) || !this.positions.find(x => x.id === pos.id)) continue;
 
       const age = now - pos.openedAt;
 const _ftIsLaggardForceSuspended = this.cfg.laggardCheckEnabled &&
@@ -4319,7 +4348,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
         await this.ftClosePosition(pos, 'sl', pos.slPrice); continue;
       }
 
-      if (pos.currentTpPrice > 0 && !(pos._edaTpPrice > 0) && mark <= pos.currentTpPrice) {
+      if (pos.currentTpPrice > 0 && mark <= pos.currentTpPrice) {
         this.log(`🎯 ${pos.symbol}: FT TP hit @ ${fmtP(mark)} — closing`, 'success');
         await this.ftClosePosition(pos, 'tp', pos.currentTpPrice); continue;
       }
@@ -4712,6 +4741,25 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
                 pos.slSet   = true;
               }
               this.log(`🌑 ${pos.symbol}: gap — ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI) (candle ${new Date(c.t).toTimeString().slice(0,8)})`, 'trade');
+
+              // ── SPEED DROP in gap audit: close if 2 consecutive stages within 30min ──
+              if (!closed && pos.dcaStage >= 2) {
+                const SPEED_DROP_MS = 30 * 60 * 1000;
+                const filledOrders = pos.orders.filter(o => o.type === 'cond' && o.filled && o.filledAt != null)
+                  .sort((a, b) => (a.filledAt || 0) - (b.filledAt || 0));
+                if (filledOrders.length >= 2) {
+                  const prevFill = filledOrders[filledOrders.length - 2];
+                  const thisFill = filledOrders[filledOrders.length - 1];
+                  const gap = (thisFill.filledAt || c.t) - (prevFill.filledAt || c.t);
+                  if (gap < SPEED_DROP_MS) {
+                    const gapMins = (gap / 60000).toFixed(1);
+                    this.log(`⚡ SPEED DROP ${pos.symbol}: gap-audit ${prevFill.label} → ${thisFill.label} in ${gapMins}min (<30min) — closing`, 'warn');
+                    pos._speedDrop = true;
+                    closed = true; closedAt = c.t; closePrice = c.c; closeReason = 'speed';
+                    break;
+                  }
+                }
+              }
             }
           }
 
@@ -4766,7 +4814,7 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
           this.sess.trades++;
           this.sess.pnl += pnl;
           if (isWin) this.sess.wins++; else this.sess.losses++;
-          if (closeReason === 'force') this.sess.forceClose++;
+          if (closeReason === 'force' || closeReason === 'speed') this.sess.forceClose++;
           while (this.closedTrades.some(r => r.closedAt === closedAt)) closedAt++;
           this.closedTrades.unshift({
             id:               pos.id,
@@ -5447,8 +5495,28 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
           }
           this.log(`🌑 ${pos.symbol}: ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
           this.persist();
+
+          // ── SPEED DROP: if 2+ consecutive DCA stages trigger within 30 minutes, close immediately ──
+          if (pos.dcaStage >= 2) {
+            const SPEED_DROP_MS = 30 * 60 * 1000; // 30 minutes
+            const filledOrders = pos.orders.filter(o => o.type === 'cond' && o.filled && o.filledAt != null)
+              .sort((a, b) => (a.filledAt || 0) - (b.filledAt || 0));
+            if (filledOrders.length >= 2) {
+              const prevFill = filledOrders[filledOrders.length - 2];
+              const thisFill = filledOrders[filledOrders.length - 1];
+              const gap = (thisFill.filledAt || now) - (prevFill.filledAt || now);
+              if (gap < SPEED_DROP_MS) {
+                const gapMins = (gap / 60000).toFixed(1);
+                this.log(`⚡ SPEED DROP ${pos.symbol}: ${prevFill.label} → ${thisFill.label} in ${gapMins}min (<30min) — closing immediately`, 'warn');
+                pos._speedDrop = true;
+                await this.pseudoClosePosition(pos, 'speed');
+                break;
+              }
+            }
+          }
         }
       }
+      if (_closingIds.has(pos.id) || !this.positions.find(x => x.id === pos.id)) continue;
 
       if (pos.slSet && pos.slPrice > 0 && pos.dcaStage >= this._posStageCount(pos)) {
         const instr = await this.getInstrInfo(pos.symbol);
@@ -5527,7 +5595,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         continue;
       }
 
-      if (pos.currentTpPrice > 0 && !(pos._edaTpPrice > 0) && mark <= pos.currentTpPrice) {
+      if (pos.currentTpPrice > 0 && mark <= pos.currentTpPrice) {
         this.log(`🌑 ${pos.symbol}: TP hit @ ${fmtP(mark)} ≤ ${fmtP(pos.currentTpPrice)} — closing`, 'success');
         await this.pseudoClosePosition(pos, 'tp', pos.currentTpPrice);
         continue;
@@ -5716,69 +5784,51 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     if (_totalCt === 0 && _absorpCards.length === 0) { el.innerHTML = ''; return; }
     const _fmtDurMs = ms => { const s=Math.floor((ms||0)/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60; return s<60?sc+'s':s<3600?m+'m '+String(sc).padStart(2,'0')+'s':h+'h '+String(m).padStart(2,'0')+'m'; };
     const _fmtDate  = ts => ts ? new Date(ts).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
-    const absorpHtml = _absorpCards.map(t => {
+
+    // Render absorption card — inline helper used in the unified sorted list below.
+    const _renderAbsorpCard = t => {
       const sym = t.symbol.replace('USDT','');
       const pnl = t.totalPnl ?? 0;
       const pnlCol = pnl >= 0 ? 'var(--profit)' : 'var(--short)';
-      const cutsCount = (t.cuts || []).length;
-      const statusLabel = '✂️ ABSORBED';
-      const firstAt = t.firstCutAt ? _fmtDate(t.firstCutAt) : '—';
-      const lastAt  = t.lastCutAt  ? _fmtDate(t.lastCutAt)  : '—';
+      const cutN      = t.cutN ?? (t.cuts || []).length;
+      const cutOrd    = cutN === 1 ? '1st' : cutN === 2 ? '2nd' : cutN === 3 ? '3rd' : `${cutN}th`;
+      const cutTime   = _fmtDate(t.closedAt || t.firstCutAt);
+      const stage     = t.dcaStage != null ? t.dcaStage : '—';
       return `<div style="background:var(--bg-raised);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:3px;overflow:hidden;margin-bottom:0">
         <div style="padding:6px 9px;display:flex;align-items:center;justify-content:space-between;background:rgba(255,180,0,0.04)">
           <div style="display:flex;align-items:center;gap:6px">
             <span style="font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text-hi)">${sym}</span>
-            <span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,180,0,.35);color:var(--warn);background:rgba(255,180,0,.08);letter-spacing:1px">${statusLabel}</span>
+            <span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,180,0,.35);color:var(--warn);background:rgba(255,180,0,.08);letter-spacing:1px">✂️ ABSORBED</span>
           </div>
           <span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${pnlCol}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USDT</span>
         </div>
         <div style="padding:6px 9px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px">
-          <div class="ps"><div class="psl">Cuts</div><div class="psv">${cutsCount}</div></div>
-          <div class="ps"><div class="psl">First cut</div><div class="psv" style="font-size:8px">${firstAt}</div></div>
-          <div class="ps"><div class="psl">Last cut</div><div class="psv" style="font-size:8px">${lastAt}</div></div>
+          <div class="ps"><div class="psl">Cut</div><div class="psv">${cutOrd}</div></div>
+          <div class="ps"><div class="psl">Time</div><div class="psv" style="font-size:8px">${cutTime}</div></div>
+          <div class="ps"><div class="psl">Stage</div><div class="psv">${stage}</div></div>
         </div>
       </div>`;
-    }).join('');
+    };
 
-    el.innerHTML = absorpHtml + this.closedTrades.filter(t => t.reason !== 'absorption').map(t => {
-      if (t.reason === 'period-rollup') {
-        const r = t.rollup || {};
-        const rNet = r.netPnl ?? 0, rRoi = r.netRoi ?? 0;
-        const netCol = rNet >= 0 ? 'var(--profit)' : 'var(--short)';
-        const roiCol = rRoi >= 0 ? 'var(--profit)' : 'var(--short)';
-        const tickers = (r.tickers || []).join(' · ') || '—';
-        const tsRange = `${_fmtDate(r.openedAt)} → ${_fmtDate(r.closedAt)}`;
-        return `
-        <div style="background:var(--bg-raised);border:1px solid var(--border);border-left:3px solid var(--text-lo);border-radius:3px;overflow:hidden;">
-          <div style="padding:6px 9px;display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.02)">
-            <span style="font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:1px;color:var(--text-lo)">📦 PERIOD ROLLUP ×${r.count ?? 0}</span>
-            <span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${netCol}">${rNet >= 0 ? '+' : ''}${rNet.toFixed(2)} USDT</span>
-          </div>
-          <div style="padding:6px 9px">
-            <div style="font-family:var(--mono);font-size:8px;color:var(--text-lo);word-break:break-all;margin-bottom:5px">${tickers}</div>
-            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:5px">
-              <div class="ps"><div class="psl">Net ROI</div><div class="psv" style="color:${roiCol}">${rRoi >= 0 ? '+' : ''}${rRoi.toFixed(1)}%</div></div>
-              <div class="ps"><div class="psl">Wins</div><div class="psv" style="color:var(--profit)">${r.wins ?? 0}/${r.count ?? 0}</div></div>
-              <div class="ps"><div class="psl">Avg DCA</div><div class="psv">${(r.avgDcaStage ?? 0).toFixed(1)}</div></div>
-              <div class="ps"><div class="psl">Avg Dur</div><div class="psv">${_fmtDurMs(r.avgDuration)}</div></div>
-            </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:5px">
-              ${r.bestByRoi  ? `<div class="ps"><div class="psl">↑ ROI</div><div class="psv" style="color:var(--profit)">${r.bestByRoi.sym} ${r.bestByRoi.pnlPct >= 0 ? '+' : ''}${(r.bestByRoi.pnlPct ?? 0).toFixed(1)}%</div></div>` : ''}
-              ${r.worstByRoi ? `<div class="ps"><div class="psl">↓ ROI</div><div class="psv" style="color:var(--short)">${r.worstByRoi.sym} ${(r.worstByRoi.pnlPct ?? 0).toFixed(1)}%</div></div>` : ''}
-              ${r.bestByPnl  ? `<div class="ps"><div class="psl">↑ PnL</div><div class="psv" style="color:var(--profit)">${r.bestByPnl.sym} ${r.bestByPnl.totalPnl >= 0 ? '+' : ''}${(r.bestByPnl.totalPnl ?? 0).toFixed(2)}</div></div>` : ''}
-              ${r.worstByPnl ? `<div class="ps"><div class="psl">↓ PnL</div><div class="psv" style="color:var(--short)">${r.worstByPnl.sym} ${(r.worstByPnl.totalPnl ?? 0).toFixed(2)}</div></div>` : ''}
-            </div>
-            <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);border-top:1px solid var(--border);padding-top:5px">${tsRange}</div>
-          </div>
-        </div>`;
-      }
+    // Merge absorption cards and regular cards into a single chronological list.
+    // Period-rollup represents the oldest compacted batch and always sits at the bottom.
+    const _rollupCard   = this.closedTrades.find(t => t.reason === 'period-rollup');
+    const _sortedCards  = this.closedTrades
+      .filter(t => t.reason !== 'period-rollup')
+      .sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
+
+    el.innerHTML = _sortedCards.map(t => {
+      if (t.reason === 'absorption') return _renderAbsorpCard(t);
       const isWin      = t.isWin;
       const accentCol  = isWin ? 'var(--profit)' : 'var(--short)';
       const accentBg   = isWin ? 'rgba(0,229,160,0.04)' : 'rgba(255,69,96,0.04)';
       const badgeStyle = isWin
         ? 'color:var(--profit);border-color:rgba(0,229,160,.3);background:var(--profit-dim)'
         : 'color:var(--short);border-color:rgba(255,69,96,.3);background:var(--short-glow)';
-      const reasonLabel = t.reason === 'tp' ? 'TP' : t.reason === 'sl' ? 'SL' : t.reason === 'force' ? 'FORCE' : t.reason === 'laggard' ? 'EDa' : t.reason === 'FR-drop' ? 'FR-Drop' : 'CLOSE';
+      const reasonLabel = t.reason === 'tp' ? 'TP' : t.reason === 'sl' ? 'SL' : t.reason === 'force' ? 'FORCE' : t.reason === 'laggard' ? 'EDa' : t.reason === 'FR-drop' ? 'FR-Drop' : t.reason === 'speed' ? 'SPEED' : 'CLOSE';
+      const speedBadge = t.reason === 'speed'
+        ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,120,0,.55);color:#ff7800;background:rgba(255,120,0,.10);letter-spacing:1px">⚡ SPEED DROP</span>`
+        : '';
       const ftBadge = t._advFt
         ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(180,100,255,.55);color:#b464ff;background:rgba(180,100,255,.10);letter-spacing:1px">⚡ ADV</span>`
         : t._ft
@@ -5839,6 +5889,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
               ${ftBadge}
               ${funBadge}
               ${salfBadge}
+              ${speedBadge}
             </div>
             <span style="font-family:var(--mono);font-size:9px;color:var(--text-lo)">${durStr}</span>
           </div>
@@ -5862,7 +5913,38 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
             <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);border-top:1px solid var(--border);padding-top:5px">${openedStr ? openedStr + '<br>' : ''}${tsStr}</div>
           </div>
         </div>`;
-    }).join('');
+    }).join('') + (() => {
+      if (!_rollupCard) return '';
+      const r = _rollupCard.rollup || {};
+      const rNet = r.netPnl ?? 0, rRoi = r.netRoi ?? 0;
+      const netCol = rNet >= 0 ? 'var(--profit)' : 'var(--short)';
+      const roiCol = rRoi >= 0 ? 'var(--profit)' : 'var(--short)';
+      const tickers = (r.tickers || []).join(' · ') || '—';
+      const tsRange = `${_fmtDate(r.openedAt)} → ${_fmtDate(r.closedAt)}`;
+      return `
+        <div style="background:var(--bg-raised);border:1px solid var(--border);border-left:3px solid var(--text-lo);border-radius:3px;overflow:hidden;">
+          <div style="padding:6px 9px;display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.02)">
+            <span style="font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:1px;color:var(--text-lo)">📦 PERIOD ROLLUP ×${r.count ?? 0}</span>
+            <span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${netCol}">${rNet >= 0 ? '+' : ''}${rNet.toFixed(2)} USDT</span>
+          </div>
+          <div style="padding:6px 9px">
+            <div style="font-family:var(--mono);font-size:8px;color:var(--text-lo);word-break:break-all;margin-bottom:5px">${tickers}</div>
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:5px">
+              <div class="ps"><div class="psl">Net ROI</div><div class="psv" style="color:${roiCol}">${rRoi >= 0 ? '+' : ''}${rRoi.toFixed(1)}%</div></div>
+              <div class="ps"><div class="psl">Wins</div><div class="psv" style="color:var(--profit)">${r.wins ?? 0}/${r.count ?? 0}</div></div>
+              <div class="ps"><div class="psl">Avg DCA</div><div class="psv">${(r.avgDcaStage ?? 0).toFixed(1)}</div></div>
+              <div class="ps"><div class="psl">Avg Dur</div><div class="psv">${_fmtDurMs(r.avgDuration)}</div></div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:5px">
+              ${r.bestByRoi  ? `<div class="ps"><div class="psl">↑ ROI</div><div class="psv" style="color:var(--profit)">${r.bestByRoi.sym} ${r.bestByRoi.pnlPct >= 0 ? '+' : ''}${(r.bestByRoi.pnlPct ?? 0).toFixed(1)}%</div></div>` : ''}
+              ${r.worstByRoi ? `<div class="ps"><div class="psl">↓ ROI</div><div class="psv" style="color:var(--short)">${r.worstByRoi.sym} ${(r.worstByRoi.pnlPct ?? 0).toFixed(1)}%</div></div>` : ''}
+              ${r.bestByPnl  ? `<div class="ps"><div class="psl">↑ PnL</div><div class="psv" style="color:var(--profit)">${r.bestByPnl.sym} ${r.bestByPnl.totalPnl >= 0 ? '+' : ''}${(r.bestByPnl.totalPnl ?? 0).toFixed(2)}</div></div>` : ''}
+              ${r.worstByPnl ? `<div class="ps"><div class="psl">↓ PnL</div><div class="psv" style="color:var(--short)">${r.worstByPnl.sym} ${(r.worstByPnl.totalPnl ?? 0).toFixed(2)}</div></div>` : ''}
+            </div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);border-top:1px solid var(--border);padding-top:5px">${tsRange}</div>
+          </div>
+        </div>`;
+    })();
   },
 
   renderPotGainers() {
@@ -6193,11 +6275,14 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const maxDebt = this._posMaxDebt(p); // Infinity for laggard
       const capped  = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
       if (raw < capped) overflow += (capped - raw);
-      p._laggardLostValue = capped;
+      // Snap sub-milliUSDT residue to 0 so floating-point noise can't permanently lock a
+      // position in debt state via the one-way debt rule.
+      p._laggardLostValue = Math.abs(capped) < 0.001 ? 0 : capped;
     }
     // Push any capped overflow to the laggard.
     if (overflow > 0 && laggard) {
-      laggard._laggardLostValue = parseFloat(((laggard._laggardLostValue || 0) - overflow).toFixed(6));
+      const _lgRaw = parseFloat(((laggard._laggardLostValue || 0) - overflow).toFixed(6));
+      laggard._laggardLostValue = Math.abs(_lgRaw) < 0.001 ? 0 : _lgRaw;
     }
     const lagDebt = laggard ? (laggard._laggardLostValue || 0) : 0;
     if ((overflow > 0 || lagDebt < -1) && Date.now() - (this._lastDebtPoolDiagAt || 0) > 60000) {
@@ -6605,7 +6690,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       totalPnl: pnl,
       cutPnl: pnl,
       mark: extra.mark ?? mark ?? null,
-      cuts: [{ posId: extra.posId || pos?.id || null, symbol, pnl, mark: extra.mark ?? mark ?? null, cutAt }],
+      dcaStage: extra.dcaStage ?? null,
+      cuts: [{ posId: extra.posId || pos?.id || null, symbol, pnl, mark: extra.mark ?? mark ?? null, cutAt, dcaStage: extra.dcaStage ?? null }],
       isOpen: false,
       firstCutAt: cutAt,
       lastCutAt: cutAt,
@@ -6639,7 +6725,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   _recordAbsorptionCut(pos, cutPnl, mark, cutAt = Date.now()) {
     this._migratePinnedAbsorptionCards();
-    this.closedTrades.unshift(this._absorptionCutCard(pos, cutPnl, mark, cutAt));
+    const card = this._absorptionCutCard(pos, cutPnl, mark, cutAt, { dcaStage: pos?.dcaStage ?? null });
+    card.cutN = pos?._absorpCutCount ?? 1;
+    this.closedTrades.unshift(card);
   },
 
   _settleAbsorptionCard(pos, close = {}) {
@@ -6777,6 +6865,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         }
       }
     }
+    pos._absorpCutCount = (pos._absorpCutCount || 0) + 1;
     this._recordAbsorptionCut(pos, cutPnl, mark);
   },
 
@@ -6947,7 +7036,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         // recovery never deepens a normal-phase target past the user's configured ingress TP.
         if (debt < 0 && edaTpPrice > 0) {
           const entryTpFloor = pos.entryPrice * (1 - ((this.cfg.entryTpRoi / 100) / pos.leverage)); // SHORT
-          const effectiveEdaTp = edaTpPrice < entryTpFloor ? entryTpFloor : edaTpPrice;
+          // Shorts: lower price = more profit. Clamp UP (toward entry) when EDa TP is above
+          // the floor, i.e. would deliver less ROI than the configured entry TP.
+          const effectiveEdaTp = edaTpPrice > entryTpFloor ? entryTpFloor : edaTpPrice;
           if (effectiveEdaTp < pos.currentTpPrice) {
             const prev = pos._edaTpPrev;
             if (prev == null || Math.abs(effectiveEdaTp - prev) / Math.abs(prev) > 0.0005) {
@@ -6976,7 +7067,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         // Non-laggards in reduce phase never deepen below the reduce TP floor; the oldest
         // laggard is the only exception and keeps the raw EDa target.
         const reduceTpFloor = pos.entryPrice * (1 - (0.03 / pos.leverage)); // SHORT: 3% reduce TP
-        const effectiveEdaTp = isLaggardPos ? edaTpPrice : (edaTpPrice < reduceTpFloor ? reduceTpFloor : edaTpPrice);
+        // Laggard is exempt — any EDa target including negative ROI. Non-laggard: clamp UP
+        // (toward entry) when EDa TP is above the 3% floor (less than 3% ROI).
+        const effectiveEdaTp = isLaggardPos ? edaTpPrice : (edaTpPrice > reduceTpFloor ? reduceTpFloor : edaTpPrice);
         const prev = pos._edaTpPrev;
         if (prev == null || Math.abs(effectiveEdaTp - prev) / Math.abs(prev) > 0.0005) {
           pos._edaTpPrev  = effectiveEdaTp;
@@ -7017,7 +7110,12 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         this.log(`⏳ ${pos.symbol}: ${role} EDa TP hit — ED $${buffedED.toFixed(2)} ≤ 0 (buffedEV $${buffedEV.toFixed(2)}, lost $${debt.toFixed(2)}, uPnL ${uPnl>=0?'+':''}$${uPnl.toFixed(2)})`, 'warn');
         await new Promise(r => setTimeout(r, 5000));
         if (!this.positions.find(x => x.id === pos.id)) continue;
-        await this.pseudoClosePosition(pos, 'laggard');
+        try {
+          await this.pseudoClosePosition(pos, 'laggard');
+        } catch(e) {
+          delete pos._laggardClosingAt;
+          this.log(`[PW-EDA-CLOSE-01] ${pos.symbol}: EDa close threw — ${e?.message || e} — timestamp cleared, will retry`, 'error');
+        }
       }
     }
   },
@@ -7063,12 +7161,13 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         const maxDebt  = this._posMaxDebt(pos); // Infinity for laggard
         const capped   = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
         if (raw < capped) overflow += (capped - raw); // debt shed = positive overflow
-        pos._laggardLostValue = capped;
+        pos._laggardLostValue = Math.abs(capped) < 0.001 ? 0 : capped;
         _debtParts.push(`${pos.symbol} ${share>=0?'+':'−'}$${Math.abs(share).toFixed(2)}→$${capped.toFixed(2)}${raw < capped ? '*' : ''}`);
       });
       // Push any capped overflow to the laggard (it is the debt repository and has no cap).
       if (overflow > 0 && laggard) {
-        laggard._laggardLostValue = parseFloat(((laggard._laggardLostValue || 0) - overflow).toFixed(6));
+        const _lgRaw = parseFloat(((laggard._laggardLostValue || 0) - overflow).toFixed(6));
+        laggard._laggardLostValue = Math.abs(_lgRaw) < 0.001 ? 0 : _lgRaw;
         _debtParts.push(`${laggard.symbol} overflow −$${overflow.toFixed(2)}→$${laggard._laggardLostValue.toFixed(2)}`);
       }
       this.log(`⏳ Debt share (${closingPos.symbol} @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%): ${_debtParts.join(' | ')}${overflow > 0 ? ' [* capped → laggard]' : ''}`, 'info');
@@ -7097,11 +7196,11 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           if (pos.phase === 'reduce') {
             if (!isLaggardPos) {
               const floorTp = pos.entryPrice * (1 - (0.03 / pos.leverage));
-              if (effectiveEdaTp < floorTp) effectiveEdaTp = floorTp;
+              if (effectiveEdaTp > floorTp) effectiveEdaTp = floorTp;
             }
           } else {
             const floorTp = pos.entryPrice * (1 - ((this.cfg.entryTpRoi / 100) / pos.leverage));
-            if (effectiveEdaTp < floorTp) effectiveEdaTp = floorTp;
+            if (effectiveEdaTp > floorTp) effectiveEdaTp = floorTp;
           }
           pos._edaTpPrice    = effectiveEdaTp;
           pos._edaTpPrev     = effectiveEdaTp;
@@ -7142,7 +7241,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     this.sess.trades++;
     this.sess.pnl += totalPnl;
     if (isWin) this.sess.wins++; else this.sess.losses++;
-    if (reason === 'force' || reason === 'laggard') this.sess.forceClose++;
+    if (reason === 'force' || reason === 'laggard' || reason === 'speed') this.sess.forceClose++;
 
     let closedAt = Date.now();
     while (this.closedTrades.length && this.closedTrades[0].closedAt === closedAt) closedAt++;

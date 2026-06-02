@@ -1912,6 +1912,7 @@ function pw() { return {
   _postCloseLaggardTimer: null, // debounce handle for 30s post-close laggard re-check
   _lastTickerFetch: 0, // timestamp of last full-ticker batch fetch in pseudoWatchPositions
   funLockIn:  {},    // symbol → { gate, trades, setAt } — Super Fun Mode lock-in, 6h TTL
+  funCreep:   {},    // symbol → { count, overExtCount, setAt, bumpedAt } — FUN FR creep tracker, 6h TTL
   salfCreep:  {},    // symbol → { count, setAt, bumpedAt } — SalF median creep, 6h TTL from setAt
   _symbolBanlist: {}, // symbol → { reason, setAt } — temporary one-week scan exclusion
   _tpIngress: {},          // symbol → { count, setAt } — per-symbol entry TP reduction: 0.5^count, floor at tpIngressMin%, TTL 3h
@@ -2105,6 +2106,7 @@ function pw() { return {
         closedTrades: this.closedTrades,
         bot: { startTime: this.bot.startTime, lastScan: this.bot.lastScan, lastScanAt: this.bot.lastScanAt },
         funLockIn:  this.funLockIn,
+        funCreep:   this.funCreep,
         salfCreep:  this.salfCreep,
         symbolBanlist: this._symbolBanlist,
         tpIngress:          this._tpIngress,
@@ -2185,6 +2187,7 @@ function pw() { return {
       if (Array.isArray(s.closedTrades)) this.closedTrades = s.closedTrades;
       if (s.potGainers?.length) this.potGainers = s.potGainers;
       if (s.funLockIn && typeof s.funLockIn === 'object') this.funLockIn = s.funLockIn;
+      if (s.funCreep  && typeof s.funCreep  === 'object') this.funCreep  = s.funCreep;
       if (s.salfCreep && typeof s.salfCreep === 'object') this.salfCreep = s.salfCreep;
       if (s.symbolBanlist && typeof s.symbolBanlist === 'object') this._loadSymbolBanlist(s.symbolBanlist);
       const nowGl = Date.now();
@@ -2241,6 +2244,7 @@ function pw() { return {
     this.potGainers = [];
     this.closedTrades = [];
     this.funLockIn  = {};
+    this.funCreep   = {};
     this.salfCreep  = {};
     this._symbolBanlist = {};
     this._tpIngress          = {};
@@ -2248,6 +2252,7 @@ function pw() { return {
     this.sess = { trades:0, wins:0, losses:0, pnl:0, forceClose:0, tpReduce:0, ftTotalDone:0 };
     this.closedTrades = [];
     this.funLockIn         = {};
+    this.funCreep          = {};
     this.salfCreep         = {};
     this._stopAllIftPollers();
     this._tpIngress          = {};
@@ -2649,6 +2654,7 @@ function pw() { return {
           await this.openShort(c);
         }
         const _admBlocked = [];
+        const _admAdded   = [];
         for (const c of candidates) {
           if (c.status !== 'watch') continue;
           const eff = this.positions.reduce((n, p) => n + (p._fun ? (p._funMult ?? 2) : p._salf ? 2 : p._ft ? 2 : 1), 0);
@@ -2657,8 +2663,14 @@ function pw() { return {
           const alreadyActive   = this.positions.find(p => p.symbol === c.symbol);
           if (alreadyWatching || alreadyActive) continue;
           const _admBefore = this.potGainers.length;
-          await this.placeEntryConditional(c);
+          const _admResult = await this.placeEntryConditional(c);
           if (this.potGainers.length === _admBefore) _admBlocked.push(c.symbol.replace('USDT',''));
+          else if (_admResult) _admAdded.push(_admResult);
+        }
+        if (_admAdded.length > 0) {
+          const _admGates = [...new Set(_admAdded.map(r => `${r.gate6}/${r.gate12}/${r.gate24}`))];
+          const _admSyms  = _admAdded.map(r => r.sym.replace('USDT','')).join(', ');
+          this.log(`◉ Added to Potential Entry watchlist: ${_admSyms} — RSI gate ${_admGates.join(' | ')} | expires ${this.cfg.potGainerExpireMins}min`, 'info');
         }
         if (_admBlocked.length > 0) this.log(`◉ Pot gainer admission blocked (no OE history): ${_admBlocked.join(', ')}`, 'warn');
       } else if (!this.cfg.gainersEnabled) {
@@ -2753,8 +2765,14 @@ function pw() { return {
       }
 
       // SalF (sale fishing) scan — 2× slot cost; skip if fewer than 2 free
-      const _salfEff = this.positions.reduce((n, p) => n + (p._fun ? (p._funMult ?? 2) : p._salf ? 2 : p._ft ? 2 : 1), 0);
-      if (this.cfg.sfEnabled && (this.cfg.maxPos - _salfEff) >= 2) await this.runSalfScan(allTickers);
+      const _salfEff = this.positions.reduce((n, p) => n + (p._fun ? (p._funMult ?? 1) : p._salf ? 2 : p._ft ? 2 : 1), 0);
+      if (this.cfg.sfEnabled && (this.cfg.maxPos - _salfEff) >= 2) {
+        await this.runSalfScan(allTickers);
+      } else if (!this.cfg.sfEnabled) {
+        this.log('SalF disabled — skipped.', 'scan');
+      } else {
+        this.log(`SalF skipped — slots full (eff ${_salfEff}/${this.cfg.maxPos}, need 2 free).`, 'scan');
+      }
 
       await this.refreshBalance();
     } catch(e) { this.log('[E01] Scan error: '+e.message+' — '+((e.stack||'').split('\n')[1]||'').trim(), 'error'); }
@@ -3535,7 +3553,9 @@ function pw() { return {
       const gapTo   = now;
       if (_closingIds.has(pos.id)) continue;
       _closingIds.add(pos.id);
-      this.log(`☀️ ${pos.symbol}: auditing ${Math.round((gapTo-gapFrom)/60000)}min gap...`, 'info');
+      const _gapMins = Math.round((gapTo-gapFrom)/60000);
+      if (_gapMins < 1) { _closingIds.delete(pos.id); continue; }
+      this.log(`☀️ ${pos.symbol}: auditing ${_gapMins}min gap...`, 'info');
 
       try {
         const candles = await this.pseudoFetchKlines(pos.symbol, gapFrom, gapTo);
@@ -3885,7 +3905,7 @@ function pw() { return {
     if (g) g.status = 'watch';
     this.persist();
     this.renderPotGainers();
-    this.log(`◉ ${sym}: added to Potential Entry watchlist — RSI gate ${gate6}/${gate12}/${gate24} | expires ${this.cfg.potGainerExpireMins}min`, 'info');
+    return { sym, gate6, gate12, gate24 }; // caller handles rollup log
   },
 
   async watchPotentialEntries(force = false) {
@@ -3929,6 +3949,7 @@ function pw() { return {
         const rsi24 = await this.fetchRSI(pe.symbol, 24);
         this.potGainers = this.potGainers.map(e => e.id === pe.id ? { ...e, rsi6, rsi12, rsi24 } : e);
         pe = this.potGainers.find(e => e.id === pe.id); // keep local ref in sync
+        if (!pe) continue; // removed by a concurrent path (collision, expiry) between map and find
         this.renderPotGainers();
         if (rsi6 == null || rsi12 == null || rsi24 == null) {
           continue;
@@ -4219,9 +4240,8 @@ function pw() { return {
         }
       } else if (pendingAdds.length > 0) {
         const nextAdd = pendingAdds.reduce((best, o) => o.price > best.price ? o : best, pendingAdds[0]);
-        if (mark <= nextAdd.price && now - (pos._lastDcaCrossDiagAt || 0) > 15000) {
-          pos._lastDcaCrossDiagAt = now;
-          this.log(`[PC-DCA-03] ${pos.symbol}: DCA trigger condition met mark ${fmtP(mark)} ≤ ${fmtP(nextAdd.price)} (${nextAdd.label || 'cond'}); processing`, 'warn');
+        if (mark <= nextAdd.price) {
+          // trigger detail captured below in the per-add trade log
         }
       }
       for (const add of pendingAdds) {
@@ -4266,7 +4286,7 @@ function pw() { return {
               this.log(`☀️ ${pos.symbol}: stage ${this._posStageCount(pos)} — SL set @ ${fmtP(pos.slPrice)}`, 'warn');
             }
           }
-          this.log(`☀️ ${pos.symbol}: ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
+          this.log(`☀️ ${pos.symbol}: ${add.label} triggered @ ${fmtP(add.price)} (mark ${fmtP(mark)}) | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
           this.persist();
         }
         } catch(e) {
@@ -4634,33 +4654,32 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const _fmtDurMs = ms => { const s=Math.floor((ms||0)/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sc=s%60; return s<60?sc+'s':s<3600?m+'m '+String(sc).padStart(2,'0')+'s':h+'h '+String(m).padStart(2,'0')+'m'; };
     const _fmtDate  = ts => ts ? new Date(ts).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
 
-    // Absorption card — pinned at top and never rolled up
-    const absorpHtml = _absorpCards.map(t => {
-      const sym = t.symbol.replace('USDT','');
-      const pnl = t.totalPnl ?? 0;
-      const pnlCol = pnl >= 0 ? 'var(--profit)' : 'var(--short)';
-      const cutsCount = (t.cuts || []).length;
-      const statusLabel = t.isOpen !== false ? '✂️ ABSORBING' : '✂️ SETTLED';
-      const statusCol   = t.isOpen !== false ? 'var(--warn)' : 'var(--text-lo)';
-      const firstAt = t.firstCutAt ? _fmtDate(t.firstCutAt) : '—';
-      const lastAt  = t.lastCutAt  ? _fmtDate(t.lastCutAt)  : '—';
-      return `<div style="background:var(--bg-raised);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:3px;overflow:hidden;margin-bottom:0">
-        <div style="padding:6px 9px;display:flex;align-items:center;justify-content:space-between;background:rgba(255,180,0,0.04)">
-          <div style="display:flex;align-items:center;gap:6px">
-            <span style="font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text-hi)">${sym}</span>
-            <span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,180,0,.35);color:var(--warn);background:rgba(255,180,0,.08);letter-spacing:1px">${statusLabel}</span>
+    el.innerHTML = this.closedTrades.map(t => {
+      // Absorption cut card — rendered inline at its chronological position
+      if (t.reason === 'absorption') {
+        const sym    = (t.symbol || '').replace('USDT','');
+        const pnl    = t.pnl ?? t.totalPnl ?? 0;
+        const pnlCol = pnl >= 0 ? 'var(--profit)' : 'var(--short)';
+        const cutNo  = t.count  ?? '—';
+        const stage  = t.Stage  ?? t.dcaStage ?? '—';
+        const timeStr = t.time  ? _fmtDate(t.time) : (t.cutAt ? _fmtDate(t.cutAt) : '—');
+        const markStr = t.mark  ? fmtP(t.mark) : '—';
+        return `<div style="background:var(--bg-raised);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:3px;overflow:hidden">
+          <div style="padding:6px 9px;display:flex;align-items:center;justify-content:space-between;background:rgba(255,180,0,0.04)">
+            <div style="display:flex;align-items:center;gap:6px">
+              <span style="font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text-hi)">${sym}</span>
+              <span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,180,0,.35);color:var(--warn);background:rgba(255,180,0,.08);letter-spacing:1px">✂️ CUT #${cutNo}</span>
+            </div>
+            <span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${pnlCol}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(3)} USDT</span>
           </div>
-          <span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${pnlCol}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} USDT</span>
-        </div>
-        <div style="padding:6px 9px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px">
-          <div class="ps"><div class="psl">Cuts</div><div class="psv">${cutsCount}</div></div>
-          <div class="ps"><div class="psl">First cut</div><div class="psv" style="font-size:8px">${firstAt}</div></div>
-          <div class="ps"><div class="psl">Last cut</div><div class="psv" style="font-size:8px">${lastAt}</div></div>
-        </div>
-      </div>`;
-    }).join('');
-
-    el.innerHTML = absorpHtml + this.closedTrades.filter(t => t.reason !== 'absorption').map(t => {
+          <div style="padding:6px 9px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px">
+            <div class="ps"><div class="psl">Cut #</div><div class="psv">${cutNo}</div></div>
+            <div class="ps"><div class="psl">DCA Stage</div><div class="psv">${stage}</div></div>
+            <div class="ps"><div class="psl">Mark</div><div class="psv">${markStr}</div></div>
+          </div>
+          <div style="padding:0 9px 6px;font-family:var(--mono);font-size:9px;color:var(--text-lo)">${timeStr}</div>
+        </div>`;
+      }
       if (t.reason === 'period-rollup') {
         const r = t.rollup || {};
         const rNet = r.netPnl ?? 0, rRoi = r.netRoi ?? 0;
@@ -5117,11 +5136,14 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const laggard = positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, positions[0]);
     let overflow = 0;
     for (const p of positions) {
-      const raw     = parseFloat((debtPerSlot * this._posSlotWeight(p)).toFixed(6));
-      const maxDebt = this._posMaxDebt(p); // Infinity for laggard
-      const capped  = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
-      if (raw < capped) overflow += (capped - raw);
-      p._laggardLostValue = capped;
+      const _rdp_raw  = parseFloat((debtPerSlot * this._posSlotWeight(p)).toFixed(6));
+      const maxDebt   = this._posMaxDebt(p); // Infinity for laggard
+      const _rdp_cap  = maxDebt === Infinity ? _rdp_raw : Math.max(_rdp_raw, -maxDebt);
+      if (_rdp_raw < _rdp_cap) overflow += (_rdp_cap - _rdp_raw);
+      // Clamp sub-epsilon negatives (incl. -0) to 0 to prevent phantom EDa TP
+      const _RDEP     = 1e-6;
+      const raw = _rdp_raw; const capped = _rdp_cap; // keep log compat
+      p._laggardLostValue = (_rdp_cap < 0 && _rdp_cap > -_RDEP) ? 0 : _rdp_cap;
     }
     // Push any capped overflow to the laggard.
     if (overflow > 0 && laggard) {
@@ -5370,49 +5392,35 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   },
 
   _recordAbsorptionCut(pos, cutPnl, mark, cutAt = Date.now()) {
-    const cardId = 'absorption_pinned';
-    let card = this.closedTrades.find(t => t.id === cardId && t.reason === 'absorption');
-    if (!card) {
-      const legacyCards = this.closedTrades.filter(t => t.reason === 'absorption');
-      const legacyCuts = legacyCards.flatMap(t => (t.cuts || []).map(c => ({ ...c, symbol: c.symbol || t.symbol, posId: c.posId || t.posId })));
-      const legacyTotal = legacyCards.reduce((s, t) => s + (t.totalPnl ?? t.pnl ?? 0), 0);
-      const legacyFirst = legacyCards.reduce((min, t) => Math.min(min, t.firstCutAt || t.openedAt || Infinity), Infinity);
-      const legacyLast = legacyCards.reduce((max, t) => Math.max(max, t.lastCutAt || t.closedAt || 0), 0);
-      this.closedTrades = this.closedTrades.filter(t => t.reason !== 'absorption');
-      card = {
-        id: cardId,
-        reason: 'absorption',
-        symbol: 'LOSS ABSORPTION',
-        cuts: legacyCuts,
-        totalPnl: parseFloat(legacyTotal.toFixed(6)),
-        finalCloses: {},
-        isOpen: true,
-        firstCutAt: Number.isFinite(legacyFirst) ? legacyFirst : cutAt,
-        lastCutAt: legacyLast || null,
-      };
-      this.closedTrades.unshift(card);
-    }
-    card.cuts.push({ posId: pos.id, symbol: pos.symbol, pnl: cutPnl, mark, cutAt });
-    card.totalPnl = parseFloat(((card.totalPnl || 0) + cutPnl).toFixed(6));
-    card.lastCutAt = cutAt;
-    if (!card.firstCutAt) card.firstCutAt = cutAt;
-    card.isOpen = true;
+    // Fire-and-forget: one individual card per cut event, inserted chronologically in the trade feed.
+    // count = relative cut number for this position (1st cut = 1, 2nd cut = 2, …)
+    const prevCuts = this.closedTrades.filter(t => t.reason === 'absorption' && t.posId === pos.id).length;
+    const card = {
+      id:       'abs_' + pos.id + '_' + cutAt,
+      reason:   'absorption',
+      symbol:   pos.symbol,
+      posId:    pos.id,
+      pnl:      parseFloat(cutPnl.toFixed(6)),
+      mark,
+      cutAt,
+      openedAt: cutAt,
+      closedAt: cutAt,
+      isOpen:   false,
+      count:    prevCuts + 1,          // relative cut count for this position
+      time:     cutAt,                 // epoch ms timestamp of this cut
+      Stage:    pos.dcaStage ?? 0,     // DCA stage the position was at when cut
+    };
+    this.closedTrades.unshift(card);
   },
 
   _settleAbsorptionCard(pos, close = {}) {
-    const closedAt = close.closedAt || Date.now();
-    const pinned = this.closedTrades.find(t => t.id === 'absorption_pinned' && t.reason === 'absorption');
-    if (pinned) {
-      if (!pinned.finalCloses) pinned.finalCloses = {};
-      pinned.finalCloses[pos.id] = { ...close, closedAt };
-      pinned.lastCloseAt = closedAt;
-      return;
-    }
+    // Per-event cards are already closed at creation; nothing to settle.
+    // Legacy path: if an old-style card with this posId exists, close it out.
     const card = this.closedTrades.find(t => t.id === 'absorption_' + pos.id && t.reason === 'absorption');
     if (!card) return;
-    card.finalClose = { ...close, closedAt };
+    card.finalClose = { ...close, closedAt: close.closedAt || Date.now() };
     card.isOpen = false;
-    card.closedAt = closedAt;
+    card.closedAt = close.closedAt || Date.now();
   },
 
   async runLossAbsorption() {
@@ -5494,7 +5502,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
     const sym = pos.symbol.replace('USDT','');
     const _stratTag = pos._fun ? 'FUN' : pos._ft ? 'FT' : pos._salf ? 'SalF' : 'gainer';
-    this.log(`✂️ ${sym}: [uPnL] absorption (${_stratTag}) — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)} | reusable $${pos._savedMargin.toFixed(2)}`, 'warn');
+    const _logSlotMult = pos._fun ? (pos._funMult ?? 1) : (pos._salf || pos._ft) ? 2 : 1;
+    this.log(`✂️ ${sym}: [uPnL] absorption (${_stratTag}) — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)} | floor $${floorMargin.toFixed(2)} | mult ${_logSlotMult}× | reusable $${pos._savedMargin.toFixed(2)}`, 'warn');
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
       // Distribute absorption loss across all positions weighted by slot cost.
       // Non-laggard positions are capped at _posMaxDebt; overflow goes to the laggard.
@@ -5511,7 +5520,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           const maxDebt = this._posMaxDebt(p); // Infinity for laggard
           const capped  = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
           if (raw < capped) _abs_overflow += (capped - raw);
-          p._laggardLostValue = capped;
+          const _AEP = 1e-6;
+          p._laggardLostValue = (capped < 0 && capped > -_AEP) ? 0 : capped;
         }
         if (_abs_overflow > 0 && _abs_laggard) {
           _abs_laggard._laggardLostValue = parseFloat(((_abs_laggard._laggardLostValue || 0) - _abs_overflow).toFixed(6));
@@ -5755,9 +5765,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           pos.currentTpPrice = effectiveEdaTp; // keep single source of truth in sync
           pos._nativeReduceTpPrice = null;
           // LONG: EDa TP is above mark when reachable
-          if (effectiveEdaTp > (pos.markPrice ?? 0)) {
-            this.setTP(pos, effectiveEdaTp).catch(() => {});
-          }
+            if (typeof this.setTP === 'function' && effectiveEdaTp > (pos.markPrice ?? 0)) {
+              this.setTP(pos, effectiveEdaTp).catch(() => {});
+            }
         }
       } else {
         if (pos._edaTpPrice > 0 && pos.currentTpPrice === pos._edaTpPrice) {
@@ -5802,12 +5812,16 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const _debtParts = [];
       this.positions.forEach(pos => {
         const share    = pnlPerSlot * this._posSlotWeight(pos);
-        const current  = pos._laggardLostValue || 0;
-        // Sign-lock: once a position carries negative debt (loss absorption) it can only
-        // go more negative — positive shares (winning closes) must not reduce it back
-        // toward zero. Conversely, positive debt (bail-out credit) can only increase;
-        // negative shares must not erode it. Zero is the mediator and accepts both.
-        const signBlocked = (current < 0 && share > 0); // negative debt only: wins cannot reduce it
+        // Clamp -0 and sub-epsilon negatives to exactly 0 so they never trigger the
+        // sign-lock or the EDa TP branch erroneously. Threshold: 1 micro-USDT.
+        const _DEBT_EPS = 1e-6;
+        const _raw_cur  = pos._laggardLostValue || 0;
+        const current   = (_raw_cur < 0 && _raw_cur > -_DEBT_EPS) ? 0 : _raw_cur;
+        if (current !== _raw_cur) pos._laggardLostValue = current; // write-back the clamp
+        // Sign-lock: once a position carries meaningful negative debt (loss absorption)
+        // it can only go more negative — positive shares (winning closes) must not
+        // reduce it back toward zero. Zero is the mediator and accepts both directions.
+        const signBlocked = (current < -_DEBT_EPS && share > 0);
         const raw      = signBlocked
           ? current
           : parseFloat((current + share).toFixed(6));
@@ -5836,7 +5850,11 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       for (const survivor of this.positions) {
         if (!survivor._laggardInitialEV) continue;
         const buffedEV = survivor._laggardInitialEV * buffMul;
-        const _notify_debt = survivor._laggardLostValue || 0;
+        const _nfy_raw     = survivor._laggardLostValue || 0;
+        const _DEBT_EPS    = 1e-6;
+        // Clamp sub-epsilon negatives (incl. -0) to 0 before branching
+        const _notify_debt = (_nfy_raw < 0 && _nfy_raw > -_DEBT_EPS) ? 0 : _nfy_raw;
+        if (_notify_debt !== _nfy_raw) survivor._laggardLostValue = _notify_debt;
         const isLaggardPos = laggard && survivor.id === laggard.id;
         if (_notify_debt < 0) {
           // Loss absorption: TP only needs to recover the debt, not the full EV.
