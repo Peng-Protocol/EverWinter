@@ -70,6 +70,8 @@ RSI6 hitting ≥ the configured maximum (default 90) signals a parabolic, non-me
 
 **3-Hour Graylist**: Before any entry, a historical check is advised across 15-minute candles over the past 3 hours — if any candle had RSI6 ≥ the configured maximum, the ticker is graylisted for the rest of the window. A recently over-extended ticker is prone to re-spiking rather than stabilizing — the graylist prevents premature re-entry after a parabolic move.
 
+**OE and Speed Drops**: If a position over-extends while open, or triggers too many DCAs in quick succession, it is better to abandon it. 
+
 ---
 
 #### Close Confirmation (ClC)
@@ -92,17 +94,17 @@ Applied as a band — neither too thin nor too thick:
 
 ---
 
-#### Localized Buy Average (LBA)
+#### Localized Sell Average (LSA)
 
-LBA measures current buying intensity relative to the ticker's recent baseline. It compares recent USDT volume against the average hourly USDT volume derived from the 24-hour turnover.
-
-The signal is directionally counterintuitive but mechanically sound: when a ticker is declining, people buy on the way down. They buy when it looks cheap, when they think it's bottoming, when they're averaging into longs. Active buying during a decline does not stop the decline — it provides liquidity for continued selling. The sellers have willing counterparties, which means they can keep distributing without a vacuum snap-back.
+LSA measures current selling intensity relative to the ticker's recent baseline. It compares a recent candle's volume against the average volume of the preceding lookback window (typically 1 hour).
 
 Applied as a band — neither too thin nor too thick:
-- **Floor**: Buying must be above the baseline. Active dip-buyers are present, giving sellers counterparties to distribute into.
-- **Cap**: Buying must not be excessively above the baseline. An extreme buy blowoff — panic buying or a short squeeze starting — marks potential exhaustion of the selling side rather than continuation.
+- **Floor**: Selling must be above the baseline. The ticker is actively distributing, not just drifting.
+- **Cap**: Selling must not be excessively above the baseline. A volume blowoff — extreme selling crammed into one window — marks exhaustion rather than continuation.
 
-**SalF context**: Floor 25%, cap 50% by default vs. 24-hour hourly average. A ticker already in sustained decline has buying activity baked into its recent baseline; a 25% elevation confirms dip-buyers are active. LBA Creep narrows the window after each close on the same symbol, tightening re-entry as the selloff matures.
+**Post-OE reversal context**: Floor 125%, cap 150% by default. An OE ticker's baseline is heavily bullish — almost all recent candles were green. The first significant red candle reads elevated against that baseline. 125% is aggressive for a normal ticker but realistic for one that has been running hot.
+
+**Sustained decline context**: A ticker that has been falling for hours already has selling activity baked into its recent baseline. The threshold for "above average" drops accordingly — a 25% elevation against the 24-hour hourly average is enough to confirm selling is still present and not merely drifting, capped at 50% to block exhaustion flushes even on a declining baseline.
 
 ---
 
