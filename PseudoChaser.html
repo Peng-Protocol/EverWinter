@@ -1889,9 +1889,9 @@ function pw() { return {
     sfGreenCandleMin: 3,           // min green 15m candles (of last 4 completed) for SalF entry — LONG ClC
     tpIngressEnabled: true,     // on every non-gainer close, cut entry TP target by 50% per close (min tpIngressMin%)
     tpIngressMin: 3,            // floor % for TP ingress reduction
-    dcaDoublingEnabled: true, // each DCA add escalates by configured multiplier; faster rescue, higher margin cost
-    dcaMultiplier: 2,          // per-stage notional multiplier when dcaDoublingEnabled (e.g. 2 = ×2, ×4; 3 = ×3, ×9)
-    dcaAccumulationEnabled: false, // each add grows by one entry unit (Add1 ×2, Add2 ×3 … AddN ×(N+1))
+    dcaDoublingEnabled: true, // each later DCA add escalates by configured multiplier; Add1 stays at configured add notional
+    dcaMultiplier: 2,          // per-stage notional multiplier after Add1 (e.g. 2 = ×1, ×2, ×4; 3 = ×1, ×3, ×9)
+    dcaAccumulationEnabled: false, // each later add grows by one entry unit (Add1 ×1, Add2 ×2 … AddN ×N)
     dcaStages: 3,             // integer stage count; slider allows [3,6,7,...,18]; 4/5 not valid
   },
   connected: { api:true },
@@ -2920,7 +2920,7 @@ function pw() { return {
     for (let i = 0; i < this._dcaStageCount(); i++) {
       const addPrice = this.snapPrice(price * (1 - _salfAddPcts[i] / 100), instr);
       if (!addPrice || addPrice <= 0) continue;
-      const stageAdd = this.cfg.dcaDoublingEnabled ? addNotional * Math.pow(this.cfg.dcaMultiplier ?? 2, i + 1) : this.cfg.dcaAccumulationEnabled ? addNotional * (i + 2) : addNotional;
+      const stageAdd = this.cfg.dcaDoublingEnabled ? addNotional * Math.pow(this.cfg.dcaMultiplier ?? 2, i) : this.cfg.dcaAccumulationEnabled ? addNotional * (i + 1) : addNotional;
       const addQty   = this.snapQty(stageAdd / addPrice, instr);
       runNotional += addPrice * addQty;
       runSize     += addQty;
@@ -3158,7 +3158,7 @@ function pw() { return {
     for (let i = 0; i < this._dcaStageCount(); i++) {
       const addPrice = this.snapPrice(price * (1 - _funAddPcts[i] / 100), instr);
       if (!addPrice || addPrice <= 0) continue;
-      const stageAdd = this.cfg.dcaDoublingEnabled ? addNotional * Math.pow(this.cfg.dcaMultiplier ?? 2, i + 1) : this.cfg.dcaAccumulationEnabled ? addNotional * (i + 2) : addNotional;
+      const stageAdd = this.cfg.dcaDoublingEnabled ? addNotional * Math.pow(this.cfg.dcaMultiplier ?? 2, i) : this.cfg.dcaAccumulationEnabled ? addNotional * (i + 1) : addNotional;
       const addQty   = this.snapQty(stageAdd / addPrice, instr);
       runNotional += addPrice * addQty;
       runSize     += addQty;
@@ -3260,7 +3260,7 @@ function pw() { return {
         prices.push(price);
         const qty = pos.orders?.[s]?.qty > 0
           ? pos.orders[s].qty
-          : this.snapQty((this.cfg.addNotional * _addMult * (_accum ? (s + 1) : Math.pow(_m, s))) / price, instr);
+          : this.snapQty((this.cfg.addNotional * _addMult * (_accum ? s : Math.pow(_m, s - 1))) / price, instr);
         qtys.push(qty);
       }
 
@@ -3291,7 +3291,7 @@ function pw() { return {
 
     const cumNFb = [baseN];
     for (let s = 1; s <= stageCountFb; s++) {
-      cumNFb.push(cumNFb[s - 1] + addN * (_accum ? (s + 1) : Math.pow(_mFb, s)));
+      cumNFb.push(cumNFb[s - 1] + addN * (_accum ? s : Math.pow(_mFb, s - 1)));
     }
     for (let s = stageCountFb; s >= 1; s--) {
       const stageN = cumNFb[s] - cumNFb[s - 1];
@@ -3794,7 +3794,7 @@ function pw() { return {
         invalidDcaPrice = true;
         break;
       }
-      const stageNotional = this.cfg.dcaDoublingEnabled ? effAddNotional * Math.pow(this.cfg.dcaMultiplier ?? 2, i + 1) : this.cfg.dcaAccumulationEnabled ? effAddNotional * (i + 2) : effAddNotional;
+      const stageNotional = this.cfg.dcaDoublingEnabled ? effAddNotional * Math.pow(this.cfg.dcaMultiplier ?? 2, i) : this.cfg.dcaAccumulationEnabled ? effAddNotional * (i + 1) : effAddNotional;
       const rawAddQty = stageNotional / addPrice;
       const addQty    = this.snapQty(rawAddQty, instr);
       runNotional_ps += addPrice * addQty;
@@ -3812,6 +3812,15 @@ function pw() { return {
       if (addQty > 0) orders.push({ label:`Add${i+1} -${_psAddPcts[i]}%`, price:addPrice, qty:addQty, tpPrice:addTp, type:'cond', filled:false, orderId:`pseudo-${Date.now()}-${i}` });
     }
     if (invalidDcaPrice) return;
+    const _planLines = orders.filter(o => o.type === 'cond').map((o, i) => {
+      const addNotional = (o.price || 0) * (o.qty || 0);
+      const addMargin   = addNotional / effectiveLev;
+      const scale       = margin > 0 ? addMargin / margin : 0;
+      return `${o.label}: $${addNotional.toFixed(2)} notional / $${addMargin.toFixed(2)} margin (${scale.toFixed(2)}× entry)`;
+    });
+    if (_planLines.length) {
+      this.log(`☀️ ${sym}: DCA plan scaled from entry margin $${margin.toFixed(2)} — ${_planLines.join(' | ')}`, 'debug');
+    }
     
     const existingPos = this.positions.find(p => p.symbol === sym);
     if (existingPos) {
@@ -3850,6 +3859,7 @@ function pw() { return {
       _fundingIntervalMs: this._klineCache[`fr_${sym}`]?.intervalMs || 8 * 3600000,
       upnl:0, openedAt:Date.now(), phase:'normal', isPending:false,
       _long: true,
+      _entryMargin: margin,
       currentTpPrice: _psEdaTpPrice > 0 && _psEdaTpPrice > tpPrice ? _psEdaTpPrice : tpPrice,
       tpPct: _psEdaTpPrice > 0 && _psEdaTpPrice > tpPrice
         ? parseFloat(((_psEdaTpPrice - price) / price * effectiveLev * 100).toFixed(2))
@@ -4286,7 +4296,11 @@ function pw() { return {
               this.log(`☀️ ${pos.symbol}: stage ${this._posStageCount(pos)} — SL set @ ${fmtP(pos.slPrice)}`, 'warn');
             }
           }
-          this.log(`☀️ ${pos.symbol}: ${add.label} triggered @ ${fmtP(add.price)} (mark ${fmtP(mark)}) | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
+          const _addedNotional = (add.price || 0) * (add.qty || 0);
+          const _addedMargin   = _addedNotional / (pos.leverage || 1);
+          const _entryMargin   = (pos._entryMargin || ((pos.orders?.[0]?.price || pos.originalEntryPrice || pos.entryPrice) * (pos.orders?.[0]?.qty || 0) / (pos.leverage || 1)) || (this.cfg.minNotional / (pos.leverage || this.cfg.leverage || 1)));
+          const _scale         = _entryMargin > 0 ? (_addedMargin / _entryMargin) : 0;
+          this.log(`☀️ ${pos.symbol}: ${add.label} triggered @ ${fmtP(add.price)} (mark ${fmtP(mark)}) | Added ${add.qty || 0} qty ≈ $${_addedNotional.toFixed(2)} notional / $${_addedMargin.toFixed(2)} margin (${_scale.toFixed(2)}× entry) | Margin now $${(pos.margin || 0).toFixed(2)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
           this.persist();
         }
         } catch(e) {
@@ -5057,9 +5071,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       if (!addPrice || addPrice >= prevPrice) { prevPrice = addPrice || prevPrice; continue; } // LONG: must step down
 
       const stageNotional = this.cfg.dcaDoublingEnabled
-        ? baseAdd * Math.pow(this.cfg.dcaMultiplier ?? 2, i + 1)
+        ? baseAdd * Math.pow(this.cfg.dcaMultiplier ?? 2, i)
         : this.cfg.dcaAccumulationEnabled
-        ? baseAdd * (i + 2)
+        ? baseAdd * (i + 1)
         : baseAdd;
       const addQty = this.snapQty(stageNotional / addPrice, instr);
       if (addQty <= 0) { prevPrice = addPrice; continue; }
