@@ -2132,7 +2132,7 @@ function pw() { return {
   creds: { key:'', secret:'' },
   cfg: {
     leverage:6, minNotional:6, addNotional:6,
-    rsi6Min:70, rsi12Min:70, rsi24Min:80, rsi6Max:90, maxPos:10, scanMins:15, topN:25,
+    rsi6Min:70, rsi12Min:70, rsi24Min:70, rsi6Max:90, maxPos:10, scanMins:15, topN:25,
     potGainerRsiPct: 10,   // RSI shortfall % below threshold for watchlist qualification
     potGainerExpireMins: 15,  // watchlist TTL (minutes)
     gainersEnabled: true,
@@ -3505,6 +3505,24 @@ function pw() { return {
     } catch { return { peak: null, oeCount: 0 }; }
   },
 
+
+  async _checkOeDrop(pos) {
+    try {
+      if (!pos || pos._oeDropCheckedStage === pos.dcaStage) return false;
+      pos._oeDropCheckedStage = pos.dcaStage;
+      const { peak, oeCount } = await this.fetchHistoricalRSI6Peaks(pos.symbol, 15);
+      if (peak != null && peak > 90) {
+        this.log(`⚡ OE DROP ${pos.symbol}: RSI6 peak ${peak.toFixed(1)} > 90 in preceding 3h (${oeCount || 1} candle${(oeCount || 1) === 1 ? '' : 's'}) — closing immediately`, 'warn');
+        pos._oeDrop = true;
+        await this.pseudoClosePosition(pos, 'oe-drop');
+        return true;
+      }
+    } catch(e) {
+      this.log(`⚡ ${pos.symbol}: OE Drop check failed — ${e.message}`, 'warn');
+    }
+    return false;
+  },
+
   async fetchFundingRate(symbol) {
     try {
       const cacheKey = `fr_${symbol}`;
@@ -4742,6 +4760,16 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
               }
               this.log(`🌑 ${pos.symbol}: gap — ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI) (candle ${new Date(c.t).toTimeString().slice(0,8)})`, 'trade');
 
+              try {
+                const { peak: _oePeak, oeCount: _oeCount } = await this.fetchHistoricalRSI6Peaks(pos.symbol, 15);
+                if (_oePeak != null && _oePeak > 90) {
+                  this.log(`⚡ OE DROP ${pos.symbol}: gap RSI6 peak ${_oePeak.toFixed(1)} > 90 in preceding 3h (${_oeCount || 1} candle${(_oeCount || 1) === 1 ? '' : 's'}) — closing immediately`, 'warn');
+                  pos._oeDrop = true;
+                  closed = true; closedAt = c.t; closePrice = c.c; closeReason = 'oe-drop';
+                  break;
+                }
+              } catch(e) { this.log(`⚡ ${pos.symbol}: OE Drop gap check failed — ${e.message}`, 'warn'); }
+
               // ── SPEED DROP in gap audit: close if 2 consecutive stages within 30min ──
               if (!closed && pos.dcaStage >= 2) {
                 const SPEED_DROP_MS = 30 * 60 * 1000;
@@ -5496,6 +5524,8 @@ if (age >= (this.cfg.runtimeHours * 3600000) && pos.phase !== 'force' && !_ftIsL
           this.log(`🌑 ${pos.symbol}: ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
           this.persist();
 
+          if (await this._checkOeDrop(pos)) break;
+
           // ── SPEED DROP: if 2+ consecutive DCA stages trigger within 30 minutes, close immediately ──
           if (pos.dcaStage >= 2) {
             const SPEED_DROP_MS = 30 * 60 * 1000; // 30 minutes
@@ -5825,7 +5855,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const badgeStyle = isWin
         ? 'color:var(--profit);border-color:rgba(0,229,160,.3);background:var(--profit-dim)'
         : 'color:var(--short);border-color:rgba(255,69,96,.3);background:var(--short-glow)';
-      const reasonLabel = t.reason === 'tp' ? 'TP' : t.reason === 'sl' ? 'SL' : t.reason === 'force' ? 'FORCE' : t.reason === 'laggard' ? 'EDa' : t.reason === 'FR-drop' ? 'FR-Drop' : t.reason === 'speed' ? 'SPEED' : 'CLOSE';
+      const reasonLabel = t.reason === 'tp' ? 'TP' : t.reason === 'sl' ? 'SL' : t.reason === 'force' ? 'FORCE' : t.reason === 'laggard' ? 'EDa' : t.reason === 'FR-drop' ? 'FR-Drop' : t.reason === 'speed' ? 'SPEED' : t.reason === 'oe-drop' ? 'OE Drop' : 'CLOSE';
       const speedBadge = t.reason === 'speed'
         ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,120,0,.55);color:#ff7800;background:rgba(255,120,0,.10);letter-spacing:1px">⚡ SPEED DROP</span>`
         : '';
@@ -6623,6 +6653,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const isNewPromotion = !this.ftCandidates[symbol] && !_ftMaxBlocked;
       const isUpgrade      = this.ftCandidates[symbol] && !this.ftCandidates[symbol]._advFt && !_ftMaxBlocked;
       if (isNewPromotion) {
+        if ((this.cfg.ftRosterMax ?? 10) < 1) { this.persist(); return; }
         this._ftRosterBump(symbol);
         this.ftCandidates[symbol] = { count, qualifiedAt: now, tradesOpened: 0, _advFt: true };
         this.log(`⚡ ${symbol}: promoted to Advanced FT roster (×${count} over-extended hits)`, 'trade');
@@ -6630,8 +6661,11 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         this.ftCandidates[symbol]._advFt = true;
         this.ftCandidates[symbol].count  = count;
         this.log(`⚡ ${symbol}: FT roster upgraded to Advanced FT (×${count} over-extended)`, 'info');
-      } else {
+      } else if (this.ftCandidates[symbol]) {
         this.ftCandidates[symbol].count = count;
+      } else {
+        this.persist();
+        return;
       }
       const rosterExpiresAt = (this.ftCandidates[symbol].qualifiedAt || now) + (this.cfg.runtimeHours * 3600000);
       this._advFtGraylist[symbol] = rosterExpiresAt;
@@ -6645,7 +6679,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   // Enforce ftRosterMax cap. Returns the evicted symbol (or null). Bumps lowest FR first, then oldest.
   _ftRosterBump(incomingSymbol) {
-    const max = this.cfg.ftRosterMax || 10;
+    const max = Math.max(0, this.cfg.ftRosterMax ?? 10);
+    if (max < 1) { this.log(`🎯 FT roster disabled (max ${max}) — cannot admit ${incomingSymbol}`, 'warn'); return null; }
     const roster = Object.entries(this.ftCandidates).filter(([s]) => s !== incomingSymbol);
     if (roster.length < max) return null; // room available
     // Sort: lowest funding rate first (least over-shorted = least wanted), then oldest qualifiedAt
