@@ -179,7 +179,7 @@ PseudoWinter runs the complete EverWinter logic against live market data with ph
 
 ## PseudoChaser
 
- `PseudoChaser.html` is an intentional imitation of PseudoWinter but with a longs-only bias and flipped criteria for entry. It uses the same strategies but with a few tweaks; standard gainers still enter at overbought levels but use over-extension as an entry criteria rather than a pass. Adv FT enter when ClC has 3 or more green candles, rather than red. Fund Chasing uses negative funding rates, all funding rates across the app are flipped. SalF uses inverted LSA (LBA — buying volume anomaly) and green ClC. The UI is color flipped as well, going from icy blue/teal to dim tan/orange. 
+ `PseudoChaser.html` is an intentional imitation of PseudoWinter but with a longs-only bias and flipped criteria for entry. It uses the same strategies but with a few tweaks; standard gainers still enter at overbought levels but do not pass over-extended tickers. Adv FT enter when ClC has 3 or more green candles, rather than red. Fund Chasing uses negative funding rates, all funding rates across the app are flipped. SalF uses inverted LSA (LBA — buying volume anomaly) and green ClC. The UI is color flipped as well, going from icy blue/teal to dim tan/orange. 
 
  ---
 

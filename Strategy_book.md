@@ -70,7 +70,9 @@ RSI6 hitting ≥ the configured maximum (default 90) signals a parabolic, non-me
 
 **3-Hour Graylist**: Before any entry, a historical check is advised across 15-minute candles over the past 3 hours — if any candle had RSI6 ≥ the configured maximum, the ticker is graylisted for the rest of the window. A recently over-extended ticker is prone to re-spiking rather than stabilizing — the graylist prevents premature re-entry after a parabolic move.
 
-**OE and Speed Drops**: If a position over-extends while open, or triggers too many DCAs in quick succession, it is better to abandon it. 
+**OE Drop**: Over-extension detection doesn't stop at the entry gate — it also applies to positions already open. When a DCA stage fills on an open position, the preceding three hours of RSI6 history are checked. If any candle in that window peaked at or above the configured maximum, the position is closed immediately. A ticker that has over-extended recently is not a candidate for deeper commitment — it is still in a volatile, non-mean-reverting state, and adding into it is adding into a parabola. The close is final; the symbol enters a one-hour all-strategy graylist before it can be considered again.
+
+**Speed Drop**: Two consecutive DCA stages filling too quickly (default 30 minutes) is a hard signal to reduce confidence. Rather than committing further capital into a ticker still in an uptrend, the position is closed immediately. Like an OE Drop close, the symbol enters the same one-hour all-strategy graylist afterwards. Speed Drop and OE Drop are both about recognizing when a position has become wrong quickly and cutting before the damage compounds.
 
 ---
 
@@ -170,6 +172,16 @@ The 6-stage structure captures intermediate moves that 3-stage misses. A ticker 
 **TP ROI by Stage**: The entry ROI% is divided by the stage number — stage 0 gets the full target, stage 1 half, stage 2 one-third, and so on — floored at 3%. The declining target reflects the better average entry: approximately the same dollar amount at a closer exit price.
 
 **Final stage**: A fill on the last add is itself an invalidation of the thesis. It exists as an emergency harness, not a planned outcome.
+
+#### Binary Mode
+
+Binary Mode is a stripped-down DCA configuration for high-conviction, short-runway trades. Instead of a full stage ladder, each position gets exactly one add, placed at +3% above entry. When that add fills, a stop-loss is set at +6.09% from the original entry. If the ticker doesn't reverse within that range, the trade is over.
+
+The philosophy is different from standard DCA in a meaningful way. Normal DCA accepts that a position may need significant runway and structures for that possibility. Binary Mode refuses the possibility entirely. You are betting on a clean, prompt reversal, and you are willing to be definitively wrong at a fixed cost rather than absorbing a slow drift across multiple stages.
+
+Second Wind is incompatible with Binary Mode and cannot be used alongside it — the entire point of Binary Mode is a hard ceiling on exposure, and Second Wind exists to extend past that ceiling.
+
+Binary Mode suits tickers and conditions where the conviction is high but the tolerance for prolonged drawdown is low. When it works, it closes fast. When it doesn't, the exit is clean and bounded.
 
 ---
 
@@ -392,20 +404,20 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 
 | Sub-Type | Condition | Slot Cost |
 |---|---|---|
-| HFG (High-Fund Gainer) | FR ≥ high gate, gainer | 3× |
-| LFG (Low-Fund Gainer) | FR ≥ low gate, gainer | 2× |
-| HFL (High-Fund Loser) | FR ≥ high gate, loser | 2× |
-| LFL (Low-Fund Loser) | FR ≥ low gate, loser | 1× |
+| HFS (High-Fund Surge) | FR ≥ high gate, all RSIs above 50 | 2× |
+| LFS (Low-Fund Surge) | FR ≥ low gate, all RSIs above 50 | 2× |
+| HFP (High-Fund Plunge) | FR ≥ high gate, all RSIs below 50 | 1× |
+| LFP (Low-Fund Plunge) | FR ≥ low gate, all RSIs below 50 | 1× |
 
-  Below the low fund floor, no entry is taken regardless of other conditions. Re-entry requires an escalating funding rate after each close on the same symbol — the gate seeds at 1.0% and multiplies ×1.5 per close, with a 6-hour TTL.
+Below the low fund floor, no entry is taken regardless of other conditions. Re-entry requires an escalating funding rate after each close on the same symbol — the gate seeds at 1.0% and multiplies ×1.5 per close, with a 6-hour TTL.
 
 - RSI Proximity Block (RSI6 within the configured proximity of the maximum is skipped — prevents entering a ticker about to over-extend)
 - RSI Minimum Gate (RSI6, RSI12, and RSI24 must all be ≥ the configured floor, default 25 — coins already oversold on any timeframe are skipped; applies in both normal and Super FUN mode)
 - Historical OE Look-back (counts 15m candles at RSI6 ≥ maximum in the past 3 hours)
-  - Losers with any OE hit are reclassified to the gainers gate
+  - Plunges with any OE hit are reclassified to the surge gate
   - OE count scales the VM threshold multiplicatively for gainers
-- Volume Momentum (threshold differs by sub-type [HFG : 10%, LFG : 20%, HFL : -10%, LFL : -5%] High fund does not require as much VM as low fund, losers demonstrate negative VMs due to having already sold off heavily), creeps upward per close on the same symbol.
-- LSA for losers only: volume within floor/cap band confirms continued selling
+
+**Lukewarm RSIs**: A ticker that disagrees with itself across timeframes has no clear directional state. All RSIs must be either above or below the threshold to qualify. 
 
 **Position management:**
 - DCA structure
@@ -414,12 +426,6 @@ FUN targets positive funding rates rather than RSI over-extension. A persistentl
 - Passive loss absorption
 - Passive Second Wind
 - EDa Payback
-
-**Re-entry Cooldown**: A configurable minimum interval (default one minute) is enforced between FUN entries on the same ticker. This interval scales +1 with each re-entry.
-
-**Super FUN Mode**: EverWinter has replaced regular FUN with Super FUN entirely. It focuses on funding rate plus positive VM, while the lock-in ratchet requires re-entry to match or beat the last close's funding tier within a 6-hour window. Tickers blocked by RSI proximity or OE count are admitted as the OE sub-type (1× slot cost, high funding gate required). Passive absorption is what makes this stance viable — if the ticker turns, the position is absorbed by uPnL threshold rather than force-closed on a timer.
-
-All Super FUN re-entries on the same ticker have TP Ingress deferred and use 2x the standard entry TP. After one Super FUN trade on the same ticker within the hour, re-entry is flagged for accelerated absorption, but the loss threshold remains `-(baseMargin × 0.25)`. If absorption is off, re-entry is deferred until the window clears.
 
 ---
 
@@ -441,6 +447,12 @@ SalF deliberately avoids two failure modes: **exhausted entries** (the ticker ha
   - LBA Creep: the window narrows after each close on the same symbol, tightening re-entry as the selloff matures
 - RSI Floor: all three timeframes above the minimum (default 25); below this, snap-back probability exceeds continuation probability
 - Funding rate gate (tighter than other strategies — reduces exposure to over-shorted tickers)
+
+**Surge and Plunge**:
+
+SalF entries are classified as surge or plunge based on RSI alignment, and size accordingly. A surge requires all RSIs above 50, vice versa with plunges. 
+
+The logic reflects what SalF is hunting. A ticker already plunging on all timeframes is exactly the kind of decline SalF was designed for. Surges are more likely to still have buying pressure, therefore less conviction. 
 
 **Position management:**
 - DCA structure
