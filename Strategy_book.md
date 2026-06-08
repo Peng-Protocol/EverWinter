@@ -83,13 +83,11 @@ A session where both sides lose consistently signals a choppy, untradeable envir
 
 #### Lock-in System
 
-When a position opens, the symbol's RSI at that moment is recorded in a lock-in entry (6-hour TTL). The locked RSI acts as a gate on future re-entries: **re-entry is blocked when current RSI is at or below the locked level.** The locked value ratchets to the minimum seen across all entries within the TTL window.
+When a position opens, the symbol's RSI at entry is recorded with a 6-hour TTL. Future re-entries into the same ticker are gated by that stored value. Both lock-ins share the same rationale: a ticker that just moved hard often reverses sharply before resuming. The lock-in makes you follow the move rather than re-enter at the worst point of the cycle.
 
-The rationale is the same for both gainer and loser lock-ins: a ticker that just moved significantly — pumped hard or collapsed hard — often spikes back in the opposite direction before resuming. You do not want to enter into that spike. By requiring RSI to be above the stored floor before re-entry, the system waits for the immediate bounce to complete rather than entering at the worst moment of the cycle.
+- **Bullish lock-in** (Gainers strategy): stored RSI is a **rising floor** — ratchets to the maximum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is below the floor. The ticker must pump to a higher RSI than the last entry before it qualifies again.
 
-- **Gainer lock-in** (used by the Gainers strategy): after shorting an overbought coin and closing, re-entry into that ticker is blocked unless RSI has climbed higher than the stored floor. The coin must pump further — to a more extreme overbought level — before it is a valid candidate again.
-
-- **Loser lock-in** (used by the Losers strategy): after shorting a declining coin and closing, re-entry is blocked unless RSI is above the stored floor. The coin must bounce — RSI must recover — before shorting it again. This prevents re-entering a deeply oversold ticker that is about to spike.
+- **Bearish lock-in** (Losers strategy): stored RSI is a **falling ceiling** — ratchets to the minimum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is above the ceiling. The ticker must decline to a lower RSI than the last entry before it qualifies again.
 
 ---
 
@@ -210,13 +208,13 @@ The Gainers strategy targets coins showing strong upward momentum. Entry require
 
 **Entry assembles:**
 - RSI floor gating across RSI6, RSI12, RSI24
-- Gainer lock-in check — re-entry into a recently closed symbol blocked unless RSI has risen above the stored floor
+- Bullish lock-in check — re-entry blocked unless RSI has risen above the stored floor
 
 **Position management:**
 - Binary Mode — TP and SL set at entry, no DCA
 - Drawdown throttle
 - EDa TP overrides standard TP for the laggard when collective debt exists
-- Gainer lock-in bump on open — records entry RSI, ratchets the re-entry gate
+- Bullish lock-in bump on open — records entry RSI, ratchets the floor up
 
 ---
 
@@ -230,13 +228,13 @@ The Losers strategy targets coins showing strong downward momentum. Entry requir
 
 **Entry assembles:**
 - RSI ceiling gating across RSI6, RSI12, RSI24 — all timeframes must be at or below their configured ceiling
-- Loser lock-in check — re-entry into a recently closed symbol blocked unless RSI has risen above the stored floor
+- Bearish lock-in check — re-entry blocked unless RSI has fallen below the stored ceiling
 
 **Position management:**
 - Binary Mode — TP and SL set at entry, no DCA
 - Drawdown throttle
 - EDa TP overrides standard TP for the laggard when collective debt exists
-- Loser lock-in bump on open — records entry RSI, ratchets the re-entry gate
+- Bearish lock-in bump on open — records entry RSI, ratchets the ceiling down
 
 ---
 

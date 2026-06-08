@@ -223,7 +223,12 @@ Mirror of EverWinter for long side. `Buy` market to open, `Sell` reduceOnly limi
 
 ## Lock-in State
 
-`gainerLockIn` and `loserLockIn` are plain objects (`symbol → { rsi, setAt, count }`). The `rsi` field ratchets down to the minimum RSI seen across all entries for that symbol within the 6h TTL window. Re-entry is blocked when current RSI ≤ stored `rsi`. `_sweepExpiredData()` removes entries where `Date.now() - setAt > 6 * 3600 * 1000`.
+`gainerLockIn` (bullish lock-in) and `loserLockIn` (bearish lock-in) are plain objects keyed by symbol: `{ rsi6, rsi12, rsi24, setAt, trades }`.
+
+- `gainerLockIn[sym]` ratchets **up** via `Math.max` — stores the highest RSI seen at entry. Re-entry is blocked when any current RSI component falls below the stored value.
+- `loserLockIn[sym]` ratchets **down** via `Math.min` — stores the lowest RSI seen at entry. Re-entry is blocked when any current RSI component rises above the stored value.
+
+`_sweepExpiredData()` removes entries where `Date.now() - setAt > 6 * 3600 * 1000`.
 
 ---
 
