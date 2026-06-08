@@ -780,10 +780,6 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <div style="font-size:9px;color:var(--text-lo);line-height:1.4;margin-top:1px">1 DCA add only. SL set 3% below Add1 trigger after fill.</div>
               </div>
             </label>
-            <div x-show="cfg.binaryModeEnabled" style="margin-top:7px;padding:6px 9px;background:rgba(180,100,255,.07);border:1px solid rgba(180,100,255,.25);border-radius:4px;font-size:9.5px;color:var(--text-lo);line-height:1.55">
-              <b style="color:#b464ff">Binary risk structure active.</b> All new positions: 1 DCA add at −3%, SL fires 3% below Add1 trigger. EDa TP, loss absorption, FR drops and all other machinery remain active. Max exposure ≈ 2× margin per position before SL.
-            </div>
-
           </div>
 
           <!-- DCA Add Orders (Binary mode only) -->
@@ -1308,10 +1304,10 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
           </template>
         </div>
       </div>
-      <!-- Potential Gainers Watchlist — only shown when Gainers strategy is active -->
-      <div x-show="cfg.gainersEnabled" style="border-top:1px solid var(--border)">
+      <!-- Potential Losers Watchlist — only shown when Gainers strategy is active and has entries -->
+      <div x-show="cfg.gainersEnabled && potGainers.length>0" style="border-top:1px solid var(--border)">
         <div style="padding:8px 13px 4px;display:flex;align-items:center;justify-content:space-between">
-          <div class="sec-ttl" style="margin-bottom:0">Potential Losers</div>
+          <div class="sec-ttl" style="margin-bottom:0">Potential Losers <em x-text="potGainers.length+' watching'"></em></div>
         </div>
         <!-- Fixed-height scroll box — 4 rows × ~30px -->
         <div style="height:120px;overflow-y:auto;overflow-x:hidden;border-top:1px solid var(--border);border-bottom:1px solid var(--border);background:var(--bg-deep)">
@@ -1349,17 +1345,13 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
           </template>
         </div>
 
-        <!-- Potential Gainers (strat) watchlist -->
-        <div style="border-top:1px solid var(--border)">
+        <!-- Potential Gainers (strat) watchlist — only shown when there are entries -->
+        <div x-show="potGainerStrat.length>0" style="border-top:1px solid var(--border)">
           <div style="padding:6px 10px 4px;display:flex;align-items:center;justify-content:space-between">
-            <div class="sec-ttl" style="margin-bottom:0">Potential Gainers</div>
-            <span style="font-family:var(--mono);font-size:9px;color:var(--text-lo)" x-text="potGainerStrat.length+' watching'"></span>
+            <div class="sec-ttl" style="margin-bottom:0">Potential Gainers <em x-text="potGainerStrat.length+' watching'"></em></div>
           </div>
           <!-- Fixed-height scroll box — 4 rows × ~28px -->
           <div style="height:112px;overflow-y:auto;overflow-x:hidden;background:var(--bg-deep);border-top:1px solid var(--border)">
-            <template x-if="potGainerStrat.length===0">
-              <div style="padding:10px 13px;font-family:var(--mono);font-size:10px;color:var(--text-lo)">Nobody here but us chickens!</div>
-            </template>
             <template x-if="potGainerStrat.length>0">
               <div>
                 <div style="padding:4px 13px 3px;font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:var(--text-lo);background:var(--bg-raised)">&#9650; GAINERS WATCH &#8212; polling every 5s</div>
@@ -2627,6 +2619,7 @@ function pw() { return {
   async runScheduledCycle() {
     if (this._cycleRunning) return;
     this.bot.lastScanAt = Date.now();
+    this._sweepExpiredData();
     // Drawdown throttle — block all scans (scheduled and manual) during halt window
     if (this.cfg.drawdownThrottleEnabled && this._drawdownHaltUntil > Date.now()) {
       const remMs  = this._drawdownHaltUntil - Date.now();
@@ -2925,12 +2918,6 @@ function pw() { return {
           if (_gsAdded.length > 0) this.log(`◉ [GS] Added to watchlist: ${_gsAdded.join(', ')}`, 'info');
           this.persist();
         }
-
-        // Expire old gainer lock-in entries
-        const _gsNow = Date.now();
-        for (const sym of Object.keys(this.gainerStratLockIn)) {
-          if (_gsNow - (this.gainerStratLockIn[sym].setAt || 0) >= 6 * 3600 * 1000) delete this.gainerStratLockIn[sym];
-        }
       }
 
       await this.refreshBalance();
@@ -3102,6 +3089,29 @@ function pw() { return {
     const r24str = e.rsi24 != null ? `/${e.rsi24.toFixed(1)}` : '';
     this.log(`◉ [GS] ${symbol}: gainer lock-in — RSI floor ≥ ${e.rsi6.toFixed(1)}${r12str}${r24str} | ${e.trades} trade${e.trades === 1 ? '' : 's'} in window`, 'info');
     this.persist();
+  },
+
+  // Sweep all time-bound data structures and evict expired entries.
+  // Called at the start of every scheduled cycle so stale data can never persist
+  // longer than one cycle interval regardless of how entries were created.
+  _sweepExpiredData() {
+    const now = Date.now();
+    const LOCK_TTL = 6 * 3600 * 1000;
+    for (const sym of Object.keys(this.gainerLockIn)) {
+      if (now - (this.gainerLockIn[sym].setAt || 0) >= LOCK_TTL) delete this.gainerLockIn[sym];
+    }
+    for (const sym of Object.keys(this.gainerStratLockIn)) {
+      if (now - (this.gainerStratLockIn[sym].setAt || 0) >= LOCK_TTL) delete this.gainerStratLockIn[sym];
+    }
+    const potGainerTtlMs = (this.cfg.potGainerExpireMins ?? 15) * 60000;
+    this.potGainers = this.potGainers.filter(pe => (now - (pe.placedAt || 0)) < potGainerTtlMs);
+    this.potGainerStrat = this.potGainerStrat.filter(pe => {
+      const expiresAt = pe.expiresAt || ((pe.placedAt || 0) + potGainerTtlMs);
+      return now < expiresAt;
+    });
+    for (const sym of Object.keys(this._symbolBanlist)) {
+      if (!this._normalizeBanEntry(this._symbolBanlist[sym])) delete this._symbolBanlist[sym];
+    }
   },
 
   // Fetch a single live ticker for a symbol. Returns the ticker object { lastPrice, ... }.
