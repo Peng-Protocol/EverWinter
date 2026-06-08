@@ -772,21 +772,32 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
           <!-- Binary Mode -->
           <div class="g" class="mt-sep" style="margin-top:14px">
             <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:8px">BINARY MODE</div>
-            <label class="tog"
-              @click="cfg.binaryModeEnabled=!cfg.binaryModeEnabled;persist()">
+            <label class="tog" @click="cfg.binaryModeEnabled=!cfg.binaryModeEnabled;persist()">
               <div class="tog-t" :class="cfg.binaryModeEnabled?'on':''"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l">Binary Mode</div>
-                <div style="font-size:9px;color:var(--text-lo);line-height:1.4;margin-top:1px">1 DCA add only. SL set 3% below Add1 trigger after fill.</div>
+                <div style="font-size:9px;color:var(--text-lo);line-height:1.4;margin-top:1px">No DCA orders. TP and SL set at entry. Both configurable below.</div>
               </div>
             </label>
+
+            <div x-show="cfg.binaryModeEnabled" style="margin-top:10px">
+              <div class="g">
+                <div class="lbl">Take Profit <b x-text="cfg.binaryTpPct+'%'"></b></div>
+                <input type="range" min="1" max="50" step="1" x-model.number="cfg.binaryTpPct" :disabled="bot.running" @change="persist()">
+                <div class="hint">TP closes at this % gain (leverage-adjusted). At 18%: TP = entry × (1 + 18% / lev).</div>
+              </div>
+              <div class="g" style="margin-top:8px">
+                <div class="lbl">Stop Loss <b x-text="cfg.binarySlPct+'%'"></b></div>
+                <input type="range" min="1" max="50" step="1" x-model.number="cfg.binarySlPct" :disabled="bot.running" @change="persist()">
+                <div class="hint">SL fires at this % loss (leverage-adjusted). At 18%: SL = entry × (1 − 18% / lev).</div>
+              </div>
+            </div>
           </div>
 
-          <!-- DCA Add Orders (Binary mode only) -->
-          <div class="g" class="mt-sep">
+          <!-- DCA Add Orders (non-binary mode) -->
+          <div x-show="!cfg.binaryModeEnabled" class="g" class="mt-sep">
             <div class="sec-ttl" style="margin-bottom:6px;font-size:9px">DCA ADD ORDERS</div>
             <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px;line-height:1.6">
-              Binary mode: 1 DCA add at −3%. SL set 3% below Add1 trigger after fill. $<span x-text="cfg.minNotional"></span> notional per add ($<span x-text="(cfg.minNotional/cfg.leverage).toFixed(2)"></span> margin).
               Est. max loss ≈ $<span x-text="Math.abs(_slEstimate().totalLoss).toFixed(2)"></span> if SL fires.
             </div>
           </div>
@@ -1801,7 +1812,9 @@ function pw() { return {
     dcaStages: 3,             // integer stage count; slider allows [3,6,7,...,18]; 4/5 not valid
     drawdownThrottleEnabled: true,  // halt new scans for 12h if 6h rolling PnL drops below drawdownFactor × entry margin
     drawdownFactor: 0.5,            // loss threshold as a multiple of entry margin (e.g. 0.5 = −$0.50 per $1 margin)
-    binaryModeEnabled: true,        // 1 DCA add only; SL set 3% below Add1 trigger; no second wind; no escalation/accumulation
+    binaryModeEnabled: true,        // binary risk: TP + SL set at entry, no DCA orders
+    binaryTpPct: 18,                // binary mode take-profit % (leverage-adjusted ROI)
+    binarySlPct: 18,                // binary mode stop-loss % (leverage-adjusted ROI)
   },
   connected: { api:true },
   ui: { scanning:false, refreshing:false },
@@ -2944,38 +2957,46 @@ function pw() { return {
     }
 
     const binary      = this._binaryMode();
-    const tpPct       = this.cfg.entryTpRoi;
+    const tpPct       = binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
     const tpPrice     = this.snapPrice(price * (1 + tpPct / 100 / lev), instr); // LONG: TP above entry
-    const addPcts     = this._activeAddPcts();
-    const stages      = binary ? 1 : Math.min(this.cfg.dcaStages || 1, addPcts.length);
-    const addNotional = this.cfg.addNotional || notional;
 
-    // Build DCA conditional orders (triggers below entry for LONG)
+    // Binary mode: no DCA orders; TP + SL set at entry
     const orders = [];
-    let runNotional = price * entryQty;
-    let runSize     = entryQty;
-    let prevPrice   = price;
-
-    for (let i = 0; i < stages; i++) {
-      const addPrice = this.snapPrice(price * (1 - addPcts[i] / 100), instr);
-      if (!addPrice || addPrice >= prevPrice) continue;
-      const addQty = this.snapQty(addNotional / addPrice, instr);
-      if (addQty <= 0) { prevPrice = addPrice; continue; }
-      runNotional += addPrice * addQty;
-      runSize     += addQty;
-      const expectedAvg = runNotional / runSize;
-      const stageTpRoi  = this._tpRoi(i + 1);
-      const stageTp     = this.snapPrice(expectedAvg * (1 + stageTpRoi / 100 / lev), instr);
-      orders.push({
-        label:   `Add${i + 1} -${addPcts[i]}%`,
-        price:   addPrice,
-        qty:     addQty,
-        tpPrice: stageTp,
-        type:    'cond',
-        filled:  false,
-        orderId: `open-${now}-${i}`,
-      });
-      prevPrice = addPrice;
+    let slPrice = null;
+    let slSet   = false;
+    let stages  = 0;
+    if (binary) {
+      const bSlPct = this.cfg.binarySlPct ?? 18;
+      slPrice = this.snapPrice(price * (1 - bSlPct / 100 / lev), instr); // LONG: SL below entry
+      slSet   = true;
+    } else {
+      const addPcts     = this._activeAddPcts();
+      const addNotional = this.cfg.addNotional || notional;
+      stages = Math.min(this.cfg.dcaStages || 1, addPcts.length);
+      let runNotional = price * entryQty;
+      let runSize     = entryQty;
+      let prevPrice   = price;
+      for (let i = 0; i < stages; i++) {
+        const addPrice = this.snapPrice(price * (1 - addPcts[i] / 100), instr);
+        if (!addPrice || addPrice >= prevPrice) continue;
+        const addQty = this.snapQty(addNotional / addPrice, instr);
+        if (addQty <= 0) { prevPrice = addPrice; continue; }
+        runNotional += addPrice * addQty;
+        runSize     += addQty;
+        const expectedAvg = runNotional / runSize;
+        const stageTpRoi  = this._tpRoi(i + 1);
+        const stageTp     = this.snapPrice(expectedAvg * (1 + stageTpRoi / 100 / lev), instr);
+        orders.push({
+          label:   `Add${i + 1} -${addPcts[i]}%`,
+          price:   addPrice,
+          qty:     addQty,
+          tpPrice: stageTp,
+          type:    'cond',
+          filled:  false,
+          orderId: `open-${now}-${i}`,
+        });
+        prevPrice = addPrice;
+      }
     }
 
     const id = now + Math.random();
@@ -2998,7 +3019,8 @@ function pw() { return {
       _gainerStrat,
       tpPct,
       currentTpPrice:      tpPrice,
-      slPrice:             null,
+      slPrice,
+      slSet,
       rsi6,
       rsi12,
       rsi24,
@@ -3015,7 +3037,8 @@ function pw() { return {
 
     this.positions.push(pos);
     const stratLabel = _gainerStrat ? '[GS] ' : '';
-    this.log(`◉ ${stratLabel}${symbol.replace('USDT','')} LONG opened @ ${fmtP(price)} | ${lev}× | $${(notional/lev).toFixed(2)} margin | TP ${tpPct}% (${fmtP(tpPrice)}) | ${stages} DCA stage${stages!==1?'s':''}`, 'trade');
+    const _binTag    = binary ? ` | SL:${fmtP(slPrice)} [Binary]` : '';
+    this.log(`◉ ${stratLabel}${symbol.replace('USDT','')} LONG opened @ ${fmtP(price)} | ${lev}× | $${(notional/lev).toFixed(2)} margin | TP ${tpPct}% (${fmtP(tpPrice)})${_binTag}${binary ? '' : ' | '+stages+' DCA stage'+(stages!==1?'s':'')}`, 'trade');
     this.persist();
   },
 
@@ -3534,17 +3557,12 @@ function pw() { return {
           // persist visibly through every SW cycle — especially bad for the laggard under infinite SW.
           const _slFirstWindFilled = pos.orders.filter(o => o.type === 'cond' && o.filled && !o._secondWind).length;
           const _slFirstWindTotal  = pos._firstWindStageCount || this._posStageCount(pos);
-          if (!add._secondWind && _slFirstWindFilled >= _slFirstWindTotal && !pos.slPrice) {
+          if (!add._secondWind && _slFirstWindFilled >= _slFirstWindTotal && !pos.slPrice && !pos._binary) {
             const instr = await this.getInstrInfo(pos.symbol);
             if (instr) {
-              // Binary mode: SL is 3% below the Add1 trigger price (add.price)
-              // Normal mode: SL is 1.05× leverage-adjusted below avg entry
-              const _slBase = pos._binary
-                ? this.snapPrice(add.price * (1 - 0.03 / pos.leverage), instr)
-                : this.snapPrice(pos.entryPrice * (1 - 1.05 / pos.leverage), instr);
-              pos.slPrice = _slBase;
+              pos.slPrice = this.snapPrice(pos.entryPrice * (1 - 1.05 / pos.leverage), instr);
               pos.slSet   = true;
-              this.log(`☀️ ${pos.symbol}: stage ${this._posStageCount(pos)}${pos._binary ? ' [binary]' : ''} — SL set @ ${fmtP(pos.slPrice)}`, 'warn');
+              this.log(`☀️ ${pos.symbol}: stage ${this._posStageCount(pos)} — SL set @ ${fmtP(pos.slPrice)}`, 'warn');
             }
           }
           const _addedNotional = (add.price || 0) * (add.qty || 0);
@@ -3563,21 +3581,25 @@ function pw() { return {
         try {
           const _slFwFilled = (pos.orders || []).filter(o => o.type === 'cond' && o.filled && !o._secondWind).length;
           const _slFwTotal  = pos._firstWindStageCount || this._posStageCount(pos);
-          if (_slFwFilled >= _slFwTotal) {
+          const _slGate     = pos._binary || _slFwFilled >= _slFwTotal;
+          if (_slGate) {
             const instr = await this.getInstrInfo(pos.symbol);
             if (!instr) {
               this.log(`[PC-SL-01] ${pos.symbol}: SL drift check skipped — instrument unavailable`, 'warn');
             } else {
-              // Binary: anchor SL to Add1 trigger (first cond order price); normal: avg entry
-              const _slAnchor = pos._binary
-                ? ((pos.orders || []).find(o => o.type === 'cond' && !o._secondWind)?.price || pos.entryPrice)
-                : pos.entryPrice;
-              const _slPct = pos._binary ? 0.03 : 1.05;
-              const targetSl = this.snapPrice(_slAnchor * (1 - _slPct / pos.leverage), instr);
-              const slTol    = (_slAnchor * _slPct / pos.leverage) * 0.10;
+              let targetSl, slTol;
+              if (pos._binary) {
+                const bSlPct = this.cfg.binarySlPct ?? 18;
+                const base   = pos.originalEntryPrice || pos.entryPrice;
+                targetSl = this.snapPrice(base * (1 - bSlPct / 100 / pos.leverage), instr); // LONG
+                slTol    = base * bSlPct / 100 / pos.leverage * 0.10;
+              } else {
+                targetSl = this.snapPrice(pos.entryPrice * (1 - 1.05 / pos.leverage), instr);
+                slTol    = (pos.entryPrice * 1.05 / pos.leverage) * 0.10;
+              }
               if (Math.abs(pos.slPrice - targetSl) > slTol) {
                 pos.slPrice = targetSl;
-                this.log(`☀️ ${pos.symbol}: SL drift-corrected → ${fmtP(targetSl)}`, 'warn');
+                this.log(`☀️ ${pos.symbol}: SL drift-corrected → ${fmtP(targetSl)}${pos._binary ? ' [Binary]' : ''}`, 'warn');
                 this.persist();
               }
             }

@@ -766,19 +766,27 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             </div>
           </div>
 
-          <!-- Drop Guards -->
-          <!-- DCA Add Orders -->
+          <!-- Binary Mode -->
           <div class="g" class="mt-sep">
-            <div class="sec-ttl" style="margin-bottom:6px;font-size:9px">DCA ADD ORDERS</div>
+            <div class="sec-ttl" style="margin-bottom:6px;font-size:9px">BINARY MODE</div>
 
-            <!-- Binary Mode toggle -->
-            <div class="g" style="margin-bottom:10px">
-              <label class="tog" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''" @click.prevent="if(!cfgLocked){ if(cfg.binaryModeEnabled){ cfg.binaryModeEnabled=false; } else if(false){ /* blocked */ } else { cfg.binaryModeEnabled=true; } persist()}">
-                <div class="tog-t" :class="cfg.binaryModeEnabled?'on':''" :style="''"><div class="tog-k"></div></div>
-                <span class="tog-l">Binary Mode</span>
-              </label>
-              <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Exactly 1 DCA add at +3%. On fill, sets SL at +6.09% from entry (3% above Add1 trigger).</div>
-              <div x-show="false" style="font-size:9px;color:var(--warn);margin-top:3px">⚠ Disable Second Wind first to enable Binary Mode.</div>
+            <label class="tog" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''" @click.prevent="if(!cfgLocked){cfg.binaryModeEnabled=!cfg.binaryModeEnabled;persist()}">
+              <div class="tog-t" :class="cfg.binaryModeEnabled?'on':''"><div class="tog-k"></div></div>
+              <span class="tog-l">Binary Mode</span>
+            </label>
+            <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">No DCA orders. TP and SL set at entry. Both configurable below.</div>
+
+            <div x-show="cfg.binaryModeEnabled" style="margin-top:10px">
+              <div class="g">
+                <div class="lbl">Take Profit <b x-text="cfg.binaryTpPct+'%'"></b></div>
+                <input type="range" min="1" max="50" step="1" x-model.number="cfg.binaryTpPct" :disabled="bot.running" @change="persist()">
+                <div class="hint">TP closes at this % gain (leverage-adjusted). At 18%: TP = entry × (1 − 18% / lev).</div>
+              </div>
+              <div class="g" style="margin-top:8px">
+                <div class="lbl">Stop Loss <b x-text="cfg.binarySlPct+'%'"></b></div>
+                <input type="range" min="1" max="50" step="1" x-model.number="cfg.binarySlPct" :disabled="bot.running" @change="persist()">
+                <div class="hint">SL fires at this % loss (leverage-adjusted). At 18%: SL = entry × (1 + 18% / lev).</div>
+              </div>
             </div>
 
 
@@ -1174,7 +1182,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   return html;
                 })()"></div>
               </div>
-              <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="(()=>{ const slRoi = cfg.binaryModeEnabled ? (1.03*1.03-1)*100*p.leverage : 105; return '~−'+slRoi.toFixed(1)+'%  '+fmtP(p.slPrice); })()"></div></div>
+              <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="(()=>{ const slRoi = cfg.binaryModeEnabled ? (cfg.binarySlPct??18) : 105; return '~−'+slRoi.toFixed(1)+'%  '+fmtP(p.slPrice); })()"></div></div>
             </div>
             <!-- ── PRICE LADDER BAR ── -->
             <div x-data="{
@@ -1667,7 +1675,9 @@ function pw() { return {
     sfSurgeMult: 1,                // notional multiplier for SalF surge entries (all RSIs ≥ 50)
     sfRsiMin: 25,                  // minimum RSI on all timeframes (6/12/24) for SalF entries
     sfRedCandleMin: 3,             // min red 15m candles (of last 4 completed) for SalF entry; 0 = disabled
-    binaryModeEnabled: true,   // binary risk: exactly 1 DCA add at +3%; on fill, set SL 3% above Add1 trigger
+    binaryModeEnabled: true,   // binary risk: TP + SL set at entry, no DCA orders
+    binaryTpPct: 18,           // binary mode take-profit % (leverage-adjusted ROI)
+    binarySlPct: 18,           // binary mode stop-loss % (leverage-adjusted ROI)
     drawdownThrottleEnabled: false, // halt new entries for 12h when 6hr rolling PnL < -(factor × entry margin)
     drawdownThrottleFactor: 0.5,    // loss factor as multiple of entry margin (default 0.5×)
     frDropEnabled: true,            // close any open position when its FR drops below -(frDropFundingRateMin)
@@ -3103,65 +3113,74 @@ function pw() { return {
     const levResult = this.resolveEffectiveLeverage(sym, instr);
     if (!levResult) { const g = this.gainers.find(x=>x.symbol===sym); if (g) g.status='maxlev'; return; }
     const effectiveLev = levResult.lev;
+    const binary       = this.cfg.binaryModeEnabled;
     const effMinNotional = this.cfg.minNotional;
-    const effAddNotional = this.cfg.addNotional;
-    const effTpRoi       = [this.cfg.entryTpRoi, this._tpRoi(1)];
-    const effTp0         = this.cfg.entryTpRoi;
+    const effTp0         = binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
     const rawQty   = effMinNotional / price;
     const qty      = this.snapQty(rawQty, instr);
     if (qty <= 0) { this.log(`${sym}: qty below min — skipping`, 'warn'); return; }
     const actualNotional = qty * price;
     if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) { this.log(`${sym}: notional below exchange min — skipping`, 'warn'); return; }
     const tpPrice = this.snapPrice(price * (1 - (effTp0 / 100) / effectiveLev), instr);
-    if (!tpPrice || tpPrice <= 0) { 
-      this.log(`${sym}: Pseudo TP price invalid (${tpPrice}) — price too low for API precision — BLACKLISTED`, 'warn'); 
+    if (!tpPrice || tpPrice <= 0) {
+      this.log(`${sym}: Pseudo TP price invalid (${tpPrice}) — price too low for API precision — BLACKLISTED`, 'warn');
       this._banSymbol(sym, `Pseudo TP price too low for API precision (${tpPrice})`);
       this.gainers = this.gainers.filter(g => g.symbol !== sym);
       this.persist();
-      return; 
+      return;
     }
     const margin  = actualNotional / effectiveLev;
-    const orders  = [{ label:'Entry', price, type:'tp', filled:false, orderId:null }];
-    let runNotional_ps = price * this.snapQty(effMinNotional / price, instr);
-    let runSize_ps     = this.snapQty(effMinNotional / price, instr);
-    let invalidDcaPrice = false;
-    const _psAddPcts = this._activeAddPcts();
-    for (let i = 0; i < this._dcaStageCount(); i++) {
-      const addPrice  = this.snapPrice(price * (1 + _psAddPcts[i]/100), instr);
-      if (!addPrice || addPrice <= 0) {
-        this.log(`${sym}: Pseudo DCA Add${i+1} price invalid (${addPrice}) — BLACKLISTED`, 'warn');
-        this._banSymbol(sym, `Pseudo DCA Add${i+1} price too low for API precision (${addPrice})`);
-        this.gainers = this.gainers.filter(g => g.symbol !== sym);
-                  this.persist();
-        invalidDcaPrice = true;
-        break;
+
+    // Binary mode: no DCA orders; TP + SL set at entry
+    const orders = [];
+    let slPrice = null;
+    let slSet   = false;
+    if (binary) {
+      const bSlPct = this.cfg.binarySlPct ?? 18;
+      slPrice = this.snapPrice(price * (1 + bSlPct / 100 / effectiveLev), instr);
+      slSet   = true;
+    } else {
+      const effAddNotional = this.cfg.addNotional;
+      const effTpRoi       = [effTp0, this._tpRoi(1)];
+      let runNotional_ps = price * this.snapQty(effMinNotional / price, instr);
+      let runSize_ps     = this.snapQty(effMinNotional / price, instr);
+      let invalidDcaPrice = false;
+      const _psAddPcts = this._activeAddPcts();
+      for (let i = 0; i < this._dcaStageCount(); i++) {
+        const addPrice  = this.snapPrice(price * (1 + _psAddPcts[i]/100), instr);
+        if (!addPrice || addPrice <= 0) {
+          this.log(`${sym}: Pseudo DCA Add${i+1} price invalid (${addPrice}) — BLACKLISTED`, 'warn');
+          this._banSymbol(sym, `Pseudo DCA Add${i+1} price too low for API precision (${addPrice})`);
+          this.gainers = this.gainers.filter(g => g.symbol !== sym);
+          this.persist();
+          invalidDcaPrice = true;
+          break;
+        }
+        const rawAddQty = effAddNotional / addPrice;
+        const addQty    = this.snapQty(rawAddQty, instr);
+        runNotional_ps += addPrice * addQty;
+        runSize_ps     += addQty;
+        const expectedAvg = runSize_ps > 0 ? runNotional_ps / runSize_ps : addPrice;
+        const addTp = this.snapPrice(expectedAvg * (1 - (effTpRoi[i+1] / 100) / effectiveLev), instr);
+        if (!addTp || addTp <= 0) {
+          this.log(`${sym}: Pseudo DCA Add${i+1} TP invalid (${addTp}) — BLACKLISTED`, 'warn');
+          this._banSymbol(sym, `Pseudo DCA Add${i+1} TP too low for API precision (${addTp})`);
+          this.gainers = this.gainers.filter(g => g.symbol !== sym);
+          this.persist();
+          invalidDcaPrice = true;
+          break;
+        }
+        if (addQty > 0) orders.push({ label:`Add${i+1} +${_psAddPcts[i]}%`, price:addPrice, qty:addQty, tpPrice:addTp, type:'cond', filled:false, orderId:`pseudo-${Date.now()}-${i}` });
       }
-      const stageNotional = effAddNotional;
-      const rawAddQty = stageNotional / addPrice;
-      const addQty    = this.snapQty(rawAddQty, instr);
-      runNotional_ps += addPrice * addQty;
-      runSize_ps     += addQty;
-      const expectedAvg = runSize_ps > 0 ? runNotional_ps / runSize_ps : addPrice;
-      const addTp = this.snapPrice(expectedAvg * (1 - (effTpRoi[i+1] / 100) / effectiveLev), instr);
-      if (!addTp || addTp <= 0) {
-        this.log(`${sym}: Pseudo DCA Add${i+1} TP invalid (${addTp}) — BLACKLISTED`, 'warn');
-        this._banSymbol(sym, `Pseudo DCA Add${i+1} TP too low for API precision (${addTp})`);
-        this.gainers = this.gainers.filter(g => g.symbol !== sym);
-                  this.persist();
-        invalidDcaPrice = true;
-        break;
-      }
-      if (addQty > 0) orders.push({ label:`Add${i+1} +${_psAddPcts[i]}%`, price:addPrice, qty:addQty, tpPrice:addTp, type:'cond', filled:false, orderId:`pseudo-${Date.now()}-${i}` });
+      if (invalidDcaPrice) return;
     }
-    if (invalidDcaPrice) return;
-    
+
     const existingPos = this.positions.find(p => p.symbol === sym);
     if (existingPos) {
       this.log(`🌑 ${sym}: Pseudo entry blocked — position already exists (${existingPos._ft ? 'FT' : 'Unknown'}, ID: ${existingPos.id})`, 'warn');
       return;
     }
-    
-    const _psInitialEV = margin * (effTp0 / 100);
+
     this.positions.push({
       id:Date.now()+Math.random(), symbol:sym,
       entryPrice:price, originalEntryPrice:price, markPrice:price, totalSize:qty, leverage:effectiveLev, margin,
@@ -3171,21 +3190,18 @@ function pw() { return {
       upnl:0, openedAt:Date.now(), phase:'normal', isPending:false,
       currentTpPrice: tpPrice,
       tpPct: effTp0,
+      slPrice, slSet,
       dcaStage:0, orders,
-      _stageCount: this._dcaStageCount(),
+      _stageCount: binary ? 0 : this._dcaStageCount(),
       _pseudo:true, _loser: candidate._loser === true, _lastSeenAt:Date.now(),
-
     });
     const g = this.gainers.find(x=>x.symbol===sym);
     if (g) g.status='active';
     this._electLaggard();
     this._redistributeED();
-    // PseudoWinter does not implement rodeo notional creep — stub so the log tag is always empty.
-    const nThresh = { count: 0, mult: 1 };
-    const creepTag = nThresh.count > 0 ? ` | 🎠 Rodeo×${nThresh.count} — notional ×${nThresh.mult.toFixed(2)}` : '';
-    const _psDebtTag = _laggardSeedDebt < 0 ? ` | Debt seed $${_laggardSeedDebt.toFixed(2)} → EDa TP ${fmtP(_psEdaTpPrice)}` : '';
     const _loserTag = candidate._loser ? ' | 🔻 LOSER' : '';
-    this.log(`🌑 ▼ PSEUDO SHORT ${sym} @ ${fmtP(price)} | Qty:${qty} | Notional:$${actualNotional.toFixed(2)} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} | RSI6:${candidate.rsi6?.toFixed(1)} RSI12:${candidate.rsi12?.toFixed(1)} RSI24:${candidate.rsi24?.toFixed(1)}${creepTag}${_psDebtTag}${_loserTag}`, 'trade');
+    const _binTag   = binary ? ` | SL:${fmtP(slPrice)} [Binary]` : '';
+    this.log(`🌑 ▼ PSEUDO SHORT ${sym} @ ${fmtP(price)} | Qty:${qty} | Notional:$${actualNotional.toFixed(2)} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} (${effTp0}%) | RSI6:${candidate.rsi6?.toFixed(1)} RSI12:${candidate.rsi12?.toFixed(1)} RSI24:${candidate.rsi24?.toFixed(1)}${_binTag}${_loserTag}`, 'trade');
     if (candidate._loser === true) {
       this.loserLockInBump(sym, candidate.rsi6, candidate.rsi12, candidate.rsi24);
     } else {
@@ -3398,18 +3414,16 @@ function pw() { return {
       }
       if (_closingIds.has(pos.id) || !this.positions.find(x => x.id === pos.id)) continue;
 
-      if (pos.slSet && pos.slPrice > 0 && pos.dcaStage >= 1) {
+      const _slGate = pos.slSet && pos.slPrice > 0 && (this.cfg.binaryModeEnabled || pos.dcaStage >= 1);
+      if (_slGate) {
         const instr = await this.getInstrInfo(pos.symbol);
         if (instr) {
-          const targetSl = this.cfg.binaryModeEnabled
-            ? this._binarySLPrice(pos, instr)
-            : this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), instr);
-          const slTol    = this.cfg.binaryModeEnabled
-            ? (pos.originalEntryPrice || pos.entryPrice) * 0.0609 * 0.10
-            : (pos.entryPrice * 1.05 / pos.leverage) * 0.10;
+          const targetSl = this._binarySLPrice(pos, instr);
+          const bSlPct   = this.cfg.binarySlPct ?? 18;
+          const slTol    = (pos.originalEntryPrice || pos.entryPrice) * bSlPct / 100 / pos.leverage * 0.10;
           if (Math.abs(pos.slPrice - targetSl) > slTol) {
             pos.slPrice = targetSl;
-            this.log(`🌑 ${pos.symbol}: SL drift-corrected → ${fmtP(targetSl)}${this.cfg.binaryModeEnabled ? ' [Binary]' : ''}`, 'warn');
+            this.log(`🌑 ${pos.symbol}: SL drift-corrected → ${fmtP(targetSl)} [Binary]`, 'warn');
             this.persist();
           }
         }
@@ -3877,11 +3891,11 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   // Returns the final DCA trigger percent (also the SL trigger).
   _dcaFinalPct() { return 3; },
 
-  // Binary mode SL: 3% above the Add1 trigger (which is itself +3% from entry), so +6.09% from entry.
-  // Uses originalEntryPrice for consistency even after avg-down.
+  // Binary mode SL: binarySlPct % above entry (leverage-adjusted). Uses originalEntryPrice.
   _binarySLPrice(pos, instr) {
-    const base = pos.originalEntryPrice || pos.entryPrice;
-    const raw  = base * 1.03 * 1.03;
+    const bSlPct = this.cfg.binarySlPct ?? 18;
+    const base   = pos.originalEntryPrice || pos.entryPrice;
+    const raw    = base * (1 + bSlPct / 100 / pos.leverage);
     return instr ? this.snapPrice(raw, instr) : parseFloat(raw.toFixed(8));
   },
 
