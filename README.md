@@ -221,20 +221,101 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 
 ---
 
-## EDa Laggard
+## EDa (Effective Debt Adjusted) System
 
-`_electLaggard()` sets `_laggardId` to the oldest open position (by `openedAt`). `_redistributeED()` computes the EDa TP price for the laggard: the TP is raised until the laggard's projected close PnL covers both its own expected value and the collective `_lostValue` (accumulated losses from other closed positions). `currentTpPrice` on the laggard position is the singular source of truth for its TP — the watcher uses this field, not the initial TP derived from entry price.
+The EDa system distributes the financial cost of losing trades across all open positions, adjusting their take-profit targets to ensure the portfolio collectively recovers the debt. It runs in both PseudoWinter (shorts) and PseudoChaser (longs) and activates whenever `laggardCheckEnabled` is true.
+
+### Core Concepts
+
+| Term | Definition |
+|---|---|
+| **EV (Expected Value)** | The profit a position is expected to earn when it closes at its configured TP: `margin × tpPct / 100`. |
+| **LV (Lost Value)** | `_lostValue` — a running accumulator updated on every close: `_lostValue += totalPnl`. Profitable closes push it toward zero; losing closes push it negative. Snapped to 0 when it drifts above −0.01. |
+| **ED (Effective Debt)** | Per-position debt: `ED = EV − (lvShare + uPnL)`. A positive ED means the position owes more than its current unrealised value. Negative uPnL increases ED; positive uPnL reduces it. |
+| **Laggard** | Always the **oldest open position** (lowest `openedAt`). It absorbs uncapped debt and has its TP overridden by the raw EDa price. |
+| **Non-laggard** | Every other open position. Receives a capped share of lost value (up to `edaLvCapMult × EV`, default 2×). |
+| **EDa TP** | A derived TP price that, if hit, covers the position's full ED. Stored on the position as `_edaTpPrice` and written to `currentTpPrice` whenever active. |
+
+### `_updateLostValue(totalPnl)` (PseudoWinter)
+
+Called on every close. Adds `totalPnl` (net after fees) to `_lostValue`. Snaps to zero if the result is > −0.01 (eliminates floating-point drift).
+
+### `_electLaggard()` (PseudoWinter)
+
+Sets `_laggardId` to the `id` of the position with the lowest `openedAt` among all pseudo-positions. Called after every open and close. PseudoChaser uses an equivalent inline `reduce` in the EDa block.
+
+### `_redistributeED()` (PseudoWinter) / inline EDa block (PseudoChaser)
+
+Runs after every close and after `_electLaggard`. Three-step algorithm:
+
+**Step 1 — Compute EV and base ED**
+
+For each position:
+```
+p._ev = p.margin × (_baseTpPct || tpPct || entryTpRoi) / 100
+p._ed = p._ev − p.upnl
+```
+
+**Step 2 — Distribute lost value**
+
+If `_lostValue ≠ 0`, each position receives an equal per-slot share `lv / n`. Non-laggard shares are capped at `±(edaLvCapMult × _ev)`. The laggard absorbs whatever is left over — uncapped.
+
+```
+perPos = _lostValue / numPositions
+share  = clamp(perPos, −cap, +cap)   // non-laggard
+laggard._ed += (_lostValue − Σ absorbed)  // unbounded remainder
+```
+
+**Step 3 — Compute and apply EDa TP**
+
+For a short (PseudoWinter), the EDa TP is the exit price at which the position's PnL equals its ED:
+```
+pnl = (entry − exit) / entry × lev × margin = ED
+→  exit = entry × (1 − ED / (lev × margin))
+```
+For a long (PseudoChaser) the formula is additive:
+```
+exit = entry + debt × entry / (lev × margin)
+```
+
+**Assignment rules:**
+
+| Role | Rule |
+|---|---|
+| **Laggard** | Raw EDa TP applied unconditionally — can be below 3% ROI or even require a loss. Closes fast; debt recovery falls to non-laggards. |
+| **Non-laggard (normal phase)** | EDa TP only applied when it demands *more* profit than the config TP. Shorts: `min(rawEdaTp, configTp)` keeps the lower (deeper) price. Longs: `max(rawEdaTp, configTp)` keeps the higher price. |
+| **Non-laggard (reduce phase)** | Same logic, but the floor is the 3% reduce-phase TP instead of configTp. |
+| **No debt (`ED ≤ 0`)** | `_edaTpPrice` is cleared and `currentTpPrice` is restored to the phase TP. |
+
+When EDa is active, `currentTpPrice` and `tpPct` are overwritten immediately and become the single source of truth for TP checks in `pseudoWatchPositions`.
+
+### Laggard Stats UI
+
+The stats column shows per-laggard metrics: **EV**, **LV Share** (the per-position slice of `_lostValue`), **uPnL**, and derived **ED**. The EDa TP price is shown when non-zero. PseudoChaser additionally shows **Value Lost — Non-Laggards** (total and per-position share distributed to non-laggards).
 
 ---
 
 ## Lock-in State
 
-`gainerLockIn` (bullish lock-in) and `loserLockIn` (bearish lock-in) are plain objects keyed by symbol: `{ rsi6, rsi12, rsi24, setAt, trades }`.
+`gainerLockIn` and `loserLockIn` are plain objects keyed by symbol: `{ rsi6, rsi12, rsi24, setAt, trades }`. Both are refreshed at **position close** (in addition to open), so the 6-hour TTL restarts from close time.
 
-- `gainerLockIn[sym]` ratchets **up** via `Math.max` — stores the highest RSI seen at entry. Re-entry is blocked when any current RSI component falls below the stored value.
-- `loserLockIn[sym]` ratchets **down** via `Math.min` — stores the lowest RSI seen at entry. Re-entry is blocked when any current RSI component rises above the stored value.
+### PseudoWinter
 
-`_sweepExpiredData()` removes entries where `Date.now() - setAt > 6 * 3600 * 1000`.
+| Store | Direction | Ratchet | Re-entry condition |
+|---|---|---|---|
+| `gainerLockIn[sym]` | Floor (shorts on high RSI) | `Math.max` — rises each trade | RSI must be **strictly above** the floor on all three timeframes |
+| `loserLockIn[sym]` | Ceiling (shorts on low RSI) | `Math.min` — falls each trade | RSI must be **strictly below** the ceiling on all three timeframes |
+
+### PseudoChaser
+
+| Store | Direction | Ratchet | Re-entry condition |
+|---|---|---|---|
+| `gainerLockIn[sym]` | Roof (longs — blocks if RSI bounced too high) | `Math.min` — falls each trade | RSI must be **strictly below** the roof |
+| `gainerStratLockIn[sym]` | Floor (gainer-strat longs on high RSI) | `Math.max` — rises each trade | RSI must be **strictly above** the floor |
+
+**Strict inequality**: the gate blocks at-or-beyond the lock-in level, requiring RSI to move past it for re-entry. For a floor of 75, the next entry needs RSI > 75; the ratchet then sets the new floor to that entry's RSI, requiring yet higher RSI next time.
+
+`_sweepExpiredData()` removes entries where `Date.now() − setAt > 6 × 3600 × 1000`.
 
 ---
 
