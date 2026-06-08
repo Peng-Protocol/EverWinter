@@ -23,15 +23,15 @@ The system has no directional bias. PseudoWinter opens shorts; PseudoChaser open
 
 The core insight is about **meta-structure**, not individual tickers. On any given day the market moves with a character — broadly bullish, broadly bearish, or choppy. Trying to predict what any single ticker will do inside that character is hard. Reading the character itself and trading alongside it is easier, and more consistent.
 
-On a **bullish day**: gainers are likely to continue pumping, and losers are likely to revert upward. The better trades are longs — longs on gainers extending further, longs on oversold losers recovering. Shorts taken into that environment face headwind.
+On a **bullish day**: gainers are likely to continue pumping, and losers are likely to revert upward. The better trades are longs — longs on gaining momentum, longs on oversold coins recovering. Shorts taken into that environment face headwind.
 
-On a **bearish day**: gainers that ran up are likely to retrace, and losers are likely to extend further downward. The better trades are shorts — shorts on over-extended gainers, shorts on losers continuing their decline.
+On a **bearish day**: gainers that ran up are likely to retrace, and losers are likely to extend further downward. The better trades are shorts — shorts on overbought gainers, shorts on coins still in freefall.
 
-Neither system predicts the day in advance. The approach is to maintain both sides simultaneously and let drawdown throttling limit damage on the side that is wrong today. The side aligned with the day's meta-structure runs profitably; the opposing side hits its SLs cleanly and closes bounded losses. Over a session the net of both sides reflects the actual character of that day.
+Neither system predicts the day in advance. The approach is to run both sides simultaneously and let drawdown throttling limit damage on the side that is wrong today. The side aligned with the day's meta-structure runs profitably; the opposing side hits its SLs cleanly and closes bounded losses. Over a session the net of both sides reflects the actual character of that day.
 
 **Two approaches coexist within this system:**
 
-**Proactive (PseudoWinter, PseudoChaser)**: Design budget spent at the entry gate — RSI filters across timeframes, lock-in ratchets. Conservative filters mean fewer entries, cleaner setups. Binary mode bounds every position at entry with a fixed TP and SL; no DCA, no extended exposure. A missed entry is acceptable; a bad entry costs exactly the configured SL percentage and nothing more.
+**Proactive (PseudoWinter, PseudoChaser)**: Design budget spent at the entry gate — RSI filters across timeframes, lock-in ratchets. Binary mode bounds every position at entry with a fixed TP and SL; no DCA, no extended exposure. A missed entry is acceptable; a bad entry costs exactly the configured SL percentage and nothing more.
 
 **Reactive (Psycho Mode)**: Design budget spent in the exit system — DCA escalation, aggressive absorption, laggard debt tracking, cascade triggers. Entry filter is one change-percent threshold. Accepts that many entries will be wrong and structures for it mechanically. Capital headroom is the tradeoff.
 
@@ -55,64 +55,41 @@ Proactive techniques decide whether and when to enter. They filter noise from si
 
 #### RSI Gating
 
-RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's method. The multi-timeframe requirement ensures the overbought or oversold condition is present at multiple levels of resolution simultaneously — a single timeframe spike is noise; alignment across three is signal.
+RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's method. The multi-timeframe requirement ensures the condition is present at multiple levels of resolution simultaneously — a single timeframe spike is noise; alignment across three is signal.
 
-**Floor gates** confirm momentum is sufficiently developed for a mean-reversion trade to have fuel. **Ceiling gates** (used in the losers strategy) block entries where the ticker still has downward momentum — a ticker failing the ceiling is still collapsing, not stabilizing.
+**Floor gates** confirm momentum is sufficiently developed. **Ceiling gates** block entries where momentum is still running — a ticker failing the ceiling is not ready.
 
-The standard Gainers gate is **70-70-80**: RSI6 ≥ 70, RSI12 ≥ 70, RSI24 ≥ 80. RSI24 at 80 is the final gatekeeper, confirming genuine overbought conditions on the longer timeframe.
-
-RSI calibration history:
-- **70-70-70**: Too aggressive — frequent false positives on runaway pumps
-- **70-70-75**: Balanced — best risk/reward for most market conditions
-- **70-70-80**: Strictest — fewer positions, cleanest setups
-
----
-
-#### Over-Extension Detection
-
-RSI6 at or above the configured maximum (default 90) signals a parabolic, non-mean-reverting state. Standard entry is blocked — the ticker is flagged and graylisted.
-
-**RSI6 Maximum (Hard Disqualifier)**: When RSI6 ≥ the maximum, entry is blocked for that scan cycle.
-
-**3-Hour Graylist**: If any 15-minute candle in the past 3 hours had RSI6 ≥ the maximum, the ticker is graylisted for the remainder of the window. A recently over-extended ticker is prone to re-spiking rather than stabilizing — the graylist prevents premature re-entry after a parabolic move.
+The default gate is **70-70-70**: RSI6 ≥ 70, RSI12 ≥ 70, RSI24 ≥ 70. All three thresholds are configurable.
 
 ---
 
 #### Binary Mode
 
-Binary Mode is the default position structure. Each position opens with exactly one take profit and one stop loss, both set natively on the exchange at entry. No DCA orders. TP and SL percentages are configurable (default 18% both).
+Binary Mode is the default position structure. Each position opens with exactly one take profit and one stop loss set natively on the exchange at entry. No DCA orders. TP and SL percentages are configurable (default 18% both).
 
-The philosophy is a hard commitment to bounded exposure. Standard DCA accepts that a position may need runway and structures for it. Binary Mode refuses the possibility. The thesis is either right within the configured range, or wrong and closed at a fixed cost. There is no middle state of adding into an adverse move.
+The philosophy is a hard commitment to bounded exposure. The thesis is either right within the configured range, or wrong and closed at a fixed cost. There is no middle state.
 
-Binary Mode is suited to the meta-structure approach: when reading the market correctly, positions close fast at TP. When the read is wrong, positions close at a known, fixed loss and capital is immediately free for redeployment on the correct side.
+Binary Mode suits the meta-structure approach: when the read is correct, positions close fast at TP. When the read is wrong, positions close at a known, fixed loss and capital is immediately free for redeployment.
 
 ---
 
 #### Drawdown Throttling
 
-When session drawdown exceeds the configured threshold, the scan stops opening new positions. The throttle lifts automatically when PnL recovers. 
+When session drawdown exceeds the configured threshold, the scan stops opening new positions. The throttle lifts automatically when PnL recovers.
 
-Drawdown throttling is the meta-structure safety valve. A day where both sides are losing consistently signals either a choppy, untradeable environment or a wrong meta-read. Pausing new entries prevents compounding losses into a market that isn't cooperating. Once conditions improve the system resumes naturally.
+A session where both sides lose consistently signals a choppy, untradeable environment or a wrong meta-read. Pausing new entries prevents compounding losses into a market that isn't cooperating.
 
 ---
 
 #### Lock-in System
 
-After a position closes, the symbol enters a lock-in window (6-hour TTL). The lock-in records RSI levels at close and enforces a ratcheting re-entry gate:
+When a position opens, the symbol's RSI at that moment is recorded in a lock-in entry (6-hour TTL). The locked RSI acts as a gate on future re-entries: **re-entry is blocked when current RSI is at or below the locked level.** The locked value ratchets to the minimum seen across all entries within the TTL window.
 
-**Gainer Lock-in**: Roof lowers on each close — re-entry requires RSI to have cooled further than the last closing RSI. Prevents chasing a ticker that is resetting only slightly before pumping again.
+The rationale is the same for both gainer and loser lock-ins: a ticker that just moved significantly — pumped hard or collapsed hard — often spikes back in the opposite direction before resuming. You do not want to enter into that spike. By requiring RSI to be above the stored floor before re-entry, the system waits for the immediate bounce to complete rather than entering at the worst moment of the cycle.
 
-**Loser Lock-in**: Floor rises on each close — re-entry requires the ticker to be more extended than at the last close. Prevents re-entering a falling ticker that has barely bounced.
+- **Gainer lock-in** (used by the Gainers strategy): after shorting an overbought coin and closing, re-entry into that ticker is blocked unless RSI has climbed higher than the stored floor. The coin must pump further — to a more extreme overbought level — before it is a valid candidate again.
 
-The ratchet is one-directional and accumulates: three closes on the same symbol tighten the gate three times. Re-entry after a lock-in is always at genuinely better conditions than the last entry — not just the same conditions repeated.
-
----
-
-#### Margin Size Hierarchy
-
-Each strategy receives a different slot size based on its perceived conviction, positions that have higher filters and trade cleanly deserve more margin.
-
-Positions are scaled at 1×, 2×, and 3× slot usage — a 2× position uses twice the configured base notional. This maximizes capital efficiency on high-conviction entries while keeping lower-conviction entries lean.
+- **Loser lock-in** (used by the Losers strategy): after shorting a declining coin and closing, re-entry is blocked unless RSI is above the stored floor. The coin must bounce — RSI must recover — before shorting it again. This prevents re-entering a deeply oversold ticker that is about to spike.
 
 ---
 
@@ -165,7 +142,7 @@ The laggard is the weakest position in the book, selected by either age (oldest 
 
 Each position opens with an expected profit at close. The laggard's target is buffered by 50% (configurable). Every subsequent close — win or loss — feeds realized PnL into a shared tally. When the laggard's own unrealized PnL, combined with everything the rest of the book has closed, clears that buffered target, the laggard is released.
 
-**EDa TP (Effective Debt Adjusted Take Profit)**: When collective debt exists, each position's TP is adjusted so its close contributes to debt recovery. The EDa TP is the singular source of truth for the laggard's exit — it overrides standard TP calculation and cannot be drifted or manually overridden below it.
+**EDa TP (Effective Debt Adjusted Take Profit)**: When collective debt exists, the laggard's TP is adjusted so its close recovers enough to offset the shared debt. The EDa TP is the singular source of truth for the laggard's exit — it overrides standard TP and cannot be drifted below it.
 
 ---
 
@@ -189,7 +166,7 @@ When the timer fires, the queued stage's price is checked against current price.
 
 When the final DCA stage fills and absorption has reduced position margin significantly below expected cumulative margin, the stage count is recalibrated and new DCA orders are queued from current price. SL is deferred until the recalibrated count fills.
 
-**Passive Second Wind**: When absorption reaches the margin floor, accumulated saved margin funds additional DCA stages placed 6% above the prior stage. Saves margin the position has already shed and converts it into continued runway — no new capital from the book.
+**Passive Second Wind**: When absorption reaches the margin floor, accumulated saved margin funds additional DCA stages placed 6% above the prior stage — no new capital from the book.
 
 ---
 
@@ -225,50 +202,41 @@ Each strategy is a specific combination of techniques.
 
 ### Gainers Strategy
 
-**"False negatives are acceptable. False positives cost the fixed SL and nothing more."**
+The Gainers strategy targets coins showing strong upward momentum. Entry requires RSI alignment across all three timeframes above the configured floor gates, confirming the move is developed and not a single-candle spike.
 
-Gainers identifies coins showing strong upward momentum and opens positions betting on mean reversion. In PseudoWinter (shorts), the bet is that the pump exhausts and price reverts. In PseudoChaser (longs), the Gainers logic is adapted to enter oversold conditions — the mirror of the same exhaustion thesis applied to falling assets.
+**PseudoWinter (short)**: The biggest 24h gainers are filtered for RSI6/12/24 ≥ the configured floors. A short is opened betting the pump either exhausts and reverts, or at minimum pulls back enough to close at TP. On bearish days this is a high-probability setup — pumped coins face the full weight of the broader trend. On bullish days it still works but the move must be genuinely overbought across all timeframes to qualify, and the binary SL caps damage if the pump extends instead.
 
-The strategy performs best when the meta-structure is aligned: on bearish days, pumping gainers are fighting the trend and reversions come faster and cleaner. On bullish days the same setup works but requires more patience.
+**PseudoChaser (long)**: The same RSI structure is applied to find coins with strong upward momentum on all timeframes — coins already gaining that RSI suggests have further room. A long is opened betting the momentum continues. On bullish days this is naturally aligned with the meta-structure. On bearish days, qualified gainers are still gaining against the trend, so the RSI gate acts as a genuine strength filter — only real outliers qualify.
 
 **Entry assembles:**
-- RSI Gating at 70-70-80 — strictest configuration; RSI24 at 80 is the final gatekeeper
-- Over-Extension Disqualifier (RSI6 ≥ maximum blocks entry)
-- Over-Extension Graylist (any OE hit in the past 3 hours blocks entry)
-- Gainer Lock-in check (ratcheted RSI roof from prior closes on this symbol)
+- RSI floor gating across RSI6, RSI12, RSI24
+- Gainer lock-in check — re-entry into a recently closed symbol blocked unless RSI has risen above the stored floor
 
 **Position management:**
 - Binary Mode — TP and SL set at entry, no DCA
-- Drawdown throttle cuts new entries if session loss exceeds threshold
+- Drawdown throttle
 - EDa TP overrides standard TP for the laggard when collective debt exists
-- Lock-in bump on close — ratchets the re-entry gate for this symbol
-
-**1× slot usage by default.**
-
-The lock-in ratchet is the long-term filter for the Gainers strategy. Over many closes on the same symbol, the system builds a picture of what RSI levels represent genuine exhaustion on that ticker versus shallow pullbacks. Re-entry conditions tighten automatically with each trade, without manual adjustment.
+- Gainer lock-in bump on open — records entry RSI, ratchets the re-entry gate
 
 ---
 
 ### Losers Strategy
 
-**"On bearish days the biggest losers are usually still falling. On bullish days they're usually reverting. Trade accordingly."**
+The Losers strategy targets coins showing strong downward momentum. Entry requires RSI alignment across all three timeframes below the configured ceiling gates, confirming the decline is sustained and not a brief dip.
 
-Losers identifies coins showing strong downward momentum. In PseudoWinter (shorts), the bet is on trend continuation — the ticker is already falling and RSI alignment confirms the decline has further to go. In PseudoChaser (longs), the same watchlist is monitored for oversold conditions where a reversal is due.
+**PseudoWinter (short)**: The biggest 24h losers are filtered for RSI6/12/24 ≤ the configured ceilings. A short is opened betting the decline continues. On bearish days the full meta-structure supports the trade. On bullish days even the weakest coins tend to recover — the binary SL limits damage to the configured percentage and exits cleanly.
 
-The Losers strategy is the complement to Gainers in the meta-structure framework. Gainers is a mean-reversion thesis; Losers is a trend-continuation thesis. On bearish days both strategies align in the same direction. On bullish days they can work against each other — this is acceptable; the lock-in and drawdown throttle limit re-entry and total exposure.
+**PseudoChaser (long)**: The strategy is applied to coins that have been falling significantly and are now deeply oversold across all three RSI timeframes. A long is opened betting on a reversal — the selling pressure is exhausted and a bounce is due. On bullish days oversold coins snap back hard. On bearish days the bounce may be shallow, but the binary TP and SL define the exact outcome either way.
 
-**Entry assembles (PseudoWinter — shorts on losers):**
-- RSI Ceiling Gating — RSI6, RSI12, RSI24 must all be ≤ configured ceiling thresholds, confirming sustained downward momentum across timeframes
-- Loser Lock-in check (ratcheted RSI floor from prior closes on this symbol)
-- Over-Extension Disqualifier applied from the short side (RSI too oversold can signal exhaustion rather than continuation)
+**Entry assembles:**
+- RSI ceiling gating across RSI6, RSI12, RSI24 — all timeframes must be at or below their configured ceiling
+- Loser lock-in check — re-entry into a recently closed symbol blocked unless RSI has risen above the stored floor
 
 **Position management:**
 - Binary Mode — TP and SL set at entry, no DCA
 - Drawdown throttle
-- EDa TP for laggard when collective debt exists
-- Loser lock-in bump on close — ratchets the RSI floor for re-entry
-
-**1× slot usage by default.**
+- EDa TP overrides standard TP for the laggard when collective debt exists
+- Loser lock-in bump on open — records entry RSI, ratchets the re-entry gate
 
 ---
 
@@ -311,19 +279,19 @@ Each position uses exactly the configured notional. No DCA means no additional m
 | 10 | $6 | $1 | $10 |
 | 10 | $12 | $2 | $20 |
 
-Sizing for binary mode is simple: `total margin = positions × (notional / leverage)`. Size notional so total margin across all positions is within comfortable loss tolerance, since binary SL means all positions could close at max loss simultaneously on an extreme adverse day.
+Sizing for binary mode is simple: `total margin = positions × (notional / leverage)`. Size notional so total margin across all positions is within comfortable loss tolerance — binary SL means all positions could close at max loss simultaneously on an extreme adverse day.
 
 **Psycho Mode (PsychoWinter):**
 
-DCA structure adds margin at each subsequent stage, so a position that fully DCA'd through all adds will consume significantly more.
+DCA structure adds margin at each subsequent stage.
 
 **Margin requirements for 10 open positions at $6 notional (3-stage flat):**
 
 | Scenario | Stages Used | Margin per Position | Total Margin |
 |---|---|---|---|
-| Pessimistic | 0 → 2 (three stages) | $3 | $30 |
-| Moderate | 0 → 1 (two stages) | $2 | $20 |
-| Optimistic | 0 only (entry) | $1 | $10 |
+| Pessimistic | 0 → 2 | $3 | $30 |
+| Moderate | 0 → 1 | $2 | $20 |
+| Optimistic | 0 only | $1 | $10 |
 
 **Sizing formula (Psycho Mode)**: notional = balance × inverse ratio × leverage
 
@@ -340,8 +308,6 @@ DCA structure adds margin at each subsequent stage, so a position that fully DCA
 ## Conclusion
 
 These strategies are designed for automation. The mental overhead of manually tracking RSI gates across three timeframes, lock-in ratchet state per symbol, drawdown throttle thresholds, EDa TP adjustments across multiple open positions, and simultaneous management of a full position book is overwhelming in real time. Automation handles it without error.
-
-Within these constraints the proactive strategies (Gainers, Losers) yield clean, bounded trades that compound over time with minimal capital exposure per position. Psycho Mode provides high-throughput reactive exposure for traders comfortable with wider drawdown in exchange for more simultaneous activity.
 
 The meta-structure approach means neither side needs to be right all day — just more right than wrong over a session. Drawdown throttling enforces a hard floor on any session's loss. The system works best when you let it run and resist the impulse to override.
 
