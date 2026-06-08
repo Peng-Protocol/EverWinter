@@ -1,6 +1,6 @@
-# ❄️☀️ WINTER-CHASER
+# ❄️ EVERWINTER
 
-**Winter-Chaser** is a dual-direction, browser-based trading system for Bybit USDT Perpetuals. It ships as two independent simulation bots — **PseudoWinter** (shorts) and **PseudoChaser** (longs) — each upgradeable to live trading via a plugin. Both target mean-reversion and trend-continuation opportunities using multi-timeframe RSI gating, binary mode risk management, and drawdown throttling. See the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md) for entry logic and rationale.
+**EverWinter** is a dual-direction, browser-based trading suite for Bybit USDT Perpetuals executing the **Winter-Chaser** strategy. It ships as two independent simulation bots — **PseudoWinter** (shorts) and **PseudoChaser** (longs) — each upgradeable to live trading via a plugin. Both target mean-reversion and trend-continuation opportunities using multi-timeframe RSI gating, binary mode risk management, and drawdown throttling. See the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md) for entry logic and rationale.
 
 ---
 
