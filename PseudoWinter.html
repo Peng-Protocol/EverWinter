@@ -994,6 +994,15 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
         <div style="font-family:var(--mono);font-size:10px;letter-spacing:2.5px;color:var(--text-lo);text-transform:uppercase;opacity:0.45">Choose your destiny</div>
       </div>
 
+      <div data-plugin-slot="config-bottom"></div>
+
+      <!-- ── Plugin Manager link ── -->
+      <div style="padding:10px 16px 6px;text-align:center">
+        <button @click="_pluginMgrOpen=true" style="background:none;border:none;font-family:var(--mono);font-size:9px;color:var(--text-lo);letter-spacing:1.5px;cursor:pointer;opacity:0.5;text-transform:uppercase;transition:opacity 0.2s" @mouseenter="$el.style.opacity='1'" @mouseleave="$el.style.opacity='0.5'">
+          ⊕ Plugin Manager <span x-show="_pluginList.length>0" style="color:var(--ice)" x-text="'('+_pluginList.length+')'"></span>
+        </button>
+      </div>
+
     </div>
 
     </div>
@@ -1022,6 +1031,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             </div>
           </div>
         </div>
+        <div data-plugin-slot="account-bar-extra"></div>
       </div>
 
       <!-- Scan + Refresh bar -->
@@ -1714,6 +1724,10 @@ function pw() { return {
   _volBaseline:   {}, // symbol → { volume24h, turnover24h, lastPrice, ts } — seeded from bulk ticker in runScan
   _symData:       {}, // symbol → { rsi6, rsi12, rsi24, fundingRate, volMomPct, lastPrice, ts } — single source of truth for per-symbol live data; written by any fetch path, read by all watchlists/display
   cfgOpen: { general: false, gainers: false, losers: false }, // accordion open state
+  _pluginMgrOpen: false,
+  _pluginList: [],
+  _pluginConflicts: [],
+  _pluginFileErr: '',
   showDangerZone: false,    // toggle for destructive action buttons in Persistence section
   showImportConfirm: false, // toggle for import data confirmation modal
   showExportMenu: false,    // toggle for export type selection popup
@@ -1736,6 +1750,7 @@ function pw() { return {
   init() {
     if (this._initDone) return;
     this._initDone = true;
+    this._pluginInit();
     try {
       document.getElementById('pw-load-status').textContent = 'LOADING SAVED STATE...';
       this.loadSaved();
@@ -4397,7 +4412,142 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     this.log(`⚡ Bail complete.`, 'warn');
   },
 
+  _pluginInit() {
+    if (!window.__pluginSystem) return;
+    this._pluginList = window.__pluginSystem.load();
+    this._pluginConflicts = window.__pluginSystem.checkConflicts(this._pluginList);
+  },
+  _pluginRemove(id) {
+    this._pluginList = this._pluginList.filter(p => p.id !== id);
+    window.__pluginSystem.save(this._pluginList);
+    this._pluginConflicts = window.__pluginSystem.checkConflicts(this._pluginList);
+  },
+  _pluginLoad(event) {
+    this._pluginFileErr = '';
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        delete window.__BotPlugin;
+        new Function(e.target.result)();
+        const plug = window.__BotPlugin;
+        if (!plug || !plug.id) throw new Error('No valid __BotPlugin export found');
+        const entry = {
+          id: plug.id,
+          name: plug.name || plug.id,
+          version: plug.version || '0.0.0',
+          targetBot: plug.targetBot || '',
+          after: plug.after || [],
+          before: plug.before || [],
+          conflicts: plug.conflicts || [],
+          requires: plug.requires || [],
+          touches: plug.touches || [],
+          css: plug.css || '',
+          slots: plug.slots || {},
+          transformSrc: plug.transform ? plug.transform.toString() : '',
+        };
+        const existing = this._pluginList.findIndex(p => p.id === entry.id);
+        if (existing >= 0) this._pluginList.splice(existing, 1, entry);
+        else this._pluginList.push(entry);
+        window.__pluginSystem.save(this._pluginList);
+        this._pluginConflicts = window.__pluginSystem.checkConflicts(this._pluginList);
+        event.target.value = '';
+        this.log(`[Plugin] Loaded "${entry.name}" v${entry.version}. Reload to activate.`, 'info');
+      } catch(err) {
+        this._pluginFileErr = err.message;
+        event.target.value = '';
+      }
+    };
+    reader.readAsText(file);
+  },
+
 };}
+
+// ─── PLUGIN SYSTEM ───────────────────────────────────────────────────────────
+(function _pluginSystem() {
+  const _PS_KEY = '__pw_plugins_v1';
+
+  function _psLoad() {
+    try { return JSON.parse(localStorage.getItem(_PS_KEY) || '[]'); }
+    catch(e) { return []; }
+  }
+
+  function _psSort(plugins) {
+    const ids = new Set(plugins.map(p => p.id));
+    const prereqs = {};
+    for (const p of plugins) prereqs[p.id] = new Set();
+    for (const p of plugins) {
+      for (const dep of (p.after || [])) { if (ids.has(dep)) prereqs[p.id].add(dep); }
+      for (const dep of (p.before || [])) { if (ids.has(dep)) { if (!prereqs[dep]) prereqs[dep] = new Set(); prereqs[dep].add(p.id); } }
+    }
+    const order = [], visited = new Set();
+    const queue = plugins.filter(p => prereqs[p.id].size === 0).map(p => p.id);
+    visited.add(...(queue.length ? queue : []));
+    while (queue.length) {
+      const cur = queue.shift();
+      order.push(cur);
+      for (const p of plugins) {
+        if (!visited.has(p.id) && prereqs[p.id].has(cur)) {
+          prereqs[p.id].delete(cur);
+          if (prereqs[p.id].size === 0) { visited.add(p.id); queue.push(p.id); }
+        }
+      }
+    }
+    return order.length === plugins.length ? order.map(id => plugins.find(p => p.id === id)) : plugins;
+  }
+
+  window.__pluginSystem = {
+    KEY: _PS_KEY,
+    load: _psLoad,
+    sort: _psSort,
+    save(plugins) { localStorage.setItem(_PS_KEY, JSON.stringify(plugins)); },
+    checkConflicts(plugins) {
+      const warns = [];
+      const ids = new Set(plugins.map(p => p.id));
+      for (const p of plugins) {
+        for (const cid of (p.conflicts || [])) { if (ids.has(cid)) warns.push(`"${p.name}" conflicts with "${cid}"`); }
+        for (const rid of (p.requires || [])) { if (!ids.has(rid)) warns.push(`"${p.name}" requires "${rid}" (not loaded)`); }
+      }
+      return warns;
+    }
+  };
+
+  const stored = _psLoad();
+  if (!stored.length) return;
+
+  const sorted = _psSort(stored);
+
+  for (const p of sorted) {
+    if (!p.css) continue;
+    const s = document.createElement('style');
+    s.setAttribute('data-plugin-id', p.id);
+    s.textContent = p.css;
+    document.head.appendChild(s);
+  }
+
+  const _origPw = pw;
+  window.pw = function() {
+    let def = _origPw();
+    for (const p of sorted) {
+      if (!p.transformSrc) continue;
+      try {
+        const fn = new Function('return (' + p.transformSrc + ')')();
+        def = fn(def);
+      } catch(e) { console.error('[Plugin] "' + p.id + '" transform failed:', e); }
+    }
+    return def;
+  };
+
+  for (const p of sorted) {
+    if (!p.slots) continue;
+    for (const [slot, html] of Object.entries(p.slots)) {
+      document.querySelectorAll('[data-plugin-slot="' + slot + '"]').forEach(el => {
+        el.insertAdjacentHTML('beforeend', html);
+      });
+    }
+  }
+})();
 </script>
 
 </div><!-- #pw-app -->
