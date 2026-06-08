@@ -1,261 +1,263 @@
 # ❄️ EVERWINTER
 
-**EverWinter** is a single-file, browser-based bot for Bybit USDT Perpetuals targeting mean-reversion on top gainers via multi-timeframe RSI gating, tiered DCA, and a risk management suite. See the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md) for entry logic and rationale.
+**EverWinter** is a browser-based trading suite for Bybit USDT Perpetuals executing the **Winter-Chaser** strategy. See the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md) for trading logic and rationale.
 
 ---
 
-## Technical Stack
+## Files
 
-- **Frontend:** Alpine.js, Bootstrap 5, "Glacier-Void" CSS theme
-- **API:** Bybit V5 REST (`category: linear`)
-- **Architecture:** Single-file HTML/JS — no build step, no backend. All API calls go directly to Bybit.
-- **Persistence:** `localStorage` — config, session stats, trade history, and positions survive page reloads.
-- **Credentials:** Keys held in volatile Alpine state; never transmitted outside `api.bybit.com`.
-
----
-
-## Getting Started
-
-1. Download `EverWinter1.0.html` and open it in any modern desktop or mobile browser.
-2. Generate a Bybit API key with **Contract/Derivatives** read + trade permissions.
-3. Enter the key pair in the API panel, configure leverage and margin, then click **Start Bot**.
+| File | Description |
+|---|---|
+| `PseudoWinter.html` | Shorts-only simulation bot (Glacier-Void theme) |
+| `PseudoChaser.html` | Longs-only simulation bot (Ember-Void theme) |
+| `PsychoWinter1.0.html` | Reactive approach standalone bot |
+| `ChartWinter.html` | Chart and scan research tool |
+| `plugins/modes/EverWinter.html` | Live trading plugin for PseudoWinter |
+| `plugins/modes/SunChaser.html` | Live trading plugin for PseudoChaser |
 
 ---
 
-## Position Types
+## Architecture
 
-EverWinter operates (4) distinct position archetypes:
+Each bot is a single self-contained HTML file. No build step, no backend, no server. All logic is inline JavaScript; Alpine.js and Bootstrap 5 are loaded from CDN at runtime.
 
-* **Standard Gainer**
-* **Advanced Follow-Through (ADV FT)**
-* **Fund Chasing (FUN)**
-* **Sale Fishing (SalF)**
+**Component pattern**: A plain function (e.g. `pw()`) returns the Alpine component definition object. `Alpine.data()` is not used — the function is referenced directly in the `x-data` attribute. The CDN script tag comes last in the file so Alpine finds the function already defined.
 
-All explained in the [Strategy Guide](https://github.com/Peng-Protocol/EverWinter/blob/main/Strategy_book.md). ADV FT, FUN, and SalF carry a unique badge; Standard Gainers carry none.
+**Timer architecture**: Four module-level variables (`_cdTimer`, `_watchTimer`, `_refreshTimer`, `_audioTimer`) hold timer handles outside the Alpine proxy. This prevents Alpine from wrapping them in reactive proxies, which would break `clearInterval`.
 
----
-
-## Watchlists
-
-
-### Temporary Symbol Banlist
-Banlist entries now store `{ reason, setAt }`, expire after one week, and are pruned as they are checked. Legacy string-only banlist entries are intentionally dropped on the next app launch so previously permanent bans are re-evaluated against current exchange tradability.
-
-### Potential Entries Watchlist
-Symbols within a configurable RSI shortfall of the full entry gate (default 3%). The 5-second poller re-checks all gates and opens immediately on qualification — no waiting for the next full scan. Tickers failing other filters (OE, funding, volume divergence) are evicted mid-watch.
-
-### Follow-Through Watchlist
-ADV FT candidates only, rebuilt each scan from the persisted `ftCandidates` roster. Shows status per candidate with OE hit count (⚡) and trades opened. When full, eviction priority is lowest FR first, then oldest.
+**Module-level state**: `_closingIds` (Set), `_klineCache` (object), `_instrCache` (object), `_auditRunning`, `_auditPromise` are all declared outside the Alpine component. They are shared across all method calls for the lifetime of the page.
 
 ---
 
-## Pollers
+## Timers and Cycle Timing
 
-### Scan Countdown (`_cdTimer`)
-Fires every second; triggers the full scan when it reaches zero.
+| Timer | Interval | Purpose |
+|---|---|---|
+| `tick` counter | 1 s (`setInterval`) | Drives reactive countdown displays in the template |
+| `_watchTimer` | 5 s (`setInterval`) | Calls `pseudoWatchPositions()` continuously |
+| `_cdTimer` | 1 s (`setInterval`) | Checks whether `scanMins` has elapsed; fires `runScheduledCycle()` when due |
+| `_refreshTimer` | Varies | UI refresh for account balance (live mode only) |
 
-### Position Watcher (`_watchTimer`)
-Fires every 5 seconds. Handles TP drift, phase transitions, DCA stage progression, and SL placement.
+`scanMins` is user-configurable (5–60, default 15). The scan bar in the UI shows elapsed time as a shrinking fill, computed from `Date.now() - bot.lastScanAt`.
 
-### Potential Entries Poller (`_potEntryTimer`)
-Fires every 5 seconds. Kline cache is force-evicted per symbol on every tick to prevent stale reads.
+`runScheduledCycle()` is guarded by `_cycleRunning` to prevent re-entrant execution. `pseudoWatchPositions()` is not guarded — it is designed to be interruptible and idempotent.
 
-### Market Refresh
-Manual-only in PseudoWinter via the **Refresh** button. Calls `pseudoWatchPositions()` and `watchPotentialEntries()` on demand.
-
-### Audio Keepalive (`_audioTimer`)
-Fires every 25 seconds; replays a silent clip to keep `AudioContext` alive on Android. The **SYNC** indicator blinks orange on interruption.
+On `visibilitychange` (tab returns to foreground): if a scan is overdue, it fires immediately; open positions are re-watched; the keepalive timer is resumed.
 
 ---
 
-## Scan Behaviour
+## Scan Cycle (`runScheduledCycle`)
 
-### 1. Gainers Scan (`runScan`)
-1. **Ticker fetch** — all USDT perpetuals in one bulk call; funding rates and 24h volume seeded into kline cache.
-2. **Gainer filter** — positive-change, non-BTC, price ≥ $0.001, sorted by 24h change. Top `topN + 10` retained; only `topN` evaluated.
-3. **Per-symbol gates** — symbol banlist → ADV FT graylist → extender graylist → funding → high/low volume divergence → RSI proximity block → RSI6 max → RSI gate triplet (RSI6/RSI12/RSI24).
-4. **Historical look-back** — ADV FT–eligible symbols with an OE this cycle are graylisted; no gainer entry opens.
+1. `_sweepExpiredData()` — evicts lock-in entries past their 6h TTL, expired banlist entries (7-day TTL), and expired potential-gainers/losers watchlist entries.
+2. Drawdown throttle check — if halted, returns early.
+3. `runScan()` — fetches all USDT perpetual tickers in a single bulk call (`GET /v5/market/tickers?category=linear`), filters and ranks them, then evaluates per-symbol gates for each candidate (banlist, lock-in, RSI). Qualifying symbols open positions up to `maxPos`.
+4. `bot.lastScanAt` updated; `bot.lastScan` set to human-readable timestamp.
 
-### 2. FUN Scan
-Runs inline after the gainers pass using the same bulk fetch. Per candidate: symbol banlist → position check → FR classification → slot check → FR gate (lock-in in Super FUN, creep in normal) → RSI6 OE look-back → loser OE reclassification → RSI6 proximity block → RSI minimum gate (RSI6/RSI12/RSI24 all ≥ `funRsiMin`, default 25) → vol momentum gate → LSA check for losers.
-
-### 3. ADV FT Scan (`scanFollowThroughs`)
-Runs against `ftCandidates` after `runScan`. Per symbol: funding → RSI floor (> 45) → RSI6 ceiling (< 75) → Close Confirmation (≥3 of last 4 15m bars red) → LSA band. ClC and LSA reuse `_klineCache[${symbol}_15]` — no extra fetch.
-
-### 4. SalF Scan (`runSalfScan`)
-Separate pass each cycle; evaluates gainers and losers pools. Per symbol: banlist → position check → funding → RSI floor → red candle count (≥3 of last 4) → LSA gate (VM ≥ `sfLsaMin` floor, raised per close by LSA Creep). VM sourced from `_symData` seeded by bulk ticker pass — no extra fetch.
-
-### 5. Extender Ticks
-Once per cycle, tracked symbols within their 3h TTL fetch a fresh RSI6 and bump if still extended. Kline cache freshness is candle-boundary based: entries reuse until `lastCompletedTs` falls behind the current 15m boundary, then refresh automatically on the next close.
+The bulk ticker call is reused for funding rate seeding and 24h change data. A second per-symbol ticker call is made only when a single-symbol price is needed (e.g. position watcher mark-price check).
 
 ---
 
-## Order Execution
+## Position Watcher (`pseudoWatchPositions`)
 
-### Take Profit Orders
-TPs are placed as **GTC Limit Buy reduceOnly** orders — fills as maker, no market-order slippage on trigger. Each position tracks `tpOrderId`; the order is cancelled and replaced whenever the TP target changes. Any exchange-native TP on a position is cleared on first limit-TP placement. (Note; The bots use exchange native TPs as a precaution, then cancel them when a limit can be successfully placed. The exception is reduce phase which purely uses limit orders to prevent race conditions if immediately triggered). 
+Runs every 5 s. For each open position:
 
-### Entry and Close Orders
-Entries are **Market**. Force/manual closes are **Limit IOC** at `markPrice × 1.001`, falling back to Market if no mark is available. DCA adds are **conditional limit** (stop-limit) at the configured add price.
+- Computes unrealized PnL from current mark price vs entry price.
+- Checks TP and SL conditions against mark price.
+- Runs whiplash audit: when mark price is within `whiplashProximityPct` of TP, fetches 1-minute klines over the last ~6 minutes to confirm whether TP was touched (catches cases where price spiked through TP between watcher cycles).
+- Checks funding rate drop condition if enabled.
+- Checks runtime deadline (`runtimeHours`) and TP-reduce phase (`tpReduceMins`).
 
-### Phase Management
-
-**Take Profit Configuration & Debt Management**
-Target profit boundaries are established dynamically, but execution logic heavily depends on the presence of collective debt and the active lifecycle phase. The bot adheres to the following procedural hierarchy:
-* **Entry Phase:** The initial TP is set strictly at the time of position creation based on the configured ROI parameter.
-* **Reduce Phase (No Debt):** If there is no collective debt, the `reduce` phase is respected and the profit target is overridden to a hard 3% floor to facilitate safe exits.
-* **Debt Override (EDa TP):** If collective debt exists, the Effective Debt adjusted (EDa) TP configuration acts as an absolute override. The EDa TP is enforced across all phases (including normal and reduce), ensuring systemic debt recovery takes priority over standard lifecycle targets.
+A full-ticker batch fetch inside the watcher is throttled to at most once per 15 s (`TICKER_THROTTLE_MS`). Per-symbol kline fetches use a 60 s in-memory cache (`_klineCache`).
 
 ---
 
-## Loss Absorption (Passive)
+## RSI Computation
 
-Passive absorption is now **uPnL-based**, not timer-based. On each position-management tick, a position is eligible for one base-margin cut only when unrealized PnL is below its loss threshold and the 30s per-position cooldown has elapsed. FUN positions use a fixed threshold of `-(baseMargin × 0.25)`; FT/AdvFT/SalF scale by slot weight (`-(baseMargin × 0.25 × slots)`). Cuts stop at the stage-based minimum margin floor: below DCA stage 2 the floor scales with strategy size, and at stage 2+ it collapses to one base margin.
+`calcRSI(closes, period)` implements Wilder's smoothing method:
+1. Seed average gain and average loss from the first `period` changes.
+2. Apply Wilder's EMA (`(prev × (n−1) + curr) / n`) for each subsequent close.
+3. Return `100 − (100 / (1 + avgGain/avgLoss))`.
 
-### Saved Margin (`_savedMargin`)
-Each cut accumulates `cutMgn = cutQty × entryPrice / leverage` into `pos._savedMargin` after subtracting absorbed loss. Visible in the activity log as `| saved $X.XX`.
-
-**Ruleset**
-The bot employs a staged approach to unrealized loss absorption to optimize capital efficiency. Execution scales based on the current DCA depth of the position:
-* **Stage 1 or Lower:** The bot(s) maintain the relative position minimum margin. Absorption logic is throttled to prevent unnecessary capital drain on positions hovering near the entry price.
-* **Stage 2 and Beyond:** The system aggressively escalates to "cutting to the bone." The bot absorbs the position down to the base notional, minimizing exposure on deeply extended trades.
-
-### Passive Second Wind
-Fires when absorption is due but the position is at minimum margin and `_savedMargin > 0`. Computes `extraStages = floor(_savedMargin / baseMargin)` and places that many conditional orders above the last stage trigger at 6% compounding increments, each stamped `_secondWind: true`. After activation: `_stageCount` expands, SL is recomputed to the new highest stage, and the interval resets to relative stage 0 from `_secondWindBaseStage` — the bot re-earns faster intervals as second-wind stages fill.
-
-### Infinite Second Wind (toggle, default on)
-When enabled, second wind re-fires each time enough margin has been saved since the last activation — there is no single-use cap. Savings from every absorbing position are pooled across all open positions' `_savedMargin`, so every position can accumulate second-wind runway funded by the whole book. The laggard's `runtimeHours` force-close is suspended, letting it run until its EDa TP is hit.
-SW creation is capped, only 6 DCA orders can exist at a time. 
+RSI6, RSI12, RSI24 each use this function with `period = 6`, `12`, `24` on 60-minute kline close prices. Klines are fetched as `interval=60&limit=30` — 30 hourly candles, enough for RSI24 warmup with 6 extra candles.
 
 ---
 
+## Persistence
 
-## Congestion Auto-Reduce
+### PseudoWinter
 
-When **Laggard Auto-Reduce** is enabled and open positions reach `laggardAutoReduceThreshold` (or `maxPos`), positions are pushed into reduce phase early.
+| Key | Contents |
+|---|---|
+| `pw_v1` | `cfg`, `positions`, `sess`, `closedTrades`, `bot.startTime/lastScan/lastScanAt`, `gainerLockIn`, `loserLockIn`, `symbolBanlist`, `lostValue`, `laggardId` |
+| `pw_v1_log` | Activity log array (capped at 300 entries) |
+| `__pw_plugins_v1` | Serialized plugin list (see Plugin System) |
 
-- Positions already at effective TP ROI `≤ 3%` (including TP ingress-reduced entries) are skipped — they are already at reduce-floor TP.
-- If EDa is not valid/placeable on that tick, it falls back to native **3% TP**.
+### PseudoChaser
 
-This means congestion can fire correctly while making no visible TP change on positions already at 3%.
+| Key | Contents |
+|---|---|
+| `pc_v1` | Same structure as `pw_v1` |
+| `pc_v1_log` | Activity log array |
+| `__pw_plugins_v1` | Plugin list (same key, separate namespace per page origin) |
 
----
+### PsychoWinter
 
-## Stats Menu
+| Key | Contents |
+|---|---|
+| `psychowinter_v1_cfg` | Config object |
+| `psychowinter_v1_pseudo` | Positions and session state (simulation) |
+| `psychowinter_v1_live` | Positions and session state (live) |
+| `psychowinter_v1_pseudo_log` / `_live_log` | Activity logs |
 
-### Session
-Trade count, wins, losses, win rate, net PnL, Force Closes, and TP Reduces. Resets on **Clear Stats** or bot restart; survives page reload.
+### ChartWinter
 
-### FUN Lock-in
-FUN now runs as Super FUN only. Each FUN close stamps a minimum FR re-entry gate for that symbol (`funFundingHigh` for HFG/HFL/OE, `funFundingLow` for LFG/LFL). At 1+ closes in the 6h window: fast absorption activates on any open FUN position; with absorption off, re-entry is deferred entirely.
+| Key | Contents |
+|---|---|
+| `cw_v1` | Config, pinned tickers, saved price/candle lines per symbol |
 
-### TP Ingress
-Per-symbol TP reduction for non-Gainer strategies. Each close multiplies the stage-0 TP by `0.5^count`, floored at `minTpRoi` (default 3%). Resets after a 3h TTL.
+### Live Trading Plugins
 
-### SalF Creep
-Per-symbol LSA floor raising after SalF closes. Floor increases by `sfLsaMin × sfMedianCreepPct%` per close — re-entry requires stronger buying conviction as selling pressure weakens. 6h TTL.
+| Key | Contents |
+|---|---|
+| `__ew_creds` | `{ key, secret }` for EverWinter (Bybit API credentials) |
+| `__sc_creds` | `{ key, secret }` for SunChaser |
 
-### Activity Log
-300-entry capped feed; colour-coded: `scan` (light blue), `trade` (ice blue), `success` (green), `warn` (amber), `error` (red), `info` (muted). Cleared on **Clear Stats**.
-
-### Persistence
-Full-state export/import (config, stats, trades, positions). Import overwrites all local data; open positions re-sync on next connect.
-
----
-
-## Trades Menu
-
-Reverse-chronological feed of closed positions: symbol, entry/exit price, DCA stage, duration, PnL, close reason. Rendered via `renderTradeFeed()`, not Alpine `x-for`, to avoid reactivity issues on large lists. Old cards are rolled up into a period card as the list grows.
-
-> **Accounting Notice:** To maintain total transparency between session data and visible history, all absorption cuts are recorded and rendered as distinct PnL cards directly within the live trade feed.
-
----
-
-## PseudoWinter (Simulation Mode)
-
-PseudoWinter runs the complete EverWinter logic against live market data with phantom capital — no API key required, no real orders. Funding fees are deducted from simulated PnL. Works from `file://` protocol where Bybit's public API would reject cross-origin requests.
+`persist()` is called on every config change and after every position open/close. The activity log is written separately to keep the main key small. `closedTrades` is compacted before write (oldest entries pruned first) to avoid hitting localStorage size limits.
 
 ---
 
-## PseudoChaser
+## Bybit API Endpoints
 
- `PseudoChaser.html` is an intentional imitation of PseudoWinter but with a longs-only bias and flipped criteria for entry. It uses the same strategies but with a few tweaks; standard gainers enter at oversold levels. Fund Chasing uses negative funding rates, all funding rates across the app are flipped. SalF uses inverted LSA (LBA — buying volume anomaly) and green ClC. The UI is color flipped as well, going from icy blue/teal to dim tan/orange. 
+All calls target `https://api.bybit.com` with `category=linear`.
 
- ---
+### Public (no auth required)
 
-## PsychoWinter
+| Endpoint | Usage |
+|---|---|
+| `GET /v5/market/tickers?category=linear` | Bulk ticker fetch — all perpetuals; used for scan, watcher price updates, funding rate seeding |
+| `GET /v5/market/tickers?category=linear&symbol=X` | Single-symbol price and funding rate |
+| `GET /v5/market/kline?category=linear&symbol=X&interval=60&limit=30` | Hourly klines for RSI computation |
+| `GET /v5/market/kline?category=linear&symbol=X&interval=15&limit=N` | 15-minute klines for volume/candle analysis |
+| `GET /v5/market/kline?category=linear&symbol=X&interval=1&...` | 1-minute klines for whiplash audit |
+| `GET /v5/market/instruments-info?category=linear&symbol=X` | Tick size and quantity step for order precision |
 
-**PsychoWinter** (`PsychoWinter1.0.html`) is a standalone single-file bot running Psycho Mode — no RSI gates, ADV FT, FUN, SalF, or TP reduce. `localStorage` namespaced separately (`psychowinter_v1`). Runs pseudo by default; live mode requires Bybit credentials.
+### Signed (live trading plugins only)
 
-### Positions Menu
+| Endpoint | Usage |
+|---|---|
+| `GET /v5/account/wallet-balance` | Account balance |
+| `GET /v5/position/list?category=linear&settleCoin=USDT` | Sync open positions from exchange |
+| `GET /v5/execution/list?category=linear&symbol=X&orderId=Y` | Fill price after order execution |
+| `GET /v5/position/closed-pnl?category=linear&symbol=X` | Actual exit price and realized PnL on close |
+| `GET /v5/market/time` | Server timestamp for clock sync |
+| `POST /v5/order/create` | Place market order to open position |
+| `POST /v5/order/create` (reduceOnly) | Place limit order to close position |
+| `POST /v5/position/trading-stop` | Set TP and SL natively on exchange |
+| `POST /v5/order/cancel` | Cancel open orders before close |
 
-Open position feed. Sort buttons: **PnL**, **DCA** (by triggered stage, not current band), **Mgn**. DCA stage boxes show: triggered, current band, set (live conditional), queued (5-min delay), missed, default. The SL displayed is pre-computed from simulated full-stage fill — **no actual SL fires until the final stage fills**.
+**Signing**: HMAC-SHA-256 via `crypto.subtle.sign`. Signature string is `timestamp + apiKey + recvWindow + payload`. Headers: `X-BAPI-API-KEY`, `X-BAPI-TIMESTAMP`, `X-BAPI-RECV-WINDOW` (5000 ms), `X-BAPI-SIGN`. A minimum 250 ms gap is enforced between signed requests.
 
-### Trades Menu
+---
 
-Reverse-chronological closed feed. Rapid force/laggard closes roll up per 15-minute window: ticker count, net PnL/ROI, wins, common DCA, avg duration, best/worst performers. Rolls up old trades into a period roll-up to avoid the 200 max entries cap. 
+## Plugin System
 
-### Log Menu
+### Storage and Load Order
 
-Session counters, laggard status (buffered EV, lost value, deficit; "→ CLOSING" when deficit hits zero), Open Now snapshot, DCA Spread (S0–S7), Conditionals table, EXHUMED table (absorbed loss, EH TP, cut count, distance-to-TP; ✦ = also laggard). Activity log capped at 300 entries. Rolls up similar messages within 15 minute window. 
+Plugins are stored as serialized objects in `localStorage.__pw_plugins_v1`. Each entry includes all manifest fields plus `transformSrc` (the `transform` function stringified). On page load, the plugin system IIFE runs before Alpine initializes, deserializes stored plugins, topologically sorts them by `after`/`before` manifest fields (Kahn's algorithm), and wraps the component function (`pw()` or `pc()`).
 
-### Scan Control
+### Transform Pipeline
 
-**START/STOP SCAN** controls only new-position entry — position management, absorption, laggard, and cascade continue regardless. **SCAN NOW** manually triggers a cycle.
-
-### Scan
-
-Bulk ticker fetch → filter by absolute 24h change ≥ threshold → Fisher-Yates shuffle → first `psychoPerCycle` not already held → SHORT each. Halts at position cap.
-
-### Position Watcher
-
-Fires every 5 seconds regardless of scan state; single bulk mark-price fetch per tick. Per position: DCA trigger → TP check → funding accrual → force-close deadline → SL after final stage. One full linear book download every 5 seconds (~12 req, 600–1,200 KB/min).
-
-### Loss Absorption (Aggressive)
-
-Triggers at 2.5× base margin loss; cuts 5% at market. Speeds up with each uninterrupted round. 
-
-| Round (rel) | Interval |
-|-------------|----------|
-| 0 | 5 min |
-| 1 | ~3 min 20 s |
-| 2 | ~1 min 40 s (min 30 s) |
-| 3+ | 30 s |
-
-Resets if the ticker falls below threshold, floors at 30 s. Paused during pending DCA delay windows and when stage 7 is placed or triggered.
-
-**Outlier Acceleration** — positions whose margin or absolute loss exceeds 2.5× the book average absorb at the 30 s floor. Deferred if a single 5% cut would crystallise > 2.5× base notional. Updates average entry price and TP. 
-
-**Outlier Deceleration** — positions whose  margin deficit is 2.5× the book average have 5% added at market. Same cooldown as acceleration.
-
-### Exhumation
-
-If a position's absorption tab shows net negative PnL, it is exhumed and assigned an EH TP:
 ```
-exhEdaTp = entryPrice − (buffedEV + |absorbedLoss|) × entryPrice / (leverage × margin)
+pw()  →  plugin[0].transform(def)  →  plugin[1].transform(def)  →  ...  →  Alpine
 ```
-Exhumed positions block regular TP, recompute EH TP on each DCA fill or absorption cut, and suspend laggard force-close. Only SL or EH TP can close them (sacrifice as last resort). Clears when `tab.totalPnl ≥ 0`.
 
-### Laggard
+Each plugin's `transform(def)` receives the current component definition object and returns a modified version. Methods are replaced or wrapped by closing over the original. The final definition is what Alpine receives at `x-data` evaluation time.
 
-Evaluates oldest position (or deepest-stage with **Age Mode**); force-closes when `buffedEV − lostValue − uPnL ≤ 0`. Every close and absorption cut feeds into the lost-value tally. **80% margin floor**: cuts skipped if they'd leave < 80% of base margin, preventing EDa TP from computing negative. **Profit Offset** scales the EV buffer (default +50% = 1.5× EV); non-laggards cap negative lost-value at `laggardDebtCapPct` (default 150%) of slot-weighted base EV with overflow pushed to the laggard; **Laggard Absorption** trims 5% every 5 min instead of force-closing.
+### CSS and HTML Slots
 
-### Cascade Trigger
+Plugin `css` strings are injected into `<head>` synchronously during the IIFE. Plugin `slots` objects are keyed by slot name (e.g. `"config-bottom"`, `"account-bar-extra"`); the IIFE finds matching `data-plugin-slot` anchor divs and sets their `innerHTML` before Alpine starts.
 
-When collective uPnL exceeds 2.5× entry margin, closes the 2 most profitable non-laggard, non-exhumed positions. Closed PnL feeds the laggard's lost-value tally. 5-minute cooldown.
+### Loading a Plugin File
 
-### Position Cascade Trigger
+The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For `.html` files, `DOMParser` extracts all `<script>` tag contents and concatenates them. The extracted code is executed via `new Function(code)()`, which must set `window.__BotPlugin`. The plugin object is serialized (with `transform.toString()` stored as `transformSrc`) and saved to localStorage.
 
-When any single position's loss drops below −2.5× entry margin, closes the most profitable position and runs a scan to replace it. Each successive trigger closes more positions per the **PPC Escalation Multiplier** (default 2×: 1, 2, 4, 8…). Exhumed positions excluded.
+**A page reload is required after loading or removing a plugin.** The transform pipeline runs once at page load before Alpine initializes; plugins saved to localStorage during a session take effect on the next load.
 
-### Sacrifice and Retraction
+### Manifest Fields
 
-Sacrifice activates when allocated margin exceeds 4× the per-position baseline; closes one position per cycle (priority: DCA-staged, near break-even; exhumed last; laggard excluded). **Retraction** is a second trigger: collective uPnL below −2.5× entry margin activates sacrifice regardless of margin ratio.
+| Field | Type | Purpose |
+|---|---|---|
+| `id` | string | Unique identifier; used for deduplication and conflict resolution |
+| `name` | string | Display name in Plugin Manager UI |
+| `version` | string | Shown in UI |
+| `targetBot` | string | `"PseudoWinter"` or `"PseudoChaser"` — informational |
+| `after` | string[] | Load after these plugin IDs |
+| `before` | string[] | Load before these plugin IDs |
+| `conflicts` | string[] | Hard-reject if any of these are also loaded |
+| `requires` | string[] | Warn if any of these are missing |
+| `touches` | string[] | Method names this plugin modifies — surfaces overlap warnings |
+
+---
+
+## Live Trading Plugins
+
+### EverWinter (PseudoWinter → SHORT)
+
+Overrides `pseudoOpenShort`, `pseudoClosePosition`, `pseudoWatchPositions`.
+
+**Open**: Places `Sell` market order → polls execution list for fill → constructs position object with `totalSize` from fill → calls `POST /v5/position/trading-stop` to set TP (trigger at `fillPrice * (1 - tpPct/100/lev) * 1.001`) and SL natively.
+
+**Close**: Places `Buy` reduceOnly limit at `markPrice * 1.003` (above mark, ensures taker fill) → fetches `closed-pnl` for actual exit price → calls original simulation close logic.
+
+**Sync**: `_ewSyncPositions()` runs every 8 s inside `pseudoWatchPositions` when credentials are present. Fetches all open linear positions from the exchange. Any position present in the simulation book but absent from the exchange response is closed via the original simulation close path using the `closed-pnl` exit price.
+
+### SunChaser (PseudoChaser → LONG)
+
+Mirror of EverWinter for long side. `Buy` market to open, `Sell` reduceOnly limit at `markPrice * 0.997` to close. TP trigger at `fillPrice * (1 + tpPct/100/lev) * 0.999`. Creds in `__sc_creds`.
+
+### Balance Display
+
+Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balance?accountType=UNIFIED` and populate `acct.balance` (walletBalance) and `acct.available` (availableToWithdraw) for the USDT coin. The market menu balance display switches from `∞` to the live wallet balance once credentials are present and the first scan cycle completes. Without credentials it remains `∞`.
+
+---
+
+## EDa Laggard
+
+`_electLaggard()` sets `_laggardId` to the oldest open position (by `openedAt`). `_redistributeED()` computes the EDa TP price for the laggard: the TP is raised until the laggard's projected close PnL covers both its own expected value and the collective `_lostValue` (accumulated losses from other closed positions). `currentTpPrice` on the laggard position is the singular source of truth for its TP — the watcher uses this field, not the initial TP derived from entry price.
+
+---
+
+## Lock-in State
+
+`gainerLockIn` (bullish lock-in) and `loserLockIn` (bearish lock-in) are plain objects keyed by symbol: `{ rsi6, rsi12, rsi24, setAt, trades }`.
+
+- `gainerLockIn[sym]` ratchets **up** via `Math.max` — stores the highest RSI seen at entry. Re-entry is blocked when any current RSI component falls below the stored value.
+- `loserLockIn[sym]` ratchets **down** via `Math.min` — stores the lowest RSI seen at entry. Re-entry is blocked when any current RSI component rises above the stored value.
+
+`_sweepExpiredData()` removes entries where `Date.now() - setAt > 6 * 3600 * 1000`.
+
+---
+
+## Drawdown Throttle
+
+When enabled, `runScheduledCycle()` checks rolling 6-hour PnL. If net PnL over the window falls below `-(drawdownThrottleFactor × entry margin)`, `_drawdownHaltUntil` is set to `Date.now() + 12 * 3600 * 1000`. New entries are blocked until `_drawdownHaltUntil` passes. The halt can be manually cancelled from the config panel (resets `_drawdownHaltUntil` to null).
+
+---
+
+## Activity Log
+
+The activity log array is capped at 300 entries in memory and written to the `_log` localStorage key after each append. Entries are objects `{ t, m, type }` where `t` is a formatted timestamp, `m` is the message string (with ticker symbols stripped of `USDT` suffix for display), and `type` is `info`, `warn`, or `error`. The feed panel renders from this array with color coding per type.
+
+---
+
+## Data Export / Import
+
+The Export button serializes `{ cfg, positions, sess, closedTrades, gainerLockIn, loserLockIn, symbolBanlist, lostValue, laggardId }` as a JSON blob downloaded as a `.json` file. Import reads the file via `FileReader`, parses it, and merges into current state — positions are replaced wholesale, config fields are merged field-by-field to avoid clobbering keys added in newer versions. A 5 s debounce prevents accidental double-imports.
 
 ---
 
 ## ChartWinter
 
-**ChartWinter** (`ChartWinter.html`) is a standalone chart and scan research tool sharing EverWinter's config schema. Runs its own scan with RSI and funding-rate parameters; computes RSI6/RSI12/RSI24 client-side via Wilder's method. Gainers/Losers toggle, configurable change range, pinnable tickers, persistent price/candle lines saved per symbol in `localStorage`.
+Standalone single-file chart tool. Runs its own scan (same `GET /v5/market/tickers` + per-symbol klines) with independent RSI computation. Gainers/Losers toggle. Pinnable tickers persist chart lines (price levels and candle annotations) per symbol in `cw_v1`. No position management, no order execution.
 
 ---

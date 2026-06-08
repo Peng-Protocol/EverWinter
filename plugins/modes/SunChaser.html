@@ -1,0 +1,393 @@
+<!--
+  SunChaser Plugin for PseudoChaser
+  Transforms PseudoChaser into a live Bybit long-trading bot.
+  Load via Plugin Manager in PseudoChaser's config panel.
+-->
+<script>
+(function () {
+  'use strict';
+
+  async function _scSign(key, secret, payload, tsOffset) {
+    const ts   = String(Date.now() + (tsOffset | 0));
+    const recv = '5000';
+    const str  = ts + key + recv + payload;
+    const enc  = new TextEncoder();
+    const k    = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig  = await crypto.subtle.sign('HMAC', k, enc.encode(str));
+    const hex  = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    return { 'X-BAPI-API-KEY': key, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': recv, 'X-BAPI-SIGN': hex, 'Content-Type': 'application/json' };
+  }
+
+  window.__BotPlugin = {
+    id:        'sunchaser',
+    name:      'SunChaser',
+    version:   '1.0.0',
+    targetBot: 'pseudochaser',
+    after:     [],
+    before:    [],
+    conflicts: [],
+    requires:  [],
+    touches:   ['init', 'pseudoOpenShort', 'pseudoClosePosition', 'pseudoWatchPositions', 'refreshBalance'],
+
+    css: `
+      .sc-creds { border-top: 1px solid var(--border); margin-top: 12px; padding: 12px 0 4px; }
+      .sc-creds-ttl { font-family: var(--mono); font-size: 9px; letter-spacing: 2px; color: var(--ice); text-transform: uppercase; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
+      .sc-live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ice); display: inline-block; animation: sc-pulse 2s infinite; }
+      @keyframes sc-pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+      .sc-inp { width: 100%; background: var(--bg-void); border: 1px solid var(--border-hi); color: var(--text-hi); padding: 5px 8px; border-radius: 4px; font-family: var(--mono); font-size: 10px; margin-bottom: 6px; }
+      .sc-inp:focus { outline: none; border-color: var(--ice); }
+      .sc-save { width: 100%; background: var(--bg-raised); border: 1px solid var(--ice); color: var(--ice); font-size: 10px; padding: 5px 0; border-radius: 4px; cursor: pointer; font-family: var(--mono); letter-spacing: 1px; transition: background 0.15s; }
+      .sc-save:hover { background: var(--ice-glow); }
+      .sc-note { font-size: 9px; color: var(--text-lo); text-align: center; margin-top: 6px; font-family: var(--mono); }
+    `,
+
+    slots: {
+      'config-bottom': `
+        <div class="sc-creds">
+          <div class="sc-creds-ttl"><span class="sc-live-dot"></span>SunChaser — Live API</div>
+          <div style="font-size:10px;color:var(--text-lo);margin-bottom:3px">API Key</div>
+          <input type="text" class="sc-inp" x-model="creds.key" placeholder="Bybit API Key" autocomplete="off" spellcheck="false">
+          <div style="font-size:10px;color:var(--text-lo);margin-bottom:3px">API Secret</div>
+          <input type="password" class="sc-inp" x-model="creds.secret" placeholder="Bybit API Secret" autocomplete="off">
+          <button class="sc-save" @click="_scSaveCreds()">SAVE CREDENTIALS</button>
+          <div class="sc-note">Stored in localStorage — sent only to api.bybit.com</div>
+          <div x-show="creds.key && creds.secret" style="margin-top:6px;font-size:9px;font-family:var(--mono);color:var(--profit);text-align:center">⚡ Live mode active</div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _sign      = _scSign;
+      const _origInit  = def.init;
+      const _origOpen  = def.pseudoOpenShort;
+      const _origClose = def.pseudoClosePosition;
+      const _origWatch = def.pseudoWatchPositions;
+
+      return Object.assign({}, def, {
+
+        _tsOffset:     0,
+        _lastSignedAt: 0,
+        _scLive:       true,
+        _scLastSync:   0,
+        _scClosing:    {},
+
+        async init() {
+          await _origInit.call(this);
+          try {
+            const s = JSON.parse(localStorage.getItem('__sc_creds') || '{}');
+            if (s.key)    this.creds.key    = s.key;
+            if (s.secret) this.creds.secret = s.secret;
+          } catch(e) {}
+          if (this.creds.key && this.creds.secret) await this._scSyncTs();
+          this.log('☀ SunChaser live plugin active.', 'info');
+        },
+
+        _scSaveCreds() {
+          localStorage.setItem('__sc_creds', JSON.stringify({ key: this.creds.key, secret: this.creds.secret }));
+          this._scSyncTs();
+          this.log('[SC] Credentials saved.', 'info');
+        },
+
+        async _scSyncTs() {
+          try {
+            const r = await fetch('https://api.bybit.com/v5/market/time');
+            const d = await r.json();
+            const ms = parseInt(d.result?.timeNano ? d.result.timeNano / 1000000 : (d.result?.timeSecond || 0) * 1000);
+            if (ms > 0) this._tsOffset = ms - Date.now();
+          } catch(e) { this._tsOffset = 0; }
+        },
+
+        async refreshBalance() {
+          if (!this.creds.key || !this.creds.secret) return;
+          try {
+            await this._scDelay();
+            const p = 'accountType=UNIFIED';
+            const h = await _sign(this.creds.key, this.creds.secret, p, this._tsOffset);
+            const r = await fetch(`${this.base}/v5/account/wallet-balance?${p}`, { headers: h });
+            const d = await this._scSafeJson(r);
+            const coin = d?.result?.list?.[0]?.coin?.find(c => c.coin === 'USDT');
+            if (coin) {
+              this.acct.balance   = parseFloat(coin.walletBalance   || 0);
+              this.acct.available = parseFloat(coin.availableToWithdraw || coin.availableToBorrow || 0);
+            }
+          } catch(e) {}
+        },
+
+        async _scDelay() {
+          const GAP = 250;
+          const now = Date.now();
+          const t   = Math.max(now, (this._lastSignedAt || 0) + GAP);
+          this._lastSignedAt = t;
+          if (t > now) await new Promise(r => setTimeout(r, t - now));
+        },
+
+        _scPriceDp(symbol) {
+          const ts = this._instrCache?.[symbol]?.tickSize;
+          if (!ts) return 4;
+          const s  = String(ts);
+          const d  = s.indexOf('.');
+          return d < 0 ? 0 : s.length - d - 1;
+        },
+
+        async _scSafeJson(res) {
+          try { const t = await res.text(); return t && !t.trimStart().startsWith('<') ? JSON.parse(t) : null; }
+          catch(e) { return null; }
+        },
+
+        async _scPlaceOrder(symbol, side, qty, refPrice = 0) {
+          await this._scDelay();
+          let body;
+          if (refPrice > 0) {
+            const dp  = this._scPriceDp(symbol);
+            const lim = parseFloat((refPrice * (side === 'Buy' ? 1.001 : 0.999)).toFixed(dp));
+            body = { category: 'linear', symbol, side, orderType: 'Limit', qty: String(qty), price: String(lim), timeInForce: 'GTC', reduceOnly: false };
+          } else {
+            body = { category: 'linear', symbol, side, orderType: 'Market', qty: String(qty), timeInForce: 'IOC', reduceOnly: false };
+          }
+          const b = JSON.stringify(body);
+          const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+          try {
+            const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
+            const d = await this._scSafeJson(r);
+            if (!d)              { this.log(`[SC] placeOrder ${symbol}: empty response`, 'error'); return null; }
+            if (d.retCode !== 0) { this.log(`[SC] placeOrder ${symbol}: ${d.retMsg}`, 'error'); return d.retMsg?.toLowerCase().includes('not supported') ? 'NOT_LIVE' : null; }
+            return d.result?.orderId || null;
+          } catch(e) { this.log(`[SC] placeOrder: ${e.message}`, 'error'); return null; }
+        },
+
+        async _scWaitFill(symbol, orderId = null) {
+          const POLL = 2500, TIMEOUT = 30000;
+          const end  = Date.now() + TIMEOUT;
+          const check = async () => {
+            await this._scDelay();
+            const p = `category=linear&symbol=${symbol}`;
+            const h = await _sign(this.creds.key, this.creds.secret, p, this._tsOffset);
+            const r = await fetch(`${this.base}/v5/position/list?${p}`, { headers: h });
+            const d = await this._scSafeJson(r);
+            const e = d ? (d.result?.list || []).find(x => x.symbol === symbol && x.side === 'Buy' && parseFloat(x.size) > 0) : null;
+            if (!e) return null;
+            const fp = parseFloat(e.avgPrice || e.entryPrice || 0);
+            return fp > 0 ? fp : null;
+          };
+          while (Date.now() < end) {
+            await new Promise(r => setTimeout(r, POLL));
+            try { const fp = await check(); if (fp) return fp; } catch(e) {}
+          }
+          if (orderId) {
+            try {
+              await this._scDelay();
+              const b = JSON.stringify({ category: 'linear', symbol, orderId });
+              const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+              await fetch(`${this.base}/v5/order/cancel`, { method: 'POST', headers: h, body: b });
+            } catch(e) {}
+            try { const fp = await check(); if (fp) return fp; } catch(e) {}
+          }
+          this.log(`[SC] ${symbol}: fill timeout — aborted.`, 'warn');
+          return null;
+        },
+
+        async _scSetTP(pos, tpPrice) {
+          await this._scDelay();
+          const dp   = this._scPriceDp(pos.symbol);
+          // For long: TP fires when price rises to trigger; set 0.1% below to avoid missing the fill
+          const trig = parseFloat((tpPrice * 0.999).toFixed(dp));
+          const b    = JSON.stringify({ category: 'linear', symbol: pos.symbol, takeProfit: String(trig), tpTriggerBy: 'LastPrice', positionIdx: 0 });
+          const h    = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+          try {
+            const r = await fetch(`${this.base}/v5/position/trading-stop`, { method: 'POST', headers: h, body: b });
+            const d = await this._scSafeJson(r);
+            if (d?.retCode === 0) { pos.currentTpPrice = tpPrice; return 'ok'; }
+            this.log(`[SC] setTP ${pos.symbol}: ${d?.retMsg || 'no response'}`, 'warn');
+            return 'error';
+          } catch(e) { this.log(`[SC] setTP: ${e.message}`, 'error'); return 'error'; }
+        },
+
+        async _scSetSL(symbol, slPrice) {
+          await this._scDelay();
+          const dp  = this._scPriceDp(symbol);
+          const str = slPrice > 0 ? slPrice.toFixed(dp) : '0';
+          const b   = JSON.stringify({ category: 'linear', symbol, stopLoss: str, slTriggerBy: 'LastPrice', positionIdx: 0 });
+          const h   = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+          try {
+            const r = await fetch(`${this.base}/v5/position/trading-stop`, { method: 'POST', headers: h, body: b });
+            const d = await this._scSafeJson(r);
+            if (d?.retCode !== 0) this.log(`[SC] setSL ${symbol}: ${d?.retMsg}`, 'warn');
+          } catch(e) {}
+        },
+
+        async _scSyncPositions() {
+          if (!this.creds.key || !this.creds.secret) return;
+          try {
+            await this._scDelay();
+            const p = 'category=linear&settleCoin=USDT';
+            const h = await _sign(this.creds.key, this.creds.secret, p, this._tsOffset);
+            const r = await fetch(`${this.base}/v5/position/list?${p}`, { headers: h });
+            const d = await this._scSafeJson(r);
+            if (!d || d.retCode !== 0) return;
+            const exMap = new Map((d.result?.list || [])
+              .filter(e => e.side === 'Buy' && parseFloat(e.size) > 0)
+              .map(e => [e.symbol, e]));
+            for (const pos of [...this.positions]) {
+              const ep = exMap.get(pos.symbol);
+              if (!ep) {
+                let exitPrice = pos.markPrice || pos.entryPrice, reason = 'tp';
+                try {
+                  await this._scDelay();
+                  const pp = `category=linear&symbol=${pos.symbol}&limit=1`;
+                  const ph = await _sign(this.creds.key, this.creds.secret, pp, this._tsOffset);
+                  const pr = await fetch(`${this.base}/v5/position/closed-pnl?${pp}`, { headers: ph });
+                  const pd = await this._scSafeJson(pr);
+                  const rec = pd?.result?.list?.[0];
+                  if (rec) {
+                    exitPrice = parseFloat(rec.avgExitPrice || rec.exitPrice || exitPrice);
+                    reason    = parseFloat(rec.closedPnl || 0) >= 0 ? 'tp' : 'sl';
+                  }
+                } catch(e) {}
+                this.log(`[SC] ${pos.symbol}: exchange closed [${reason}] @ ${exitPrice}`, 'info');
+                await _origClose.call(this, pos, reason, exitPrice);
+              } else {
+                pos.markPrice = parseFloat(ep.markPrice || ep.avgPrice || pos.markPrice);
+                pos.totalSize = parseFloat(ep.size || pos.totalSize);
+              }
+            }
+            this._scLastSync = Date.now();
+          } catch(e) { this.log(`[SC] sync error: ${e.message}`, 'warn'); }
+        },
+
+        async pseudoOpenShort(candidate) {
+          if (!this.creds.key || !this.creds.secret) {
+            this.log('[SC] No credentials set — set API key/secret in config panel.', 'warn');
+            return;
+          }
+          const { symbol, price, rsi6=null, rsi12=null, rsi24=null, fundingRate=null, _gainerStrat=false } = candidate;
+          if (this._symbolBanlist?.[symbol]) return;
+          if (this.positions.find(p => p.symbol === symbol)) return;
+          if (this.positions.length >= this.cfg.maxPos) return;
+
+          const instr = await this.getInstrInfo(symbol);
+          if (!instr) { this.log(`[SC] ${symbol}: instrument info unavailable`, 'warn'); return; }
+
+          const lev      = this.cfg.leverage;
+          const notional = this.cfg.minNotional;
+          const qty      = this.snapQty(notional / price, instr);
+          if (!qty || qty <= 0) { this.log(`[SC] ${symbol}: qty ≤ 0`, 'warn'); return; }
+
+          const binary = this._binaryMode ? this._binaryMode() : this.cfg.binaryModeEnabled;
+          const tpPct  = binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
+
+          this.log(`[SC] Placing BUY ${symbol} qty=${qty} @ ~${price}…`, 'info');
+          const oid = await this._scPlaceOrder(symbol, 'Buy', qty, price);
+          if (!oid || oid === 'NOT_LIVE') return;
+
+          const fillPrice = await this._scWaitFill(symbol, oid);
+          if (!fillPrice) return;
+
+          const tpPrice = this.snapPrice(fillPrice * (1 + tpPct / 100 / lev), instr);  // LONG: TP above entry
+          const bSlPct  = this.cfg.binarySlPct ?? 18;
+          const slPrice = binary ? this.snapPrice(fillPrice * (1 - bSlPct / 100 / lev), instr) : 0;  // LONG: SL below entry
+
+          const now = Date.now();
+          const pos = {
+            id:                  now + Math.random(),
+            symbol,
+            entryPrice:          fillPrice,
+            originalEntryPrice:  fillPrice,
+            markPrice:           fillPrice,
+            totalSize:           qty,
+            margin:              notional / lev,
+            leverage:            lev,
+            openedAt:            now,
+            phase:               'normal',
+            dcaStage:            0,
+            orders:              [],
+            _pseudo:             false,
+            _long:               true,
+            _binary:             binary,
+            _gainerStrat,
+            tpPct,
+            currentTpPrice:      tpPrice,
+            slPrice,
+            slSet:               binary,
+            rsi6,
+            rsi12,
+            rsi24,
+            fundingRate,
+            _stageCount:         0,
+            _firstWindStageCount: 0,
+            _laggardInitialEV:   0,
+            _edaTpPrice:         0,
+            _edaTpPrev:          null,
+            _laggardLostValue:   0,
+            _fundingHistory:     [],
+            upnl:                0,
+          };
+
+          this.positions.push(pos);
+          if (typeof this.persist === 'function') this.persist();
+
+          if (tpPrice > 0) await this._scSetTP(pos, tpPrice);
+          if (slPrice > 0) await this._scSetSL(symbol, slPrice);
+
+          const g = (this.gainers || []).find(x => x.symbol === symbol);
+          if (g) g.status = 'active';
+
+          this.log(`☀ [SC] LONG ${symbol} @ ${fillPrice} | TP:${tpPrice}${slPrice ? ' SL:'+slPrice : ''}`, 'info');
+
+          if (_gainerStrat) this.gainerStratLockInBump?.(symbol, rsi6, rsi12, rsi24);
+          else this.gainerLockInBump?.(symbol, rsi6, rsi12, rsi24);
+        },
+
+        async pseudoClosePosition(pos, reason = 'manual', fillPrice = null) {
+          if (this.creds.key && this.creds.secret && !this._scClosing?.[pos.id]) {
+            if (!this._scClosing) this._scClosing = {};
+            this._scClosing[pos.id] = true;
+            try {
+              await this._scDelay();
+              const ref = fillPrice || pos.markPrice || pos.entryPrice;
+              const dp  = this._scPriceDp(pos.symbol);
+              let body;
+              if (ref > 0) {
+                const lim = parseFloat((ref * 0.997).toFixed(dp));  // LONG close: Sell limit slightly below mark
+                body = { category: 'linear', symbol: pos.symbol, side: 'Sell', orderType: 'Limit', qty: String(pos.totalSize), price: String(lim), timeInForce: 'GTC', reduceOnly: true };
+              } else {
+                body = { category: 'linear', symbol: pos.symbol, side: 'Sell', orderType: 'Market', qty: String(pos.totalSize), timeInForce: 'IOC', reduceOnly: true };
+              }
+              const b = JSON.stringify(body);
+              const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+              const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
+              const d = await this._scSafeJson(r);
+              if (d?.retCode === 0) {
+                await new Promise(res => setTimeout(res, 2000));
+                try {
+                  await this._scDelay();
+                  const pp = `category=linear&symbol=${pos.symbol}&limit=1`;
+                  const ph = await _sign(this.creds.key, this.creds.secret, pp, this._tsOffset);
+                  const pr = await fetch(`${this.base}/v5/position/closed-pnl?${pp}`, { headers: ph });
+                  const pd = await this._scSafeJson(pr);
+                  const rec = pd?.result?.list?.[0];
+                  if (rec) fillPrice = parseFloat(rec.avgExitPrice || rec.exitPrice || ref);
+                } catch(e) {}
+              } else {
+                this.log(`[SC] close failed ${pos.symbol}: ${d?.retMsg || 'no response'}`, 'warn');
+              }
+            } catch(e) {
+              this.log(`[SC] close error ${pos.symbol}: ${e.message}`, 'warn');
+            } finally {
+              delete this._scClosing[pos.id];
+            }
+          }
+          return _origClose.call(this, pos, reason, fillPrice || pos.markPrice || pos.entryPrice);
+        },
+
+        async pseudoWatchPositions() {
+          const now = Date.now();
+          if (this.creds.key && this.creds.secret && now - (this._scLastSync || 0) > 8000) {
+            await this._scSyncPositions();
+          }
+          return _origWatch.call(this);
+        },
+      });
+    },
+  };
+})();
+</script>
