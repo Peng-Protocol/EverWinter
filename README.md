@@ -181,6 +181,8 @@ Plugin `css` strings are injected into `<head>` synchronously during the IIFE. P
 
 The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For `.html` files, `DOMParser` extracts all `<script>` tag contents and concatenates them. The extracted code is executed via `new Function(code)()`, which must set `window.__BotPlugin`. The plugin object is serialized (with `transform.toString()` stored as `transformSrc`) and saved to localStorage.
 
+**A page reload is required after loading or removing a plugin.** The transform pipeline runs once at page load before Alpine initializes; plugins saved to localStorage during a session take effect on the next load.
+
 ### Manifest Fields
 
 | Field | Type | Purpose |
@@ -212,6 +214,10 @@ Overrides `pseudoOpenShort`, `pseudoClosePosition`, `pseudoWatchPositions`.
 ### SunChaser (PseudoChaser → LONG)
 
 Mirror of EverWinter for long side. `Buy` market to open, `Sell` reduceOnly limit at `markPrice * 0.997` to close. TP trigger at `fillPrice * (1 + tpPct/100/lev) * 0.999`. Creds in `__sc_creds`.
+
+### Balance Display
+
+Neither plugin fetches account balance. The market menu balance display remains `∞` (the simulation default) even in live mode. Unrealized PnL shown alongside it is computed locally from open position data, not from the exchange.
 
 ---
 
