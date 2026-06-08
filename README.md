@@ -217,7 +217,7 @@ Mirror of EverWinter for long side. `Buy` market to open, `Sell` reduceOnly limi
 
 ### Balance Display
 
-Neither plugin fetches account balance. The market menu balance display remains `∞` (the simulation default) even in live mode. Unrealized PnL shown alongside it is computed locally from open position data, not from the exchange.
+Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balance?accountType=UNIFIED` and populate `acct.balance` (walletBalance) and `acct.available` (availableToWithdraw) for the USDT coin. The market menu balance display switches from `∞` to the live wallet balance once credentials are present and the first scan cycle completes. Without credentials it remains `∞`.
 
 ---
 
