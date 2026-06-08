@@ -7,6 +7,8 @@
 1. [Philosophy Overview](#philosophy-overview)
 2. [Techniques](#techniques)
    - [Proactive Techniques](#proactive-techniques)
+     - [RSI Gating](#rsi-gating)
+     - [Over-Extension Filter](#over-extension-filter)
    - [Reactive Techniques](#reactive-techniques)
 3. [Strategies](#strategies)
    - [Gainers](#gainers-strategy)
@@ -60,6 +62,20 @@ RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's meth
 **Floor gates** confirm momentum is sufficiently developed. **Ceiling gates** block entries where momentum is still running — a ticker failing the ceiling is not ready.
 
 The default gate is **70-70-70**: RSI6 ≥ 70, RSI12 ≥ 70, RSI24 ≥ 70. All three thresholds are configurable.
+
+---
+
+#### Over-Extension Filter
+
+Tickers at the extremes of the RSI range are excluded from entry even when all gate conditions are otherwise met. A ticker with RSI too far above a ceiling, or too far below a floor, has already moved so aggressively that its next move is genuinely unpredictable — it can explode further in the same direction or snap back violently, with no reliable read on which.
+
+**Upper ceiling**: If RSI6 exceeds the configured maximum (default 90), the ticker is skipped. The move is too mature. Entering at this point risks catching a parabolic extension right before a sharp reversal, or riding a runaway that defies the short thesis entirely.
+
+**Lower floor**: If RSI6 falls below the configured minimum (default 10), the ticker is also skipped. A coin in freefall with RSI near zero is in capitulation — it may stabilize, but it may also continue dropping vertically. The risk profile is the same: directional certainty vanishes at the extremes.
+
+The same logic applies to the potential-entry watchlist. If a ticker is sitting on the watchlist waiting for its gate to be reached, and RSI crosses the ceiling or floor boundary in the meantime, it is evicted immediately rather than held for an entry that is now outside acceptable parameters.
+
+The filter is symmetric: **skip the over-extended on the way up, skip the over-extended on the way down.**
 
 ---
 
