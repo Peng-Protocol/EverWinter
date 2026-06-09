@@ -13,7 +13,7 @@
 3. [Strategies](#strategies)
    - [Gainers](#gainers-strategy)
    - [Losers](#losers-strategy)
-   - [Slider](#slider-strategy) *(tentative)*
+   - [Drifters](#drifters-strategy) *(tentative)*
    - [Psycho Mode](#psycho-mode)
 4. [Sizing](#sizing)
 5. [Conclusion](#conclusion)
@@ -64,7 +64,7 @@ RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's meth
 
 The default **floor gate is 30-30-30**: RSI6 ≥ 30, RSI12 ≥ 30, RSI24 ≥ 30. The default **ceiling gate is 30-30-30**: RSI6 ≤ 30, RSI12 ≤ 30, RSI24 ≤ 30. All six thresholds are independently configurable.
 
-The space above 30 and below 70 is where most tickers spend most of their time. Standard gating at 30-30-30 captures the boundary of oversold/overbought territory — momentum entering or leaving this zone is the signal. The mid-range (roughly 30–70) does become relevant under specific session conditions; see the Slider strategy.
+The space above 30 and below 70 is where most tickers spend most of their time. Standard gating at 30-30-30 captures the boundary of oversold/overbought territory — momentum entering or leaving this zone is the signal. The mid-range (roughly 30–70) does become relevant under specific session conditions; see the Drifters strategy.
 
 ---
 
@@ -108,7 +108,7 @@ When a position opens, the symbol's RSI at entry is recorded with a 6-hour TTL. 
 
 - **Bearish lock-in** (Losers strategy): stored RSI is a **falling ceiling** — ratchets to the minimum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is above the ceiling. The ticker must decline to a lower RSI than the last entry before it qualifies again.
 
-As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many loser-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many gainer-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves. This observation is the premise of the tentative Slider strategy.
+As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many loser-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many gainer-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves. This observation is the premise of the tentative Drifters strategy.
 
 ---
 
@@ -259,19 +259,19 @@ The Losers strategy targets coins showing strong downward momentum. Entry requir
 
 ---
 
-### Slider Strategy *(tentative)*
+### Drifters Strategy *(tentative)*
 
-The Slider is a concept, not yet a live strategy. It is documented here because the logic is coherent and the components to build it already exist.
+The Drifters strategy is a concept, not yet a live strategy. It is documented here because the logic is coherent and the components to build it already exist.
 
 **The premise**: Standard gating requires RSI alignment at the extremes — above 70-70-70 for gainers, below 30-30-30 for losers. As a session runs, many qualifying tickers get entered and locked out. Eventually, the pool of available extreme-RSI candidates dries up. At that point the lock-in ledger holds something valuable: a record of which side the session has been trading heavily. If loser-side lock-ins significantly outnumber gainer-side lock-ins, the recent period was bearish. If gainer-side lock-ins dominate, it was bullish.
 
-The Slider uses that imbalance as a directional bias signal and then reaches into the middle RSI zone — broadly 30 to 70 — to find entries consistent with that bias.
+Drifters uses that imbalance as a directional bias signal and then reaches into the middle RSI zone — broadly 30 to 70 — to find entries consistent with that bias.
 
 **Short bias** (loser lock-ins > gainer lock-ins): Target tickers in the upper-middle range, RSI readings that are elevated but have not yet reached the standard 70-70-70 floor. These are coins that have been rising but haven't extended far enough to qualify normally. In a session that has already been producing a lot of declining, locked-out tickers, a coin sitting at 55-60-60 RSI is a relative strength outlier — a reasonable short candidate if the broader bias is down.
 
 **Long bias** (gainer lock-ins > loser lock-ins): Target tickers in the lower-middle range, RSI readings that are depressed but have not fallen to the standard 30-30-30 ceiling. A coin at 40-45-45 in a session full of locked-out pumps is a relative weakness outlier — a potential long if the broader bias is up.
 
-**Why "Slider"**: The effective entry gate slides — downward from 70 toward the middle for shorts in a bearish session, upward from 30 toward the middle for longs in a bullish one. The gate is not fixed; it is moved by what the session has already demonstrated about its character.
+**Why "Drifters"**: Entries drift into the mid-RSI zone — downward from 70 toward the middle for shorts in a bearish session, upward from 30 toward the middle for longs in a bullish one. The gate is not fixed; it is moved by what the session has already demonstrated about its character.
 
 **What still needs to be resolved**: the exact threshold at which lock-in imbalance is considered significant, the RSI band within the middle zone to target, and whether the over-extension filter should apply in modified form here (likely yes — a middle-RSI ticker approaching 70 from below in a short-biased session is still approaching an over-extended zone and should probably still be skipped). The concept is sound; the calibration is open.
 
