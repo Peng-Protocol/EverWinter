@@ -30,6 +30,10 @@ On a **bullish day**: gainers are likely to continue pumping, and losers are lik
 
 On a **bearish day**: gainers that ran up are likely to retrace, and losers are likely to extend further downward. The better trades are shorts — shorts on overbought gainers, shorts on coins still in freefall.
 
+On a **volatile day**: neither side dominates. Coins pump and dump freely in both directions — overbought tickers snap back, oversold tickers bounce hard. Both the short side and the long side can be profitable simultaneously because the market is producing clear extremes on both ends. The lock-in ledger on such days will show meaningful activity on both sides without either dominating by the configured threshold, producing a neutral or near-neutral bias. Drifters defers when bias is neutral, since its mid-RSI entries rely on a directional lean to have edge; without one, lukewarm conditions dominate and entries are skipped.
+
+Some days are also **minimally skewed** — leaning slightly bullish or bearish but not enough to reach the configured Drifters threshold. These are treated as neutral for Drifters purposes. The threshold exists precisely to distinguish a meaningful lean from noise.
+
 Neither system predicts the day in advance. The approach is to run both sides simultaneously and let drawdown throttling limit damage on the side that is wrong today. The side aligned with the day's meta-structure runs profitably; the opposing side hits its SLs cleanly and closes bounded losses. Over a session the net of both sides reflects the actual character of that day.
 
 **Two approaches coexist within this system:**
