@@ -842,14 +842,6 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               When this many positions are open, force all into TP reduce phase.
             </div>
           </div>
-          <div class="g" style="margin-top:12px">
-            <label class="tog" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''" @click="if(!cfgLocked){cfg.lossAbsorptionEnabled=!cfg.lossAbsorptionEnabled;persist()}">
-              <div class="tog-t" :class="cfg.lossAbsorptionEnabled?'on':''"><div class="tog-k"></div></div>
-              <span class="tog-l">Loss Absorption</span>
-            </label>
-            <div style="font-size:9.5px;color:var(--text-lo);margin-top:4px">Closes base notional whenever uPnL crosses −25% of base margin. 30s cooldown between cuts. Stops at the minimum margin floor and only fires in loss.</div>
-
-          </div>
 
         </div>
       </div>
@@ -1443,8 +1435,9 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <span style="color:var(--text-lo);font-size:9px;letter-spacing:1px">ED</span>
                 <span x-html="(()=>{
                   const ev = lag._laggardInitialEV ?? (lag.margin * ((lag._baseTpPct ?? lag.tpPct ?? cfg.entryTpRoi) / 100));
+                  const buffMul = 1 + (Math.max(-99, cfg.laggardProfitOffset ?? 50) / 100);
                   const lv = lag._laggardLostValue || 0;
-                  const ed = ev - (lv + (lag.upnl || 0));
+                  const ed = (ev * buffMul) - (lv + (lag.upnl || 0));
                   const c = ed > 0 ? 'var(--short)' : ed < 0 ? 'var(--profit)' : 'var(--text-mid)';
                   return '<span style=&quot;color:'+c+'&quot;>'+(ed>=0?'+':'')+ed.toFixed(3)+'</span>';
                 })()"></span>
@@ -1484,7 +1477,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
         <div class="sec-ttl">Loser Lock-in <em x-text="Object.keys(gainerLockIn).length+' active'"></em></div>
         <template x-for="[sym, entry] in Object.entries(gainerLockIn)" :key="sym">
           <div style="margin-bottom:6px;font-family:var(--mono);font-size:10px">
-            <div style="display:flex;justify-content:space-between;color:var(--ice)">
+            <div style="display:flex;justify-content:space-between;color:var(--short)">
               <span x-text="sym.replace('USDT','')"></span>
               <span style="display:flex;align-items:center;gap:5px">
                 <span x-text="(entry.trades||1)+' trade'+((entry.trades||1)===1?'':'s')"></span>
@@ -1493,7 +1486,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               </span>
             </div>
             <div style="color:var(--text-lo);font-size:9px;margin-top:2px">
-              RSI roof ≤ <span style="color:var(--ice)" x-text="(entry.rsi6!=null?entry.rsi6.toFixed(1):'—')+'/'+(entry.rsi12!=null?entry.rsi12.toFixed(1):'—')+'/'+(entry.rsi24!=null?entry.rsi24.toFixed(1):'—')"></span>
+              RSI roof ≤ <span style="color:var(--short)" x-text="(entry.rsi6!=null?entry.rsi6.toFixed(1):'—')+'/'+(entry.rsi12!=null?entry.rsi12.toFixed(1):'—')+'/'+(entry.rsi24!=null?entry.rsi24.toFixed(1):'—')"></span>
             </div>
           </div>
         </template>
@@ -1763,7 +1756,7 @@ function fmtAge(ts, _tick) {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
-  return (h > 0 ? h + 'h ' : '') + String(m).padStart(2,'0') + 'm ' + String(sec).padStart(2,'0') + 's';
+  return (h > 0 ? h + 'h ' : '') + m + 'm ' + String(sec).padStart(2,'0') + 's';
 }
 
 // Countdown-to helper: returns 'Xh Ym Zs' until targetMs, or '—' if past/invalid.
@@ -1792,7 +1785,6 @@ let _potEntryTimer    = null;
 let _refreshTimer     = null;
 let _audioTimer       = null;
 let _laggardInterval  = null;
-let _absorpTimer      = null;
 
 function pw() { return {
   showSetup: false,
@@ -1824,7 +1816,6 @@ function pw() { return {
     laggardProfitOffset: 50,   // EV multiplier offset % (-99 to +200); positive = protective
     laggardAutoReduce: true,
     laggardAutoReduceThreshold: 4,
-    lossAbsorptionEnabled: true,
 
     laggardDebtCapPct: 150,    // max debt a position can carry as % of its base EV (slots × margin × tpRoi); laggard exempt
     whiplashProximityPct: 20,  // % of TP distance remaining when whiplash audit arms (higher = earlier trigger)
@@ -2130,10 +2121,8 @@ function pw() { return {
   // ── PERIOD ROLLUP — compacts oldest individual trades when cap is hit ──
   _compactClosedTrades() {
     const KEEP = 50;
-    const realCloses  = this.closedTrades.filter(t => t.reason !== 'period-rollup' && t.reason !== 'absorption');
-    const absorpCards = this.closedTrades.filter(t => t.reason === 'absorption');
-    // Combined cap: total visible cards across both types triggers compaction.
-    const allCards = [...realCloses, ...absorpCards].sort((a, b) =>
+    const realCloses  = this.closedTrades.filter(t => t.reason !== 'period-rollup');
+    const allCards = [...realCloses].sort((a, b) =>
       (b.closedAt ?? b.time ?? 0) - (a.closedAt ?? a.time ?? 0)
     );
     if (allCards.length <= KEEP) return;
@@ -2179,12 +2168,6 @@ function pw() { return {
       symCounts[sym] = (symCounts[sym] || 0) + 1;
       const tp = t.totalPnl ?? t.pnl ?? 0, pp = t.pnlPct ?? 0;
       netPnl += tp;
-      if (t.reason === 'absorption') {
-        // absorption cuts: count as losses, include margin for ROI; no dca/dur/extremes
-        count++; totalMargin += t.margin ?? 0;
-        mergeTs(t.closedAt, t.closedAt);
-        return;
-      }
       count++; totalMargin += t.margin ?? 0;
       wins += tp > 0 ? 1 : 0; dcaSum += t.dcaStage ?? 0; durSum += t.duration ?? 0;
       updateExtremes(sym, pp, tp);
@@ -2588,15 +2571,6 @@ function pw() { return {
     _potEntryTimer = setInterval(() => this.watchPotentialEntries(), 5000);
     if (_laggardInterval) { clearInterval(_laggardInterval); _laggardInterval = null; }
     _laggardInterval = setInterval(() => { if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) this.runLaggardCheck(); }, 60000);
-    // Loss absorption runs on its own 15s timer, independent of the watch cycle lock.
-    // Previously it was called from inside pseudoWatchPositions, which meant it could be
-    // starved when long watch cycles (1s delay × N positions) blocked the re-entry guard.
-    if (_absorpTimer) { clearInterval(_absorpTimer); _absorpTimer = null; }
-    _absorpTimer = setInterval(() => {
-      if (this.bot.running && this.cfg.lossAbsorptionEnabled && this.positions.length > 0) {
-        this.runLossAbsorption().catch(() => {});
-      }
-    }, 15000);
     if (this.cfg.laggardCheckEnabled && this.positions.length >= 2) {
       await this.runLaggardCheck();
     }
@@ -2611,7 +2585,6 @@ function pw() { return {
     clearInterval(_potEntryTimer);
     _potEntryTimer = null;
     clearInterval(_laggardInterval); _laggardInterval = null;
-    clearInterval(_absorpTimer); _absorpTimer = null;
     this.stopKeepalive();
     this.bot.scanCd = 0; this.bot.scanPct = 100;
     this.bot.startTime = null;
@@ -2701,10 +2674,6 @@ function pw() { return {
       await this.runScan();
       const allTickers = this._lastAllTickers || [];
 
-
-      // Loss absorption also runs on its own dedicated timer (_absorpTimer, 15s).
-      // This call ensures a final pass at end-of-cycle in case the timer hasn't fired yet.
-      if (this.cfg.lossAbsorptionEnabled && this.positions.length > 0) await this.runLossAbsorption();
 
     } catch(e) { this.log('[CYC] [E02] Cycle error: ' + e.message, 'error'); }
     finally { this._cycleRunning = false; }
@@ -3282,6 +3251,17 @@ function pw() { return {
           this.renderPotGainers();
           continue;
         }
+        // Eject if RSI climbed back above the tolerance band — no longer a candidate
+        const _potCapTol = this.cfg.potGainerRsiPct ?? 10;
+        const _potCap    = this.cfg.rsi6Min ?? 30;
+        if (rsi6 > _potCap * (1 + _potCapTol / 100)) {
+          this.potGainers = this.potGainers.filter(e => e.id !== pe.id);
+          const g = this.gainers.find(x => x.symbol === pe.symbol);
+          if (g && g.status === 'watch') g.status = 'skip';
+          this.persist();
+          this.renderPotGainers();
+          continue;
+        }
         const gate6  = this.cfg.rsi6Min;  // cap: fire when RSI drops below this
         const gate12 = this.cfg.rsi12Min;
         const gate24 = this.cfg.rsi24Min;
@@ -3347,6 +3327,13 @@ function pw() { return {
       if (rsi6 === null) continue;
       // Ceiling check — eject if over-extended
       if (rsi6 > (this.cfg.gainerRsi6Max ?? 90)) {
+        this.potGainerStrat = this.potGainerStrat.filter(e => e.id !== pe.id);
+        this.persist();
+        continue;
+      }
+      // Floor drop-out — eject if RSI fell below the tolerance band
+      const _gsDropTol = (this.cfg.gainerPotRsiPct ?? 10) / 100;
+      if (rsi6 < pe.gate6 * (1 - _gsDropTol)) {
         this.potGainerStrat = this.potGainerStrat.filter(e => e.id !== pe.id);
         this.persist();
         continue;
@@ -3677,7 +3664,7 @@ function pw() { return {
       if (age >= forceMs && pos.phase !== 'force' && !_isLaggardForce) {
         pos.phase = 'force';
         this.persist();
-      } else if (age >= reduceMs && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3))) {
+      } else if (age >= reduceMs && (pos.phase === 'normal' || (pos.phase === 'reduce' && pos.tpPct > 3 && !(pos._edaTpPrice > 0)))) {
         const wasReduced = pos.phase === 'reduce';
         pos.phase = 'reduce';
         if (!wasReduced) this.sess.tpReduce++;
@@ -3685,7 +3672,8 @@ function pw() { return {
           pos.id === this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]).id;
         // Only defer to EDa when it is actively holding an override price — not merely because
         // _laggardInitialEV was stamped at entry. If _edaTpPrice is 0 the normal reduce path runs.
-        const _useGlobalEda = this.cfg.laggardCheckEnabled && pos.phase === 'reduce' && (pos._edaTpPrice > 0);
+        const _useGlobalEda = this.cfg.laggardCheckEnabled && pos.phase === 'reduce' &&
+          ((pos._edaTpPrice > 0) || (pos._laggardLostValue || 0) !== 0);
         // LONG: UROI = (mark - entry) / entry * lev * 100
         const currentUROI = (mark - pos.entryPrice) / pos.entryPrice * pos.leverage * 100;
         const reduceTpPrice = pos.entryPrice * (1 + (0.03 / pos.leverage)); // LONG: TP above entry
@@ -3887,15 +3875,14 @@ function pw() { return {
     const hdrCount = document.getElementById('pw-trade-count');
     const hdrMeta  = document.getElementById('pw-trade-meta');
     const _ru       = this.closedTrades.find(t => t.reason === 'period-rollup');
-    const _individ  = this.closedTrades.filter(t => t.reason !== 'period-rollup' && t.reason !== 'absorption');
-    const _absorpShown = this.closedTrades.filter(t => t.reason === 'absorption'); // not-yet-compacted absorption cards still in feed
-    const _allShown = [..._individ, ..._absorpShown]; // combined for net PnL and render ordering
-    const _totalCt  = _individ.length + _absorpShown.length + (_ru?.rollup?.count || 0);
-    if (hdrCount) hdrCount.textContent = _totalCt + ' closed' + (_ru ? ' (' + (_individ.length + _absorpShown.length) + ' shown)' : '');
+    const _individ  = this.closedTrades.filter(t => t.reason !== 'period-rollup');
+    const _allShown = _individ;
+    const _totalCt  = _individ.length + (_ru?.rollup?.count || 0);
+    if (hdrCount) hdrCount.textContent = _totalCt + ' closed' + (_ru ? ' (' + _individ.length + ' shown)' : '');
     if (hdrMeta) {
       if (_totalCt > 0) {
         const wins   = _individ.filter(t => t.isWin).length + (_ru?.rollup?.wins || 0);
-        const losses = _totalCt - wins; // absorption cards are always losses
+        const losses = _totalCt - wins;
         const net    = [..._allShown, ...((_ru?.rollup?.netPnl != null) ? [{ totalPnl: _ru.rollup.netPnl }] : [])].reduce((s,t) => s + (t.totalPnl ?? t.pnl ?? 0), 0);
         const netStr = (net >= 0 ? '+' : '') + net.toFixed(2) + ' USDT';
         const netCol = net >= 0 ? 'var(--profit)' : 'var(--short)';
@@ -3964,31 +3951,6 @@ function pw() { return {
       return tb - ta;
     });
     el.innerHTML = _sortedFeed.map(t => {
-      // Absorption cut card — rendered inline at its chronological position
-      if (t.reason === 'absorption') {
-        const sym    = (t.symbol || '').replace('USDT','');
-        const pnl    = t.pnl ?? t.totalPnl ?? 0;
-        const pnlCol = pnl >= 0 ? 'var(--profit)' : 'var(--short)';
-        const cutNo  = t.count  ?? '—';
-        const stage  = t.Stage  ?? t.dcaStage ?? '—';
-        const timeStr = t.time  ? _fmtDate(t.time) : (t.cutAt ? _fmtDate(t.cutAt) : '—');
-        const markStr = t.mark  ? fmtP(t.mark) : '—';
-        return `<div style="background:var(--bg-raised);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:3px;overflow:hidden">
-          <div style="padding:6px 9px;display:flex;align-items:center;justify-content:space-between;background:rgba(255,180,0,0.04)">
-            <div style="display:flex;align-items:center;gap:6px">
-              <span style="font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text-hi)">${sym}</span>
-              <span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(255,180,0,.35);color:var(--warn);background:rgba(255,180,0,.08);letter-spacing:1px">✂️ CUT #${cutNo}</span>
-            </div>
-            <span style="font-family:var(--mono);font-size:10px;font-weight:700;color:${pnlCol}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(3)} USDT</span>
-          </div>
-          <div style="padding:6px 9px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px">
-            <div class="ps"><div class="psl">Cut #</div><div class="psv">${cutNo}</div></div>
-            <div class="ps"><div class="psl">DCA Stage</div><div class="psv">${stage}</div></div>
-            <div class="ps"><div class="psl">Mark</div><div class="psv">${markStr}</div></div>
-          </div>
-          <div style="padding:0 9px 6px;font-family:var(--mono);font-size:9px;color:var(--text-lo)">${timeStr}</div>
-        </div>`;
-      }
       if (t.reason === 'period-rollup') {
         const r = t.rollup || {};
         const rNet = r.netPnl ?? 0, rRoi = r.netRoi ?? 0;
@@ -4040,7 +4002,7 @@ function pw() { return {
         if (Number.isFinite(n) && n > 0) return Math.floor(n);
         const sw = Number(t._swStageCount || t.swStageCount || 0);
         const dca = Number(t.dcaStage || 0);
-        return Math.max(3, dca + Math.max(0, sw));
+        return Math.max(1, dca + Math.max(0, sw));
       })();
       const tsStr     = (() => { try { return 'Closed: ' + this.fmtTs(t.closedAt); } catch(e) { return 'Closed: —'; } })();
       const pnl     = t.pnl    ?? 0;
@@ -4476,138 +4438,6 @@ function pw() { return {
   // mult: notional multiplier — also equals slot cost
 
 
-
-  _recordAbsorptionCut(pos, cutPnl, mark, cutAt = Date.now(), cutMgn = 0) {
-    // Fire-and-forget: one individual card per cut event, inserted chronologically in the trade feed.
-    // count = relative cut number for this position (1st cut = 1, 2nd cut = 2, …)
-    const prevCuts = this.closedTrades.filter(t => t.reason === 'absorption' && t.posId === pos.id).length;
-    const card = {
-      id:       'abs_' + pos.id + '_' + cutAt,
-      reason:   'absorption',
-      symbol:   pos.symbol,
-      posId:    pos.id,
-      pnl:      parseFloat(cutPnl.toFixed(6)),
-      margin:   cutMgn,
-      mark,
-      cutAt,
-      openedAt: cutAt,
-      closedAt: cutAt,
-      isOpen:   false,
-      count:    prevCuts + 1,          // relative cut count for this position
-      time:     cutAt,                 // epoch ms timestamp of this cut
-      Stage:    pos.dcaStage ?? 0,     // DCA stage the position was at when cut
-    };
-    this.closedTrades.unshift(card);
-  },
-
-  _settleAbsorptionCard(pos, close = {}) {
-    // Per-event cards are already closed at creation; nothing to settle.
-    // Legacy path: if an old-style card with this posId exists, close it out.
-    const card = this.closedTrades.find(t => t.id === 'absorption_' + pos.id && t.reason === 'absorption');
-    if (!card) return;
-    card.finalClose = { ...close, closedAt: close.closedAt || Date.now() };
-    card.isOpen = false;
-    card.closedAt = close.closedAt || Date.now();
-  },
-
-  async runLossAbsorption() {
-    if (!this.cfg.lossAbsorptionEnabled) return;
-    const now        = Date.now();
-    const baseMargin = this.cfg.minNotional / this.cfg.leverage;
-    let _absorpCuts  = 0;
-    for (const pos of [...this.positions]) {
-      const _slotMult = 1;
-      const posBaseMargin = baseMargin;
-      const _uPnlThreshold = -(baseMargin * 0.25);
-      // Compute uPnL live from markPrice
-      const _posUPnl = pos.markPrice
-        ? (pos.markPrice - pos.entryPrice) / pos.entryPrice * pos.leverage * pos.margin
-        : (pos.upnl ?? 0);
-      // Only fire in loss and respect 30s cooldown between cuts.
-      if (_posUPnl > _uPnlThreshold) continue;
-      const _lastAbsorp = pos._lastAbsorpAt ?? 0;
-      if ((now - _lastAbsorp) < 30 * 1000) continue;
-
-      if ((pos.margin || 0) <= posBaseMargin) {
-        // At floor with no saved margin (already handled SW above) — nothing to do.
-        continue;
-      }
-
-      pos._lastAbsorpAt = now;
-      this._tryAbsorbPos(pos, baseMargin, posBaseMargin);
-      _absorpCuts++;
-    }
-    this.persist();
-    if (_absorpCuts > 0) this.renderTradeFeed();
-  },
-
-  _tryAbsorbPos(pos, cutBase, floorMargin) {
-    if ((pos.margin || 0) <= floorMargin) return;
-    const mark        = pos.markPrice || pos.entryPrice;
-    // cutMgn is always the raw 1x config base — cut size is independent of position mult.
-    // floorMargin (which may be mult-scaled) controls when we stop, not how much we cut.
-    const cutMgn      = Math.min(cutBase, pos.margin - floorMargin);
-    const cutFraction = cutMgn / pos.margin;
-    const cutQty      = pos.totalSize * cutFraction;
-    if (cutQty <= 0) return;
-    // Buffer guard: do not cut if the result would leave less than 80% of the floor margin.
-    // Prevents absorption grinding a position to near-zero instead of stopping cleanly at floor.
-    if (pos.margin - cutMgn < floorMargin * 0.8) return;
-    const cutPnl = (mark - pos.entryPrice) / pos.entryPrice * pos.leverage * cutMgn; // LONG
-    pos.totalSize = Math.max(0, pos.totalSize - cutQty);
-    pos.margin    = Math.max(0, pos.margin - cutMgn);
-    if (pos.notional) pos.notional *= (1 - cutFraction);
-    // Reusable margin is net of realized loss on this cut.
-    const netSavedMgn = Math.max(0, cutMgn + Math.min(0, cutPnl));
-    pos._savedMargin = parseFloat(((pos._savedMargin || 0) + netSavedMgn).toFixed(6));
-    pos._savedMarginSelf = parseFloat(((pos._savedMarginSelf || 0) + netSavedMgn).toFixed(6));
-    this.sess.pnl = parseFloat(((this.sess.pnl || 0) + cutPnl).toFixed(6));
-    this.recordDrawdownPnl(cutPnl);
-    this.sess.trades++;
-    this.sess.losses++;
-    const sym = pos.symbol.replace('USDT','');
-    const _stratTag = pos._gainerStrat ? 'gainers' : 'losers';
-    const _logSlotMult = 1;
-    this.log(`[ABS] ✂️ ${sym}: [uPnL] absorption (${_stratTag}) — base cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT | margin $${pos.margin.toFixed(2)} | floor $${floorMargin.toFixed(2)} | mult ${_logSlotMult}×`, 'warn');
-    if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
-      // Distribute absorption loss across all positions weighted by slot cost.
-      // Non-laggard positions are capped at _posMaxDebt; overflow goes to the laggard.
-      // Applying the cap here (not relying on _rebalanceDebtPool alone) ensures the laggard
-      // acts as the debt repository from the first write, not just after a second pass.
-      const _abs_totalSlots = this.positions.reduce((s, p) => s + this._posSlotWeight(p), 0);
-      if (_abs_totalSlots > 0) {
-        const _abs_pnlPerSlot = cutPnl / _abs_totalSlots;
-        const _abs_laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
-        let _abs_overflow = 0;
-        for (const p of this.positions) {
-          const share   = _abs_pnlPerSlot * this._posSlotWeight(p);
-          const raw     = parseFloat(((p._laggardLostValue || 0) + share).toFixed(6));
-          const maxDebt = this._posMaxDebt(p); // Infinity for laggard
-          const capped  = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
-          if (raw < capped) _abs_overflow += (capped - raw);
-          const _AEP = 1e-6;
-          p._laggardLostValue = this._snapLV((capped < 0 && capped > -_AEP) ? 0 : capped);
-        }
-        if (_abs_overflow > 0 && _abs_laggard) {
-          _abs_laggard._laggardLostValue = this._snapLV(parseFloat(((_abs_laggard._laggardLostValue || 0) - _abs_overflow).toFixed(6)));
-        }
-      }
-      this._rebalanceDebtPool();
-      const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
-      if (laggard && laggard.phase === 'reduce' && laggard._laggardInitialEV) {
-        const buffMul  = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
-        const buffedEV = laggard._laggardInitialEV * buffMul;
-        const _abs_debt = laggard._laggardLostValue || 0;
-        laggard._edaTpPrice = _abs_debt < 0
-          ? Math.max(0, laggard.entryPrice - (buffedEV - _abs_debt) * laggard.entryPrice / (laggard.leverage * laggard.margin))
-          : 0;
-      }
-      // Global debt mode: pool this cut's saved margin into every other open position
-      // so all reduce-phase candidates can build passive second-wind runway.
-    }
-    this._recordAbsorptionCut(pos, cutPnl, mark, Date.now(), cutMgn);
-  },
-
   async runLaggardCheck() {
     if (!this.cfg.laggardCheckEnabled) return;
     if (this.positions.length < 1) return;
@@ -4770,10 +4600,14 @@ function pw() { return {
       this.log(`[EDA] ⏳ Debt share (${closingPos.symbol} @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%): ${_debtParts.join(' | ')}${overflow > 0 ? ' [* capped → laggard]' : ''}`, 'info');
     }
 
-    // Recompute EDa TP on ALL surviving positions after lostValue update so every
-    // position is in sync immediately — not just the laggard. Uses the same two-clause
-    // formula as runLaggardCheck: negative debt (loss absorption) excludes EV; positive
-    // debt (bail-out) includes buffedEV so the laggard stays sticky.
+    // Equalise non-laggard debt before recomputing EDa TPs. Positions that opened
+    // after prior loss events start from _laggardLostValue = 0 and diverge from older
+    // non-laggards unless the pool is rebalanced here, before TPs are derived.
+    this._rebalanceDebtPool();
+
+    // Recompute EDa TP on ALL surviving positions and sync currentTpPrice immediately
+    // so there is no gap that causes currentTpPrice and _edaTpPrice to fight until
+    // the next watchCycle or runLaggardCheck pass.
     if (this.positions.length >= 1) {
       const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
       const buffMul = 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
@@ -4810,6 +4644,9 @@ function pw() { return {
             const _nfy_entryTpFloor = survivor.entryPrice * (1 + ((this.cfg.entryTpRoi / 100) / survivor.leverage)); // LONG
             if (survivor._edaTpPrice < _nfy_entryTpFloor) survivor._edaTpPrice = _nfy_entryTpFloor;
           }
+          // Sync currentTpPrice immediately — single source of truth, no waiting for next cycle.
+          survivor.currentTpPrice = survivor._edaTpPrice;
+          survivor.tpPct = parseFloat(((survivor._edaTpPrice - survivor.entryPrice) / survivor.entryPrice * survivor.leverage * 100).toFixed(2));
         }
       }
     }
@@ -4876,7 +4713,7 @@ function pw() { return {
       margin:           pos.margin,
       leverage:         pos.leverage,
       dcaStage:         pos.dcaStage || 0,
-      _stageCount:      this._posStageCount(pos),
+      _stageCount:      pos._binary ? 1 : this._posStageCount(pos),
       _swStageCount:    ((pos.orders || []).filter(o => o.type === 'cond' && o._secondWind).length || 0),
       duration,
       closedAt,
@@ -4885,8 +4722,6 @@ function pw() { return {
 
     const g = this.gainers.find(x => x.symbol === pos.symbol);
     if (g) g.status = 'closed';
-    // Mark any open absorption card for this position as settled without adding close PnL again.
-    this._settleAbsorptionCard(pos, { reason, exitPrice, pnl, pnlPct, totalPnl, closedAt });
     // Filter the closing position out BEFORE notifying so debt is distributed
     // only to survivors — not to the position being closed (which would orphan its share).
     this.positions = this.positions.filter(x => x.id !== pos.id);

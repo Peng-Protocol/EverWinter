@@ -7,10 +7,13 @@
 1. [Philosophy Overview](#philosophy-overview)
 2. [Techniques](#techniques)
    - [Proactive Techniques](#proactive-techniques)
+     - [RSI Gating](#rsi-gating)
+     - [Over-Extension Filter](#over-extension-filter)
    - [Reactive Techniques](#reactive-techniques)
 3. [Strategies](#strategies)
    - [Gainers](#gainers-strategy)
    - [Losers](#losers-strategy)
+   - [Slider](#slider-strategy) *(tentative)*
    - [Psycho Mode](#psycho-mode)
 4. [Sizing](#sizing)
 5. [Conclusion](#conclusion)
@@ -61,6 +64,22 @@ RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's meth
 
 The default gate is **70-70-70**: RSI6 ≥ 70, RSI12 ≥ 70, RSI24 ≥ 70. All three thresholds are configurable.
 
+The space between roughly 30 and 70 is where most tickers spend most of their time. Standard gating ignores this zone entirely by design — momentum in that range is inconclusive. It does become relevant under specific session conditions; see the Slider strategy.
+
+---
+
+#### Over-Extension Filter
+
+Tickers at the extremes of the RSI range are excluded from entry even when all gate conditions are otherwise met. A ticker that has moved too aggressively has lost its predictability — its next move can go either way with roughly equal conviction, which is not a setup worth taking.
+
+**Upper over-extension** (RSI6 above the configured ceiling, default 90): bad for shorts and bad for longs. A short risks entering a parabolic extension that keeps running; a long risks entering right before the inevitable violent snap-back. Neither side has an edge when a ticker is that stretched upward.
+
+**Lower over-extension** (RSI6 below the configured floor, default 10): equally bad in both directions. A long into capitulation risks catching a coin still in freefall; a short risks the violent snap-back that low RSI coins are prone to when selling pressure finally exhausts. The pattern is the same: the extremes strip out directional certainty.
+
+**Over-extension applies to both gainer and loser setups.** A gainer that has pushed RSI above 90 does not become a better short because it is "more overbought" — it becomes a worse one. A loser that has collapsed below RSI 10 does not become a better long because it is "more oversold" — it becomes a worse one. At those levels the move has already happened; what comes next is a coin flip.
+
+**Skip the over-extended, in either direction, on either side.**
+
 ---
 
 #### Binary Mode
@@ -88,6 +107,8 @@ When a position opens, the symbol's RSI at entry is recorded with a 6-hour TTL. 
 - **Bullish lock-in** (Gainers strategy): stored RSI is a **rising floor** — ratchets to the maximum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is below the floor. The ticker must pump to a higher RSI than the last entry before it qualifies again.
 
 - **Bearish lock-in** (Losers strategy): stored RSI is a **falling ceiling** — ratchets to the minimum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is above the ceiling. The ticker must decline to a lower RSI than the last entry before it qualifies again.
+
+As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many loser-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many gainer-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves. This observation is the premise of the tentative Slider strategy.
 
 ---
 
@@ -235,6 +256,24 @@ The Losers strategy targets coins showing strong downward momentum. Entry requir
 - Drawdown throttle
 - EDa TP overrides standard TP for the laggard when collective debt exists
 - Bearish lock-in bump on open — records entry RSI, ratchets the ceiling down
+
+---
+
+### Slider Strategy *(tentative)*
+
+The Slider is a concept, not yet a live strategy. It is documented here because the logic is coherent and the components to build it already exist.
+
+**The premise**: Standard gating requires RSI alignment at the extremes — above 70-70-70 for gainers, below 30-30-30 for losers. As a session runs, many qualifying tickers get entered and locked out. Eventually, the pool of available extreme-RSI candidates dries up. At that point the lock-in ledger holds something valuable: a record of which side the session has been trading heavily. If loser-side lock-ins significantly outnumber gainer-side lock-ins, the recent period was bearish. If gainer-side lock-ins dominate, it was bullish.
+
+The Slider uses that imbalance as a directional bias signal and then reaches into the middle RSI zone — broadly 30 to 70 — to find entries consistent with that bias.
+
+**Short bias** (loser lock-ins > gainer lock-ins): Target tickers in the upper-middle range, RSI readings that are elevated but have not yet reached the standard 70-70-70 floor. These are coins that have been rising but haven't extended far enough to qualify normally. In a session that has already been producing a lot of declining, locked-out tickers, a coin sitting at 55-60-60 RSI is a relative strength outlier — a reasonable short candidate if the broader bias is down.
+
+**Long bias** (gainer lock-ins > loser lock-ins): Target tickers in the lower-middle range, RSI readings that are depressed but have not fallen to the standard 30-30-30 ceiling. A coin at 40-45-45 in a session full of locked-out pumps is a relative weakness outlier — a potential long if the broader bias is up.
+
+**Why "Slider"**: The effective entry gate slides — downward from 70 toward the middle for shorts in a bearish session, upward from 30 toward the middle for longs in a bullish one. The gate is not fixed; it is moved by what the session has already demonstrated about its character.
+
+**What still needs to be resolved**: the exact threshold at which lock-in imbalance is considered significant, the RSI band within the middle zone to target, and whether the over-extension filter should apply in modified form here (likely yes — a middle-RSI ticker approaching 70 from below in a short-biased session is still approaching an over-extended zone and should probably still be skipped). The concept is sound; the calibration is open.
 
 ---
 
