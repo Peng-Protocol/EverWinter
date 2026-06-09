@@ -199,6 +199,31 @@ The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For
 
 ---
 
+### Plugin Stack Order
+
+The transform pipeline runs left-to-right, innermost to outermost:
+
+```
+pw()  →  plugin[0].transform(def)  →  plugin[1].transform(def)  →  ...  →  Alpine
+```
+
+When `pseudoOpenShort` is called at runtime, the **last** transform's version executes first. Each plugin captures the previous version via a `_orig*` closure and can call it, wrap it, or gate it.
+
+**Rule: strategy plugins must declare `after: ['everwinter']` / `after: ['sunchaser']` in their manifest.**
+
+The live trading plugin (EverWinter, SunChaser) completely replaces `pseudoOpenShort` with a real-API version that pushes the position itself — it does not call any prior version. Strategy plugins must therefore be the **outermost** wrapper so they can gate entries before the API call and post-process the newly pushed position after it.
+
+If a strategy plugin loaded before the live plugin, the live plugin would discard the strategy wrapper by replacing the method at the end of the chain — the strategy would never execute.
+
+| Load order | Chain position | Role |
+|---|---|---|
+| First | Innermost | Live trading plugin (EverWinter / SunChaser) — API execution |
+| Last | Outermost | Strategy plugins (Drifters, etc.) — entry gating, position stamping |
+
+Without `after`/`before` declarations the topological sort falls back to registration order. Always declare ordering explicitly for any plugin that wraps `pseudoOpenShort`.
+
+---
+
 ## Live Trading Plugins
 
 ### EverWinter (PseudoWinter → SHORT)

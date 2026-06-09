@@ -1,0 +1,279 @@
+<!--
+  Drifters Strategy Plugin for PseudoWinter
+  Mid-RSI zone short entries driven by aggregate lock-in trade bias.
+  Entries require all three RSI timeframes on the same side of 50.
+  Defers when the session's lock-in trade count signals a bullish bias
+  (short-only bot should not fight a bullish market).
+
+  Load via Plugin Manager in PseudoWinter's config panel.
+  Load AFTER EverWinter if using live trading — see README Plugin Stack Order.
+  targetBot: pseudowinter
+-->
+<script>
+(function () {
+  'use strict';
+
+  const DFT_W_KEY = '__dft_winter_v1';
+  const LOCK_TTL  = 6 * 3600 * 1000;
+
+  window.__BotPlugin = {
+    id:        'drifters-winter',
+    name:      'Drifters (Winter)',
+    version:   '1.0.0',
+    targetBot: 'pseudowinter',
+    after:     ['everwinter'],
+    before:    [],
+    conflicts: [],
+    requires:  [],
+    touches:   ['init', 'persist', '_sweepExpiredData', 'runScan', 'pseudoOpenShort', 'pseudoClosePosition', 'renderTradeFeed'],
+
+    css: `
+      .dft-w-section { margin-top:8px; padding-top:8px; border-top:1px solid var(--border); }
+      .dft-w-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+    `,
+
+    slots: {
+      'mode-config': `
+        <div class="dft-w-section">
+          <div style="font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:var(--text-lo);margin-bottom:8px">DRIFTERS STRATEGY</div>
+          <label class="tog" @click.prevent="if(!cfgLocked){cfg.driftersEnabled=!cfg.driftersEnabled;persist()}">
+            <div class="tog-t" :class="cfg.driftersEnabled?'on':''"><div class="tog-k"></div></div>
+            <div>
+              <div class="tog-l">Drifters Mode</div>
+              <div class="dft-w-hint">Mid-RSI entries (~50-50-50) biased by session lock-in trade count. Defers when session leans bullish.</div>
+            </div>
+          </label>
+          <div x-show="cfg.driftersEnabled" style="margin-top:8px">
+            <div class="g">
+              <div class="lbl">Bias Threshold <b x-text="(cfg.driftersThreshold??2).toFixed(1)+'×'"></b></div>
+              <input type="range" min="1" max="5" step="0.1" x-model.number="cfg.driftersThreshold" @change="persist()">
+              <div class="dft-w-hint">Preferred lock-in side must have this × more aggregate trades to declare a bias. 1× = any imbalance; 5× = dominant lean only.</div>
+            </div>
+          </div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _origInit    = def.init;
+      const _origPersist = def.persist;
+      const _origSweep   = def._sweepExpiredData;
+      const _origScan    = def.runScan;
+      const _origOpen    = def.pseudoOpenShort;
+      const _origClose   = def.pseudoClosePosition;
+      const _origRender  = def.renderTradeFeed;
+
+      return Object.assign({}, def, {
+
+        _driftersBiasLastLogged: null,
+
+        async init() {
+          await _origInit.call(this);
+          if (this.cfg.driftersEnabled   === undefined) this.cfg.driftersEnabled   = false;
+          if (this.cfg.driftersThreshold === undefined) this.cfg.driftersThreshold = 2;
+          if (!this.driftLockIn) this.driftLockIn = {};
+          try {
+            const raw = localStorage.getItem(DFT_W_KEY);
+            if (raw) {
+              const s   = JSON.parse(raw);
+              const now = Date.now();
+              if (s.driftLockIn && typeof s.driftLockIn === 'object') {
+                for (const [sym, e] of Object.entries(s.driftLockIn)) {
+                  if (e?.setAt && (now - e.setAt) < LOCK_TTL) this.driftLockIn[sym] = e;
+                }
+              }
+            }
+          } catch(e) {}
+        },
+
+        persist() {
+          _origPersist.call(this);
+          try {
+            localStorage.setItem(DFT_W_KEY, JSON.stringify({ driftLockIn: this.driftLockIn || {} }));
+          } catch(e) {}
+        },
+
+        _sweepExpiredData() {
+          _origSweep.call(this);
+          const now = Date.now();
+          for (const sym of Object.keys(this.driftLockIn || {})) {
+            if (now - (this.driftLockIn[sym].setAt || 0) >= LOCK_TTL) delete this.driftLockIn[sym];
+          }
+        },
+
+        // Bias is determined at scan time by summing trades from the already-persisted
+        // gainerLockIn / loserLockIn maps. Survives reloads; ages out with TTL naturally.
+        _driftersBias() {
+          const g = Object.values(this.gainerLockIn || {}).reduce((s, e) => s + (e.trades || 0), 0);
+          const l = Object.values(this.loserLockIn  || {}).reduce((s, e) => s + (e.trades || 0), 0);
+          const t = this.cfg.driftersThreshold || 2;
+          if (g === 0 && l === 0) return 'neutral';
+          if (g >= l * t) return 'bullish';
+          if (l >= g * t) return 'bearish';
+          return 'neutral';
+        },
+
+        // All three timeframes on same side of 50 = high/low. Mixed = lukewarm (skip).
+        _drifterRsiClass(rsi6, rsi12, rsi24) {
+          if (rsi6 >= 50 && rsi12 >= 50 && rsi24 >= 50) return 'high';
+          if (rsi6 <= 50 && rsi12 <= 50 && rsi24 <= 50) return 'low';
+          return 'lukewarm';
+        },
+
+        driftLockInBump(symbol, rsi6, rsi12, rsi24, drifterType) {
+          if (!this.driftLockIn) this.driftLockIn = {};
+          const now   = Date.now();
+          const entry = this.driftLockIn[symbol];
+          if (entry && (now - entry.setAt) < LOCK_TTL && entry.drifterType === drifterType) {
+            if (drifterType === 'high') {
+              entry.rsi6  = Math.max(entry.rsi6,  rsi6  ?? 50);
+              entry.rsi12 = Math.max(entry.rsi12, rsi12 ?? 50);
+              entry.rsi24 = Math.max(entry.rsi24, rsi24 ?? 50);
+            } else {
+              entry.rsi6  = Math.min(entry.rsi6,  rsi6  ?? 50);
+              entry.rsi12 = Math.min(entry.rsi12, rsi12 ?? 50);
+              entry.rsi24 = Math.min(entry.rsi24, rsi24 ?? 50);
+            }
+            entry.trades++;
+            entry.setAt = now;
+          } else {
+            this.driftLockIn[symbol] = { rsi6: rsi6 ?? 50, rsi12: rsi12 ?? 50, rsi24: rsi24 ?? 50, trades: 1, setAt: now, drifterType };
+          }
+          const e   = this.driftLockIn[symbol];
+          const dir = drifterType === 'high' ? '▲' : '▼';
+          this.log(`[DFT] ${dir} ${symbol.replace('USDT','')}: drift lock-in — RSI ${e.rsi6.toFixed(1)}/${e.rsi12.toFixed(1)}/${e.rsi24.toFixed(1)} | ${e.trades} trade${e.trades === 1 ? '' : 's'}`, 'info');
+          try { localStorage.setItem(DFT_W_KEY, JSON.stringify({ driftLockIn: this.driftLockIn })); } catch(ex) {}
+        },
+
+        async runScan() {
+          await _origScan.call(this);
+          await this._driftersRunScan();
+        },
+
+        async _driftersRunScan() {
+          if (!this.cfg.driftersEnabled) return;
+          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
+
+          const bias = this._driftersBias();
+
+          if (bias !== this._driftersBiasLastLogged) {
+            this._driftersBiasLastLogged = bias;
+            if (bias === 'bullish') {
+              this.log('📈 Today is bullish — Drifters deferred (short-only bias)', 'info');
+            }
+          }
+
+          // PseudoWinter is short-only — defer in a bullish session
+          if (bias === 'bullish') return;
+
+          try {
+            const tr = await fetch(`${this.base}/v5/market/tickers?category=linear`);
+            const td = await tr.json();
+            if (td.retCode !== 0) return;
+            const allTickers = td.result?.list || [];
+
+            const activeSyms = new Set((this.positions || []).map(p => p.symbol));
+
+            const candidates = allTickers
+              .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
+              .filter(t => !activeSyms.has(t.symbol))
+              .filter(t => !(this._isSymbolBanned?.(t.symbol)))
+              .sort((a, b) => parseFloat(b.turnover24h || 0) - parseFloat(a.turnover24h || 0))
+              .slice(0, 30);
+
+            for (const t of candidates) {
+              if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) break;
+
+              const sym   = t.symbol;
+              const price = parseFloat(t.lastPrice || 0);
+              if (!price) continue;
+
+              const rsi6  = await this.fetchRSI(sym, 6);
+              const rsi12 = await this.fetchRSI(sym, 12);
+              const rsi24 = await this.fetchRSI(sym, 24);
+              if (rsi6 == null || rsi12 == null || rsi24 == null) continue;
+
+              const drifterType = this._drifterRsiClass(rsi6, rsi12, rsi24);
+              if (drifterType === 'lukewarm') continue;
+
+              // driftLockIn gate
+              if (!this.driftLockIn) this.driftLockIn = {};
+              const dl = this.driftLockIn[sym];
+              if (dl && (Date.now() - dl.setAt) < LOCK_TTL && dl.drifterType === drifterType) {
+                if (drifterType === 'high') {
+                  if (rsi6 <= dl.rsi6 || rsi12 <= dl.rsi12 || rsi24 <= dl.rsi24) continue;
+                } else {
+                  if (rsi6 >= dl.rsi6 || rsi12 >= dl.rsi12 || rsi24 >= dl.rsi24) continue;
+                }
+              }
+
+              const dir = drifterType === 'high' ? '▲' : '▼';
+              this.log(`[DFT] ${dir} ${sym.replace('USDT','')} @ ${price} RSI ${rsi6.toFixed(0)}/${rsi12.toFixed(0)}/${rsi24.toFixed(0)} — ${drifterType} drifter entry`, 'info');
+              await this.pseudoOpenShort({ symbol: sym, price, rsi6, rsi12, rsi24, _drifterType: drifterType });
+            }
+          } catch(e) {
+            this.log('[DFT] Scan error: ' + e.message, 'warn');
+          }
+        },
+
+        async pseudoOpenShort(candidate) {
+          if (!candidate._drifterType) return _origOpen.call(this, candidate);
+
+          const drifterType = candidate._drifterType;
+
+          // Suppress main lock-in bumps — Drifters manages its own driftLockIn map
+          const _gbump = this.gainerLockInBump;
+          const _lbump = this.loserLockInBump;
+          this.gainerLockInBump = () => {};
+          this.loserLockInBump  = () => {};
+
+          const lenBefore = (this.positions || []).length;
+          try {
+            await _origOpen.call(this, candidate);
+          } finally {
+            this.gainerLockInBump = _gbump;
+            this.loserLockInBump  = _lbump;
+          }
+
+          if ((this.positions || []).length > lenBefore) {
+            const pos = this.positions[this.positions.length - 1];
+            pos._drifterType = drifterType;
+            this.driftLockInBump(candidate.symbol, candidate.rsi6, candidate.rsi12, candidate.rsi24, drifterType);
+            if (typeof this.persist === 'function') this.persist();
+          }
+        },
+
+        async pseudoClosePosition(pos, reason, fillPrice) {
+          const drifterType = pos._drifterType ?? null;
+          const prevLen     = this.closedTrades?.length ?? 0;
+          await _origClose.call(this, pos, reason, fillPrice);
+          // Carry _drifterType onto the newly prepended closed trade record
+          if (drifterType && (this.closedTrades?.length ?? 0) > prevLen) {
+            this.closedTrades[0]._drifterType = drifterType;
+          }
+        },
+
+        renderTradeFeed() {
+          _origRender.call(this);
+          if (!this.closedTrades?.some(t => t._drifterType)) return;
+          const el = document.getElementById('pw-trade-feed');
+          if (!el) return;
+          const sorted = this.closedTrades
+            .filter(t => t.reason !== 'period-rollup')
+            .sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
+          const cards = el.querySelectorAll(':scope > div');
+          sorted.forEach((t, idx) => {
+            if (!t._drifterType || !cards[idx]) return;
+            const isHigh = t._drifterType === 'high';
+            const badge  = document.createElement('span');
+            badge.style.cssText = `font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;${isHigh ? 'border:1px solid rgba(0,229,160,.45);color:var(--profit);background:rgba(0,229,160,.10)' : 'border:1px solid rgba(239,68,68,.45);color:var(--short);background:rgba(239,68,68,.10)'}`;
+            badge.textContent = 'DRIFT';
+            const headFlex = cards[idx].querySelector('div[style*="display:flex"]');
+            if (headFlex) headFlex.appendChild(badge);
+          });
+        },
+      });
+    },
+  };
+})();
+</script>

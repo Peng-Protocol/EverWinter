@@ -13,7 +13,7 @@
 3. [Strategies](#strategies)
    - [Gainers](#gainers-strategy)
    - [Losers](#losers-strategy)
-   - [Slider](#slider-strategy) *(tentative)*
+   - [Drifters](#drifters-strategy)
    - [Psycho Mode](#psycho-mode)
 4. [Sizing](#sizing)
 5. [Conclusion](#conclusion)
@@ -29,6 +29,10 @@ The core insight is about **meta-structure**, not individual tickers. On any giv
 On a **bullish day**: gainers are likely to continue pumping, and losers are likely to revert upward. The better trades are longs — longs on gaining momentum, longs on oversold coins recovering. Shorts taken into that environment face headwind.
 
 On a **bearish day**: gainers that ran up are likely to retrace, and losers are likely to extend further downward. The better trades are shorts — shorts on overbought gainers, shorts on coins still in freefall.
+
+On a **volatile day**: neither side dominates. Coins pump and dump freely in both directions — overbought tickers snap back, oversold tickers bounce hard. Both the short side and the long side can be profitable simultaneously because the market is producing clear extremes on both ends. The lock-in ledger on such days will show meaningful activity on both sides without either dominating by the configured threshold, producing a neutral or near-neutral bias. Drifters defers when bias is neutral, since its mid-RSI entries rely on a directional lean to have edge; without one, lukewarm conditions dominate and entries are skipped.
+
+Some days are also **minimally skewed** — leaning slightly bullish or bearish but not enough to reach the configured Drifters threshold. These are treated as neutral for Drifters purposes. The threshold exists precisely to distinguish a meaningful lean from noise.
 
 Neither system predicts the day in advance. The approach is to run both sides simultaneously and let drawdown throttling limit damage on the side that is wrong today. The side aligned with the day's meta-structure runs profitably; the opposing side hits its SLs cleanly and closes bounded losses. Over a session the net of both sides reflects the actual character of that day.
 
@@ -60,11 +64,11 @@ Proactive techniques decide whether and when to enter. They filter noise from si
 
 RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's method. The multi-timeframe requirement ensures the condition is present at multiple levels of resolution simultaneously — a single timeframe spike is noise; alignment across three is signal.
 
-**Floor gates** confirm momentum is sufficiently developed. **Ceiling gates** block entries where momentum is still running — a ticker failing the ceiling is not ready.
+**Floor gates** confirm upward momentum is sufficiently developed — used by the Gainers strategy. **Ceiling gates** confirm downward momentum is sufficiently developed — used by the Losers strategy. A ticker failing its respective gate is not ready.
 
-The default gate is **70-70-70**: RSI6 ≥ 70, RSI12 ≥ 70, RSI24 ≥ 70. All three thresholds are configurable.
+The default **floor gate is 30-30-30**: RSI6 ≥ 30, RSI12 ≥ 30, RSI24 ≥ 30. The default **ceiling gate is 30-30-30**: RSI6 ≤ 30, RSI12 ≤ 30, RSI24 ≤ 30. All six thresholds are independently configurable.
 
-The space between roughly 30 and 70 is where most tickers spend most of their time. Standard gating ignores this zone entirely by design — momentum in that range is inconclusive. It does become relevant under specific session conditions; see the Slider strategy.
+The space above 30 and below 70 is where most tickers spend most of their time. Standard gating at 30-30-30 captures the boundary of oversold/overbought territory — momentum entering or leaving this zone is the signal. The mid-range (roughly 30–70) does become relevant under specific session conditions; see the Drifters strategy.
 
 ---
 
@@ -108,7 +112,9 @@ When a position opens, the symbol's RSI at entry is recorded with a 6-hour TTL. 
 
 - **Bearish lock-in** (Losers strategy): stored RSI is a **falling ceiling** — ratchets to the minimum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is above the ceiling. The ticker must decline to a lower RSI than the last entry before it qualifies again.
 
-As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many loser-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many gainer-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves. This observation is the premise of the tentative Slider strategy.
+As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many loser-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many gainer-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves. This observation is the bias signal used by the Drifters strategy.
+
+The Drifters strategy maintains a third map, `driftLockIn`, keyed by symbol with the same TTL and schema as the main lock-ins. It records drift-specific entries separately so that normal gainer/loser lock-in gates are not polluted by mid-RSI Drifters activity.
 
 ---
 
@@ -221,7 +227,7 @@ Each strategy is a specific combination of techniques.
 
 ### Gainers Strategy
 
-The Gainers strategy targets coins showing strong upward momentum. Entry requires RSI alignment across all three timeframes above the configured floor gates, confirming the move is developed and not a single-candle spike.
+The Gainers strategy targets coins showing strong upward momentum. Entry requires RSI alignment across all three timeframes at or above the configured floor gates (default **30-30-30**), confirming the move is developed and not a single-candle spike.
 
 **PseudoWinter (short)**: The biggest 24h gainers are filtered for RSI6/12/24 ≥ the configured floors. A short is opened betting the pump either exhausts and reverts, or at minimum pulls back enough to close at TP. On bearish days this is a high-probability setup — pumped coins face the full weight of the broader trend. On bullish days it still works but the move must be genuinely overbought across all timeframes to qualify, and the binary SL caps damage if the pump extends instead.
 
@@ -241,7 +247,7 @@ The Gainers strategy targets coins showing strong upward momentum. Entry require
 
 ### Losers Strategy
 
-The Losers strategy targets coins showing strong downward momentum. Entry requires RSI alignment across all three timeframes below the configured ceiling gates, confirming the decline is sustained and not a brief dip.
+The Losers strategy targets coins showing strong downward momentum. Entry requires RSI alignment across all three timeframes at or below the configured ceiling gates (default **30-30-30**), confirming the decline is sustained and not a brief dip.
 
 **PseudoWinter (short)**: The biggest 24h losers are filtered for RSI6/12/24 ≤ the configured ceilings. A short is opened betting the decline continues. On bearish days the full meta-structure supports the trade. On bullish days even the weakest coins tend to recover — the binary SL limits damage to the configured percentage and exits cleanly.
 
@@ -259,21 +265,42 @@ The Losers strategy targets coins showing strong downward momentum. Entry requir
 
 ---
 
-### Slider Strategy *(tentative)*
-
-The Slider is a concept, not yet a live strategy. It is documented here because the logic is coherent and the components to build it already exist.
+### Drifters Strategy
 
 **The premise**: Standard gating requires RSI alignment at the extremes — above 70-70-70 for gainers, below 30-30-30 for losers. As a session runs, many qualifying tickers get entered and locked out. Eventually, the pool of available extreme-RSI candidates dries up. At that point the lock-in ledger holds something valuable: a record of which side the session has been trading heavily. If loser-side lock-ins significantly outnumber gainer-side lock-ins, the recent period was bearish. If gainer-side lock-ins dominate, it was bullish.
 
-The Slider uses that imbalance as a directional bias signal and then reaches into the middle RSI zone — broadly 30 to 70 — to find entries consistent with that bias.
+Drifters uses that aggregate lock-in trade count as a directional bias signal and reaches into the middle RSI zone — around the 50-50-50 midpoint — to find entries consistent with that bias.
 
-**Short bias** (loser lock-ins > gainer lock-ins): Target tickers in the upper-middle range, RSI readings that are elevated but have not yet reached the standard 70-70-70 floor. These are coins that have been rising but haven't extended far enough to qualify normally. In a session that has already been producing a lot of declining, locked-out tickers, a coin sitting at 55-60-60 RSI is a relative strength outlier — a reasonable short candidate if the broader bias is down.
+**RSI midpoint gating**: An entry requires all three RSI timeframes on the same side of 50.
 
-**Long bias** (gainer lock-ins > loser lock-ins): Target tickers in the lower-middle range, RSI readings that are depressed but have not fallen to the standard 30-30-30 ceiling. A coin at 40-45-45 in a session full of locked-out pumps is a relative weakness outlier — a potential long if the broader bias is up.
+- **High drifter** (all three ≥ 50): RSI is drifting above the midpoint — green `DRIFT` badge.
+- **Low drifter** (all three ≤ 50): RSI is drifting below the midpoint — red `DRIFT` badge.
+- **Lukewarm** (mixed, some above and some below 50): skip entry. Lukewarm is this strategy's equivalent of over-extension — a mixed RSI signal provides no directional edge.
 
-**Why "Slider"**: The effective entry gate slides — downward from 70 toward the middle for shorts in a bearish session, upward from 30 toward the middle for longs in a bullish one. The gate is not fixed; it is moved by what the session has already demonstrated about its character.
+**Bias detection**: Computed at scan time by summing the `trades` field across all entries in the existing `gainerLockIn` and `loserLockIn` maps. No separate counters — the lock-in maps are already persisted and survive reloads. The aggregate reflects what the session has actually traded.
 
-**What still needs to be resolved**: the exact threshold at which lock-in imbalance is considered significant, the RSI band within the middle zone to target, and whether the over-extension filter should apply in modified form here (likely yes — a middle-RSI ticker approaching 70 from below in a short-biased session is still approaching an over-extended zone and should probably still be skipped). The concept is sound; the calibration is open.
+**Threshold**: The `driftersThreshold` config (default **2×**) sets how dominant one side must be. At 2×, gainer lock-in aggregate trades must be at least double loser lock-in trades to declare a bullish bias. At 1×, any imbalance declares a bias. At 5×, only a heavily dominant side triggers.
+
+**Deferral**:
+- PseudoWinter (short-only): logs *"Today is bullish"* and defers all Drifters entries when bias is bullish. Fighting a bullish session from the short side is the wrong trade.
+- PseudoChaser (long-only): logs *"Today is bearish"* and defers when bias is bearish.
+
+The deferral message fires once per bias change, not on every scan cycle.
+
+**Drift lock-in**: Separate from the main gainer/loser lock-ins. Keyed by symbol, stores `{ rsi6, rsi12, rsi24, trades, setAt, drifterType }` with a 6-hour TTL. High drifters ratchet the RSI floor up (requires stricter RSI alignment on re-entry); low drifters ratchet the ceiling down. A symbol can hold separate drift entries for each direction if both fire within the TTL window.
+
+**Position markers**: `_drifterType: 'high' | 'low'` stamped on open positions and carried to closed trade records. The `DRIFT` badge appears in the position card and the closed-trade history feed. Green = high, red = low — the badge text is always `DRIFT` regardless of direction.
+
+**Why "Drifters"**: Entries drift into the mid-RSI zone — from the standard entry extremes toward the center — guided by what the session has already proven about its character.
+
+**Plugin stack**: `Drifters-Winter.html` loads after EverWinter; `Drifters-Chaser.html` loads after SunChaser. Declare `after: ['everwinter']` / `after: ['sunchaser']` in the manifest. See the README Plugin Stack Order section for the technical rationale.
+
+**Components used**:
+- RSI Gating (midpoint variant — 50-50-50 instead of 70-70-70 or 30-30-30)
+- Lock-in System (separate `driftLockIn` map)
+- `_driftersBias()` scan-time bias computation from existing lock-in maps
+- `_drifterRsiClass()` — high / low / lukewarm classification
+- Plugin transform hooks: `runScan`, `pseudoOpenShort`, `pseudoClosePosition`, `renderTradeFeed`, `persist`, `_sweepExpiredData`
 
 ---
 
