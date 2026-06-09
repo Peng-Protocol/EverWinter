@@ -60,11 +60,11 @@ Proactive techniques decide whether and when to enter. They filter noise from si
 
 RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's method. The multi-timeframe requirement ensures the condition is present at multiple levels of resolution simultaneously — a single timeframe spike is noise; alignment across three is signal.
 
-**Floor gates** confirm momentum is sufficiently developed. **Ceiling gates** block entries where momentum is still running — a ticker failing the ceiling is not ready.
+**Floor gates** confirm upward momentum is sufficiently developed — used by the Gainers strategy. **Ceiling gates** confirm downward momentum is sufficiently developed — used by the Losers strategy. A ticker failing its respective gate is not ready.
 
-The default gate is **70-70-70**: RSI6 ≥ 70, RSI12 ≥ 70, RSI24 ≥ 70. All three thresholds are configurable.
+The default **floor gate is 30-30-30**: RSI6 ≥ 30, RSI12 ≥ 30, RSI24 ≥ 30. The default **ceiling gate is 30-30-30**: RSI6 ≤ 30, RSI12 ≤ 30, RSI24 ≤ 30. All six thresholds are independently configurable.
 
-The space between roughly 30 and 70 is where most tickers spend most of their time. Standard gating ignores this zone entirely by design — momentum in that range is inconclusive. It does become relevant under specific session conditions; see the Slider strategy.
+The space above 30 and below 70 is where most tickers spend most of their time. Standard gating at 30-30-30 captures the boundary of oversold/overbought territory — momentum entering or leaving this zone is the signal. The mid-range (roughly 30–70) does become relevant under specific session conditions; see the Slider strategy.
 
 ---
 
@@ -221,7 +221,7 @@ Each strategy is a specific combination of techniques.
 
 ### Gainers Strategy
 
-The Gainers strategy targets coins showing strong upward momentum. Entry requires RSI alignment across all three timeframes above the configured floor gates, confirming the move is developed and not a single-candle spike.
+The Gainers strategy targets coins showing strong upward momentum. Entry requires RSI alignment across all three timeframes at or above the configured floor gates (default **30-30-30**), confirming the move is developed and not a single-candle spike.
 
 **PseudoWinter (short)**: The biggest 24h gainers are filtered for RSI6/12/24 ≥ the configured floors. A short is opened betting the pump either exhausts and reverts, or at minimum pulls back enough to close at TP. On bearish days this is a high-probability setup — pumped coins face the full weight of the broader trend. On bullish days it still works but the move must be genuinely overbought across all timeframes to qualify, and the binary SL caps damage if the pump extends instead.
 
@@ -241,7 +241,7 @@ The Gainers strategy targets coins showing strong upward momentum. Entry require
 
 ### Losers Strategy
 
-The Losers strategy targets coins showing strong downward momentum. Entry requires RSI alignment across all three timeframes below the configured ceiling gates, confirming the decline is sustained and not a brief dip.
+The Losers strategy targets coins showing strong downward momentum. Entry requires RSI alignment across all three timeframes at or below the configured ceiling gates (default **30-30-30**), confirming the decline is sustained and not a brief dip.
 
 **PseudoWinter (short)**: The biggest 24h losers are filtered for RSI6/12/24 ≤ the configured ceilings. A short is opened betting the decline continues. On bearish days the full meta-structure supports the trade. On bullish days even the weakest coins tend to recover — the binary SL limits damage to the configured percentage and exits cleanly.
 
