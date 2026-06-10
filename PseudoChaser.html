@@ -790,7 +790,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="g">
                 <div class="lbl">Take Profit <b x-text="cfg.binaryTpPct+'%'"></b></div>
                 <input type="range" min="1" max="50" step="1" x-model.number="cfg.binaryTpPct" :disabled="bot.running" @change="persist()">
-                <div class="hint">TP closes at this % gain (leverage-adjusted). At 18%: TP = entry × (1 + 18% / lev).</div>
+                <div class="hint">Debt-free close at this % gain: TP = entry × (1 + slider% / lev). If debt is redistributed from other positions, EDa extends the TP above the slider.</div>
               </div>
               <div class="g" style="margin-top:8px">
                 <div class="lbl">Stop Loss <b x-text="cfg.binarySlPct+'%'"></b></div>
@@ -815,11 +815,11 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
           <div class="g" class="mt-sep">
             <div class="sec-ttl" style="margin-bottom:6px;font-size:9px">TAKE PROFIT</div>
             <div class="sg2 gs">
-              <div class="stat" x-show="cfg.binaryModeEnabled"><div class="sl">Binary TP</div><div class="sv profit sm" x-text="cfg.binaryTpPct+'% → '+(cfg.binaryTpPct/(1+(Math.max(-99,cfg.laggardProfitOffset??50)/100))).toFixed(1)+'%'"></div></div>
+              <div class="stat" x-show="cfg.binaryModeEnabled"><div class="sl">Binary TP</div><div class="sv profit sm" x-text="cfg.binaryTpPct+'%'"></div></div>
               <div data-plugin-slot="tp-stats"></div>
             </div>
             <div x-show="cfg.binaryModeEnabled" style="font-size:9.5px;color:var(--text-lo);margin-top:7px;line-height:1.6">
-              The slider is the buffered (EV) target; a debt-free position closes at the functional TP = slider ÷ buffer (Profit Offset). SL at entry × (1 − binarySlPct / lev).
+              Debt-free close at slider %. EDa extends the TP above slider only when redistributed debt is held. SL at entry × (1 − binarySlPct / lev).
             </div>
             <div data-plugin-slot="tp-description"></div>
           </div>
@@ -2964,7 +2964,7 @@ function pw() { return {
               const rawQty   = this.cfg.minNotional / price;
               const qty      = this.snapQty(rawQty, instr);
               const _prevTpPctL = this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
-              const tpPrice  = this.snapPrice(price * (1 + (_prevTpPctL / this._buffMul() / 100) / this.cfg.leverage), instr); // LONG: functional TP above entry
+              const tpPrice  = this.snapPrice(price * (1 + (this.cfg.binaryModeEnabled ? _prevTpPctL : _prevTpPctL / this._buffMul()) / 100 / this.cfg.leverage), instr); // LONG: binary at slider %; DCA at slider ÷ buffer
               const notional = qty * price;
               if (qty <= 0) {
                 status='invalid'; skipReason = skipReason || 'qty below min';
@@ -3165,7 +3165,7 @@ function pw() { return {
 
     const binary      = this._binaryMode();
     const tpPct       = binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
-    const tpPrice     = this.snapPrice(price * (1 + tpPct / this._buffMul() / 100 / lev), instr); // LONG: functional TP above entry (slider ÷ buffer)
+    const tpPrice     = this.snapPrice(price * (1 + (binary ? tpPct : tpPct / this._buffMul()) / 100 / lev), instr); // LONG: binary closes at slider %; DCA closes at slider ÷ buffer
 
     // Binary mode: no DCA orders; TP + SL set at entry
     const orders = [];
@@ -3713,22 +3713,23 @@ function pw() { return {
       const _dg_stage = _dg_pos.dcaStage || 0;
       const _dg_base  = _dg_stage === 0 ? (_dg_pos._baseTpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi)) : this._tpRoi(_dg_stage);
       const _dg_roi   = _dg_base;
-      // Stage 0 carries the visual buffer — actual TP price is at _dg_roi/buffMul; DCA stages use raw %
-      const _dg_functRoi = _dg_stage === 0 ? _dg_roi / this._buffMul() : _dg_roi;
+      // Binary stage 0 closes at slider %; DCA stage 0 closes at slider ÷ buffer.
+      const _dg_functRoi       = _dg_stage === 0 ? (_dg_pos._binary ? _dg_roi : _dg_roi / this._buffMul()) : _dg_roi;
+      const _dg_legacyFunctRoi = _dg_stage === 0 ? _dg_roi / this._buffMul() : _dg_roi; // migration: old binary was stored at slider÷buffer
       // If tpPct was deliberately set to something other than expected (e.g. FUN doubling,
-      // ingress-adjusted entry), the TP is intentional — stand down. Accept both the buffered
-      // (legacy) and functional (current) tpPct conventions.
+      // ingress-adjusted entry), the TP is intentional — stand down.
       if (_dg_pos.tpPct != null
           && Math.abs((_dg_pos.tpPct || 0) - _dg_roi) > 0.01
-          && Math.abs((_dg_pos.tpPct || 0) - _dg_functRoi) > 0.01) continue;
+          && Math.abs((_dg_pos.tpPct || 0) - _dg_functRoi) > 0.01
+          && Math.abs((_dg_pos.tpPct || 0) - _dg_legacyFunctRoi) > 0.01) continue;
       const _dg_instr  = await this.getInstrInfo(_dg_pos.symbol);
       if (!_dg_instr) continue;
-      const _dg_target = this.snapPrice(_dg_pos.entryPrice * (1 + (_dg_functRoi / 100) / _dg_pos.leverage), _dg_instr); // LONG: functional TP above entry
+      const _dg_target = this.snapPrice(_dg_pos.entryPrice * (1 + (_dg_functRoi / 100) / _dg_pos.leverage), _dg_instr); // LONG: TP above entry
       const _dg_tol    = (_dg_pos.entryPrice * (_dg_functRoi / 100) / _dg_pos.leverage) * 0.10;
       if (_dg_target > 0 && Math.abs(_dg_pos.currentTpPrice - _dg_target) > _dg_tol) {
         _dg_pos.currentTpPrice = _dg_target;
         _dg_pos.tpPct          = parseFloat(_dg_functRoi.toFixed(2));
-        this.log(`[DFT] ☀️ ${_dg_pos.symbol}: TP drift-corrected (stage ${_dg_stage}, ${_dg_functRoi.toFixed(1)}% functional ROI) → ${fmtP(_dg_target)}`, 'warn');
+        this.log(`[DFT] ☀️ ${_dg_pos.symbol}: TP drift-corrected (stage ${_dg_stage}, ${_dg_functRoi.toFixed(1)}% ROI) → ${fmtP(_dg_target)}`, 'warn');
         this.persist();
       }
     }
@@ -3910,7 +3911,7 @@ function pw() { return {
         let _wpTpRef = _effTp;
         if (!(pos._edaTpPrice > 0) && (pos.dcaStage || 0) === 0) {
           const _wpRoi = this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
-          _wpTpRef = pos.entryPrice * (1 + (_wpRoi / this._buffMul() / 100) / pos.leverage); // LONG: functional TP above entry
+          _wpTpRef = pos.entryPrice * (1 + (pos._binary ? _wpRoi : _wpRoi / this._buffMul()) / 100 / pos.leverage); // LONG: TP above entry
         }
         const tpGap  = _wpTpRef - pos.entryPrice; // LONG: distance from entry up to TP
         const tpProx = mark - pos.entryPrice;      // LONG: price distance already covered upward
@@ -4538,15 +4539,15 @@ function pw() { return {
   },
 
   // Unified EDa TP target for a LONG position.
-  //   No held loss   → functional TP (slider ÷ buffMul).
+  //   No held loss   → binary: slider TP; DCA: functional TP (slider ÷ buffMul).
   //   Held loss > 0  → price where profit covers bufferedEV + the held loss.
   // _laggardLostValue is negative when a position holds loss; magnitude is the debt it carries.
   _edaTargetPrice(pos) {
     const buffMul = this._buffMul();
     const stage   = pos.dcaStage || 0;
     const baseTp  = pos._baseTpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
-    // Only stage 0 (binary/entry) carries the visual buffer; DCA stages use raw _tpRoi() %.
-    const funcPct = stage === 0 ? baseTp / buffMul : this._tpRoi(stage);
+    // Binary stage 0 closes at slider %; DCA stage 0 closes at slider ÷ buffer.
+    const funcPct = stage === 0 ? (pos._binary ? baseTp : baseTp / buffMul) : this._tpRoi(stage);
     const funcTp  = pos.entryPrice * (1 + funcPct / 100 / pos.leverage); // LONG: above entry
     const bufferedEV = pos._laggardInitialEV > 0 ? pos._laggardInitialEV : pos.margin * (baseTp / 100);
     const lostMag = Math.max(0, -(pos._laggardLostValue || 0));
