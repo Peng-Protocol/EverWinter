@@ -3239,13 +3239,21 @@ function pw() { return {
       upnl:                0,
     };
 
-    // Place any retained lost value (laggard closed in loss while the book was empty)
-    // on this position — it becomes the new debt repository.
+    // Absorb pending debt from the pool (_retainedLostValue) up to this position's bufferedEV cap.
+    // The pool accumulates from: (a) empty-book close losses, (b) overflow when all open positions
+    // are already at their cap. New positions drain the pool as they open.
     const _retained = this._retainedLostValue || 0;
-    if (_retained < 0 && this.positions.length === 0) {
-      pos._laggardLostValue = _retained;
-      this._retainedLostValue = 0;
-      this.log(`[EDA] ⏳ ${symbol.replace('USDT','')} opened into an empty book — inheriting $${Math.abs(_retained).toFixed(2)} retained lost value as the new debt repository.`, 'warn');
+    if (_retained < 0) {
+      const _maxAbsorb = -(pos._laggardInitialEV || pos.margin * (tpPct / 100));
+      const _absorb    = Math.max(_retained, _maxAbsorb); // both negative; max = least negative
+      pos._laggardLostValue = parseFloat(((pos._laggardLostValue || 0) + _absorb).toFixed(6));
+      this._retainedLostValue = parseFloat((_retained - _absorb).toFixed(6));
+      const _absAmt = Math.abs(_absorb);
+      if (_absAmt > 0.005) {
+        const _remAmt = Math.abs(this._retainedLostValue || 0);
+        const _intoEmpty = this.positions.length === 0;
+        this.log(`[EDA] ⏳ ${symbol.replace('USDT','')}: absorbs $${_absAmt.toFixed(2)} pending debt${_intoEmpty ? ' (empty book)' : ''}${_remAmt > 0.005 ? '; $' + _remAmt.toFixed(2) + ' remaining in pool' : '; pool cleared'}`, 'warn');
+      }
     }
 
     this.positions.push(pos);
@@ -4550,16 +4558,14 @@ function pw() { return {
     return { price, funcPct, bufferedEV, lostMag, target, eda: true };
   },
 
-  // Maximum loss magnitude (positive) a non-laggard position may carry: its own bufferedEV
-  // (margin × buffered slider TP%). The laggard is the debt repository and is unbounded.
+  // Maximum loss magnitude (positive) any position may carry: its own bufferedEV
+  // (margin × buffered slider TP%). Uniform for all positions including the laggard.
+  // Overflow beyond this cap flows to _retainedLostValue (the pending-debt pool) and
+  // is absorbed by incoming positions as they open.
   _posMaxDebt(pos) {
-    const laggard = this.positions.length >= 1
-      ? this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0])
-      : null;
-    if (laggard && pos.id === laggard.id) return Infinity; // laggard is the debt repository
     const margin = pos.margin || (this.cfg.minNotional / this.cfg.leverage);
     const baseTp = pos._baseTpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
-    return pos._laggardInitialEV > 0 ? pos._laggardInitialEV : margin * (baseTp / 100); // bufferedEV
+    return pos._laggardInitialEV > 0 ? pos._laggardInitialEV : margin * (baseTp / 100);
   },
 
   // Redistributes collective debt equally across all open positions weighted by slot cost.
@@ -4580,17 +4586,17 @@ function pw() { return {
     let overflow = 0;
     for (const p of positions) {
       const _rdp_raw  = parseFloat((debtPerSlot * this._posSlotWeight(p)).toFixed(6));
-      const maxDebt   = this._posMaxDebt(p); // Infinity for laggard
-      const _rdp_cap  = maxDebt === Infinity ? _rdp_raw : Math.max(_rdp_raw, -maxDebt);
+      const maxDebt   = this._posMaxDebt(p);
+      const _rdp_cap  = Math.max(_rdp_raw, -maxDebt);
       if (_rdp_raw < _rdp_cap) overflow += (_rdp_cap - _rdp_raw);
       // Clamp sub-epsilon negatives (incl. -0) to 0 to prevent phantom EDa TP
       const _RDEP     = 1e-6;
       const raw = _rdp_raw; const capped = _rdp_cap; // keep log compat
       p._laggardLostValue = this._snapLV((_rdp_cap < 0 && _rdp_cap > -_RDEP) ? 0 : _rdp_cap);
     }
-    // Push any capped overflow to the laggard.
-    if (overflow > 0 && laggard) {
-      laggard._laggardLostValue = this._snapLV(parseFloat(((laggard._laggardLostValue || 0) - overflow).toFixed(6)));
+    // Overflow that exceeds all positions' caps flows into the pending-debt pool.
+    if (overflow > 0) {
+      this._retainedLostValue = parseFloat(((this._retainedLostValue || 0) - overflow).toFixed(6));
     }
   },
 
@@ -4640,8 +4646,8 @@ function pw() { return {
         pos._edaTpPrev = null;
       }
       if (_eda.eda && _eda.price > 0) {
-        // Holding loss → target covers bufferedEV + the held loss. The non-laggard cap on
-        // held loss (own bufferedEV) is enforced in the debt pool, so max target = 2× bufferedEV.
+        // Holding loss → target covers bufferedEV + the held loss. All positions are capped
+        // at bufferedEV of held loss, so max EDa target = 2× bufferedEV per position.
         const prev = pos._edaTpPrev;
         if (prev == null || Math.abs(_eda.price - prev) / Math.abs(prev) > 0.0005) {
           pos._edaTpPrev = _eda.price;
@@ -4686,9 +4692,9 @@ function pw() { return {
       ? closingPnlUsdt
       : (closingRoiPct / 100 * (closingPos.margin || 0));
 
-    // Held loss the closing position carried (negative, capped for non-laggards, unbounded for
-    // the laggard/debt repository). Carried forward only on a loss-close — a profit close hit
-    // the EDa target, which already priced the recovery in.
+    // Held loss the closing position carried (negative, capped at bufferedEV for all positions).
+    // Carried forward only on a loss-close — a profit close hit the EDa target, which already
+    // priced the recovery in.
     const heldLoss   = (closingPnl < 0) ? Math.min(0, closingPos._laggardLostValue || 0) : 0;
     const wasLaggard = !this.positions.length || this.positions.every(p => closingPos.openedAt <= p.openedAt);
     const carried    = closingPnl + heldLoss; // total to pass to the pool
@@ -4705,13 +4711,13 @@ function pw() { return {
 
     if (heldLoss < 0) {
       const _nextLag = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
-      this.log(`[EDA] ⏳ ${wasLaggard ? 'Laggard' : 'Position'} ${closingPos.symbol} closed in loss holding $${Math.abs(heldLoss).toFixed(2)} lost value — redistributing to survivors${wasLaggard ? `; ${_nextLag.symbol} is now the debt repository` : ''}.`, 'warn');
+      this.log(`[EDA] ⏳ ${wasLaggard ? 'Laggard' : 'Position'} ${closingPos.symbol} closed in loss holding $${Math.abs(heldLoss).toFixed(2)} lost value — redistributing to survivors.`, 'warn');
     }
 
     // Distribute the closing PnL (plus any held loss it carried) across surviving positions
     // weighted by slot cost. A 3× FUN position absorbs 3× the share of a 1× gainer — debt is
     // proportional to how many slots each position occupies, not raw position count.
-    // Non-laggard positions are capped at _posMaxDebt; any overflow is pushed to the laggard.
+    // All positions are capped at _posMaxDebt (bufferedEV); overflow flows to the pending-debt pool.
     const laggard = this.positions.length >= 1
       ? this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0])
       : null;
@@ -4729,19 +4735,19 @@ function pw() { return {
         const current   = this._snapLV((_raw_cur < 0 && _raw_cur > -_DEBT_EPS) ? 0 : _raw_cur);
         if (current !== _raw_cur) pos._laggardLostValue = current; // write-back the clamp
         const raw      = parseFloat((current + share).toFixed(6));
-        const maxDebt  = this._posMaxDebt(pos); // Infinity for laggard
-        const capped   = maxDebt === Infinity ? raw : Math.max(raw, -maxDebt);
+        const maxDebt  = this._posMaxDebt(pos);
+        const capped   = Math.max(raw, -maxDebt);
         if (raw < capped) overflow += (capped - raw); // debt shed = positive overflow
         pos._laggardLostValue = this._snapLV(capped);
         const shareNote = (share>=0?'+':'−') + '$' + Math.abs(share).toFixed(2);
         _debtParts.push(`${pos.symbol} ${shareNote}→$${capped.toFixed(2)}${raw < capped ? '*' : ''}`);
       });
-      // Push any capped overflow to the laggard (it is the debt repository and has no cap).
-      if (overflow > 0 && laggard) {
-        laggard._laggardLostValue = this._snapLV(parseFloat(((laggard._laggardLostValue || 0) - overflow).toFixed(6)));
-        _debtParts.push(`${laggard.symbol} overflow −$${overflow.toFixed(2)}→$${laggard._laggardLostValue.toFixed(2)}`);
+      // Overflow that exceeds all positions' caps flows into the pending-debt pool.
+      if (overflow > 0) {
+        this._retainedLostValue = parseFloat(((this._retainedLostValue || 0) - overflow).toFixed(6));
+        _debtParts.push(`pool +$${overflow.toFixed(2)}→${this._retainedLostValue.toFixed(2)}`);
       }
-      this.log(`[EDA] ⏳ Debt share (${closingPos.symbol} @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%): ${_debtParts.join(' | ')}${overflow > 0 ? ' [* capped → laggard]' : ''}`, 'info');
+      this.log(`[EDA] ⏳ Debt share (${closingPos.symbol} @ ${closingRoiPct>=0?'+':''}${closingRoiPct.toFixed(1)}%): ${_debtParts.join(' | ')}${overflow > 0 ? ' [* capped → pool]' : ''}`, 'info');
     }
 
     // Equalise non-laggard debt before recomputing EDa TPs. Positions that opened
