@@ -749,7 +749,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <!-- Active halt banner -->
               <div x-show="_drawdownHaltUntil && _drawdownHaltUntil > Date.now()" style="margin-top:10px;padding:8px 10px;background:rgba(255,69,96,0.08);border:1px solid rgba(255,69,96,0.4);border-radius:3px">
                 <div style="font-family:var(--mono);font-size:10px;color:var(--short);margin-bottom:5px">🛑 HALTED — resumes in <span x-text="(()=>{ void tick; const rem=Math.max(0,_drawdownHaltUntil-Date.now()); const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); return h+'h '+String(m).padStart(2,'0')+'m'; })()"></span></div>
-                <button @click="if(!cfgLocked){_drawdownHaltUntil=null;persist()}" :disabled="cfgLocked" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Cancel Halt</button>
+                <button @click="if(!cfgLocked){_drawdownHaltUntil=null;_drawdownWindow=[];persist()}" :disabled="cfgLocked" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Cancel Halt</button>
               </div>
             </div>
           </div>
@@ -1893,6 +1893,7 @@ function pw() { return {
   _laggardId:    null,   // ID of the current laggard position (highest effective debt — unbounded EDa TP)
   _cycleRunning: false, // re-entry guard for runScheduledCycle
   _drawdownHaltUntil: null, // timestamp (ms) when drawdown halt expires; null = not halted
+  _drawdownWindow: [],  // { pnl, ts }[] — rolling 6h closed-trade PnL log for drawdown throttle (immune to closedTrades compaction)
   _volBaseline:   {}, // symbol → { volume24h, turnover24h, lastPrice, ts } — seeded from bulk ticker in runScan
   _symData:       {}, // symbol → { rsi6, rsi12, rsi24, fundingRate, volMomPct, lastPrice, ts } — single source of truth for per-symbol live data; written by any fetch path, read by all watchlists/display
   cfgOpen: { general: false, gainers: false, losers: false }, // accordion open state
@@ -1971,6 +1972,14 @@ function pw() { return {
       && this._drawdownHaltUntil > Date.now();
   },
 
+  // Record a closed trade's PnL into the rolling 6h window and evaluate the throttle
+  // immediately — waiting for the next scan cycle lets losses run past the threshold.
+  _recordDrawdownPnl(pnl) {
+    if (!this.cfg.drawdownThrottleEnabled) return;
+    this._drawdownWindow.push({ pnl, ts: Date.now() });
+    this._checkDrawdownThrottle();
+  },
+
   _checkDrawdownThrottle() {
     if (!this.cfg.drawdownThrottleEnabled) {
       // Clear any stale halt if the feature gets disabled
@@ -1988,11 +1997,12 @@ function pw() { return {
     // Skip evaluation if already halted
     if (this._isDrawdownHalted()) return;
 
+    // Sum the dedicated rolling window — closedTrades gets compacted into period-rollup
+    // records past 50 entries, which would let older losses fall out of the 6h sum.
     const windowMs   = 6 * 3600 * 1000;
     const cutoff     = now - windowMs;
-    const rollingPnl = this.closedTrades
-      .filter(t => t.reason !== 'period-rollup' && (t.closedAt || 0) >= cutoff)
-      .reduce((s, t) => s + (t.totalPnl ?? t.pnl ?? 0), 0);
+    this._drawdownWindow = this._drawdownWindow.filter(e => (e.ts || 0) >= cutoff);
+    const rollingPnl = this._drawdownWindow.reduce((s, e) => s + (e.pnl || 0), 0);
 
     const entryMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
     const factor      = Math.max(0.1, this.cfg.drawdownThrottleFactor ?? 0.5);
@@ -2132,6 +2142,8 @@ function pw() { return {
         laggardId:     this._laggardId,
         potGainers:    this.potGainers,
         potLosers:     this.potLosers,
+        drawdownHaltUntil: this._drawdownHaltUntil,
+        drawdownWindow:    this._drawdownWindow,
       }));
       this.savedPositions = [...this.positions];
     } catch(e) {}
@@ -2215,6 +2227,16 @@ function pw() { return {
       if (typeof s.drawdownHaltUntil === 'number' && s.drawdownHaltUntil > nowGl) {
         this._drawdownHaltUntil = s.drawdownHaltUntil;
       }
+      // Restore the rolling drawdown window (prune stale entries); seed it from recent
+      // closedTrades for saves that predate the dedicated window.
+      const DD_TTL_LOAD = 6 * 3600 * 1000;
+      if (Array.isArray(s.drawdownWindow)) {
+        this._drawdownWindow = s.drawdownWindow.filter(e => e?.ts && (nowGl - e.ts) < DD_TTL_LOAD);
+      } else if (Array.isArray(s.closedTrades)) {
+        this._drawdownWindow = s.closedTrades
+          .filter(t => t && t.reason !== 'period-rollup' && (t.closedAt || 0) > nowGl - DD_TTL_LOAD)
+          .map(t => ({ pnl: t.totalPnl ?? t.pnl ?? 0, ts: t.closedAt }));
+      }
     } catch(e) {}
     this.$nextTick(() => { this.renderTradeFeed(); });
   },
@@ -2243,6 +2265,8 @@ function pw() { return {
     this.loserLockIn  = {};
     this._lostValue   = 0;
     this._laggardId   = null;
+    this._drawdownWindow = [];
+    this._drawdownHaltUntil = null;
     this.sess = { trades:0, wins:0, losses:0, pnl:0, forceClose:0, ftTotalDone:0 };
     this._symData = {};
     this.bot.startTime = this.bot.running ? this.bot.startTime : null;
@@ -4640,6 +4664,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     } else {
       this.gainerLockInBump(pos.symbol, pos.rsi6, pos.rsi12, pos.rsi24, { countTrade: false });
     }
+
+    // Drawdown throttle: record and evaluate immediately — not at the next scan cycle
+    this._recordDrawdownPnl(totalPnl);
 
     // EDa: update lost value, re-elect laggard, redistribute debt
     const _wasLaggard = (pos.id === this._laggardId);
