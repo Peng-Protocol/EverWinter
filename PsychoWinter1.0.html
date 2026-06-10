@@ -1189,6 +1189,83 @@ let _cdTimer    = null;
 let _watchTimer = null;
 let _audioTimer = null;
 
+// ── Bybit public WebSocket ticker feed (stored outside Alpine to prevent proxy mutation) ──
+// Replaces the recurring full-ticker REST poll (~300 KB per call, every 15s) with delta
+// pushes (~100 bytes each) for only the symbols the watch loops care about.
+let _wsUrl        = 'wss://stream.bybit.com/v5/public/linear'; // swapped for the testnet stream when cfg.testnet is on
+const WS_FRESH_MS = 15000; // ticker older than this is considered stale → REST fallback
+let _wsConn           = null;
+let _wsPingTimer      = null;
+let _wsReconnectTimer = null;
+let _wsWantTopics     = new Set(); // topics the watch loops want subscribed
+let _wsSubTopics      = new Set(); // topics subscribed on the live connection
+const _wsTickers      = {};        // symbol → merged ticker fields + ts (deltas merged over snapshot)
+
+function _wsSend(obj) {
+  try { if (_wsConn && _wsConn.readyState === WebSocket.OPEN) _wsConn.send(JSON.stringify(obj)); } catch {}
+}
+
+function _wsResync() {
+  if (!_wsConn || _wsConn.readyState !== WebSocket.OPEN) return;
+  const sub   = [..._wsWantTopics].filter(t => !_wsSubTopics.has(t));
+  const unsub = [..._wsSubTopics].filter(t => !_wsWantTopics.has(t));
+  for (let i = 0; i < sub.length;   i += 10) _wsSend({ op: 'subscribe',   args: sub.slice(i, i + 10) });
+  for (let i = 0; i < unsub.length; i += 10) _wsSend({ op: 'unsubscribe', args: unsub.slice(i, i + 10) });
+  for (const t of sub)   _wsSubTopics.add(t);
+  for (const t of unsub) { _wsSubTopics.delete(t); delete _wsTickers[t.slice('tickers.'.length)]; }
+}
+
+function _wsEnsureOpen() {
+  if (!_wsWantTopics.size) return;
+  if (_wsConn && (_wsConn.readyState === WebSocket.CONNECTING || _wsConn.readyState === WebSocket.OPEN)) return;
+  if (_wsReconnectTimer) return; // reconnect backoff pending
+  let conn;
+  try { conn = new WebSocket(_wsUrl); } catch { return; }
+  _wsConn = conn;
+  conn.onopen = () => {
+    _wsSubTopics = new Set();
+    _wsResync();
+    clearInterval(_wsPingTimer);
+    _wsPingTimer = setInterval(() => _wsSend({ op: 'ping' }), 20000); // Bybit requires a ping at least every 20s
+  };
+  conn.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (!m.topic || !m.topic.startsWith('tickers.') || !m.data) return;
+    const sym = m.data.symbol || m.topic.slice('tickers.'.length);
+    _wsTickers[sym] = { ...(_wsTickers[sym] || {}), ...m.data, ts: Date.now() };
+  };
+  conn.onclose = () => {
+    clearInterval(_wsPingTimer); _wsPingTimer = null;
+    if (_wsConn === conn) _wsConn = null;
+    _wsSubTopics = new Set();
+    if (_wsWantTopics.size && !_wsReconnectTimer) {
+      _wsReconnectTimer = setTimeout(() => { _wsReconnectTimer = null; _wsEnsureOpen(); }, 5000);
+    }
+  };
+  conn.onerror = () => { try { conn.close(); } catch {} };
+}
+
+// Align the WS subscription set with the symbols the watch loops currently track.
+function wsWatchSymbols(symbols, url) {
+  if (url && url !== _wsUrl) {
+    _wsUrl = url;
+    if (_wsConn) { try { _wsConn.close(); } catch {} } // reconnect against the new host
+  }
+  _wsWantTopics = new Set((symbols || []).filter(Boolean).map(s => `tickers.${s}`));
+  if (!_wsWantTopics.size) {
+    if (_wsConn) { try { _wsConn.close(); } catch {} } // nothing watched — drop the stream entirely
+    return;
+  }
+  _wsEnsureOpen();
+  _wsResync();
+}
+
+// Fresh merged ticker from the WS feed, or null if absent/stale (caller falls back to REST).
+function wsTicker(symbol, maxAgeMs = WS_FRESH_MS) {
+  const t = _wsTickers[symbol];
+  return (t && t.lastPrice != null && (Date.now() - t.ts) <= maxAgeMs) ? t : null;
+}
+
 function psycho() { return {
 
   tick: 0,
@@ -1251,6 +1328,7 @@ function psycho() { return {
   _whiplashScheduled: {},
   _tsOffset:      0,
   _lastSignedAt:  0,
+  _lastTickerFetch: 0, // timestamp of last per-symbol REST ticker fallback round in watchPositions
 
   // ── Init ──
   _modeKey()    { return 'psychowinter_v1_' + (this.cfg.liveMode ? 'live' : 'pseudo'); },
@@ -1851,19 +1929,40 @@ function psycho() { return {
 
   // ── Watch Positions ──
   async watchPositions() {
-    if (this.positions.length === 0) return;
+    if (this.positions.length === 0) { wsWatchSymbols([]); return; } // drop the WS stream when nothing is held
     const now = Date.now();
 
-    // Fetch mark prices from bulk ticker
+    // Keep the WS ticker subscriptions aligned with the held position symbols
+    wsWatchSymbols(this.positions.map(p => p.symbol),
+      this.cfg.testnet ? 'wss://stream-testnet.bybit.com/v5/public/linear' : 'wss://stream.bybit.com/v5/public/linear');
+
+    // Build mark prices from the WS ticker feed
     let tickerMap = {};
-    try {
-      const url = `${this._baseUrl()}/v5/market/tickers?category=linear`;
-      const r   = await fetch(url);
-      const d   = await r.json();
-      for (const t of (d?.result?.list || [])) {
-        tickerMap[t.symbol] = { mark: parseFloat(t.lastPrice), fr: parseFloat(t.fundingRate??0)*100, nft: parseInt(t.nextFundingTime||0) };
+    const missing = [];
+    for (const pos of this.positions) {
+      if (tickerMap[pos.symbol] || missing.includes(pos.symbol)) continue;
+      const wt = wsTicker(pos.symbol);
+      if (wt) {
+        tickerMap[pos.symbol] = { mark: parseFloat(wt.lastPrice), fr: parseFloat(wt.fundingRate??0)*100, nft: parseInt(wt.nextFundingTime||0) };
+      } else {
+        missing.push(pos.symbol);
       }
-    } catch(e) { /* keep last known prices */ }
+    }
+    // REST fallback: per-symbol tickers (~700 B each) for anything the WS hasn't covered yet,
+    // throttled to at most one fallback round per 15s
+    const TICKER_THROTTLE_MS = 15000;
+    if (missing.length && (now - (this._lastTickerFetch || 0)) >= TICKER_THROTTLE_MS) {
+      this._lastTickerFetch = now;
+      for (const sym of missing) {
+        try {
+          const r = await fetch(`${this._baseUrl()}/v5/market/tickers?category=linear&symbol=${sym}`);
+          const d = await r.json();
+          const t = d?.result?.list?.[0];
+          if (!t) continue;
+          tickerMap[sym] = { mark: parseFloat(t.lastPrice), fr: parseFloat(t.fundingRate??0)*100, nft: parseInt(t.nextFundingTime||0) };
+        } catch(e) { /* keep last known prices */ }
+      }
+    }
 
     // Update mark prices and settle funding
     const _fundingFees = [];
