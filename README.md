@@ -246,6 +246,29 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 
 ---
 
+## Drifters Plugins
+
+`plugins/strategies/Drifters-Winter.html` (id `drifters-winter`, `after: ['everwinter']`) targets PseudoWinter; `plugins/strategies/Drifters-Chaser.html` (id `drifters-chaser`, `after: ['sunchaser']`) targets PseudoChaser. The `after` declaration makes each the outermost transform so it can gate entries ahead of the live-API open (see Plugin Stack Order). Strategy rationale lives in the Strategy Book; this section documents the implementation.
+
+### Internals
+
+- `_driftersBias()` — sums the `trades` field across the persisted lock-in maps and compares the sides against `cfg.driftersThreshold` (default `2`). Winter compares `gainerLockIn` vs `loserLockIn`; Chaser compares `gainerStratLockIn` (bullish activity) vs `gainerLockIn` (roof/bearish activity). Returns `'bullish'`, `'bearish'`, or `'neutral'` (also neutral when both sides are zero).
+- `_driftersRunScan()` — appended to `runScan`. Returns early when `cfg.driftersEnabled` is off, the book is at `maxPos`, or the bias opposes the bot's direction. Otherwise fetches the full ticker list, takes the top 30 non-banned, non-BTC USDT symbols by 24h turnover (skipping symbols already in the book), classifies each with `_drifterRsiClass(rsi6, rsi12, rsi24)` — `'high'` (all ≥ 50), `'low'` (all ≤ 50), `'lukewarm'` (mixed → skip) — and opens via `pseudoOpenShort` with `_drifterType` set on the candidate.
+- `driftLockIn` — third lock-in map keyed by symbol: `{ rsi6, rsi12, rsi24, trades, setAt, drifterType }`, 6-hour TTL. One entry per symbol: a same-direction re-fire ratchets each timeframe (`Math.max` for high, `Math.min` for low), increments `trades`, and refreshes `setAt`; an opposite-direction fire replaces the entry outright. Persisted under the plugin's own localStorage key (restored on init with expired entries dropped) and swept by the wrapped `_sweepExpiredData()`.
+- Re-entry gate: a fresh same-direction `driftLockIn` entry blocks the symbol unless all three RSI readings are strictly past the stored values (above for high, below for low).
+- `pseudoOpenShort` wrap — non-drift candidates pass straight through to the original. For drift candidates, the main lock-in bumps are suppressed for the duration of the call (Winter: gainer/loser bumps; Chaser: `gainerStratLockInBump`), the new position is stamped with `pos._drifterType`, and `driftLockInBump(...)` records the drift entry.
+- `pseudoClosePosition` wrap — carries `_drifterType` onto the newly prepended `closedTrades[0]` record so history rendering can tag it.
+- Transform hooks touched: `runScan`, `pseudoOpenShort`, `pseudoClosePosition`, `renderTradeFeed`, `persist`, `_sweepExpiredData`.
+
+### UI Elements
+
+- **Mode label suffix** — the `mode-label-extra` slot appends "+ Drifters" to the header mode label while `cfg.driftersEnabled` is on.
+- **Config accordion** — the `strategy-accordions` slot adds a "〜 Drifters Strategy" accordion to the config column with an ice-blue **ON** / grey **OFF** state chip in its header. Inside: a **Drifters Mode** toggle (with a hint line summarizing the strategy) and, when enabled, a **Bias Threshold** slider — `cfg.driftersThreshold`, range 1.0×–5.0× in 0.1 steps, default 2.0×, current value rendered next to the label. Both respect the config lock.
+- **DRIFT badge** — `renderTradeFeed` is wrapped to append a small monospace `DRIFT` chip to closed-trade cards whose record carries `_drifterType`: green border/text for `'high'`, red for `'low'`. The badge text never varies; color alone encodes direction. Open-position cards are not badged — the marker lives on the position object and surfaces once the trade closes.
+- **Activity log** — bias changes log once per change (not per scan): 📈 "Today is bullish — Drifters deferred (short-only bias)" (Winter) / 📉 "Today is bearish — Drifters deferred (long-only bias)" (Chaser). Each entry logs `[DFT] ▲/▼ SYM @ price RSI a/b/c — high|low drifter entry`; each lock-in bump logs the ratcheted RSI triple and the accumulated trade count.
+
+---
+
 ## EDa (Effective Debt Adjusted) System
 
 The EDa system distributes the financial cost of losing trades across all open positions, adjusting their take-profit targets to ensure the portfolio collectively recovers the debt. It runs in both PseudoWinter (shorts) and PseudoChaser (longs) and activates whenever `laggardCheckEnabled` is true.
@@ -341,6 +364,8 @@ The stats column shows per-laggard metrics: **EV**, **LV Share** (the per-positi
 **Strict inequality**: the gate blocks at-or-beyond the lock-in level, requiring RSI to move past it for re-entry. For a floor of 75, the next entry needs RSI > 75; the ratchet then sets the new floor to that entry's RSI, requiring yet higher RSI next time.
 
 `_sweepExpiredData()` removes entries where `Date.now() − setAt > 6 × 3600 × 1000`.
+
+With a Drifters plugin loaded, a third map `driftLockIn` exists alongside these — same TTL, same sweep — documented under Drifters Plugins above.
 
 ---
 
