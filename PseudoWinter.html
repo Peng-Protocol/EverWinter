@@ -1752,6 +1752,79 @@ let _watchTimer       = null;
 let _refreshTimer     = null;
 let _audioTimer       = null;
 
+// ── Bybit public WebSocket ticker feed (stored outside Alpine to prevent proxy mutation) ──
+// Replaces the recurring full-ticker REST poll (~300 KB per call, every 15s) with delta
+// pushes (~100 bytes each) for only the symbols the watch loops care about.
+const WS_URL      = 'wss://stream.bybit.com/v5/public/linear';
+const WS_FRESH_MS = 15000; // ticker older than this is considered stale → REST fallback
+let _wsConn           = null;
+let _wsPingTimer      = null;
+let _wsReconnectTimer = null;
+let _wsWantTopics     = new Set(); // topics the watch loops want subscribed
+let _wsSubTopics      = new Set(); // topics subscribed on the live connection
+const _wsTickers      = {};        // symbol → merged ticker fields + ts (deltas merged over snapshot)
+
+function _wsSend(obj) {
+  try { if (_wsConn && _wsConn.readyState === WebSocket.OPEN) _wsConn.send(JSON.stringify(obj)); } catch {}
+}
+
+function _wsResync() {
+  if (!_wsConn || _wsConn.readyState !== WebSocket.OPEN) return;
+  const sub   = [..._wsWantTopics].filter(t => !_wsSubTopics.has(t));
+  const unsub = [..._wsSubTopics].filter(t => !_wsWantTopics.has(t));
+  for (let i = 0; i < sub.length;   i += 10) _wsSend({ op: 'subscribe',   args: sub.slice(i, i + 10) });
+  for (let i = 0; i < unsub.length; i += 10) _wsSend({ op: 'unsubscribe', args: unsub.slice(i, i + 10) });
+  for (const t of sub)   _wsSubTopics.add(t);
+  for (const t of unsub) { _wsSubTopics.delete(t); delete _wsTickers[t.slice('tickers.'.length)]; }
+}
+
+function _wsEnsureOpen() {
+  if (!_wsWantTopics.size) return;
+  if (_wsConn && (_wsConn.readyState === WebSocket.CONNECTING || _wsConn.readyState === WebSocket.OPEN)) return;
+  if (_wsReconnectTimer) return; // reconnect backoff pending
+  let conn;
+  try { conn = new WebSocket(WS_URL); } catch { return; }
+  _wsConn = conn;
+  conn.onopen = () => {
+    _wsSubTopics = new Set();
+    _wsResync();
+    clearInterval(_wsPingTimer);
+    _wsPingTimer = setInterval(() => _wsSend({ op: 'ping' }), 20000); // Bybit requires a ping at least every 20s
+  };
+  conn.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (!m.topic || !m.topic.startsWith('tickers.') || !m.data) return;
+    const sym = m.data.symbol || m.topic.slice('tickers.'.length);
+    _wsTickers[sym] = { ...(_wsTickers[sym] || {}), ...m.data, ts: Date.now() };
+  };
+  conn.onclose = () => {
+    clearInterval(_wsPingTimer); _wsPingTimer = null;
+    if (_wsConn === conn) _wsConn = null;
+    _wsSubTopics = new Set();
+    if (_wsWantTopics.size && !_wsReconnectTimer) {
+      _wsReconnectTimer = setTimeout(() => { _wsReconnectTimer = null; _wsEnsureOpen(); }, 5000);
+    }
+  };
+  conn.onerror = () => { try { conn.close(); } catch {} };
+}
+
+// Align the WS subscription set with the symbols the watch loops currently track.
+function wsWatchSymbols(symbols) {
+  _wsWantTopics = new Set((symbols || []).filter(Boolean).map(s => `tickers.${s}`));
+  if (!_wsWantTopics.size) {
+    if (_wsConn) { try { _wsConn.close(); } catch {} } // nothing watched — drop the stream entirely
+    return;
+  }
+  _wsEnsureOpen();
+  _wsResync();
+}
+
+// Fresh merged ticker from the WS feed, or null if absent/stale (caller falls back to REST).
+function wsTicker(symbol, maxAgeMs = WS_FRESH_MS) {
+  const t = _wsTickers[symbol];
+  return (t && t.lastPrice != null && (Date.now() - t.ts) <= maxAgeMs) ? t : null;
+}
+
 function pw() { return {
   showSetup: false,
   creds: { key:'', secret:'' },
@@ -1809,7 +1882,7 @@ function pw() { return {
   _instrCache: {},   // symbol → { minQty, qtyStep, tickSize, ... } — null = unsupported (cleared on reconnect)
   _klineCache: {},   // symbol_interval → { closes[], ts } — 60s TTL; shared across RSI6/12/24 calls for same symbol
   _postCloseLaggardTimer: null, // debounce handle for 30s post-close laggard re-check
-  _lastTickerFetch: 0, // timestamp of last full-ticker batch fetch in pseudoWatchPositions
+  _lastTickerFetch: 0, // timestamp of last per-symbol REST ticker fallback round in pseudoWatchPositions
   gainerLockIn:  {},    // symbol → { rsi6, rsi12, rsi24, trades, setAt } — gainer RSI lock-in, 6h TTL
   loserLockIn:   {},    // symbol → { rsi6, rsi12, rsi24, trades, setAt } — loser RSI lock-in, 6h TTL (ratchets down)
   losers: [],           // loser scan candidates — parallel to gainers[]
@@ -2717,19 +2790,48 @@ function pw() { return {
         if (val != null) this.symDataWrite(symbol, { [`rsi${period}`]: val });
         return val;
       }
-      const limit = Math.max(period, 24) + 6; // RSI-24 needs 25+ closes; +6 for warm-up
+      const KLINE_DEPTH = Math.max(period, 24) + 6; // RSI-24 needs 25+ closes; +6 for warm-up
+      // Incremental top-up: when the cache is only a few bars behind, fetch just the missing
+      // candles (a few hundred bytes) instead of re-pulling the whole window.
+      const gapBars = (cached && cached.lastCompletedTs != null && cached.timestamps?.length >= 2)
+        ? Math.round((expectedLastTs - cached.lastCompletedTs) / BAR_15MS) : Infinity;
+      const limit = (gapBars >= 1 && gapBars + 1 < KLINE_DEPTH) ? gapBars + 1 : KLINE_DEPTH;
       const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=${limit}`);
       const d = await r.json();
       if (d.retCode !== 0) return null;
-      const candles        = (d.result?.list || []).reverse();
-      const opens          = candles.map(c => parseFloat(c[1]));
-      const closes         = candles.map(c => parseFloat(c[4]));
-      const volumes        = candles.map(c => parseFloat(c[6])); // [6] = turnover in USDT (quote)
-      const baseVolumes    = candles.map(c => parseFloat(c[5])); // [5] = base asset qty (token count)
-      const timestamps     = candles.map(c => parseInt(c[0]));
-      const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
-      this._klineCache[cacheKey] = { opens, closes, volumes, baseVolumes, timestamps, lastCompletedTs, ts: Date.now() };
-      const val = calcRSI(closes, period);
+      const candles = (d.result?.list || []).reverse(); // chronological; last entry = forming bar
+      let entry;
+      if (limit < KLINE_DEPTH && candles.length) {
+        // Drop the cached forming-bar snapshot — the fetched rows carry its final values —
+        // then append everything newer, preserving the [...completed, forming] array shape.
+        entry = cached;
+        if (entry.timestamps.length && entry.timestamps[entry.timestamps.length - 1] > entry.lastCompletedTs) {
+          entry.opens.pop(); entry.closes.pop(); entry.volumes.pop(); entry.baseVolumes.pop(); entry.timestamps.pop();
+        }
+        for (const c of candles) {
+          const cts = parseInt(c[0]);
+          if (entry.timestamps.length && cts <= entry.timestamps[entry.timestamps.length - 1]) continue;
+          entry.opens.push(parseFloat(c[1]));
+          entry.closes.push(parseFloat(c[4]));
+          entry.volumes.push(parseFloat(c[6]));     // [6] = turnover in USDT (quote)
+          entry.baseVolumes.push(parseFloat(c[5])); // [5] = base asset qty (token count)
+          entry.timestamps.push(cts);
+        }
+        const excess = entry.closes.length - KLINE_DEPTH;
+        if (excess > 0) for (const k of ['opens', 'closes', 'volumes', 'baseVolumes', 'timestamps']) entry[k].splice(0, excess);
+        entry.lastCompletedTs = entry.timestamps.length >= 2 ? entry.timestamps[entry.timestamps.length - 2] : null;
+        entry.ts = Date.now();
+      } else {
+        const opens          = candles.map(c => parseFloat(c[1]));
+        const closes         = candles.map(c => parseFloat(c[4]));
+        const volumes        = candles.map(c => parseFloat(c[6])); // [6] = turnover in USDT (quote)
+        const baseVolumes    = candles.map(c => parseFloat(c[5])); // [5] = base asset qty (token count)
+        const timestamps     = candles.map(c => parseInt(c[0]));
+        const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
+        entry = { opens, closes, volumes, baseVolumes, timestamps, lastCompletedTs, ts: Date.now() };
+      }
+      this._klineCache[cacheKey] = entry;
+      const val = calcRSI(entry.closes, period);
       if (val != null) this.symDataWrite(symbol, { [`rsi${period}`]: val });
       return val;
     } catch { return null; }
@@ -2744,6 +2846,13 @@ function pw() { return {
         this.symDataWrite(symbol, { fundingRate: cached.rate });
         return cached.rate;
       }
+      const wt = wsTicker(symbol);
+      if (wt && wt.fundingRate != null) {
+        const rate = parseFloat(wt.fundingRate) * 100;
+        this._klineCache[cacheKey] = { rate, intervalMs: cached?.intervalMs, ts: Date.now() };
+        this.symDataWrite(symbol, { fundingRate: rate });
+        return rate;
+      }
       const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${symbol}`);
       const d = await r.json();
       if (d.retCode !== 0) return null;
@@ -2757,6 +2866,8 @@ function pw() { return {
   },
 
   async fetchTicker(symbol) {
+    const wt = wsTicker(symbol);
+    if (wt) return wt; // live WS ticker — same field names as the REST response
     try {
       const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${symbol}`);
       const d = await r.json();
@@ -3571,27 +3682,57 @@ function pw() { return {
     const now = Date.now();
 
     const hasPositions = this.positions.some(p => p._pseudo);
-    const TICKER_THROTTLE_MS = 15000; // at most one full-ticker fetch per 15s
+    // Keep the WS ticker subscriptions aligned with everything the watch loops track
+    wsWatchSymbols([...new Set([
+      ...this.positions.filter(p => p._pseudo).map(p => p.symbol),
+      ...this.potGainers.map(e => e.symbol),
+      ...this.potLosers.map(e => e.symbol),
+    ])]);
+    const TICKER_THROTTLE_MS = 15000; // at most one REST ticker-fallback round per 15s
     const tickerStale = (now - (this._lastTickerFetch || 0)) >= TICKER_THROTTLE_MS;
 
-    if (hasPositions && tickerStale) {
+    if (hasPositions) {
       try {
-        const tr = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
-        const td = await tr.json();
-        if (td && td.retCode === 0) {
-          this._lastTickerFetch = now;
+        {
           const tickMap = {};
-          for (const t of (td.result?.list || [])) {
-            tickMap[t.symbol] = parseFloat(t.lastPrice || 0);
-            if (t.symbol && t.fundingRate != null) {
-              this._klineCache[`fr_${t.symbol}`] = {
-                rate: parseFloat(t.fundingRate || 0) * 100,
-                intervalMs: t.fundingIntervalHour ? parseInt(t.fundingIntervalHour, 10) * 3600000 : 8 * 3600000,
-                ts: now,
-              };
+          const missing = [];
+          for (const pos of this.positions) {
+            if (!pos._pseudo) continue;
+            const wt = wsTicker(pos.symbol);
+            if (wt) {
+              tickMap[pos.symbol] = parseFloat(wt.lastPrice || 0);
+              if (wt.fundingRate != null) {
+                this._klineCache[`fr_${pos.symbol}`] = {
+                  rate: parseFloat(wt.fundingRate) * 100,
+                  intervalMs: this._klineCache[`fr_${pos.symbol}`]?.intervalMs,
+                  ts: now,
+                };
+              }
+            } else {
+              missing.push(pos.symbol);
             }
           }
-          this._lastTickerMap = tickMap; // shared with ftWatchPositions
+          // REST fallback: per-symbol tickers (~700 B each) for anything the WS hasn't covered yet
+          if (missing.length && tickerStale) {
+            this._lastTickerFetch = now;
+            for (const sym of missing) {
+              try {
+                const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+                const td = await tr.json();
+                const t = (td && td.retCode === 0) ? td.result?.list?.[0] : null;
+                if (!t) continue;
+                tickMap[sym] = parseFloat(t.lastPrice || 0);
+                if (t.fundingRate != null) {
+                  this._klineCache[`fr_${sym}`] = {
+                    rate: parseFloat(t.fundingRate || 0) * 100,
+                    intervalMs: t.fundingIntervalHour ? parseInt(t.fundingIntervalHour, 10) * 3600000 : 8 * 3600000,
+                    ts: now,
+                  };
+                }
+              } catch { /* keep last known mark for this symbol */ }
+            }
+          }
+          this._lastTickerMap = { ...(this._lastTickerMap || {}), ...tickMap }; // shared with ftWatchPositions
           for (const pos of this.positions) {
             if (!pos._pseudo) continue;
             const mp = tickMap[pos.symbol];
