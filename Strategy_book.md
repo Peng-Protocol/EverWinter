@@ -114,7 +114,7 @@ When a position opens, the symbol's RSI at entry is recorded with a 6-hour TTL. 
 
 As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many loser-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many gainer-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves. This observation is the bias signal used by the Drifters strategy.
 
-The Drifters strategy maintains a third map, `driftLockIn`, keyed by symbol with the same TTL and schema as the main lock-ins. It records drift-specific entries separately so that normal gainer/loser lock-in gates are not polluted by mid-RSI Drifters activity.
+The Drifters strategy keeps a third lock-in ledger of its own, with the same six-hour memory and the same ratcheting rules as the main ones. Drift entries are recorded separately so that mid-range Drifters activity never tightens or loosens the gates the standard gainer and loser strategies rely on.
 
 ---
 
@@ -273,13 +273,13 @@ Drifters uses that aggregate lock-in trade count as a directional bias signal an
 
 **RSI midpoint gating**: An entry requires all three RSI timeframes on the same side of 50.
 
-- **High drifter** (all three ≥ 50): RSI is drifting above the midpoint — green `DRIFT` badge.
-- **Low drifter** (all three ≤ 50): RSI is drifting below the midpoint — red `DRIFT` badge.
+- **High drifter** (all three at or above 50): RSI is drifting above the midpoint.
+- **Low drifter** (all three at or below 50): RSI is drifting below the midpoint.
 - **Lukewarm** (mixed, some above and some below 50): skip entry. Lukewarm is this strategy's equivalent of over-extension — a mixed RSI signal provides no directional edge.
 
-**Bias detection**: Computed at scan time by summing the `trades` field across all entries in the existing `gainerLockIn` and `loserLockIn` maps. No separate counters — the lock-in maps are already persisted and survive reloads. The aggregate reflects what the session has actually traded.
+**Bias detection**: Read at scan time by totaling the trades recorded on each side of the existing lock-in ledger. No separate bookkeeping is needed — the ledger already survives reloads, and its totals reflect what the session has actually traded.
 
-**Threshold**: The `driftersThreshold` config (default **2×**) sets how dominant one side must be. At 2×, gainer lock-in aggregate trades must be at least double loser lock-in trades to declare a bullish bias. At 1×, any imbalance declares a bias. At 5×, only a heavily dominant side triggers.
+**Threshold**: The bias threshold setting (default **2×**) sets how dominant one side must be. At 2×, gainer lock-in aggregate trades must be at least double loser lock-in trades to declare a bullish bias. At 1×, any imbalance declares a bias. At 5×, only a heavily dominant side triggers.
 
 **Deferral**:
 - PseudoWinter (short-only): logs *"Today is bullish"* and defers all Drifters entries when bias is bullish. Fighting a bullish session from the short side is the wrong trade.
@@ -287,20 +287,19 @@ Drifters uses that aggregate lock-in trade count as a directional bias signal an
 
 The deferral message fires once per bias change, not on every scan cycle.
 
-**Drift lock-in**: Separate from the main gainer/loser lock-ins. Keyed by symbol, stores `{ rsi6, rsi12, rsi24, trades, setAt, drifterType }` with a 6-hour TTL. High drifters ratchet the RSI floor up (requires stricter RSI alignment on re-entry); low drifters ratchet the ceiling down. A symbol can hold separate drift entries for each direction if both fire within the TTL window.
+**Drift lock-in**: Separate from the main gainer/loser lock-ins. Each entry remembers a ticker's three RSI readings at entry, its trade count, and its drift direction for six hours. High drifters ratchet the RSI floor up — re-entry demands all three readings strictly above the last entry's. Low drifters ratchet the ceiling down. A ticker holds one drift record at a time; if it later fires in the opposite direction, the record is replaced and the ratchet starts fresh.
 
-**Position markers**: `_drifterType: 'high' | 'low'` stamped on open positions and carried to closed trade records. The `DRIFT` badge appears in the position card and the closed-trade history feed. Green = high, red = low — the badge text is always `DRIFT` regardless of direction.
+**Position markers**: Positions opened by Drifters carry their drift direction for the life of the trade and into the closed-trade history, where a DRIFT badge marks them — green for high drifters, red for low. Drift trades stay distinguishable from standard entries at a glance.
 
 **Why "Drifters"**: Entries drift into the mid-RSI zone — from the standard entry extremes toward the center — guided by what the session has already proven about its character.
 
-**Plugin stack**: `Drifters-Winter.html` loads after EverWinter; `Drifters-Chaser.html` loads after SunChaser. Declare `after: ['everwinter']` / `after: ['sunchaser']` in the manifest. See the README Plugin Stack Order section for the technical rationale.
+**Plugin stack**: Drifters ships as a strategy plugin for each bot and must load after the live-trading plugin it rides on — over EverWinter on the short side, over SunChaser on the long side. See the README's Drifters Plugins and Plugin Stack Order sections for file names, manifest declarations, and the technical rationale.
 
 **Components used**:
 - RSI Gating (midpoint variant — 50-50-50 instead of 70-70-70 or 30-30-30)
-- Lock-in System (separate `driftLockIn` map)
-- `_driftersBias()` scan-time bias computation from existing lock-in maps
-- `_drifterRsiClass()` — high / low / lukewarm classification
-- Plugin transform hooks: `runScan`, `pseudoOpenShort`, `pseudoClosePosition`, `renderTradeFeed`, `persist`, `_sweepExpiredData`
+- Lock-in System (separate drift ledger)
+- Session bias, read from the main lock-in ledgers at scan time
+- High / low / lukewarm classification of every candidate
 
 ---
 

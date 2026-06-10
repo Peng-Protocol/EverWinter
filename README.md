@@ -246,6 +246,29 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 
 ---
 
+## Drifters Plugins
+
+`plugins/strategies/Drifters-Winter.html` (id `drifters-winter`, `after: ['everwinter']`) targets PseudoWinter; `plugins/strategies/Drifters-Chaser.html` (id `drifters-chaser`, `after: ['sunchaser']`) targets PseudoChaser. The `after` declaration makes each the outermost transform so it can gate entries ahead of the live-API open (see Plugin Stack Order). Strategy rationale lives in the Strategy Book; this section documents the implementation.
+
+### Internals
+
+- `_driftersBias()` — sums the `trades` field across the persisted lock-in maps and compares the sides against `cfg.driftersThreshold` (default `2`). Winter compares `gainerLockIn` vs `loserLockIn`; Chaser compares `gainerStratLockIn` (bullish activity) vs `gainerLockIn` (roof/bearish activity). Returns `'bullish'`, `'bearish'`, or `'neutral'` (also neutral when both sides are zero).
+- `_driftersRunScan()` — appended to `runScan`. Returns early when `cfg.driftersEnabled` is off, the book is at `maxPos`, or the bias opposes the bot's direction. Otherwise fetches the full ticker list, takes the top 30 non-banned, non-BTC USDT symbols by 24h turnover (skipping symbols already in the book), classifies each with `_drifterRsiClass(rsi6, rsi12, rsi24)` — `'high'` (all ≥ 50), `'low'` (all ≤ 50), `'lukewarm'` (mixed → skip) — and opens via `pseudoOpenShort` with `_drifterType` set on the candidate.
+- `driftLockIn` — third lock-in map keyed by symbol: `{ rsi6, rsi12, rsi24, trades, setAt, drifterType }`, 6-hour TTL. One entry per symbol: a same-direction re-fire ratchets each timeframe (`Math.max` for high, `Math.min` for low), increments `trades`, and refreshes `setAt`; an opposite-direction fire replaces the entry outright. Persisted under the plugin's own localStorage key (restored on init with expired entries dropped) and swept by the wrapped `_sweepExpiredData()`.
+- Re-entry gate: a fresh same-direction `driftLockIn` entry blocks the symbol unless all three RSI readings are strictly past the stored values (above for high, below for low).
+- `pseudoOpenShort` wrap — non-drift candidates pass straight through to the original. For drift candidates, the main lock-in bumps are suppressed for the duration of the call (Winter: gainer/loser bumps; Chaser: `gainerStratLockInBump`), the new position is stamped with `pos._drifterType`, and `driftLockInBump(...)` records the drift entry.
+- `pseudoClosePosition` wrap — carries `_drifterType` onto the newly prepended `closedTrades[0]` record so history rendering can tag it.
+- Transform hooks touched: `runScan`, `pseudoOpenShort`, `pseudoClosePosition`, `renderTradeFeed`, `persist`, `_sweepExpiredData`.
+
+### UI Elements
+
+- **Mode label suffix** — the `mode-label-extra` slot appends "+ Drifters" to the header mode label while `cfg.driftersEnabled` is on.
+- **Config accordion** — the `strategy-accordions` slot adds a "〜 Drifters Strategy" accordion to the config column with an ice-blue **ON** / grey **OFF** state chip in its header. Inside: a **Drifters Mode** toggle (with a hint line summarizing the strategy) and, when enabled, a **Bias Threshold** slider — `cfg.driftersThreshold`, range 1.0×–5.0× in 0.1 steps, default 2.0×, current value rendered next to the label. Both respect the config lock.
+- **DRIFT badge** — `renderTradeFeed` is wrapped to append a small monospace `DRIFT` chip to closed-trade cards whose record carries `_drifterType`: green border/text for `'high'`, red for `'low'`. The badge text never varies; color alone encodes direction. Open-position cards are not badged — the marker lives on the position object and surfaces once the trade closes.
+- **Activity log** — bias changes log once per change (not per scan): 📈 "Today is bullish — Drifters deferred (short-only bias)" (Winter) / 📉 "Today is bearish — Drifters deferred (long-only bias)" (Chaser). Each entry logs `[DFT] ▲/▼ SYM @ price RSI a/b/c — high|low drifter entry`; each lock-in bump logs the ratcheted RSI triple and the accumulated trade count.
+
+---
+
 ## EDa (Effective Debt Adjusted) System
 
 The EDa system distributes the financial cost of losing trades across all open positions, adjusting their take-profit targets to ensure the portfolio collectively recovers the debt. It runs in both PseudoWinter (shorts) and PseudoChaser (longs) and activates whenever `laggardCheckEnabled` is true.
@@ -254,12 +277,13 @@ The EDa system distributes the financial cost of losing trades across all open p
 
 | Term | Definition |
 |---|---|
-| **EV (Expected Value)** | The profit a position is expected to earn when it closes at its configured TP: `margin × tpPct / 100`. |
-| **LV (Lost Value)** | `_lostValue` — a running accumulator updated on every close: `_lostValue += totalPnl`. Profitable closes push it toward zero; losing closes push it negative. Snapped to 0 when it drifts above −0.01. |
-| **ED (Effective Debt)** | Per-position debt: `ED = EV − (lvShare + uPnL)`. A positive ED means the position owes more than its current unrealised value. Negative uPnL increases ED; positive uPnL reduces it. |
-| **Laggard** | Always the **oldest open position** (lowest `openedAt`). It absorbs uncapped debt and has its TP overridden by the raw EDa price. |
-| **Non-laggard** | Every other open position. Receives a capped share of lost value (up to `edaLvCapMult × EV`, default 2×). |
-| **EDa TP** | A derived TP price that, if hit, covers the position's full ED. Stored on the position as `_edaTpPrice` and written to `currentTpPrice` whenever active. |
+| **buffMul (TP buffer)** | `1 + laggardProfitOffset/100` (default `1.5` at +50%). The TP slider is the *buffered* value; the functional (debt-free) TP is `slider ÷ buffMul` — 18% on the slider closes at 12%. All stage-0 TP price computations divide by `buffMul` (the old hardcoded `1.5`). |
+| **Functional EV** | Profit at the functional TP: `margin × (slider ÷ buffMul) / 100`. |
+| **Buffered EV** | `margin × slider% ` (= functional EV × buffMul). PseudoChaser stamps this at open as `_laggardInitialEV`; PseudoWinter computes it per pass as `_bufferedEV`. |
+| **Lost Value / debt** | PseudoWinter: global `_lostValue` accumulator (`+= totalPnl` on every close, snapped to 0 above −0.01 — never positive). PseudoChaser: per-position `_laggardLostValue` (negative = held loss, positive = banked credit from profitable closes). |
+| **Laggard** | Always the **oldest open position**. It is the debt repository: holds unbounded lost value (the remainder after non-laggard caps). |
+| **Non-laggard** | Every other open position. Holds at most its own **buffered EV** in lost value (so the max EDa target is 2× buffered EV — e.g. $0.36 on a $1-margin/18% position). `edaLvCapPct`/`laggardDebtCapPct` are legacy and unused. |
+| **EDa TP** | When a position holds lost value, its TP price is moved so the close covers `bufferedEV + heldLoss` (e.g. $0.18 + $0.09 → $0.27 → 27% ROI at $1 margin). With no held loss the position rests at the functional TP. Stored as `_edaTpPrice`, mirrored into `currentTpPrice`/`tpPct`. |
 
 ### `_updateLostValue(totalPnl)` (PseudoWinter)
 
@@ -269,54 +293,25 @@ Called on every close. Adds `totalPnl` (net after fees) to `_lostValue`. Snaps t
 
 Sets `_laggardId` to the `id` of the position with the lowest `openedAt` among all pseudo-positions. Called after every open and close. PseudoChaser uses an equivalent inline `reduce` in the EDa block.
 
-### `_redistributeED()` (PseudoWinter) / inline EDa block (PseudoChaser)
+### `_redistributeED()` (PseudoWinter) / `_edaTargetPrice()` + `runLaggardCheck` (PseudoChaser)
 
-Runs after every close and after `_electLaggard`. Three-step algorithm:
+PseudoWinter, after every open/close/watch tick:
 
-**Step 1 — Compute EV and base ED**
-
-For each position:
+1. Per position compute `_funcPct` (slider ÷ buffMul for stage 0, raw `_tpRoi(stage)` otherwise), `_funcEV`, `_bufferedEV`.
+2. Distribute `totalDebt = −_lostValue` equally; non-laggard shares capped at their own `_bufferedEV` (`p._edDebt`), laggard takes the unbounded remainder.
+3. TP per position: no debt → functional TP. With debt → exit price where `pnl = bufferedEV + debt`:
 ```
-p._ev = p.margin × (_baseTpPct || tpPct || entryTpRoi) / 100
-p._ed = p._ev − p.upnl
-```
-
-**Step 2 — Distribute lost value**
-
-If `_lostValue ≠ 0`, each position receives an equal per-slot share `lv / n`. Non-laggard shares are capped at `±(edaLvCapMult × _ev)`. The laggard absorbs whatever is left over — uncapped.
-
-```
-perPos = _lostValue / numPositions
-share  = clamp(perPos, −cap, +cap)   // non-laggard
-laggard._ed += (_lostValue − Σ absorbed)  // unbounded remainder
+SHORT: exit = entry × (1 − (bufferedEV + debt) / (lev × margin))
+LONG:  exit = entry + (bufferedEV + heldLoss) × entry / (lev × margin)
 ```
 
-**Step 3 — Compute and apply EDa TP**
+PseudoChaser keeps per-position lost value: `_notifyLaggardClose` distributes each close's PnL (slot-weighted, non-laggards capped at buffered EV, overflow → laggard) and `_edaTargetPrice(pos)` derives the TP from the position's own held loss. The `runLaggardCheck` close-check (`bufferedEV − lostValue − uPnL ≤ 0`) releases a position early when banked credit plus its own uPnL covers the buffered target.
 
-For a short (PseudoWinter), the EDa TP is the exit price at which the position's PnL equals its ED:
-```
-pnl = (entry − exit) / entry × lev × margin = ED
-→  exit = entry × (1 − ED / (lev × margin))
-```
-For a long (PseudoChaser) the formula is additive:
-```
-exit = entry + debt × entry / (lev × margin)
-```
-
-**Assignment rules:**
-
-| Role | Rule |
-|---|---|
-| **Laggard** | Raw EDa TP applied unconditionally — can be below 3% ROI or even require a loss. Closes fast; debt recovery falls to non-laggards. |
-| **Non-laggard (normal phase)** | EDa TP only applied when it demands *more* profit than the config TP. Shorts: `min(rawEdaTp, configTp)` keeps the lower (deeper) price. Longs: `max(rawEdaTp, configTp)` keeps the higher price. |
-| **Non-laggard (reduce phase)** | Same logic, but the floor is the 3% reduce-phase TP instead of configTp. |
-| **No debt (`ED ≤ 0`)** | `_edaTpPrice` is cleared and `currentTpPrice` is restored to the phase TP. |
-
-When EDa is active, `currentTpPrice` and `tpPct` are overwritten immediately and become the single source of truth for TP checks in `pseudoWatchPositions`.
+**Laggard loss-close debt carry-forward:** when a position closes in loss while holding lost value, the held value is added to the redistribution instead of evaporating with the position (activity log: "closed in loss holding $X lost value — redistributing"). If the book is left empty, the outstanding loss is retained — PseudoWinter keeps it in `_lostValue`, PseudoChaser in `_retainedLostValue` (persisted) — and placed on the next position to open, which is logged as it inheriting the debt repository role.
 
 ### Laggard Stats UI
 
-The stats column shows per-laggard metrics: **EV**, **LV Share** (the per-position slice of `_lostValue`), **uPnL**, and derived **ED**. The EDa TP price is shown when non-zero. PseudoChaser additionally shows **Value Lost — Non-Laggards** (total and per-position share distributed to non-laggards).
+The stats column shows per-laggard metrics: **Buffered EV**, **Lost Value** (the debt the laggard holds), **uPnL**, and derived **ED** (`bufferedEV + heldLoss − uPnL`). PseudoWinter and PseudoChaser additionally show **Value Lost — Non-Laggards** (total and per-position held loss, each capped at that position's buffered EV).
 
 ---
 
@@ -341,6 +336,8 @@ The stats column shows per-laggard metrics: **EV**, **LV Share** (the per-positi
 **Strict inequality**: the gate blocks at-or-beyond the lock-in level, requiring RSI to move past it for re-entry. For a floor of 75, the next entry needs RSI > 75; the ratchet then sets the new floor to that entry's RSI, requiring yet higher RSI next time.
 
 `_sweepExpiredData()` removes entries where `Date.now() − setAt > 6 × 3600 × 1000`.
+
+With a Drifters plugin loaded, a third map `driftLockIn` exists alongside these — same TTL, same sweep — documented under Drifters Plugins above.
 
 ---
 
