@@ -4,8 +4,10 @@
 
   Each scan cycle picks N random tickers whose |24h change| clears a
   configurable baseline and longs them with a fixed SL / far TP, force-closing
-  any survivor after 12 hours. The barrier geometry (TP 100% / SL 18% default)
-  means a single TP win covers ~5.5 SL losses; the edge comes from firing only
+  any survivor after 12 hours. The TP slider is the buffered (EV) value like the
+  general-settings TP UI — functional TP = slider ÷ Profit Offset buffer (default
+  105% buffered → 70% functional at +50%). The barrier geometry (functional TP
+  70% / SL 18% default) means a single TP win covers ~3.9 SL losses; the edge comes from firing only
   when the broad market drifts the bot's way. When Ashfall is loaded and its
   climate profile has sufficient evidence, a hostile reading defers the cycle.
 
@@ -27,7 +29,7 @@
   window.__BotPlugin = {
     id:        'firestorm-chaser',
     name:      'Firestorm (Chaser)',
-    version:   '1.0.0',
+    version:   '1.1.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser', 'ashfall-chaser'],
     before:    [],
@@ -75,9 +77,9 @@
                 <input type="range" min="5" max="50" step="1" x-model.number="cfg.firestormSlPct" @change="persist()">
               </div>
               <div class="g" style="margin-top:8px">
-                <div class="lbl">Take Profit <b x-text="(cfg.firestormTpPct??100)+'%'"></b></div>
+                <div class="lbl">Take Profit <b x-text="(cfg.firestormTpPct??105)+'% → '+((cfg.firestormTpPct??105)/(1+(Math.max(-99,cfg.laggardProfitOffset??50)/100))).toFixed(1)+'%'"></b></div>
                 <input type="range" min="20" max="300" step="5" x-model.number="cfg.firestormTpPct" @change="persist()">
-                <div class="fst-hint">Functional ROI. One win at <span x-text="(cfg.firestormTpPct??100)+'%'"></span> covers ~<span x-text="((cfg.firestormTpPct??100)/(cfg.firestormSlPct??18)).toFixed(1)"></span> stop-loss exits.</div>
+                <div class="fst-hint">Buffered (EV) target; a debt-free position closes at the functional TP = slider ÷ buffer (Profit Offset). One functional win covers ~<span x-text="(((cfg.firestormTpPct??105)/(1+(Math.max(-99,cfg.laggardProfitOffset??50)/100)))/(cfg.firestormSlPct??18)).toFixed(1)"></span> stop-loss exits.</div>
               </div>
             </div>
           </div>
@@ -101,9 +103,16 @@
           if (this.cfg.firestormEnabled     === undefined) this.cfg.firestormEnabled     = false;
           if (this.cfg.firestormBaselinePct === undefined) this.cfg.firestormBaselinePct = 6;
           if (this.cfg.firestormSlPct       === undefined) this.cfg.firestormSlPct       = 18;
-          if (this.cfg.firestormTpPct       === undefined) this.cfg.firestormTpPct       = 100;
           if (this.cfg.firestormPicks       === undefined) this.cfg.firestormPicks       = 3;
-          this.log(`[FST] Firestorm (Chaser) v1.0.0 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% | ${this.cfg.firestormPicks}/cycle`, 'info');
+          // v1.1: TP slider is now the buffered (EV) value like the general-settings TP UI.
+          // One-time migration resets pre-buffer (functional) values to the new default.
+          if (this.cfg.firestormTpBuffered !== true) {
+            this.cfg.firestormTpBuffered = true;
+            this.cfg.firestormTpPct = 105;
+            if (typeof this.persist === 'function') this.persist();
+          }
+          const _fstFuncTp = (this.cfg.firestormTpPct ?? 105) / this._buffMul();
+          this.log(`[FST] Firestorm (Chaser) v1.1.0 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% buffered (${_fstFuncTp.toFixed(1)}% functional) | ${this.cfg.firestormPicks}/cycle`, 'info');
         },
 
         // Ashfall climate reading, when present and evidenced. null = no opinion.
@@ -177,8 +186,8 @@
 
         // Open one scatter long. The host (sim and live) reads binary TP/SL from cfg
         // at open time, so the firestorm values are swapped in around the call. The TP
-        // slider is a functional ROI target — the host divides the configured value by
-        // the EDa buffer (_buffMul), so it is pre-multiplied to land where configured.
+        // slider is the buffered (EV) value — passed straight through as binaryTpPct;
+        // the host derives the functional TP as slider ÷ _buffMul.
         async _fstOpen(t) {
           const sym   = t.symbol;
           const price = parseFloat(t.lastPrice || 0);
@@ -200,7 +209,7 @@
             sl: this.cfg.binarySlPct,
           };
           this.cfg.binaryModeEnabled = true;
-          this.cfg.binaryTpPct = (this.cfg.firestormTpPct ?? 100) * this._buffMul();
+          this.cfg.binaryTpPct = this.cfg.firestormTpPct ?? 105;
           this.cfg.binarySlPct = this.cfg.firestormSlPct ?? 18;
 
           const lenBefore = (this.positions || []).length;
@@ -232,14 +241,15 @@
         async pseudoWatchPositions() {
           await _origWatch.call(this);
           const now = Date.now();
-          const tp  = this.cfg.firestormTpPct ?? 100;
+          // Slider is buffered; the watcher enforces the functional ROI (slider ÷ buffer).
+          const tp  = (this.cfg.firestormTpPct ?? 105) / this._buffMul();
           const sl  = this.cfg.firestormSlPct ?? 18;
           for (const pos of [...(this.positions || [])]) {
             if (!pos._firestorm) continue;
             if (!this.positions.find(x => x.id === pos.id)) continue; // closed earlier this pass
             const roi = pos.margin > 0 ? ((pos.upnl || 0) / pos.margin) * 100 : 0;
             if (roi >= tp) {
-              this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: TP — ROI ${roi.toFixed(1)}% ≥ ${tp}%`, 'success');
+              this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: TP — ROI ${roi.toFixed(1)}% ≥ ${tp.toFixed(1)}% (functional)`, 'success');
               await this.pseudoClosePosition(pos, 'tp', pos.markPrice);
               continue;
             }
