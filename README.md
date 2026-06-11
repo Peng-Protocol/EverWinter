@@ -55,6 +55,8 @@ On `visibilitychange` (tab returns to foreground): if a scan is overdue, it fire
 
 The bulk ticker call is reused for funding rate seeding and 24h change data. A second per-symbol ticker call is made only when a single-symbol price is needed (e.g. position watcher mark-price check).
 
+The full response is also cached on the instance as `_lastAllTickers`, with `_lastAllTickersAt` (epoch ms) recording when it was fetched. **Strategy plugins that append their own scan pass should reuse this cache when it is under 60 s old instead of re-fetching the endpoint** — a pass appended via the `runScan` wrap runs seconds after the host scan populated it. The age check makes the fallback fetch kick in automatically when the cache is stale (e.g. samplers running during a halt, when scans are skipped before the fetch).
+
 ---
 
 ## Position Watcher (`pseudoWatchPositions`)
@@ -98,7 +100,7 @@ RSI6, RSI12, RSI24 each use this function with `period = 6`, `12`, `24` on 60-mi
 |---|---|
 | `pc_v1` | Same structure as `pw_v1` |
 | `pc_v1_log` | Activity log array |
-| `__pw_plugins_v1` | Plugin list (same key, separate namespace per page origin) |
+| `__pc_plugins_v1` | Serialized plugin list (own key — the bots previously shared `__pw_plugins_v1`, which clobbered each other's lists when served from the same origin) |
 
 ### PsychoWinter
 
@@ -163,7 +165,9 @@ All calls target `https://api.bybit.com` with `category=linear`.
 
 ### Storage and Load Order
 
-Plugins are stored as serialized objects in `localStorage.__pw_plugins_v1`. Each entry includes all manifest fields plus `transformSrc` (the `transform` function stringified). On page load, the plugin system IIFE runs before Alpine initializes, deserializes stored plugins, topologically sorts them by `after`/`before` manifest fields (Kahn's algorithm), and wraps the component function (`pw()` or `pc()`).
+Plugins are stored as serialized objects in `localStorage.__pw_plugins_v1` (PseudoWinter) / `localStorage.__pc_plugins_v1` (PseudoChaser). Each entry includes all manifest fields plus `src` — the plugin's **raw source code**. On page load, the plugin system IIFE runs before Alpine initializes, deserializes stored plugins (skipping any whose `targetBot` names a different bot), topologically sorts them by `after`/`before` manifest fields (Kahn's algorithm), and wraps the component function (`pw()` or `pc()`).
+
+Storing raw source matters: an earlier loader stored `transform.toString()` (`transformSrc`) and revived it with `new Function`, which broke on shorthand-method syntax and severed the plugin's closure over its module constants — no transform ever applied. The current loader **re-executes the stored source** at boot, rebuilding the live plugin object with closures intact, and takes `transform` from that. Legacy `transformSrc` entries cannot be revived; they are flagged as inactive by the conflict checker and must be re-loaded from their file once.
 
 ### Transform Pipeline
 
@@ -171,7 +175,12 @@ Plugins are stored as serialized objects in `localStorage.__pw_plugins_v1`. Each
 pw()  →  plugin[0].transform(def)  →  plugin[1].transform(def)  →  ...  →  Alpine
 ```
 
-Each plugin's `transform(def)` receives the current component definition object and returns a modified version. Methods are replaced or wrapped by closing over the original. The final definition is what Alpine receives at `x-data` evaluation time.
+Each plugin's `transform(def)` receives the current component definition object and returns a modified version. The final definition is what Alpine receives at `x-data` evaluation time.
+
+Two styles are supported, and a plugin may mix them per method:
+
+- **Wrap** — capture the original via a `_orig*` closure and call it (`await _origScan.call(this)`), adding behavior before/after. Use this whenever the host behavior should be preserved: it composes with other plugins and inherits host bugfixes for free. Declare wrapped methods in `touches`.
+- **Replace (suppress)** — return a definition whose method does **not** call the original. Use this when extending is contorted (e.g. the live-trading plugins' `pseudoOpenShort`, which substitutes real API execution for the simulation fill). Declare replaced methods in `suppresses` (in addition to `touches`): replacement is last-writer-wins, so the manager hard-warns when two loaded plugins suppress the same method.
 
 ### CSS and HTML Slots
 
@@ -179,7 +188,7 @@ Plugin `css` strings are injected into `<head>` synchronously during the IIFE. P
 
 ### Loading a Plugin File
 
-The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For `.html` files, `DOMParser` extracts all `<script>` tag contents and concatenates them. The extracted code is executed via `new Function(code)()`, which must set `window.__BotPlugin`. The plugin object is serialized (with `transform.toString()` stored as `transformSrc`) and saved to localStorage.
+The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For `.html` files, `DOMParser` extracts all `<script>` tag contents and concatenates them. The extracted code is executed via `new Function(code)()`, which must set `window.__BotPlugin`. A plugin whose `targetBot` does not match the host bot is rejected at this point. The manifest fields plus the raw extracted source (`src`) are saved to localStorage; the source is re-executed at every page load to produce the live transform.
 
 **A page reload is required after loading or removing a plugin.** The transform pipeline runs once at page load before Alpine initializes; plugins saved to localStorage during a session take effect on the next load.
 
@@ -190,12 +199,13 @@ The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For
 | `id` | string | Unique identifier; used for deduplication and conflict resolution |
 | `name` | string | Display name in Plugin Manager UI |
 | `version` | string | Shown in UI |
-| `targetBot` | string | `"PseudoWinter"` or `"PseudoChaser"` — informational |
+| `targetBot` | string | `"pseudowinter"` or `"pseudochaser"` — **enforced**: file load is rejected on mismatch, and stored entries for another bot are skipped at boot |
 | `after` | string[] | Load after these plugin IDs |
 | `before` | string[] | Load before these plugin IDs |
 | `conflicts` | string[] | Hard-reject if any of these are also loaded |
 | `requires` | string[] | Warn if any of these are missing |
-| `touches` | string[] | Method names this plugin modifies — surfaces overlap warnings |
+| `touches` | string[] | Method names this plugin modifies (wraps or replaces) — informational |
+| `suppresses` | string[] | Method names this plugin **replaces without calling the original** — the conflict checker warns when two loaded plugins suppress the same method |
 
 ---
 
@@ -228,7 +238,7 @@ Without `after`/`before` declarations the topological sort falls back to registr
 
 ### EverWinter (PseudoWinter → SHORT)
 
-Overrides `pseudoOpenShort`, `pseudoClosePosition`, `pseudoWatchPositions`.
+Overrides `pseudoOpenShort`, `pseudoClosePosition`, `pseudoWatchPositions`. Both live plugins declare `suppresses: ['pseudoOpenShort', 'refreshBalance']` — those two are full replacements that never call the simulation originals; the close and watch overrides wrap them.
 
 **Open**: Places `Sell` market order → polls execution list for fill → constructs position object with `totalSize` from fill → calls `POST /v5/position/trading-stop` to set TP (trigger at `fillPrice * (1 - tpPct/100/lev) * 1.001`) and SL natively.
 
@@ -253,7 +263,7 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 ### Internals
 
 - `_driftersBias()` — sums the `trades` field across the persisted lock-in maps and compares the sides against `cfg.driftersThreshold` (default `2`). Winter compares `gainerLockIn` vs `loserLockIn`; Chaser compares `gainerStratLockIn` (bullish activity) vs `gainerLockIn` (roof/bearish activity). Returns `'bullish'`, `'bearish'`, or `'neutral'` (also neutral when both sides are zero).
-- `_driftersRunScan()` — appended to `runScan`. Returns early when `cfg.driftersEnabled` is off, the book is at `maxPos`, or the bias opposes the bot's direction. Otherwise fetches the full ticker list, takes the top 30 non-banned, non-BTC USDT symbols by 24h turnover (skipping symbols already in the book), classifies each with `_drifterRsiClass(rsi6, rsi12, rsi24)` — `'high'` (all ≥ 50), `'low'` (all ≤ 50), `'lukewarm'` (mixed → skip) — and opens via `pseudoOpenShort` with `_drifterType` set on the candidate.
+- `_driftersRunScan()` — appended to `runScan`. Returns early when `cfg.driftersEnabled` is off, the book is at `maxPos`, or the bias opposes the bot's direction. Otherwise reuses the host's `_lastAllTickers` cache when fresh (< 60 s, i.e. the stock scan just fetched it) — falling back to its own bulk ticker fetch — and takes the top 30 non-banned, non-BTC USDT symbols by 24h turnover (skipping symbols already in the book), classifies each with `_drifterRsiClass(rsi6, rsi12, rsi24)` — `'high'` (all ≥ 50), `'low'` (all ≤ 50), `'lukewarm'` (mixed → skip) — and opens via `pseudoOpenShort` with `_drifterType` set on the candidate.
 - `driftLockIn` — third lock-in map keyed by symbol: `{ rsi6, rsi12, rsi24, trades, setAt, drifterType }`, 6-hour TTL. One entry per symbol: a same-direction re-fire ratchets each timeframe (`Math.max` for high, `Math.min` for low), increments `trades`, and refreshes `setAt`; an opposite-direction fire replaces the entry outright. Persisted under the plugin's own localStorage key (restored on init with expired entries dropped) and swept by the wrapped `_sweepExpiredData()`.
 - Re-entry gate: a fresh same-direction `driftLockIn` entry blocks the symbol unless all three RSI readings are strictly past the stored values (above for high, below for low).
 - `pseudoOpenShort` wrap — non-drift candidates pass straight through to the original. For drift candidates, the main lock-in bumps are suppressed for the duration of the call (Winter: gainer/loser bumps; Chaser: `gainerStratLockInBump`), the new position is stamped with `pos._drifterType`, and `driftLockInBump(...)` records the drift entry.
@@ -277,7 +287,7 @@ Both replace the fixed 12h drawdown-throttle / gains-lock timers with a learned 
 
 ### Market structure reading
 
-Computed from the **full** USDT-perp ticker universe (same filters as the scan: USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`) — deliberately *not* the curated gainer/loser pools, whose dynamic floors make pool membership endogenous to the top mover:
+Computed from the **full** USDT-perp ticker universe (same filters as the scan: USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`) — deliberately *not* the curated gainer/loser pools, whose dynamic floors make pool membership endogenous to the top mover. The reading reuses the host's `_lastAllTickers` cache when fresh (< 60 s); the slow-tick sampler during halts fetches its own copy, since scans (and therefore cache refreshes) don't run while halted:
 
 - `skew` = (Σ gainer 24h% − Σ |loser 24h%|) / (Σ both) — magnitude lean, −1…+1
 - `breadth` = (gainer count − loser count) / (total count) — participation lean, −1…+1
@@ -305,6 +315,38 @@ Transform hooks touched: `init`, `persist`, `runScan`, `pseudoClosePosition`, pl
 - **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with skew/breadth/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score.
 
 Note: for the first weeks the plugin behaves almost exactly like the stock timers — that is by design. It refuses to override the clock until enough evidence has accumulated near the current reading.
+
+---
+
+## Blizzard / Firestorm Plugins
+
+`plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles.
+
+A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 100% / SL 18% by default) means one TP win covers ~5.5 SL exits; the edge is meant to come from broad market drift, so the strategy defers when the climate reads hostile.
+
+### Entry pass (`_blzRunScan` / `_fstRunScan`)
+
+Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn uniformly at random without replacement (failed opens retried up to 3× picks). Each cycle logs pool size and opens.
+
+### Climate gate (Permafrost / Ashfall coupling)
+
+When the matching halt governor is loaded, the strategy reads its live structure status (`pfStatus`/`afStatus`). If the reading is fresh (< 2h), evidenced (mass ≥ 6), and **hostile (score < 0)**, the cycle is deferred (logged once per state change). Absent governor, stale reading, or thin profile → the strategy fires on its own — the gate only ever vetoes, mirroring the governors' own refuse-to-act-on-thin-evidence posture. Halt governance itself (Permafrost/Ashfall extending or thawing drawdown/gains-lock halts) applies to these entries automatically since the pass sits behind the host's halt gates.
+
+### Open mechanics (cfg-swap)
+
+Both the sim hosts and the live plugins read binary-mode TP/SL from `cfg` at open time, so `_blzOpen`/`_fstOpen` swaps `binaryModeEnabled: true`, `binaryTpPct`, and `binarySlPct` in around the `pseudoOpenShort` call and restores them in `finally` (re-persisting the restored cfg). Entries are therefore always binary-style: TP and SL stamped at entry, no DCA ladder. The TP slider (`blizzardTpPct`/`firestormTpPct`, default 100, range 20–300) is a **functional ROI** target — the sim hosts divide the configured value by the EDa buffer (`_buffMul`), so the swap pre-multiplies by it. Main lock-in bumps are suppressed during the call (Drifters precedent — scatter entries are not signal trades); RSIs are fetched for the position record. New positions are stamped `_blizzard`/`_firestorm` plus `_slPctOverride`.
+
+`_slPctOverride` is a small host accommodation added for this plugin but usable by any: the watcher's binary **SL drift-correction** (which re-targets `slPrice` from the global `cfg.binarySlPct` each tick) and the position-card SL display honor a per-position override when present, so a plugin-set SL survives instead of being corrected back to the global slider.
+
+### Exits
+
+The plugin's `pseudoWatchPositions` wrap is the authoritative exit for stamped positions (it manages them even if the mode is toggled off mid-flight): per tick it computes ROI as `upnl / margin` and closes at `roi ≥ TP%` (`'tp'`), `roi ≤ −SL%` (`'sl'`), or age ≥ 12h (`'blizzard-12h'`/`'firestorm-12h'`), always at mark price. The host enforces the same TP/SL independently (exchange-native in live mode — note the live TP order sits at `TP × buffMul` since the live open does not divide by the buffer; the wrap closes at the configured functional level first). Closed records carry the stamp and the trade feed badges them `BLZ` (ice) / `FST` (ember).
+
+### Interactions
+
+- **EDa** — scatter positions participate fully: they hold debt shares, can be elected laggard, and their SL losses feed `_lostValue` redistribution. (TP targets survive EDa recomputes via `_baseTpPct`, which stores the swapped value.)
+- **Drawdown throttle / gains lock** — scatter PnL feeds both windows, and both halts block new scatter entries.
+- **maxPos** — shared with the stock strategy; scatter entries stop at the global cap.
 
 ---
 
@@ -356,23 +398,27 @@ The stats column shows per-laggard metrics: **Buffered EV**, **Lost Value** (the
 
 ## Lock-in State
 
-`gainerLockIn` and `loserLockIn` are plain objects keyed by symbol: `{ rsi6, rsi12, rsi24, setAt, trades }`. Both are refreshed at **position close** (in addition to open), so the 6-hour TTL restarts from close time.
+Lock-in maps are plain objects keyed by symbol, entries `{ change, setAt, trades }` — both bots gate on **24h change** (values rounded to 4 decimal places on write). Entries are refreshed at **position close** (in addition to open), so the 6-hour TTL restarts from close time. The two bots gate in opposite directions.
 
-### PseudoWinter
+### PseudoWinter (continuation)
 
-| Store | Direction | Ratchet | Re-entry condition |
+Winter's gates are continuation bets — re-entry only when the move has pushed *further* in the entry direction, with **strict inequality** (at-the-level blocks):
+
+| Store | Used by | Ratchet | Re-entry condition |
 |---|---|---|---|
-| `gainerLockIn[sym]` | Floor (shorts on high RSI) | `Math.max` — rises each trade | RSI must be **strictly above** the floor on all three timeframes |
-| `loserLockIn[sym]` | Ceiling (shorts on low RSI) | `Math.min` — falls each trade | RSI must be **strictly below** the ceiling on all three timeframes |
+| `gainerLockIn[sym]` | Gainer strategy (shorts) | `Math.max` — floor rises each trade | 24h change must be **strictly above** the floor — the gainer must stretch further before it is shorted again |
+| `loserLockIn[sym]` | Loser strategy (shorts) | `Math.min` — ceiling falls each trade | 24h change must be **strictly below** the ceiling — the loser must bleed further before it is shorted again |
 
-### PseudoChaser
+### PseudoChaser (mean-reversion-aware)
 
-| Store | Direction | Ratchet | Re-entry condition |
+Chaser's gates deliberately invert Winter's continuation logic, and **equality is allowed** (re-entry *at* the locked level passes):
+
+| Store | Used by | Ratchet | Re-entry condition |
 |---|---|---|---|
-| `gainerLockIn[sym]` | Roof (longs — blocks if RSI bounced too high) | `Math.min` — falls each trade | RSI must be **strictly below** the roof |
-| `gainerStratLockIn[sym]` | Floor (gainer-strat longs on high RSI) | `Math.max` — rises each trade | RSI must be **strictly above** the floor |
+| `gainerLockIn[sym]` | Loser strategy (longs) | `Math.max` — floor rises each trade | 24h change must be **at or above** the floor — a recovering loser is picking up energy and can keep going up |
+| `gainerStratLockIn[sym]` | Gainer strategy (longs) | `Math.min` — ceiling falls each trade | 24h change must be **at or below** the ceiling — a faltering gainer may rebound, so re-entry waits for the pullback |
 
-**Strict inequality**: the gate blocks at-or-beyond the lock-in level, requiring RSI to move past it for re-entry. For a floor of 75, the next entry needs RSI > 75; the ratchet then sets the new floor to that entry's RSI, requiring yet higher RSI next time.
+In both bots the ratchet moves the level to each new trade's change, tightening in the strategy's preferred direction. Chaser's watchlist-promotion paths (potential gainers/losers — currently **disabled and hidden from the UI**) carry the same gates for consistency, reading the current 24h change from the cycle's `_lastAllTickers` cache via `_change24h(symbol)`.
 
 `_sweepExpiredData()` removes entries where `Date.now() − setAt > 6 × 3600 × 1000`.
 
@@ -383,6 +429,39 @@ With a Drifters plugin loaded, a third map `driftLockIn` exists alongside these 
 ## Drawdown Throttle
 
 When enabled, `runScheduledCycle()` checks rolling 6-hour PnL. If net PnL over the window falls below `-(drawdownThrottleFactor × entry margin)`, `_drawdownHaltUntil` is set to `Date.now() + 12 * 3600 * 1000`. New entries are blocked until `_drawdownHaltUntil` passes. The halt can be manually cancelled from the config panel (resets `_drawdownHaltUntil` to null).
+
+---
+
+## Gains Lock
+
+The profit-side mirror of the Drawdown Throttle: instead of halting after losses, it banks a winning streak by halting new entries once rolling profit hits a target. Runs in both PseudoWinter and PseudoChaser; enabled by default (`cfg.gainsLockEnabled: true`).
+
+### Mechanism
+
+- Every position close feeds realized PnL into a rolling window (`_gainsWindow`, entries `{ pnl, ts }`, 6-hour TTL) — `_recordGainsPnl(pnl)` in PseudoWinter, `recordGainsPnl(pnl)` in PseudoChaser.
+- The trigger threshold is `gainsLockFactor × entry margin`, where entry margin = `minNotional ÷ leverage`. `cfg.gainsLockFactor` ranges 0.1–5.0 in 0.1 steps, default 1.0×.
+- When window PnL ≥ threshold, `_gainsLockHaltUntil = now + 12h` and the `[GLK] 🔒` trigger line is logged. While locked, `_isGainsLocked()` makes `runScheduledCycle()`/`runScan()` return early (scan-deferred log line with hours remaining), so no new entries open; **open positions are unaffected** — the watcher keeps managing TP/SL as usual.
+- Expiry is checked each cycle; on lapse the lock clears itself and logs `[GLK] ✅ Gains lock lifted`.
+- `_gainsLockHaltUntil` is persisted (`gainsLockHaltUntil` in the main state key), so the lock survives reloads.
+
+### Trigger check (PseudoWinter `_checkGainsLock`)
+
+```
+windowPnl = Σ pnl over last 6h
+threshold = max(0.1, cfg.gainsLockFactor) × (minNotional / leverage)
+windowPnl ≥ threshold  →  _gainsLockHaltUntil = now + 12h
+```
+
+PseudoChaser performs the equivalent check inline in `recordGainsPnl` (window pruned by `GL_TTL`, factor not floored).
+
+### UI
+
+The config panel exposes the toggle, the **Profit Factor** slider (with the computed dollar threshold at current margin), and — while locked — a countdown with a **Cancel Lock** / **clear manually** action that nulls the halt and empties the window. PseudoWinter's market menu additionally shows a `GLK Xh` badge while the lock is active; PseudoChaser shows `🔒 GLK` with a clear action.
+
+### Interactions
+
+- **Drifters** — on init, tightens `cfg.gainsLockFactor` to 1.5 if it is ≥ 2, banking profits sooner during drift sessions.
+- **Permafrost / Ashfall** — replace the fixed 12-hour lock duration with the learned market-climate profile: a gains lock under their governance ends when the climate score crosses the thaw/settle threshold (hard-capped at `permafrostCapHours`/`ashfallCapHours`), and lifting clears the rolling window just like a manual clear. See the Permafrost / Ashfall section.
 
 ---
 

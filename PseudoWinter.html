@@ -1045,7 +1045,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="ps" style="display:none"><div class="psl">Size</div>  <div class="psv" x-text="p.totalSize"></div></div>
               <div class="ps"><div class="psl">Lev</div>   <div class="psv"      x-text="p.leverage+'×'"></div></div>
               <div class="ps"><div class="psl">Margin</div><div class="psv"      x-text="'$'+p.margin.toFixed(2)"></div></div>
-              <div class="ps"><div class="psl">24h Chg</div><div class="psv" :class="'short'" x-text="(()=>{const v=(p.change24h??null);if(v===null)return'—';const s=v>=0?'+':'';return s+v+'%';})()"></div></div>
+              <div class="ps"><div class="psl">24h Chg</div><div class="psv" :class="'short'" x-text="(()=>{const v=parseFloat(p.change24h);if(!Number.isFinite(v))return'—';const r=+v.toFixed(4);return (r>=0?'+':'')+r+'%';})()"></div></div>
               <div class="ps"><div class="psl">24H Δ @ Entry</div><div class="psv" x-text="(()=>{const c=parseFloat(p.change24h);return Number.isFinite(c)?(c>=0?'+':'')+c.toFixed(2)+'%':'—';})()"></div></div>
               <!-- SalF: LSA ratio at entry (static, captured on open) -->
               <div class="ps" x-show="false">
@@ -1109,7 +1109,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   return vmHtml;
                 })()"></div>
               </div>
-              <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="(()=>{ const slRoi = cfg.binaryModeEnabled ? (cfg.binarySlPct??18) : 105; return '~−'+slRoi.toFixed(1)+'%  '+fmtP(p.slPrice); })()"></div></div>
+              <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="(()=>{ const slRoi = p._slPctOverride ?? (cfg.binaryModeEnabled ? (cfg.binarySlPct??18) : 105); return '~−'+slRoi.toFixed(1)+'%  '+fmtP(p.slPrice); })()"></div></div>
             </div>
             <!-- ── PRICE LADDER BAR ── -->
             <div x-data="{
@@ -1767,6 +1767,8 @@ function pw() { return {
   _gainsLockHaltUntil: null, // timestamp (ms) when gains lock expires; null = not locked
   _gainsWindow: [],     // { pnl, ts }[] — rolling 6h closed-trade PnL log for gains lock
   _volBaseline:   {}, // symbol → { volume24h, turnover24h, lastPrice, ts } — seeded from bulk ticker in runScan
+  _lastAllTickers:   [], // last full bulk ticker response — strategy plugins reuse instead of re-fetching when fresh
+  _lastAllTickersAt: 0,  // epoch ms when _lastAllTickers was fetched
   _symData:       {}, // symbol → { rsi6, rsi12, rsi24, fundingRate, volMomPct, lastPrice, ts } — single source of truth for per-symbol live data; written by any fetch path, read by all watchlists/display
   cfgOpen: { general: false, gainers: false, losers: false }, // accordion open state
   _pluginMgrOpen: false,
@@ -2448,6 +2450,8 @@ function pw() { return {
       const td=await tr.json();
       if (td.retCode!==0) throw new Error('Tickers: '+td.retMsg);
       const allTickers = td.result?.list || [];
+      this._lastAllTickers   = allTickers; // shared with strategy plugin scan passes
+      this._lastAllTickersAt = Date.now();
 
       // Seed funding rate cache from bulk ticker response
       const now_fr = Date.now();
@@ -3373,7 +3377,7 @@ function pw() { return {
     this.positions.push({
       id:Date.now()+Math.random(), symbol:sym,
       entryPrice:price, originalEntryPrice:price, markPrice:price, totalSize:qty, leverage:effectiveLev, margin,
-      change24h:candidate.change.toFixed(2), rsi6:candidate.rsi6, rsi12:candidate.rsi12, rsi24:candidate.rsi24,
+      change24h:(candidate.change ?? 0).toFixed(2), rsi6:candidate.rsi6, rsi12:candidate.rsi12, rsi24:candidate.rsi24,
       fundingRate: candidate.fundingRate ?? null,
       _fundingIntervalMs: this._klineCache[`fr_${sym}`]?.intervalMs || 8 * 3600000,
       upnl:0, openedAt:Date.now(), phase:'normal', isPending:false,
@@ -3786,7 +3790,7 @@ function pw() { return {
         const instr = await this.getInstrInfo(pos.symbol);
         if (instr) {
           const targetSl = this._binarySLPrice(pos, instr);
-          const bSlPct   = this.cfg.binarySlPct ?? 18;
+          const bSlPct   = pos._slPctOverride ?? this.cfg.binarySlPct ?? 18;
           const slTol    = (pos.originalEntryPrice || pos.entryPrice) * bSlPct / 100 / pos.leverage * 0.10;
           if (Math.abs(pos.slPrice - targetSl) > slTol) {
             pos.slPrice = targetSl;
@@ -4213,7 +4217,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   // Binary mode SL: binarySlPct % above entry (leverage-adjusted). Uses originalEntryPrice.
   _binarySLPrice(pos, instr) {
-    const bSlPct = this.cfg.binarySlPct ?? 18;
+    const bSlPct = pos._slPctOverride ?? this.cfg.binarySlPct ?? 18;
     const base   = pos.originalEntryPrice || pos.entryPrice;
     const raw    = base * (1 + bSlPct / 100 / pos.leverage);
     return instr ? this.snapPrice(raw, instr) : parseFloat(raw.toFixed(8));
@@ -4267,6 +4271,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   gainerLockInBump(symbol, change, { countTrade = true } = {}) {
     if (!this.cfg.gainerLockInEnabled) return;
+    change = +(Number(change) || 0).toFixed(4);
     const LOCK_TTL = 6 * 3600 * 1000;
     const now   = Date.now();
     const entry = this.gainerLockIn[symbol];
@@ -4301,6 +4306,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   loserLockInBump(symbol, change, { countTrade = true } = {}) {
     if (!this.cfg.loserLockInEnabled) return;
+    change = +(Number(change) || 0).toFixed(4);
     const LOCK_TTL = 6 * 3600 * 1000;
     const now   = Date.now();
     const entry = this.loserLockIn[symbol];
@@ -4588,6 +4594,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         new Function(_pluginCode)();
         const plug = window.__BotPlugin;
         if (!plug || !plug.id) throw new Error('No valid __BotPlugin export found');
+        const botId = window.__pluginSystem.BOT;
+        if (plug.targetBot && plug.targetBot.toLowerCase() !== botId) {
+          throw new Error(`Plugin targets "${plug.targetBot}" — this bot is "${botId}"`);
+        }
         const entry = {
           id: plug.id,
           name: plug.name || plug.id,
@@ -4598,9 +4608,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           conflicts: plug.conflicts || [],
           requires: plug.requires || [],
           touches: plug.touches || [],
+          suppresses: plug.suppresses || [],
           css: plug.css || '',
           slots: plug.slots || {},
-          transformSrc: plug.transform ? plug.transform.toString() : '',
+          src: _pluginCode,
         };
         const existing = this._pluginList.findIndex(p => p.id === entry.id);
         if (existing >= 0) this._pluginList.splice(existing, 1, entry);
@@ -4623,6 +4634,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 // ─── PLUGIN SYSTEM ───────────────────────────────────────────────────────────
 (function _pluginSystem() {
   const _PS_KEY = '__pw_plugins_v1';
+  const _PS_BOT = 'pseudowinter';
 
   function _psLoad() {
     try { return JSON.parse(localStorage.getItem(_PS_KEY) || '[]'); }
@@ -4655,21 +4667,35 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   window.__pluginSystem = {
     KEY: _PS_KEY,
+    BOT: _PS_BOT,
     load: _psLoad,
     sort: _psSort,
     save(plugins) { localStorage.setItem(_PS_KEY, JSON.stringify(plugins)); },
     checkConflicts(plugins) {
       const warns = [];
       const ids = new Set(plugins.map(p => p.id));
+      const suppressedBy = {};
       for (const p of plugins) {
         for (const cid of (p.conflicts || [])) { if (ids.has(cid)) warns.push(`"${p.name}" conflicts with "${cid}"`); }
         for (const rid of (p.requires || [])) { if (!ids.has(rid)) warns.push(`"${p.name}" requires "${rid}" (not loaded)`); }
+        for (const fn of (p.suppresses || [])) {
+          if (suppressedBy[fn]) warns.push(`"${p.name}" and "${suppressedBy[fn]}" both suppress "${fn}" — last loaded wins`);
+          else suppressedBy[fn] = p.name;
+        }
+        if (!p.src && p.transformSrc) warns.push(`"${p.name}" was saved by an older loader and is inactive — re-load its plugin file`);
       }
       return warns;
     }
   };
 
-  const stored = _psLoad();
+  // Skip plugins saved for a different bot (the two bots may share an origin)
+  const stored = _psLoad().filter(p => {
+    if (p.targetBot && p.targetBot.toLowerCase() !== _PS_BOT) {
+      console.warn('[Plugin] "' + p.id + '" targets "' + p.targetBot + '" — skipped on ' + _PS_BOT);
+      return false;
+    }
+    return true;
+  });
   if (!stored.length) return;
 
   const sorted = _psSort(stored);
@@ -4682,14 +4708,24 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     document.head.appendChild(s);
   }
 
+  // Re-execute each plugin's stored source to rebuild its live object (closure
+  // constants intact), then apply its transform. Stringified-function entries
+  // from the old loader (transformSrc) cannot be revived — checkConflicts flags them.
   const _origPw = pw;
   window.pw = function() {
     let def = _origPw();
     for (const p of sorted) {
-      if (!p.transformSrc) continue;
+      if (!p.src) {
+        if (p.transformSrc) console.warn('[Plugin] "' + p.id + '" was saved by an older loader — re-load its file to activate it.');
+        continue;
+      }
       try {
-        const fn = new Function('return (' + p.transformSrc + ')')();
-        def = fn(def);
+        delete window.__BotPlugin;
+        new Function(p.src)();
+        const live = window.__BotPlugin;
+        delete window.__BotPlugin;
+        if (!live || live.id !== p.id) throw new Error('source did not export plugin "' + p.id + '"');
+        if (typeof live.transform === 'function') def = live.transform(def);
       } catch(e) { console.error('[Plugin] "' + p.id + '" transform failed:', e); }
     }
     return def;
@@ -4731,6 +4767,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
             </div>
             <div x-show="p.touches&&p.touches.length>0" style="font-size:9px;color:var(--text-lo);margin-top:4px">
               Touches: <span style="color:var(--warn);font-family:var(--mono)" x-text="(p.touches||[]).join(', ')"></span>
+            </div>
+            <div x-show="p.suppresses&&p.suppresses.length>0" style="font-size:9px;color:var(--text-lo);margin-top:4px">
+              Suppresses: <span style="color:#ff4560;font-family:var(--mono)" x-text="(p.suppresses||[]).join(', ')"></span>
             </div>
           </div>
           <button @click="_pluginRemove(p.id)" style="background:rgba(255,69,96,0.12);border:1px solid rgba(255,69,96,0.25);color:#ff4560;font-size:10px;padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0">Remove</button>

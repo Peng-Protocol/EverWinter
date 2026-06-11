@@ -1,0 +1,290 @@
+<!--
+  Blizzard Strategy Plugin for PseudoWinter
+  Random scattershot shorts — a bet on the market at large.
+
+  Each scan cycle picks N random tickers whose |24h change| clears a
+  configurable baseline and shorts them with a fixed SL / far TP, force-closing
+  any survivor after 12 hours. The barrier geometry (TP 100% / SL 18% default)
+  means a single TP win covers ~5.5 SL losses; the edge comes from firing only
+  when the broad market drifts the bot's way. When Permafrost is loaded and its
+  climate profile has sufficient evidence, a hostile reading defers the cycle.
+
+  Entries are subject to the host's drawdown throttle and gains lock, and to
+  Permafrost governance of those halts when it is loaded.
+
+  Load via Plugin Manager in PseudoWinter's config panel.
+  Load AFTER EverWinter if using live trading — see README Plugin Stack Order.
+  targetBot: pseudowinter
+-->
+<script>
+(function () {
+  'use strict';
+
+  const HOLD_MS          = 12 * 3600 * 1000; // force-close survivors after 12h
+  const CLIMATE_MIN_MASS = 6;                // evidence mass required to honor a Permafrost reading
+  const CLIMATE_STALE_MS = 2 * 3600 * 1000;  // ignore readings older than this
+
+  window.__BotPlugin = {
+    id:        'blizzard-winter',
+    name:      'Blizzard (Winter)',
+    version:   '1.0.0',
+    targetBot: 'pseudowinter',
+    after:     ['everwinter', 'permafrost-winter'],
+    before:    [],
+    conflicts: [],
+    requires:  [],
+    touches:   ['init', 'runScan', 'pseudoWatchPositions', 'pseudoClosePosition', 'renderTradeFeed'],
+
+    css: `
+      .blz-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+    `,
+
+    slots: {
+      'mode-label-extra': `<span x-show="cfg.blizzardEnabled"> + Blizzard</span>`,
+      'strategy-accordions': `
+        <div x-data="{ open: false }">
+          <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span>❅ Blizzard</span>
+              <span x-show="cfg.blizzardEnabled" style="font-size:8px;padding:1px 5px;background:rgba(96,210,255,.15);border:1px solid rgba(96,210,255,.3);border-radius:2px;color:var(--ice);letter-spacing:1px">ON</span>
+              <span x-show="!cfg.blizzardEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
+            </div>
+            <span class="cfg-acc-arrow" :class="open?'open':''">▶</span>
+          </button>
+          <div x-show="open" x-transition.opacity class="cfg-acc-body">
+            <label class="tog" @click.prevent="if(!cfgLocked){cfg.blizzardEnabled=!cfg.blizzardEnabled;persist()}">
+              <div class="tog-t" :class="cfg.blizzardEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Blizzard Mode</div>
+                <div class="blz-hint">Random scattershot shorts across big 24h movers — a bet on the market at large. Survivors force-close after 12h. Defers when Permafrost reads a hostile climate.</div>
+              </div>
+            </label>
+            <div x-show="cfg.blizzardEnabled" style="margin-top:8px">
+              <div class="g">
+                <div class="lbl">Baseline 24h Δ <b x-text="(cfg.blizzardBaselinePct??6).toFixed(1)+'%'"></b></div>
+                <input type="range" min="1" max="20" step="0.5" x-model.number="cfg.blizzardBaselinePct" @change="persist()">
+                <div class="blz-hint">A ticker qualifies when its 24h change exceeds this in either direction.</div>
+              </div>
+              <div class="g" style="margin-top:8px">
+                <div class="lbl">Picks / Cycle <b x-text="(cfg.blizzardPicks??3)"></b></div>
+                <input type="range" min="1" max="10" step="1" x-model.number="cfg.blizzardPicks" @change="persist()">
+                <div class="blz-hint">Random tickers shorted per scan cycle, until max positions or a halt.</div>
+              </div>
+              <div class="g" style="margin-top:8px">
+                <div class="lbl">Stop Loss <b x-text="(cfg.blizzardSlPct??18)+'%'"></b></div>
+                <input type="range" min="5" max="50" step="1" x-model.number="cfg.blizzardSlPct" @change="persist()">
+              </div>
+              <div class="g" style="margin-top:8px">
+                <div class="lbl">Take Profit <b x-text="(cfg.blizzardTpPct??100)+'%'"></b></div>
+                <input type="range" min="20" max="300" step="5" x-model.number="cfg.blizzardTpPct" @change="persist()">
+                <div class="blz-hint">Functional ROI. One win at <span x-text="(cfg.blizzardTpPct??100)+'%'"></span> covers ~<span x-text="((cfg.blizzardTpPct??100)/(cfg.blizzardSlPct??18)).toFixed(1)"></span> stop-loss exits.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _origInit  = def.init;
+      const _origScan  = def.runScan;
+      const _origWatch = def.pseudoWatchPositions;
+      const _origClose = def.pseudoClosePosition;
+      const _origRender = def.renderTradeFeed;
+
+      return Object.assign({}, def, {
+
+        _blzDeferLogged: false,
+
+        async init() {
+          await _origInit.call(this);
+          if (this.cfg.blizzardEnabled     === undefined) this.cfg.blizzardEnabled     = false;
+          if (this.cfg.blizzardBaselinePct === undefined) this.cfg.blizzardBaselinePct = 6;
+          if (this.cfg.blizzardSlPct       === undefined) this.cfg.blizzardSlPct       = 18;
+          if (this.cfg.blizzardTpPct       === undefined) this.cfg.blizzardTpPct       = 100;
+          if (this.cfg.blizzardPicks       === undefined) this.cfg.blizzardPicks       = 3;
+          this.log(`[BLZ] Blizzard (Winter) v1.0.0 loaded — ${this.cfg.blizzardEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.blizzardBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.blizzardSlPct}% / TP ${this.cfg.blizzardTpPct}% | ${this.cfg.blizzardPicks}/cycle`, 'info');
+        },
+
+        // Permafrost climate reading, when present and evidenced. null = no opinion.
+        _blzClimate() {
+          const st = this.pfStatus;
+          if (!st || !st.at || (Date.now() - st.at) > CLIMATE_STALE_MS) return null;
+          if ((st.mass || 0) < CLIMATE_MIN_MASS || st.score === null || st.score === undefined) return null;
+          return st.score;
+        },
+
+        async runScan() {
+          await _origScan.call(this);
+          await this._blzRunScan();
+        },
+
+        async _blzRunScan() {
+          if (!this.cfg.blizzardEnabled) return;
+          if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
+          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
+
+          const climate = this._blzClimate();
+          if (climate !== null && climate < 0) {
+            if (!this._blzDeferLogged) {
+              this._blzDeferLogged = true;
+              this.log(`[BLZ] ❅ Hostile climate (score ${climate.toFixed(2)}) — Blizzard deferred`, 'info');
+            }
+            return;
+          }
+          this._blzDeferLogged = false;
+
+          let opened = 0, poolSize = 0;
+          const picks = Math.max(1, Math.round(this.cfg.blizzardPicks ?? 3));
+          try {
+            // Reuse the host scan's bulk ticker response when fresh
+            let allTickers;
+            if (this._lastAllTickers?.length && (Date.now() - (this._lastAllTickersAt || 0)) < 60000) {
+              allTickers = this._lastAllTickers;
+            } else {
+              const tr = await fetch(`${this.base}/v5/market/tickers?category=linear`);
+              const td = await tr.json();
+              if (td.retCode !== 0) {
+                this.log(`[BLZ] Scan: ticker fetch error — retCode ${td.retCode} ${td.retMsg || ''}`.trim(), 'warn');
+                return;
+              }
+              allTickers = td.result?.list || [];
+            }
+
+            const baseline   = this.cfg.blizzardBaselinePct ?? 6;
+            const activeSyms = new Set((this.positions || []).map(p => p.symbol));
+            const pool = allTickers.filter(t =>
+              t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
+              && parseFloat(t.lastPrice || 0) >= 0.001
+              && Math.abs(parseFloat(t.price24hPcnt || 0) * 100) >= baseline
+              && !activeSyms.has(t.symbol)
+              && !(this._isSymbolBanned?.(t.symbol)));
+            poolSize = pool.length;
+
+            let tried = 0;
+            while (pool.length && opened < picks && tried < picks * 3
+                   && (this.positions?.length ?? 0) < (this.cfg.maxPos ?? 5)) {
+              const t = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
+              tried++;
+              if (await this._blzOpen(t)) opened++;
+            }
+          } catch(e) {
+            this.log('[BLZ] Scan error: ' + e.message, 'warn');
+            return;
+          }
+          this.log(`[BLZ] ❅ Scattershot: ${poolSize} movers ≥${(this.cfg.blizzardBaselinePct ?? 6).toFixed(1)}% — ${opened}/${picks} opened${climate !== null ? ` | climate ${climate.toFixed(2)}` : ''}`, 'info');
+        },
+
+        // Open one scatter short. The host (sim and live) reads binary TP/SL from cfg
+        // at open time, so the blizzard values are swapped in around the call. The TP
+        // slider is a functional ROI target — the host divides the configured value by
+        // the EDa buffer (_buffMul), so it is pre-multiplied to land where configured.
+        async _blzOpen(t) {
+          const sym   = t.symbol;
+          const price = parseFloat(t.lastPrice || 0);
+          if (!price) return false;
+          const change = parseFloat(t.price24hPcnt || 0) * 100;
+          const rsi6  = (await this.fetchRSI(sym, 6))  ?? 50;
+          const rsi12 = (await this.fetchRSI(sym, 12)) ?? 50;
+          const rsi24 = (await this.fetchRSI(sym, 24)) ?? 50;
+
+          // Suppress main lock-in bumps — scatter entries are not signal trades
+          const _gbump = this.gainerLockInBump;
+          const _lbump = this.loserLockInBump;
+          this.gainerLockInBump = () => {};
+          this.loserLockInBump  = () => {};
+
+          const _pb = {
+            be: this.cfg.binaryModeEnabled,
+            tp: this.cfg.binaryTpPct,
+            sl: this.cfg.binarySlPct,
+          };
+          this.cfg.binaryModeEnabled = true;
+          this.cfg.binaryTpPct = (this.cfg.blizzardTpPct ?? 100) * this._buffMul();
+          this.cfg.binarySlPct = this.cfg.blizzardSlPct ?? 18;
+
+          const lenBefore = (this.positions || []).length;
+          try {
+            await this.pseudoOpenShort({ symbol: sym, price, change, rsi6, rsi12, rsi24, _blizzard: true });
+          } finally {
+            this.cfg.binaryModeEnabled = _pb.be;
+            this.cfg.binaryTpPct       = _pb.tp;
+            this.cfg.binarySlPct       = _pb.sl;
+            this.gainerLockInBump      = _gbump;
+            this.loserLockInBump       = _lbump;
+            if (typeof this.persist === 'function') this.persist(); // re-save restored cfg
+          }
+
+          if ((this.positions || []).length > lenBefore) {
+            const pos = this.positions[this.positions.length - 1];
+            pos._blizzard      = true;
+            pos._slPctOverride = this.cfg.blizzardSlPct ?? 18; // keeps the watcher's SL drift-correction on our value
+            if (typeof this.persist === 'function') this.persist();
+            return true;
+          }
+          return false;
+        },
+
+        // Authoritative exits for scatter positions: functional-ROI TP/SL plus the 12h
+        // force-close. The host enforces TP/SL too (exchange-native in live mode); this
+        // wrap guarantees the configured levels regardless of EDa adjustments or the
+        // sim/live TP-buffer asymmetry. Manages existing positions even when disabled.
+        async pseudoWatchPositions() {
+          await _origWatch.call(this);
+          const now = Date.now();
+          const tp  = this.cfg.blizzardTpPct ?? 100;
+          const sl  = this.cfg.blizzardSlPct ?? 18;
+          for (const pos of [...(this.positions || [])]) {
+            if (!pos._blizzard) continue;
+            if (!this.positions.find(x => x.id === pos.id)) continue; // closed earlier this pass
+            const roi = pos.margin > 0 ? ((pos.upnl || 0) / pos.margin) * 100 : 0;
+            if (roi >= tp) {
+              this.log(`[BLZ] ❅ ${pos.symbol.replace('USDT','')}: TP — ROI ${roi.toFixed(1)}% ≥ ${tp}%`, 'success');
+              await this.pseudoClosePosition(pos, 'tp', pos.markPrice);
+              continue;
+            }
+            if (roi <= -sl) {
+              this.log(`[BLZ] ❅ ${pos.symbol.replace('USDT','')}: SL — ROI ${roi.toFixed(1)}% ≤ −${sl}%`, 'warn');
+              await this.pseudoClosePosition(pos, 'sl', pos.markPrice);
+              continue;
+            }
+            if (now - (pos.openedAt || now) >= HOLD_MS) {
+              this.log(`[BLZ] ❅ ${pos.symbol.replace('USDT','')}: 12h up — force close @ ROI ${roi.toFixed(1)}%`, 'info');
+              await this.pseudoClosePosition(pos, 'blizzard-12h', pos.markPrice);
+            }
+          }
+        },
+
+        async pseudoClosePosition(pos, reason, fillPrice) {
+          const isBlz   = pos._blizzard === true;
+          const prevLen = this.closedTrades?.length ?? 0;
+          await _origClose.call(this, pos, reason, fillPrice);
+          // Carry the stamp onto the newly prepended closed trade record
+          if (isBlz && (this.closedTrades?.length ?? 0) > prevLen) {
+            this.closedTrades[0]._blizzard = true;
+          }
+        },
+
+        renderTradeFeed() {
+          _origRender.call(this);
+          if (!this.closedTrades?.some(t => t._blizzard)) return;
+          const el = document.getElementById('pw-trade-feed');
+          if (!el) return;
+          const sorted = this.closedTrades
+            .filter(t => t.reason !== 'period-rollup')
+            .sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0));
+          const cards = el.querySelectorAll(':scope > div');
+          sorted.forEach((t, idx) => {
+            if (!t._blizzard || !cards[idx]) return;
+            const badge = document.createElement('span');
+            badge.style.cssText = 'font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(96,210,255,.45);color:var(--ice);background:rgba(96,210,255,.10)';
+            badge.textContent = 'BLZ';
+            const headFlex = cards[idx].querySelector('div[style*="display:flex"]');
+            if (headFlex) headFlex.appendChild(badge);
+          });
+        },
+      });
+    },
+  };
+})();
+</script>
