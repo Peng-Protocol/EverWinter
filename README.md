@@ -318,6 +318,38 @@ Note: for the first weeks the plugin behaves almost exactly like the stock timer
 
 ---
 
+## Blizzard / Firestorm Plugins
+
+`plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles.
+
+A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 100% / SL 18% by default) means one TP win covers ~5.5 SL exits; the edge is meant to come from broad market drift, so the strategy defers when the climate reads hostile.
+
+### Entry pass (`_blzRunScan` / `_fstRunScan`)
+
+Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn uniformly at random without replacement (failed opens retried up to 3× picks). Each cycle logs pool size and opens.
+
+### Climate gate (Permafrost / Ashfall coupling)
+
+When the matching halt governor is loaded, the strategy reads its live structure status (`pfStatus`/`afStatus`). If the reading is fresh (< 2h), evidenced (mass ≥ 6), and **hostile (score < 0)**, the cycle is deferred (logged once per state change). Absent governor, stale reading, or thin profile → the strategy fires on its own — the gate only ever vetoes, mirroring the governors' own refuse-to-act-on-thin-evidence posture. Halt governance itself (Permafrost/Ashfall extending or thawing drawdown/gains-lock halts) applies to these entries automatically since the pass sits behind the host's halt gates.
+
+### Open mechanics (cfg-swap)
+
+Both the sim hosts and the live plugins read binary-mode TP/SL from `cfg` at open time, so `_blzOpen`/`_fstOpen` swaps `binaryModeEnabled: true`, `binaryTpPct`, and `binarySlPct` in around the `pseudoOpenShort` call and restores them in `finally` (re-persisting the restored cfg). Entries are therefore always binary-style: TP and SL stamped at entry, no DCA ladder. The TP slider (`blizzardTpPct`/`firestormTpPct`, default 100, range 20–300) is a **functional ROI** target — the sim hosts divide the configured value by the EDa buffer (`_buffMul`), so the swap pre-multiplies by it. Main lock-in bumps are suppressed during the call (Drifters precedent — scatter entries are not signal trades); RSIs are fetched for the position record. New positions are stamped `_blizzard`/`_firestorm` plus `_slPctOverride`.
+
+`_slPctOverride` is a small host accommodation added for this plugin but usable by any: the watcher's binary **SL drift-correction** (which re-targets `slPrice` from the global `cfg.binarySlPct` each tick) and the position-card SL display honor a per-position override when present, so a plugin-set SL survives instead of being corrected back to the global slider.
+
+### Exits
+
+The plugin's `pseudoWatchPositions` wrap is the authoritative exit for stamped positions (it manages them even if the mode is toggled off mid-flight): per tick it computes ROI as `upnl / margin` and closes at `roi ≥ TP%` (`'tp'`), `roi ≤ −SL%` (`'sl'`), or age ≥ 12h (`'blizzard-12h'`/`'firestorm-12h'`), always at mark price. The host enforces the same TP/SL independently (exchange-native in live mode — note the live TP order sits at `TP × buffMul` since the live open does not divide by the buffer; the wrap closes at the configured functional level first). Closed records carry the stamp and the trade feed badges them `BLZ` (ice) / `FST` (ember).
+
+### Interactions
+
+- **EDa** — scatter positions participate fully: they hold debt shares, can be elected laggard, and their SL losses feed `_lostValue` redistribution. (TP targets survive EDa recomputes via `_baseTpPct`, which stores the swapped value.)
+- **Drawdown throttle / gains lock** — scatter PnL feeds both windows, and both halts block new scatter entries.
+- **maxPos** — shared with the stock strategy; scatter entries stop at the global cap.
+
+---
+
 ## EDa (Effective Debt Adjusted) System
 
 The EDa system distributes the financial cost of losing trades across all open positions, adjusting their take-profit targets to ensure the portfolio collectively recovers the debt. It runs in both PseudoWinter (shorts) and PseudoChaser (longs) and activates whenever `laggardCheckEnabled` is true.
