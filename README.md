@@ -55,6 +55,8 @@ On `visibilitychange` (tab returns to foreground): if a scan is overdue, it fire
 
 The bulk ticker call is reused for funding rate seeding and 24h change data. A second per-symbol ticker call is made only when a single-symbol price is needed (e.g. position watcher mark-price check).
 
+The full response is also cached on the instance as `_lastAllTickers`, with `_lastAllTickersAt` (epoch ms) recording when it was fetched. **Strategy plugins that append their own scan pass should reuse this cache when it is under 60 s old instead of re-fetching the endpoint** — a pass appended via the `runScan` wrap runs seconds after the host scan populated it. The age check makes the fallback fetch kick in automatically when the cache is stale (e.g. samplers running during a halt, when scans are skipped before the fetch).
+
 ---
 
 ## Position Watcher (`pseudoWatchPositions`)
@@ -261,7 +263,7 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 ### Internals
 
 - `_driftersBias()` — sums the `trades` field across the persisted lock-in maps and compares the sides against `cfg.driftersThreshold` (default `2`). Winter compares `gainerLockIn` vs `loserLockIn`; Chaser compares `gainerStratLockIn` (bullish activity) vs `gainerLockIn` (roof/bearish activity). Returns `'bullish'`, `'bearish'`, or `'neutral'` (also neutral when both sides are zero).
-- `_driftersRunScan()` — appended to `runScan`. Returns early when `cfg.driftersEnabled` is off, the book is at `maxPos`, or the bias opposes the bot's direction. Otherwise fetches the full ticker list, takes the top 30 non-banned, non-BTC USDT symbols by 24h turnover (skipping symbols already in the book), classifies each with `_drifterRsiClass(rsi6, rsi12, rsi24)` — `'high'` (all ≥ 50), `'low'` (all ≤ 50), `'lukewarm'` (mixed → skip) — and opens via `pseudoOpenShort` with `_drifterType` set on the candidate.
+- `_driftersRunScan()` — appended to `runScan`. Returns early when `cfg.driftersEnabled` is off, the book is at `maxPos`, or the bias opposes the bot's direction. Otherwise reuses the host's `_lastAllTickers` cache when fresh (< 60 s, i.e. the stock scan just fetched it) — falling back to its own bulk ticker fetch — and takes the top 30 non-banned, non-BTC USDT symbols by 24h turnover (skipping symbols already in the book), classifies each with `_drifterRsiClass(rsi6, rsi12, rsi24)` — `'high'` (all ≥ 50), `'low'` (all ≤ 50), `'lukewarm'` (mixed → skip) — and opens via `pseudoOpenShort` with `_drifterType` set on the candidate.
 - `driftLockIn` — third lock-in map keyed by symbol: `{ rsi6, rsi12, rsi24, trades, setAt, drifterType }`, 6-hour TTL. One entry per symbol: a same-direction re-fire ratchets each timeframe (`Math.max` for high, `Math.min` for low), increments `trades`, and refreshes `setAt`; an opposite-direction fire replaces the entry outright. Persisted under the plugin's own localStorage key (restored on init with expired entries dropped) and swept by the wrapped `_sweepExpiredData()`.
 - Re-entry gate: a fresh same-direction `driftLockIn` entry blocks the symbol unless all three RSI readings are strictly past the stored values (above for high, below for low).
 - `pseudoOpenShort` wrap — non-drift candidates pass straight through to the original. For drift candidates, the main lock-in bumps are suppressed for the duration of the call (Winter: gainer/loser bumps; Chaser: `gainerStratLockInBump`), the new position is stamped with `pos._drifterType`, and `driftLockInBump(...)` records the drift entry.
@@ -285,7 +287,7 @@ Both replace the fixed 12h drawdown-throttle / gains-lock timers with a learned 
 
 ### Market structure reading
 
-Computed from the **full** USDT-perp ticker universe (same filters as the scan: USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`) — deliberately *not* the curated gainer/loser pools, whose dynamic floors make pool membership endogenous to the top mover:
+Computed from the **full** USDT-perp ticker universe (same filters as the scan: USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`) — deliberately *not* the curated gainer/loser pools, whose dynamic floors make pool membership endogenous to the top mover. The reading reuses the host's `_lastAllTickers` cache when fresh (< 60 s); the slow-tick sampler during halts fetches its own copy, since scans (and therefore cache refreshes) don't run while halted:
 
 - `skew` = (Σ gainer 24h% − Σ |loser 24h%|) / (Σ both) — magnitude lean, −1…+1
 - `breadth` = (gainer count − loser count) / (total count) — participation lean, −1…+1
