@@ -398,23 +398,29 @@ The stats column shows per-laggard metrics: **Buffered EV**, **Lost Value** (the
 
 ## Lock-in State
 
-`gainerLockIn` and `loserLockIn` are plain objects keyed by symbol: `{ rsi6, rsi12, rsi24, setAt, trades }`. Both are refreshed at **position close** (in addition to open), so the 6-hour TTL restarts from close time.
+Lock-in maps are plain objects keyed by symbol. Both bots refresh entries at **position close** (in addition to open), so the 6-hour TTL restarts from close time — but the two bots gate on different data and in different directions.
 
-### PseudoWinter
+### PseudoWinter (RSI-based)
+
+Entries: `{ rsi6, rsi12, rsi24, setAt, trades }`.
 
 | Store | Direction | Ratchet | Re-entry condition |
 |---|---|---|---|
 | `gainerLockIn[sym]` | Floor (shorts on high RSI) | `Math.max` — rises each trade | RSI must be **strictly above** the floor on all three timeframes |
 | `loserLockIn[sym]` | Ceiling (shorts on low RSI) | `Math.min` — falls each trade | RSI must be **strictly below** the ceiling on all three timeframes |
 
-### PseudoChaser
+**Strict inequality**: the gate blocks at-or-beyond the lock-in level, requiring RSI to move past it for re-entry. For a floor of 75, the next entry needs RSI > 75; the ratchet then sets the new floor to that entry's RSI, requiring yet higher RSI next time. Winter's gates are continuation bets — re-entry only when the move has pushed *further* in the entry direction.
 
-| Store | Direction | Ratchet | Re-entry condition |
+### PseudoChaser (24h-change-based)
+
+Entries: `{ change, setAt, trades }`. Chaser's gates deliberately invert Winter's continuation logic — they are mean-reversion-aware:
+
+| Store | Used by | Ratchet | Re-entry condition |
 |---|---|---|---|
-| `gainerLockIn[sym]` | Roof (longs — blocks if RSI bounced too high) | `Math.min` — falls each trade | RSI must be **strictly below** the roof |
-| `gainerStratLockIn[sym]` | Floor (gainer-strat longs on high RSI) | `Math.max` — rises each trade | RSI must be **strictly above** the floor |
+| `gainerLockIn[sym]` | Loser strategy | `Math.max` — floor rises each trade | 24h change must be **at or above** the floor — a recovering loser is picking up energy and can keep going up |
+| `gainerStratLockIn[sym]` | Gainer strategy | `Math.min` — ceiling falls each trade | 24h change must be **at or below** the ceiling — a faltering gainer may rebound, so re-entry waits for the pullback |
 
-**Strict inequality**: the gate blocks at-or-beyond the lock-in level, requiring RSI to move past it for re-entry. For a floor of 75, the next entry needs RSI > 75; the ratchet then sets the new floor to that entry's RSI, requiring yet higher RSI next time.
+Equality is allowed (re-entry *at* the locked level passes); the ratchet then moves the level to the new trade's change, tightening in the strategy's preferred direction. The same gates are enforced on the watchlist-promotion paths (potential gainers/losers), where the current 24h change is read from the cycle's `_lastAllTickers` cache via `_change24h(symbol)`; promotion-path entries also record their real 24h change into the maps (previously stamped `0`).
 
 `_sweepExpiredData()` removes entries where `Date.now() − setAt > 6 × 3600 × 1000`.
 
