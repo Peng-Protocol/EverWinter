@@ -4588,6 +4588,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         new Function(_pluginCode)();
         const plug = window.__BotPlugin;
         if (!plug || !plug.id) throw new Error('No valid __BotPlugin export found');
+        const botId = window.__pluginSystem.BOT;
+        if (plug.targetBot && plug.targetBot.toLowerCase() !== botId) {
+          throw new Error(`Plugin targets "${plug.targetBot}" — this bot is "${botId}"`);
+        }
         const entry = {
           id: plug.id,
           name: plug.name || plug.id,
@@ -4598,9 +4602,10 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           conflicts: plug.conflicts || [],
           requires: plug.requires || [],
           touches: plug.touches || [],
+          suppresses: plug.suppresses || [],
           css: plug.css || '',
           slots: plug.slots || {},
-          transformSrc: plug.transform ? plug.transform.toString() : '',
+          src: _pluginCode,
         };
         const existing = this._pluginList.findIndex(p => p.id === entry.id);
         if (existing >= 0) this._pluginList.splice(existing, 1, entry);
@@ -4623,6 +4628,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 // ─── PLUGIN SYSTEM ───────────────────────────────────────────────────────────
 (function _pluginSystem() {
   const _PS_KEY = '__pw_plugins_v1';
+  const _PS_BOT = 'pseudowinter';
 
   function _psLoad() {
     try { return JSON.parse(localStorage.getItem(_PS_KEY) || '[]'); }
@@ -4655,21 +4661,35 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   window.__pluginSystem = {
     KEY: _PS_KEY,
+    BOT: _PS_BOT,
     load: _psLoad,
     sort: _psSort,
     save(plugins) { localStorage.setItem(_PS_KEY, JSON.stringify(plugins)); },
     checkConflicts(plugins) {
       const warns = [];
       const ids = new Set(plugins.map(p => p.id));
+      const suppressedBy = {};
       for (const p of plugins) {
         for (const cid of (p.conflicts || [])) { if (ids.has(cid)) warns.push(`"${p.name}" conflicts with "${cid}"`); }
         for (const rid of (p.requires || [])) { if (!ids.has(rid)) warns.push(`"${p.name}" requires "${rid}" (not loaded)`); }
+        for (const fn of (p.suppresses || [])) {
+          if (suppressedBy[fn]) warns.push(`"${p.name}" and "${suppressedBy[fn]}" both suppress "${fn}" — last loaded wins`);
+          else suppressedBy[fn] = p.name;
+        }
+        if (!p.src && p.transformSrc) warns.push(`"${p.name}" was saved by an older loader and is inactive — re-load its plugin file`);
       }
       return warns;
     }
   };
 
-  const stored = _psLoad();
+  // Skip plugins saved for a different bot (the two bots may share an origin)
+  const stored = _psLoad().filter(p => {
+    if (p.targetBot && p.targetBot.toLowerCase() !== _PS_BOT) {
+      console.warn('[Plugin] "' + p.id + '" targets "' + p.targetBot + '" — skipped on ' + _PS_BOT);
+      return false;
+    }
+    return true;
+  });
   if (!stored.length) return;
 
   const sorted = _psSort(stored);
@@ -4682,14 +4702,24 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     document.head.appendChild(s);
   }
 
+  // Re-execute each plugin's stored source to rebuild its live object (closure
+  // constants intact), then apply its transform. Stringified-function entries
+  // from the old loader (transformSrc) cannot be revived — checkConflicts flags them.
   const _origPw = pw;
   window.pw = function() {
     let def = _origPw();
     for (const p of sorted) {
-      if (!p.transformSrc) continue;
+      if (!p.src) {
+        if (p.transformSrc) console.warn('[Plugin] "' + p.id + '" was saved by an older loader — re-load its file to activate it.');
+        continue;
+      }
       try {
-        const fn = new Function('return (' + p.transformSrc + ')')();
-        def = fn(def);
+        delete window.__BotPlugin;
+        new Function(p.src)();
+        const live = window.__BotPlugin;
+        delete window.__BotPlugin;
+        if (!live || live.id !== p.id) throw new Error('source did not export plugin "' + p.id + '"');
+        if (typeof live.transform === 'function') def = live.transform(def);
       } catch(e) { console.error('[Plugin] "' + p.id + '" transform failed:', e); }
     }
     return def;
@@ -4731,6 +4761,9 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
             </div>
             <div x-show="p.touches&&p.touches.length>0" style="font-size:9px;color:var(--text-lo);margin-top:4px">
               Touches: <span style="color:var(--warn);font-family:var(--mono)" x-text="(p.touches||[]).join(', ')"></span>
+            </div>
+            <div x-show="p.suppresses&&p.suppresses.length>0" style="font-size:9px;color:var(--text-lo);margin-top:4px">
+              Suppresses: <span style="color:#ff4560;font-family:var(--mono)" x-text="(p.suppresses||[]).join(', ')"></span>
             </div>
           </div>
           <button @click="_pluginRemove(p.id)" style="background:rgba(255,69,96,0.12);border:1px solid rgba(255,69,96,0.25);color:#ff4560;font-size:10px;padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0">Remove</button>

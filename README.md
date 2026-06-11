@@ -98,7 +98,7 @@ RSI6, RSI12, RSI24 each use this function with `period = 6`, `12`, `24` on 60-mi
 |---|---|
 | `pc_v1` | Same structure as `pw_v1` |
 | `pc_v1_log` | Activity log array |
-| `__pw_plugins_v1` | Plugin list (same key, separate namespace per page origin) |
+| `__pc_plugins_v1` | Serialized plugin list (own key — the bots previously shared `__pw_plugins_v1`, which clobbered each other's lists when served from the same origin) |
 
 ### PsychoWinter
 
@@ -163,7 +163,9 @@ All calls target `https://api.bybit.com` with `category=linear`.
 
 ### Storage and Load Order
 
-Plugins are stored as serialized objects in `localStorage.__pw_plugins_v1`. Each entry includes all manifest fields plus `transformSrc` (the `transform` function stringified). On page load, the plugin system IIFE runs before Alpine initializes, deserializes stored plugins, topologically sorts them by `after`/`before` manifest fields (Kahn's algorithm), and wraps the component function (`pw()` or `pc()`).
+Plugins are stored as serialized objects in `localStorage.__pw_plugins_v1` (PseudoWinter) / `localStorage.__pc_plugins_v1` (PseudoChaser). Each entry includes all manifest fields plus `src` — the plugin's **raw source code**. On page load, the plugin system IIFE runs before Alpine initializes, deserializes stored plugins (skipping any whose `targetBot` names a different bot), topologically sorts them by `after`/`before` manifest fields (Kahn's algorithm), and wraps the component function (`pw()` or `pc()`).
+
+Storing raw source matters: an earlier loader stored `transform.toString()` (`transformSrc`) and revived it with `new Function`, which broke on shorthand-method syntax and severed the plugin's closure over its module constants — no transform ever applied. The current loader **re-executes the stored source** at boot, rebuilding the live plugin object with closures intact, and takes `transform` from that. Legacy `transformSrc` entries cannot be revived; they are flagged as inactive by the conflict checker and must be re-loaded from their file once.
 
 ### Transform Pipeline
 
@@ -171,7 +173,12 @@ Plugins are stored as serialized objects in `localStorage.__pw_plugins_v1`. Each
 pw()  →  plugin[0].transform(def)  →  plugin[1].transform(def)  →  ...  →  Alpine
 ```
 
-Each plugin's `transform(def)` receives the current component definition object and returns a modified version. Methods are replaced or wrapped by closing over the original. The final definition is what Alpine receives at `x-data` evaluation time.
+Each plugin's `transform(def)` receives the current component definition object and returns a modified version. The final definition is what Alpine receives at `x-data` evaluation time.
+
+Two styles are supported, and a plugin may mix them per method:
+
+- **Wrap** — capture the original via a `_orig*` closure and call it (`await _origScan.call(this)`), adding behavior before/after. Use this whenever the host behavior should be preserved: it composes with other plugins and inherits host bugfixes for free. Declare wrapped methods in `touches`.
+- **Replace (suppress)** — return a definition whose method does **not** call the original. Use this when extending is contorted (e.g. the live-trading plugins' `pseudoOpenShort`, which substitutes real API execution for the simulation fill). Declare replaced methods in `suppresses` (in addition to `touches`): replacement is last-writer-wins, so the manager hard-warns when two loaded plugins suppress the same method.
 
 ### CSS and HTML Slots
 
@@ -179,7 +186,7 @@ Plugin `css` strings are injected into `<head>` synchronously during the IIFE. P
 
 ### Loading a Plugin File
 
-The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For `.html` files, `DOMParser` extracts all `<script>` tag contents and concatenates them. The extracted code is executed via `new Function(code)()`, which must set `window.__BotPlugin`. The plugin object is serialized (with `transform.toString()` stored as `transformSrc`) and saved to localStorage.
+The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For `.html` files, `DOMParser` extracts all `<script>` tag contents and concatenates them. The extracted code is executed via `new Function(code)()`, which must set `window.__BotPlugin`. A plugin whose `targetBot` does not match the host bot is rejected at this point. The manifest fields plus the raw extracted source (`src`) are saved to localStorage; the source is re-executed at every page load to produce the live transform.
 
 **A page reload is required after loading or removing a plugin.** The transform pipeline runs once at page load before Alpine initializes; plugins saved to localStorage during a session take effect on the next load.
 
@@ -190,12 +197,13 @@ The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For
 | `id` | string | Unique identifier; used for deduplication and conflict resolution |
 | `name` | string | Display name in Plugin Manager UI |
 | `version` | string | Shown in UI |
-| `targetBot` | string | `"PseudoWinter"` or `"PseudoChaser"` — informational |
+| `targetBot` | string | `"pseudowinter"` or `"pseudochaser"` — **enforced**: file load is rejected on mismatch, and stored entries for another bot are skipped at boot |
 | `after` | string[] | Load after these plugin IDs |
 | `before` | string[] | Load before these plugin IDs |
 | `conflicts` | string[] | Hard-reject if any of these are also loaded |
 | `requires` | string[] | Warn if any of these are missing |
-| `touches` | string[] | Method names this plugin modifies — surfaces overlap warnings |
+| `touches` | string[] | Method names this plugin modifies (wraps or replaces) — informational |
+| `suppresses` | string[] | Method names this plugin **replaces without calling the original** — the conflict checker warns when two loaded plugins suppress the same method |
 
 ---
 
@@ -228,7 +236,7 @@ Without `after`/`before` declarations the topological sort falls back to registr
 
 ### EverWinter (PseudoWinter → SHORT)
 
-Overrides `pseudoOpenShort`, `pseudoClosePosition`, `pseudoWatchPositions`.
+Overrides `pseudoOpenShort`, `pseudoClosePosition`, `pseudoWatchPositions`. Both live plugins declare `suppresses: ['pseudoOpenShort', 'refreshBalance']` — those two are full replacements that never call the simulation originals; the close and watch overrides wrap them.
 
 **Open**: Places `Sell` market order → polls execution list for fill → constructs position object with `totalSize` from fill → calls `POST /v5/position/trading-stop` to set TP (trigger at `fillPrice * (1 - tpPct/100/lev) * 1.001`) and SL natively.
 
@@ -383,6 +391,39 @@ With a Drifters plugin loaded, a third map `driftLockIn` exists alongside these 
 ## Drawdown Throttle
 
 When enabled, `runScheduledCycle()` checks rolling 6-hour PnL. If net PnL over the window falls below `-(drawdownThrottleFactor × entry margin)`, `_drawdownHaltUntil` is set to `Date.now() + 12 * 3600 * 1000`. New entries are blocked until `_drawdownHaltUntil` passes. The halt can be manually cancelled from the config panel (resets `_drawdownHaltUntil` to null).
+
+---
+
+## Gains Lock
+
+The profit-side mirror of the Drawdown Throttle: instead of halting after losses, it banks a winning streak by halting new entries once rolling profit hits a target. Runs in both PseudoWinter and PseudoChaser; enabled by default (`cfg.gainsLockEnabled: true`).
+
+### Mechanism
+
+- Every position close feeds realized PnL into a rolling window (`_gainsWindow`, entries `{ pnl, ts }`, 6-hour TTL) — `_recordGainsPnl(pnl)` in PseudoWinter, `recordGainsPnl(pnl)` in PseudoChaser.
+- The trigger threshold is `gainsLockFactor × entry margin`, where entry margin = `minNotional ÷ leverage`. `cfg.gainsLockFactor` ranges 0.1–5.0 in 0.1 steps, default 1.0×.
+- When window PnL ≥ threshold, `_gainsLockHaltUntil = now + 12h` and the `[GLK] 🔒` trigger line is logged. While locked, `_isGainsLocked()` makes `runScheduledCycle()`/`runScan()` return early (scan-deferred log line with hours remaining), so no new entries open; **open positions are unaffected** — the watcher keeps managing TP/SL as usual.
+- Expiry is checked each cycle; on lapse the lock clears itself and logs `[GLK] ✅ Gains lock lifted`.
+- `_gainsLockHaltUntil` is persisted (`gainsLockHaltUntil` in the main state key), so the lock survives reloads.
+
+### Trigger check (PseudoWinter `_checkGainsLock`)
+
+```
+windowPnl = Σ pnl over last 6h
+threshold = max(0.1, cfg.gainsLockFactor) × (minNotional / leverage)
+windowPnl ≥ threshold  →  _gainsLockHaltUntil = now + 12h
+```
+
+PseudoChaser performs the equivalent check inline in `recordGainsPnl` (window pruned by `GL_TTL`, factor not floored).
+
+### UI
+
+The config panel exposes the toggle, the **Profit Factor** slider (with the computed dollar threshold at current margin), and — while locked — a countdown with a **Cancel Lock** / **clear manually** action that nulls the halt and empties the window. PseudoWinter's market menu additionally shows a `GLK Xh` badge while the lock is active; PseudoChaser shows `🔒 GLK` with a clear action.
+
+### Interactions
+
+- **Drifters** — on init, tightens `cfg.gainsLockFactor` to 1.5 if it is ≥ 2, banking profits sooner during drift sessions.
+- **Permafrost / Ashfall** — replace the fixed 12-hour lock duration with the learned market-climate profile: a gains lock under their governance ends when the climate score crosses the thaw/settle threshold (hard-capped at `permafrostCapHours`/`ashfallCapHours`), and lifting clears the rolling window just like a manual clear. See the Permafrost / Ashfall section.
 
 ---
 
