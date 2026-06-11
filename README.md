@@ -269,6 +269,45 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 
 ---
 
+## Permafrost / Ashfall Plugins
+
+`plugins/strategies/Permafrost-Winter.html` (id `permafrost-winter`, `after: ['everwinter']`) targets PseudoWinter; `plugins/strategies/Ashfall-Chaser.html` (id `ashfall-chaser`, `after: ['sunchaser']`) targets PseudoChaser. Same code, two profiles: the plugin is direction-agnostic — it learns only from this installation's realized PnL — so each bot grows its own map and the two must never share data.
+
+Both replace the fixed 12h drawdown-throttle / gains-lock timers with a learned **market-climate profile**. The moment a halt fires, the plugin records the market structure at that instant; over time these events teach it which climates are hostile (drawdowns) and which favorable (gains locks). A halt then ends when the climate changes — not when a clock runs out.
+
+### Market structure reading
+
+Computed from the **full** USDT-perp ticker universe (same filters as the scan: USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`) — deliberately *not* the curated gainer/loser pools, whose dynamic floors make pool membership endogenous to the top mover:
+
+- `skew` = (Σ gainer 24h% − Σ |loser 24h%|) / (Σ both) — magnitude lean, −1…+1
+- `breadth` = (gainer count − loser count) / (total count) — participation lean, −1…+1
+
+### Profile
+
+- **Events** (weight 10) — recorded by wrapping the halt-trigger seams (`_checkDrawdownThrottle`/`_checkGainsLock` in Winter; `recordDrawdownPnl`/`recordGainsPnl` in Chaser). A drawdown event votes −1 at its (skew, breadth) point; a gains-lock event votes +1.
+- **Samples** (weight 1) — a structure reading is taken on every `runScan` and every slow tick during halts; 6h later it is labeled with the realized PnL (`totalPnl`, matching the halt windows) of trades closed in that window, normalized by entry margin and clamped to ±1. Windows with no closed trades are dropped — no evidence either way.
+- **Score** — gaussian-kernel weighted vote (bandwidth 0.25) of all entries near the current reading, with 7-day half-life recency decay so stale scars fade. Returns `score` ∈ [−1, +1] and `mass` (effective evidence weight nearby).
+
+### Halt lifecycle
+
+1. Halt fires → structure captured, event recorded.
+2. If local `mass ≥ 6` the halt becomes **profile-governed**: the halt timestamp is extended to the hard cap (`cfg.permafrostCapHours` / `cfg.ashfallCapHours`, default 24h, range 12–48h) and a slow sampler starts at `max(1h, 4 × scanMins)`. If the profile is too thin, the stock 12h timer stands untouched.
+3. Each slow tick re-reads structure; the halt lifts early ("thaw" / "ash settled") once `score ≥` the configured threshold (`cfg.permafrostThawScore` / `cfg.ashfallThawScore`, default 0, range −0.5…+0.5) with sufficient mass — never before 1h elapsed. Lifting clears the corresponding rolling PnL window, mirroring the manual-clear semantics.
+4. The hard cap is the exploration arm: it resumes trading regardless, so a region the profile distrusts gets re-tested rather than avoided forever.
+5. Manual halt clears are respected — the sampler notices the halt is gone and stands down.
+
+Transform hooks touched: `init`, `persist`, `runScan`, `pseudoClosePosition`, plus the two halt seams per bot. Profile persists under `__permafrost_winter_v1` / `__ashfall_chaser_v1` (events capped at 200, samples at 1000).
+
+### UI Elements
+
+- **Mode label suffix** — "+ Permafrost" / "+ Ashfall" via `mode-label-extra` while enabled.
+- **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours) plus **Export** (JSON download of the profile) and **Clear Profile** buttons. Controls respect the config lock.
+- **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with skew/breadth/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score.
+
+Note: for the first weeks the plugin behaves almost exactly like the stock timers — that is by design. It refuses to override the clock until enough evidence has accumulated near the current reading.
+
+---
+
 ## EDa (Effective Debt Adjusted) System
 
 The EDa system distributes the financial cost of losing trades across all open positions, adjusting their take-profit targets to ensure the portfolio collectively recovers the debt. It runs in both PseudoWinter (shorts) and PseudoChaser (longs) and activates whenever `laggardCheckEnabled` is true.
