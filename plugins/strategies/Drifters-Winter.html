@@ -19,7 +19,7 @@
   window.__BotPlugin = {
     id:        'drifters-winter',
     name:      'Drifters (Winter)',
-    version:   '1.0.0',
+    version:   '1.1.0',
     targetBot: 'pseudowinter',
     after:     ['everwinter'],
     before:    [],
@@ -80,6 +80,8 @@
           await _origInit.call(this);
           if (this.cfg.driftersEnabled   === undefined) this.cfg.driftersEnabled   = false;
           if (this.cfg.driftersThreshold === undefined) this.cfg.driftersThreshold = 2;
+          // Tighter gains lock for Drifters sessions — bank profits sooner
+          if ((this.cfg.gainsLockFactor ?? 2) >= 2) this.cfg.gainsLockFactor = 1.5;
           if (!this.driftLockIn) this.driftLockIn = {};
           try {
             const raw = localStorage.getItem(DFT_W_KEY);
@@ -93,6 +95,7 @@
               }
             }
           } catch(e) {}
+          this.log(`[DFT] Drifters (Winter) v1.1.0 loaded — ${this.cfg.driftersEnabled ? 'enabled' : 'disabled'} | threshold ${(this.cfg.driftersThreshold ?? 2).toFixed(1)}×`, 'info');
         },
 
         persist() {
@@ -175,15 +178,19 @@
           // PseudoWinter is short-only — defer in a bullish session
           if (bias === 'bullish') return;
 
+          let candidates = [], lukewarm = 0, locked = 0, opened = 0;
           try {
             const tr = await fetch(`${this.base}/v5/market/tickers?category=linear`);
             const td = await tr.json();
-            if (td.retCode !== 0) return;
+            if (td.retCode !== 0) {
+              this.log(`[DFT] Scan: ticker fetch error — retCode ${td.retCode} ${td.retMsg || ''}`.trim(), 'warn');
+              return;
+            }
             const allTickers = td.result?.list || [];
 
             const activeSyms = new Set((this.positions || []).map(p => p.symbol));
 
-            const candidates = allTickers
+            candidates = allTickers
               .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
               .filter(t => !activeSyms.has(t.symbol))
               .filter(t => !(this._isSymbolBanned?.(t.symbol)))
@@ -203,26 +210,30 @@
               if (rsi6 == null || rsi12 == null || rsi24 == null) continue;
 
               const drifterType = this._drifterRsiClass(rsi6, rsi12, rsi24);
-              if (drifterType === 'lukewarm') continue;
+              if (drifterType === 'lukewarm') { lukewarm++; continue; }
 
               // driftLockIn gate
               if (!this.driftLockIn) this.driftLockIn = {};
               const dl = this.driftLockIn[sym];
               if (dl && (Date.now() - dl.setAt) < LOCK_TTL && dl.drifterType === drifterType) {
                 if (drifterType === 'high') {
-                  if (rsi6 <= dl.rsi6 || rsi12 <= dl.rsi12 || rsi24 <= dl.rsi24) continue;
+                  if (rsi6 <= dl.rsi6 || rsi12 <= dl.rsi12 || rsi24 <= dl.rsi24) { locked++; continue; }
                 } else {
-                  if (rsi6 >= dl.rsi6 || rsi12 >= dl.rsi12 || rsi24 >= dl.rsi24) continue;
+                  if (rsi6 >= dl.rsi6 || rsi12 >= dl.rsi12 || rsi24 >= dl.rsi24) { locked++; continue; }
                 }
               }
 
               const dir = drifterType === 'high' ? '▲' : '▼';
               this.log(`[DFT] ${dir} ${sym.replace('USDT','')} @ ${price} RSI ${rsi6.toFixed(0)}/${rsi12.toFixed(0)}/${rsi24.toFixed(0)} — ${drifterType} drifter entry`, 'info');
+              const lenBefore = (this.positions || []).length;
               await this.pseudoOpenShort({ symbol: sym, price, rsi6, rsi12, rsi24, _drifterType: drifterType });
+              if ((this.positions || []).length > lenBefore) opened++;
             }
           } catch(e) {
             this.log('[DFT] Scan error: ' + e.message, 'warn');
+            return;
           }
+          this.log(`[DFT] Scan: ${candidates.length} candidates — ${lukewarm} lukewarm, ${locked} locked, ${opened} opened`, 'info');
         },
 
         async pseudoOpenShort(candidate) {
