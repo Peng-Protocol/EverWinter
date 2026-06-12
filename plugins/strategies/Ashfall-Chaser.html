@@ -12,6 +12,14 @@
   cap) while it stays hostile. With a thin profile the plugin defers to the
   stock 12h timer.
 
+  PLK (preemptive lock, on by default): proactive rather than reactive — when
+  a routine structure check reads a climate that is historically bad (score at
+  or below the PLK trigger, with sufficient evidence), entries lock before any
+  PnL damage occurs. A PLK rides the drawdown gate so every entry choke point
+  respects it, and lifts like the other halts: early once structure clears the
+  settle score, or at the hard cap. A real drawdown/gains-lock halt supersedes
+  an active PLK.
+
   The profile is direction-agnostic: it only learns what realized PnL says
   about this installation — the same logic powers Permafrost on PseudoWinter.
 
@@ -38,7 +46,7 @@
   window.__BotPlugin = {
     id:        'ashfall-chaser',
     name:      'Ashfall (Chaser)',
-    version:   '1.1.0',
+    version:   '1.2.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser'],
     before:    [],
@@ -84,6 +92,18 @@
                 <input type="range" min="12" max="48" step="1" x-model.number="cfg.ashfallCapHours" @change="persist()">
                 <div class="ash-hint">Maximum informed-halt duration. Resumes regardless once reached — stale burns must be re-tested.</div>
               </div>
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.ashfallPlkEnabled=!(cfg.ashfallPlkEnabled??true);persist()}">
+                <div class="tog-t" :class="(cfg.ashfallPlkEnabled??true)?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Preemptive Lock (PLK)</div>
+                  <div class="ash-hint">Proactive rather than reactive: when a routine structure check reads a climate that is historically bad (score at or below the trigger, with sufficient evidence), entries lock preemptively — before any PnL damage. Lifts like the other halts: early at the Settle Score, or at the Hard Cap.</div>
+                </div>
+              </label>
+              <div class="g" x-show="cfg.ashfallPlkEnabled??true" style="margin-top:8px">
+                <div class="lbl">PLK Trigger Score <b x-text="(cfg.ashfallPlkScore??-0.15).toFixed(2)"></b></div>
+                <input type="range" min="-0.5" max="-0.05" step="0.05" x-model.number="cfg.ashfallPlkScore" @change="persist()">
+                <div class="ash-hint">Profile score at or below which the preemptive lock engages. Closer to 0 = more cautious (locks earlier); more negative = only the worst climates trigger it.</div>
+              </div>
               <div class="ash-stat" style="margin-top:10px;padding:8px 10px;background:rgba(255,150,80,.05);border:1px solid rgba(255,150,80,.18);border-radius:3px">
                 <div>PROFILE — <span x-text="(afEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(afEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(afSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
                 <div x-show="afStatus.at">READING — skew <span x-text="(afStatus.skew??0).toFixed(2)"></span> | breadth <span x-text="(afStatus.breadth??0).toFixed(2)"></span> | score <span x-text="afStatus.score===null?'—':afStatus.score.toFixed(2)"></span> | mass <span x-text="afStatus.mass.toFixed(1)"></span></div>
@@ -106,6 +126,8 @@
       const _origClose = def.pseudoClosePosition;
       const _origDD    = def.recordDrawdownPnl;
       const _origGL    = def.recordGainsPnl;
+      const _origIsDD  = def._isDrawdownHalted;
+      const _origIsGL  = def._isGainsLocked;
 
       // Slow sampler handle lives outside the Alpine proxy (see Timer architecture)
       let _ashTimer = null;
@@ -123,6 +145,8 @@
           if (this.cfg.ashfallEnabled   === undefined) this.cfg.ashfallEnabled   = false;
           if (this.cfg.ashfallThawScore === undefined) this.cfg.ashfallThawScore = 0;
           if (this.cfg.ashfallCapHours  === undefined) this.cfg.ashfallCapHours  = 24;
+          if (this.cfg.ashfallPlkEnabled === undefined) this.cfg.ashfallPlkEnabled = true;
+          if (this.cfg.ashfallPlkScore   === undefined) this.cfg.ashfallPlkScore   = -0.15;
           try {
             const raw = localStorage.getItem(ASH_KEY);
             if (raw) {
@@ -133,10 +157,25 @@
               if (s.halt && s.halt.at) this.afHalt = s.halt;
             }
           } catch(e) {}
-          // Drop a stale governed-halt record if the underlying halt is gone (manual clear, expiry)
-          if (this.afHalt && !this._isDrawdownHalted() && !this._isGainsLocked()) this.afHalt = null;
+          // Drop a stale governed-halt record if the underlying halt is gone (manual clear, expiry).
+          // A PLK has no backing host timer — it expires on its own hard cap instead.
+          if (this.afHalt?.kind === 'plk') {
+            if (Date.now() - this.afHalt.at >= (this.cfg.ashfallCapHours ?? 24) * 3600 * 1000) this.afHalt = null;
+          } else if (this.afHalt && !_origIsDD.call(this) && !_origIsGL.call(this)) this.afHalt = null;
           if (this.afHalt) this._afEnsureSampler();
-          this.log(`[ASH] Ashfall (Chaser) v1.1.0 loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
+          this.log(`[ASH] Ashfall (Chaser) v1.2.0 loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
+        },
+
+        // ── PLK (preemptive lock) — proactive halt on historically bad structure ──
+        _afPlkActive() {
+          if (!this.cfg.ashfallEnabled || !(this.cfg.ashfallPlkEnabled ?? true)) return false;
+          return this.afHalt?.kind === 'plk';
+        },
+
+        // PLK rides the drawdown gate: every entry choke point (host scans and
+        // plugins) that respects the drawdown halt respects a preemptive lock too.
+        _isDrawdownHalted() {
+          return _origIsDD.call(this) || this._afPlkActive();
         },
 
         persist() {
@@ -278,8 +317,9 @@
         },
 
         async _afSamplerTick() {
-          const ddActive = this._isDrawdownHalted(), glActive = this._isGainsLocked();
-          if (!this.cfg.ashfallEnabled || !this.afHalt || (!ddActive && !glActive)) {
+          const ddActive = _origIsDD.call(this), glActive = this._isGainsLocked();
+          const isPlk    = this.afHalt?.kind === 'plk';
+          if (!this.cfg.ashfallEnabled || !this.afHalt || (!isPlk && !ddActive && !glActive)) {
             this.afHalt = null; this._afStopSampler(); this.persist(); return;
           }
           const reading = await this._afFetchStructure();
@@ -289,11 +329,17 @@
           const elapsed = Date.now() - this.afHalt.at;
           if (elapsed >= MIN_HALT_MS && mass >= MIN_MASS && score !== null && score >= (this.cfg.ashfallThawScore ?? 0)) {
             const kind = this.afHalt.kind;
-            if (kind === 'drawdown') { this._drawdownHaltUntil = 0; this._drawdownWindow = []; }
-            else                     { this._gainsLockHaltUntil = 0; this._gainsWindow = []; }
+            if      (kind === 'drawdown')  { this._drawdownHaltUntil = 0; this._drawdownWindow = []; }
+            else if (kind === 'gainslock') { this._gainsLockHaltUntil = 0; this._gainsWindow = []; }
+            // 'plk' has no host timer to clear — dropping afHalt lifts it
             this.afHalt = null;
             this._afStopSampler();
             this.log(`[ASH] 🍂 Ash settled — structure cleared the ${kind} zone after ${(elapsed / 3600000).toFixed(1)}h (score ${score.toFixed(2)} ≥ ${(this.cfg.ashfallThawScore ?? 0).toFixed(2)}, mass ${mass.toFixed(1)}) — new entries re-enabled`, 'success');
+          } else if (isPlk && elapsed >= (this.cfg.ashfallCapHours ?? 24) * 3600 * 1000) {
+            // PLK hard cap — the host timers cap the other kinds; PLK caps itself here
+            this.afHalt = null;
+            this._afStopSampler();
+            this.log(`[ASH] 🛑 PLK hard cap reached after ${(elapsed / 3600000).toFixed(1)}h — preemptive lock lifted for re-test`, 'warn');
           } else {
             const _d = this._afDescribe(reading, score, mass);
             this.log(`[ASH] ♨ Halt check (${(elapsed / 3600000).toFixed(1)}h elapsed) — market is ${_d.desc} | ${_d.bias} — holding`, 'info');
@@ -319,6 +365,19 @@
             const { score, mass } = this.afStatus;
             const _d = this._afDescribe(r, score, mass);
             this.log(`[ASH] ♨ Routine market structure check — market is ${_d.desc} | ${_d.bias}`, 'info');
+            // PLK — proactive rather than reactive: when the current structure is
+            // historically bad with sufficient evidence, lock entries preemptively
+            // before PnL damage, instead of waiting for a drawdown halt to fire.
+            // Lifts like the other halts: early when structure clears the thaw
+            // score, or at the hard cap.
+            if ((this.cfg.ashfallPlkEnabled ?? true) && !this.afHalt
+                && !_origIsDD.call(this) && !_origIsGL.call(this)
+                && mass >= MIN_MASS && score !== null
+                && score <= (this.cfg.ashfallPlkScore ?? -0.15)) {
+              this.afHalt = { kind: 'plk', at: Date.now(), informed: true };
+              this.log(`[ASH] 🛑 PLK — structure is ${_d.desc} and historically bad for longs (score ${score.toFixed(2)} ≤ ${(this.cfg.ashfallPlkScore ?? -0.15).toFixed(2)}, mass ${mass.toFixed(1)}) — preemptive lock engaged; lifts when structure clears`, 'warn');
+              this._afEnsureSampler();
+            }
             this.persist();
           }).catch(() => {});
         },
@@ -339,10 +398,12 @@
         },
 
         recordDrawdownPnl(pnl) {
-          const prevActive = this._isDrawdownHalted();
+          // Compare the host's own gate — the wrapped one reads true under a PLK
+          const prevActive = _origIsDD.call(this);
           _origDD.call(this, pnl);
           if (!this.cfg.ashfallEnabled) return;
-          if (!prevActive && this._isDrawdownHalted()) {
+          if (!prevActive && _origIsDD.call(this)) {
+            // A real drawdown halt supersedes an active PLK (kind is overwritten)
             this._afOnHaltTriggered('drawdown').catch(() => {});
           }
         },

@@ -11,6 +11,14 @@
   against the profile — or holds past 12h (up to a hard cap) while it stays
   hostile. With a thin profile the plugin defers to the stock 12h timer.
 
+  PLK (preemptive lock, on by default): proactive rather than reactive — when
+  a routine structure check reads a climate that is historically bad (score at
+  or below the PLK trigger, with sufficient evidence), entries lock before any
+  PnL damage occurs. A PLK rides the drawdown gate so every entry choke point
+  respects it, and lifts like the other halts: early once structure clears the
+  thaw score, or at the hard cap. A real drawdown/gains-lock halt supersedes
+  an active PLK.
+
   The profile is direction-agnostic: it only learns what realized PnL says
   about this installation, so the same logic powers Ashfall on PseudoChaser.
 
@@ -37,7 +45,7 @@
   window.__BotPlugin = {
     id:        'permafrost-winter',
     name:      'Permafrost (Winter)',
-    version:   '1.1.0',
+    version:   '1.2.0',
     targetBot: 'pseudowinter',
     after:     ['everwinter'],
     before:    [],
@@ -83,6 +91,18 @@
                 <input type="range" min="12" max="48" step="1" x-model.number="cfg.permafrostCapHours" @change="persist()">
                 <div class="pfr-hint">Maximum informed-halt duration. Resumes regardless once reached — stale scars must be re-tested.</div>
               </div>
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.permafrostPlkEnabled=!(cfg.permafrostPlkEnabled??true);persist()}">
+                <div class="tog-t" :class="(cfg.permafrostPlkEnabled??true)?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Preemptive Lock (PLK)</div>
+                  <div class="pfr-hint">Proactive rather than reactive: when a routine structure check reads a climate that is historically bad (score at or below the trigger, with sufficient evidence), entries lock preemptively — before any PnL damage. Lifts like the other halts: early at the Thaw Score, or at the Hard Cap.</div>
+                </div>
+              </label>
+              <div class="g" x-show="cfg.permafrostPlkEnabled??true" style="margin-top:8px">
+                <div class="lbl">PLK Trigger Score <b x-text="(cfg.permafrostPlkScore??-0.15).toFixed(2)"></b></div>
+                <input type="range" min="-0.5" max="-0.05" step="0.05" x-model.number="cfg.permafrostPlkScore" @change="persist()">
+                <div class="pfr-hint">Profile score at or below which the preemptive lock engages. Closer to 0 = more cautious (locks earlier); more negative = only the worst climates trigger it.</div>
+              </div>
               <div class="pfr-stat" style="margin-top:10px;padding:8px 10px;background:rgba(96,210,255,.05);border:1px solid rgba(96,210,255,.15);border-radius:3px">
                 <div>PROFILE — <span x-text="(pfEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(pfEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(pfSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
                 <div x-show="pfStatus.at">READING — skew <span x-text="(pfStatus.skew??0).toFixed(2)"></span> | breadth <span x-text="(pfStatus.breadth??0).toFixed(2)"></span> | score <span x-text="pfStatus.score===null?'—':pfStatus.score.toFixed(2)"></span> | mass <span x-text="pfStatus.mass.toFixed(1)"></span></div>
@@ -105,6 +125,8 @@
       const _origClose = def.pseudoClosePosition;
       const _origDD    = def._checkDrawdownThrottle;
       const _origGL    = def._checkGainsLock;
+      const _origIsDD  = def._isDrawdownHalted;
+      const _origIsGL  = def._isGainsLocked;
 
       // Slow sampler handle lives outside the Alpine proxy (see Timer architecture)
       let _pfrTimer = null;
@@ -122,6 +144,8 @@
           if (this.cfg.permafrostEnabled   === undefined) this.cfg.permafrostEnabled   = false;
           if (this.cfg.permafrostThawScore === undefined) this.cfg.permafrostThawScore = 0;
           if (this.cfg.permafrostCapHours  === undefined) this.cfg.permafrostCapHours  = 24;
+          if (this.cfg.permafrostPlkEnabled === undefined) this.cfg.permafrostPlkEnabled = true;
+          if (this.cfg.permafrostPlkScore   === undefined) this.cfg.permafrostPlkScore   = -0.15;
           try {
             const raw = localStorage.getItem(PFR_KEY);
             if (raw) {
@@ -132,10 +156,25 @@
               if (s.halt && s.halt.at) this.pfHalt = s.halt;
             }
           } catch(e) {}
-          // Drop a stale governed-halt record if the underlying halt is gone (manual clear, expiry)
-          if (this.pfHalt && !this._isDrawdownHalted() && !this._isGainsLocked()) this.pfHalt = null;
+          // Drop a stale governed-halt record if the underlying halt is gone (manual clear, expiry).
+          // A PLK has no backing host timer — it expires on its own hard cap instead.
+          if (this.pfHalt?.kind === 'plk') {
+            if (Date.now() - this.pfHalt.at >= (this.cfg.permafrostCapHours ?? 24) * 3600 * 1000) this.pfHalt = null;
+          } else if (this.pfHalt && !_origIsDD.call(this) && !_origIsGL.call(this)) this.pfHalt = null;
           if (this.pfHalt) this._pfEnsureSampler();
-          this.log(`[PFR] Permafrost (Winter) v1.1.0 loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
+          this.log(`[PFR] Permafrost (Winter) v1.2.0 loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
+        },
+
+        // ── PLK (preemptive lock) — proactive halt on historically bad structure ──
+        _pfPlkActive() {
+          if (!this.cfg.permafrostEnabled || !(this.cfg.permafrostPlkEnabled ?? true)) return false;
+          return this.pfHalt?.kind === 'plk';
+        },
+
+        // PLK rides the drawdown gate: every entry choke point (host scans and
+        // plugins) that respects the drawdown halt respects a preemptive lock too.
+        _isDrawdownHalted() {
+          return _origIsDD.call(this) || this._pfPlkActive();
         },
 
         persist() {
@@ -277,8 +316,9 @@
         },
 
         async _pfSamplerTick() {
-          const ddActive = this._isDrawdownHalted(), glActive = this._isGainsLocked();
-          if (!this.cfg.permafrostEnabled || !this.pfHalt || (!ddActive && !glActive)) {
+          const ddActive = _origIsDD.call(this), glActive = this._isGainsLocked();
+          const isPlk    = this.pfHalt?.kind === 'plk';
+          if (!this.cfg.permafrostEnabled || !this.pfHalt || (!isPlk && !ddActive && !glActive)) {
             this.pfHalt = null; this._pfStopSampler(); this.persist(); return;
           }
           const reading = await this._pfFetchStructure();
@@ -288,11 +328,17 @@
           const elapsed = Date.now() - this.pfHalt.at;
           if (elapsed >= MIN_HALT_MS && mass >= MIN_MASS && score !== null && score >= (this.cfg.permafrostThawScore ?? 0)) {
             const kind = this.pfHalt.kind;
-            if (kind === 'drawdown') { this._drawdownHaltUntil = null; this._drawdownWindow = []; }
-            else                     { this._gainsLockHaltUntil = null; this._gainsWindow = []; }
+            if      (kind === 'drawdown')  { this._drawdownHaltUntil = null; this._drawdownWindow = []; }
+            else if (kind === 'gainslock') { this._gainsLockHaltUntil = null; this._gainsWindow = []; }
+            // 'plk' has no host timer to clear — dropping pfHalt lifts it
             this.pfHalt = null;
             this._pfStopSampler();
             this.log(`[PFR] 🌊 Thaw — structure cleared the ${kind} zone after ${(elapsed / 3600000).toFixed(1)}h (score ${score.toFixed(2)} ≥ ${(this.cfg.permafrostThawScore ?? 0).toFixed(2)}, mass ${mass.toFixed(1)}) — new entries re-enabled`, 'success');
+          } else if (isPlk && elapsed >= (this.cfg.permafrostCapHours ?? 24) * 3600 * 1000) {
+            // PLK hard cap — the host timers cap the other kinds; PLK caps itself here
+            this.pfHalt = null;
+            this._pfStopSampler();
+            this.log(`[PFR] 🛑 PLK hard cap reached after ${(elapsed / 3600000).toFixed(1)}h — preemptive lock lifted for re-test`, 'warn');
           } else {
             const _d = this._pfDescribe(reading, score, mass);
             this.log(`[PFR] 🧊 Halt check (${(elapsed / 3600000).toFixed(1)}h elapsed) — market is ${_d.desc} | ${_d.bias} — holding`, 'info');
@@ -318,6 +364,19 @@
             const { score, mass } = this.pfStatus;
             const _d = this._pfDescribe(r, score, mass);
             this.log(`[PFR] 🧊 Routine market structure check — market is ${_d.desc} | ${_d.bias}`, 'info');
+            // PLK — proactive rather than reactive: when the current structure is
+            // historically bad with sufficient evidence, lock entries preemptively
+            // before PnL damage, instead of waiting for a drawdown halt to fire.
+            // Lifts like the other halts: early when structure clears the thaw
+            // score, or at the hard cap.
+            if ((this.cfg.permafrostPlkEnabled ?? true) && !this.pfHalt
+                && !_origIsDD.call(this) && !_origIsGL.call(this)
+                && mass >= MIN_MASS && score !== null
+                && score <= (this.cfg.permafrostPlkScore ?? -0.15)) {
+              this.pfHalt = { kind: 'plk', at: Date.now(), informed: true };
+              this.log(`[PFR] 🛑 PLK — structure is ${_d.desc} and historically bad for shorts (score ${score.toFixed(2)} ≤ ${(this.cfg.permafrostPlkScore ?? -0.15).toFixed(2)}, mass ${mass.toFixed(1)}) — preemptive lock engaged; thaws when structure clears`, 'warn');
+              this._pfEnsureSampler();
+            }
             this.persist();
           }).catch(() => {});
         },
@@ -338,10 +397,12 @@
         },
 
         _checkDrawdownThrottle() {
-          const prevActive = this._isDrawdownHalted();
+          // Compare the host's own gate — the wrapped one reads true under a PLK
+          const prevActive = _origIsDD.call(this);
           _origDD.call(this);
           if (!this.cfg.permafrostEnabled) return;
-          if (!prevActive && this._isDrawdownHalted()) {
+          if (!prevActive && _origIsDD.call(this)) {
+            // A real drawdown halt supersedes an active PLK (kind is overwritten)
             this._pfOnHaltTriggered('drawdown').catch(() => {});
           }
         },
