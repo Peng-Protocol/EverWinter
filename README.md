@@ -262,7 +262,9 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 
 ## Drifters Plugins
 
-`plugins/strategies/Drifters-Winter.html` (id `drifters-winter`, `after: ['everwinter']`) targets PseudoWinter; `plugins/strategies/Drifters-Chaser.html` (id `drifters-chaser`, `after: ['sunchaser']`) targets PseudoChaser. The `after` declaration makes each the outermost transform so it can gate entries ahead of the live-API open (see Plugin Stack Order). Strategy rationale lives in the Strategy Book; this section documents the implementation.
+> **Deprecated.** Functionally retired as a strategy — the files remain only as a reference implementation for building a strategy plugin (lock-in ledgers, open/close wraps, slot usage, plugin-owned persistence) and will be removed in time. Not documented in the Strategy Book.
+
+`plugins/strategies/Drifters-Winter.html` (id `drifters-winter`, `after: ['everwinter']`) targets PseudoWinter; `plugins/strategies/Drifters-Chaser.html` (id `drifters-chaser`, `after: ['sunchaser']`) targets PseudoChaser. The `after` declaration makes each the outermost transform so it can gate entries ahead of the live-API open (see Plugin Stack Order).
 
 ### Internals
 
@@ -324,7 +326,7 @@ Note: for the first weeks the plugin behaves almost exactly like the stock timer
 
 ## Blizzard / Firestorm Plugins
 
-`plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles.
+`plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles. Strategy rationale lives in the Strategy Book's **Scattershot** section; this section documents the implementation.
 
 A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 105% buffered → 70% functional / SL 18% by default) means one TP win covers ~3.9 SL exits; the edge is meant to come from broad market drift, so the strategy defers when the climate reads hostile.
 
