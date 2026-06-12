@@ -473,6 +473,12 @@ The config panel exposes the toggle, the **Profit Factor** slider (with the comp
 - **Drifters** — on init, tightens `cfg.gainsLockFactor` to 1.5 if it is ≥ 2, banking profits sooner during drift sessions.
 - **Permafrost / Ashfall** — replace the fixed 12-hour lock duration with the learned market-climate profile: a gains lock under their governance ends when the climate score crosses the thaw/settle threshold (hard-capped at `permafrostCapHours`/`ashfallCapHours`), and lifting clears the rolling window just like a manual clear. See the Permafrost / Ashfall section.
 
+### Gains sequestration (interaction with the Drawdown Throttle)
+
+The lock is not just a brake — it **re-arms the drawdown throttle's sensitivity** through the time axis of the rolling windows. Without it, a profitable run sits in `_drawdownWindow` as cushion: at +$1 of window PnL, the throttle (limit −0.5× entry margin) only trips after the bot gives back the full $1 *plus* $0.50 of fresh losses. With the lock, the halt stops new closes entirely; the profitable entries age out of both 6h windows during the freeze, and trading resumes with the drawdown count near zero — only $0.50 of fresh losses now trips the throttle. The gains are sequestered as realized PnL instead of being spent as throttle cushion. Even a 1h pause shifts the 6h window materially.
+
+**Caveat — early lifts**: the sequestration is only complete when the halt outlasts the 6h window TTL. The stock 12h timer always does. Permafrost/Ashfall can settle a gains-lock halt after as little as 1h (`MIN_HALT_MS`); the early lift clears `_gainsWindow` but **not** `_drawdownWindow`, so the winning closes that triggered the lock remain in the drawdown window for up to 5 more hours and act as cushion during that span — the bot can give back the locked gains plus 0.5× margin before throttling. Accepted behavior: the governor only settles early when the climate profile reads the structure as favorable, which is exactly when that cushion is least likely to be consumed.
+
 ---
 
 ## Activity Log
