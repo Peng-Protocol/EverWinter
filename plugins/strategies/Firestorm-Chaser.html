@@ -4,10 +4,16 @@
 
   Each scan cycle picks N random tickers whose |24h change| clears a
   configurable baseline and longs them with a fixed SL / far TP, force-closing
-  any survivor after 12 hours. The barrier geometry (TP 100% / SL 18% default)
-  means a single TP win covers ~5.5 SL losses; the edge comes from firing only
+  any survivor after 12 hours. The TP slider is the buffered (EV) value like the
+  general-settings TP UI — functional TP = slider ÷ Profit Offset buffer (default
+  105% buffered → 70% functional at +50%). The barrier geometry (functional TP
+  70% / SL 18% default) means a single TP win covers ~3.9 SL losses; the edge comes from firing only
   when the broad market drifts the bot's way. When Ashfall is loaded and its
   climate profile has sufficient evidence, a hostile reading defers the cycle.
+
+  Cascade (on by default): once collective uPnL across all open positions
+  reaches the TP target (slider% × base margin), every position is bailed for
+  net profit — feeding the gains lock and seeding Ashfall data.
 
   Entries are subject to the host's drawdown throttle and gains lock, and to
   Ashfall governance of those halts when it is loaded.
@@ -27,7 +33,7 @@
   window.__BotPlugin = {
     id:        'firestorm-chaser',
     name:      'Firestorm (Chaser)',
-    version:   '1.0.0',
+    version:   '1.4.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser', 'ashfall-chaser'],
     before:    [],
@@ -41,6 +47,7 @@
 
     slots: {
       'mode-label-extra': `<span x-show="cfg.firestormEnabled"> + Firestorm</span>`,
+      'pos-card-badges': `<span x-show="p._firestorm" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)">🔥 FIRE</span>`,
       'strategy-accordions': `
         <div x-data="{ open: false }">
           <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
@@ -63,7 +70,7 @@
               <div class="g">
                 <div class="lbl">Baseline 24h Δ <b x-text="(cfg.firestormBaselinePct??6).toFixed(1)+'%'"></b></div>
                 <input type="range" min="1" max="20" step="0.5" x-model.number="cfg.firestormBaselinePct" @change="persist()">
-                <div class="fst-hint">A ticker qualifies when its 24h change exceeds this in either direction.</div>
+                <div class="fst-hint">A ticker qualifies when its 24h change exceeds this in either direction; picks alternate between gainers and losers so each cycle spans both sides.</div>
               </div>
               <div class="g" style="margin-top:8px">
                 <div class="lbl">Picks / Cycle <b x-text="(cfg.firestormPicks??3)"></b></div>
@@ -75,10 +82,17 @@
                 <input type="range" min="5" max="50" step="1" x-model.number="cfg.firestormSlPct" @change="persist()">
               </div>
               <div class="g" style="margin-top:8px">
-                <div class="lbl">Take Profit <b x-text="(cfg.firestormTpPct??100)+'%'"></b></div>
+                <div class="lbl">Take Profit <b x-text="(cfg.firestormTpPct??105)+'% → '+((cfg.firestormTpPct??105)/(1+(Math.max(-99,cfg.laggardProfitOffset??50)/100))).toFixed(1)+'%'"></b></div>
                 <input type="range" min="20" max="300" step="5" x-model.number="cfg.firestormTpPct" @change="persist()">
-                <div class="fst-hint">Functional ROI. One win at <span x-text="(cfg.firestormTpPct??100)+'%'"></span> covers ~<span x-text="((cfg.firestormTpPct??100)/(cfg.firestormSlPct??18)).toFixed(1)"></span> stop-loss exits.</div>
+                <div class="fst-hint">Buffered (EV) target; a debt-free position closes at the functional TP = slider ÷ buffer (Profit Offset). One functional win covers ~<span x-text="(((cfg.firestormTpPct??105)/(1+(Math.max(-99,cfg.laggardProfitOffset??50)/100)))/(cfg.firestormSlPct??18)).toFixed(1)"></span> stop-loss exits.</div>
               </div>
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.firestormCascadeEnabled=!(cfg.firestormCascadeEnabled??true);persist()}">
+                <div class="tog-t" :class="(cfg.firestormCascadeEnabled??true)?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Cascade</div>
+                  <div class="fst-hint">When collective uPnL across all open positions reaches the TP target (slider% × base margin, $<span x-text="(((cfg.firestormTpPct??105)/100)*((cfg.minNotional||6)/(cfg.leverage||6))).toFixed(2)"></span> at current settings), bail everything for net profit. Feeds the gains lock and seeds Ashfall data.</div>
+                </div>
+              </label>
             </div>
           </div>
         </div>
@@ -101,9 +115,19 @@
           if (this.cfg.firestormEnabled     === undefined) this.cfg.firestormEnabled     = false;
           if (this.cfg.firestormBaselinePct === undefined) this.cfg.firestormBaselinePct = 6;
           if (this.cfg.firestormSlPct       === undefined) this.cfg.firestormSlPct       = 18;
-          if (this.cfg.firestormTpPct       === undefined) this.cfg.firestormTpPct       = 100;
           if (this.cfg.firestormPicks       === undefined) this.cfg.firestormPicks       = 3;
-          this.log(`[FST] Firestorm (Chaser) v1.0.0 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% | ${this.cfg.firestormPicks}/cycle`, 'info');
+          if (this.cfg.firestormCascadeEnabled === undefined) this.cfg.firestormCascadeEnabled = true;
+          // v1.1: TP slider is now the buffered (EV) value like the general-settings TP UI.
+          // One-time migration resets pre-buffer (functional) values to the new default.
+          if (this.cfg.firestormTpBuffered !== true) {
+            this.cfg.firestormTpBuffered = true;
+            this.cfg.firestormTpPct = 105;
+            if (typeof this.persist === 'function') this.persist();
+          }
+          // Backfill the role-badge override on positions opened before v1.2.1
+          for (const p of this.positions || []) if (p._firestorm) p._roleBadgeOverride = true;
+          const _fstFuncTp = (this.cfg.firestormTpPct ?? 105) / this._buffMul();
+          this.log(`[FST] Firestorm (Chaser) v1.4.0 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% buffered (${_fstFuncTp.toFixed(1)}% functional) | ${this.cfg.firestormPicks}/cycle | cascade ${(this.cfg.firestormCascadeEnabled ?? true) ? 'on' : 'off'}`, 'info');
         },
 
         // Ashfall climate reading, when present and evidenced. null = no opinion.
@@ -134,8 +158,11 @@
           }
           this._fstDeferLogged = false;
 
-          let opened = 0, poolSize = 0;
-          const picks = Math.max(1, Math.round(this.cfg.firestormPicks ?? 3));
+          let opened = 0, poolSize = 0, poolG = 0, poolL = 0;
+          // Picks are capped at remaining position headroom — at 9/10 only one more opens.
+          const headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
+          const picks = Math.min(Math.max(1, Math.round(this.cfg.firestormPicks ?? 3)), headroom);
+          if (picks < 1) return;
           try {
             // Reuse the host scan's bulk ticker response when fresh
             let allTickers;
@@ -161,24 +188,36 @@
               && !(this._isSymbolBanned?.(t.symbol)));
             poolSize = pool.length;
 
+            // Draw alternately from gainers (≥ +baseline) and losers (≤ −baseline) so a
+            // cycle's picks span both sides of the move, not just whichever dominates.
+            const gainers = pool.filter(t => parseFloat(t.price24hPcnt || 0) > 0);
+            const losers  = pool.filter(t => parseFloat(t.price24hPcnt || 0) < 0);
+            poolG = gainers.length; poolL = losers.length;
             let tried = 0;
-            while (pool.length && opened < picks && tried < picks * 3
-                   && (this.positions?.length ?? 0) < (this.cfg.maxPos ?? 5)) {
-              const t = pool.splice(Math.floor(Math.random() * pool.length), 1)[0];
-              tried++;
-              if (await this._fstOpen(t)) opened++;
-            }
+            let side  = Math.random() < 0.5 ? 0 : 1;
+            this._logBatchBegin?.();
+            try {
+              while ((gainers.length || losers.length) && opened < picks && tried < picks * 3
+                     && (this.positions?.length ?? 0) < (this.cfg.maxPos ?? 5)) {
+                let src = side === 0 ? gainers : losers;
+                if (!src.length) src = side === 0 ? losers : gainers;
+                const t = src.splice(Math.floor(Math.random() * src.length), 1)[0];
+                side = 1 - side;
+                tried++;
+                if (await this._fstOpen(t)) opened++;
+              }
+            } finally { this._logBatchEnd?.('[FST] 🔥 Entry roll-up'); }
           } catch(e) {
             this.log('[FST] Scan error: ' + e.message, 'warn');
             return;
           }
-          this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% — ${opened}/${picks} opened${climate !== null ? ` | climate ${climate.toFixed(2)}` : ''}`, 'info');
+          this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥±${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% (${poolG}▲/${poolL}▼) — ${opened}/${picks} opened${climate !== null ? ` | climate ${climate.toFixed(2)}` : ''}`, 'info');
         },
 
         // Open one scatter long. The host (sim and live) reads binary TP/SL from cfg
         // at open time, so the firestorm values are swapped in around the call. The TP
-        // slider is a functional ROI target — the host divides the configured value by
-        // the EDa buffer (_buffMul), so it is pre-multiplied to land where configured.
+        // slider is the buffered (EV) value — passed straight through as binaryTpPct;
+        // the host derives the functional TP as slider ÷ _buffMul.
         async _fstOpen(t) {
           const sym   = t.symbol;
           const price = parseFloat(t.lastPrice || 0);
@@ -200,7 +239,7 @@
             sl: this.cfg.binarySlPct,
           };
           this.cfg.binaryModeEnabled = true;
-          this.cfg.binaryTpPct = (this.cfg.firestormTpPct ?? 100) * this._buffMul();
+          this.cfg.binaryTpPct = this.cfg.firestormTpPct ?? 105;
           this.cfg.binarySlPct = this.cfg.firestormSlPct ?? 18;
 
           const lenBefore = (this.positions || []).length;
@@ -217,8 +256,9 @@
 
           if ((this.positions || []).length > lenBefore) {
             const pos = this.positions[this.positions.length - 1];
-            pos._firestorm     = true;
-            pos._slPctOverride = this.cfg.firestormSlPct ?? 18; // keeps the watcher's SL drift-correction on our value
+            pos._firestorm         = true;
+            pos._slPctOverride     = this.cfg.firestormSlPct ?? 18; // keeps the watcher's SL drift-correction on our value
+            pos._roleBadgeOverride = true; // suppress the host's gainer/loser role badge — the FIRE badge takes its place
             if (typeof this.persist === 'function') this.persist();
             return true;
           }
@@ -231,28 +271,53 @@
         // sim/live TP-buffer asymmetry. Manages existing positions even when disabled.
         async pseudoWatchPositions() {
           await _origWatch.call(this);
-          const now = Date.now();
-          const tp  = this.cfg.firestormTpPct ?? 100;
-          const sl  = this.cfg.firestormSlPct ?? 18;
-          for (const pos of [...(this.positions || [])]) {
-            if (!pos._firestorm) continue;
-            if (!this.positions.find(x => x.id === pos.id)) continue; // closed earlier this pass
-            const roi = pos.margin > 0 ? ((pos.upnl || 0) / pos.margin) * 100 : 0;
-            if (roi >= tp) {
-              this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: TP — ROI ${roi.toFixed(1)}% ≥ ${tp}%`, 'success');
-              await this.pseudoClosePosition(pos, 'tp', pos.markPrice);
-              continue;
-            }
-            if (roi <= -sl) {
-              this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: SL — ROI ${roi.toFixed(1)}% ≤ −${sl}%`, 'warn');
-              await this.pseudoClosePosition(pos, 'sl', pos.markPrice);
-              continue;
-            }
-            if (now - (pos.openedAt || now) >= HOLD_MS) {
-              this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: 12h up — force close @ ROI ${roi.toFixed(1)}%`, 'info');
-              await this.pseudoClosePosition(pos, 'firestorm-12h', pos.markPrice);
+          // Cascade — bail the whole book for net profit once collective uPnL clears the
+          // TP target (slider% × base margin). Feeds the gains lock and seeds Ashfall data.
+          if (this.cfg.firestormEnabled && (this.cfg.firestormCascadeEnabled ?? true)
+              && !this._fstCascading && (this.positions?.length ?? 0) > 0) {
+            const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+            const target     = ((this.cfg.firestormTpPct ?? 105) / 100) * baseMargin;
+            const collective = this.positions.reduce((s, p) => s + (p.upnl || 0), 0);
+            if (collective >= target) {
+              this._fstCascading = true;
+              try {
+                this.log(`[FST] 🔥 Cascade — collective uPnL $${collective.toFixed(2)} ≥ target $${target.toFixed(2)} (${this.cfg.firestormTpPct ?? 105}% of $${baseMargin.toFixed(2)} base margin) — bailing ${this.positions.length} position(s) for net profit`, 'success');
+                this._logBatchBegin?.();
+                try {
+                  for (const pos of [...this.positions]) {
+                    await this.pseudoClosePosition(pos, 'cascade', pos.markPrice);
+                  }
+                } finally { this._logBatchEnd?.('[FST] 🔥 Cascade roll-up'); }
+              } finally { this._fstCascading = false; }
+              return;
             }
           }
+          const now = Date.now();
+          // Slider is buffered; the watcher enforces the functional ROI (slider ÷ buffer).
+          const tp  = (this.cfg.firestormTpPct ?? 105) / this._buffMul();
+          const sl  = this.cfg.firestormSlPct ?? 18;
+          this._logBatchBegin?.();
+          try {
+            for (const pos of [...(this.positions || [])]) {
+              if (!pos._firestorm) continue;
+              if (!this.positions.find(x => x.id === pos.id)) continue; // closed earlier this pass
+              const roi = pos.margin > 0 ? ((pos.upnl || 0) / pos.margin) * 100 : 0;
+              if (roi >= tp) {
+                this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: TP — ROI ${roi.toFixed(1)}% ≥ ${tp.toFixed(1)}% (functional)`, 'success');
+                await this.pseudoClosePosition(pos, 'tp', pos.markPrice);
+                continue;
+              }
+              if (roi <= -sl) {
+                this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: SL — ROI ${roi.toFixed(1)}% ≤ −${sl}%`, 'warn');
+                await this.pseudoClosePosition(pos, 'sl', pos.markPrice);
+                continue;
+              }
+              if (now - (pos.openedAt || now) >= HOLD_MS) {
+                this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: 12h up — force close @ ROI ${roi.toFixed(1)}%`, 'info');
+                await this.pseudoClosePosition(pos, 'firestorm-12h', pos.markPrice);
+              }
+            }
+          } finally { this._logBatchEnd?.('[FST] 🔥 Exit roll-up'); }
         },
 
         async pseudoClosePosition(pos, reason, fillPrice) {

@@ -184,7 +184,11 @@ Two styles are supported, and a plugin may mix them per method:
 
 ### CSS and HTML Slots
 
-Plugin `css` strings are injected into `<head>` synchronously during the IIFE. Plugin `slots` objects are keyed by slot name (e.g. `"config-bottom"`, `"account-bar-extra"`); the IIFE finds matching `data-plugin-slot` anchor divs and sets their `innerHTML` before Alpine starts.
+Plugin `css` strings are injected into `<head>` synchronously during the IIFE. Plugin `slots` objects are keyed by slot name (e.g. `"config-bottom"`, `"account-bar-extra"`); the IIFE appends the HTML to matching `data-plugin-slot` anchors before Alpine starts. The injector also recurses into `<template>` fragments, so anchors inside Alpine `x-for` templates work — e.g. `"pos-card-badges"` sits inside the position-card template and injected markup can bind to the loop variable (`x-show="p._myFlag"`). A position-card badge plugin can also stamp `pos._roleBadgeOverride = true` to suppress the host's stock gainer/loser role badge in favor of its own.
+
+### Log Roll-ups
+
+Bulk operations batch their activity-log chatter into one entry via host helpers `_logBatchBegin()` / `_logBatchEnd(label)`. While a batch is open, every `log()` call **except errors** buffers instead of printing; the outermost `_logBatchEnd` flushes the buffer as a single multi-line entry (`label — N events` followed by one `·`-prefixed line per event). Errors always print individually and immediately; a batch that collected a single message passes it through unchanged, and the rolled entry takes the worst severity collected (warn > success > info). Wrapped paths: host scan entry bursts, Bail All, and the Blizzard/Firestorm entry, exit, and cascade loops (the plugins call the helpers with optional chaining, so they degrade gracefully on an older host).
 
 ### Loading a Plugin File
 
@@ -258,7 +262,9 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 
 ## Drifters Plugins
 
-`plugins/strategies/Drifters-Winter.html` (id `drifters-winter`, `after: ['everwinter']`) targets PseudoWinter; `plugins/strategies/Drifters-Chaser.html` (id `drifters-chaser`, `after: ['sunchaser']`) targets PseudoChaser. The `after` declaration makes each the outermost transform so it can gate entries ahead of the live-API open (see Plugin Stack Order). Strategy rationale lives in the Strategy Book; this section documents the implementation.
+> **Deprecated.** Functionally retired as a strategy — the files remain only as a reference implementation for building a strategy plugin (lock-in ledgers, open/close wraps, slot usage, plugin-owned persistence) and will be removed in time. Not documented in the Strategy Book.
+
+`plugins/strategies/Drifters-Winter.html` (id `drifters-winter`, `after: ['everwinter']`) targets PseudoWinter; `plugins/strategies/Drifters-Chaser.html` (id `drifters-chaser`, `after: ['sunchaser']`) targets PseudoChaser. The `after` declaration makes each the outermost transform so it can gate entries ahead of the live-API open (see Plugin Stack Order).
 
 ### Internals
 
@@ -320,13 +326,13 @@ Note: for the first weeks the plugin behaves almost exactly like the stock timer
 
 ## Blizzard / Firestorm Plugins
 
-`plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles.
+`plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles. Strategy rationale lives in the Strategy Book's **Scattershot** section; this section documents the implementation.
 
-A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 100% / SL 18% by default) means one TP win covers ~5.5 SL exits; the edge is meant to come from broad market drift, so the strategy defers when the climate reads hostile.
+A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 105% buffered → 70% functional / SL 18% by default) means one TP win covers ~3.9 SL exits; the edge is meant to come from broad market drift, so the strategy defers when the climate reads hostile.
 
 ### Entry pass (`_blzRunScan` / `_fstRunScan`)
 
-Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn uniformly at random without replacement (failed opens retried up to 3× picks). Each cycle logs pool size and opens.
+Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn at random without replacement, **alternating between gainers and losers** so each cycle's picks span both sides of the move (falling back to the remaining side when one empties; failed opens retried up to 3× picks). Each cycle logs pool size with its ▲/▼ split and opens.
 
 ### Climate gate (Permafrost / Ashfall coupling)
 
@@ -334,13 +340,17 @@ When the matching halt governor is loaded, the strategy reads its live structure
 
 ### Open mechanics (cfg-swap)
 
-Both the sim hosts and the live plugins read binary-mode TP/SL from `cfg` at open time, so `_blzOpen`/`_fstOpen` swaps `binaryModeEnabled: true`, `binaryTpPct`, and `binarySlPct` in around the `pseudoOpenShort` call and restores them in `finally` (re-persisting the restored cfg). Entries are therefore always binary-style: TP and SL stamped at entry, no DCA ladder. The TP slider (`blizzardTpPct`/`firestormTpPct`, default 100, range 20–300) is a **functional ROI** target — the sim hosts divide the configured value by the EDa buffer (`_buffMul`), so the swap pre-multiplies by it. Main lock-in bumps are suppressed during the call (Drifters precedent — scatter entries are not signal trades); RSIs are fetched for the position record. New positions are stamped `_blizzard`/`_firestorm` plus `_slPctOverride`.
+Both the sim hosts and the live plugins read binary-mode TP/SL from `cfg` at open time, so `_blzOpen`/`_fstOpen` swaps `binaryModeEnabled: true`, `binaryTpPct`, and `binarySlPct` in around the `pseudoOpenShort` call and restores them in `finally` (re-persisting the restored cfg). Entries are therefore always binary-style: TP and SL stamped at entry, no DCA ladder. The TP slider (`blizzardTpPct`/`firestormTpPct`, default 105, range 20–300) is the **buffered (EV)** value, same convention as the general-settings TP UI — it is passed straight through as `binaryTpPct` and the host derives the functional TP as slider ÷ `_buffMul` (105% → 70% at +50% offset; a one-time v1.1 migration resets stored pre-buffer values to the new default). Main lock-in bumps are suppressed during the call (Drifters precedent — scatter entries are not signal trades); RSIs are fetched for the position record. New positions are stamped `_blizzard`/`_firestorm` plus `_slPctOverride`.
+
+### Cascade
+
+`blizzardCascadeEnabled`/`firestormCascadeEnabled` (default **on**, toggle in the accordion): each watcher pass, before the per-position checks, the plugin sums uPnL across **all** open positions (scatter and stock alike). When the collective total reaches the TP target — `TpPct% × base margin` (`minNotional ÷ leverage`), $1.05 at default settings — every open position is bailed at mark price with reason `'cascade'` for a net profit. The realized PnL feeds the host's gains-lock window (readily triggering it) and, when Permafrost/Ashfall is loaded, seeds its climate profile with favorable samples. Active only while the scatter mode itself is enabled; an in-flight guard prevents re-entry while a cascade is closing.
 
 `_slPctOverride` is a small host accommodation added for this plugin but usable by any: the watcher's binary **SL drift-correction** (which re-targets `slPrice` from the global `cfg.binarySlPct` each tick) and the position-card SL display honor a per-position override when present, so a plugin-set SL survives instead of being corrected back to the global slider.
 
 ### Exits
 
-The plugin's `pseudoWatchPositions` wrap is the authoritative exit for stamped positions (it manages them even if the mode is toggled off mid-flight): per tick it computes ROI as `upnl / margin` and closes at `roi ≥ TP%` (`'tp'`), `roi ≤ −SL%` (`'sl'`), or age ≥ 12h (`'blizzard-12h'`/`'firestorm-12h'`), always at mark price. The host enforces the same TP/SL independently (exchange-native in live mode — note the live TP order sits at `TP × buffMul` since the live open does not divide by the buffer; the wrap closes at the configured functional level first). Closed records carry the stamp and the trade feed badges them `BLZ` (ice) / `FST` (ember).
+The plugin's `pseudoWatchPositions` wrap is the authoritative exit for stamped positions (it manages them even if the mode is toggled off mid-flight): per tick it computes ROI as `upnl / margin` and closes at `roi ≥ TP% ÷ buffMul` (`'tp'`, the functional level), `roi ≤ −SL%` (`'sl'`), or age ≥ 12h (`'blizzard-12h'`/`'firestorm-12h'`), always at mark price. The host enforces the same TP/SL independently (exchange-native in live mode — note the live TP order sits at the buffered slider value since the live open does not divide by the buffer; the wrap closes at the functional level first). Closed records carry the stamp and the trade feed badges them `BLZ` (ice) / `FST` (ember).
 
 ### Interactions
 
@@ -462,6 +472,12 @@ The config panel exposes the toggle, the **Profit Factor** slider (with the comp
 
 - **Drifters** — on init, tightens `cfg.gainsLockFactor` to 1.5 if it is ≥ 2, banking profits sooner during drift sessions.
 - **Permafrost / Ashfall** — replace the fixed 12-hour lock duration with the learned market-climate profile: a gains lock under their governance ends when the climate score crosses the thaw/settle threshold (hard-capped at `permafrostCapHours`/`ashfallCapHours`), and lifting clears the rolling window just like a manual clear. See the Permafrost / Ashfall section.
+
+### Gains sequestration (interaction with the Drawdown Throttle)
+
+The lock is not just a brake — it **re-arms the drawdown throttle's sensitivity** through the time axis of the rolling windows. Without it, a profitable run sits in `_drawdownWindow` as cushion: at +$1 of window PnL, the throttle (limit −0.5× entry margin) only trips after the bot gives back the full $1 *plus* $0.50 of fresh losses. With the lock, the halt stops new closes entirely; the profitable entries age out of both 6h windows during the freeze, and trading resumes with the drawdown count near zero — only $0.50 of fresh losses now trips the throttle. The gains are sequestered as realized PnL instead of being spent as throttle cushion. Even a 1h pause shifts the 6h window materially.
+
+**Caveat — early lifts**: the sequestration is only complete when the halt outlasts the 6h window TTL. The stock 12h timer always does. Permafrost/Ashfall can settle a gains-lock halt after as little as 1h (`MIN_HALT_MS`); the early lift clears `_gainsWindow` but **not** `_drawdownWindow`, so the winning closes that triggered the lock remain in the drawdown window for up to 5 more hours and act as cushion during that span — the bot can give back the locked gains plus 0.5× margin before throttling. Accepted behavior: the governor only settles early when the climate profile reads the structure as favorable, which is exactly when that cushion is least likely to be consumed.
 
 ---
 

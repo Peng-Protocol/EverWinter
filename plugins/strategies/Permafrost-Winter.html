@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'permafrost-winter',
     name:      'Permafrost (Winter)',
-    version:   '1.0.1',
+    version:   '1.1.0',
     targetBot: 'pseudowinter',
     after:     ['everwinter'],
     before:    [],
@@ -133,7 +133,7 @@
           // Drop a stale governed-halt record if the underlying halt is gone (manual clear, expiry)
           if (this.pfHalt && !this._isDrawdownHalted() && !this._isGainsLocked()) this.pfHalt = null;
           if (this.pfHalt) this._pfEnsureSampler();
-          this.log(`[PFR] Permafrost (Winter) v1.0.1 loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
+          this.log(`[PFR] Permafrost (Winter) v1.1.0 loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
         },
 
         persist() {
@@ -176,6 +176,20 @@
               gSum: +gSum.toFixed(1), lSum: +lSum.toFixed(1),
             };
           } catch(e) { return null; }
+        },
+
+        // ── Human-readable structure + historical-bias phrasing for the activity log ──
+        _pfDescribe(reading, score, mass) {
+          const lean   = (reading.skew + reading.breadth) / 2;
+          const adverb = Math.abs(lean) > 0.4 ? 'strongly ' : '';
+          const struct = lean > 0.08 ? `${adverb}bullish` : lean < -0.08 ? `${adverb}bearish` : 'mixed/flat';
+          const desc   = `${struct} (skew ${reading.skew.toFixed(2)}, breadth ${reading.breadth.toFixed(2)}, ${reading.gCount}▲/${reading.lCount}▼)`;
+          let bias;
+          if (score === null || mass < MIN_MASS) bias = `no historical bias noted (evidence mass ${mass.toFixed(1)} < ${MIN_MASS})`;
+          else if (score >= 0.15)  bias = `this is historically good for shorts (score +${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
+          else if (score <= -0.15) bias = `this is historically bad for shorts (score ${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
+          else                     bias = `historically neutral for shorts (score ${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
+          return { desc, bias };
         },
 
         // ── Hostility score: kernel-weighted, recency-decayed vote of past events
@@ -233,7 +247,8 @@
             else                     this._gainsLockHaltUntil = capUntil;
           }
           this.pfHalt = { kind, at: reading.ts, informed };
-          this.log(`[PFR] 🧊 Climate recorded at ${kind} — skew ${reading.skew.toFixed(2)}, breadth ${reading.breadth.toFixed(2)} (${reading.gCount}▲/${reading.lCount}▼) | score ${score === null ? '—' : score.toFixed(2)}, mass ${mass.toFixed(1)} → ${informed ? 'profile-governed halt, thaws when structure clears' : 'profile too thin — stock 12h timer'}`, 'info');
+          const _d = this._pfDescribe(reading, score, mass);
+          this.log(`[PFR] 🧊 ${kind === 'drawdown' ? 'Drawdown' : 'Gains lock'} activated — market structure is ${_d.desc} | ${_d.bias} → ${informed ? 'profile-governed halt, thaws when structure clears' : 'profile too thin — stock 12h timer'}`, 'warn');
           this._pfEnsureSampler();
           this.persist();
         },
@@ -265,6 +280,9 @@
             this.pfHalt = null;
             this._pfStopSampler();
             this.log(`[PFR] 🌊 Thaw — structure cleared the ${kind} zone after ${(elapsed / 3600000).toFixed(1)}h (score ${score.toFixed(2)} ≥ ${(this.cfg.permafrostThawScore ?? 0).toFixed(2)}, mass ${mass.toFixed(1)}) — new entries re-enabled`, 'success');
+          } else {
+            const _d = this._pfDescribe(reading, score, mass);
+            this.log(`[PFR] 🧊 Halt check (${(elapsed / 3600000).toFixed(1)}h elapsed) — market is ${_d.desc} | ${_d.bias} — holding`, 'info');
           }
           this.persist();
         },
@@ -281,7 +299,14 @@
         async runScan() {
           await _origScan.call(this);
           if (!this.cfg.permafrostEnabled) return;
-          this._pfFetchStructure().then(r => { if (r) { this._pfAddSample(r); this.persist(); } }).catch(() => {});
+          this._pfFetchStructure().then(r => {
+            if (!r) return;
+            this._pfAddSample(r);
+            const { score, mass } = this.pfStatus;
+            const _d = this._pfDescribe(r, score, mass);
+            this.log(`[PFR] 🧊 Routine market structure check — market is ${_d.desc} | ${_d.bias}`, 'info');
+            this.persist();
+          }).catch(() => {});
         },
 
         async pseudoClosePosition(pos, reason, fillPrice) {
