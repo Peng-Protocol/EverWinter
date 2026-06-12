@@ -33,7 +33,7 @@
   window.__BotPlugin = {
     id:        'firestorm-chaser',
     name:      'Firestorm (Chaser)',
-    version:   '1.3.1',
+    version:   '1.4.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser', 'ashfall-chaser'],
     before:    [],
@@ -127,7 +127,7 @@
           // Backfill the role-badge override on positions opened before v1.2.1
           for (const p of this.positions || []) if (p._firestorm) p._roleBadgeOverride = true;
           const _fstFuncTp = (this.cfg.firestormTpPct ?? 105) / this._buffMul();
-          this.log(`[FST] Firestorm (Chaser) v1.3.1 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% buffered (${_fstFuncTp.toFixed(1)}% functional) | ${this.cfg.firestormPicks}/cycle | cascade ${(this.cfg.firestormCascadeEnabled ?? true) ? 'on' : 'off'}`, 'info');
+          this.log(`[FST] Firestorm (Chaser) v1.4.0 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% buffered (${_fstFuncTp.toFixed(1)}% functional) | ${this.cfg.firestormPicks}/cycle | cascade ${(this.cfg.firestormCascadeEnabled ?? true) ? 'on' : 'off'}`, 'info');
         },
 
         // Ashfall climate reading, when present and evidenced. null = no opinion.
@@ -195,15 +195,18 @@
             poolG = gainers.length; poolL = losers.length;
             let tried = 0;
             let side  = Math.random() < 0.5 ? 0 : 1;
-            while ((gainers.length || losers.length) && opened < picks && tried < picks * 3
-                   && (this.positions?.length ?? 0) < (this.cfg.maxPos ?? 5)) {
-              let src = side === 0 ? gainers : losers;
-              if (!src.length) src = side === 0 ? losers : gainers;
-              const t = src.splice(Math.floor(Math.random() * src.length), 1)[0];
-              side = 1 - side;
-              tried++;
-              if (await this._fstOpen(t)) opened++;
-            }
+            this._logBatchBegin?.();
+            try {
+              while ((gainers.length || losers.length) && opened < picks && tried < picks * 3
+                     && (this.positions?.length ?? 0) < (this.cfg.maxPos ?? 5)) {
+                let src = side === 0 ? gainers : losers;
+                if (!src.length) src = side === 0 ? losers : gainers;
+                const t = src.splice(Math.floor(Math.random() * src.length), 1)[0];
+                side = 1 - side;
+                tried++;
+                if (await this._fstOpen(t)) opened++;
+              }
+            } finally { this._logBatchEnd?.('[FST] 🔥 Entry roll-up'); }
           } catch(e) {
             this.log('[FST] Scan error: ' + e.message, 'warn');
             return;
@@ -279,9 +282,12 @@
               this._fstCascading = true;
               try {
                 this.log(`[FST] 🔥 Cascade — collective uPnL $${collective.toFixed(2)} ≥ target $${target.toFixed(2)} (${this.cfg.firestormTpPct ?? 105}% of $${baseMargin.toFixed(2)} base margin) — bailing ${this.positions.length} position(s) for net profit`, 'success');
-                for (const pos of [...this.positions]) {
-                  await this.pseudoClosePosition(pos, 'cascade', pos.markPrice);
-                }
+                this._logBatchBegin?.();
+                try {
+                  for (const pos of [...this.positions]) {
+                    await this.pseudoClosePosition(pos, 'cascade', pos.markPrice);
+                  }
+                } finally { this._logBatchEnd?.('[FST] 🔥 Cascade roll-up'); }
               } finally { this._fstCascading = false; }
               return;
             }
@@ -290,25 +296,28 @@
           // Slider is buffered; the watcher enforces the functional ROI (slider ÷ buffer).
           const tp  = (this.cfg.firestormTpPct ?? 105) / this._buffMul();
           const sl  = this.cfg.firestormSlPct ?? 18;
-          for (const pos of [...(this.positions || [])]) {
-            if (!pos._firestorm) continue;
-            if (!this.positions.find(x => x.id === pos.id)) continue; // closed earlier this pass
-            const roi = pos.margin > 0 ? ((pos.upnl || 0) / pos.margin) * 100 : 0;
-            if (roi >= tp) {
-              this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: TP — ROI ${roi.toFixed(1)}% ≥ ${tp.toFixed(1)}% (functional)`, 'success');
-              await this.pseudoClosePosition(pos, 'tp', pos.markPrice);
-              continue;
+          this._logBatchBegin?.();
+          try {
+            for (const pos of [...(this.positions || [])]) {
+              if (!pos._firestorm) continue;
+              if (!this.positions.find(x => x.id === pos.id)) continue; // closed earlier this pass
+              const roi = pos.margin > 0 ? ((pos.upnl || 0) / pos.margin) * 100 : 0;
+              if (roi >= tp) {
+                this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: TP — ROI ${roi.toFixed(1)}% ≥ ${tp.toFixed(1)}% (functional)`, 'success');
+                await this.pseudoClosePosition(pos, 'tp', pos.markPrice);
+                continue;
+              }
+              if (roi <= -sl) {
+                this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: SL — ROI ${roi.toFixed(1)}% ≤ −${sl}%`, 'warn');
+                await this.pseudoClosePosition(pos, 'sl', pos.markPrice);
+                continue;
+              }
+              if (now - (pos.openedAt || now) >= HOLD_MS) {
+                this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: 12h up — force close @ ROI ${roi.toFixed(1)}%`, 'info');
+                await this.pseudoClosePosition(pos, 'firestorm-12h', pos.markPrice);
+              }
             }
-            if (roi <= -sl) {
-              this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: SL — ROI ${roi.toFixed(1)}% ≤ −${sl}%`, 'warn');
-              await this.pseudoClosePosition(pos, 'sl', pos.markPrice);
-              continue;
-            }
-            if (now - (pos.openedAt || now) >= HOLD_MS) {
-              this.log(`[FST] 🔥 ${pos.symbol.replace('USDT','')}: 12h up — force close @ ROI ${roi.toFixed(1)}%`, 'info');
-              await this.pseudoClosePosition(pos, 'firestorm-12h', pos.markPrice);
-            }
-          }
+          } finally { this._logBatchEnd?.('[FST] 🔥 Exit roll-up'); }
         },
 
         async pseudoClosePosition(pos, reason, fillPrice) {

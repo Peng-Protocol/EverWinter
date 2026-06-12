@@ -415,6 +415,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
 .ll { display: flex; gap: 7px; padding: 2px 0; border-bottom: 1px solid rgba(24,32,48,.4); animation: fu .2s ease; }
 @keyframes fu { from{opacity:0;transform:translateY(-3px)} to{opacity:1;transform:none} }
 .lt { color: var(--text-lo); flex-shrink: 0; }
+.lm         { white-space: pre-wrap; word-break: break-word; }
 .lm.info    { color: var(--text-mid); }
 .lm.success { color: var(--profit); }
 .lm.error   { color: var(--short); }
@@ -2230,6 +2231,8 @@ function pw() { return {
   },
 
   log(m, type='info') {
+    // Batched bulk operation in progress — buffer everything but errors for one rolled-up entry
+    if ((this._logBatchDepth || 0) > 0 && type !== 'error') { this._logBatchBuf.push({ m, type }); return; }
     m = fmtSymbolsText(m);
     const t = new Date().toTimeString().slice(0,8);
     this.logs.unshift({t, m, type});
@@ -2239,6 +2242,24 @@ function pw() { return {
     try {
       localStorage.setItem('pw_v1_log', JSON.stringify(this.logs));
     } catch(e) {}
+  },
+
+  // ── Log roll-up — wraps bulk operations (cascade, bail, scan entry bursts) so
+  // per-event chatter lands as one activity-log entry. Errors always log
+  // individually and immediately. Nestable; only the outermost end flushes.
+  // A batch that collected a single message passes it through unchanged.
+  _logBatchBegin() {
+    this._logBatchDepth = (this._logBatchDepth || 0) + 1;
+    if (this._logBatchDepth === 1) this._logBatchBuf = [];
+  },
+  _logBatchEnd(label) {
+    if (!(this._logBatchDepth > 0) || --this._logBatchDepth > 0) return;
+    const buf = this._logBatchBuf; this._logBatchBuf = [];
+    if (!buf || !buf.length) return;
+    if (buf.length === 1) { this.log(buf[0].m, buf[0].type); return; }
+    const sev = buf.some(e => e.type === 'warn') ? 'warn'
+              : buf.some(e => e.type === 'success' || e.type === 'trade') ? 'success' : 'info';
+    this.log(`${label} — ${buf.length} events\n` + buf.map(e => '· ' + e.m).join('\n'), sev);
   },
 
   async autoConnect() {
@@ -2642,14 +2663,17 @@ function pw() { return {
       this.log(`[SCN] Scan done. ${candidates.filter(c=>c.status==='ready').length} ready.${_loserNote} [${this.positions.length} pos = ${effectivePos}/${this.cfg.maxPos} slots]`, 'scan');
 
       if (this.cfg.gainersEnabled && slots > 0) {
-        for (const c of candidates) {
-          const eff = this.positions.length;
-          if (eff >= this.cfg.maxPos) break;
-          if (c.status !== 'ready') continue;
-          // Optional historical OE look-back. Current RSI6 OE and proximity checks remain enforced above.
+        this._logBatchBegin();
+        try {
+          for (const c of candidates) {
+            const eff = this.positions.length;
+            if (eff >= this.cfg.maxPos) break;
+            if (c.status !== 'ready') continue;
+            // Optional historical OE look-back. Current RSI6 OE and proximity checks remain enforced above.
 
-          try { await this.pseudoOpenShort(c); } catch(e) { this.log(`[ENTRY-ERR] pseudoOpenShort ${c.symbol} — ${e.message}\n${e.stack||''}`, 'warn'); }
-        }
+            try { await this.pseudoOpenShort(c); } catch(e) { this.log(`[ENTRY-ERR] pseudoOpenShort ${c.symbol} — ${e.message}\n${e.stack||''}`, 'warn'); }
+          }
+        } finally { this._logBatchEnd('[OPN] Entry roll-up'); }
         // Watchlist disabled — entry is immediate on change gate, no polling queue
       } else if (!this.cfg.gainersEnabled) {
         this.log('[SCN] Gainers disabled — gainers scan skipped.', 'scan');
@@ -4566,10 +4590,13 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const snap = [...this.positions];
     if (!snap.length) { this.log('[BSC] ⚡ Bail: no active positions.', 'warn'); return; }
     this.log(`[BSC] ⚡ Bail: closing ${snap.length} position(s) at mark price…`, 'warn');
-    for (const pos of snap) {
-      try { await this.pseudoClosePosition(pos, 'bail', pos.markPrice || pos.entryPrice); }
-      catch(e) { this.log(`[BAIL-ERR] ${pos.symbol} — ${e.message}`, 'warn'); }
-    }
+    this._logBatchBegin();
+    try {
+      for (const pos of snap) {
+        try { await this.pseudoClosePosition(pos, 'bail', pos.markPrice || pos.entryPrice); }
+        catch(e) { this.log(`[BAIL-ERR] ${pos.symbol} — ${e.message}`, 'warn'); }
+      }
+    } finally { this._logBatchEnd('[BSC] ⚡ Bail roll-up'); }
     this.log(`[BSC] ⚡ Bail complete.`, 'warn');
   },
 

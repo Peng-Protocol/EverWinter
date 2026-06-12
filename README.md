@@ -186,6 +186,10 @@ Two styles are supported, and a plugin may mix them per method:
 
 Plugin `css` strings are injected into `<head>` synchronously during the IIFE. Plugin `slots` objects are keyed by slot name (e.g. `"config-bottom"`, `"account-bar-extra"`); the IIFE appends the HTML to matching `data-plugin-slot` anchors before Alpine starts. The injector also recurses into `<template>` fragments, so anchors inside Alpine `x-for` templates work — e.g. `"pos-card-badges"` sits inside the position-card template and injected markup can bind to the loop variable (`x-show="p._myFlag"`). A position-card badge plugin can also stamp `pos._roleBadgeOverride = true` to suppress the host's stock gainer/loser role badge in favor of its own.
 
+### Log Roll-ups
+
+Bulk operations batch their activity-log chatter into one entry via host helpers `_logBatchBegin()` / `_logBatchEnd(label)`. While a batch is open, every `log()` call **except errors** buffers instead of printing; the outermost `_logBatchEnd` flushes the buffer as a single multi-line entry (`label — N events` followed by one `·`-prefixed line per event). Errors always print individually and immediately; a batch that collected a single message passes it through unchanged, and the rolled entry takes the worst severity collected (warn > success > info). Wrapped paths: host scan entry bursts, Bail All, and the Blizzard/Firestorm entry, exit, and cascade loops (the plugins call the helpers with optional chaining, so they degrade gracefully on an older host).
+
 ### Loading a Plugin File
 
 The Plugin Manager accepts `.js` or `.html` files via `<input type="file">`. For `.html` files, `DOMParser` extracts all `<script>` tag contents and concatenates them. The extracted code is executed via `new Function(code)()`, which must set `window.__BotPlugin`. A plugin whose `targetBot` does not match the host bot is rejected at this point. The manifest fields plus the raw extracted source (`src`) are saved to localStorage; the source is re-executed at every page load to produce the live transform.
