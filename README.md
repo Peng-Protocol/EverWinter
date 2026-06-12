@@ -336,6 +336,10 @@ When the matching halt governor is loaded, the strategy reads its live structure
 
 Both the sim hosts and the live plugins read binary-mode TP/SL from `cfg` at open time, so `_blzOpen`/`_fstOpen` swaps `binaryModeEnabled: true`, `binaryTpPct`, and `binarySlPct` in around the `pseudoOpenShort` call and restores them in `finally` (re-persisting the restored cfg). Entries are therefore always binary-style: TP and SL stamped at entry, no DCA ladder. The TP slider (`blizzardTpPct`/`firestormTpPct`, default 105, range 20–300) is the **buffered (EV)** value, same convention as the general-settings TP UI — it is passed straight through as `binaryTpPct` and the host derives the functional TP as slider ÷ `_buffMul` (105% → 70% at +50% offset; a one-time v1.1 migration resets stored pre-buffer values to the new default). Main lock-in bumps are suppressed during the call (Drifters precedent — scatter entries are not signal trades); RSIs are fetched for the position record. New positions are stamped `_blizzard`/`_firestorm` plus `_slPctOverride`.
 
+### Cascade
+
+`blizzardCascadeEnabled`/`firestormCascadeEnabled` (default **on**, toggle in the accordion): each watcher pass, before the per-position checks, the plugin sums uPnL across **all** open positions (scatter and stock alike). When the collective total reaches the TP target — `TpPct% × base margin` (`minNotional ÷ leverage`), $1.05 at default settings — every open position is bailed at mark price with reason `'cascade'` for a net profit. The realized PnL feeds the host's gains-lock window (readily triggering it) and, when Permafrost/Ashfall is loaded, seeds its climate profile with favorable samples. Active only while the scatter mode itself is enabled; an in-flight guard prevents re-entry while a cascade is closing.
+
 `_slPctOverride` is a small host accommodation added for this plugin but usable by any: the watcher's binary **SL drift-correction** (which re-targets `slPrice` from the global `cfg.binarySlPct` each tick) and the position-card SL display honor a per-position override when present, so a plugin-set SL survives instead of being corrected back to the global slider.
 
 ### Exits
