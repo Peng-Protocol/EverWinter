@@ -727,7 +727,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <span style="font-size:9px;color:var(--text-lo)">(×<span x-text="(1+(Math.max(-99,cfg.laggardProfitOffset??50)/100)).toFixed(2)"></span>)</span>
             </div>
             <input type="range" min="-90" max="200" step="10" x-model.number="cfg.laggardProfitOffset" :disabled="bot.running" @change="persist()">
-            <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Buffer applied to the TP slider: functional TP = slider ÷ this multiplier (so 18% → 12% at +50%). When a position holds debt its target becomes bufferedEV (margin × slider%) plus the debt. A non-laggard can hold at most its bufferedEV in lost value; the laggard is unbounded.</div>
+            <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">EV buffer context: the slider TP already includes this buffer (12% base × 1.5 = 18% at +50%) — positions always target the full slider %. When a position holds debt its target becomes bufferedEV (margin × slider%) plus the debt. A non-laggard can hold at most its bufferedEV in lost value; the laggard is unbounded.</div>
           </div>
 
           <!-- EDA Debt Cap slider -->
@@ -796,10 +796,9 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="g">
                 <div class="lbl">Take Profit
                   <b x-text="cfg.binaryTpPct+'%'"></b>
-                  <span style="font-size:9px;color:var(--text-lo)">→ <span x-text="(cfg.binaryTpPct/(1+(Math.max(-99,cfg.laggardProfitOffset??50)/100))).toFixed(1)"></span>% functional</span>
                 </div>
                 <input type="range" min="1" max="50" step="1" x-model.number="cfg.binaryTpPct" :disabled="bot.running" @change="persist()">
-                <div class="hint">This slider is the buffered (EV) target. A debt-free position closes at the functional TP = slider ÷ buffer (Laggard Profit Offset). At 18% with +50% offset that's a 12% close.</div>
+                <div class="hint">Single TP system (EDa): a debt-free position closes at the slider % ROI — parallel with the SL %. With held debt, the target rises to cover bufferedEV (margin × slider%) plus the debt share.</div>
               </div>
               <div class="g" style="margin-top:8px">
                 <div class="lbl">Stop Loss <b x-text="cfg.binarySlPct+'%'"></b></div>
@@ -1720,11 +1719,11 @@ function pw() { return {
     loserLockInEnabled: true,    // lock change entry level; re-entry must be at same or lower change
     potLoserRsiPct: 10,          // RSI excess % above ceiling for watchlist qualification (unused — kept for compat)
     potLoserExpireMins: 15,      // loser watchlist TTL (minutes) (unused — kept for compat)
-    entryTpRoi: 18,    // displayed TP ROI % (EV basis); functional TP price = entryTpRoi / buffMul (Laggard Profit Offset)
+    entryTpRoi: 18,    // TP ROI % — the single TP target (bufferedEV basis), parallel with the SL %
     runtimeHours: 12,
     gainerLockInEnabled: true, // lock RSI entry level per symbol; future entries must meet
     laggardCheckEnabled: true, // enable laggard stats display and EDa TP logic
-    laggardProfitOffset: 50,   // TP buffer: buffMul = 1 + offset/100 (default 1.5). functional TP = slider ÷ buffMul; bufferedEV = funcEV × buffMul
+    laggardProfitOffset: 50,   // EV buffer context (informational): the slider TP already includes the buffer; bufferedEV = margin × slider%
     edaCapPct: 50,             // max lost value distributed to any one position as % of its bufferedEV (50 = 50% of EV; 1000 = 10× EV)
 
     binaryModeEnabled: true,   // binary risk: TP + SL set at entry, no DCA orders
@@ -2556,7 +2555,7 @@ function pw() { return {
               const rawQty   = this.cfg.minNotional / price;
               const qty      = this.snapQty(rawQty, instr);
               const _prevTpPct = this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
-              const tpPrice  = this.snapPrice(price * (1 - (_prevTpPct / this._buffMul() / 100) / this.cfg.leverage), instr);
+              const tpPrice  = this.snapPrice(price * (1 - (_prevTpPct / 100) / this.cfg.leverage), instr);
               const notional = qty * price;
               if (qty <= 0) {
                 status='invalid'; skipReason = skipReason || 'qty below min';
@@ -2632,7 +2631,7 @@ function pw() { return {
           } else {
             const lQty      = this.snapQty(this.cfg.minNotional / price, lInstr);
             const _loserTpPct = this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
-            const lTpPrice  = this.snapPrice(price * (1 - (_loserTpPct / this._buffMul() / 100) / this.cfg.leverage), lInstr);
+            const lTpPrice  = this.snapPrice(price * (1 - (_loserTpPct / 100) / this.cfg.leverage), lInstr);
             const lNotional = lQty * price;
             if (lQty <= 0)                                                  { loserStatus = 'invalid'; loserSkipReason = 'qty below min'; }
             else if (lInstr.minOrderAmt > 0 && lNotional < lInstr.minOrderAmt) { loserStatus = 'invalid'; loserSkipReason = `notional $${lNotional.toFixed(2)} < min $${lInstr.minOrderAmt}`; }
@@ -3267,8 +3266,14 @@ function pw() { return {
           this.renderTradeFeed();
           const g = this.gainers.find(x => x.symbol === pos.symbol);
           if (g) g.status = 'closed';
-                this.positions = this.positions.filter(x => x.id !== pos.id);
-                            _closingIds.delete(pos.id);
+          this.positions = this.positions.filter(x => x.id !== pos.id);
+          // EDa: gap closes must feed the debt pool like live closes — otherwise a
+          // force/SL loss replayed from klines (and any debt the position carried)
+          // never reaches _lostValue and the held value silently vanishes.
+          this._updateLostValue(pnl);
+          this._electLaggard();
+          this._redistributeED();
+          _closingIds.delete(pos.id);
           if (this.bot.running) setTimeout(() => this.runScheduledCycle(), 500);
         } else {
           const lastCandle = candles[candles.length - 1];
@@ -3342,7 +3347,7 @@ function pw() { return {
     if (qty <= 0) { this.log(`[OPN] ${sym}: qty below min — skipping`, 'warn'); return; }
     const actualNotional = qty * price;
     if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) { this.log(`[OPN] ${sym}: notional below exchange min — skipping`, 'warn'); return; }
-    const tpPrice = this.snapPrice(price * (1 - (effTp0 / this._buffMul() / 100) / effectiveLev), instr);
+    const tpPrice = this.snapPrice(price * (1 - (effTp0 / 100) / effectiveLev), instr); // SHORT: TP at the full slider % below entry — parallel with the SL %
     if (!tpPrice || tpPrice <= 0) {
       this.log(`[OPN] ${sym}: Pseudo TP price invalid (${tpPrice}) — price too low for API precision — BLACKLISTED`, 'warn');
       this._banSymbol(sym, `Pseudo TP price too low for API precision (${tpPrice})`);
@@ -3746,11 +3751,15 @@ function pw() { return {
       if (_dg_pos._edaTpPrice > 0) continue; // EDa owns this TP — drift corrector must not interfere
       const _dg_stage = _dg_pos.dcaStage || 0;
       const _dg_roi = _dg_stage === 0 ? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi) : this._tpRoi(_dg_stage);
-      // Stage 0 carries the visual buffer — actual TP price is at _dg_roi/buffMul; DCA stages use raw %
-      const _dg_functRoi = _dg_stage === 0 ? _dg_roi / this._buffMul() : _dg_roi;
+      // Single TP system: stage 0 targets the full slider %; DCA stages use raw _tpRoi() %
+      const _dg_functRoi = _dg_roi;
       // If tpPct was deliberately set to something other than expected (e.g. FUN doubling,
-      // ingress-adjusted entry), the TP is intentional — stand down.
-      if (_dg_pos.tpPct != null && Math.abs((_dg_pos.tpPct || 0) - _dg_roi) > 0.01) continue;
+      // ingress-adjusted entry), the TP is intentional — stand down. Accept the slider %
+      // and the legacy functional convention (slider ÷ buffMul) so old positions normalize.
+      const _dg_legacyRoi = _dg_stage === 0 ? _dg_roi / this._buffMul() : _dg_roi;
+      if (_dg_pos.tpPct != null
+          && Math.abs((_dg_pos.tpPct || 0) - _dg_roi) > 0.01
+          && Math.abs((_dg_pos.tpPct || 0) - _dg_legacyRoi) > 0.01) continue;
       const _dg_instr  = await this.getInstrInfo(_dg_pos.symbol);
       if (!_dg_instr) continue;
       const _dg_target = this.snapPrice(_dg_pos.entryPrice * (1 - (_dg_functRoi / 100) / _dg_pos.leverage), _dg_instr);
@@ -3862,7 +3871,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         let _wpTpRef = _effTp;
         if (!(pos._edaTpPrice > 0) && (pos.dcaStage || 0) === 0) {
           const _wpRoi = this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
-          _wpTpRef = pos.entryPrice * (1 - (_wpRoi / this._buffMul() / 100) / pos.leverage); // functional TP
+          _wpTpRef = pos.entryPrice * (1 - (_wpRoi / 100) / pos.leverage); // SHORT: TP at slider % below entry
         }
         const tpGap  = pos.entryPrice - _wpTpRef; // total price distance to effective TP (short)
         const tpProx = pos.entryPrice - mark;      // price distance already covered
@@ -4407,14 +4416,14 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     this._laggardId = oldest ? oldest.id : null;
   },
 
-  // Buffer multiplier — driven by the Laggard Profit Offset. The slider TP is the buffered
-  // (visual) value; functional TP = slider ÷ buffMul, and bufferedEV = funcEV × buffMul.
+  // Buffer multiplier — driven by the Laggard Profit Offset. Informational only: the slider TP
+  // already includes the buffer (bufferedEV = margin × slider%); it no longer rescales TP prices.
   _buffMul() {
     return 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
   },
 
   // Redistribute lost value across all positions and compute per-position EDa TP.
-  //   No debt    → functional TP (slider ÷ buffMul).
+  //   No debt    → TP at the full slider % (bufferedEV basis), parallel with the SL %.
   //   With debt  → target profit = bufferedEV + debt   (SHORT: exit below entry).
   //   All positions are capped at edaCapPct% of their bufferedEV; unabsorbed debt stays in _lostValue
   //   and is distributed to new positions as they open.
@@ -4430,7 +4439,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       const baseTp   = p._baseTpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
       const stagePct = (p.dcaStage || 0) === 0 ? baseTp : this._tpRoi(p.dcaStage || 1);
       // Only stage 0 (binary/entry) carries the visual buffer; DCA stages use raw _tpRoi() %.
-      p._funcPct     = (p.dcaStage || 0) === 0 ? stagePct / buffMul : stagePct;
+      p._funcPct     = stagePct; // single TP system: stage 0 targets the full slider %
       p._funcEV      = p.margin * (p._funcPct / 100);
       p._bufferedEV  = (p.dcaStage || 0) === 0 ? p.margin * (stagePct / 100) : p._funcEV;
     }
