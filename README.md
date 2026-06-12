@@ -326,7 +326,7 @@ A random-scattershot bet on the market at large: each scan cycle picks N **rando
 
 ### Entry pass (`_blzRunScan` / `_fstRunScan`)
 
-Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn uniformly at random without replacement (failed opens retried up to 3× picks). Each cycle logs pool size and opens.
+Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn at random without replacement, **alternating between gainers and losers** so each cycle's picks span both sides of the move (falling back to the remaining side when one empties; failed opens retried up to 3× picks). Each cycle logs pool size with its ▲/▼ split and opens.
 
 ### Climate gate (Permafrost / Ashfall coupling)
 
