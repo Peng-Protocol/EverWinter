@@ -66,7 +66,8 @@
   // fold an *inherent* oscillation prior (markets swing strongly bullish ⇄
   // strongly bearish) into the decision. History stays primary; the inherent
   // wave only takes the helm when the learned profile is thin.
-  const WAVE_WINDOW_MS = 12 * 3600 * 1000; // recent structure history shown/used as the wave
+  const WAVE_TTL_MS    = 7 * 24 * 3600 * 1000; // wave retains as much structure history as we have, up to ~a week
+  const WAVE_CAP       = 2000;              // hard cap on stored wave points
   const WAVE_MIN_PTS   = 3;                 // readings needed before a trajectory is meaningful
   const W_LEAN         = 0.6;               // inherent-score weight on the current structure level
   const W_SLOPE        = 0.4;               // inherent-score weight on the trajectory (where it's heading)
@@ -76,7 +77,7 @@
   window.__BotPlugin = {
     id:        'ashfall-chaser',
     name:      'Ashfall (Chaser)',
-    version:   '1.5.0',
+    version:   '1.5.1',
     targetBot: 'pseudochaser',
     after:     ['sunchaser'],
     before:    [],
@@ -146,7 +147,7 @@
               <div class="g" x-show="cfg.ashfallEnabled" style="margin-top:10px">
                 <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=afStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
                 <div x-html="_afWaveSvg()" style="margin-top:4px;border:1px solid rgba(255,150,80,.15);border-radius:3px;background:rgba(255,150,80,.03)"></div>
-                <div class="ash-hint">Recent path of the market's structure lean (bull ↑ / bear ↓) over the last 12h. The plugin reads where the wave is <em>heading</em>, not just where it is — folding an inherent bull⇄bear oscillation in as a fallback so it won't long into the start of a dump. History stays primary when the profile is rich.</div>
+                <div class="ash-hint">Path of the market's structure lean (bull ↑ / bear ↓), retained for as long as there is data — up to ~a week. The plugin reads where the wave is <em>heading</em>, not just where it is — folding an inherent bull⇄bear oscillation in as a fallback so it won't long into the start of a dump. History stays primary when the profile is rich.</div>
               </div>
               <div class="ash-stat" style="margin-top:10px;padding:8px 10px;background:rgba(255,150,80,.05);border:1px solid rgba(255,150,80,.18);border-radius:3px">
                 <div>PROFILE — <span x-text="(afEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(afEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(afSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
@@ -159,7 +160,7 @@
                 </div>
                 <div style="margin-top:6px;display:flex;gap:8px">
                   <button @click="afExport()" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,150,80,.4);border-radius:2px;background:none;color:#ff9650;cursor:pointer;letter-spacing:.5px">Export</button>
-                  <button @click="if(!cfgLocked){afEvents=[];afSamples=[];afPnl=[];persist();log('[ASH] Profile cleared.','warn')}" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.4);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Clear Profile</button>
+                  <button @click="if(!cfgLocked){afEvents=[];afSamples=[];afPnl=[];afWave=[];persist();log('[ASH] Profile cleared.','warn')}" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.4);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Clear Profile</button>
                 </div>
               </div>
             </div>
@@ -186,6 +187,7 @@
         afEvents:  [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth, gCount, lCount, gSum, lSum }
         afSamples: [],   // { ts, skew, breadth, label } — label null until the 6h window resolves
         afPnl:     [],   // { ts, pnl } — plugin-owned closed-trade log for sample labeling
+        afWave:    [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
         afHalt:    null, // { kind, at, informed, strong, until?, durMs? } while a halt is being governed (until/durMs are PLK-only)
         afPlkLastLift: 0, // when the last PLK ended — gates the (dynamic) PLK cooldown
         afPlkLastDurationMs: 0, // duration of the last PLK — the cooldown matches it
@@ -207,6 +209,7 @@
               if (Array.isArray(s.events))  this.afEvents  = s.events.slice(-EVENTS_CAP);
               if (Array.isArray(s.samples)) this.afSamples = s.samples.slice(-SAMPLES_CAP);
               if (Array.isArray(s.pnl))     this.afPnl     = s.pnl.filter(e => Date.now() - e.ts < PNL_LOG_TTL);
+              if (Array.isArray(s.wave))    this.afWave    = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
               if (s.halt && s.halt.at) this.afHalt = s.halt;
               if (typeof s.plkLastLift === 'number') this.afPlkLastLift = s.plkLastLift;
               if (typeof s.plkLastDurationMs === 'number') this.afPlkLastDurationMs = s.plkLastDurationMs;
@@ -221,7 +224,7 @@
             }
           } else if (this.afHalt && !_origIsDD.call(this) && !_origIsGL.call(this)) this.afHalt = null;
           if (this.afHalt) this._afEnsureSampler();
-          this.log(`[ASH] Ashfall (Chaser) v1.5.0 loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
+          this.log(`[ASH] Ashfall (Chaser) v1.5.1 loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
         },
 
         // ── PLK (preemptive lock) — proactive halt on historically bad structure ──
@@ -287,7 +290,7 @@
           _origPers.call(this);
           try {
             localStorage.setItem(ASH_KEY, JSON.stringify({
-              events: this.afEvents, samples: this.afSamples, pnl: this.afPnl, halt: this.afHalt, plkLastLift: this.afPlkLastLift, plkLastDurationMs: this.afPlkLastDurationMs,
+              events: this.afEvents, samples: this.afSamples, pnl: this.afPnl, wave: this.afWave, halt: this.afHalt, plkLastLift: this.afPlkLastLift, plkLastDurationMs: this.afPlkLastDurationMs,
             }));
           } catch(e) {}
         },
@@ -358,11 +361,18 @@
         // ── The wave: recent path of the structure lean (oldest → newest) ──
         // lean = (skew + breadth) / 2 ∈ [−1,1]: +1 strongly bullish, −1 strongly bearish.
         _afWaveSeries() {
-          const cut = Date.now() - WAVE_WINDOW_MS;
-          return this.afSamples
-            .filter(s => s.ts >= cut)
-            .map(s => ({ ts: s.ts, lean: (s.skew + s.breadth) / 2 }))
-            .sort((a, b) => a.ts - b.ts);
+          const cut = Date.now() - WAVE_TTL_MS;
+          return this.afWave.filter(p => p.ts >= cut);
+        },
+
+        // Append a structure-lean point to the wave and prune by age / cap. Kept
+        // separate from afSamples (which get pruned for scoring) so the wave
+        // retains the full trajectory for as long as we have data, up to ~a week.
+        _afPushWave(reading) {
+          this.afWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4) });
+          const cut = Date.now() - WAVE_TTL_MS;
+          if (this.afWave.length && this.afWave[0].ts < cut) this.afWave = this.afWave.filter(p => p.ts >= cut);
+          if (this.afWave.length > WAVE_CAP) this.afWave = this.afWave.slice(-WAVE_CAP);
         },
 
         // Current lean plus its trajectory (slope = recent third − older third of the wave).
@@ -454,6 +464,7 @@
         _afAddSample(reading) {
           this._afStampSamples();
           this.afSamples.push({ ts: reading.ts, skew: reading.skew, breadth: reading.breadth, label: null });
+          this._afPushWave(reading);
           const { score, mass } = this._afScore(reading);
           const { lean, slope } = this._afTrajectory();
           const inherent = this._afInherent(lean, slope);
@@ -467,6 +478,7 @@
           if (!reading) { this.afHalt = { kind, at: Date.now(), informed: false }; this.persist(); return; }
           this.afEvents.push({ ts: reading.ts, kind, skew: reading.skew, breadth: reading.breadth, gCount: reading.gCount, lCount: reading.lCount, gSum: reading.gSum, lSum: reading.lSum });
           if (this.afEvents.length > EVENTS_CAP) this.afEvents = this.afEvents.slice(-EVENTS_CAP);
+          this._afPushWave(reading);
           const { score, mass } = this._afScore(reading);
           const lean     = (reading.skew + reading.breadth) / 2;
           const slope    = this._afTrajectory().slope;
