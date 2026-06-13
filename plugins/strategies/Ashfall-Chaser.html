@@ -27,6 +27,13 @@
   equal to that lock's own duration must pass before another can engage — no
   back-to-back preemptive locks.
 
+  Structure trajectory ("the wave"): a reading is judged in the context of what
+  preceded it, not in isolation. The recent path of the structure lean is tracked
+  and plotted in the accordion, and its direction folds into an inherent bull⇄bear
+  oscillation prior — so a mildly-bullish tape that is turning down reads negative
+  (don't long into the start of a dump). Learned history stays primary; the
+  inherent wave only takes the helm when the profile is thin.
+
   The profile is direction-agnostic: it only learns what realized PnL says
   about this installation — the same logic powers Permafrost on PseudoWinter.
 
@@ -53,10 +60,23 @@
   const SAMPLES_CAP    = 1000;
   const PNL_LOG_TTL    = 24 * 3600 * 1000;
 
+  // ── Structure trajectory ("the wave") ──
+  // A reading isn't just where the market is now — it's where it came from. We
+  // track the recent path of the structure lean and read its direction, then
+  // fold an *inherent* oscillation prior (markets swing strongly bullish ⇄
+  // strongly bearish) into the decision. History stays primary; the inherent
+  // wave only takes the helm when the learned profile is thin.
+  const WAVE_WINDOW_MS = 12 * 3600 * 1000; // recent structure history shown/used as the wave
+  const WAVE_MIN_PTS   = 3;                 // readings needed before a trajectory is meaningful
+  const W_LEAN         = 0.6;               // inherent-score weight on the current structure level
+  const W_SLOPE        = 0.4;               // inherent-score weight on the trajectory (where it's heading)
+  const SLOPE_REF      = 0.3;               // lean change over the window that counts as full-scale
+  const DIR            = 1;                 // PseudoChaser longs → favourable structure is bullish/rising
+
   window.__BotPlugin = {
     id:        'ashfall-chaser',
     name:      'Ashfall (Chaser)',
-    version:   '1.4.0',
+    version:   '1.5.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser'],
     before:    [],
@@ -123,9 +143,15 @@
                 <div class="lbl">PLK Cooldown <b>dynamic</b></div>
                 <div class="ash-hint">After a preemptive lock ends, the next one can't engage until the same span as the last lock has passed (it matches that lock's duration) — no back-to-back locks. Last lock: <span x-text="afPlkLastDurationMs>0?(Math.floor(afPlkLastDurationMs/3600000)+'h '+String(Math.round((afPlkLastDurationMs%3600000)/60000)).padStart(2,'0')+'m'):'—'"></span>.</div>
               </div>
+              <div class="g" x-show="cfg.ashfallEnabled" style="margin-top:10px">
+                <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=afStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
+                <div x-html="_afWaveSvg()" style="margin-top:4px;border:1px solid rgba(255,150,80,.15);border-radius:3px;background:rgba(255,150,80,.03)"></div>
+                <div class="ash-hint">Recent path of the market's structure lean (bull ↑ / bear ↓) over the last 12h. The plugin reads where the wave is <em>heading</em>, not just where it is — folding an inherent bull⇄bear oscillation in as a fallback so it won't long into the start of a dump. History stays primary when the profile is rich.</div>
+              </div>
               <div class="ash-stat" style="margin-top:10px;padding:8px 10px;background:rgba(255,150,80,.05);border:1px solid rgba(255,150,80,.18);border-radius:3px">
                 <div>PROFILE — <span x-text="(afEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(afEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(afSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
                 <div x-show="afStatus.at">READING — skew <span x-text="(afStatus.skew??0).toFixed(2)"></span> | breadth <span x-text="(afStatus.breadth??0).toFixed(2)"></span> | score <span x-text="afStatus.score===null?'—':afStatus.score.toFixed(2)"></span> | mass <span x-text="afStatus.mass.toFixed(1)"></span></div>
+                <div x-show="afStatus.at">STRUCTURE — lean <span x-text="(afStatus.lean??0).toFixed(2)"></span> | slope <span x-text="(afStatus.slope>=0?'+':'')+(afStatus.slope??0).toFixed(2)"></span> | effective <span x-text="afStatus.eff===null||afStatus.eff===undefined?'—':((afStatus.eff>=0?'+':'')+afStatus.eff.toFixed(2))"></span> for longs</div>
                 <div x-show="afHalt && afHalt.kind!=='plk'" style="color:#ff9650">HALT — <span x-text="afHalt?.kind"></span> (<span x-text="afHalt?.strong?'strong bias — up to '+(cfg.ashfallCapHours??24)+'h / early settle':afHalt?.informed?'default 12h':'timer fallback'"></span>) <span x-text="(()=>{ void tick; return afHalt? Math.floor((Date.now()-afHalt.at)/3600000)+'h elapsed':''; })()"></span></div>
                 <div x-show="afHalt && afHalt.kind==='plk'" style="color:#ff9650;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                   <span x-text="(()=>{ void tick; if(!afHalt||!afHalt.until) return 'PLK active'; const rem=Math.max(0,afHalt.until-Date.now()); const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); const s=Math.floor((rem%60000)/1000); return 'PLK'+(afHalt.strong?' (strong)':'')+' — '+h+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s left'; })()"></span>
@@ -163,7 +189,7 @@
         afHalt:    null, // { kind, at, informed, strong, until?, durMs? } while a halt is being governed (until/durMs are PLK-only)
         afPlkLastLift: 0, // when the last PLK ended — gates the (dynamic) PLK cooldown
         afPlkLastDurationMs: 0, // duration of the last PLK — the cooldown matches it
-        afStatus:  { skew: null, breadth: null, score: null, mass: 0, at: 0 },
+        afStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, at: 0 },
 
         async init() {
           await _origInit.call(this);
@@ -195,7 +221,7 @@
             }
           } else if (this.afHalt && !_origIsDD.call(this) && !_origIsGL.call(this)) this.afHalt = null;
           if (this.afHalt) this._afEnsureSampler();
-          this.log(`[ASH] Ashfall (Chaser) v1.4.0 loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
+          this.log(`[ASH] Ashfall (Chaser) v1.5.0 loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
         },
 
         // ── PLK (preemptive lock) — proactive halt on historically bad structure ──
@@ -204,15 +230,13 @@
           return this.afHalt?.kind === 'plk';
         },
 
-        // PLK duration scales with the strength of the historical bias: hostility
-        // magnitude (|score|) × evidence weight (mass), as a fraction of the hard
-        // cap. Floored at 1h, capped at the hard cap — so it lands on arbitrary
-        // values like 3h 20m, never a fixed block.
-        _afPlkDurationMs(score, mass) {
+        // PLK duration scales with the strength of the effective read (|eff|, which
+        // already blends learned history with the inherent structure wave), as a
+        // fraction of the hard cap. Floored at 1h, capped at the hard cap — so it
+        // lands on arbitrary values like 3h 20m, never a fixed block.
+        _afPlkDurationMs(eff) {
           const capMs    = (this.cfg.ashfallCapHours ?? 24) * 3600 * 1000;
-          const scoreFac = Math.min(1, Math.abs(score || 0));
-          const massFac  = Math.min(1, (mass || 0) / STRONG_MASS);
-          const strength = scoreFac * massFac;
+          const strength = Math.min(1, Math.abs(eff || 0));
           return Math.min(capMs, Math.max(MIN_HALT_MS, Math.round(strength * capMs)));
         },
 
@@ -317,13 +341,82 @@
           const mag    = Math.abs(lean);
           const adverb = mag >= tStrong ? 'strongly ' : mag >= tModerate ? 'moderately ' : 'mildly ';
           const struct = mag <= tFlat ? 'mixed/flat' : `${adverb}${lean > 0 ? 'bullish' : 'bearish'}`;
-          const desc   = `${struct} (skew ${reading.skew.toFixed(2)}, breadth ${reading.breadth.toFixed(2)}, ${reading.gCount}▲/${reading.lCount}▼)`;
+          const slope  = this._afTrajectory().slope;
+          const trend  = slope > 0.05 ? ', rising (turning bullish)' : slope < -0.05 ? ', falling (turning bearish)' : ', steady';
+          const desc   = `${struct}${trend} (skew ${reading.skew.toFixed(2)}, breadth ${reading.breadth.toFixed(2)}, ${reading.gCount}▲/${reading.lCount}▼)`;
+          const inherent = this._afInherent(lean, slope);
+          const eff      = this._afEffectiveScore(score, mass, inherent);
           let bias;
-          if (score === null || mass < MIN_MASS) bias = `no historical bias noted (evidence mass ${mass.toFixed(1)} < ${MIN_MASS})`;
-          else if (score >= 0.15)  bias = `this is historically good for longs (score +${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
-          else if (score <= -0.15) bias = `this is historically bad for longs (score ${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
+          if (score === null || mass < MIN_MASS) bias = `thin history (mass ${mass.toFixed(1)} < ${MIN_MASS}) — leaning on inherent structure (${eff >= 0 ? '+' : ''}${eff.toFixed(2)} for longs)`;
+          else if (score >= 0.15)  bias = `historically good for longs (score +${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
+          else if (score <= -0.15) bias = `historically bad for longs (score ${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
           else                     bias = `historically neutral for longs (score ${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
-          return { desc, bias };
+          if (score !== null && mass >= MIN_MASS && Math.abs(eff - score) >= 0.1) bias += ` | structure shifts the effective read to ${eff >= 0 ? '+' : ''}${eff.toFixed(2)}`;
+          return { desc, bias, eff };
+        },
+
+        // ── The wave: recent path of the structure lean (oldest → newest) ──
+        // lean = (skew + breadth) / 2 ∈ [−1,1]: +1 strongly bullish, −1 strongly bearish.
+        _afWaveSeries() {
+          const cut = Date.now() - WAVE_WINDOW_MS;
+          return this.afSamples
+            .filter(s => s.ts >= cut)
+            .map(s => ({ ts: s.ts, lean: (s.skew + s.breadth) / 2 }))
+            .sort((a, b) => a.ts - b.ts);
+        },
+
+        // Current lean plus its trajectory (slope = recent third − older third of the wave).
+        _afTrajectory() {
+          const wave = this._afWaveSeries();
+          const n    = wave.length;
+          const lean = n ? wave[n - 1].lean : (((this.afStatus.skew ?? 0) + (this.afStatus.breadth ?? 0)) / 2);
+          if (n < WAVE_MIN_PTS) return { lean, slope: 0, n };
+          const k      = Math.max(1, Math.floor(n / 3));
+          const recent = wave.slice(-k).reduce((a, p) => a + p.lean, 0) / k;
+          const older  = wave.slice(0, k).reduce((a, p) => a + p.lean, 0) / k;
+          return { lean, slope: recent - older, n };
+        },
+
+        // Inherent favourability for this bot's direction (DIR): a long bot likes
+        // bullish *and* rising structure. The slope term is what stops us longing
+        // into the start of a dump (mildly bullish but turning down).
+        _afInherent(lean, slope) {
+          const slopeN = Math.max(-1, Math.min(1, (slope || 0) / SLOPE_REF));
+          return Math.max(-1, Math.min(1, DIR * (W_LEAN * (lean || 0) + W_SLOPE * slopeN)));
+        },
+
+        // Effective score: learned history is primary, the inherent wave is the
+        // fallback — blended by how much evidence the profile actually has.
+        _afEffectiveScore(score, mass, inherent) {
+          const massFrac = Math.max(0, Math.min(1, (mass || 0) / STRONG_MASS));
+          return score === null ? inherent : massFrac * score + (1 - massFrac) * inherent;
+        },
+
+        // Inline SVG wave plot for the accordion — recent lean path with a mid (flat) line.
+        _afWaveSvg() {
+          void this.tick;
+          const wave = this._afWaveSeries();
+          const W = 260, H = 64, pad = 6;
+          const y = lean => pad + ((1 - lean) / 2) * (H - 2 * pad);
+          const mid = y(0);
+          if (wave.length < 2) {
+            return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block"><line x1="0" y1="${mid}" x2="${W}" y2="${mid}" stroke="rgba(255,255,255,.15)" stroke-dasharray="3 3"/><text x="${W/2}" y="${H/2+3}" fill="rgba(255,255,255,.35)" font-size="9" font-family="monospace" text-anchor="middle">gathering structure history…</text></svg>`;
+          }
+          const n  = wave.length;
+          const xs = i => pad + (i / (n - 1)) * (W - 2 * pad);
+          const pts = wave.map((p, i) => `${xs(i).toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ');
+          const cur = wave[n - 1].lean;
+          const col = cur > 0.05 ? 'var(--profit)' : cur < -0.05 ? 'var(--short)' : '#ff9650';
+          const cx  = xs(n - 1), cy = y(cur);
+          return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block">`
+            + `<line x1="0" y1="${pad}" x2="${W}" y2="${pad}" stroke="rgba(0,229,160,.12)"/>`
+            + `<line x1="0" y1="${(H-pad).toFixed(1)}" x2="${W}" y2="${(H-pad).toFixed(1)}" stroke="rgba(255,69,96,.12)"/>`
+            + `<line x1="0" y1="${mid.toFixed(1)}" x2="${W}" y2="${mid.toFixed(1)}" stroke="rgba(255,255,255,.18)" stroke-dasharray="3 3"/>`
+            + `<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>`
+            + `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.5" fill="${col}"/>`
+            + `<text x="2" y="${pad+7}" fill="rgba(0,229,160,.5)" font-size="8" font-family="monospace">bull</text>`
+            + `<text x="2" y="${(H-pad-1).toFixed(1)}" fill="rgba(255,69,96,.5)" font-size="8" font-family="monospace">bear</text>`
+            + `</svg>`;
         },
 
         // ── Hostility score: kernel-weighted, recency-decayed vote of past events
@@ -362,7 +455,10 @@
           this._afStampSamples();
           this.afSamples.push({ ts: reading.ts, skew: reading.skew, breadth: reading.breadth, label: null });
           const { score, mass } = this._afScore(reading);
-          this.afStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, at: reading.ts };
+          const { lean, slope } = this._afTrajectory();
+          const inherent = this._afInherent(lean, slope);
+          const eff = this._afEffectiveScore(score, mass, inherent);
+          this.afStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, at: reading.ts };
         },
 
         // ── Halt event: record the climate, decide informed cap vs timer fallback ──
@@ -372,7 +468,11 @@
           this.afEvents.push({ ts: reading.ts, kind, skew: reading.skew, breadth: reading.breadth, gCount: reading.gCount, lCount: reading.lCount, gSum: reading.gSum, lSum: reading.lSum });
           if (this.afEvents.length > EVENTS_CAP) this.afEvents = this.afEvents.slice(-EVENTS_CAP);
           const { score, mass } = this._afScore(reading);
-          this.afStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, at: reading.ts };
+          const lean     = (reading.skew + reading.breadth) / 2;
+          const slope    = this._afTrajectory().slope;
+          const inherent = this._afInherent(lean, slope);
+          const eff      = this._afEffectiveScore(score, mass, inherent);
+          this.afStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, at: reading.ts };
           const informed = mass >= MIN_MASS;
           const strong   = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.ashfallStrongScore ?? STRONG_SCORE);
           // The stock 12h horizon is the default. Only a *strong* historical bias
@@ -410,14 +510,15 @@
           const reading = await this._afFetchStructure();
           if (!reading) return;
           this._afAddSample(reading);
-          const { score, mass } = this.afStatus;
+          const { score, mass, eff } = this.afStatus;
           const elapsed = Date.now() - this.afHalt.at;
           const strong  = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.ashfallStrongScore ?? STRONG_SCORE);
           // Early settle is reserved for a strong historical bias — without one, the
           // lock is never lifted arbitrarily; it simply runs its 12h horizon. For
           // drawdown/gains-lock that horizon is the host's own timer; PLK has none,
-          // so it self-caps below (12h default, 24h only under a strong bias).
-          if (strong && elapsed >= MIN_HALT_MS && score >= (this.cfg.ashfallThawScore ?? 0)) {
+          // so it self-caps below. The settle compares the *effective* read (history
+          // + structure trajectory) so we don't lift straight into a reversal.
+          if (strong && elapsed >= MIN_HALT_MS && (eff ?? score) >= (this.cfg.ashfallThawScore ?? 0)) {
             const kind = this.afHalt.kind;
             if      (kind === 'drawdown')  { this._drawdownHaltUntil = 0; this._drawdownWindow = []; }
             else if (kind === 'gainslock') { this._gainsLockHaltUntil = 0; this._gainsWindow = []; }
@@ -457,29 +558,31 @@
           this._afFetchStructure().then(r => {
             if (!r) return;
             this._afAddSample(r);
-            const { score, mass } = this.afStatus;
+            const { score, mass, eff } = this.afStatus;
             const _d = this._afDescribe(r, score, mass);
             this.log(`[ASH] ♨ Routine market structure check — market is ${_d.desc} | ${_d.bias}`, 'info');
-            // PLK — proactive rather than reactive: when the current structure is
-            // historically bad with sufficient evidence, lock entries preemptively
-            // before PnL damage, instead of waiting for a drawdown halt to fire.
-            // Duration scales with the strength of the bias (up to the hard cap),
-            // and the re-trigger cooldown matches that same duration so locks can't
-            // fire back to back.
+            // PLK — proactive rather than reactive: when the *effective* read (learned
+            // history primary, the inherent structure wave as fallback) is bad for the
+            // bot's direction, lock entries preemptively before PnL damage. This is
+            // what keeps us from longing into the start of a dump — a mildly bullish
+            // tape that is turning down reads negative once the trajectory is folded in.
+            // Duration scales with the strength of that read; the re-trigger cooldown
+            // matches the last lock's duration so locks can't fire back to back.
             const _plkCooldownMs = this.afPlkLastDurationMs > 0
               ? this.afPlkLastDurationMs
               : (this.cfg.ashfallPlkCooldownHours ?? 24) * 3600 * 1000;
+            const _plkTrip = (this.cfg.ashfallPlkScore ?? -0.15);
             if ((this.cfg.ashfallPlkEnabled ?? true) && !this.afHalt
                 && Date.now() - (this.afPlkLastLift || 0) >= _plkCooldownMs
                 && !_origIsDD.call(this) && !_origIsGL.call(this)
-                && mass >= MIN_MASS && score !== null
-                && score <= (this.cfg.ashfallPlkScore ?? -0.15)) {
+                && eff !== null && eff !== undefined && eff <= _plkTrip) {
               const plkStrong = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.ashfallStrongScore ?? STRONG_SCORE);
-              const durMs = this._afPlkDurationMs(score, mass);
+              const durMs = this._afPlkDurationMs(eff);
               const now   = Date.now();
-              this.afHalt = { kind: 'plk', at: now, until: now + durMs, durMs, informed: true, strong: plkStrong };
+              this.afHalt = { kind: 'plk', at: now, until: now + durMs, durMs, informed: mass >= MIN_MASS, strong: plkStrong };
               const _dh = Math.floor(durMs / 3600000), _dm = Math.round((durMs % 3600000) / 60000);
-              this.log(`[ASH] 🛑 PLK — structure is ${_d.desc} and historically bad for longs (score ${score.toFixed(2)} ≤ ${(this.cfg.ashfallPlkScore ?? -0.15).toFixed(2)}, mass ${mass.toFixed(1)}) — preemptive lock engaged for ${_dh}h ${String(_dm).padStart(2,'0')}m${plkStrong ? ' (strong bias)' : ''}; cooldown will match`, 'warn');
+              const _src = mass >= MIN_MASS ? `history+structure read ${eff.toFixed(2)}` : `inherent structure read ${eff.toFixed(2)} (thin history)`;
+              this.log(`[ASH] 🛑 PLK — ${_d.desc} is bad for longs (${_src} ≤ ${_plkTrip.toFixed(2)}) — preemptive lock engaged for ${_dh}h ${String(_dm).padStart(2,'0')}m${plkStrong ? ' (strong bias)' : ''}; cooldown will match`, 'warn');
               this._afEnsureSampler();
             }
             this.persist();
