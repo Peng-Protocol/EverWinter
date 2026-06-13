@@ -7,9 +7,12 @@
   at the moment it fired — drawdown events mark hostile climate, gains-lock
   events mark favorable climate. Scan cycles add weaker PnL-labeled samples
   between those anchors. While halted, structure is re-sampled on a slow
-  timer and the halt "thaws" early once current structure scores favorably
-  against the profile — or holds past 12h (up to a hard cap) while it stays
-  hostile. With a thin profile the plugin defers to the stock 12h timer.
+  timer. Halts run the stock 12h horizon by default. Only a *strong* historical
+  bias (large |score| backed by enough evidence mass) changes that: it can hold
+  the halt past 12h up to a hard cap (24h — the extreme case) while structure
+  stays hostile, or "thaw" it early (as soon as 1h) once structure scores
+  favorably. Without a strong bias the lock is never lifted early — it just
+  serves its 12h. A thin profile falls back to the stock 12h timer too.
 
   PLK (preemptive lock, on by default): proactive rather than reactive — when
   a routine structure check reads a climate that is historically bad (score at
@@ -37,7 +40,10 @@
   const EVENT_W        = 10;                   // halt events are strong anchors
   const SAMPLE_W       = 1;                    // cycle samples are weak fill
   const MIN_MASS       = 6;                    // effective evidence mass required to override the timer
-  const MIN_HALT_MS    = 1 * 3600 * 1000;      // never thaw before 1h
+  const STRONG_MASS    = 12;                   // evidence mass for a *strong* historical bias (2× MIN_MASS)
+  const STRONG_SCORE   = 0.30;                 // |score| at/above which the bias counts as strong
+  const DEFAULT_HALT_MS = 12 * 3600 * 1000;    // stock 12h horizon — the floor unless strong history says otherwise
+  const MIN_HALT_MS    = 1 * 3600 * 1000;      // never thaw before 1h (only reachable under a strong bias)
   const LABEL_WINDOW   = 6 * 3600 * 1000;      // samples are labeled by the realized PnL that followed
   const EVENTS_CAP     = 200;
   const SAMPLES_CAP    = 1000;
@@ -46,7 +52,7 @@
   window.__BotPlugin = {
     id:        'permafrost-winter',
     name:      'Permafrost (Winter)',
-    version:   '1.3.0',
+    version:   '1.4.0',
     targetBot: 'pseudowinter',
     after:     ['everwinter'],
     before:    [],
@@ -88,15 +94,20 @@
                 <div class="pfr-hint">Profile score (−1 hostile … +1 favorable) the current structure must reach to lift a halt early. 0 = at least neutral history nearby.</div>
               </div>
               <div class="g" style="margin-top:8px">
+                <div class="lbl">Strong Bias Score <b x-text="'±'+(cfg.permafrostStrongScore??0.30).toFixed(2)"></b></div>
+                <input type="range" min="0.10" max="0.60" step="0.05" x-model.number="cfg.permafrostStrongScore" @change="persist()">
+                <div class="pfr-hint">|score| at/above which the history counts as a <em>strong bias</em> (also needs evidence mass ≥ 12). Default 12h halts only stretch toward the hard cap, or thaw early, when the bias is this strong — otherwise 12h prevails and the lock is never lifted early.</div>
+              </div>
+              <div class="g" style="margin-top:8px">
                 <div class="lbl">Hard Cap <b x-text="(cfg.permafrostCapHours??24)+'h'"></b></div>
                 <input type="range" min="12" max="48" step="1" x-model.number="cfg.permafrostCapHours" @change="persist()">
-                <div class="pfr-hint">Maximum informed-halt duration. Resumes regardless once reached — stale scars must be re-tested.</div>
+                <div class="pfr-hint">Maximum halt duration under a strong historical bias (the extreme case). Without one, halts run the default 12h. Resumes regardless once reached — stale scars must be re-tested.</div>
               </div>
               <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.permafrostPlkEnabled=!(cfg.permafrostPlkEnabled??true);persist()}">
                 <div class="tog-t" :class="(cfg.permafrostPlkEnabled??true)?'on':''"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Preemptive Lock (PLK)</div>
-                  <div class="pfr-hint">Proactive rather than reactive: when a routine structure check reads a climate that is historically bad (score at or below the trigger, with sufficient evidence), entries lock preemptively — before any PnL damage. Lifts like the other halts: early at the Thaw Score, or at the Hard Cap.</div>
+                  <div class="pfr-hint">Proactive rather than reactive: when a routine structure check reads a climate that is historically bad (score at or below the trigger, with sufficient evidence), entries lock preemptively — before any PnL damage. Holds the default 12h; only a strong bias stretches it to the Hard Cap or thaws it early at the Thaw Score.</div>
                 </div>
               </label>
               <div class="g" x-show="cfg.permafrostPlkEnabled??true" style="margin-top:8px">
@@ -112,7 +123,7 @@
               <div class="pfr-stat" style="margin-top:10px;padding:8px 10px;background:rgba(96,210,255,.05);border:1px solid rgba(96,210,255,.15);border-radius:3px">
                 <div>PROFILE — <span x-text="(pfEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(pfEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(pfSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
                 <div x-show="pfStatus.at">READING — skew <span x-text="(pfStatus.skew??0).toFixed(2)"></span> | breadth <span x-text="(pfStatus.breadth??0).toFixed(2)"></span> | score <span x-text="pfStatus.score===null?'—':pfStatus.score.toFixed(2)"></span> | mass <span x-text="pfStatus.mass.toFixed(1)"></span></div>
-                <div x-show="pfHalt" style="color:var(--ice)">HALT — <span x-text="pfHalt?.kind"></span> (<span x-text="pfHalt?.informed?'profile-governed':'timer fallback'"></span>) <span x-text="(()=>{ void tick; return pfHalt? Math.floor((Date.now()-pfHalt.at)/3600000)+'h elapsed':''; })()"></span></div>
+                <div x-show="pfHalt" style="color:var(--ice)">HALT — <span x-text="pfHalt?.kind"></span> (<span x-text="pfHalt?.strong?'strong bias — up to '+(cfg.permafrostCapHours??24)+'h / early thaw':pfHalt?.informed?'default 12h':'timer fallback'"></span>) <span x-text="(()=>{ void tick; return pfHalt? Math.floor((Date.now()-pfHalt.at)/3600000)+'h elapsed':''; })()"></span></div>
                 <div style="margin-top:6px;display:flex;gap:8px">
                   <button @click="pfExport()" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(96,210,255,.4);border-radius:2px;background:none;color:var(--ice);cursor:pointer;letter-spacing:.5px">Export</button>
                   <button @click="if(!cfgLocked){pfEvents=[];pfSamples=[];pfPnl=[];persist();log('[PFR] Profile cleared.','warn')}" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.4);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Clear Profile</button>
@@ -150,6 +161,7 @@
           await _origInit.call(this);
           if (this.cfg.permafrostEnabled   === undefined) this.cfg.permafrostEnabled   = false;
           if (this.cfg.permafrostThawScore === undefined) this.cfg.permafrostThawScore = 0;
+          if (this.cfg.permafrostStrongScore === undefined) this.cfg.permafrostStrongScore = STRONG_SCORE;
           if (this.cfg.permafrostCapHours  === undefined) this.cfg.permafrostCapHours  = 24;
           if (this.cfg.permafrostPlkEnabled === undefined) this.cfg.permafrostPlkEnabled = true;
           if (this.cfg.permafrostPlkScore   === undefined) this.cfg.permafrostPlkScore   = -0.15;
@@ -168,7 +180,7 @@
           // Drop a stale governed-halt record if the underlying halt is gone (manual clear, expiry).
           // A PLK has no backing host timer — it expires on its own hard cap instead.
           if (this.pfHalt?.kind === 'plk') {
-            if (Date.now() - this.pfHalt.at >= (this.cfg.permafrostCapHours ?? 24) * 3600 * 1000) { this.pfHalt = null; this.pfPlkLastLift = Date.now(); }
+            if (Date.now() - this.pfHalt.at >= (this.pfHalt.strong ? (this.cfg.permafrostCapHours ?? 24) : 12) * 3600 * 1000) { this.pfHalt = null; this.pfPlkLastLift = Date.now(); }
           } else if (this.pfHalt && !_origIsDD.call(this) && !_origIsGL.call(this)) this.pfHalt = null;
           if (this.pfHalt) this._pfEnsureSampler();
           this.log(`[PFR] Permafrost (Winter) v1.3.0 loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
@@ -301,16 +313,19 @@
           const { score, mass } = this._pfScore(reading);
           this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, at: reading.ts };
           const informed = mass >= MIN_MASS;
-          if (informed) {
-            // Enough evidence to govern: extend to the hard cap; thaw lifts it early
+          const strong   = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.permafrostStrongScore ?? STRONG_SCORE);
+          // The stock 12h horizon is the default. Only a *strong* historical bias
+          // extends the halt toward the 24h hard cap (and unlocks early thaw); a
+          // merely-informed profile rides the host's 12h timer unchanged.
+          if (strong) {
             const capUntil = reading.ts + (this.cfg.permafrostCapHours ?? 24) * 3600 * 1000;
             if (kind === 'drawdown') this._drawdownHaltUntil = capUntil;
             else                     this._gainsLockHaltUntil = capUntil;
           }
           if (this.pfHalt?.kind === 'plk') this.pfPlkLastLift = Date.now(); // superseded PLK still starts the cooldown
-          this.pfHalt = { kind, at: reading.ts, informed };
+          this.pfHalt = { kind, at: reading.ts, informed, strong };
           const _d = this._pfDescribe(reading, score, mass);
-          this.log(`[PFR] 🧊 ${kind === 'drawdown' ? 'Drawdown' : 'Gains lock'} activated — market structure is ${_d.desc} | ${_d.bias} → ${informed ? 'profile-governed halt, thaws when structure clears' : 'profile too thin — stock 12h timer'}`, 'warn');
+          this.log(`[PFR] 🧊 ${kind === 'drawdown' ? 'Drawdown' : 'Gains lock'} activated — market structure is ${_d.desc} | ${_d.bias} → ${strong ? `strong historical bias — profile-governed (may extend to the ${this.cfg.permafrostCapHours ?? 24}h cap or thaw early)` : informed ? 'default 12h halt — early thaw needs a strong bias' : 'profile too thin — stock 12h timer'}`, 'warn');
           this._pfEnsureSampler();
           this.persist();
         },
@@ -336,7 +351,12 @@
           this._pfAddSample(reading);
           const { score, mass } = this.pfStatus;
           const elapsed = Date.now() - this.pfHalt.at;
-          if (elapsed >= MIN_HALT_MS && mass >= MIN_MASS && score !== null && score >= (this.cfg.permafrostThawScore ?? 0)) {
+          const strong  = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.permafrostStrongScore ?? STRONG_SCORE);
+          // Early thaw is reserved for a strong historical bias — without one, the
+          // lock is never lifted arbitrarily; it simply runs its 12h horizon. For
+          // drawdown/gains-lock that horizon is the host's own timer; PLK has none,
+          // so it self-caps below (12h default, 24h only under a strong bias).
+          if (strong && elapsed >= MIN_HALT_MS && score >= (this.cfg.permafrostThawScore ?? 0)) {
             const kind = this.pfHalt.kind;
             if      (kind === 'drawdown')  { this._drawdownHaltUntil = null; this._drawdownWindow = []; }
             else if (kind === 'gainslock') { this._gainsLockHaltUntil = null; this._gainsWindow = []; }
@@ -344,9 +364,9 @@
             if (kind === 'plk') this.pfPlkLastLift = Date.now(); // start the re-trigger cooldown
             this.pfHalt = null;
             this._pfStopSampler();
-            this.log(`[PFR] 🌊 Thaw — structure cleared the ${kind} zone after ${(elapsed / 3600000).toFixed(1)}h (score ${score.toFixed(2)} ≥ ${(this.cfg.permafrostThawScore ?? 0).toFixed(2)}, mass ${mass.toFixed(1)}) — new entries re-enabled`, 'success');
-          } else if (isPlk && elapsed >= (this.cfg.permafrostCapHours ?? 24) * 3600 * 1000) {
-            // PLK hard cap — the host timers cap the other kinds; PLK caps itself here
+            this.log(`[PFR] 🌊 Thaw — strong bias cleared the ${kind} zone after ${(elapsed / 3600000).toFixed(1)}h (score ${score.toFixed(2)} ≥ ${(this.cfg.permafrostThawScore ?? 0).toFixed(2)}, mass ${mass.toFixed(1)}) — new entries re-enabled`, 'success');
+          } else if (isPlk && elapsed >= (this.pfHalt.strong ? (this.cfg.permafrostCapHours ?? 24) : 12) * 3600 * 1000) {
+            // PLK horizon — 12h default, extended to the hard cap only under a strong bias
             this.pfPlkLastLift = Date.now(); // start the re-trigger cooldown
             this.pfHalt = null;
             this._pfStopSampler();
@@ -387,8 +407,9 @@
                 && !_origIsDD.call(this) && !_origIsGL.call(this)
                 && mass >= MIN_MASS && score !== null
                 && score <= (this.cfg.permafrostPlkScore ?? -0.15)) {
-              this.pfHalt = { kind: 'plk', at: Date.now(), informed: true };
-              this.log(`[PFR] 🛑 PLK — structure is ${_d.desc} and historically bad for shorts (score ${score.toFixed(2)} ≤ ${(this.cfg.permafrostPlkScore ?? -0.15).toFixed(2)}, mass ${mass.toFixed(1)}) — preemptive lock engaged; thaws when structure clears`, 'warn');
+              const plkStrong = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.permafrostStrongScore ?? STRONG_SCORE);
+              this.pfHalt = { kind: 'plk', at: Date.now(), informed: true, strong: plkStrong };
+              this.log(`[PFR] 🛑 PLK — structure is ${_d.desc} and historically bad for shorts (score ${score.toFixed(2)} ≤ ${(this.cfg.permafrostPlkScore ?? -0.15).toFixed(2)}, mass ${mass.toFixed(1)}) — preemptive lock engaged (${plkStrong ? 'strong bias — up to the hard cap, thaws early when structure clears' : 'default 12h horizon'})`, 'warn');
               this._pfEnsureSampler();
             }
             this.persist();
