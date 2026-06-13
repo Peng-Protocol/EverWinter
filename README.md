@@ -312,12 +312,13 @@ Computed from the **full** USDT-perp ticker universe (same filters as the scan: 
 4. The hard cap is the exploration arm: it resumes trading regardless, so a region the profile distrusts gets re-tested rather than avoided forever.
 5. Manual halt clears are respected — the sampler notices the halt is gone and stands down.
 
-Transform hooks touched: `init`, `persist`, `runScan`, `pseudoClosePosition`, plus the two halt seams per bot. Profile persists under `__permafrost_winter_v1` / `__ashfall_chaser_v1` (events capped at 200, samples at 1000).
+Transform hooks touched: `init`, `persist`, `runScan`, `pseudoClosePosition`, plus the two halt seams per bot. Profile persists under `__permafrost_winter_v1` / `__ashfall_chaser_v1` (events capped at 200, samples at 1000). **These keys are plugin-owned and are not touched when the plugin is removed** — data survives an uninstall and is restored automatically on reinstall.
 
 ### UI Elements
 
 - **Mode label suffix** — "+ Permafrost" / "+ Ashfall" via `mode-label-extra` while enabled.
-- **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours) plus **Export** (JSON download of the profile) and **Clear Profile** buttons. Controls respect the config lock.
+- **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, PLK toggle and trigger slider, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours). Buttons: **Export** (JSON download of events, samples, and wave history), **Import** (replaces current events, samples, and wave from a JSON file — guarded by `confirm()`), and **Clear Profile** (zeroes events, samples, PnL log, and wave — guarded by `confirm()`). All controls respect the config lock.
+- **Danger Zone** — collapsible section always visible at the bottom of the accordion (outside the enabled-guard). Contains **Clear Plugin State**: removes the plugin's localStorage key entirely and resets all in-memory data including halt and PLK state. Guarded by `confirm()`. Use before uninstalling to prevent orphaned data, or to guarantee a fully clean slate.
 - **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with skew/breadth/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score.
 
 Note: for the first weeks the plugin behaves almost exactly like the stock timers — that is by design. It refuses to override the clock until enough evidence has accumulated near the current reading.
@@ -328,15 +329,11 @@ Note: for the first weeks the plugin behaves almost exactly like the stock timer
 
 `plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles. Strategy rationale lives in the Strategy Book's **Scattershot** section; this section documents the implementation.
 
-A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 105% buffered → 70% functional / SL 18% by default) means one TP win covers ~3.9 SL exits; the edge is meant to come from broad market drift, so the strategy defers when the climate reads hostile.
+A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 105% buffered → 70% functional / SL 18% by default) means one TP win covers ~3.9 SL exits; the edge is meant to come from broad market drift. Drawdown throttle and gains lock gate all entries; Permafrost/Ashfall governs those halts when loaded.
 
 ### Entry pass (`_blzRunScan` / `_fstRunScan`)
 
-Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn at random without replacement, **alternating between gainers and losers** so each cycle's picks span both sides of the move (falling back to the remaining side when one empties; failed opens retried up to 3× picks). Each cycle logs pool size with its ▲/▼ split and opens.
-
-### Climate gate (Permafrost / Ashfall coupling)
-
-When the matching halt governor is loaded, the strategy reads its live structure status (`pfStatus`/`afStatus`). If the reading is fresh (< 2h), evidenced (mass ≥ 6), and **hostile (score < 0)**, the cycle is deferred (logged once per state change). Absent governor, stale reading, or thin profile → the strategy fires on its own — the gate only ever vetoes, mirroring the governors' own refuse-to-act-on-thin-evidence posture. Halt governance itself (Permafrost/Ashfall extending or thawing drawdown/gains-lock halts) applies to these entries automatically since the pass sits behind the host's halt gates.
+Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked — logging a brief `"Scatter skipped — gains lock / drawdown halt / PLK active"` line at each blocked cycle so the reason is always visible. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn at random without replacement, **alternating between gainers and losers** so each cycle's picks span both sides of the move (falling back to the remaining side when one empties; failed opens retried up to 3× picks). Each cycle logs pool size with its ▲/▼ split and opens.
 
 ### Open mechanics (cfg-swap)
 
