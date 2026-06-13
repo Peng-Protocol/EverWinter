@@ -768,6 +768,18 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <div style="font-family:var(--mono);font-size:10px;color:var(--short);margin-bottom:5px">🛑 HALTED — resumes in <span x-text="(()=>{ void tick; const rem=Math.max(0,_drawdownHaltUntil-Date.now()); const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); return h+'h '+String(m).padStart(2,'0')+'m'; })()"></span></div>
                 <button @click="if(!cfgLocked){_drawdownHaltUntil=null;_drawdownWindow=[];persist()}" :disabled="cfgLocked" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Cancel Halt</button>
               </div>
+              <!-- Manual halt -->
+              <div style="margin-top:10px;padding:8px 10px;border:1px solid rgba(255,160,0,.25);border-radius:3px" :style="_manualHalt?'background:rgba(255,160,0,.07)':''">
+                <div style="font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:rgba(255,160,0,.75);margin-bottom:5px">MANUAL HALT</div>
+                <div x-show="!_manualHalt">
+                  <button @click="if(!cfgLocked){activateManualHalt()}" :disabled="cfgLocked" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,160,0,.5);border-radius:2px;background:none;color:rgba(255,160,0,.9);cursor:pointer;letter-spacing:.5px">Activate Manual Halt</button>
+                  <div style="font-size:9px;color:var(--text-lo);margin-top:4px;line-height:1.5">Immediately blocks all new scans — identical in effect to a drawdown halt. Lift it manually at any time.</div>
+                </div>
+                <div x-show="_manualHalt">
+                  <div style="font-family:var(--mono);font-size:10px;color:rgba(255,160,0,.9);margin-bottom:5px">🛑 MANUAL HALT ACTIVE</div>
+                  <button @click="if(!cfgLocked){liftManualHalt()}" :disabled="cfgLocked" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,160,0,.5);border-radius:2px;background:none;color:rgba(255,160,0,.9);cursor:pointer;letter-spacing:.5px">Lift Halt</button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -1789,6 +1801,7 @@ function pw() { return {
   _cycleRunning: false, // re-entry guard for runScheduledCycle
   _roleBadgeProviders: [], // plugins push (item)=>htmlString|null here to render their own position role badge (BLIZZ, etc.)
   _drawdownHaltUntil: null, // timestamp (ms) when drawdown halt expires; null = not halted
+  _manualHalt: false,       // user-initiated halt — blocks scans identically to a drawdown halt
   _drawdownWindow: [],  // { pnl, ts }[] — rolling 6h closed-trade PnL log for drawdown throttle (immune to closedTrades compaction)
   _gainsLockHaltUntil: null, // timestamp (ms) when gains lock expires; null = not locked
   _gainsWindow: [],     // { pnl, ts }[] — rolling 6h closed-trade PnL log for gains lock
@@ -1878,9 +1891,22 @@ function pw() { return {
   // threshold (default −0.5× entry margin), all new position entries are blocked for 12h.
   // Existing positions and DCA fills are unaffected; only new opens are gated.
   _isDrawdownHalted() {
+    if (this._manualHalt) return true;
     return this.cfg.drawdownThrottleEnabled !== false
       && typeof this._drawdownHaltUntil === 'number'
       && this._drawdownHaltUntil > Date.now();
+  },
+
+  activateManualHalt() {
+    this._manualHalt = true;
+    this.persist();
+    this.log('[MHL] 🛑 Manual halt activated — all new scans blocked until lifted.', 'warn');
+  },
+
+  liftManualHalt() {
+    this._manualHalt = false;
+    this.persist();
+    this.log('[MHL] ✅ Manual halt lifted — new entries re-enabled.', 'success');
   },
 
   // Record a closed trade's PnL into the rolling 6h window and evaluate the throttle
@@ -2111,6 +2137,7 @@ function pw() { return {
         drawdownWindow:     this._drawdownWindow,
         gainsLockHaltUntil: this._gainsLockHaltUntil,
         gainsWindow:        this._gainsWindow,
+        manualHalt:         this._manualHalt,
       }));
       this.savedPositions = [...this.positions];
     } catch(e) {}
@@ -2201,6 +2228,7 @@ function pw() { return {
       if (typeof s.drawdownHaltUntil === 'number' && s.drawdownHaltUntil > nowGl) {
         this._drawdownHaltUntil = s.drawdownHaltUntil;
       }
+      if (s.manualHalt) this._manualHalt = true;
       // Restore the rolling drawdown window (prune stale entries); seed it from recent
       // closedTrades for saves that predate the dedicated window.
       const DD_TTL_LOAD = 6 * 3600 * 1000;
@@ -2243,6 +2271,7 @@ function pw() { return {
     this._laggardId   = null;
     this._drawdownWindow = [];
     this._drawdownHaltUntil = null;
+    this._manualHalt = false;
     this._gainsWindow = [];
     this._gainsLockHaltUntil = null;
     this.sess = { trades:0, wins:0, losses:0, pnl:0, forceClose:0, ftTotalDone:0 };
@@ -2503,7 +2532,12 @@ function pw() { return {
   async runScan() {
     if (this.ui.scanning) return;
     if (this._isDrawdownHalted()) {
-      this.log(this._drawdownHaltUntil > Date.now() ? '[DWN] 🛑 Scan skipped — drawdown halt active' : '[PLK] 🛑 Scan skipped — preemptive lock active', 'warn');
+      this.log(
+        this._manualHalt ? '[MHL] 🛑 Scan skipped — manual halt active' :
+        this._drawdownHaltUntil > Date.now() ? '[DWN] 🛑 Scan skipped — drawdown halt active' :
+        '[PLK] 🛑 Scan skipped — preemptive lock active',
+        'warn'
+      );
       return;
     }
     if (this._isGainsLocked()) {
@@ -2653,9 +2687,10 @@ function pw() { return {
           const effectiveLSlots = this.positions.length;
           if (effectiveLSlots >= this.cfg.maxPos) { loserCandidates.push({ symbol: sym, change, price, rsi6: null, rsi12: null, rsi24: null, fundingRate: loserFr, status: 'maxed', skipReason: '' }); continue; }
 
-          // 24hr change gate — must be at or below dynamic loser ceiling (60% of worst, min -3%)
-          if (change > dynamicLoserCeiling) {
-            loserCandidates.push({ symbol: sym, change, price, rsi6: null, rsi12: null, rsi24: null, fundingRate: loserFr, status: 'skip', skipReason: `24h change ${change.toFixed(2)}% above loser gate ${dynamicLoserCeiling.toFixed(2)}%` });
+          // 24hr change gate — must be at or above dynamic loser ceiling (60% of worst, min -3%)
+          // skip if MORE extreme (more negative) than the threshold — avoids rug-pull tickers
+          if (change < dynamicLoserCeiling) {
+            loserCandidates.push({ symbol: sym, change, price, rsi6: null, rsi12: null, rsi24: null, fundingRate: loserFr, status: 'skip', skipReason: `24h change ${change.toFixed(2)}% below loser gate ${dynamicLoserCeiling.toFixed(2)}%` });
             continue;
           }
 

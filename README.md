@@ -304,20 +304,67 @@ Computed from the **full** USDT-perp ticker universe (same filters as the scan: 
 - **Samples** (weight 1) — a structure reading is taken on every `runScan` and every slow tick during halts; 6h later it is labeled with the realized PnL (`totalPnl`, matching the halt windows) of trades closed in that window, normalized by entry margin and clamped to ±1. Windows with no closed trades are dropped — no evidence either way.
 - **Score** — gaussian-kernel weighted vote (bandwidth 0.25) of all entries near the current reading, with 7-day half-life recency decay so stale scars fade. Returns `score` ∈ [−1, +1] and `mass` (effective evidence weight nearby).
 
+### Structure trajectory (the wave)
+
+Every structure reading appends a `{ ts, lean }` point to a rolling wave array, where `lean = (skew + breadth) / 2 ∈ [−1, +1]` (+1 strongly bullish, −1 strongly bearish). This is kept **separate from samples** — it is never labeled, scored, or pruned for evidence; its only job is to record the path of the market. Points older than 7 days are pruned; the array is hard-capped at 2000 points.
+
+`_afTrajectory()` / `_pfTrajectory()` derives two numbers from the wave:
+- `lean` — the most recent point's value
+- `slope` — mean of the newest third minus mean of the oldest third; positive = drifting bullish, negative = drifting bearish
+
+The wave is plotted as an inline SVG in the accordion (bull/bear reference lines, current-direction color, live dot at the latest point) and its direction label ("rising ▲ / falling ▼ / steady ▬") is shown next to the graph header.
+
+### Effective score and inherent prior
+
+A raw `score` from the learned profile is only available once `mass ≥ MIN_MASS (6)`. Before that — and as a blending term even after — the plugin uses an **inherent prior** derived purely from the wave:
+
+```
+inherent = DIR × (0.6 × lean + 0.4 × clamp(slope / 0.3, −1, +1))
+```
+
+`DIR = −1` for Winter (shorts favor bearish/falling), `DIR = +1` for Chaser (longs favor bullish/rising). The slope term is what prevents longing into a dump or shorting into a pump: a mildly bullish but falling tape gives a negative inherent score for longs.
+
+The **effective score** blends learned history with the inherent prior by how full the evidence cup is:
+
+```
+massFrac = clamp(mass / STRONG_MASS, 0, 1)     (STRONG_MASS = 12)
+eff = (score is null) ? inherent
+                      : massFrac × score + (1 − massFrac) × inherent
+```
+
+At `mass = 0` the inherent prior drives everything. At `mass ≥ 12` the learned profile is in full control. Between those extremes the two are blended. `eff` (not raw `score`) is what gates the PLK and is shown as "effective" in the status block; the slow-tick sampler's early-thaw decision also uses `eff`.
+
+### PLK (Preemptive Lock)
+
+A proactive entry lock that fires *before* any PnL damage, during routine scan structure checks. When `eff ≤ cfg.permafrostPlkScore` / `cfg.ashfallPlkScore` (default −0.15, range −0.50…−0.05) with sufficient evidence (`mass ≥ MIN_MASS`), a PLK engages for a duration that scales with `|eff|` as a fraction of the hard cap:
+
+```
+durMs = clamp(|eff| × capMs, 1h, capMs)
+```
+
+This produces arbitrary durations (e.g. 3h 20m) rather than fixed blocks. The PLK rides the drawdown gate (`_isDrawdownHalted()` is overridden to return true while a PLK is active), so every entry choke point — including strategy plugins — respects it automatically. A real drawdown or gains-lock halt supersedes an active PLK (the `kind` field is overwritten; the PLK cooldown still starts from that moment).
+
+**Dynamic cooldown**: after any PLK ends (elapsed, early-thaw, or manual lift), the next PLK cannot engage until `plkLastDurationMs` has passed — the cooldown matches the last lock's own duration, preventing back-to-back locks.
+
+**Manual lift**: available via the "Lift PLK" button in the accordion status block and via the topbar countdown pill (which also shows remaining time and is click-to-lift). Lifting starts the cooldown immediately.
+
+Under a **strong bias** (`mass ≥ 12` and `|score| ≥ cfg.*StrongScore`, default ±0.30), the PLK gets the `strong` flag, which enables early thaw/settle: the sampler checks `eff` each tick and lifts the PLK once it crosses the Thaw/Settle Score, same as for a drawdown/gainslock halt.
+
 ### Halt lifecycle
 
 1. Halt fires → structure captured, event recorded.
-2. If local `mass ≥ 6` the halt becomes **profile-governed**: the halt timestamp is extended to the hard cap (`cfg.permafrostCapHours` / `cfg.ashfallCapHours`, default 24h, range 12–48h) and a slow sampler starts at `max(1h, 4 × scanMins)`. If the profile is too thin, the stock 12h timer stands untouched.
-3. Each slow tick re-reads structure; the halt lifts early ("thaw" / "ash settled") once `score ≥` the configured threshold (`cfg.permafrostThawScore` / `cfg.ashfallThawScore`, default 0, range −0.5…+0.5) with sufficient mass — never before 1h elapsed. Lifting clears the corresponding rolling PnL window, mirroring the manual-clear semantics.
-4. The hard cap is the exploration arm: it resumes trading regardless, so a region the profile distrusts gets re-tested rather than avoided forever.
+2. If `mass ≥ 6` the halt becomes **profile-governed**: the halt timestamp is extended to the hard cap (`cfg.permafrostCapHours` / `cfg.ashfallCapHours`, default 24h, range 12–48h) and a slow sampler starts at `max(1h, 4 × scanMins)`. Profile too thin → stock 12h timer stands untouched.
+3. Early lift requires a **strong bias** (`mass ≥ 12` and `|score| ≥ cfg.*StrongScore`): each slow tick checks `eff ≥ Thaw/Settle Score` (default 0) after at least 1h has elapsed. Without a strong bias the halt always runs to the 12h default or the hard cap — it is never lifted early. Lifting clears the corresponding rolling PnL window.
+4. The hard cap is the exploration arm: it resumes trading regardless, so a region the profile distrusts is re-tested rather than avoided forever.
 5. Manual halt clears are respected — the sampler notices the halt is gone and stands down.
 
-Transform hooks touched: `init`, `persist`, `runScan`, `pseudoClosePosition`, plus the two halt seams per bot. Profile persists under `__permafrost_winter_v1` / `__ashfall_chaser_v1` (events capped at 200, samples at 1000).
+Transform hooks touched: `init`, `persist`, `runScan`, `pseudoClosePosition`, plus the two halt seams per bot. Profile persists under `__permafrost_winter_v1` / `__ashfall_chaser_v1` (events capped at 200, samples at 1000, wave at 2000 points with 7-day TTL). **These keys are plugin-owned and are not touched when the plugin is removed** — data survives an uninstall and is restored automatically on reinstall.
 
 ### UI Elements
 
 - **Mode label suffix** — "+ Permafrost" / "+ Ashfall" via `mode-label-extra` while enabled.
-- **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours) plus **Export** (JSON download of the profile) and **Clear Profile** buttons. Controls respect the config lock.
+- **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, PLK toggle and trigger slider, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours). Buttons: **Export** (JSON download of events, samples, and wave history), **Import** (replaces current events, samples, and wave from a JSON file — guarded by `confirm()`), and **Clear Profile** (zeroes events, samples, PnL log, and wave — guarded by `confirm()`). All controls respect the config lock.
+- **Danger Zone** — collapsible section always visible at the bottom of the accordion (outside the enabled-guard). Contains **Clear Plugin State**: removes the plugin's localStorage key entirely and resets all in-memory data including halt and PLK state. Guarded by `confirm()`. Use before uninstalling to prevent orphaned data, or to guarantee a fully clean slate.
 - **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with skew/breadth/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score.
 
 Note: for the first weeks the plugin behaves almost exactly like the stock timers — that is by design. It refuses to override the clock until enough evidence has accumulated near the current reading.
@@ -328,15 +375,11 @@ Note: for the first weeks the plugin behaves almost exactly like the stock timer
 
 `plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles. Strategy rationale lives in the Strategy Book's **Scattershot** section; this section documents the implementation.
 
-A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 105% buffered → 70% functional / SL 18% by default) means one TP win covers ~3.9 SL exits; the edge is meant to come from broad market drift, so the strategy defers when the climate reads hostile.
+A random-scattershot bet on the market at large: each scan cycle picks N **random** tickers whose |24h change| clears a configurable baseline and opens them in the bot's direction with a fixed SL and a far TP, force-closing any survivor after 12 hours. The barrier geometry (TP 105% buffered → 70% functional / SL 18% by default) means one TP win covers ~3.9 SL exits; the edge is meant to come from broad market drift. Drawdown throttle and gains lock gate all entries; Permafrost/Ashfall governs those halts when loaded.
 
 ### Entry pass (`_blzRunScan` / `_fstRunScan`)
 
-Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn at random without replacement, **alternating between gainers and losers** so each cycle's picks span both sides of the move (falling back to the remaining side when one empties; failed opens retried up to 3× picks). Each cycle logs pool size with its ▲/▼ split and opens.
-
-### Climate gate (Permafrost / Ashfall coupling)
-
-When the matching halt governor is loaded, the strategy reads its live structure status (`pfStatus`/`afStatus`). If the reading is fresh (< 2h), evidenced (mass ≥ 6), and **hostile (score < 0)**, the cycle is deferred (logged once per state change). Absent governor, stale reading, or thin profile → the strategy fires on its own — the gate only ever vetoes, mirroring the governors' own refuse-to-act-on-thin-evidence posture. Halt governance itself (Permafrost/Ashfall extending or thawing drawdown/gains-lock halts) applies to these entries automatically since the pass sits behind the host's halt gates.
+Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked — logging a brief `"Scatter skipped — gains lock / drawdown halt / PLK active"` line at each blocked cycle so the reason is always visible. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6, range 1–20) — in **either direction** — excluding held and banned symbols. Up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn at random without replacement, **alternating between gainers and losers** so each cycle's picks span both sides of the move (falling back to the remaining side when one empties; failed opens retried up to 3× picks). Each cycle logs pool size with its ▲/▼ split and opens.
 
 ### Open mechanics (cfg-swap)
 
