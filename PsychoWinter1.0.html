@@ -1351,6 +1351,7 @@ function psycho() { return {
   _whiplashScheduled: {},
   _tsOffset:      0,
   _lastSignedAt:  0,
+  _pwNeedsSync:   false,
   _lastTickerFetch: 0, // timestamp of last per-symbol REST ticker fallback round in watchPositions
   _lastAllTickers:   null,
   _lastAllTickersAt: 0,
@@ -1587,6 +1588,7 @@ function psycho() { return {
   },
 
   async runScheduledCycle() {
+    await this.liveSyncPositions();
     try { await this.runPsychoScan(); } catch(e) { this.bot.scanning = false; this.log('Scan error: '+e.message, 'error'); }
   },
 
@@ -1965,6 +1967,10 @@ function psycho() { return {
   // ── Watch Positions ──
   async watchPositions() {
     if (this.positions.length === 0) { wsWatchSymbols([]); return; } // drop the WS stream when nothing is held
+    if (this._pwNeedsSync) {
+      this._pwNeedsSync = false;
+      await this.liveSyncPositions();
+    }
     const now = Date.now();
 
     // Keep the WS ticker subscriptions aligned with the held position symbols
@@ -2480,6 +2486,7 @@ function psycho() { return {
     } else {
       this._logCloseBatch(pos.symbol, totalPnl, pnlPct, reason, isWin);
     }
+    if (reason === 'sl' || reason === 'tp') this._pwNeedsSync = true;
     _closingIds.delete(pos.id);
     this.persist();
   },
@@ -3841,6 +3848,40 @@ function psycho() { return {
 
   async liveCancelOrder(symbol, orderId) {
     await this.liveApiCall('/v5/order/cancel', { category:'linear', symbol, orderId }, 'POST');
+  },
+
+  async liveSyncPositions() {
+    if (!this.cfg.liveMode || !this.cfg.apiKey || !this.cfg.apiSecret) return;
+    try {
+      const result = await this.liveApiCall('/v5/position/list', { category:'linear', settleCoin:'USDT' });
+      const exMap  = new Map(
+        (result?.list || [])
+          .filter(e => e.side === 'Sell' && parseFloat(e.size) > 0)
+          .map(e => [e.symbol, e])
+      );
+      for (const pos of [...this.positions]) {
+        if (!pos._live) continue;
+        const ep = exMap.get(pos.symbol);
+        if (!ep) {
+          let exitPrice = pos.markPrice || pos.entryPrice, reason = 'tp';
+          try {
+            const pr  = await this.liveApiCall('/v5/position/closed-pnl', { category:'linear', symbol:pos.symbol, limit:1 });
+            const rec = pr?.list?.[0];
+            if (rec) {
+              exitPrice = parseFloat(rec.avgExitPrice || rec.exitPrice || exitPrice);
+              reason    = parseFloat(rec.closedPnl || 0) >= 0 ? 'tp' : 'sl';
+            }
+          } catch(e) {}
+          this.log(`[SYNC] ${pos.symbol}: exchange closed [${reason}] @ ${exitPrice}`, 'info');
+          await this.pseudoClosePosition(pos, reason, exitPrice);
+        } else {
+          pos.markPrice = parseFloat(ep.markPrice || ep.avgPrice || pos.markPrice);
+          pos.totalSize = parseFloat(ep.size      || pos.totalSize);
+        }
+      }
+    } catch(e) {
+      this.log(`[SYNC] position sync error: ${e.message}`, 'warn');
+    }
   },
 
   // ── Keepalive ──
