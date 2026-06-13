@@ -156,7 +156,7 @@
                     <div class="tog-t" :class="cfg.permafrostIoEnabled?'on':''"><div class="tog-k"></div></div>
                     <span class="tog-l">Collective IO</span>
                   </label>
-                  <span class="pfr-hint" style="margin:0">Fetches L/S ratio from the top 3 tickers by turnover each scan and blends their contrarian signal into the inherent score.</span>
+                  <span class="pfr-hint" style="margin:0">Aggregates funding rates across all tickers (already in the ticker response — zero extra bandwidth) as a contrarian crowd-sentiment signal and blends it into the inherent score.</span>
                 </div>
                 <div x-show="cfg.permafrostIoEnabled && pfStatus.ioScore != null" class="pfr-hint" style="margin-top:3px">
                   IO <span x-text="pfStatus.ioScore>=0?'+':''"></span><span x-text="(pfStatus.ioScore??0).toFixed(2)"></span> — <span x-text="(pfStatus.ioScore??0)>0.2?'crowd net long (contrarian bearish)':(pfStatus.ioScore??0)<-0.2?'crowd net short (contrarian bullish)':'crowd neutral'"></span>
@@ -336,7 +336,7 @@
             }
             let gSum = 0, lSum = 0, gCount = 0, lCount = 0;
             let gTurnover = 0, lTurnover = 0;
-            const byTurnover = [];
+            let frSum = 0, frCount = 0;
             for (const t of list) {
               if (!t.symbol.endsWith('USDT') || t.symbol === 'BTCUSDT') continue;
               if (parseFloat(t.lastPrice || 0) < 0.001) continue;
@@ -344,28 +344,19 @@
               const tvr = parseFloat(t.turnover24h  || 0);
               if (ch > 0)      { gSum += ch; gCount++; gTurnover += tvr; }
               else if (ch < 0) { lSum += Math.abs(ch); lCount++; lTurnover += tvr; }
-              if (tvr > 0) byTurnover.push({ symbol: t.symbol, tvr });
+              const fr = parseFloat(t.fundingRate || 0);
+              if (!isNaN(fr)) { frSum += fr * 100; frCount++; } // accumulate as %
             }
             const sumT   = gSum + lSum, cntT = gCount + lCount;
             const totalTvr = gTurnover + lTurnover;
             const vol    = totalTvr > 0 ? +((gTurnover - lTurnover) / totalTvr).toFixed(4) : 0;
             const volAbs = +(totalTvr / 1e9).toFixed(2); // USD billions
 
-            // Collective IO: L/S ratio from top 3 tickers by turnover (contrarian signal).
-            // buyRatio > 0.5 = crowd is net long → bearish lean for a short bot.
-            let ioScore = null;
-            if (this.cfg.permafrostIoEnabled !== false && byTurnover.length > 0) {
-              byTurnover.sort((a, b) => b.tvr - a.tvr);
-              const top3 = byTurnover.slice(0, 3).map(t => t.symbol);
-              try {
-                const ratios = await Promise.all(top3.map(async sym => {
-                  const r = await fetch(`${this.base}/v5/market/account-ratio?category=linear&symbol=${sym}&period=1h&limit=1`);
-                  const d = await r.json();
-                  return d.retCode === 0 ? parseFloat(d.result?.list?.[0]?.buyRatio ?? 0.5) : 0.5;
-                }));
-                ioScore = +((ratios.reduce((a, v) => a + v, 0) / ratios.length - 0.5) * 2).toFixed(4);
-              } catch(e) { /* non-fatal — IO unavailable this tick */ }
-            }
+            // Collective IO from aggregate funding rate: positive funding = longs paying = crowd net long.
+            // Normalised against 0.05% reference (≈5× the typical 0.01%/8h baseline) → [-1, 1].
+            const ioScore = frCount > 0
+              ? +Math.max(-1, Math.min(1, (frSum / frCount) / 0.05)).toFixed(4)
+              : null;
 
             return {
               ts: Date.now(),
