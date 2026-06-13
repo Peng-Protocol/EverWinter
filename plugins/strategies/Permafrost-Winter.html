@@ -70,6 +70,7 @@
   const WAVE_MIN_PTS   = 3;                 // readings needed before a trajectory is meaningful
   const W_LEAN         = 0.6;               // inherent-score weight on the current structure level
   const W_SLOPE        = 0.4;               // inherent-score weight on the trajectory (where it's heading)
+  const W_IO           = 0.15;              // inherent-score weight on collective IO sentiment (contrarian)
   const SLOPE_REF      = 0.3;               // lean change over the window that counts as full-scale
   const DIR            = -1;                // PseudoWinter shorts → favourable structure is bearish/falling
 
@@ -147,6 +148,19 @@
                 <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=pfStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
                 <div x-html="_pfWaveSvg()" style="margin-top:4px;border:1px solid rgba(96,210,255,.15);border-radius:3px;background:rgba(96,210,255,.03)"></div>
                 <div class="pfr-hint">Path of the market's structure lean (bull ↑ / bear ↓), retained for as long as there is data — up to ~a week. The plugin reads where the wave is <em>heading</em>, not just where it is — folding an inherent bull⇄bear oscillation in as a fallback so it won't short into the start of a pump. History stays primary when the profile is rich.</div>
+                <div class="lbl" style="margin-top:8px">Slope Window <b x-text="(cfg.permafrostSlopeWindowHours??6)+'h'"></b></div>
+                <input type="range" min="1" max="24" step="1" x-model.number="cfg.permafrostSlopeWindowHours" @change="persist()">
+                <div class="pfr-hint">Timeframe for the directional comparison — "turning bullish/bearish" means the avg lean over the last N hours has shifted vs the N hours before it. Default 6h; raise to 12h for a slower, less reactive signal.</div>
+                <div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                  <label class="tog" style="font-size:9px" @click="cfg.permafrostIoEnabled=!cfg.permafrostIoEnabled;persist()">
+                    <div class="tog-t" :class="cfg.permafrostIoEnabled?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">Collective IO</span>
+                  </label>
+                  <span class="pfr-hint" style="margin:0">Aggregates funding rates across all tickers (already in the ticker response — zero extra bandwidth) as a contrarian crowd-sentiment signal and blends it into the inherent score.</span>
+                </div>
+                <div x-show="cfg.permafrostIoEnabled && pfStatus.ioScore != null" class="pfr-hint" style="margin-top:3px">
+                  IO <span x-text="pfStatus.ioScore>=0?'+':''"></span><span x-text="(pfStatus.ioScore??0).toFixed(2)"></span> — <span x-text="(pfStatus.ioScore??0)>0.2?'crowd net long (contrarian bearish)':(pfStatus.ioScore??0)<-0.2?'crowd net short (contrarian bullish)':'crowd neutral'"></span>
+                </div>
               </div>
               <div class="pfr-stat" style="margin-top:10px;padding:8px 10px;background:rgba(96,210,255,.05);border:1px solid rgba(96,210,255,.15);border-radius:3px">
                 <div>PROFILE — <span x-text="(pfEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(pfEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(pfSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
@@ -200,7 +214,8 @@
         pfHalt:    null, // { kind, at, informed, strong, until?, durMs? } while a halt is being governed (until/durMs are PLK-only)
         pfPlkLastLift: 0, // when the last PLK ended — gates the (dynamic) PLK cooldown
         pfPlkLastDurationMs: 0, // duration of the last PLK — the cooldown matches it
-        pfStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, at: 0 },
+        _pfStructureList: null, _pfStructureAt: 0, // own 3h ticker cache independent of host
+        pfStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
 
         async init() {
           await _origInit.call(this);
@@ -211,6 +226,8 @@
           if (this.cfg.permafrostPlkEnabled === undefined) this.cfg.permafrostPlkEnabled = true;
           if (this.cfg.permafrostPlkScore   === undefined) this.cfg.permafrostPlkScore   = -0.15;
           if (this.cfg.permafrostPlkCooldownHours === undefined) this.cfg.permafrostPlkCooldownHours = 24;
+          if (this.cfg.permafrostSlopeWindowHours === undefined) this.cfg.permafrostSlopeWindowHours = 6;
+          if (this.cfg.permafrostIoEnabled       === undefined) this.cfg.permafrostIoEnabled       = true;
           try {
             const raw = localStorage.getItem(PFR_KEY);
             if (raw) {
@@ -309,30 +326,53 @@
           try {
             // Reuse the host scan's bulk ticker response when fresh (slow-tick
             // sampling during halts falls back to fetching — scans don't run then)
+            const cooldownMs = (this.cfg.bulkTickerCooldownHours ?? 3) * 3600 * 1000;
             let list;
-            if (this._lastAllTickers?.length && (Date.now() - (this._lastAllTickersAt || 0)) < 60000) {
-              list = this._lastAllTickers;
+            if (this._pfStructureList?.length && (Date.now() - (this._pfStructureAt || 0)) < cooldownMs) {
+              list = this._pfStructureList; // own cache within cooldown
+            } else if (this._lastAllTickers?.length && (Date.now() - (this._lastAllTickersAt || 0)) < 60000) {
+              list = this._lastAllTickers;  // host just fetched this tick — piggyback
+              this._pfStructureList = list;
+              this._pfStructureAt   = this._lastAllTickersAt;
             } else {
               const r = await fetch(`${this.base}/v5/market/tickers?category=linear`);
               const d = await r.json();
               if (d.retCode !== 0) return null;
               list = d.result?.list || [];
+              this._pfStructureList = list;
+              this._pfStructureAt   = Date.now();
             }
             let gSum = 0, lSum = 0, gCount = 0, lCount = 0;
+            let gTurnover = 0, lTurnover = 0;
+            let frSum = 0, frCount = 0;
             for (const t of list) {
               if (!t.symbol.endsWith('USDT') || t.symbol === 'BTCUSDT') continue;
               if (parseFloat(t.lastPrice || 0) < 0.001) continue;
-              const ch = parseFloat(t.price24hPcnt || 0) * 100;
-              if (ch > 0)      { gSum += ch; gCount++; }
-              else if (ch < 0) { lSum += Math.abs(ch); lCount++; }
+              const ch  = parseFloat(t.price24hPcnt || 0) * 100;
+              const tvr = parseFloat(t.turnover24h  || 0);
+              if (ch > 0)      { gSum += ch; gCount++; gTurnover += tvr; }
+              else if (ch < 0) { lSum += Math.abs(ch); lCount++; lTurnover += tvr; }
+              const fr = parseFloat(t.fundingRate || 0);
+              if (!isNaN(fr)) { frSum += fr * 100; frCount++; } // accumulate as %
             }
             const sumT   = gSum + lSum, cntT = gCount + lCount;
+            const totalTvr = gTurnover + lTurnover;
+            const vol    = totalTvr > 0 ? +((gTurnover - lTurnover) / totalTvr).toFixed(4) : 0;
+            const volAbs = +(totalTvr / 1e9).toFixed(2); // USD billions
+
+            // Collective IO from aggregate funding rate: positive funding = longs paying = crowd net long.
+            // Normalised against 0.05% reference (≈5× the typical 0.01%/8h baseline) → [-1, 1].
+            const ioScore = frCount > 0
+              ? +Math.max(-1, Math.min(1, (frSum / frCount) / 0.05)).toFixed(4)
+              : null;
+
             return {
               ts: Date.now(),
               skew:    sumT > 0 ? (gSum - lSum) / sumT : 0,
               breadth: cntT > 0 ? (gCount - lCount) / cntT : 0,
               gCount, lCount,
               gSum: +gSum.toFixed(1), lSum: +lSum.toFixed(1),
+              vol, volAbs, ioScore,
             };
           } catch(e) { return null; }
         },
@@ -356,7 +396,7 @@
           const slope  = this._pfTrajectory().slope;
           const trend  = slope > 0.05 ? ', rising (turning bullish)' : slope < -0.05 ? ', falling (turning bearish)' : ', steady';
           const desc   = `${struct}${trend} (skew ${reading.skew.toFixed(2)}, breadth ${reading.breadth.toFixed(2)}, ${reading.gCount}▲/${reading.lCount}▼)`;
-          const inherent = this._pfInherent(lean, slope);
+          const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
           const eff      = this._pfEffectiveScore(score, mass, inherent);
           let bias;
           if (score === null || mass < MIN_MASS) bias = `thin history (mass ${mass.toFixed(1)} < ${MIN_MASS}) — leaning on inherent structure (${eff >= 0 ? '+' : ''}${eff.toFixed(2)} for shorts)`;
@@ -395,22 +435,28 @@
         // separate from pfSamples (which get pruned for scoring) so the wave
         // retains the full trajectory for as long as we have data, up to ~a week.
         _pfPushWave(reading) {
-          this.pfWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4) });
+          this.pfWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4), vol: reading.vol ?? 0, volAbs: reading.volAbs ?? 0 });
           const cut = Date.now() - WAVE_TTL_MS;
           if (this.pfWave.length && this.pfWave[0].ts < cut) this.pfWave = this.pfWave.filter(p => p.ts >= cut);
           if (this.pfWave.length > WAVE_CAP) this.pfWave = this.pfWave.slice(-WAVE_CAP);
         },
 
-        // Current lean plus its trajectory (slope = recent third − older third of the wave).
+        // Current lean plus its trajectory (slope = avg lean over last N hours − avg lean N–2N hours ago).
+        // Using a fixed time window (cfg.permafrostSlopeWindowHours, default 6h) so "turning bullish/bearish"
+        // always reflects the same timeframe regardless of how much wave history has accumulated.
         // slope > 0 → drifting bullish; slope < 0 → drifting bearish.
         _pfTrajectory() {
           const wave = this._pfWaveSeries();
           const n    = wave.length;
           const lean = n ? wave[n - 1].lean : (((this.pfStatus.skew ?? 0) + (this.pfStatus.breadth ?? 0)) / 2);
           if (n < WAVE_MIN_PTS) return { lean, slope: 0, n };
-          const k      = Math.max(1, Math.floor(n / 3));
-          const recent = wave.slice(-k).reduce((a, p) => a + p.lean, 0) / k;
-          const older  = wave.slice(0, k).reduce((a, p) => a + p.lean, 0) / k;
+          const winMs     = (this.cfg.permafrostSlopeWindowHours ?? 6) * 3600 * 1000;
+          const now       = Date.now();
+          const recentPts = wave.filter(p => p.ts >= now - winMs);
+          const olderPts  = wave.filter(p => p.ts >= now - 2 * winMs && p.ts < now - winMs);
+          if (!recentPts.length || !olderPts.length) return { lean, slope: 0, n };
+          const recent = recentPts.reduce((a, p) => a + p.lean, 0) / recentPts.length;
+          const older  = olderPts.reduce((a, p) => a + p.lean, 0) / olderPts.length;
           return { lean, slope: recent - older, n };
         },
 
@@ -418,9 +464,12 @@
         // a short bot likes bearish *and* falling structure; longing likes bullish/rising.
         // The slope term is what stops us shorting into the start of a pump (mildly
         // bearish but turning up) or longing into the start of a dump.
-        _pfInherent(lean, slope) {
+        _pfInherent(lean, slope, ioScore) {
           const slopeN = Math.max(-1, Math.min(1, (slope || 0) / SLOPE_REF));
-          return Math.max(-1, Math.min(1, DIR * (W_LEAN * (lean || 0) + W_SLOPE * slopeN)));
+          // IO is contrarian: negate ioScore so crowded longs favour the short bot and vice versa.
+          // W_IO is additive alongside lean/slope — the outer clamp keeps the result in [-1, 1].
+          const ioN = ioScore != null ? Math.max(-1, Math.min(1, -ioScore)) : 0;
+          return Math.max(-1, Math.min(1, DIR * (W_LEAN * (lean || 0) + W_SLOPE * slopeN + W_IO * ioN)));
         },
 
         // Effective score: learned history is primary, the inherent wave is the
@@ -430,30 +479,68 @@
           return score === null ? inherent : massFrac * score + (1 - massFrac) * inherent;
         },
 
-        // Inline SVG wave plot for the accordion — recent lean path with a mid (flat) line.
+        // Inline SVG wave plot — time-based 1-week window, bins data into pixel columns so
+        // the chart compacts automatically as history grows (no index stretching).
         _pfWaveSvg() {
           void this.tick;
           const wave = this._pfWaveSeries();
           const W = 260, H = 64, pad = 6;
           const y = lean => pad + ((1 - lean) / 2) * (H - 2 * pad);
           const mid = y(0);
-          if (wave.length < 2) {
-            return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block"><line x1="0" y1="${mid}" x2="${W}" y2="${mid}" stroke="rgba(255,255,255,.15)" stroke-dasharray="3 3"/><text x="${W/2}" y="${H/2+3}" fill="rgba(255,255,255,.35)" font-size="9" font-family="monospace" text-anchor="middle">gathering structure history…</text></svg>`;
+          const placeholder = `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block"><line x1="0" y1="${mid}" x2="${W}" y2="${mid}" stroke="rgba(255,255,255,.15)" stroke-dasharray="3 3"/><text x="${W/2}" y="${H/2+3}" fill="rgba(255,255,255,.35)" font-size="9" font-family="monospace" text-anchor="middle">gathering structure history…</text></svg>`;
+          if (wave.length < 2) return placeholder;
+          const now = Date.now();
+          const tMin = now - WAVE_TTL_MS;
+          const plotW = W - 2 * pad;
+          const BINS = Math.floor(plotW);
+          const bins = new Array(BINS).fill(null).map(() => ({ sum: 0, n: 0 }));
+          for (const p of wave) {
+            const bi = Math.min(BINS - 1, Math.max(0, Math.floor(((p.ts - tMin) / WAVE_TTL_MS) * BINS)));
+            bins[bi].sum += p.lean; bins[bi].n++;
           }
-          const n  = wave.length;
-          const xs = i => pad + (i / (n - 1)) * (W - 2 * pad);
-          const pts = wave.map((p, i) => `${xs(i).toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ');
-          const cur = wave[n - 1].lean;
+          const pts = [];
+          for (let i = 0; i < BINS; i++) {
+            if (!bins[i].n) continue;
+            pts.push({ x: pad + i + 0.5, lean: bins[i].sum / bins[i].n });
+          }
+          if (pts.length < 2) return placeholder;
+
+          // Volume line: bin vol and volAbs alongside lean; opacity reflects absolute volume level.
+          const vBins = new Array(BINS).fill(null).map(() => ({ vSum: 0, aSum: 0, n: 0 }));
+          for (const p of wave) {
+            if (p.vol == null) continue;
+            const bi = Math.min(BINS - 1, Math.max(0, Math.floor(((p.ts - tMin) / WAVE_TTL_MS) * BINS)));
+            vBins[bi].vSum += p.vol; vBins[bi].aSum += (p.volAbs ?? Math.abs(p.vol)); vBins[bi].n++;
+          }
+          const volPts = [];
+          for (let i = 0; i < BINS; i++) {
+            if (!vBins[i].n) continue;
+            volPts.push({ x: pad + i + 0.5, v: vBins[i].vSum / vBins[i].n, abs: vBins[i].aSum / vBins[i].n });
+          }
+          const maxAbs = Math.max(...volPts.map(p => p.abs), 0.001);
+          // Draw vol as individual segments so each can carry its own opacity (low vol → faint).
+          let volSvg = '';
+          for (let i = 1; i < volPts.length; i++) {
+            const p1 = volPts[i-1], p2 = volPts[i];
+            const relAbs = ((p1.abs + p2.abs) / 2) / maxAbs;
+            const op = (0.12 + relAbs * 0.55).toFixed(2);
+            volSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.v).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.v).toFixed(1)}" stroke="rgba(255,185,50,${op})" stroke-width="1"/>`;
+          }
+
+          const cur = pts[pts.length - 1].lean;
           const col = cur > 0.05 ? 'var(--profit)' : cur < -0.05 ? 'var(--short)' : 'var(--ice)';
-          const cx  = xs(n - 1), cy = y(cur);
+          const polyPts = pts.map(p => `${p.x.toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ');
+          const cx = pts[pts.length - 1].x, cy = y(cur);
           return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block">`
             + `<line x1="0" y1="${pad}" x2="${W}" y2="${pad}" stroke="rgba(0,229,160,.12)"/>`
             + `<line x1="0" y1="${(H-pad).toFixed(1)}" x2="${W}" y2="${(H-pad).toFixed(1)}" stroke="rgba(255,69,96,.12)"/>`
             + `<line x1="0" y1="${mid.toFixed(1)}" x2="${W}" y2="${mid.toFixed(1)}" stroke="rgba(255,255,255,.18)" stroke-dasharray="3 3"/>`
-            + `<polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>`
+            + volSvg
+            + `<polyline points="${polyPts}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>`
             + `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.5" fill="${col}"/>`
             + `<text x="2" y="${pad+7}" fill="rgba(0,229,160,.5)" font-size="8" font-family="monospace">bull</text>`
             + `<text x="2" y="${(H-pad-1).toFixed(1)}" fill="rgba(255,69,96,.5)" font-size="8" font-family="monospace">bear</text>`
+            + `<text x="${W-18}" y="${pad+7}" fill="rgba(255,185,50,.45)" font-size="8" font-family="monospace">vol</text>`
             + `</svg>`;
         },
 
@@ -478,9 +565,9 @@
           this._pfPushWave(reading);
           const { score, mass } = this._pfScore(reading);
           const { lean, slope } = this._pfTrajectory();
-          const inherent = this._pfInherent(lean, slope);
+          const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
           const eff = this._pfEffectiveScore(score, mass, inherent);
-          this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, at: reading.ts };
+          this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, ioScore: reading.ioScore ?? null, at: reading.ts };
         },
 
         // ── Halt event: record the climate, decide informed cap vs timer fallback ──
@@ -493,9 +580,9 @@
           const { score, mass } = this._pfScore(reading);
           const lean     = (reading.skew + reading.breadth) / 2;
           const slope    = this._pfTrajectory().slope;
-          const inherent = this._pfInherent(lean, slope);
+          const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
           const eff      = this._pfEffectiveScore(score, mass, inherent);
-          this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, at: reading.ts };
+          this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, ioScore: reading.ioScore ?? null, at: reading.ts };
           const informed = mass >= MIN_MASS;
           const strong   = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.permafrostStrongScore ?? STRONG_SCORE);
           // The stock 12h horizon is the default. Only a *strong* historical bias
