@@ -698,6 +698,19 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             <div class="lbl">Scan Every <b x-text="cfg.scanMins+'min'"></b></div>
             <input type="range" min="5" max="60" step="5" x-model.number="cfg.scanMins" :disabled="bot.running" @change="persist()">
           </div>
+          <!-- Bulk ticker cooldown -->
+          <div class="g" style="margin-top:6px">
+            <label class="tog" @click="cfg.bulkTickerCooldownEnabled=!cfg.bulkTickerCooldownEnabled;persist()">
+              <div class="tog-t" :class="cfg.bulkTickerCooldownEnabled?'on':''"><div class="tog-k"></div></div>
+              <span class="tog-l">Bulk Ticker Cooldown</span>
+            </label>
+            <div style="font-size:9px;color:var(--text-lo);margin-top:2px;line-height:1.5">Reuses the full ticker list for N hours instead of re-fetching every scan. Reduces bulk fetches from 96/day to 8/day at 3h.</div>
+            <div x-show="cfg.bulkTickerCooldownEnabled" style="margin-top:6px">
+              <div class="lbl">Cooldown <b x-text="(cfg.bulkTickerCooldownHours??3)+'h'"></b></div>
+              <input type="range" min="1" max="12" step="1" x-model.number="cfg.bulkTickerCooldownHours" @change="persist()">
+              <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);margin-top:3px" x-text="(()=>{ void tick; const rem=Math.max(0,((cfg.bulkTickerCooldownHours??3)*3600000)-(Date.now()-(_lastAllTickersAt||0))); if(!_lastAllTickersAt||rem<=0) return 'ready — will fetch on next scan'; const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); return 'next refresh in '+h+'h '+String(m).padStart(2,'0')+'m'; })()"></div>
+            </div>
+          </div>
 
           <!-- Drawdown Throttle -->
           <div class="g" style="margin-top:10px">
@@ -1901,6 +1914,7 @@ function pw() { return {
   cfg: {
     leverage:6, minNotional:6, addNotional:6,
     rsi6Min:30, rsi12Min:30, rsi24Min:30, rsi6Max:10, maxPos:10, scanMins:15, topN:25, // unused — kept for compat
+    bulkTickerCooldownEnabled: true, bulkTickerCooldownHours: 3,
     capChangeMax: -3,              // max 24h change (%) to enter cap strategy — must be this negative or more
     potGainerRsiPct: 10,   // unused — kept for compat
     potGainerExpireMins: 15,  // unused — kept for compat
@@ -2968,26 +2982,35 @@ function pw() { return {
     this.ui.scanning = true;
     this.bot.lastScanAt = Date.now();
     try {
-      const tr=await fetch(`${this.base}/v5/market/tickers?category=linear`);
-      const td=await tr.json();
-      if (td.retCode!==0) throw new Error('Tickers: '+td.retMsg);
-      const allTickers = td.result?.list || [];
-      this._lastAllTickers   = allTickers; // shared with runScheduledCycle and strategy plugin scan passes
-      this._lastAllTickersAt = Date.now();
+      const _cooldownMs  = (this.cfg.bulkTickerCooldownHours ?? 3) * 3600 * 1000;
+      const _useCached   = this.cfg.bulkTickerCooldownEnabled !== false
+        && this._lastAllTickers?.length > 0
+        && (Date.now() - (this._lastAllTickersAt || 0)) < _cooldownMs;
+      let allTickers;
+      if (_useCached) {
+        allTickers = this._lastAllTickers;
+      } else {
+        const tr=await fetch(`${this.base}/v5/market/tickers?category=linear`);
+        const td=await tr.json();
+        if (td.retCode!==0) throw new Error('Tickers: '+td.retMsg);
+        allTickers = td.result?.list || [];
+        this._lastAllTickers   = allTickers; // shared with runScheduledCycle and strategy plugin scan passes
+        this._lastAllTickersAt = Date.now();
 
-      // Seed funding rate cache from bulk ticker response
-      const now_fr = Date.now();
-      for (const t of allTickers) {
-        if (!t.symbol || t.fundingRate == null) continue;
-        const cacheKey = `fr_${t.symbol}`;
-        this._klineCache[cacheKey] = {
-          rate:       parseFloat(t.fundingRate) * 100,
-          intervalMs: t.fundingIntervalHour ? parseInt(t.fundingIntervalHour, 10) * 3600000 : 8 * 3600000,
-          ts:         now_fr,
-        };
-        if (t.lastPrice != null) {
-          const _lp = parseFloat(t.lastPrice || 0);
-          if (_lp > 0) this.symDataWrite(t.symbol, { lastPrice: _lp });
+        // Seed funding rate cache — only on fresh fetch
+        const now_fr = Date.now();
+        for (const t of allTickers) {
+          if (!t.symbol || t.fundingRate == null) continue;
+          const cacheKey = `fr_${t.symbol}`;
+          this._klineCache[cacheKey] = {
+            rate:       parseFloat(t.fundingRate) * 100,
+            intervalMs: t.fundingIntervalHour ? parseInt(t.fundingIntervalHour, 10) * 3600000 : 8 * 3600000,
+            ts:         now_fr,
+          };
+          if (t.lastPrice != null) {
+            const _lp = parseFloat(t.lastPrice || 0);
+            if (_lp > 0) this.symDataWrite(t.symbol, { lastPrice: _lp });
+          }
         }
       }
 
