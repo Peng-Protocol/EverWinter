@@ -11,8 +11,6 @@
      - [Over-Extension Filter](#over-extension-filter)
    - [Reactive Techniques](#reactive-techniques)
 3. [Strategies](#strategies)
-   - [Gainers](#gainers-strategy)
-   - [Losers](#losers-strategy)
    - [Scattershot](#scattershot-strategy)
    - [Psycho Mode](#psycho-mode)
 4. [Sizing](#sizing)
@@ -62,7 +60,7 @@ Proactive techniques decide whether and when to enter. They filter noise from si
 
 RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's method. The multi-timeframe requirement ensures the condition is present at multiple levels of resolution simultaneously — a single timeframe spike is noise; alignment across three is signal.
 
-**Floor gates** confirm upward momentum is sufficiently developed — used by the Gainers strategy. **Ceiling gates** confirm downward momentum is sufficiently developed — used by the Losers strategy. A ticker failing its respective gate is not ready.
+**Floor gates** confirm upward momentum is sufficiently developed. **Ceiling gates** confirm downward momentum is sufficiently developed. A ticker failing its respective gate is not ready.
 
 The default **floor gate is 30-30-30**: RSI6 ≥ 30, RSI12 ≥ 30, RSI24 ≥ 30. The default **ceiling gate is 30-30-30**: RSI6 ≤ 30, RSI12 ≤ 30, RSI24 ≤ 30. All six thresholds are independently configurable.
 
@@ -106,11 +104,11 @@ A session where both sides lose consistently signals a choppy, untradeable envir
 
 When a position opens, the symbol's RSI at entry is recorded with a 6-hour TTL. Future re-entries into the same ticker are gated by that stored value. Both lock-ins share the same rationale: a ticker that just moved hard often reverses sharply before resuming. The lock-in makes you follow the move rather than re-enter at the worst point of the cycle.
 
-- **Bullish lock-in** (Gainers strategy): stored RSI is a **rising floor** — ratchets to the maximum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is below the floor. The ticker must pump to a higher RSI than the last entry before it qualifies again.
+- **Bullish lock-in**: stored RSI is a **rising floor** — ratchets to the maximum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is below the floor. The ticker must pump to a higher RSI than the last entry before it qualifies again.
 
-- **Bearish lock-in** (Losers strategy): stored RSI is a **falling ceiling** — ratchets to the minimum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is above the ceiling. The ticker must decline to a lower RSI than the last entry before it qualifies again.
+- **Bearish lock-in**: stored RSI is a **falling ceiling** — ratchets to the minimum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is above the ceiling. The ticker must decline to a lower RSI than the last entry before it qualifies again.
 
-As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many loser-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many gainer-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves.
+As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many bearish-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many bullish-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves.
 
 ---
 
@@ -218,46 +216,6 @@ A perfect AMa run returns roughly **709% on the original entry margin** at 6× l
 ## Strategies
 
 Each strategy is a specific combination of techniques.
-
----
-
-### Gainers Strategy
-
-The Gainers strategy targets coins showing strong upward momentum. Entry requires RSI alignment across all three timeframes at or above the configured floor gates (default **30-30-30**), confirming the move is developed and not a single-candle spike.
-
-**Short side**: The biggest 24h gainers are filtered for RSI6/12/24 ≥ the configured floors. A short is opened betting the pump either exhausts and reverts, or at minimum pulls back enough to close at TP. On bearish days this is a high-probability setup — pumped coins face the full weight of the broader trend. On bullish days it still works but the move must be genuinely overbought across all timeframes to qualify, and the binary SL caps damage if the pump extends instead.
-
-**Long side**: The same RSI structure is applied to find coins with strong upward momentum on all timeframes — coins already gaining that RSI suggests have further room. A long is opened betting the momentum continues. On bullish days this is naturally aligned with the meta-structure. On bearish days, qualified gainers are still gaining against the trend, so the RSI gate acts as a genuine strength filter — only real outliers qualify.
-
-**Entry assembles:**
-- RSI floor gating across RSI6, RSI12, RSI24
-- Bullish lock-in check — re-entry blocked unless RSI has risen above the stored floor
-
-**Position management:**
-- Binary Mode — TP and SL set at entry, no DCA
-- Drawdown throttle
-- EDa TP overrides standard TP for the laggard when collective debt exists
-- Bullish lock-in bump on open — records entry RSI, ratchets the floor up
-
----
-
-### Losers Strategy
-
-The Losers strategy targets coins showing strong downward momentum. Entry requires RSI alignment across all three timeframes at or below the configured ceiling gates (default **30-30-30**), confirming the decline is sustained and not a brief dip.
-
-**Short side**: The biggest 24h losers are filtered for RSI6/12/24 ≤ the configured ceilings. A short is opened betting the decline continues. On bearish days the full meta-structure supports the trade. On bullish days even the weakest coins tend to recover — the binary SL limits damage to the configured percentage and exits cleanly.
-
-**Long side**: The strategy is applied to coins that have been falling significantly and are now deeply oversold across all three RSI timeframes. A long is opened betting on a reversal — the selling pressure is exhausted and a bounce is due. On bullish days oversold coins snap back hard. On bearish days the bounce may be shallow, but the binary TP and SL define the exact outcome either way.
-
-**Entry assembles:**
-- RSI ceiling gating across RSI6, RSI12, RSI24 — all timeframes must be at or below their configured ceiling
-- Bearish lock-in check — re-entry blocked unless RSI has fallen below the stored ceiling
-
-**Position management:**
-- Binary Mode — TP and SL set at entry, no DCA
-- Drawdown throttle
-- EDa TP overrides standard TP for the laggard when collective debt exists
-- Bearish lock-in bump on open — records entry RSI, ratchets the ceiling down
 
 ---
 

@@ -941,6 +941,17 @@ body::before {
   display: flex; gap: 8px; flex-wrap: wrap;
   margin-top: 14px;
 }
+
+/* ─── CW ACTIVITY LOG ─── */
+.cw-log-box { background: var(--bg-void); border: 1px solid var(--border); border-radius: 2px; height: 195px; overflow-y: auto; padding: 6px 8px; font-family: var(--mono); font-size: 10.5px; }
+.cw-ll { display: grid; grid-template-columns: 52px 64px 1fr; gap: 5px; align-items: baseline; padding: 2px 0; border-bottom: 1px solid rgba(0,0,0,.08); animation: fu .2s ease; }
+@keyframes fu { from{opacity:0;transform:translateY(-3px)} to{opacity:1;transform:none} }
+.cw-lt { color: var(--text-lo); flex-shrink: 0; }
+.cw-lc { font-weight: 600; letter-spacing: .5px; flex-shrink: 0; }
+.cw-lm { white-space: pre-wrap; word-break: break-word; }
+.cw-lc.info,  .cw-lm.info  { color: var(--text-mid); }
+.cw-lc.warn,  .cw-lm.warn  { color: var(--warn); }
+.cw-lc.err,   .cw-lm.err   { color: var(--short); }
 .btn {
   padding: 6px 14px;
   font-family: var(--mono); font-size: 10px; letter-spacing: 1px;
@@ -1198,7 +1209,7 @@ body::before {
               <div class="tk-fr" :class="t.fundingRate<0?'neg':(t.fundingRate>0?'pos':'')"
                    x-text="t.fundingRate!=null?(t.fundingRate>=0?'+':'')+t.fundingRate.toFixed(4):'—'"></div>
               <div class="hide-sm" style="font-family:var(--mono);font-size:11px;text-align:right;color:var(--text-hi)"
-                   x-text="mcapData[t.symbol] ? '$'+fmtV(mcapData[t.symbol]) : '—'"></div>
+                   x-text="mcapData[t.symbol] ? '$'+fmtV(mcapData[t.symbol]) : (mcapFetching ? '⋯' : '—')"></div>
               <div class="tk-rsi hide-sm">
                 <span class="r" :class="rsiCls(t.rsi6)"  x-text="rsiFmt(t.rsi6)"></span>
                 <span class="sep">/</span>
@@ -1262,7 +1273,7 @@ body::before {
                 <div class="tk-num-cell">
                   <span class="tk-num-lbl">MCap</span>
                   <span style="display:block!important;font-size:12px;font-family:var(--mono)"
-                        x-text="mcapData[t.symbol] ? '$'+fmtV(mcapData[t.symbol]) : '—'"></span>
+                        x-text="mcapData[t.symbol] ? '$'+fmtV(mcapData[t.symbol]) : (mcapFetching ? '⋯' : '—')"></span>
                 </div>
               </div>
               <!-- Bottom: strategy tags -->
@@ -1788,6 +1799,29 @@ body::before {
           </div>
         </div>
 
+        <!-- Activity Log -->
+        <div class="st-section">
+          <div class="st-body">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+              <span style="font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--text-lo)">
+                Activity Log
+                <span x-show="mcapFetching" style="margin-left:6px;color:var(--text-mid)">· MCap fetching…</span>
+              </span>
+              <button @click="cwLog=[]" x-show="cwLog.length>0" style="background:none;border:none;cursor:pointer;color:var(--text-lo);font-family:var(--mono);font-size:9px;padding:0;letter-spacing:1px">CLEAR</button>
+            </div>
+            <div class="cw-log-box">
+              <template x-for="e in cwLog" :key="e.id">
+                <div class="cw-ll">
+                  <span class="cw-lt" x-text="e.ts"></span>
+                  <span class="cw-lc" :class="e.type" x-text="e.code||'INFO'"></span>
+                  <span class="cw-lm" :class="e.type" x-text="e.msg"></span>
+                </div>
+              </template>
+              <div x-show="cwLog.length===0" style="color:var(--text-lo);padding:4px 0;font-size:10px">No activity yet.</div>
+            </div>
+          </div>
+        </div>
+
         <div class="st-actions">
           <span class="mono text-lo" style="font-size:10px;margin-right:auto;align-self:center">
             Settings auto-save. Uses public Bybit market data — no API key required.
@@ -1977,8 +2011,9 @@ let _wsReconnectTimer = null;
 let _wsWantTopics     = new Set(); // topics the watch loops want subscribed
 let _wsSubTopics      = new Set(); // topics subscribed on the live connection
 const _wsTickers      = {};        // symbol → merged ticker fields + ts (deltas merged over snapshot)
-const _cwCoinIdCache  = {};        // base → CoinGecko coin ID (permanent)
+const _cwCoinIdCache  = {};        // base → CoinGecko coin ID ('' = confirmed miss)
 const _cwMcapCache    = {};        // id → { mcap, ts } (1h TTL)
+let   _cwCoinList     = null;      // [ {id,symbol,name} ] fetched once per session
 
 function _wsSend(obj) {
   try { if (_wsConn && _wsConn.readyState === WebSocket.OPEN) _wsConn.send(JSON.stringify(obj)); } catch {}
@@ -2124,6 +2159,9 @@ function cw() { return {
   tickers: [],           // display list — tickers that passed ≥1 strategy
   rawTickers: [],        // last full ticker batch from bybit (reused by scans)
   mcapData: {},          // symbol → USD market cap (CoinGecko, 1h TTL)
+  mcapFetching: false,   // true while CoinGecko batch is in flight
+  cwLog: [],             // activity + error log entries
+  _cwLogId: 0,
   searchResults: [],     // independent ticker search results
   ui_searchMode: false,  // true when showing search results instead of scan results
   ui_searching: false,   // true while search is in flight
@@ -2195,6 +2233,16 @@ function cw() { return {
     setTimeout(() => {
       this.toasts = this.toasts.filter(t => t.id !== id);
     }, 3100);
+  },
+
+  // ─── ACTIVITY LOG ─────────────────────────────────────────────────
+  // Persistent in-memory log. code = short error code tracing to the
+  // originating function (e.g. 'CG-S01', 'SCAN-02').
+  cwlog(msg, type='info', code='') {
+    const id = ++this._cwLogId;
+    const ts = new Date().toTimeString().slice(0, 8);
+    this.cwLog.unshift({ id, ts, msg, type, code });
+    if (this.cwLog.length > 200) this.cwLog.length = 200;
   },
 
   // ─── CACHE STATS (computed) ───────────────────────────────────────
@@ -2750,6 +2798,7 @@ function cw() { return {
       this.toast(`Scan complete — ${final.length} match${final.length===1?'':'es'}`, 'ok');
     } catch(e) {
       console.error('Scan failed:', e);
+      this.cwlog('Scan failed: ' + (e.message || 'unknown'), 'err', 'SCAN-02');
       this.toast('Scan failed: ' + (e.message || 'unknown'), 'err');
     } finally {
       this.ui.scanning = false;
@@ -2758,36 +2807,101 @@ function cw() { return {
   },
 
   // ─── COINGECKO MARKET CAP ─────────────────────────────────────────
-  async _cwGetMcap(base) {
-    let id = _cwCoinIdCache[base];
-    if (!id) {
-      try {
-        const r = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(base)}`);
-        if (!r.ok) return null;
-        const d = await r.json();
-        const hit = d?.coins?.[0];
-        if (hit?.id) { id = hit.id; _cwCoinIdCache[base] = id; }
-      } catch(e) { return null; }
-    }
-    if (!id) return null;
-    const cached = _cwMcapCache[id];
-    if (cached && Date.now() - cached.ts < 3_600_000) return cached.mcap;
+  // Strategy: 2 API calls total for any batch size.
+  //   Step 1 — /coins/list  : download full symbol→id map once per session (cached in _cwCoinList)
+  //   Step 2 — /simple/price: batch all needed IDs in one request (up to 250 per call)
+  // This avoids the per-ticker sequential calls that trigger 429s.
+
+  async _cwEnsureCoinList() {
+    if (_cwCoinList) return _cwCoinList;
+    // Restore from localStorage if fresh (24h TTL) — shared with plugins via same key
     try {
-      const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd&include_market_cap=true`);
-      if (!r.ok) return null;
-      const d = await r.json();
-      const mcap = d?.[id]?.usd_market_cap;
-      if (!mcap) return null;
-      _cwMcapCache[id] = { mcap, ts: Date.now() };
-      return mcap;
-    } catch(e) { return null; }
+      const s = JSON.parse(localStorage.getItem('__cgCoinList') || 'null');
+      if (s?.list?.length && Date.now() - s.ts < 86_400_000) {
+        _cwCoinList = s.list;
+        this.cwlog(`CoinGecko coin list from cache — ${_cwCoinList.length} entries`, 'info', 'CG-L00');
+        return _cwCoinList;
+      }
+    } catch(e) {}
+    try {
+      const r = await fetch('https://api.coingecko.com/api/v3/coins/list?include_platform=false');
+      if (!r.ok) { this.cwlog(`CoinGecko coins/list HTTP ${r.status}`, 'err', 'CG-L01'); return null; }
+      _cwCoinList = await r.json();
+      try { localStorage.setItem('__cgCoinList', JSON.stringify({ list: _cwCoinList, ts: Date.now() })); } catch(e) {}
+      this.cwlog(`CoinGecko coin list fetched — ${_cwCoinList.length} entries`, 'info', 'CG-L00');
+      return _cwCoinList;
+    } catch(e) {
+      this.cwlog(`CoinGecko coins/list error: ${e.message}`, 'err', 'CG-L02');
+      return null;
+    }
   },
 
   async _cwFetchMcaps() {
-    for (const t of this.tickers) {
-      const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
-      const mcap = await this._cwGetMcap(base);
-      if (mcap) this.mcapData[t.symbol] = mcap;
+    if (this.mcapFetching) return;
+    this.mcapFetching = true;
+    const now = Date.now();
+    try {
+      const bases = this.tickers.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
+
+      // Phase 1: resolve IDs for bases not yet seen
+      const unknown = bases.filter(b => _cwCoinIdCache[b] === undefined);
+      if (unknown.length) {
+        const list = await this._cwEnsureCoinList();
+        if (list) {
+          for (const base of unknown) {
+            const hit = list.find(c => c.symbol === base);
+            _cwCoinIdCache[base] = hit?.id || '';
+            if (!hit?.id) this.cwlog(`No CoinGecko match for '${base}'`, 'warn', 'CG-S03');
+          }
+        }
+      }
+
+      // Phase 2: collect IDs that need a fresh mcap (not cached or expired)
+      const ids = [...new Set(
+        bases.map(b => _cwCoinIdCache[b]).filter(id => {
+          if (!id) return false;
+          const c = _cwMcapCache[id];
+          return !c || now - c.ts >= 3_600_000;
+        })
+      )];
+
+      if (ids.length) {
+        // /simple/price accepts up to 250 ids per call
+        const BATCH = 250;
+        for (let i = 0; i < ids.length; i += BATCH) {
+          const chunk = ids.slice(i, i + BATCH);
+          try {
+            const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${chunk.join(',')}&vs_currencies=usd&include_market_cap=true`);
+            if (!r.ok) {
+              this.cwlog(`CoinGecko mcap batch HTTP ${r.status}`, 'err', 'CG-M01');
+            } else {
+              const d = await r.json();
+              for (const id of chunk) {
+                const mcap = d?.[id]?.usd_market_cap;
+                if (mcap) _cwMcapCache[id] = { mcap, ts: now };
+                else this.cwlog(`No mcap returned for '${id}'`, 'warn', 'CG-M03');
+              }
+            }
+          } catch(e) {
+            this.cwlog(`CoinGecko mcap batch error: ${e.message}`, 'err', 'CG-M02');
+          }
+          if (i + BATCH < ids.length) await new Promise(r => setTimeout(r, 1200));
+        }
+      }
+
+      // Phase 3: push resolved values into reactive mcapData
+      let fetched = 0, failed = 0;
+      for (const t of this.tickers) {
+        const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
+        const id   = _cwCoinIdCache[base];
+        const c    = id ? _cwMcapCache[id] : null;
+        if (c) { this.mcapData[t.symbol] = c.mcap; fetched++; } else failed++;
+      }
+      this.cwlog(`MCap batch — ${fetched} ok, ${failed} no data (${ids.length} fetched from CG)`, failed > 0 ? 'warn' : 'info', 'CG-DONE');
+    } catch(e) {
+      this.cwlog(`MCap fetch error: ${e.message}`, 'err', 'CG-M02');
+    } finally {
+      this.mcapFetching = false;
     }
   },
 
@@ -3248,6 +3362,7 @@ function cw() { return {
 
     } catch(e) {
       console.error('loadChartData:', e);
+      this.cwlog('Chart load failed: ' + (e.message || 'unknown'), 'err', 'CHART-01');
       this.toast('Chart load failed: ' + (e.message || 'unknown'), 'err');
     } finally {
       this.chart.updating = false;
@@ -3352,7 +3467,10 @@ function cw() { return {
         aVol, aTurn, volMom,
       };
       this.chart.change24h = parseFloat(t.price24hPcnt || 0) * 100;
-    } catch(e) { console.warn('_fetchTickerStats:', e); }
+    } catch(e) {
+      console.warn('_fetchTickerStats:', e);
+      this.cwlog('Ticker stats error: ' + (e.message || 'unknown'), 'warn', 'STATS-01');
+    }
   },
 
   // ─── Prefetch earlier candles so a clicked candle can show RSI ────
@@ -3502,6 +3620,7 @@ function cw() { return {
       }
     } catch(e) {
       console.warn('pollChart error:', e);
+      this.cwlog('Chart poll error: ' + (e.message || 'unknown'), 'warn', 'POLL-01');
     }
   },
 
