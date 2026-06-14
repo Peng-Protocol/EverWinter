@@ -1,11 +1,13 @@
 <!--
   Fund Chasing Strategy Plugin for PseudoChaser
-  Long tickers with high negative funding rates.
+  Long tickers with elevated funding rates (from the shorts' perspective).
 
-  Negative funding means shorts pay longs on every settlement interval.
-  This plugin enters longs when the funding rate on a ticker meets or
-  falls below the configured threshold (default −0.1%), collecting the
-  funding payment as embedded carry while awaiting a directional TP or SL.
+  Standard mode: negative funding (shorts pay longs) — collect carry.
+  Structure-aware mode: when Ashfall reads a bullish market lean, flips
+  to the opposite gate — targets tickers with high positive funding
+  (longs paying shorts). These are coins where shorts are positioned
+  against the bullish trend and are at elevated risk of being squeezed
+  as the meta-structure asserts itself.
 
   The entry pool is drawn exclusively from the host's bulk ticker cache
   (_lastAllTickers). The plugin tracks the cache timestamp and only
@@ -27,7 +29,7 @@
   window.__BotPlugin = {
     id:        'fundchasing-chaser',
     name:      'Fund Chasing (Chaser)',
-    version:   '1.0.0',
+    version:   '1.1.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser', 'ashfall-chaser'],
     before:    [],
@@ -81,6 +83,14 @@
                 <div class="lbl">Max Share <b x-text="(cfg.fccShareCapPct??50)+'% ('+Math.max(1,Math.floor((cfg.maxPos??5)*((cfg.fccShareCapPct??50)/100)))+' of '+(cfg.maxPos??5)+' slots)'"></b></div>
                 <input type="range" min="10" max="100" step="5" x-model.number="cfg.fccShareCapPct" @change="persist()">
               </div>
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.fccStructureAwareEnabled=!(cfg.fccStructureAwareEnabled??true);persist()}">
+                <div class="tog-t" :class="(cfg.fccStructureAwareEnabled??true)?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Structure Awareness</div>
+                  <div class="fcc-hint">When Ashfall reads a bullish market lean, flips to the opposite gate — targets tickers with high positive funding (longs paying shorts). These coins have shorts positioned against the trend and are at risk of being squeezed. Falls back to standard gate when Ashfall is not loaded or structure is neutral/bearish.</div>
+                </div>
+              </label>
+              <div x-show="cfg.fccStructureAwareEnabled??true" class="fcc-hint" style="margin-top:5px;padding:4px 6px;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:2px" x-text="(afStatus != null) ? '♨ Ashfall connected — lean ' + (afStatus.lean??0).toFixed(2) + ' → ' + ((afStatus.lean??0) > 0 ? 'bullish · reversed gate active' : 'neutral/bearish · standard gate') : '⚠ Ashfall not loaded — standard gate always used'"></div>
             </div>
           </div>
         </div>
@@ -96,15 +106,16 @@
 
         async init() {
           await _origInit.call(this);
-          if (this.cfg.fccEnabled          === undefined) this.cfg.fccEnabled          = false;
-          if (this.cfg.fccFrMax            === undefined) this.cfg.fccFrMax            = -0.1;
-          if (this.cfg.fccPicks            === undefined) this.cfg.fccPicks            = 3;
-          if (this.cfg.fccShareCapEnabled  === undefined) this.cfg.fccShareCapEnabled  = true;
-          if (this.cfg.fccShareCapPct      === undefined) this.cfg.fccShareCapPct      = 50;
+          if (this.cfg.fccEnabled                === undefined) this.cfg.fccEnabled                = false;
+          if (this.cfg.fccFrMax                  === undefined) this.cfg.fccFrMax                  = -0.1;
+          if (this.cfg.fccPicks                  === undefined) this.cfg.fccPicks                  = 3;
+          if (this.cfg.fccShareCapEnabled        === undefined) this.cfg.fccShareCapEnabled        = true;
+          if (this.cfg.fccShareCapPct            === undefined) this.cfg.fccShareCapPct            = 50;
+          if (this.cfg.fccStructureAwareEnabled  === undefined) this.cfg.fccStructureAwareEnabled  = true;
           this.registerRoleBadge?.(item => (item && item._fcc)
             ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)">💰 FUND</span>`
             : null);
-          this.log(`[FCC] Fund Chasing (Chaser) v1.0.0 loaded — ${this.cfg.fccEnabled ? 'enabled' : 'disabled'} | FR ≤ ${(this.cfg.fccFrMax ?? -0.1).toFixed(2)}% | ${this.cfg.fccPicks}/cycle`, 'info');
+          this.log(`[FCC] Fund Chasing (Chaser) v1.1.0 loaded — ${this.cfg.fccEnabled ? 'enabled' : 'disabled'} | FR ≤ ${(this.cfg.fccFrMax ?? -0.1).toFixed(2)}% | ${this.cfg.fccPicks}/cycle | structure-aware ${(this.cfg.fccStructureAwareEnabled ?? true) ? 'on' : 'off'}`, 'info');
         },
 
         async runScan() {
@@ -143,20 +154,35 @@
 
           const frMax      = this.cfg.fccFrMax ?? -0.1;
           const activeSyms = new Set((this.positions || []).map(p => p.symbol));
+
+          // Structure awareness: when Ashfall reads a bullish lean, flip to the
+          // opposite funding gate — coins where longs are paying (trapped shorts)
+          // are at elevated squeeze risk when the bullish meta-structure asserts itself.
+          const _afLean     = (this.cfg.fccStructureAwareEnabled ?? true) ? (this.afStatus?.lean ?? null) : null;
+          const bullishMode = _afLean !== null && _afLean > 0;
+
           const pool = allTickers
             .filter(t =>
               t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
               && parseFloat(t.lastPrice || 0) >= 0.001
               && t.fundingRate != null
-              && parseFloat(t.fundingRate) * 100 <= frMax
+              && (bullishMode
+                ? parseFloat(t.fundingRate) * 100 >= -frMax   // reversed gate: longs paying (note frMax is negative)
+                : parseFloat(t.fundingRate) * 100 <= frMax)   // standard gate: shorts paying
               && !activeSyms.has(t.symbol)
               && !(this._isSymbolBanned?.(t.symbol)))
-            .sort((a, b) => parseFloat(a.fundingRate || 0) - parseFloat(b.fundingRate || 0));
+            .sort((a, b) => bullishMode
+              ? parseFloat(b.fundingRate || 0) - parseFloat(a.fundingRate || 0)   // most positive first
+              : parseFloat(a.fundingRate || 0) - parseFloat(b.fundingRate || 0)); // most negative first
 
           this._fccLastActedAt = freshAt;
 
+          const gateDesc = bullishMode
+            ? `FR ≥ ${(-frMax).toFixed(2)}% [bullish structure, lean ${_afLean.toFixed(2)}]`
+            : `FR ≤ ${frMax.toFixed(2)}%${_afLean !== null ? ' [neutral/bearish structure]' : ''}`;
+
           if (!pool.length) {
-            this.log(`[FCC] 💰 No tickers with FR ≤ ${frMax.toFixed(2)}% in fresh snapshot`, 'info');
+            this.log(`[FCC] 💰 No tickers with ${gateDesc} in fresh snapshot`, 'info');
             return;
           }
 
@@ -169,7 +195,7 @@
               if (await this._fccOpen(t)) opened++;
             }
           } finally { this._logBatchEnd?.('[FCC] 💰 Entry roll-up'); }
-          this.log(`[FCC] 💰 ${pool.length} tickers ≤ FR ${frMax.toFixed(2)}% — ${opened}/${picks} opened`, 'info');
+          this.log(`[FCC] 💰 ${pool.length} tickers ${gateDesc} — ${opened}/${picks} opened`, 'info');
         },
 
         async _fccOpen(t) {

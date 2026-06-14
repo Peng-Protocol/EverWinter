@@ -1,11 +1,13 @@
 <!--
   Fund Chasing Strategy Plugin for PseudoWinter
-  Short tickers with high positive funding rates.
+  Short tickers with elevated funding rates.
 
-  Positive funding means longs pay shorts on every settlement interval.
-  This plugin enters shorts when the funding rate on a ticker meets or
-  exceeds the configured threshold (default +0.1%), collecting the funding
-  payment as embedded carry while awaiting a directional TP or SL.
+  Standard mode: positive funding (longs pay shorts) — collect carry.
+  Structure-aware mode: when Permafrost reads a bearish market lean,
+  flips to the opposite gate — targets tickers with deeply negative
+  funding (shorts paying longs). These are coins where longs are
+  positioned against the bearish trend and are at elevated risk of
+  collapsing as the meta-structure asserts itself.
 
   The entry pool is drawn exclusively from the host's bulk ticker cache
   (_lastAllTickers). The plugin tracks the cache timestamp and only
@@ -27,7 +29,7 @@
   window.__BotPlugin = {
     id:        'fundchasing-winter',
     name:      'Fund Chasing (Winter)',
-    version:   '1.0.0',
+    version:   '1.1.0',
     targetBot: 'pseudowinter',
     after:     ['everwinter', 'permafrost-winter'],
     before:    [],
@@ -81,6 +83,14 @@
                 <div class="lbl">Max Share <b x-text="(cfg.fcwShareCapPct??50)+'% ('+Math.max(1,Math.floor((cfg.maxPos??5)*((cfg.fcwShareCapPct??50)/100)))+' of '+(cfg.maxPos??5)+' slots)'"></b></div>
                 <input type="range" min="10" max="100" step="5" x-model.number="cfg.fcwShareCapPct" @change="persist()">
               </div>
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.fcwStructureAwareEnabled=!(cfg.fcwStructureAwareEnabled??true);persist()}">
+                <div class="tog-t" :class="(cfg.fcwStructureAwareEnabled??true)?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Structure Awareness</div>
+                  <div class="fcw-hint">When Permafrost reads a bearish market lean, flips to the opposite gate — targets tickers with deeply negative funding (shorts paying longs). These coins are positioned against the trend and likely to collapse. Falls back to standard gate when Permafrost is not loaded or structure is neutral/bullish.</div>
+                </div>
+              </label>
+              <div x-show="cfg.fcwStructureAwareEnabled??true" class="fcw-hint" style="margin-top:5px;padding:4px 6px;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:2px" x-text="(pfStatus != null) ? '🧊 Permafrost connected — lean ' + (pfStatus.lean??0).toFixed(2) + ' → ' + ((pfStatus.lean??0) < 0 ? 'bearish · reversed gate active' : 'neutral/bullish · standard gate') : '⚠ Permafrost not loaded — standard gate always used'"></div>
             </div>
           </div>
         </div>
@@ -96,15 +106,16 @@
 
         async init() {
           await _origInit.call(this);
-          if (this.cfg.fcwEnabled          === undefined) this.cfg.fcwEnabled          = false;
-          if (this.cfg.fcwFrMin            === undefined) this.cfg.fcwFrMin            = 0.1;
-          if (this.cfg.fcwPicks            === undefined) this.cfg.fcwPicks            = 3;
-          if (this.cfg.fcwShareCapEnabled  === undefined) this.cfg.fcwShareCapEnabled  = true;
-          if (this.cfg.fcwShareCapPct      === undefined) this.cfg.fcwShareCapPct      = 50;
+          if (this.cfg.fcwEnabled                === undefined) this.cfg.fcwEnabled                = false;
+          if (this.cfg.fcwFrMin                  === undefined) this.cfg.fcwFrMin                  = 0.1;
+          if (this.cfg.fcwPicks                  === undefined) this.cfg.fcwPicks                  = 3;
+          if (this.cfg.fcwShareCapEnabled        === undefined) this.cfg.fcwShareCapEnabled        = true;
+          if (this.cfg.fcwShareCapPct            === undefined) this.cfg.fcwShareCapPct            = 50;
+          if (this.cfg.fcwStructureAwareEnabled  === undefined) this.cfg.fcwStructureAwareEnabled  = true;
           this.registerRoleBadge?.(item => (item && item._fcw)
             ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(96,210,255,.45);color:var(--ice);background:rgba(96,210,255,.10)">💰 FUND</span>`
             : null);
-          this.log(`[FCW] Fund Chasing (Winter) v1.0.0 loaded — ${this.cfg.fcwEnabled ? 'enabled' : 'disabled'} | FR ≥ ${(this.cfg.fcwFrMin ?? 0.1).toFixed(2)}% | ${this.cfg.fcwPicks}/cycle`, 'info');
+          this.log(`[FCW] Fund Chasing (Winter) v1.1.0 loaded — ${this.cfg.fcwEnabled ? 'enabled' : 'disabled'} | FR ≥ ${(this.cfg.fcwFrMin ?? 0.1).toFixed(2)}% | ${this.cfg.fcwPicks}/cycle | structure-aware ${(this.cfg.fcwStructureAwareEnabled ?? true) ? 'on' : 'off'}`, 'info');
         },
 
         async runScan() {
@@ -143,20 +154,35 @@
 
           const frMin      = this.cfg.fcwFrMin ?? 0.1;
           const activeSyms = new Set((this.positions || []).map(p => p.symbol));
+
+          // Structure awareness: when Permafrost reads a bearish lean, flip to the
+          // opposite funding gate — coins where shorts are paying (trapped longs) are
+          // at elevated collapse risk when the bearish meta-structure asserts itself.
+          const _pfLean     = (this.cfg.fcwStructureAwareEnabled ?? true) ? (this.pfStatus?.lean ?? null) : null;
+          const bearishMode = _pfLean !== null && _pfLean < 0;
+
           const pool = allTickers
             .filter(t =>
               t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
               && parseFloat(t.lastPrice || 0) >= 0.001
               && t.fundingRate != null
-              && parseFloat(t.fundingRate) * 100 >= frMin
+              && (bearishMode
+                ? parseFloat(t.fundingRate) * 100 <= -frMin   // reversed gate: shorts paying
+                : parseFloat(t.fundingRate) * 100 >= frMin)   // standard gate: longs paying
               && !activeSyms.has(t.symbol)
               && !(this._isSymbolBanned?.(t.symbol)))
-            .sort((a, b) => parseFloat(b.fundingRate || 0) - parseFloat(a.fundingRate || 0));
+            .sort((a, b) => bearishMode
+              ? parseFloat(a.fundingRate || 0) - parseFloat(b.fundingRate || 0)   // most negative first
+              : parseFloat(b.fundingRate || 0) - parseFloat(a.fundingRate || 0)); // most positive first
 
           this._fcwLastActedAt = freshAt;
 
+          const gateDesc = bearishMode
+            ? `FR ≤ −${frMin.toFixed(2)}% [bearish structure, lean ${_pfLean.toFixed(2)}]`
+            : `FR ≥ ${frMin.toFixed(2)}%${_pfLean !== null ? ' [neutral/bullish structure]' : ''}`;
+
           if (!pool.length) {
-            this.log(`[FCW] 💰 No tickers with FR ≥ ${frMin.toFixed(2)}% in fresh snapshot`, 'info');
+            this.log(`[FCW] 💰 No tickers with ${gateDesc} in fresh snapshot`, 'info');
             return;
           }
 
@@ -169,7 +195,7 @@
               if (await this._fcwOpen(t)) opened++;
             }
           } finally { this._logBatchEnd?.('[FCW] 💰 Entry roll-up'); }
-          this.log(`[FCW] 💰 ${pool.length} tickers ≥ FR ${frMin.toFixed(2)}% — ${opened}/${picks} opened`, 'info');
+          this.log(`[FCW] 💰 ${pool.length} tickers ${gateDesc} — ${opened}/${picks} opened`, 'info');
         },
 
         async _fcwOpen(t) {
