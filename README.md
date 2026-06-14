@@ -48,7 +48,7 @@ On `visibilitychange` (tab returns to foreground): if a scan is overdue, it fire
 
 ## Scan Cycle (`runScheduledCycle`)
 
-1. `_sweepExpiredData()` — evicts lock-in entries past their 6h TTL, expired banlist entries (7-day TTL), and expired potential-gainers/losers watchlist entries.
+1. `_sweepExpiredData()` — evicts lock-in entries past their 6h TTL and expired banlist entries (7-day TTL).
 2. Drawdown throttle check — if halted, returns early.
 3. `runScan()` — fetches all USDT perpetual tickers in a single bulk call (`GET /v5/market/tickers?category=linear`), filters and ranks them, then evaluates per-symbol gates for each candidate (banlist, lock-in, RSI). Qualifying symbols open positions up to `maxPos`.
 4. `bot.lastScanAt` updated; `bot.lastScan` set to human-readable timestamp.
@@ -90,7 +90,7 @@ RSI6, RSI12, RSI24 each use this function with `period = 6`, `12`, `24` on 60-mi
 
 | Key | Contents |
 |---|---|
-| `pw_v1` | `cfg`, `positions`, `sess`, `closedTrades`, `bot.startTime/lastScan/lastScanAt`, `gainerLockIn`, `loserLockIn`, `symbolBanlist`, `lostValue`, `laggardId` |
+| `pw_v1` | `cfg`, `positions`, `sess`, `closedTrades`, `bot.startTime/lastScan/lastScanAt`, `symbolBanlist`, `lostValue`, `laggardId` |
 | `pw_v1_log` | Activity log array (capped at 300 entries) |
 | `__pw_plugins_v1` | Serialized plugin list (see Plugin System) |
 
@@ -184,7 +184,7 @@ Two styles are supported, and a plugin may mix them per method:
 
 ### CSS and HTML Slots
 
-Plugin `css` strings are injected into `<head>` synchronously during the IIFE. Plugin `slots` objects are keyed by slot name (e.g. `"config-bottom"`, `"account-bar-extra"`); the IIFE appends the HTML to matching `data-plugin-slot` anchors before Alpine starts. The injector also recurses into `<template>` fragments, so anchors inside Alpine `x-for` templates work — e.g. `"pos-card-badges"` sits inside the position-card template and injected markup can bind to the loop variable (`x-show="p._myFlag"`). A position-card badge plugin can also stamp `pos._roleBadgeOverride = true` to suppress the host's stock gainer/loser role badge in favor of its own.
+Plugin `css` strings are injected into `<head>` synchronously during the IIFE. Plugin `slots` objects are keyed by slot name (e.g. `"config-bottom"`, `"account-bar-extra"`); the IIFE appends the HTML to matching `data-plugin-slot` anchors before Alpine starts. The injector also recurses into `<template>` fragments, so anchors inside Alpine `x-for` templates work — e.g. `"pos-card-badges"` sits inside the position-card template and injected markup can bind to the loop variable (`x-show="p._myFlag"`). A position-card badge plugin can also stamp `pos._roleBadgeOverride = true` to suppress the host's default role badge in favor of its own.
 
 ### Log Roll-ups
 
@@ -268,11 +268,11 @@ Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balanc
 
 ### Internals
 
-- `_driftersBias()` — sums the `trades` field across the persisted lock-in maps and compares the sides against `cfg.driftersThreshold` (default `2`). Winter compares `gainerLockIn` vs `loserLockIn`; Chaser compares `gainerStratLockIn` (bullish activity) vs `gainerLockIn` (roof/bearish activity). Returns `'bullish'`, `'bearish'`, or `'neutral'` (also neutral when both sides are zero).
+- `_driftersBias()` — sums the `trades` field across the persisted lock-in maps and compares the sides against `cfg.driftersThreshold` (default `2`). Winter reads `gainerLockIn` (bullish-side entries) vs `loserLockIn` (bearish-side entries); Chaser compares `gainerStratLockIn` (bullish activity) vs `gainerLockIn` (roof/bearish activity). Returns `'bullish'`, `'bearish'`, or `'neutral'` (also neutral when both sides are zero).
 - `_driftersRunScan()` — appended to `runScan`. Returns early when `cfg.driftersEnabled` is off, the book is at `maxPos`, or the bias opposes the bot's direction. Otherwise reuses the host's `_lastAllTickers` cache when fresh (< 60 s, i.e. the stock scan just fetched it) — falling back to its own bulk ticker fetch — and takes the top 30 non-banned, non-BTC USDT symbols by 24h turnover (skipping symbols already in the book), classifies each with `_drifterRsiClass(rsi6, rsi12, rsi24)` — `'high'` (all ≥ 50), `'low'` (all ≤ 50), `'lukewarm'` (mixed → skip) — and opens via `pseudoOpenShort` with `_drifterType` set on the candidate.
 - `driftLockIn` — third lock-in map keyed by symbol: `{ rsi6, rsi12, rsi24, trades, setAt, drifterType }`, 6-hour TTL. One entry per symbol: a same-direction re-fire ratchets each timeframe (`Math.max` for high, `Math.min` for low), increments `trades`, and refreshes `setAt`; an opposite-direction fire replaces the entry outright. Persisted under the plugin's own localStorage key (restored on init with expired entries dropped) and swept by the wrapped `_sweepExpiredData()`.
 - Re-entry gate: a fresh same-direction `driftLockIn` entry blocks the symbol unless all three RSI readings are strictly past the stored values (above for high, below for low).
-- `pseudoOpenShort` wrap — non-drift candidates pass straight through to the original. For drift candidates, the main lock-in bumps are suppressed for the duration of the call (Winter: gainer/loser bumps; Chaser: `gainerStratLockInBump`), the new position is stamped with `pos._drifterType`, and `driftLockInBump(...)` records the drift entry.
+- `pseudoOpenShort` wrap — non-drift candidates pass straight through to the original. For drift candidates, lock-in bumps are suppressed for the duration of the call (Chaser: `gainerStratLockInBump`), the new position is stamped with `pos._drifterType`, and `driftLockInBump(...)` records the drift entry.
 - `pseudoClosePosition` wrap — carries `_drifterType` onto the newly prepended `closedTrades[0]` record so history rendering can tag it.
 - Transform hooks touched: `runScan`, `pseudoOpenShort`, `pseudoClosePosition`, `renderTradeFeed`, `persist`, `_sweepExpiredData`.
 
@@ -473,10 +473,10 @@ Lock-in maps are plain objects keyed by symbol, entries `{ change, setAt, trades
 
 Winter's gates are continuation bets — re-entry only when the move has pushed *further* in the entry direction, with **strict inequality** (at-the-level blocks):
 
-| Store | Used by | Ratchet | Re-entry condition |
+| Store | Direction | Ratchet | Re-entry condition |
 |---|---|---|---|
-| `gainerLockIn[sym]` | Gainer strategy (shorts) | `Math.max` — floor rises each trade | 24h change must be **strictly above** the floor — the gainer must stretch further before it is shorted again |
-| `loserLockIn[sym]` | Loser strategy (shorts) | `Math.min` — ceiling falls each trade | 24h change must be **strictly below** the ceiling — the loser must bleed further before it is shorted again |
+| `gainerLockIn[sym]` | Bullish-side entries | `Math.max` — floor rises each trade | 24h change must be **strictly above** the floor — the ticker must stretch further before it is entered again |
+| `loserLockIn[sym]` | Bearish-side entries | `Math.min` — ceiling falls each trade | 24h change must be **strictly below** the ceiling — the ticker must bleed further before it is entered again |
 
 ### PseudoChaser (mean-reversion-aware)
 
@@ -548,7 +548,7 @@ The activity log array is capped at 300 entries in memory and written to the `_l
 
 ## Data Export / Import
 
-The Export button serializes `{ cfg, positions, sess, closedTrades, gainerLockIn, loserLockIn, symbolBanlist, lostValue, laggardId }` as a JSON blob downloaded as a `.json` file. Import reads the file via `FileReader`, parses it, and merges into current state — positions are replaced wholesale, config fields are merged field-by-field to avoid clobbering keys added in newer versions. A 5 s debounce prevents accidental double-imports.
+The Export button serializes `{ cfg, positions, sess, closedTrades, symbolBanlist, lostValue, laggardId }` as a JSON blob downloaded as a `.json` file. Import reads the file via `FileReader`, parses it, and merges into current state — positions are replaced wholesale, config fields are merged field-by-field to avoid clobbering keys added in newer versions. A 5 s debounce prevents accidental double-imports.
 
 ---
 
