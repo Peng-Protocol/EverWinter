@@ -265,11 +265,13 @@ The Losers strategy targets coins showing strong downward momentum. Entry requir
 
 **The premise**: A bet on the market at large rather than on any single ticker. Reading one coin's next move is hard; reading the day's broad drift is easier. If the market is drifting your way, a random sample of its biggest movers — held behind asymmetric barriers — profits without ever predicting which specific ticker will move. The randomness is the point: no ticker-level thesis exists to be wrong about.
 
-**Candidate pool**: Every ticker whose 24-hour change clears a configured baseline in either direction — at or above +6%, or at or below −6%, by default. Big movers are chosen because they are the coins the day's character is actually expressing itself through; quiet tickers carry no information about the drift. The pool is ranked by 24-hour turnover and only the top 10 by volume are evaluated for entry.
+**Candidate pool**: Every ticker whose 24-hour change clears a configured baseline in either direction — at or above +6%, or at or below −6%, by default. Big movers are chosen because they are the coins the day's character is actually expressing itself through; quiet tickers carry no information about the drift. Within the pool, the highest-volume movers are prioritized — they are the coins where the day's character is most actively expressed.
 
-**Vol/mcap filtered selection**: For each of the top-10 candidates, market cap is fetched from CoinGecko and the turnover-to-market-cap ratio is computed. **Blizzard (short)** selects tickers where 24h vol is **less than 10% of market cap** — low relative volume suggests the broad market has not yet chased the move, making it a candidate to fade. **Firestorm (long)** selects tickers where 24h vol is **greater than 10% of market cap** — high relative volume confirms momentum is actively backing the move. If none of the inspected tickers pass, the cycle skips entry entirely and logs the outcome. Otherwise up to the configured number of picks (default 3) are drawn at random from the passing set. Picks never exceed remaining position headroom.
+**Vol/mcap ratio**: The selection criterion is the relationship between a ticker's 24-hour trading volume and its total market capitalization. A ratio above 10% means a significant fraction of the coin's entire market value changed hands in a single day — unusually high participation that confirms momentum is broadly backed. A ratio below 10% means the move happened on relatively modest turnover relative to the coin's size — the broader market has not yet committed to the direction.
 
-Market cap data is fetched per-ticker from the CoinGecko public API (no key required), cached at the coin-ID level for one hour. The first scan of a session may resolve coin IDs via search for unknown symbols; subsequent cycles reuse cached IDs. If market cap data is unavailable for a ticker — due to a failed lookup, API outage, or an obscure coin not listed on CoinGecko — that ticker is excluded from the candidate pool. See the README for the full CoinGecko limitation details.
+**Firestorm (long)** enters only tickers where vol exceeds 10% of market cap. High participation is the confirmation: the move is not a thin-market artifact, it has genuine buyers behind it.
+
+**Blizzard (short)** enters only tickers where vol is below 10% of market cap. The market moved but did not chase it — a candidate to fade. If no tickers in the pool meet the relevant threshold, the round passes without opening positions.
 
 **Asymmetric barriers**: Every entry opens binary — one fixed stop loss (default 18%) and one far take profit (default 105% buffered, closing functionally at 70% — the buffered value ÷ the profit-offset buffer, the same convention as the standard TP). The barrier geometry is the whole edge: one functional TP win covers roughly four stop-loss exits. The strategy does not need to be right often — it needs the broad drift to occasionally carry a random pick a long way.
 
@@ -283,7 +285,7 @@ Market cap data is fetched per-ticker from the CoinGecko public API (no key requ
 
 **Components used**:
 - Binary Mode (fixed SL, far buffered TP — asymmetric barrier geometry)
-- Vol/mcap ratio filter on top-10 movers by 24h turnover (CoinGecko market cap, per-ticker lookup, 1h cache)
+- Vol/mcap ratio filter — vol > 10% of market cap for longs (Firestorm), vol < 10% for shorts (Blizzard)
 - 12-hour force close
 - Cascade — collective profit bail across the open book
 - Climate gate (learned market-structure profile)
