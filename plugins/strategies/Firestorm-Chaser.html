@@ -31,7 +31,7 @@
   window.__BotPlugin = {
     id:        'firestorm-chaser',
     name:      'Firestorm (Chaser)',
-    version:   '1.6.0',
+    version:   '1.7.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser', 'ashfall-chaser'],
     before:    [],
@@ -139,7 +139,7 @@
           this.registerRoleBadge?.(item => (item && item._firestorm)
             ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)">🔥 FIRE</span>`
             : null);
-          this.log(`[FST] Firestorm (Chaser) v1.6.0 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% buffered | ${this.cfg.firestormPicks}/cycle | cascade ${(this.cfg.firestormCascadeEnabled ?? true) ? 'on' : 'off'}`, 'info');
+          this.log(`[FST] Firestorm (Chaser) v1.7.0 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% buffered | ${this.cfg.firestormPicks}/cycle | cascade ${(this.cfg.firestormCascadeEnabled ?? true) ? 'on' : 'off'}`, 'info');
         },
 
         async runScan() {
@@ -203,13 +203,13 @@
             poolSize = pool.length;
 
             // Sort baseline movers by 24h turnover desc; inspect up to 10 for vol/mcap ratio.
-            // Per-ticker mcap is fetched individually — cheaper than a bulk snapshot.
+            // Mcaps are pre-fetched in a 2-call batch (coins/list + simple/price) before the loop.
             const sorted  = [...pool].sort((a, b) => parseFloat(b.turnover24h || 0) - parseFloat(a.turnover24h || 0));
             const inspect = sorted.slice(0, 10);
+            await this._fstPrefetchMcaps(inspect.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase()));
             const longPool = [];
             for (const t of inspect) {
-              const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
-              const mcap = await this._fstGetMcap(base);
+              const mcap = this._fstGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase());
               if (!mcap) continue;
               if (parseFloat(t.turnover24h || 0) / mcap > 0.10) longPool.push(t);
             }
@@ -237,34 +237,53 @@
           this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥±${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}%, ${poolFiltered} vol/mcap>10% — ${opened}/${picks} opened`, 'info');
         },
 
-        // Returns market cap in USD for a single base symbol, or null if unavailable.
-        // Two-level cache: permanent session ID cache (CoinGecko IDs don't change) +
-        // 1h market-cap cache so repeated scan cycles don't re-fetch.
-        async _fstGetMcap(base) {
+        // Pre-fetches mcaps for a batch of base symbols in 2 API calls:
+        //   1. window.__cgCoinList — /coins/list, fetched once per page session, shared across plugins
+        //   2. /simple/price?ids=A,B,C — one batch call for all uncached IDs
+        async _fstPrefetchMcaps(bases) {
           if (!this._fstCoinIdCache) this._fstCoinIdCache = {};
           if (!this._fstMcapCache)   this._fstMcapCache   = {};
-          let id = this._fstCoinIdCache[base];
-          if (!id) {
-            try {
-              const r = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(base)}`);
-              if (!r.ok) return null;
-              const d = await r.json();
-              const hit = d?.coins?.[0];
-              if (hit?.id) { id = hit.id; this._fstCoinIdCache[base] = id; }
-            } catch(e) { return null; }
+          const now = Date.now();
+          const unknown = bases.filter(b => this._fstCoinIdCache[b] === undefined);
+          if (unknown.length) {
+            if (!window.__cgCoinList) {
+              try {
+                const r = await fetch('https://api.coingecko.com/api/v3/coins/list?include_platform=false');
+                if (r.ok) window.__cgCoinList = await r.json();
+              } catch(e) { /* will result in cache misses */ }
+            }
+            if (window.__cgCoinList) {
+              for (const base of unknown) {
+                const hit = window.__cgCoinList.find(c => c.symbol === base);
+                this._fstCoinIdCache[base] = hit?.id || '';
+              }
+            }
           }
-          if (!id) return null;
-          const cached = this._fstMcapCache[id];
-          if (cached && Date.now() - cached.ts < 3_600_000) return cached.mcap;
+          const ids = [...new Set(
+            bases.map(b => this._fstCoinIdCache[b]).filter(id => {
+              if (!id) return false;
+              const c = this._fstMcapCache[id];
+              return !c || now - c.ts >= 3_600_000;
+            })
+          )];
+          if (!ids.length) return;
           try {
-            const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd&include_market_cap=true`);
-            if (!r.ok) return null;
-            const d = await r.json();
-            const mcap = d?.[id]?.usd_market_cap;
-            if (!mcap) return null;
-            this._fstMcapCache[id] = { mcap, ts: Date.now() };
-            return mcap;
-          } catch(e) { return null; }
+            const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids.join(',')}&vs_currencies=usd&include_market_cap=true`);
+            if (r.ok) {
+              const d = await r.json();
+              for (const id of ids) {
+                const mcap = d?.[id]?.usd_market_cap;
+                if (mcap) this._fstMcapCache[id] = { mcap, ts: now };
+              }
+            }
+          } catch(e) { /* silent — inspect loop will skip nulls */ }
+        },
+
+        _fstGetMcapSync(base) {
+          const id = this._fstCoinIdCache?.[base];
+          if (!id) return null;
+          const c = this._fstMcapCache?.[id];
+          return (c && Date.now() - c.ts < 3_600_000) ? c.mcap : null;
         },
 
         // Open one scatter long. The host (sim and live) reads binary TP/SL from cfg
