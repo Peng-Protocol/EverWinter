@@ -1,0 +1,206 @@
+<!--
+  Fund Chasing Strategy Plugin for PseudoChaser
+  Long tickers with high negative funding rates.
+
+  Negative funding means shorts pay longs on every settlement interval.
+  This plugin enters longs when the funding rate on a ticker meets or
+  falls below the configured threshold (default −0.1%), collecting the
+  funding payment as embedded carry while awaiting a directional TP or SL.
+
+  The entry pool is drawn exclusively from the host's bulk ticker cache
+  (_lastAllTickers). The plugin tracks the cache timestamp and only
+  fires entries once per fresh fetch — it will not re-scan the same
+  cached snapshot twice, so the effective re-scan interval matches the
+  host's bulk ticker cooldown (default 3h).
+
+  TP, SL, and all exit logic use the host's binary mode settings.
+  Drawdown throttle and gains lock gate all entries.
+
+  Load via Plugin Manager in PseudoChaser's config panel.
+  Load AFTER SunChaser if using live trading — see README Plugin Stack Order.
+  targetBot: pseudochaser
+-->
+<script>
+(function () {
+  'use strict';
+
+  window.__BotPlugin = {
+    id:        'fundchasing-chaser',
+    name:      'Fund Chasing (Chaser)',
+    version:   '1.0.0',
+    targetBot: 'pseudochaser',
+    after:     ['sunchaser', 'ashfall-chaser'],
+    before:    [],
+    conflicts: [],
+    requires:  [],
+    touches:   ['init', 'runScan', 'pseudoClosePosition'],
+
+    css: `
+      .fcc-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+    `,
+
+    slots: {
+      'mode-label-extra': `<span x-show="cfg.fccEnabled"> + FundChase</span>`,
+      'strategy-accordions': `
+        <div x-data="{ open: false }">
+          <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span>♨ Fund Chasing</span>
+              <span x-show="cfg.fccEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,150,80,.15);border:1px solid rgba(255,150,80,.35);border-radius:2px;color:#ff9650;letter-spacing:1px">ON</span>
+              <span x-show="!cfg.fccEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
+            </div>
+            <span class="cfg-acc-arrow" :class="open?'open':''">▶</span>
+          </button>
+          <div x-show="open" x-transition.opacity class="cfg-acc-body">
+            <label class="tog" @click.prevent="if(!cfgLocked){cfg.fccEnabled=!cfg.fccEnabled;persist()}">
+              <div class="tog-t" :class="cfg.fccEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Fund Chasing Mode</div>
+                <div class="fcc-hint">Long tickers with deeply negative funding rates — shorts pay longs every interval, embedding carry into the position. Only fires on a fresh bulk ticker fetch (≈ every 3h). TP / SL use the host binary mode settings.</div>
+              </div>
+            </label>
+            <div x-show="cfg.fccEnabled" style="margin-top:8px">
+              <div class="g">
+                <div class="lbl">Max Funding Rate <b x-text="(cfg.fccFrMax??-0.1).toFixed(2)+'%'"></b></div>
+                <input type="range" min="-1" max="-0.01" step="0.01" x-model.number="cfg.fccFrMax" @change="persist()">
+                <div class="fcc-hint">Enter a long when the ticker's current funding rate is ≤ this value. More negative threshold = fewer, stronger-signal entries.</div>
+              </div>
+              <div class="g" style="margin-top:8px">
+                <div class="lbl">Max Entries / Cycle <b x-text="(cfg.fccPicks??3)"></b></div>
+                <input type="range" min="1" max="10" step="1" x-model.number="cfg.fccPicks" @change="persist()">
+                <div class="fcc-hint">Tickers are ranked by funding rate ascending (most negative first). Entries open until this limit, max positions, or a halt.</div>
+              </div>
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.fccShareCapEnabled=!(cfg.fccShareCapEnabled??true);persist()}">
+                <div class="tog-t" :class="(cfg.fccShareCapEnabled??true)?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Position Share Cap</div>
+                  <div class="fcc-hint">Prevents Fund Chasing from filling all slots, reserving headroom for other strategies.</div>
+                </div>
+              </label>
+              <div class="g" x-show="cfg.fccShareCapEnabled??true" style="margin-top:8px">
+                <div class="lbl">Max Share <b x-text="(cfg.fccShareCapPct??50)+'% ('+Math.max(1,Math.floor((cfg.maxPos??5)*((cfg.fccShareCapPct??50)/100)))+' of '+(cfg.maxPos??5)+' slots)'"></b></div>
+                <input type="range" min="10" max="100" step="5" x-model.number="cfg.fccShareCapPct" @change="persist()">
+              </div>
+            </div>
+          </div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _origInit  = def.init;
+      const _origScan  = def.runScan;
+      const _origClose = def.pseudoClosePosition;
+
+      return Object.assign({}, def, {
+
+        async init() {
+          await _origInit.call(this);
+          if (this.cfg.fccEnabled          === undefined) this.cfg.fccEnabled          = false;
+          if (this.cfg.fccFrMax            === undefined) this.cfg.fccFrMax            = -0.1;
+          if (this.cfg.fccPicks            === undefined) this.cfg.fccPicks            = 3;
+          if (this.cfg.fccShareCapEnabled  === undefined) this.cfg.fccShareCapEnabled  = true;
+          if (this.cfg.fccShareCapPct      === undefined) this.cfg.fccShareCapPct      = 50;
+          this.registerRoleBadge?.(item => (item && item._fcc)
+            ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)">💰 FUND</span>`
+            : null);
+          this.log(`[FCC] Fund Chasing (Chaser) v1.0.0 loaded — ${this.cfg.fccEnabled ? 'enabled' : 'disabled'} | FR ≤ ${(this.cfg.fccFrMax ?? -0.1).toFixed(2)}% | ${this.cfg.fccPicks}/cycle`, 'info');
+        },
+
+        async runScan() {
+          await _origScan.call(this);
+          await this._fccRunScan();
+        },
+
+        async _fccRunScan() {
+          if (!this.cfg.fccEnabled) return;
+          if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
+            this.log(`[FCC] 💰 Skipped — ${this._isGainsLocked?.() ? 'gains lock' : 'drawdown halt'} active`, 'info');
+            return;
+          }
+          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
+
+          // Only act on a fresh bulk ticker fetch — skip if the cache timestamp
+          // hasn't advanced since the last time we processed entries.
+          const freshAt = this._lastAllTickersAt || 0;
+          if (!freshAt || freshAt === this._fccLastActedAt) return;
+
+          const allTickers = this._lastAllTickers || [];
+          if (!allTickers.length) return;
+
+          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
+          if (this.cfg.fccShareCapEnabled ?? true) {
+            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.fccShareCapPct ?? 50) / 100)));
+            const fccCount = (this.positions || []).filter(p => p._fcc).length;
+            headroom = Math.min(headroom, capSlots - fccCount);
+            if (headroom < 1) {
+              this.log(`[FCC] 💰 Share cap reached — no slots reserved for Fund Chasing`, 'info');
+              this._fccLastActedAt = freshAt;
+              return;
+            }
+          }
+          const picks = Math.min(Math.max(1, Math.round(this.cfg.fccPicks ?? 3)), headroom);
+
+          const frMax      = this.cfg.fccFrMax ?? -0.1;
+          const activeSyms = new Set((this.positions || []).map(p => p.symbol));
+          const pool = allTickers
+            .filter(t =>
+              t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
+              && parseFloat(t.lastPrice || 0) >= 0.001
+              && t.fundingRate != null
+              && parseFloat(t.fundingRate) * 100 <= frMax
+              && !activeSyms.has(t.symbol)
+              && !(this._isSymbolBanned?.(t.symbol)))
+            .sort((a, b) => parseFloat(a.fundingRate || 0) - parseFloat(b.fundingRate || 0));
+
+          this._fccLastActedAt = freshAt;
+
+          if (!pool.length) {
+            this.log(`[FCC] 💰 No tickers with FR ≤ ${frMax.toFixed(2)}% in fresh snapshot`, 'info');
+            return;
+          }
+
+          let opened = 0;
+          this._logBatchBegin?.();
+          try {
+            for (const t of pool) {
+              if (opened >= picks) break;
+              if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) break;
+              if (await this._fccOpen(t)) opened++;
+            }
+          } finally { this._logBatchEnd?.('[FCC] 💰 Entry roll-up'); }
+          this.log(`[FCC] 💰 ${pool.length} tickers ≤ FR ${frMax.toFixed(2)}% — ${opened}/${picks} opened`, 'info');
+        },
+
+        async _fccOpen(t) {
+          const sym    = t.symbol;
+          const price  = parseFloat(t.lastPrice || 0);
+          if (!price) return false;
+          const change = parseFloat(t.price24hPcnt || 0) * 100;
+          const fr     = parseFloat(t.fundingRate  || 0) * 100;
+          const lenBefore = (this.positions || []).length;
+          await this.pseudoOpenShort({ symbol: sym, price, change, fundingRate: fr, _fcc: true });
+          if ((this.positions || []).length > lenBefore) {
+            const pos = this.positions[this.positions.length - 1];
+            pos._fcc = true;
+            if (typeof this.persist === 'function') this.persist();
+            return true;
+          }
+          return false;
+        },
+
+        async pseudoClosePosition(pos, reason, fillPrice) {
+          const isFcc   = pos._fcc === true;
+          const prevLen = this.closedTrades?.length ?? 0;
+          await _origClose.call(this, pos, reason, fillPrice);
+          if (isFcc && (this.closedTrades?.length ?? 0) > prevLen) {
+            this.closedTrades[0]._fcc = true;
+            this.persist?.();
+            this.renderTradeFeed?.();
+          }
+        },
+      });
+    },
+  };
+})();
+</script>
