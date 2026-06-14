@@ -235,7 +235,7 @@ body::before {
 .tk-table-inner { min-width: 700px; }
 .tk-head {
   display: grid;
-  grid-template-columns: minmax(130px,1.4fr) 96px 96px 96px 120px minmax(140px,1fr) 90px;
+  grid-template-columns: minmax(130px,1.4fr) 96px 96px 96px 100px 120px minmax(140px,1fr) 90px;
   gap: 8px;
   padding: 7px 10px;
   font-family: var(--mono); font-size: 9px; font-weight: 500;
@@ -252,7 +252,7 @@ body::before {
 
 .tk-row {
   display: grid;
-  grid-template-columns: minmax(130px,1.4fr) 96px 96px 96px 120px minmax(140px,1fr) 90px;
+  grid-template-columns: minmax(130px,1.4fr) 96px 96px 96px 100px 120px minmax(140px,1fr) 90px;
   gap: 8px;
   padding: 10px;
   align-items: center;
@@ -1171,6 +1171,7 @@ body::before {
             <span class="right">PRICE</span>
             <span class="right">24H %</span>
             <span class="right">FUND %</span>
+            <span class="right hide-sm">MCAP</span>
             <span class="center hide-sm">RSI 6 / 12 / 24</span>
             <span>STRATEGY</span>
             <span class="center">CHART</span>
@@ -1196,6 +1197,8 @@ body::before {
                    x-text="(t.change24h>=0?'+':'')+t.change24h.toFixed(2)+'%'"></div>
               <div class="tk-fr" :class="t.fundingRate<0?'neg':(t.fundingRate>0?'pos':'')"
                    x-text="t.fundingRate!=null?(t.fundingRate>=0?'+':'')+t.fundingRate.toFixed(4):'—'"></div>
+              <div class="hide-sm" style="font-family:var(--mono);font-size:11px;text-align:right;color:var(--text-hi)"
+                   x-text="mcapData[t.symbol] ? '$'+fmtV(mcapData[t.symbol]) : '—'"></div>
               <div class="tk-rsi hide-sm">
                 <span class="r" :class="rsiCls(t.rsi6)"  x-text="rsiFmt(t.rsi6)"></span>
                 <span class="sep">/</span>
@@ -1255,6 +1258,11 @@ body::before {
                   <span class="tk-num-lbl">Turn 24h</span>
                   <span style="display:block!important;font-size:12px;font-family:var(--mono)"
                         x-text="'$'+fmtV(t.turnover24h)"></span>
+                </div>
+                <div class="tk-num-cell">
+                  <span class="tk-num-lbl">MCap</span>
+                  <span style="display:block!important;font-size:12px;font-family:var(--mono)"
+                        x-text="mcapData[t.symbol] ? '$'+fmtV(mcapData[t.symbol]) : '—'"></span>
                 </div>
               </div>
               <!-- Bottom: strategy tags -->
@@ -1567,6 +1575,17 @@ body::before {
               <label class="tog" @click="cfg.excludeBTC=!cfg.excludeBTC;persist()">
                 <div class="tog-t" :class="cfg.excludeBTC?'on':''"><div class="tog-k"></div></div>
               </label>
+            </div>
+
+            <div class="st-field">
+              <div class="lbl">
+                <div class="n">Light Control</div>
+                <div class="d">Dims non-text UI elements. 0% = full brightness, 50% = noticeably darker.</div>
+              </div>
+              <div class="st-range">
+                <input type="range" min="0" max="50" step="1" x-model.number="cfg.lightControl" @change="applyLightControl();persist()">
+                <div class="v" x-text="(cfg.lightControl??0)+'%'"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -1958,6 +1977,8 @@ let _wsReconnectTimer = null;
 let _wsWantTopics     = new Set(); // topics the watch loops want subscribed
 let _wsSubTopics      = new Set(); // topics subscribed on the live connection
 const _wsTickers      = {};        // symbol → merged ticker fields + ts (deltas merged over snapshot)
+const _cwCoinIdCache  = {};        // base → CoinGecko coin ID (permanent)
+const _cwMcapCache    = {};        // id → { mcap, ts } (1h TTL)
 
 function _wsSend(obj) {
   try { if (_wsConn && _wsConn.readyState === WebSocket.OPEN) _wsConn.send(JSON.stringify(obj)); } catch {}
@@ -2084,6 +2105,7 @@ function cw() { return {
     chartPollSec: 15,
     extendedCandles: 500,
     zoomStepPct: 5,
+    lightControl: 0,
   },
 
   // ─── SCAN / BOT STATE ─────────────────────────────────────────────
@@ -2101,6 +2123,7 @@ function cw() { return {
   // ─── DATA ─────────────────────────────────────────────────────────
   tickers: [],           // display list — tickers that passed ≥1 strategy
   rawTickers: [],        // last full ticker batch from bybit (reused by scans)
+  mcapData: {},          // symbol → USD market cap (CoinGecko, 1h TTL)
   searchResults: [],     // independent ticker search results
   ui_searchMode: false,  // true when showing search results instead of scan results
   ui_searching: false,   // true while search is in flight
@@ -2188,6 +2211,8 @@ function cw() { return {
   // ─── INIT ─────────────────────────────────────────────────────────
   init() {
     this.loadSaved();
+    this.applyLightControl();
+    this.$watch('cfg.lightControl', () => this.applyLightControl());
     this.loadPersistentLines();
     this.loadPersistentVlines();
 
@@ -2721,6 +2746,7 @@ function cw() { return {
       this.bot.lastEvaluated = symbolSet.size;
       this.bot.lastScan = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
 
+      this._cwFetchMcaps();
       this.toast(`Scan complete — ${final.length} match${final.length===1?'':'es'}`, 'ok');
     } catch(e) {
       console.error('Scan failed:', e);
@@ -2729,6 +2755,47 @@ function cw() { return {
       this.ui.scanning = false;
       this.ui.scanStage = '';
     }
+  },
+
+  // ─── COINGECKO MARKET CAP ─────────────────────────────────────────
+  async _cwGetMcap(base) {
+    let id = _cwCoinIdCache[base];
+    if (!id) {
+      try {
+        const r = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(base)}`);
+        if (!r.ok) return null;
+        const d = await r.json();
+        const hit = d?.coins?.[0];
+        if (hit?.id) { id = hit.id; _cwCoinIdCache[base] = id; }
+      } catch(e) { return null; }
+    }
+    if (!id) return null;
+    const cached = _cwMcapCache[id];
+    if (cached && Date.now() - cached.ts < 3_600_000) return cached.mcap;
+    try {
+      const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd&include_market_cap=true`);
+      if (!r.ok) return null;
+      const d = await r.json();
+      const mcap = d?.[id]?.usd_market_cap;
+      if (!mcap) return null;
+      _cwMcapCache[id] = { mcap, ts: Date.now() };
+      return mcap;
+    } catch(e) { return null; }
+  },
+
+  async _cwFetchMcaps() {
+    for (const t of this.tickers) {
+      const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
+      const mcap = await this._cwGetMcap(base);
+      if (mcap) this.mcapData[t.symbol] = mcap;
+    }
+  },
+
+  // ─── LIGHT CONTROL ────────────────────────────────────────────────
+  applyLightControl() {
+    const brightness = 100 - (this.cfg.lightControl ?? 0) * 0.8;
+    const el = document.querySelector('.app');
+    if (el) el.style.filter = brightness < 100 ? `brightness(${brightness}%)` : '';
   },
 
   // ═════════════════════════════════════════════════════════════════
