@@ -31,7 +31,7 @@
   window.__BotPlugin = {
     id:        'firestorm-chaser',
     name:      'Firestorm (Chaser)',
-    version:   '1.5.4',
+    version:   '1.6.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser', 'ashfall-chaser'],
     before:    [],
@@ -69,7 +69,7 @@
               <div class="g">
                 <div class="lbl">Baseline 24h Δ <b x-text="(cfg.firestormBaselinePct??6).toFixed(1)+'%'"></b></div>
                 <input type="range" min="1" max="20" step="0.5" x-model.number="cfg.firestormBaselinePct" @change="persist()">
-                <div class="fst-hint">A ticker qualifies when its 24h change exceeds this in either direction; picks alternate between gainers and losers so each cycle spans both sides.</div>
+                <div class="fst-hint">A ticker qualifies when its |24h change| exceeds this threshold. Of those, only tickers with 24h vol &gt; 10% of market cap are selected (long pool — high relative volume confirms momentum behind the move).</div>
               </div>
               <div class="g" style="margin-top:8px">
                 <div class="lbl">Picks / Cycle <b x-text="(cfg.firestormPicks??3)"></b></div>
@@ -140,7 +140,7 @@
           this.registerRoleBadge?.(item => (item && item._firestorm)
             ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)">🔥 FIRE</span>`
             : null);
-          this.log(`[FST] Firestorm (Chaser) v1.5.4 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% buffered | ${this.cfg.firestormPicks}/cycle | cascade ${(this.cfg.firestormCascadeEnabled ?? true) ? 'on' : 'off'}`, 'info');
+          this.log(`[FST] Firestorm (Chaser) v1.6.0 loaded — ${this.cfg.firestormEnabled ? 'enabled' : 'disabled'} | baseline ${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% | SL ${this.cfg.firestormSlPct}% / TP ${this.cfg.firestormTpPct}% buffered | ${this.cfg.firestormPicks}/cycle | cascade ${(this.cfg.firestormCascadeEnabled ?? true) ? 'on' : 'off'}`, 'info');
         },
 
         async runScan() {
@@ -156,7 +156,7 @@
           }
           if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
 
-          let opened = 0, poolSize = 0, poolG = 0, poolL = 0;
+          let opened = 0, poolSize = 0, poolFiltered = 0;
           // Picks are capped at remaining position headroom — at 9/10 only one more opens.
           let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
           // Share cap — Firestorm holds at most firestormShareCapPct% of maxPos so scatter
@@ -203,21 +203,30 @@
               && !(this._isSymbolBanned?.(t.symbol)));
             poolSize = pool.length;
 
-            // Draw alternately from gainers (≥ +baseline) and losers (≤ −baseline) so a
-            // cycle's picks span both sides of the move, not just whichever dominates.
-            const gainers = pool.filter(t => parseFloat(t.price24hPcnt || 0) > 0);
-            const losers  = pool.filter(t => parseFloat(t.price24hPcnt || 0) < 0);
-            poolG = gainers.length; poolL = losers.length;
+            // Sort baseline movers by 24h turnover desc; inspect up to 10 for vol/mcap ratio.
+            // Per-ticker mcap is fetched individually — cheaper than a bulk snapshot.
+            const sorted  = [...pool].sort((a, b) => parseFloat(b.turnover24h || 0) - parseFloat(a.turnover24h || 0));
+            const inspect = sorted.slice(0, 10);
+            const longPool = [];
+            for (const t of inspect) {
+              const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
+              const mcap = await this._fstGetMcap(base);
+              if (!mcap) continue;
+              if (parseFloat(t.turnover24h || 0) / mcap > 0.10) longPool.push(t);
+            }
+            poolFiltered = longPool.length;
+            if (!poolFiltered) {
+              this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥±${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}%, checked ${inspect.length} by turnover — none met vol/mcap>10%`, 'info');
+              return;
+            }
+            const candidates = [...longPool];
             let tried = 0;
-            let side  = Math.random() < 0.5 ? 0 : 1;
             this._logBatchBegin?.();
             try {
-              while ((gainers.length || losers.length) && opened < picks && tried < picks * 3
+              while (candidates.length && opened < picks && tried < picks * 3
                      && (this.positions?.length ?? 0) < (this.cfg.maxPos ?? 5)) {
-                let src = side === 0 ? gainers : losers;
-                if (!src.length) src = side === 0 ? losers : gainers;
-                const t = src.splice(Math.floor(Math.random() * src.length), 1)[0];
-                side = 1 - side;
+                const idx = Math.floor(Math.random() * candidates.length);
+                const t   = candidates.splice(idx, 1)[0];
                 tried++;
                 if (await this._fstOpen(t)) opened++;
               }
@@ -226,7 +235,37 @@
             this.log('[FST] Scan error: ' + e.message, 'warn');
             return;
           }
-          this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥±${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% (${poolG}▲/${poolL}▼) — ${opened}/${picks} opened`, 'info');
+          this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥±${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}%, ${poolFiltered} vol/mcap>10% — ${opened}/${picks} opened`, 'info');
+        },
+
+        // Returns market cap in USD for a single base symbol, or null if unavailable.
+        // Two-level cache: permanent session ID cache (CoinGecko IDs don't change) +
+        // 1h market-cap cache so repeated scan cycles don't re-fetch.
+        async _fstGetMcap(base) {
+          if (!this._fstCoinIdCache) this._fstCoinIdCache = {};
+          if (!this._fstMcapCache)   this._fstMcapCache   = {};
+          let id = this._fstCoinIdCache[base];
+          if (!id) {
+            try {
+              const r = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(base)}`);
+              if (!r.ok) return null;
+              const d = await r.json();
+              const hit = d?.coins?.[0];
+              if (hit?.id) { id = hit.id; this._fstCoinIdCache[base] = id; }
+            } catch(e) { return null; }
+          }
+          if (!id) return null;
+          const cached = this._fstMcapCache[id];
+          if (cached && Date.now() - cached.ts < 3_600_000) return cached.mcap;
+          try {
+            const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd&include_market_cap=true`);
+            if (!r.ok) return null;
+            const d = await r.json();
+            const mcap = d?.[id]?.usd_market_cap;
+            if (!mcap) return null;
+            this._fstMcapCache[id] = { mcap, ts: Date.now() };
+            return mcap;
+          } catch(e) { return null; }
         },
 
         // Open one scatter long. The host (sim and live) reads binary TP/SL from cfg

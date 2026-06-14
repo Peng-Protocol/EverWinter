@@ -704,7 +704,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="tog-t" :class="cfg.bulkTickerCooldownEnabled?'on':''"><div class="tog-k"></div></div>
               <span class="tog-l">Bulk Ticker Cooldown</span>
             </label>
-            <div style="font-size:9px;color:var(--text-lo);margin-top:2px;line-height:1.5">Reuses the full ticker list for N hours instead of re-fetching every scan. Reduces bulk fetches from 96/day to 8/day at 3h.</div>
+            <div style="font-size:9px;color:var(--text-lo);margin-top:2px;line-height:1.5" x-text="'Reuses the full ticker list for N hours instead of re-fetching every scan. Reduces bulk fetches from '+(Math.round(1440/(cfg.scanMins??15)))+'/day to '+(Math.round(24/(cfg.bulkTickerCooldownHours??3)))+'/day at '+(cfg.bulkTickerCooldownHours??3)+'h.'"></div>
             <div x-show="cfg.bulkTickerCooldownEnabled" style="margin-top:6px">
               <div class="lbl">Cooldown <b x-text="(cfg.bulkTickerCooldownHours??3)+'h'"></b></div>
               <input type="range" min="1" max="12" step="1" x-model.number="cfg.bulkTickerCooldownHours" @change="persist()">
@@ -2135,7 +2135,7 @@ function pw() { return {
     const intervalMs = t.fundingIntervalHour
       ? parseInt(t.fundingIntervalHour, 10) * 3600000
       : 8 * 3600000;
-    this._klineCache[cacheKey] = { rate, intervalMs, ts: Date.now() };
+    this._klineCache[cacheKey] = { rate, intervalMs, ts: Date.now(), change24h: parseFloat(t.price24hPcnt || 0) * 100, lastPrice: parseFloat(t.lastPrice || 0) };
     return rate;
   },
 
@@ -2773,6 +2773,18 @@ function pw() { return {
       });
     }
 
+    if (this._manualHalt) {
+      problems.push({
+        pip:        'warn',
+        pipStyle:   'background:rgba(255,160,0,.9)',
+        label:      'MHL',
+        labelStyle: 'color:rgba(255,160,0,.9)',
+        border:     'border-color:rgba(255,160,0,.45);background:rgba(255,160,0,.06)',
+        title:      'Manual halt active — all new scans blocked',
+        action:     null,
+      });
+    }
+
     if (this.cfg.drawdownThrottleEnabled && this._drawdownHaltUntil > Date.now()) {
       const _ddRem = this._drawdownHaltUntil - Date.now();
       const _ddH   = Math.floor(_ddRem / 3600000);
@@ -3041,6 +3053,9 @@ function pw() { return {
           const fr = await this.fetchFundingRate(sym);
           entryFundingRate = fr;
         } catch(e) { this.log(`[PC-SCAN-01] ${sym}: funding fetch failed — ${e.message}`, 'warn'); }
+        const _frSnap     = this._klineCache[`fr_${sym}`];
+        const _liveChange = _frSnap?.change24h ?? change;
+        const _livePrice  = _frSnap?.lastPrice  || price;
 
         let status='skip';
         let skipReason = '';
@@ -3051,9 +3066,9 @@ function pw() { return {
         } else {
           // 24h change gate — must be at or below dynamic cap ceiling (≥60% of worst, min -3%)
           // skip if LESS negative than ceiling — ticker hasn't dropped enough to qualify
-          if (change > dynamicCapCeiling) {
+          if (_liveChange > dynamicCapCeiling) {
             status = 'skip';
-            candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate:entryFundingRate,status,skipReason});
+            candidates.push({symbol:sym,change:_liveChange,price:_livePrice,rsi6:null,rsi12:null,rsi24:null,fundingRate:entryFundingRate,status,skipReason});
             continue;
           }
           // Loser lock-in gate — re-entry direction set by gainerLockInDir
@@ -3062,10 +3077,10 @@ function pw() { return {
             const _gli = this.gainerLockIn[sym];
             if (_gli && (Date.now() - _gli.setAt) < 6 * 3600 * 1000) {
               const _gDir = this.cfg.gainerLockInDir ?? 'below';
-              if (_gDir === 'above' ? change <= _gli.change : change >= _gli.change) {
+              if (_gDir === 'above' ? _liveChange <= _gli.change : _liveChange >= _gli.change) {
                 status = 'lockin';
-                skipReason = `24h chg ${change.toFixed(2)}% ${_gDir === 'above' ? 'below' : 'above'} lock-in ${_gli.change.toFixed(2)}% (re-entry ${_gDir} only)`;
-                candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate:entryFundingRate,status,skipReason});
+                skipReason = `24h chg ${_liveChange.toFixed(2)}% ${_gDir === 'above' ? 'below' : 'above'} lock-in ${_gli.change.toFixed(2)}% (re-entry ${_gDir} only)`;
+                candidates.push({symbol:sym,change:_liveChange,price:_livePrice,rsi6:null,rsi12:null,rsi24:null,fundingRate:entryFundingRate,status,skipReason});
                 continue;
               }
             }
@@ -3075,11 +3090,11 @@ function pw() { return {
             if (!instr) {
               status='invalid'; skipReason = skipReason || 'not supported on this exchange';
             } else {
-              const rawQty   = this.cfg.minNotional / price;
+              const rawQty   = this.cfg.minNotional / _livePrice;
               const qty      = this.snapQty(rawQty, instr);
               const _prevTpPctL = this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
-              const tpPrice  = this.snapPrice(price * (1 + (_prevTpPctL / 100) / this.cfg.leverage), instr); // LONG: TP at slider % above entry
-              const notional = qty * price;
+              const tpPrice  = this.snapPrice(_livePrice * (1 + (_prevTpPctL / 100) / this.cfg.leverage), instr); // LONG: TP at slider % above entry
+              const notional = qty * _livePrice;
               if (qty <= 0) {
                 status='invalid'; skipReason = skipReason || 'qty below min';
               } else if (instr.minOrderAmt > 0 && notional < instr.minOrderAmt) {
@@ -3093,7 +3108,7 @@ function pw() { return {
             if (status==='invalid') this.log(`[SCN] ${sym}: skipped — ${skipReason}`, 'info');
           }
         }
-        candidates.push({symbol:sym,change,price,rsi6:null,rsi12:null,rsi24:null,fundingRate:entryFundingRate,status,skipReason});
+        candidates.push({symbol:sym,change:_liveChange,price:_livePrice,rsi6:null,rsi12:null,rsi24:null,fundingRate:entryFundingRate,status,skipReason});
       }
       } // end gainersEnabled
 
