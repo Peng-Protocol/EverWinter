@@ -2011,8 +2011,9 @@ let _wsReconnectTimer = null;
 let _wsWantTopics     = new Set(); // topics the watch loops want subscribed
 let _wsSubTopics      = new Set(); // topics subscribed on the live connection
 const _wsTickers      = {};        // symbol → merged ticker fields + ts (deltas merged over snapshot)
-const _cwCoinIdCache  = {};        // base → CoinGecko coin ID (permanent)
+const _cwCoinIdCache  = {};        // base → CoinGecko coin ID ('' = confirmed miss)
 const _cwMcapCache    = {};        // id → { mcap, ts } (1h TTL)
+let   _cwCoinList     = null;      // [ {id,symbol,name} ] fetched once per session
 
 function _wsSend(obj) {
   try { if (_wsConn && _wsConn.readyState === WebSocket.OPEN) _wsConn.send(JSON.stringify(obj)); } catch {}
@@ -2806,69 +2807,89 @@ function cw() { return {
   },
 
   // ─── COINGECKO MARKET CAP ─────────────────────────────────────────
-  async _cwGetMcap(base) {
-    // _cwCoinIdCache[base] === undefined → not yet looked up
-    // _cwCoinIdCache[base] === ''        → confirmed not found (suppress retries)
-    let id = _cwCoinIdCache[base];
-    if (id === undefined) {
-      try {
-        const r = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(base)}`);
-        if (!r.ok) {
-          this.cwlog(`CoinGecko search HTTP ${r.status} for '${base}'`, 'err', 'CG-S01');
-          return null;
-        }
-        const d = await r.json();
-        const hit = d?.coins?.[0];
-        if (hit?.id) {
-          id = hit.id;
-          _cwCoinIdCache[base] = id;
-        } else {
-          this.cwlog(`CoinGecko: no coin match for '${base}'`, 'warn', 'CG-S03');
-          _cwCoinIdCache[base] = ''; // cache the miss — suppress future retries
-          return null;
-        }
-      } catch(e) {
-        this.cwlog(`CoinGecko search error for '${base}': ${e.message}`, 'err', 'CG-S02');
-        return null;
-      }
-    }
-    if (!id) return null; // cached miss ('')
-    const cached = _cwMcapCache[id];
-    if (cached && Date.now() - cached.ts < 3_600_000) return cached.mcap;
+  // Strategy: 2 API calls total for any batch size.
+  //   Step 1 — /coins/list  : download full symbol→id map once per session (cached in _cwCoinList)
+  //   Step 2 — /simple/price: batch all needed IDs in one request (up to 250 per call)
+  // This avoids the per-ticker sequential calls that trigger 429s.
+
+  async _cwEnsureCoinList() {
+    if (_cwCoinList) return _cwCoinList;
     try {
-      const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd&include_market_cap=true`);
-      if (!r.ok) {
-        this.cwlog(`CoinGecko mcap HTTP ${r.status} for '${id}'`, 'err', 'CG-M01');
-        return null;
-      }
-      const d = await r.json();
-      const mcap = d?.[id]?.usd_market_cap;
-      if (!mcap) {
-        this.cwlog(`CoinGecko mcap null for '${id}' (${base})`, 'warn', 'CG-M03');
-        return null;
-      }
-      _cwMcapCache[id] = { mcap, ts: Date.now() };
-      return mcap;
+      const r = await fetch('https://api.coingecko.com/api/v3/coins/list?include_platform=false');
+      if (!r.ok) { this.cwlog(`CoinGecko coins/list HTTP ${r.status}`, 'err', 'CG-L01'); return null; }
+      _cwCoinList = await r.json();
+      this.cwlog(`CoinGecko coin list loaded — ${_cwCoinList.length} entries`, 'info', 'CG-L00');
+      return _cwCoinList;
     } catch(e) {
-      this.cwlog(`CoinGecko mcap error for '${id}': ${e.message}`, 'err', 'CG-M02');
+      this.cwlog(`CoinGecko coins/list error: ${e.message}`, 'err', 'CG-L02');
       return null;
     }
   },
 
   async _cwFetchMcaps() {
-    if (this.mcapFetching) return; // guard against concurrent runs
+    if (this.mcapFetching) return;
     this.mcapFetching = true;
-    let fetched = 0, failed = 0;
+    const now = Date.now();
     try {
+      const bases = this.tickers.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
+
+      // Phase 1: resolve IDs for bases not yet seen
+      const unknown = bases.filter(b => _cwCoinIdCache[b] === undefined);
+      if (unknown.length) {
+        const list = await this._cwEnsureCoinList();
+        if (list) {
+          for (const base of unknown) {
+            const hit = list.find(c => c.symbol === base);
+            _cwCoinIdCache[base] = hit?.id || '';
+            if (!hit?.id) this.cwlog(`No CoinGecko match for '${base}'`, 'warn', 'CG-S03');
+          }
+        }
+      }
+
+      // Phase 2: collect IDs that need a fresh mcap (not cached or expired)
+      const ids = [...new Set(
+        bases.map(b => _cwCoinIdCache[b]).filter(id => {
+          if (!id) return false;
+          const c = _cwMcapCache[id];
+          return !c || now - c.ts >= 3_600_000;
+        })
+      )];
+
+      if (ids.length) {
+        // /simple/price accepts up to 250 ids per call
+        const BATCH = 250;
+        for (let i = 0; i < ids.length; i += BATCH) {
+          const chunk = ids.slice(i, i + BATCH);
+          try {
+            const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${chunk.join(',')}&vs_currencies=usd&include_market_cap=true`);
+            if (!r.ok) {
+              this.cwlog(`CoinGecko mcap batch HTTP ${r.status}`, 'err', 'CG-M01');
+            } else {
+              const d = await r.json();
+              for (const id of chunk) {
+                const mcap = d?.[id]?.usd_market_cap;
+                if (mcap) _cwMcapCache[id] = { mcap, ts: now };
+                else this.cwlog(`No mcap returned for '${id}'`, 'warn', 'CG-M03');
+              }
+            }
+          } catch(e) {
+            this.cwlog(`CoinGecko mcap batch error: ${e.message}`, 'err', 'CG-M02');
+          }
+          if (i + BATCH < ids.length) await new Promise(r => setTimeout(r, 1200));
+        }
+      }
+
+      // Phase 3: push resolved values into reactive mcapData
+      let fetched = 0, failed = 0;
       for (const t of this.tickers) {
         const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
-        const mcap = await this._cwGetMcap(base);
-        if (mcap) { this.mcapData[t.symbol] = mcap; fetched++; }
-        else failed++;
-        // 350 ms gap between requests — CoinGecko free tier rate limit
-        await new Promise(r => setTimeout(r, 350));
+        const id   = _cwCoinIdCache[base];
+        const c    = id ? _cwMcapCache[id] : null;
+        if (c) { this.mcapData[t.symbol] = c.mcap; fetched++; } else failed++;
       }
-      this.cwlog(`MCap fetch complete — ${fetched} ok, ${failed} failed`, failed > 0 ? 'warn' : 'info', 'CG-DONE');
+      this.cwlog(`MCap batch — ${fetched} ok, ${failed} no data (${ids.length} fetched from CG)`, failed > 0 ? 'warn' : 'info', 'CG-DONE');
+    } catch(e) {
+      this.cwlog(`MCap fetch error: ${e.message}`, 'err', 'CG-M02');
     } finally {
       this.mcapFetching = false;
     }
