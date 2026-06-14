@@ -203,16 +203,22 @@
               && !(this._isSymbolBanned?.(t.symbol)));
             poolSize = pool.length;
 
-            // Filter to tickers with vol/mcap > 10% — high relative 24h volume confirms
-            // momentum behind the move, making it a candidate to ride long.
-            const mcapMap  = await this._fstFetchMcap();
-            const longPool = pool.filter(t => {
+            // Sort baseline movers by 24h turnover desc; inspect up to 10 for vol/mcap ratio.
+            // Per-ticker mcap is fetched individually — cheaper than a bulk snapshot.
+            const sorted  = [...pool].sort((a, b) => parseFloat(b.turnover24h || 0) - parseFloat(a.turnover24h || 0));
+            const inspect = sorted.slice(0, 10);
+            const longPool = [];
+            for (const t of inspect) {
               const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
-              const mcap = mcapMap.get(base);
-              if (!mcap) return true; // no mcap data → include by default
-              return parseFloat(t.turnover24h || 0) / mcap > 0.10;
-            });
+              const mcap = await this._fstGetMcap(base);
+              if (!mcap) continue;
+              if (parseFloat(t.turnover24h || 0) / mcap > 0.10) longPool.push(t);
+            }
             poolFiltered = longPool.length;
+            if (!poolFiltered) {
+              this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥±${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}%, checked ${inspect.length} by turnover — none met vol/mcap>10%`, 'info');
+              return;
+            }
             const candidates = [...longPool];
             let tried = 0;
             this._logBatchBegin?.();
@@ -229,34 +235,37 @@
             this.log('[FST] Scan error: ' + e.message, 'warn');
             return;
           }
-          this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥±${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}% → ${poolFiltered} vol/mcap>10% — ${opened}/${picks} opened`, 'info');
+          this.log(`[FST] 🔥 Scattershot: ${poolSize} movers ≥±${(this.cfg.firestormBaselinePct ?? 6).toFixed(1)}%, ${poolFiltered} vol/mcap>10% — ${opened}/${picks} opened`, 'info');
         },
 
-        async _fstFetchMcap() {
-          const SIX_H = 6 * 3600 * 1000;
-          if (this._fstMcapData && (Date.now() - (this._fstMcapAt || 0)) < SIX_H) return this._fstMcapData;
-          try {
-            const mcapMap = new Map();
-            for (const page of [1, 2]) {
-              const r = await fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${page}`);
-              if (!r.ok) break;
-              const data = await r.json();
-              if (!Array.isArray(data)) break;
-              for (const coin of data) {
-                if (coin.symbol && coin.market_cap > 0 && !mcapMap.has(coin.symbol.toLowerCase())) {
-                  mcapMap.set(coin.symbol.toLowerCase(), coin.market_cap);
-                }
-              }
-            }
-            if (mcapMap.size > 0) {
-              this._fstMcapData = mcapMap;
-              this._fstMcapAt   = Date.now();
-              this.log(`[FST] mcap snapshot: ${mcapMap.size} coins cached (6h TTL)`, 'info');
-            }
-          } catch(e) {
-            this.log(`[FST] mcap fetch error: ${e.message}`, 'warn');
+        // Returns market cap in USD for a single base symbol, or null if unavailable.
+        // Two-level cache: permanent session ID cache (CoinGecko IDs don't change) +
+        // 1h market-cap cache so repeated scan cycles don't re-fetch.
+        async _fstGetMcap(base) {
+          if (!this._fstCoinIdCache) this._fstCoinIdCache = {};
+          if (!this._fstMcapCache)   this._fstMcapCache   = {};
+          let id = this._fstCoinIdCache[base];
+          if (!id) {
+            try {
+              const r = await fetch(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(base)}`);
+              if (!r.ok) return null;
+              const d = await r.json();
+              const hit = d?.coins?.[0];
+              if (hit?.id) { id = hit.id; this._fstCoinIdCache[base] = id; }
+            } catch(e) { return null; }
           }
-          return this._fstMcapData || new Map();
+          if (!id) return null;
+          const cached = this._fstMcapCache[id];
+          if (cached && Date.now() - cached.ts < 3_600_000) return cached.mcap;
+          try {
+            const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(id)}&vs_currencies=usd&include_market_cap=true`);
+            if (!r.ok) return null;
+            const d = await r.json();
+            const mcap = d?.[id]?.usd_market_cap;
+            if (!mcap) return null;
+            this._fstMcapCache[id] = { mcap, ts: Date.now() };
+            return mcap;
+          } catch(e) { return null; }
         },
 
         // Open one scatter long. The host (sim and live) reads binary TP/SL from cfg
