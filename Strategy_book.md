@@ -265,9 +265,11 @@ The Losers strategy targets coins showing strong downward momentum. Entry requir
 
 **The premise**: A bet on the market at large rather than on any single ticker. Reading one coin's next move is hard; reading the day's broad drift is easier. If the market is drifting your way, a random sample of its biggest movers — held behind asymmetric barriers — profits without ever predicting which specific ticker will move. The randomness is the point: no ticker-level thesis exists to be wrong about.
 
-**Candidate pool**: Every ticker whose 24-hour change clears a configured baseline in either direction — at or above +6%, or at or below −6%, by default. Big movers are chosen because they are the coins the day's character is actually expressing itself through; quiet tickers carry no information about the drift.
+**Candidate pool**: Every ticker whose 24-hour change clears a configured baseline in either direction — at or above +6%, or at or below −6%, by default. Big movers are chosen because they are the coins the day's character is actually expressing itself through; quiet tickers carry no information about the drift. The pool is ranked by 24-hour turnover and only the top 10 by volume are evaluated for entry.
 
-**Random picks, both sides**: Each scan cycle draws a configured number of tickers (default 3) from the pool at random, alternating between gainers and losers so the sample spans both sides of the move rather than clustering on whichever side dominates. Picks never exceed remaining position headroom.
+**Vol/mcap filtered selection**: For each of the top-10 candidates, market cap is fetched from CoinGecko and the turnover-to-market-cap ratio is computed. **Blizzard (short)** selects tickers where 24h vol is **less than 10% of market cap** — low relative volume suggests the broad market has not yet chased the move, making it a candidate to fade. **Firestorm (long)** selects tickers where 24h vol is **greater than 10% of market cap** — high relative volume confirms momentum is actively backing the move. If none of the inspected tickers pass, the cycle skips entry entirely and logs the outcome. Otherwise up to the configured number of picks (default 3) are drawn at random from the passing set. Picks never exceed remaining position headroom.
+
+Market cap data is fetched per-ticker from the CoinGecko public API (no key required), cached at the coin-ID level for one hour. The first scan of a session may resolve coin IDs via search for unknown symbols; subsequent cycles reuse cached IDs. If market cap data is unavailable for a ticker — due to a failed lookup, API outage, or an obscure coin not listed on CoinGecko — that ticker is excluded from the candidate pool. See the README for the full CoinGecko limitation details.
 
 **Asymmetric barriers**: Every entry opens binary — one fixed stop loss (default 18%) and one far take profit (default 105% buffered, closing functionally at 70% — the buffered value ÷ the profit-offset buffer, the same convention as the standard TP). The barrier geometry is the whole edge: one functional TP win covers roughly four stop-loss exits. The strategy does not need to be right often — it needs the broad drift to occasionally carry a random pick a long way.
 
@@ -281,7 +283,7 @@ The Losers strategy targets coins showing strong downward momentum. Entry requir
 
 **Components used**:
 - Binary Mode (fixed SL, far buffered TP — asymmetric barrier geometry)
-- Random sampling of large 24h movers, alternating gainers and losers
+- Vol/mcap ratio filter on top-10 movers by 24h turnover (CoinGecko market cap, per-ticker lookup, 1h cache)
 - 12-hour force close
 - Cascade — collective profit bail across the open book
 - Climate gate (learned market-structure profile)
