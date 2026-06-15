@@ -43,7 +43,8 @@
         <div x-data="{ open: false }">
           <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
             <div style="display:flex;align-items:center;gap:7px">
-              <span>❄️ EverWinter</span>
+              <!-- ❄ matches other Winter-family plugin accordions (❄ Permafrost, ❄ Blizzard, etc.) — emoji variant ❄️ is too dissimilar -->
+              <span>❄ EverWinter</span>
               <span x-show="creds.key && creds.secret" style="font-size:8px;padding:1px 5px;background:rgba(96,210,255,.15);border:1px solid rgba(96,210,255,.3);border-radius:2px;color:var(--ice);letter-spacing:1px">LIVE</span>
               <span x-show="!(creds.key && creds.secret)" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">SETUP</span>
             </div>
@@ -81,6 +82,9 @@
         _ewOpposite:    {},  // opposite-direction (Buy) exchange positions, noted but not managed
 
         async init() {
+          // Update loading screen immediately — it persists until showApp() fires after init completes
+          const _loadLogo = document.querySelector('.pw-logo');
+          if (_loadLogo) _loadLogo.textContent = '❄️ EVERWINTER';
           await _origInit.call(this);
           if (typeof this.setThemeEmoji === 'function') this.setThemeEmoji('❄️');
           this.appName  = 'EVERWINTER';
@@ -254,18 +258,20 @@
             const tolerance = base * tpPct / 100 / lev * 0.10;
             const deviation = Math.abs(exTp - targetTp);
             const lockKey   = exTp.toFixed(dp);
+            const targetKey = targetTp.toFixed(dp);
             const lockAge   = pos._ewTpLockedAt ? Date.now() - pos._ewTpLockedAt : Infinity;
-            if (pos._ewTpLockKey === lockKey && lockAge < 60000) return; // accepted as authoritative
+            // Bail if the exchange TP is accepted-authoritative OR if we already sent this target (in-flight / recently confirmed)
+            if (lockAge < 60000 && (pos._ewTpLockKey === lockKey || pos._ewTpLockKey === targetKey)) return;
 
             if (deviation > tolerance) {
               this.log(`[EW] ${pos.symbol}: TP drift — exchange ${exTp.toFixed(dp)} vs target ${targetTp.toFixed(dp)} (Δ${deviation.toFixed(dp)}) — correcting`, 'warn');
+              pos._ewTpLockKey = targetKey; pos._ewTpLockedAt = Date.now(); // pre-flight: block concurrent ticks
               const res = await this.setTP(pos, targetTp);
-              if (res === 'ok') {
-                pos._ewTpLockKey = null; pos._ewTpLockedAt = null;
-              } else {
-                pos._ewTpLockKey = lockKey; pos._ewTpLockedAt = Date.now();
+              if (res !== 'ok') {
+                pos._ewTpLockKey = lockKey; pos._ewTpLockedAt = Date.now(); // refused — accept exchange TP as authoritative
                 this.log(`[EW] ${pos.symbol}: TP correction refused — accepting exchange TP ${exTp.toFixed(dp)}`, 'debug');
               }
+              // on 'ok': keep targetKey locked so the exchange echo doesn't re-trigger for 60 s
             }
           } else {
             // Exchange TP is null — reissue stored or recomputed target
@@ -275,9 +281,10 @@
               const lockAge = pos._ewTpLockedAt ? Date.now() - pos._ewTpLockedAt : Infinity;
               if (pos._ewTpLockKey === nullKey && lockAge < 60000) return;
               this.log(`[EW] ${pos.symbol}: TP null on exchange — reissuing @ ${reissue.toFixed(dp)}`, 'warn');
+              pos._ewTpLockKey = nullKey; pos._ewTpLockedAt = Date.now(); // pre-flight lock
               const res = await this.setTP(pos, reissue);
-              if (res === 'ok') { pos._ewTpLockKey = null; pos._ewTpLockedAt = null; }
-              else               { pos._ewTpLockKey = nullKey; pos._ewTpLockedAt = Date.now(); }
+              if (res !== 'ok') { pos._ewTpLockKey = nullKey; pos._ewTpLockedAt = Date.now(); }
+              // on 'ok': keep nullKey locked until exchange echoes back a real TP value
             }
           }
         },
@@ -443,21 +450,34 @@
             if (!this._ewClosing) this._ewClosing = {};
             this._ewClosing[pos.id] = true;
             try {
-              await this._ewDelay();
               const ref = fillPrice || pos.markPrice || pos.entryPrice;
-              const dp  = this._ewPriceDp(pos.symbol);
-              let body;
-              if (ref > 0) {
-                const lim = parseFloat((ref * 1.003).toFixed(dp));
-                body = { category: 'linear', symbol: pos.symbol, side: 'Buy', orderType: 'Limit', qty: String(pos.totalSize), price: String(lim), timeInForce: 'GTC', reduceOnly: true };
+              if (reason === 'tp' || reason === 'sl') {
+                // Exchange-native TP/SL already filled — fetch real exit price, no redundant order
+                await this._ewDelay();
+                try {
+                  const pp = `category=linear&symbol=${pos.symbol}&limit=1`;
+                  const ph = await _sign(this.creds.key, this.creds.secret, pp, this._tsOffset);
+                  const pr = await fetch(`${this.base}/v5/position/closed-pnl?${pp}`, { headers: ph });
+                  const pd = await this._ewSafeJson(pr);
+                  const rec = pd?.result?.list?.[0];
+                  if (rec) fillPrice = parseFloat(rec.avgExitPrice || rec.exitPrice || ref);
+                } catch(e) {}
               } else {
-                body = { category: 'linear', symbol: pos.symbol, side: 'Buy', orderType: 'Market', qty: String(pos.totalSize), timeInForce: 'IOC', reduceOnly: true };
-              }
-              const b = JSON.stringify(body);
-              const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
-              const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
-              const d = await this._ewSafeJson(r);
-              if (d?.retCode === 0) {
+                // Manual/force close — place order, then always fetch real fill regardless of outcome
+                await this._ewDelay();
+                const dp = this._ewPriceDp(pos.symbol);
+                let body;
+                if (ref > 0) {
+                  const lim = parseFloat((ref * 1.003).toFixed(dp));
+                  body = { category: 'linear', symbol: pos.symbol, side: 'Buy', orderType: 'Limit', qty: String(pos.totalSize), price: String(lim), timeInForce: 'GTC', reduceOnly: true };
+                } else {
+                  body = { category: 'linear', symbol: pos.symbol, side: 'Buy', orderType: 'Market', qty: String(pos.totalSize), timeInForce: 'IOC', reduceOnly: true };
+                }
+                const b = JSON.stringify(body);
+                const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+                const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
+                const d = await this._ewSafeJson(r);
+                if (d?.retCode !== 0) this.log(`[EW] close attempt ${pos.symbol}: ${d?.retMsg || 'no response'}`, 'warn');
                 await new Promise(res => setTimeout(res, 2000));
                 try {
                   await this._ewDelay();
@@ -468,8 +488,6 @@
                   const rec = pd?.result?.list?.[0];
                   if (rec) fillPrice = parseFloat(rec.avgExitPrice || rec.exitPrice || ref);
                 } catch(e) {}
-              } else {
-                this.log(`[EW] close failed ${pos.symbol}: ${d?.retMsg || 'no response'}`, 'warn');
               }
             } catch(e) {
               this.log(`[EW] close error ${pos.symbol}: ${e.message}`, 'warn');
