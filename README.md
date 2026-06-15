@@ -295,8 +295,9 @@ Both replace the fixed 12h drawdown-throttle / gains-lock timers with a learned 
 
 Computed from the **full** USDT-perp ticker universe (same filters as the scan: USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`) — deliberately *not* the curated gainer/loser pools, whose dynamic floors make pool membership endogenous to the top mover. The reading reuses the host's `_lastAllTickers` cache when fresh (< 60 s); the slow-tick sampler during halts fetches its own copy, since scans (and therefore cache refreshes) don't run while halted:
 
-- `skew` = (Σ gainer 24h% − Σ |loser 24h%|) / (Σ both) — magnitude lean, −1…+1
-- `breadth` = (gainer count − loser count) / (total count) — participation lean, −1…+1
+- `skew` (displayed as **mag** in the status block) = (Σ gainer 24h% − Σ |loser 24h%|) / (Σ both) — magnitude lens: how far movers moved, size-weighted, −1…+1
+- `breadth` = (gainer count − loser count) / (total count) — participation lens: how many tickers are moving, unweighted, −1…+1
+- `ioScore` = mean(fundingRate across all tickers) / 0.05%, clamped −1…+1 — crowd-sentiment lens: positive = longs paying (crowd net bullish); zero extra bandwidth (already in the ticker response)
 
 ### Profile
 
@@ -306,23 +307,23 @@ Computed from the **full** USDT-perp ticker universe (same filters as the scan: 
 
 ### Structure trajectory (the wave)
 
-Every structure reading appends a `{ ts, lean }` point to a rolling wave array, where `lean = (skew + breadth) / 2 ∈ [−1, +1]` (+1 strongly bullish, −1 strongly bearish). This is kept **separate from samples** — it is never labeled, scored, or pruned for evidence; its only job is to record the path of the market. Points older than 7 days are pruned; the array is hard-capped at 2000 points.
+Every structure reading appends a `{ ts, lean, io }` point to a rolling wave array, where `lean = (skew + breadth) / 2 ∈ [−1, +1]` (+1 strongly bullish, −1 strongly bearish) and `io` is the `ioScore` at that moment (null for older entries recorded before IO was stored — the wave graph skips those for the IO line). This is kept **separate from samples** — it is never labeled, scored, or pruned for evidence; its only job is to record the path of the market. Points older than 7 days are pruned; the array is hard-capped at 2000 points.
 
 `_afTrajectory()` / `_pfTrajectory()` derives two numbers from the wave:
 - `lean` — the most recent point's value
 - `slope` — mean of the newest third minus mean of the oldest third; positive = drifting bullish, negative = drifting bearish
 
-The wave is plotted as an inline SVG in the accordion (bull/bear reference lines, current-direction color, live dot at the latest point) and its direction label ("rising ▲ / falling ▼ / steady ▬") is shown next to the graph header.
+The wave is plotted as an inline SVG in the accordion (bull/bear reference lines, current-direction color, live dot at the latest point; IO overlaid as a dashed purple line when data is available) and its direction label ("rising ▲ / falling ▼ / steady ▬") is shown next to the graph header.
 
 ### Effective score and inherent prior
 
 A raw `score` from the learned profile is only available once `mass ≥ MIN_MASS (6)`. Before that — and as a blending term even after — the plugin uses an **inherent prior** derived purely from the wave:
 
 ```
-inherent = DIR × (0.6 × lean + 0.4 × clamp(slope / 0.3, −1, +1))
+inherent = DIR × (0.6 × lean + 0.4 × clamp(slope / 0.3, −1, +1) + 0.15 × io)
 ```
 
-`DIR = −1` for Winter (shorts favor bearish/falling), `DIR = +1` for Chaser (longs favor bullish/rising). The slope term is what prevents longing into a dump or shorting into a pump: a mildly bullish but falling tape gives a negative inherent score for longs.
+`DIR = −1` for Winter (shorts favor bearish/falling), `DIR = +1` for Chaser (longs favor bullish/rising). The slope term is what prevents longing into a dump or shorting into a pump: a mildly bullish but falling tape gives a negative inherent score for longs. The IO term adds crowd-sentiment pressure directly: a market where longs are paying high funding rates is net bullish regardless of price action. IO defaults to 0 when the toggle is off or data is unavailable.
 
 The **effective score** blends learned history with the inherent prior by how full the evidence cup is:
 
@@ -365,7 +366,7 @@ Transform hooks touched: `init`, `persist`, `runScan`, `pseudoClosePosition`, pl
 - **Mode label suffix** — "+ Permafrost" / "+ Ashfall" via `mode-label-extra` while enabled.
 - **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, PLK toggle and trigger slider, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours). Buttons: **Export** (JSON download of events, samples, and wave history), **Import** (replaces current events, samples, and wave from a JSON file — guarded by `confirm()`), and **Clear Profile** (zeroes events, samples, PnL log, and wave — guarded by `confirm()`). All controls respect the config lock.
 - **Danger Zone** — collapsible section always visible at the bottom of the accordion (outside the enabled-guard). Contains **Clear Plugin State**: removes the plugin's localStorage key entirely and resets all in-memory data including halt and PLK state. Guarded by `confirm()`. Use before uninstalling to prevent orphaned data, or to guarantee a fully clean slate.
-- **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with skew/breadth/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score.
+- **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with mag/breadth/slope/io/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score. `mag` = the magnitude lens (`skew` in code); `breadth` = the participation lens; `slope` = wave trajectory direction; `io` = crowd funding-rate sentiment (omitted when unavailable).
 
 Note: for the first weeks the plugin behaves almost exactly like the stock timers — that is by design. It refuses to override the clock until enough evidence has accumulated near the current reading.
 
