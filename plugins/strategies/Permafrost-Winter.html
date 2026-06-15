@@ -164,7 +164,7 @@
               </div>
               <div class="pfr-stat" style="margin-top:10px;padding:8px 10px;background:rgba(96,210,255,.05);border:1px solid rgba(96,210,255,.15);border-radius:3px">
                 <div>PROFILE — <span x-text="(pfEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(pfEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(pfSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
-                <div x-show="pfStatus.at">READING — skew <span x-text="(pfStatus.skew??0).toFixed(2)"></span> | breadth <span x-text="(pfStatus.breadth??0).toFixed(2)"></span> | score <span x-text="pfStatus.score===null?'—':pfStatus.score.toFixed(2)"></span> | mass <span x-text="pfStatus.mass.toFixed(1)"></span></div>
+                <div x-show="pfStatus.at">READING — mag <span x-text="(pfStatus.skew??0).toFixed(2)"></span> | breadth <span x-text="(pfStatus.breadth??0).toFixed(2)"></span> | score <span x-text="pfStatus.score===null?'—':pfStatus.score.toFixed(2)"></span> | mass <span x-text="pfStatus.mass.toFixed(1)"></span></div>
                 <div x-show="pfStatus.at">STRUCTURE — lean <span x-text="(pfStatus.lean??0).toFixed(2)"></span> | slope <span x-text="(pfStatus.slope>=0?'+':'')+(pfStatus.slope??0).toFixed(2)"></span> | effective <span x-text="pfStatus.eff===null||pfStatus.eff===undefined?'—':((pfStatus.eff>=0?'+':'')+pfStatus.eff.toFixed(2))"></span> for shorts</div>
                 <div x-show="pfHalt && pfHalt.kind!=='plk'" style="color:var(--ice)">HALT — <span x-text="pfHalt?.kind"></span> (<span x-text="pfHalt?.strong?'strong bias — up to '+(cfg.permafrostCapHours??24)+'h / early thaw':pfHalt?.informed?'default 12h':'timer fallback'"></span>) <span x-text="(()=>{ void tick; return pfHalt? Math.floor((Date.now()-pfHalt.at)/3600000)+'h elapsed':''; })()"></span></div>
                 <div x-show="pfHalt && pfHalt.kind==='plk'" style="color:var(--ice);display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -395,7 +395,8 @@
           const struct = mag <= tFlat ? 'mixed/flat' : `${adverb}${lean > 0 ? 'bullish' : 'bearish'}`;
           const slope  = this._pfTrajectory().slope;
           const trend  = slope > 0.05 ? ', rising (turning bullish)' : slope < -0.05 ? ', falling (turning bearish)' : ', steady';
-          const desc   = `${struct}${trend} (skew ${reading.skew.toFixed(2)}, breadth ${reading.breadth.toFixed(2)}, ${reading.gCount}▲/${reading.lCount}▼)`;
+          const ioStr  = reading.ioScore != null ? `, io ${reading.ioScore >= 0 ? '+' : ''}${reading.ioScore.toFixed(2)}` : '';
+          const desc   = `${struct}${trend} (mag ${reading.skew.toFixed(2)}, breadth ${reading.breadth.toFixed(2)}, slope ${slope >= 0 ? '+' : ''}${slope.toFixed(2)}${ioStr}, ${reading.gCount}▲/${reading.lCount}▼)`;
           const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
           const eff      = this._pfEffectiveScore(score, mass, inherent);
           let bias;
@@ -435,7 +436,7 @@
         // separate from pfSamples (which get pruned for scoring) so the wave
         // retains the full trajectory for as long as we have data, up to ~a week.
         _pfPushWave(reading) {
-          this.pfWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4), vol: reading.vol ?? 0, volAbs: reading.volAbs ?? 0 });
+          this.pfWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4), vol: reading.vol ?? 0, volAbs: reading.volAbs ?? 0, io: reading.ioScore ?? null });
           const cut = Date.now() - WAVE_TTL_MS;
           if (this.pfWave.length && this.pfWave[0].ts < cut) this.pfWave = this.pfWave.filter(p => p.ts >= cut);
           if (this.pfWave.length > WAVE_CAP) this.pfWave = this.pfWave.slice(-WAVE_CAP);
@@ -527,6 +528,24 @@
             volSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.v).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.v).toFixed(1)}" stroke="rgba(255,185,50,${op})" stroke-width="1"/>`;
           }
 
+          // IO line: crowd funding-rate sentiment; only present in newer wave entries (guard p.io != null)
+          const ioBins = new Array(BINS).fill(null).map(() => ({ iSum: 0, n: 0 }));
+          for (const p of wave) {
+            if (p.io == null) continue;
+            const bi = Math.min(BINS - 1, Math.max(0, Math.floor(((p.ts - tMin) / WAVE_TTL_MS) * BINS)));
+            ioBins[bi].iSum += p.io; ioBins[bi].n++;
+          }
+          const ioPts = [];
+          for (let i = 0; i < BINS; i++) {
+            if (!ioBins[i].n) continue;
+            ioPts.push({ x: pad + i + 0.5, io: ioBins[i].iSum / ioBins[i].n });
+          }
+          let ioSvg = '';
+          for (let i = 1; i < ioPts.length; i++) {
+            const p1 = ioPts[i-1], p2 = ioPts[i];
+            ioSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.io).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.io).toFixed(1)}" stroke="rgba(200,150,255,0.5)" stroke-width="1" stroke-dasharray="3 2"/>`;
+          }
+
           const cur = pts[pts.length - 1].lean;
           const col = cur > 0.05 ? 'var(--profit)' : cur < -0.05 ? 'var(--short)' : 'var(--ice)';
           const polyPts = pts.map(p => `${p.x.toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ');
@@ -536,11 +555,13 @@
             + `<line x1="0" y1="${(H-pad).toFixed(1)}" x2="${W}" y2="${(H-pad).toFixed(1)}" stroke="rgba(255,69,96,.12)"/>`
             + `<line x1="0" y1="${mid.toFixed(1)}" x2="${W}" y2="${mid.toFixed(1)}" stroke="rgba(255,255,255,.18)" stroke-dasharray="3 3"/>`
             + volSvg
+            + ioSvg
             + `<polyline points="${polyPts}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>`
             + `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.5" fill="${col}"/>`
             + `<text x="2" y="${pad+7}" fill="rgba(0,229,160,.5)" font-size="8" font-family="monospace">bull</text>`
             + `<text x="2" y="${(H-pad-1).toFixed(1)}" fill="rgba(255,69,96,.5)" font-size="8" font-family="monospace">bear</text>`
             + `<text x="${W-18}" y="${pad+7}" fill="rgba(255,185,50,.45)" font-size="8" font-family="monospace">vol</text>`
+            + (ioPts.length >= 2 ? `<text x="${W-10}" y="${pad+17}" fill="rgba(200,150,255,.45)" font-size="8" font-family="monospace">io</text>` : '')
             + `</svg>`;
         },
 

@@ -1,0 +1,344 @@
+<!-- EDa-Chaser — Effective Debt Adjusted TP + Laggard mode plugin for PseudoChaser -->
+<!-- Wraps init, pseudoOpenLong, pseudoClosePosition to re-add EDa/laggard behavior.  -->
+<!-- Config injected via data-plugin-slot="config-eda".                                -->
+<!-- Stats injected via data-plugin-slot="stats-eda".                                  -->
+<!-- Uses registerRoleBadge for the ⏳ LAGGARD badge on the oldest open position.      -->
+<script>
+(function () {
+  'use strict';
+
+  window.__BotPlugin = {
+    id:        'eda-chaser',
+    name:      'EDa Chaser',
+    version:   '1.0.0',
+    targetBot: 'pseudochaser',
+    after:     ['sunchaser'],
+    before:    [],
+    conflicts: [],
+    touches:   ['init', 'pseudoOpenLong', 'pseudoClosePosition'],
+
+    slots: {
+      'config-eda': `
+        <div class="g" class="mt-sep">
+          <label class="tog" :style="cfgLocked?'opacity:.4;cursor:not-allowed;pointer-events:none':''" @click="if(!cfgLocked){cfg.laggardCheckEnabled=!cfg.laggardCheckEnabled;persist()}">
+            <div class="tog-t" :class="cfg.laggardCheckEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l" class="val-hi">Laggard Check</span>
+          </label>
+          <div style="font-size:9.5px;color:var(--text-lo);margin-top:5px;line-height:1.55">
+            No one gets left behind. When others have moved on, the clock starts.
+          </div>
+        </div>
+        <div class="g" x-show="cfg.laggardCheckEnabled" style="margin-top:8px">
+          <div class="lbl">
+            Profit Offset
+            <b x-text="(cfg.laggardProfitOffset>=0?'+':'')+cfg.laggardProfitOffset+'%'"></b>
+            <span style="font-size:9px;color:var(--text-lo);font-weight:400;margin-left:4px">
+              (×<span x-text="(1+(cfg.laggardProfitOffset/100)).toFixed(2)"></span>)
+            </span>
+          </div>
+          <input type="range" min="-90" max="200" step="10" x-model.number="cfg.laggardProfitOffset" :disabled="cfgLocked" @change="persist()">
+          <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px;line-height:1.4">
+            EDa: non-laggard positions capped at this × their bufferedEV in held loss; the laggard is unbounded.
+          </div>
+        </div>
+        <div class="g" x-show="cfg.laggardCheckEnabled" style="margin-top:8px">
+          <div class="lbl">EDA Debt Cap
+            <b x-text="(cfg.edaCapPct??50)+'%'"></b>
+            <span style="font-size:9px;color:var(--text-lo)"> of EV</span>
+          </div>
+          <input type="range" min="10" max="1000" step="10" x-model.number="cfg.edaCapPct" :disabled="cfgLocked" @change="persist()">
+          <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px;line-height:1.4">Max lost value per position as % of bufferedEV. 50% = half EV; 100% = full EV.</div>
+        </div>
+      `,
+      'stats-eda': `
+        <div class="sec" x-show="cfg.laggardCheckEnabled && positions.length > 0">
+          <div class="sec-ttl">Laggard Stats</div>
+          <template x-if="positions.length > 0">
+            <div x-data="{ get lag() { return positions.reduce((o,x) => x.openedAt < o.openedAt ? x : o, positions[0]); } }">
+              <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+                <span style="font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text-hi)" x-text="lag.symbol.replace('USDT','')"></span>
+                <span style="font-family:var(--mono);font-size:9px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,160,0,.45);color:#ffaa00;background:rgba(255,160,0,.08)">⏳ LAGGARD</span>
+              </div>
+              <div style="font-family:var(--mono);font-size:10px;line-height:1.9">
+                <div style="display:flex;justify-content:space-between">
+                  <span style="color:var(--text-lo);font-size:9px;letter-spacing:1px">BUFFERED EV</span>
+                  <span style="color:var(--ice)" x-text="(()=>{ const ev=lag._laggardInitialEV; return ev!=null?'$'+ev.toFixed(3):'—'; })()"></span>
+                </div>
+                <div style="display:flex;justify-content:space-between">
+                  <span style="color:var(--text-lo);font-size:9px;letter-spacing:1px">VALUE LOST</span>
+                  <span :style="'color:'+((lag._laggardLostValue||0)<0?'var(--short)':(lag._laggardLostValue||0)>0?'var(--profit)':'var(--text-mid)')"
+                        x-text="lag._laggardLostValue != null ? ((lag._laggardLostValue>=0?'+':'')+lag._laggardLostValue.toFixed(3)) : '—'"></span>
+                </div>
+                <div style="display:flex;justify-content:space-between">
+                  <span style="color:var(--text-lo);font-size:9px;letter-spacing:1px">ED</span>
+                  <span x-html="(()=>{
+                    const ev = lag._laggardInitialEV ?? (lag.margin * ((lag.tpPct ?? cfg.entryTpRoi) / 100));
+                    const lv = lag._laggardLostValue || 0;
+                    const ed = ev - (lv + (lag.upnl || 0));
+                    const c = ed > 0 ? 'var(--short)' : ed < 0 ? 'var(--profit)' : 'var(--text-mid)';
+                    return '<span style=&quot;color:'+c+'&quot;>'+(ed>=0?'+':'')+ed.toFixed(3)+'</span>';
+                  })()"></span>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="sec" x-show="cfg.laggardCheckEnabled && positions.length > 1">
+          <div class="sec-ttl">Value Lost — Non-Laggards</div>
+          <div style="font-family:var(--mono);font-size:10px;line-height:1.9">
+            <div style="display:flex;justify-content:space-between;gap:8px">
+              <span style="color:var(--text-lo);font-size:9px;letter-spacing:1px">TOTAL / EACH</span>
+              <span x-html="(()=>{
+                const laggard = positions.reduce((o,p) => p.openedAt < o.openedAt ? p : o, positions[0]);
+                const nonLag = positions.filter(p => p.id !== laggard.id);
+                const total = nonLag.reduce((s,p) => s + (p._laggardLostValue||0), 0);
+                const each = nonLag.length > 0 ? total / nonLag.length : 0;
+                const fmt = v => '<span style=&quot;color:' + (v<0?'var(--short)':v>0?'var(--profit)':'var(--text-mid)') + '&quot;>' + (v>=0?'+':'') + v.toFixed(3) + '</span>';
+                return fmt(total) + ' · ' + fmt(each);
+              })()"></span>
+            </div>
+            <div style="font-size:9px;color:var(--text-lo);margin-top:3px">
+              <span x-text="Math.max(0, positions.length - 1)"></span> non-laggard positions
+            </div>
+          </div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _origInit  = def.init;
+      const _origOpen  = def.pseudoOpenLong;
+      const _origClose = def.pseudoClosePosition;
+
+      return Object.assign({}, def, {
+
+        async init() {
+          await _origInit.call(this);
+          if (this.cfg.laggardCheckEnabled  == null) this.cfg.laggardCheckEnabled  = true;
+          if (this.cfg.laggardProfitOffset  == null) this.cfg.laggardProfitOffset  = 50;
+          if (this.cfg.edaCapPct            == null) this.cfg.edaCapPct            = 50;
+          if (this._retainedLostValue       == null) this._retainedLostValue       = 0;
+          if (this._postCloseLaggardTimer   == null) this._postCloseLaggardTimer   = null;
+          this.registerRoleBadge?.(p => {
+            if (!this.cfg.laggardCheckEnabled || !this.positions.length) return null;
+            const laggard = this.positions.reduce((o, x) => x.openedAt < o.openedAt ? x : o, this.positions[0]);
+            if (p.id !== laggard.id) return null;
+            return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,160,0,.45);color:#ffaa00;background:rgba(255,160,0,.08)">⏳ LAGGARD</span>`;
+          });
+          this.log(`[EDA] EDa Chaser v1.0.0 loaded — laggard check ${this.cfg.laggardCheckEnabled ? 'enabled' : 'disabled'}.`, 'info');
+        },
+
+        // ── EDa helper methods ──────────────────────────────────────────────────
+
+        _edaSnapLV(v) {
+          return typeof v === 'number' ? parseFloat(v.toFixed(6)) : 0;
+        },
+
+        _edaPosSlotWeight(p) {
+          return this._posSlotWeight ? this._posSlotWeight(p) : 1;
+        },
+
+        _edaTargetPrice(pos) {
+          const baseTp     = pos.tpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
+          const funcTp     = pos.entryPrice * (1 + baseTp / 100 / pos.leverage);
+          const bufferedEV = (pos._laggardInitialEV > 0) ? pos._laggardInitialEV : pos.margin * (baseTp / 100);
+          const lostMag    = Math.max(0, -(pos._laggardLostValue || 0));
+          if (lostMag <= 0) return { price: funcTp, funcPct: baseTp, bufferedEV, lostMag: 0, target: pos.margin * (baseTp / 100), eda: false };
+          const target = bufferedEV + lostMag;
+          const price  = pos.entryPrice + target * pos.entryPrice / (pos.leverage * pos.margin);
+          return { price, funcPct: baseTp, bufferedEV, lostMag, target, eda: true };
+        },
+
+        _edaPosMaxDebt(pos) {
+          const margin = pos.margin || (this.cfg.minNotional / this.cfg.leverage);
+          const baseTp = pos.tpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
+          const cap    = (this.cfg.edaCapPct ?? 50) / 100;
+          const fullEV = (pos._laggardInitialEV > 0) ? pos._laggardInitialEV : margin * (baseTp / 100);
+          return fullEV * cap;
+        },
+
+        _edaRebalanceDebtPool() {
+          if (!this.cfg.laggardCheckEnabled || !this.positions.length) return;
+          const totalDebt = this.positions.reduce((s, p) => s + (p._laggardLostValue || 0), 0);
+          if (totalDebt === 0) return;
+          const totalSlots = this.positions.reduce((s, p) => s + this._edaPosSlotWeight(p), 0);
+          if (totalSlots <= 0) return;
+          const debtPerSlot = totalDebt / totalSlots;
+          let overflow = 0;
+          for (const p of this.positions) {
+            const raw     = parseFloat((debtPerSlot * this._edaPosSlotWeight(p)).toFixed(6));
+            const maxDebt = this._edaPosMaxDebt(p);
+            const capped  = Math.max(raw, -maxDebt);
+            if (raw < capped) overflow += (capped - raw);
+            const _EPS = 1e-6;
+            p._laggardLostValue = this._edaSnapLV((capped < 0 && capped > -_EPS) ? 0 : capped);
+          }
+          if (overflow > 0) {
+            this._retainedLostValue = parseFloat(((this._retainedLostValue || 0) - overflow).toFixed(6));
+          }
+        },
+
+        async _edaRunLaggardCheck() {
+          if (!this.cfg.laggardCheckEnabled || !this.positions.length) return;
+          const laggard = this.positions.reduce((o, p) => p.openedAt < o.openedAt ? p : o, this.positions[0]);
+          const logParts = [];
+          // Backfill _laggardInitialEV for pre-plugin positions carrying debt
+          for (const pos of this.positions) {
+            if (!pos || pos._laggardInitialEV || !pos._laggardLostValue) continue;
+            const tpRef = pos.tpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : (this.cfg.entryTpRoi ?? 18));
+            pos._laggardInitialEV = (pos.margin || 0) * (tpRef / 100);
+            this.log(`[EDA] ⏳ ${pos.symbol}: _laggardInitialEV backfilled — $${pos._laggardInitialEV.toFixed(4)}`, 'info');
+            this.persist();
+          }
+          this._edaRebalanceDebtPool();
+          for (const pos of this.positions) {
+            if (!pos || !pos._laggardInitialEV) continue;
+            if (pos._laggardClosingAt && Date.now() - pos._laggardClosingAt < 30000) continue;
+            if (pos.phase === 'force') continue;
+            const lv          = pos._laggardLostValue || 0;
+            const uPnl        = pos.markPrice ? (pos.markPrice - pos.entryPrice) / pos.entryPrice * pos.leverage * pos.margin : 0;
+            const isLaggardPos = laggard && pos.id === laggard.id;
+            const _eda        = this._edaTargetPrice(pos);
+            const debtSign    = _eda.eda ? -1 : 1;
+            if (pos._edaTpDebtSign !== debtSign) { pos._edaTpDebtSign = debtSign; pos._edaTpPrev = null; }
+            if (_eda.eda && _eda.price > 0) {
+              const prev = pos._edaTpPrev;
+              if (prev == null || Math.abs(_eda.price - prev) / Math.abs(prev) > 0.0005) {
+                pos._edaTpPrev     = _eda.price;
+                pos._edaTpPrice    = _eda.price;
+                pos.currentTpPrice = _eda.price;
+                pos._nativeReduceTpPrice = null;
+                const edaRoi = (_eda.price - pos.entryPrice) / pos.entryPrice * pos.leverage * 100;
+                pos.tpPct = parseFloat(edaRoi.toFixed(2));
+                if (pos._edaTpLoggedRoi == null || Math.abs(edaRoi - pos._edaTpLoggedRoi) >= 1) {
+                  pos._edaTpLoggedRoi = edaRoi;
+                  logParts.push(`${pos.symbol.replace('USDT','')} ${edaRoi.toFixed(1)}% ($${_eda.bufferedEV.toFixed(2)}+$${_eda.lostMag.toFixed(2)})`);
+                }
+                this.persist();
+                if (typeof this.setTP === 'function' && _eda.price > (pos.markPrice ?? 0)) {
+                  this.setTP(pos, _eda.price).catch(() => {});
+                }
+              }
+            } else {
+              if (pos._edaTpPrice > 0 && pos.currentTpPrice === pos._edaTpPrice) {
+                pos.currentTpPrice = _eda.price;
+                pos.tpPct = parseFloat(_eda.funcPct.toFixed(2));
+              }
+              pos._edaTpPrice = 0;
+              pos._edaTpLoggedRoi = null;
+            }
+            // Close check: collective recovery
+            const buffedED = _eda.bufferedEV - lv - uPnl;
+            if (buffedED <= 0 && this.positions.find(x => x.id === pos.id)) {
+              if (!isLaggardPos && uPnl <= 0) continue;
+              pos._laggardClosingAt = Date.now();
+              const role = isLaggardPos ? 'Laggard' : 'EDa';
+              this.log(`[EDA] ⏳ ${pos.symbol}: ${role} EDa TP hit — ED $${buffedED.toFixed(2)} ≤ 0`, 'warn');
+              await new Promise(r => setTimeout(r, 5000));
+              if (!this.positions.find(x => x.id === pos.id)) continue;
+              await this.pseudoClosePosition(pos, 'laggard');
+            }
+          }
+          if (logParts.length) this.log(`[EDA] ⏳ EDa TP: ${logParts.join(' | ')}`, 'info');
+        },
+
+        _edaNotifyLaggardClose(closingPos, closingPnl, reason) {
+          if (!this.cfg.laggardCheckEnabled) return;
+          const hitTarget = closingPnl >= 0 && (reason === 'tp' || reason === 'laggard');
+          const heldLoss  = hitTarget ? 0 : Math.min(0, closingPos._laggardLostValue || 0);
+          const carried   = closingPnl + heldLoss;
+          if (!this.positions.length) {
+            if (carried < 0) {
+              this._retainedLostValue = parseFloat(((this._retainedLostValue || 0) + carried).toFixed(6));
+              this.log(`[EDA] ⏳ ${closingPos.symbol} closed, no survivors — $${Math.abs(carried).toFixed(2)} pushed to pending pool.`, 'warn');
+            }
+            return;
+          }
+          const totalSlots = this.positions.reduce((s, p) => s + this._edaPosSlotWeight(p), 0);
+          if (totalSlots > 0) {
+            const pnlPerSlot = carried / totalSlots;
+            let overflow = 0;
+            const parts = [];
+            for (const pos of this.positions) {
+              const share   = pnlPerSlot * this._edaPosSlotWeight(pos);
+              const _EPS    = 1e-6;
+              const cur     = this._edaSnapLV(((pos._laggardLostValue || 0) < 0 && (pos._laggardLostValue || 0) > -_EPS) ? 0 : (pos._laggardLostValue || 0));
+              pos._laggardLostValue = cur;
+              const raw     = parseFloat((cur + share).toFixed(6));
+              const maxDebt = this._edaPosMaxDebt(pos);
+              const capped  = Math.max(raw, -maxDebt);
+              if (raw < capped) overflow += (capped - raw);
+              pos._laggardLostValue = this._edaSnapLV(capped);
+              parts.push(`${pos.symbol} ${(share>=0?'+':'−')}$${Math.abs(share).toFixed(2)}→$${capped.toFixed(2)}`);
+            }
+            if (overflow > 0) {
+              this._retainedLostValue = parseFloat(((this._retainedLostValue || 0) - overflow).toFixed(6));
+            }
+            this.log(`[EDA] ⏳ Debt share (${closingPos.symbol} @ ${closingPnl>=0?'+':''}${closingPnl.toFixed(2)} USDT): ${parts.join(' | ')}`, 'info');
+          }
+          this._edaRebalanceDebtPool();
+          // Sync EDa TPs on survivors immediately
+          for (const survivor of this.positions) {
+            if (!survivor._laggardInitialEV) continue;
+            const _EPS = 1e-6;
+            const lv   = this._edaSnapLV(((survivor._laggardLostValue || 0) < 0 && (survivor._laggardLostValue || 0) > -_EPS) ? 0 : (survivor._laggardLostValue || 0));
+            survivor._laggardLostValue = lv;
+            const _eda = this._edaTargetPrice(survivor);
+            if (_eda.eda && _eda.price > 0) {
+              survivor._edaTpPrice    = _eda.price;
+              survivor.currentTpPrice = _eda.price;
+              survivor.tpPct = parseFloat(((_eda.price - survivor.entryPrice) / survivor.entryPrice * survivor.leverage * 100).toFixed(2));
+            } else {
+              if (survivor._edaTpPrice > 0 && survivor.currentTpPrice === survivor._edaTpPrice) {
+                survivor.currentTpPrice = _eda.price;
+                survivor.tpPct = parseFloat(_eda.funcPct.toFixed(2));
+              }
+              survivor._edaTpPrice = 0;
+            }
+          }
+        },
+
+        // ── Wrapped methods ─────────────────────────────────────────────────────
+
+        async pseudoOpenLong(candidate) {
+          await _origOpen.call(this, candidate);
+          // Stamp EDa fields on the newly pushed position
+          const pos = this.positions[this.positions.length - 1];
+          if (pos) {
+            const tpPct = pos.tpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
+            pos._laggardInitialEV = (pos.margin || 0) * (tpPct / 100);
+            pos._edaTpPrice       = 0;
+            pos._edaTpPrev        = null;
+            pos._laggardLostValue = 0;
+            // Absorb pending debt
+            const retained = this._retainedLostValue || 0;
+            if (retained < 0) {
+              const cap      = (this.cfg.edaCapPct ?? 50) / 100;
+              const maxAbsorb = -((pos._laggardInitialEV || pos.margin * (tpPct / 100)) * cap);
+              const absorb    = Math.max(retained, maxAbsorb);
+              pos._laggardLostValue   = parseFloat(absorb.toFixed(6));
+              this._retainedLostValue = parseFloat((retained - absorb).toFixed(6));
+              if (Math.abs(absorb) > 0.005) {
+                this.log(`[EDA] ⏳ ${(pos.symbol||'').replace('USDT','')}: absorbs $${Math.abs(absorb).toFixed(2)} pending debt.`, 'warn');
+              }
+            }
+          }
+        },
+
+        async pseudoClosePosition(pos, reason, fillPrice) {
+          // Capture upnl as best estimate of actual PnL (before close clears position)
+          const pnlEst = pos.upnl ?? 0;
+          await _origClose.call(this, pos, reason, fillPrice);
+          this._edaNotifyLaggardClose(pos, pnlEst, reason);
+          await this._edaRunLaggardCheck();
+          if (this.cfg.laggardCheckEnabled) {
+            clearTimeout(this._postCloseLaggardTimer);
+            this._postCloseLaggardTimer = setTimeout(() => { if (this.bot.running) this._edaRunLaggardCheck(); }, 30000);
+          }
+        },
+
+      });
+    },
+  };
+})();
+</script>
