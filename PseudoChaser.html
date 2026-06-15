@@ -1437,7 +1437,6 @@ let _cdTimer          = null;
 let _watchTimer       = null;
 let _refreshTimer     = null;
 let _audioTimer       = null;
-let _laggardInterval  = null;
 
 // ── Bybit public WebSocket ticker feed (stored outside Alpine to prevent proxy mutation) ──
 // Replaces the recurring full-ticker REST poll (~300 KB per call, every 15s) with delta
@@ -1996,7 +1995,6 @@ function pw() { return {
         closedTrades: this.closedTrades,
         bot: { startTime: this.bot.startTime, lastScan: this.bot.lastScan, lastScanAt: this.bot.lastScanAt },
         symbolBanlist: this._symbolBanlist,
-        retainedLostValue:  this._retainedLostValue,
         drawdownWindow:     this._drawdownWindow,
         drawdownHaltUntil:  this._drawdownHaltUntil,
         gainsWindow:        this._gainsWindow,
@@ -2167,9 +2165,6 @@ function pw() { return {
       if (s.bot?.lastScanAt) this.bot.lastScanAt = s.bot.lastScanAt;
       if (Array.isArray(s.closedTrades)) this.closedTrades = s.closedTrades;
       if (s.symbolBanlist && typeof s.symbolBanlist === 'object') this._loadSymbolBanlist(s.symbolBanlist);
-      if (typeof s.retainedLostValue === 'number' && isFinite(s.retainedLostValue) && s.retainedLostValue < 0) {
-        this._retainedLostValue = s.retainedLostValue;
-      }
       const nowGl = Date.now();
       // Restore drawdown throttle state — prune entries older than 6h on load
       if (Array.isArray(s.drawdownWindow)) {
@@ -2248,7 +2243,6 @@ function pw() { return {
     this._manualHalt        = false;
     this._gainsWindow       = [];
     this._gainsLockHaltUntil = 0;
-    this._retainedLostValue = 0;
     this.bot.startTime = this.bot.running ? this.bot.startTime : null;
     this.persist();
     this.renderTradeFeed();
@@ -2408,11 +2402,6 @@ function pw() { return {
     this.scheduleScan();
     if (_watchTimer) { clearInterval(_watchTimer); _watchTimer = null; }
     _watchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
-    if (_laggardInterval) { clearInterval(_laggardInterval); _laggardInterval = null; }
-    _laggardInterval = setInterval(() => { if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) this.runLaggardCheck(); }, 60000);
-    if (this.cfg.laggardCheckEnabled && this.positions.length >= 2) {
-      await this.runLaggardCheck();
-    }
     this.persist();
   },
 
@@ -2421,7 +2410,6 @@ function pw() { return {
     clearInterval(_cdTimer);
     clearInterval(_watchTimer); _watchTimer = null;
     clearInterval(_refreshTimer);
-    clearInterval(_laggardInterval); _laggardInterval = null;
     this.stopKeepalive();
     this.bot.scanCd = 0; this.bot.scanPct = 100;
     this.bot.startTime = null;
@@ -2872,17 +2860,14 @@ function pw() { return {
       if (!(_dg_pos.currentTpPrice > 0)) continue;
       if (_dg_pos._edaTpPrice > 0)        continue; // EDa owns this TP — drift corrector must not interfere
       const _dg_stage = _dg_pos.dcaStage || 0;
-      const _dg_base  = _dg_stage === 0 ? (_dg_pos._baseTpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi)) : this._tpRoi(_dg_stage);
+      const _dg_base  = _dg_stage === 0 ? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi) : this._tpRoi(_dg_stage);
       const _dg_roi   = _dg_base;
       // Single TP system: stage 0 targets the full slider %; DCA stages use raw _tpRoi() %
       const _dg_functRoi = _dg_roi;
       // If tpPct was deliberately set to something other than expected (e.g. FUN doubling,
-      // ingress-adjusted entry), the TP is intentional — stand down. Accept the slider %
-      // and the legacy functional convention (slider ÷ buffMul) so old positions normalize.
-      const _dg_legacyRoi = _dg_stage === 0 ? _dg_roi / this._buffMul() : _dg_roi;
+      // ingress-adjusted entry), the TP is intentional — stand down.
       if (_dg_pos.tpPct != null
-          && Math.abs((_dg_pos.tpPct || 0) - _dg_roi) > 0.01
-          && Math.abs((_dg_pos.tpPct || 0) - _dg_legacyRoi) > 0.01) continue;
+          && Math.abs((_dg_pos.tpPct || 0) - _dg_roi) > 0.01) continue;
       const _dg_instr  = await this.getInstrInfo(_dg_pos.symbol);
       if (!_dg_instr) continue;
       const _dg_target = this.snapPrice(_dg_pos.entryPrice * (1 + (_dg_functRoi / 100) / _dg_pos.leverage), _dg_instr); // LONG: TP at slider/stage % above entry
@@ -2949,12 +2934,6 @@ function pw() { return {
               : parseFloat((pos.entryPrice * (1 + (_sl_roi / 100) / pos.leverage)).toFixed(8));
             pos.currentTpPrice = _sl_tp;
             pos.tpPct          = _sl_roi;
-            if (this.cfg.laggardCheckEnabled) {
-              pos._laggardInitialEV = pos.margin * (_sl_roi / 100);
-              pos._edaTpPrice = 0;
-              pos._edaTpPrev  = null;
-              setTimeout(() => { if (this.bot.running) this.runLaggardCheck(); }, 500);
-            }
           }
           // SL fires when all first-wind DCA stages have filled — SW stages extending _stageCount must not delay it.
           // Guard !add._secondWind: SW activation clears slPrice; without this guard a SW stage fill would
@@ -3035,32 +3014,10 @@ function pw() { return {
         continue;
       }
 
-      // ── EDa TP inline recalc (single source of truth) ─────────────────
-      if (this.cfg.laggardCheckEnabled && pos._laggardInitialEV) {
-        const _eda = this._edaTargetPrice(pos);
-        if (_eda.eda && _eda.price > 0) {
-          // Holding loss → target covers bufferedEV + the held loss (laggard & non-laggard alike;
-          // the cap on how much loss a non-laggard holds is enforced in the debt pool).
-          pos._edaTpPrice    = _eda.price;
-          pos.currentTpPrice = _eda.price;
-          pos.tpPct          = parseFloat(((_eda.price - pos.entryPrice) / pos.entryPrice * pos.leverage * 100).toFixed(2));
-        } else {
-          // No held loss → rest at the slider TP (restore only if EDa owned the TP;
-          // the drift corrector below handles normalization of non-EDa TPs).
-          if (pos._edaTpPrice > 0 && pos.currentTpPrice === pos._edaTpPrice) {
-            pos.currentTpPrice = _eda.price;
-            pos.tpPct          = parseFloat(_eda.funcPct.toFixed(2));
-          }
-          pos._edaTpPrice = 0;
-        }
-      }
       // ── Unified TP close ──
-      // currentTpPrice is the single source of truth — already synced above by the EDa recalc
-      // (and by runLaggardCheck at every write site). No dual-read needed.
       const _effTpClose = pos.currentTpPrice;
       if (_effTpClose > 0 && mark >= _effTpClose) {
-        const _tpLabel = (pos._edaTpPrice > 0) ? 'EDa TP' : 'TP';
-        this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: ${_tpLabel} hit @ ${fmtP(mark)} ≥ ${fmtP(_effTpClose)} — closing`, 'success');
+        this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: TP hit @ ${fmtP(mark)} ≥ ${fmtP(_effTpClose)} — closing`, 'success');
         await this.pseudoClosePosition(pos, 'tp', _effTpClose);
         continue;
       }
@@ -3120,18 +3077,6 @@ function pw() { return {
       }
     }
 
-    // ── Laggard check ──
-    // Immediate pass uses current markPrice. Deferred pass fires 3s later to catch
-    // lostValue updates from any pseudoClosePosition callbacks that settle mid-cycle.
-    if (this.cfg.laggardCheckEnabled && this.positions.length >= 1) {
-      await this.runLaggardCheck();
-    }
-    if (this.cfg.laggardCheckEnabled) {
-      clearTimeout(this._laggardDeferredTimer);
-      this._laggardDeferredTimer = setTimeout(() => {
-        if (this.bot.running && this.positions.length >= 1) this.runLaggardCheck();
-      }, 3000);
-    }
     } catch(e) {
       this.log(`[PC-WATCH-01] position watcher failed — ${e.message}${e.stack ? ' @ '+((e.stack||'').split('\n')[1]||'').trim() : ''}`, 'error');
     } finally {

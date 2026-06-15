@@ -1802,8 +1802,6 @@ function pw() { return {
         closedTrades: this.closedTrades,
         bot: { startTime: this.bot.startTime, lastScan: this.bot.lastScan, lastScanAt: this.bot.lastScanAt },
         symbolBanlist: this._symbolBanlist,
-        lostValue:     this._lostValue,
-        laggardId:     this._laggardId,
         potGainers:    this.potGainers,
         potLosers:     this.potLosers,
         drawdownHaltUntil:  this._drawdownHaltUntil,
@@ -1870,8 +1868,6 @@ function pw() { return {
       if (s.bot?.lastScanAt) this.bot.lastScanAt = s.bot.lastScanAt;
       if (Array.isArray(s.closedTrades)) this.closedTrades = s.closedTrades;
       if (s.symbolBanlist && typeof s.symbolBanlist === 'object') this._loadSymbolBanlist(s.symbolBanlist);
-      if (typeof s.lostValue === 'number' && isFinite(s.lostValue)) this._lostValue = s.lostValue;
-      if (s.laggardId != null) this._laggardId = s.laggardId;
       if (Array.isArray(s.potGainers)) this.potGainers = s.potGainers;
       if (Array.isArray(s.potLosers))  this.potLosers  = s.potLosers;
       if (s.positions?.length) {
@@ -1931,8 +1927,6 @@ function pw() { return {
     this.savedPositions = [];
     this.positions = [];
     this.closedTrades = [];
-    this._lostValue   = 0;
-    this._laggardId   = null;
     this._drawdownWindow = [];
     this._drawdownHaltUntil = null;
     this._manualHalt = false;
@@ -2845,12 +2839,6 @@ function pw() { return {
           const g = this.gainers.find(x => x.symbol === pos.symbol);
           if (g) g.status = 'closed';
           this.positions = this.positions.filter(x => x.id !== pos.id);
-          // EDa: gap closes must feed the debt pool like live closes — otherwise a
-          // force/SL loss replayed from klines (and any debt the position carried)
-          // never reaches _lostValue and the held value silently vanishes.
-          this._updateLostValue(pnl);
-          this._electLaggard();
-          this._redistributeED();
           _closingIds.delete(pos.id);
           if (this.bot.running) setTimeout(() => this.runScheduledCycle(), 500);
         } else {
@@ -3077,9 +3065,6 @@ function pw() { return {
             if (cachedFr && cachedFr.rate != null) pos.fundingRate = cachedFr.rate;
             pos._lastSeenAt = now;
           }
-          // EDa: recompute debt distribution after mark prices updated
-          this._electLaggard();
-          this._redistributeED();
 
           // Settle any passed 8h funding intervals since last check
           const INTERVAL_MS = 8 * 3600 * 1000;
@@ -3135,12 +3120,9 @@ function pw() { return {
       // Single TP system: stage 0 targets the full slider %; DCA stages use raw _tpRoi() %
       const _dg_functRoi = _dg_roi;
       // If tpPct was deliberately set to something other than expected (e.g. FUN doubling,
-      // ingress-adjusted entry), the TP is intentional — stand down. Accept the slider %
-      // and the legacy functional convention (slider ÷ buffMul) so old positions normalize.
-      const _dg_legacyRoi = _dg_stage === 0 ? _dg_roi / this._buffMul() : _dg_roi;
+      // ingress-adjusted entry), the TP is intentional — stand down.
       if (_dg_pos.tpPct != null
-          && Math.abs((_dg_pos.tpPct || 0) - _dg_roi) > 0.01
-          && Math.abs((_dg_pos.tpPct || 0) - _dg_legacyRoi) > 0.01) continue;
+          && Math.abs((_dg_pos.tpPct || 0) - _dg_roi) > 0.01) continue;
       const _dg_instr  = await this.getInstrInfo(_dg_pos.symbol);
       if (!_dg_instr) continue;
       const _dg_target = this.snapPrice(_dg_pos.entryPrice * (1 - (_dg_functRoi / 100) / _dg_pos.leverage), _dg_instr);
@@ -3199,8 +3181,6 @@ function pw() { return {
             }
           }
           this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
-          this._electLaggard();
-          this._redistributeED();
           this.persist();
         }
       }
@@ -3247,7 +3227,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         continue;
       }
 
-      const _effTp = pos.currentTpPrice; // single source of truth — already synced by _redistributeED
+      const _effTp = pos.currentTpPrice;
       if (_effTp > 0 && !pos._whiplashScheduled) {
         let _wpTpRef = _effTp;
         if (!(pos._edaTpPrice > 0) && (pos.dcaStage || 0) === 0) {
@@ -3672,13 +3652,6 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   // Used by the collective-debt system to distribute debt proportionally to slot footprint
   // rather than raw position count, so a 3× FUN position absorbs 3× the debt of a 1× gainer.
   _posSlotWeight(pos) { return 1; },
-
-
-  // Redistributes collective debt equally across all open positions weighted by slot cost.
-  // Call this after any event that changes the debt pool (position open, close, or absorption loss).
-  // Each position's _laggardLostValue is set to: (totalDebt / totalSlots) * ownSlots,
-  // ensuring a 3× FUN position absorbs 3× the burden of a 1× gainer.
-  // Non-laggard positions are capped at _posMaxDebt; overflow is pushed to the laggard.
 
 
 
