@@ -1,28 +1,31 @@
 <!-- EDa-Winter — Effective Debt Adjusted TP + Laggard mode plugin for PseudoWinter -->
-<!-- Wraps pseudoOpenShort, pseudoWatchPositions, pseudoClosePosition to re-add EDa/laggard behavior. -->
-<!-- Injects config via data-plugin-slot="config-eda" and stats via data-plugin-slot="stats-eda". -->
-<!-- Uses registerRoleBadge to display the ⏳ LAGGARD badge on the oldest open position. -->
+<!-- Wraps init, pseudoOpenShort, pseudoClosePosition to re-add EDa/laggard behavior.  -->
+<!-- Config injected via data-plugin-slot="config-eda".                                -->
+<!-- Stats injected via data-plugin-slot="stats-eda".                                  -->
+<!-- Uses registerRoleBadge for the ⏳ LAGGARD badge on the oldest open position.      -->
 <script>
 (function () {
-  if (typeof window.__BotPlugin === 'undefined') return;
+  'use strict';
 
-  window.__BotPlugin({
-    id: 'eda-winter',
-    name: 'EDa Winter',
-    version: '1.0.0',
+  window.__BotPlugin = {
+    id:        'eda-winter',
+    name:      'EDa Winter',
+    version:   '1.0.0',
+    targetBot: 'pseudowinter',
+    after:     [],
+    before:    [],
     conflicts: [],
-    slots: ['config-eda', 'stats-eda'],
+    touches:   ['init', 'pseudoOpenShort', 'pseudoClosePosition'],
 
-    transform(def) {
-      // ── Config slot ─────────────────────────────────────────────────────────
-      def['slot:config-eda'] = `
+    slots: {
+      'config-eda': `
         <div class="g" style="margin-top:8px">
           <div class="lbl">Laggard Profit Offset
             <b x-text="(cfg.laggardProfitOffset>=0?'+':'')+(cfg.laggardProfitOffset??50)+'%'"></b>
             <span style="font-size:9px;color:var(--text-lo)">(×<span x-text="(1+(Math.max(-99,cfg.laggardProfitOffset??50)/100)).toFixed(2)"></span>)</span>
           </div>
           <input type="range" min="-90" max="200" step="10" x-model.number="cfg.laggardProfitOffset" :disabled="bot.running" @change="persist()">
-          <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">EDa: non-laggard positions are capped at this × their bufferedEV in held loss; the laggard is unbounded.</div>
+          <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">EDa: positions target bufferedEV (margin × slider%) plus held loss; non-laggards capped at that; the laggard is unbounded.</div>
         </div>
         <div class="g" style="margin-top:8px">
           <div class="lbl">EDA Debt Cap
@@ -32,10 +35,8 @@
           <input type="range" min="10" max="1000" step="10" x-model.number="cfg.edaCapPct" :disabled="bot.running" @change="persist()">
           <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Max lost value per position as % of bufferedEV. 50% = half EV; 100% = full EV.</div>
         </div>
-      `;
-
-      // ── Stats slot ──────────────────────────────────────────────────────────
-      def['slot:stats-eda'] = `
+      `,
+      'stats-eda': `
         <div class="sec" x-show="positions.length > 0">
           <div class="sec-ttl">Laggard Stats</div>
           <template x-if="positions.length > 0">
@@ -54,7 +55,7 @@
                   <span x-html="(()=>{
                     const d = lag._edDebt ?? 0;
                     const c = d > 0 ? 'var(--short)' : 'var(--text-mid)';
-                    return '<span style=\\'color:'+c+'\\'>'+(d>0?'-':'')+d.toFixed(3)+'</span>';
+                    return '<span style=&quot;color:'+c+'&quot;>'+(d>0?'-':'')+d.toFixed(3)+'</span>';
                   })()"></span>
                 </div>
                 <div style="display:flex;justify-content:space-between">
@@ -69,7 +70,7 @@
                     const d  = lag._edDebt ?? 0;
                     const ed = ev + d - (lag.upnl || 0);
                     const c = ed > 0 ? 'var(--short)' : ed < 0 ? 'var(--profit)' : 'var(--text-mid)';
-                    return '<span style=\\'color:'+c+'\\'>'+(ed>=0?'+':'')+ed.toFixed(3)+'</span>';
+                    return '<span style=&quot;color:'+c+'&quot;>'+(ed>=0?'+':'')+ed.toFixed(3)+'</span>';
                   })()"></span>
                 </div>
               </div>
@@ -87,7 +88,7 @@
                 const n = nonLag.length;
                 const total = nonLag.reduce((s,p) => s + (p._edDebt || 0), 0);
                 const each = n > 0 ? total / n : 0;
-                const fmt = v => '<span style=\\'color:' + (v>0?'var(--short)':'var(--text-mid)') + '\\'>' + (v>0?'-':'') + v.toFixed(3) + '</span>';
+                const fmt = v => '<span style=&quot;color:' + (v>0?'var(--short)':'var(--text-mid)') + '&quot;>' + (v>0?'-':'') + v.toFixed(3) + '</span>';
                 return fmt(total) + ' · ' + fmt(each);
               })()"></span>
             </div>
@@ -96,125 +97,120 @@
             </div>
           </div>
         </div>
-      `;
+      `,
+    },
 
-      // ── Role badge: ⏳ LAGGARD on oldest position ───────────────────────────
-      const _origInit = def.init;
-      def.init = function () {
-        if (_origInit) _origInit.call(this);
-        // Ensure cfg defaults exist
-        if (this.cfg.laggardProfitOffset == null) this.cfg.laggardProfitOffset = 50;
-        if (this.cfg.edaCapPct == null) this.cfg.edaCapPct = 50;
-        // Module state
-        if (this._lostValue == null) this._lostValue = 0;
-        if (this._laggardId == null) this._laggardId = null;
-        if (this._postCloseLaggardTimer == null) this._postCloseLaggardTimer = null;
-        // Register laggard role badge
-        this.registerRoleBadge(p => {
-          const isLaggard = this.positions.length > 0 && p.id === this._laggardId;
-          if (!isLaggard) return null;
-          return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,160,0,.45);color:#ffaa00;background:rgba(255,160,0,.08)">⏳ LAGGARD</span>`;
-        });
-      };
-
-      // ── EDa functions ────────────────────────────────────────────────────────
-      def._updateLostValue = function (totalPnl) {
-        this._lostValue += totalPnl;
-        if (this._lostValue > -0.01) this._lostValue = 0;
-      };
-
-      def._electLaggard = function () {
-        const pseudo = this.positions.filter(p => p._pseudo);
-        if (!pseudo.length) { this._laggardId = null; return; }
-        const oldest = pseudo.reduce((o, x) => x.openedAt < o.openedAt ? x : o, pseudo[0]);
-        this._laggardId = oldest ? oldest.id : null;
-      };
-
-      def._buffMul = function () {
-        return 1 + (Math.max(-99, this.cfg.laggardProfitOffset ?? 50) / 100);
-      };
-
-      def._redistributeED = function () {
-        const pseudo = this.positions.filter(p => p._pseudo);
-        if (!pseudo.length) return;
-        for (const p of pseudo) {
-          const baseTp   = p.tpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
-          const stagePct = (p.dcaStage || 0) === 0 ? baseTp : (this._tpRoi ? this._tpRoi(p.dcaStage || 1) : baseTp);
-          p._funcPct    = stagePct;
-          p._funcEV     = p.margin * (p._funcPct / 100);
-          p._bufferedEV = (p.dcaStage || 0) === 0 ? p.margin * (stagePct / 100) : p._funcEV;
-        }
-        const totalDebt = Math.max(0, -this._lostValue);
-        const _edaCap = ((this.cfg.edaCapPct ?? 50) / 100);
-        for (const p of pseudo) p._edDebt = 0;
-        if (totalDebt > 0) {
-          const perPos = totalDebt / pseudo.length;
-          for (const p of pseudo) {
-            p._edDebt = Math.min(perPos, p._bufferedEV * _edaCap);
-          }
-        }
-        for (const p of pseudo) {
-          const d           = p._edDebt || 0;
-          const funcTpPrice = p.entryPrice * (1 - p._funcPct / 100 / p.leverage);
-          p._ev = p._bufferedEV;
-          p._ed = p._bufferedEV + d - (p.upnl || 0);
-          if (d <= 0) {
-            p._edaTpPrice    = 0;
-            p.currentTpPrice = funcTpPrice;
-            p.tpPct          = parseFloat(p._funcPct.toFixed(2));
-            continue;
-          }
-          const targetProfit = p._bufferedEV + d;
-          const edaTp        = p.entryPrice * (1 - targetProfit / (p.leverage * p.margin));
-          if (edaTp > 0) {
-            p._edaTpPrice    = edaTp;
-            p.currentTpPrice = edaTp;
-            p.tpPct          = parseFloat(((p.entryPrice - edaTp) / p.entryPrice * p.leverage * 100).toFixed(2));
-          } else {
-            p._edaTpPrice    = 0;
-            p.currentTpPrice = funcTpPrice;
-            p.tpPct          = parseFloat(p._funcPct.toFixed(2));
-          }
-        }
-      };
-
-      // ── Wrap pseudoOpenShort ─────────────────────────────────────────────────
-      const _origOpen = def.pseudoOpenShort;
-      def.pseudoOpenShort = async function (candidate) {
-        const _retainedDebt = (this.positions.filter(p => p._pseudo).length === 0) ? Math.max(0, -this._lostValue) : 0;
-        await _origOpen.call(this, candidate);
-        this._electLaggard();
-        this._redistributeED();
-        if (_retainedDebt > 0.001) {
-          const sym = candidate.symbol || candidate.sym || '';
-          this.log(`[EDA] ${this.themeEmoji} ${sym} absorbs ${_retainedDebt.toFixed(3)} USDT pending debt (empty book).`, 'warn');
-        }
-      };
-
-      // ── Wrap pseudoClosePosition ─────────────────────────────────────────────
+    transform(def) {
+      const _origInit  = def.init;
+      const _origOpen  = def.pseudoOpenShort;
       const _origClose = def.pseudoClosePosition;
-      def.pseudoClosePosition = async function (pos, reason, fillPrice) {
-        const _wasLaggard = (pos.id === this._laggardId);
-        await _origClose.call(this, pos, reason, fillPrice);
-        // _origClose removes pos from positions; now update EDa state
-        this._updateLostValue(pos._lastClosePnl ?? 0);
-        this._electLaggard();
-        this._redistributeED();
-        if (_wasLaggard && (pos._lastClosePnl ?? 0) < 0) {
-          const _debtMag   = Math.max(0, -this._lostValue);
-          const _survivors = this.positions.filter(p => p._pseudo);
-          if (_debtMag > 0.001) {
-            if (_survivors.length) {
-              this.log(`[EDA] ${this.themeEmoji} Laggard ${pos.symbol} closed in loss — ${_debtMag.toFixed(3)} USDT lost value redistributed across ${_survivors.length} position(s).`, 'warn');
+
+      return Object.assign({}, def, {
+
+        async init() {
+          await _origInit.call(this);
+          if (this.cfg.laggardProfitOffset == null) this.cfg.laggardProfitOffset = 50;
+          if (this.cfg.edaCapPct == null)           this.cfg.edaCapPct = 50;
+          if (this._lostValue  == null)             this._lostValue  = 0;
+          if (this._laggardId  == null)             this._laggardId  = null;
+          this.registerRoleBadge?.(p => {
+            if (!this.positions.length || p.id !== this._laggardId) return null;
+            return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,160,0,.45);color:#ffaa00;background:rgba(255,160,0,.08)">⏳ LAGGARD</span>`;
+          });
+          this.log('[EDA] EDa Winter v1.0.0 loaded — debt-adjusted TPs active.', 'info');
+        },
+
+        // ── EDa helper methods ──────────────────────────────────────────────────
+
+        _edaUpdateLostValue(totalPnl) {
+          this._lostValue = (this._lostValue || 0) + totalPnl;
+          if (this._lostValue > -0.01) this._lostValue = 0;
+        },
+
+        _edaElectLaggard() {
+          const pseudo = this.positions.filter(p => p._pseudo);
+          if (!pseudo.length) { this._laggardId = null; return; }
+          const oldest = pseudo.reduce((o, x) => x.openedAt < o.openedAt ? x : o, pseudo[0]);
+          this._laggardId = oldest ? oldest.id : null;
+        },
+
+        _edaRedistribute() {
+          const pseudo = this.positions.filter(p => p._pseudo);
+          if (!pseudo.length) return;
+          for (const p of pseudo) {
+            const baseTp   = p.tpPct ?? (this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
+            const stagePct = (p.dcaStage || 0) === 0 ? baseTp : (this._tpRoi ? this._tpRoi(p.dcaStage || 1) : baseTp);
+            p._funcPct    = stagePct;
+            p._funcEV     = p.margin * (stagePct / 100);
+            p._bufferedEV = p._funcEV;
+          }
+          const totalDebt = Math.max(0, -(this._lostValue || 0));
+          const cap       = (this.cfg.edaCapPct ?? 50) / 100;
+          for (const p of pseudo) p._edDebt = 0;
+          if (totalDebt > 0) {
+            const perPos = totalDebt / pseudo.length;
+            for (const p of pseudo) p._edDebt = Math.min(perPos, p._bufferedEV * cap);
+          }
+          for (const p of pseudo) {
+            const d = p._edDebt || 0;
+            const funcTp = p.entryPrice * (1 - p._funcPct / 100 / p.leverage);
+            p._ev = p._bufferedEV;
+            p._ed = p._bufferedEV + d - (p.upnl || 0);
+            if (d <= 0) {
+              p._edaTpPrice    = 0;
+              p.currentTpPrice = funcTp;
+              p.tpPct          = parseFloat(p._funcPct.toFixed(2));
+              continue;
+            }
+            const edaTp = p.entryPrice * (1 - (p._bufferedEV + d) / (p.leverage * p.margin));
+            if (edaTp > 0) {
+              p._edaTpPrice    = edaTp;
+              p.currentTpPrice = edaTp;
+              p.tpPct          = parseFloat(((p.entryPrice - edaTp) / p.entryPrice * p.leverage * 100).toFixed(2));
             } else {
-              this.log(`[EDA] ${this.themeEmoji} Laggard ${pos.symbol} closed in loss with no positions left — ${_debtMag.toFixed(3)} USDT lost value retained; it will be placed on the next position to open.`, 'warn');
+              p._edaTpPrice    = 0;
+              p.currentTpPrice = funcTp;
+              p.tpPct          = parseFloat(p._funcPct.toFixed(2));
             }
           }
-        }
-      };
+        },
 
-      return def;
+        // ── Wrapped methods ─────────────────────────────────────────────────────
+
+        async pseudoOpenShort(candidate) {
+          const _retainedDebt = (this.positions.filter(p => p._pseudo).length === 0)
+            ? Math.max(0, -(this._lostValue || 0)) : 0;
+          await _origOpen.call(this, candidate);
+          this._edaElectLaggard();
+          this._edaRedistribute();
+          if (_retainedDebt > 0.001) {
+            const sym = candidate.symbol || candidate.sym || '';
+            this.log(`[EDA] ${this.themeEmoji} ${sym} absorbs ${_retainedDebt.toFixed(3)} USDT pending debt (empty book).`, 'warn');
+          }
+        },
+
+        async pseudoClosePosition(pos, reason, fillPrice) {
+          const pnlEst   = pos.upnl ?? 0; // capture before _origClose clears the position
+          const wasLaggard = (pos.id === this._laggardId);
+          await _origClose.call(this, pos, reason, fillPrice);
+          this._edaUpdateLostValue(pnlEst);
+          this._edaElectLaggard();
+          this._edaRedistribute();
+          if (wasLaggard && pnlEst < 0) {
+            const debtMag   = Math.max(0, -(this._lostValue || 0));
+            const survivors = this.positions.filter(p => p._pseudo);
+            if (debtMag > 0.001) {
+              if (survivors.length) {
+                this.log(`[EDA] ${this.themeEmoji} Laggard ${pos.symbol} closed in loss — ${debtMag.toFixed(3)} USDT redistributed across ${survivors.length} position(s).`, 'warn');
+              } else {
+                this.log(`[EDA] ${this.themeEmoji} Laggard ${pos.symbol} closed in loss with no survivors — ${debtMag.toFixed(3)} USDT retained for next open.`, 'warn');
+              }
+            }
+          }
+        },
+
+      });
     },
-  });
+  };
 })();
 </script>
