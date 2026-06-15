@@ -232,7 +232,7 @@ If a strategy plugin loaded before the live plugin, the live plugin would discar
 | Load order | Chain position | Role |
 |---|---|---|
 | First | Innermost | Live trading plugin (EverWinter / SunChaser) — API execution |
-| Last | Outermost | Strategy plugins (Drifters, etc.) — entry gating, position stamping |
+| Last | Outermost | Strategy plugins — entry gating, position stamping |
 
 Without `after`/`before` declarations the topological sort falls back to registration order. Always declare ordering explicitly for any plugin that wraps `pseudoOpenShort`.
 
@@ -257,31 +257,6 @@ Mirror of EverWinter for long side. `Buy` market to open, `Sell` reduceOnly limi
 ### Balance Display
 
 Both plugins override `refreshBalance()` to fetch `GET /v5/account/wallet-balance?accountType=UNIFIED` and populate `acct.balance` (walletBalance) and `acct.available` (availableToWithdraw) for the USDT coin. The market menu balance display switches from `∞` to the live wallet balance once credentials are present and the first scan cycle completes. Without credentials it remains `∞`.
-
----
-
-## Drifters Plugins
-
-> **Deprecated.** Functionally retired as a strategy — the files remain only as a reference implementation for building a strategy plugin (lock-in ledgers, open/close wraps, slot usage, plugin-owned persistence) and will be removed in time. Not documented in the Strategy Book.
-
-`plugins/strategies/Drifters-Winter.html` (id `drifters-winter`, `after: ['everwinter']`) targets PseudoWinter; `plugins/strategies/Drifters-Chaser.html` (id `drifters-chaser`, `after: ['sunchaser']`) targets PseudoChaser. The `after` declaration makes each the outermost transform so it can gate entries ahead of the live-API open (see Plugin Stack Order).
-
-### Internals
-
-- `_driftersBias()` — sums the `trades` field across the persisted lock-in maps and compares the sides against `cfg.driftersThreshold` (default `2`). Winter reads `gainerLockIn` (bullish-side entries) vs `loserLockIn` (bearish-side entries); Chaser compares `gainerStratLockIn` (bullish activity) vs `gainerLockIn` (roof/bearish activity). Returns `'bullish'`, `'bearish'`, or `'neutral'` (also neutral when both sides are zero).
-- `_driftersRunScan()` — appended to `runScan`. Returns early when `cfg.driftersEnabled` is off, the book is at `maxPos`, or the bias opposes the bot's direction. Otherwise reuses the host's `_lastAllTickers` cache when fresh (< 60 s, i.e. the stock scan just fetched it) — falling back to its own bulk ticker fetch — and takes the top 30 non-banned, non-BTC USDT symbols by 24h turnover (skipping symbols already in the book), classifies each with `_drifterRsiClass(rsi6, rsi12, rsi24)` — `'high'` (all ≥ 50), `'low'` (all ≤ 50), `'lukewarm'` (mixed → skip) — and opens via `pseudoOpenShort` with `_drifterType` set on the candidate.
-- `driftLockIn` — third lock-in map keyed by symbol: `{ rsi6, rsi12, rsi24, trades, setAt, drifterType }`, 6-hour TTL. One entry per symbol: a same-direction re-fire ratchets each timeframe (`Math.max` for high, `Math.min` for low), increments `trades`, and refreshes `setAt`; an opposite-direction fire replaces the entry outright. Persisted under the plugin's own localStorage key (restored on init with expired entries dropped) and swept by the wrapped `_sweepExpiredData()`.
-- Re-entry gate: a fresh same-direction `driftLockIn` entry blocks the symbol unless all three RSI readings are strictly past the stored values (above for high, below for low).
-- `pseudoOpenShort` wrap — non-drift candidates pass straight through to the original. For drift candidates, lock-in bumps are suppressed for the duration of the call (Chaser: `gainerStratLockInBump`), the new position is stamped with `pos._drifterType`, and `driftLockInBump(...)` records the drift entry.
-- `pseudoClosePosition` wrap — carries `_drifterType` onto the newly prepended `closedTrades[0]` record so history rendering can tag it.
-- Transform hooks touched: `runScan`, `pseudoOpenShort`, `pseudoClosePosition`, `renderTradeFeed`, `persist`, `_sweepExpiredData`.
-
-### UI Elements
-
-- **Mode label suffix** — the `mode-label-extra` slot appends "+ Drifters" to the header mode label while `cfg.driftersEnabled` is on.
-- **Config accordion** — the `strategy-accordions` slot adds a "〜 Drifters Strategy" accordion to the config column with an ice-blue **ON** / grey **OFF** state chip in its header. Inside: a **Drifters Mode** toggle (with a hint line summarizing the strategy) and, when enabled, a **Bias Threshold** slider — `cfg.driftersThreshold`, range 1.0×–5.0× in 0.1 steps, default 2.0×, current value rendered next to the label. Both respect the config lock.
-- **DRIFT badge** — `renderTradeFeed` is wrapped to append a small monospace `DRIFT` chip to closed-trade cards whose record carries `_drifterType`: green border/text for `'high'`, red for `'low'`. The badge text never varies; color alone encodes direction. Open-position cards are not badged — the marker lives on the position object and surfaces once the trade closes.
-- **Activity log** — bias changes log once per change (not per scan): 📈 "Today is bullish — Drifters deferred (short-only bias)" (Winter) / 📉 "Today is bearish — Drifters deferred (long-only bias)" (Chaser). Each entry logs `[DFT] ▲/▼ SYM @ price RSI a/b/c — high|low drifter entry`; each lock-in bump logs the ratcheted RSI triple and the accumulated trade count.
 
 ---
 
@@ -492,8 +467,6 @@ In both bots the ratchet moves the level to each new trade's change, tightening 
 
 `_sweepExpiredData()` removes entries where `Date.now() − setAt > 6 × 3600 × 1000`.
 
-With a Drifters plugin loaded, a third map `driftLockIn` exists alongside these — same TTL, same sweep — documented under Drifters Plugins above.
-
 ---
 
 ## Drawdown Throttle
@@ -530,7 +503,6 @@ The config panel exposes the toggle, the **Profit Factor** slider (with the comp
 
 ### Interactions
 
-- **Drifters** — on init, tightens `cfg.gainsLockFactor` to 1.5 if it is ≥ 2, banking profits sooner during drift sessions.
 - **Permafrost / Ashfall** — replace the fixed 12-hour lock duration with the learned market-climate profile: a gains lock under their governance ends when the climate score crosses the thaw/settle threshold (hard-capped at `permafrostCapHours`/`ashfallCapHours`), and lifting clears the rolling window just like a manual clear. See the Permafrost / Ashfall section.
 
 ### Gains sequestration (interaction with the Drawdown Throttle)
