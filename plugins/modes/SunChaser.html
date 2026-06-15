@@ -230,6 +230,50 @@
           } catch(e) {}
         },
 
+        async _scCheckTp(pos, exTp, exAvg) {
+          const dp    = this._scPriceDp(pos.symbol);
+          const lev   = pos.leverage || this.cfg.leverage;
+          const tpPct = pos.tpPct > 0 ? pos.tpPct : this.cfg.entryTpRoi;
+          const base  = exAvg > 0 ? exAvg : pos.entryPrice;
+          const targetTp = parseFloat((base * (1 + tpPct / 100 / lev)).toFixed(dp));
+
+          if (exTp > 0) {
+            // Sync display from exchange
+            pos.currentTpPrice = exTp;
+            pos.tpPct          = parseFloat(((exTp - base) / base * lev * 100).toFixed(1));
+
+            // Deviation check — 10% of expected TP distance from avgPrice
+            const tolerance = base * tpPct / 100 / lev * 0.10;
+            const deviation = Math.abs(exTp - targetTp);
+            const lockKey   = exTp.toFixed(dp);
+            const lockAge   = pos._scTpLockedAt ? Date.now() - pos._scTpLockedAt : Infinity;
+            if (pos._scTpLockKey === lockKey && lockAge < 60000) return; // accepted as authoritative
+
+            if (deviation > tolerance) {
+              this.log(`[SC] ${pos.symbol}: TP drift — exchange ${exTp.toFixed(dp)} vs target ${targetTp.toFixed(dp)} (Δ${deviation.toFixed(dp)}) — correcting`, 'warn');
+              const res = await this._scSetTP(pos, targetTp);
+              if (res === 'ok') {
+                pos._scTpLockKey = null; pos._scTpLockedAt = null;
+              } else {
+                pos._scTpLockKey = lockKey; pos._scTpLockedAt = Date.now();
+                this.log(`[SC] ${pos.symbol}: TP correction refused — accepting exchange TP ${exTp.toFixed(dp)}`, 'debug');
+              }
+            }
+          } else {
+            // Exchange TP is null — reissue stored or recomputed target
+            const reissue = pos.currentTpPrice > 0 ? pos.currentTpPrice : targetTp;
+            if (reissue > 0) {
+              const nullKey = `null:${reissue.toFixed(dp)}`;
+              const lockAge = pos._scTpLockedAt ? Date.now() - pos._scTpLockedAt : Infinity;
+              if (pos._scTpLockKey === nullKey && lockAge < 60000) return;
+              this.log(`[SC] ${pos.symbol}: TP null on exchange — reissuing @ ${reissue.toFixed(dp)}`, 'warn');
+              const res = await this._scSetTP(pos, reissue);
+              if (res === 'ok') { pos._scTpLockKey = null; pos._scTpLockedAt = null; }
+              else               { pos._scTpLockKey = nullKey; pos._scTpLockedAt = Date.now(); }
+            }
+          }
+        },
+
         async _scSyncPositions() {
           if (!this.creds.key || !this.creds.secret) return;
           try {
@@ -281,8 +325,12 @@
                 this.log(`[SC] ${pos.symbol}: exchange closed [${reason}] @ ${exitPrice}`, 'info');
                 await _origClose.call(this, pos, reason, exitPrice);
               } else {
-                pos.markPrice = parseFloat(ep.markPrice || ep.avgPrice || pos.markPrice);
+                const exAvg   = parseFloat(ep.avgPrice || ep.entryPrice || pos.entryPrice);
+                pos.markPrice = parseFloat(ep.markPrice || exAvg || pos.markPrice);
                 pos.totalSize = parseFloat(ep.size || pos.totalSize);
+                if (exAvg > 0) pos.entryPrice = exAvg;
+                const exTp = parseFloat(ep.takeProfit || 0);
+                await this._scCheckTp(pos, exTp, exAvg || pos.entryPrice);
               }
             }
             this._scLastSync = Date.now();
