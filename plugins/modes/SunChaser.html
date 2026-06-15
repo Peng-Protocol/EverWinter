@@ -191,11 +191,21 @@
           return null;
         },
 
+        async _scSetLeverage(symbol, lev) {
+          await this._scDelay();
+          const b = JSON.stringify({ category: 'linear', symbol, buyLeverage: String(lev), sellLeverage: String(lev) });
+          const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+          try {
+            const r = await fetch(`${this.base}/v5/position/set-leverage`, { method: 'POST', headers: h, body: b });
+            const d = await this._scSafeJson(r);
+            if (d?.retCode !== 0 && d?.retCode !== 110043) this.log(`[SC] setLeverage ${symbol}: ${d?.retMsg}`, 'warn');
+          } catch(e) { this.log(`[SC] setLeverage error: ${e.message}`, 'warn'); }
+        },
+
         async _scSetTP(pos, tpPrice) {
           await this._scDelay();
           const dp   = this._scPriceDp(pos.symbol);
-          // For long: TP fires when price rises to trigger; set 0.1% below to avoid missing the fill
-          const trig = parseFloat((tpPrice * 0.999).toFixed(dp));
+          const trig = parseFloat(tpPrice.toFixed(dp));
           const b    = JSON.stringify({ category: 'linear', symbol: pos.symbol, takeProfit: String(trig), tpTriggerBy: 'LastPrice', positionIdx: 0 });
           const h    = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
           try {
@@ -304,6 +314,7 @@
           const binary = this._binaryMode ? this._binaryMode() : this.cfg.binaryModeEnabled;
           const tpPct  = binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
 
+          await this._scSetLeverage(symbol, lev);
           this.log(`[SC] Placing BUY ${symbol} qty=${qty} @ ~${price}…`, 'info');
           const oid = await this._scPlaceOrder(symbol, 'Buy', qty, price);
           if (!oid || oid === 'NOT_LIVE') return;
@@ -415,6 +426,23 @@
             this._scNeedsSync = false;
             await this._scSyncPositions();
           }
+          // Update markPrice for live positions using public ticker (base watch skips _pseudo=false)
+          const live = this.positions.filter(p => !p._pseudo);
+          for (const pos of live) {
+            try {
+              const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${pos.symbol}`);
+              const td = await tr.json();
+              const t  = td?.retCode === 0 ? td.result?.list?.[0] : null;
+              if (t) {
+                const mp = parseFloat(t.lastPrice || t.markPrice || 0);
+                if (mp > 0) {
+                  pos.markPrice = mp;
+                  pos.upnl = (mp - pos.entryPrice) / pos.entryPrice * pos.leverage * pos.margin;
+                }
+              }
+            } catch {}
+          }
+          if (live.length) this.acct.upnl = this.positions.reduce((s, p) => s + (Number.isFinite(p.upnl) ? p.upnl : 0), 0);
           return _origWatch.call(this);
         },
       });
