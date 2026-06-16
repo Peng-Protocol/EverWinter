@@ -363,6 +363,8 @@ A slot-based entry filter that combines funding rate, 24-hour price direction, a
 | `-24h` | ⬇️ | ⬇️ | `price24hPcnt ≤ 0` — ticker down on the day |
 | `>10pct` | 🔊 | 🔊 | `turnover24h / marketCap > 0.10` — high relative participation |
 | `<10pct` | 🔉 | 🔉 | `turnover24h / marketCap < 0.10` — low relative participation |
+| `lsa` | 🟥 | 🟥 | Last completed 1h kline volume in the configured spike band above 24h hourly average AND `close < open` — sell-side liquidity spike |
+| `lba` | 🟩 | 🟩 | Same spike band condition AND `close > open` — buy-side liquidity spike |
 
 The badge is **app-relative** for funding: 🤑 always means the funding rate is favorable for the position direction (carry income), 💸 means the funding rate is adverse. Hovering the badge in the trades or market menu shows a plain-text tooltip with the matched criteria names. Old positions without saved criteria show `Multi` as fallback.
 
@@ -378,7 +380,9 @@ Appended to `runScan`. Skips when disabled, at `maxPos`, drawdown-halted, or gai
 
 Base pool: `_lastAllTickers` filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, excluding held and banned symbols. If any active slot contains `>10pct` or `<10pct`, the top 30 tickers by `turnover24h` are inspected and their market caps pre-fetched (see CoinGecko below); the resulting `mcapMap` is keyed by symbol. Tickers outside the top 30 cannot satisfy vol/mcap criteria (their `ratio` resolves to `null`).
 
-Matching: for each ticker in the base pool, each active slot is evaluated as `s.every(criterion passes)`. The first matching slot qualifies the ticker. Qualified tickers are sorted by descending `|fundingRate|` and the top `picks` (default 3) are opened via `pseudoOpenShort`/`pseudoOpenLong`.
+If any active slot contains `lsa` or `lba`, a random subsample of up to `cfg.miwKlineScanCap` / `cfg.micKlineScanCap` (default 50, range 10–500 step 10) tickers from the base pool is drawn via Fisher-Yates shuffle, and the last completed 1h kline is fetched for each (see 1h kline analysis below). Only sampled tickers can satisfy LSA/LBA criteria; unsampled tickers evaluate `false` for those criteria but may still qualify via other slots that do not use kline criteria.
+
+Matching: for each ticker in the base pool, each active slot is evaluated as `s.every(criterion passes)`. The first matching slot qualifies the ticker. Qualified tickers are sorted by slot index then descending `|fundingRate|`; the top `picks` (default 3) are distributed across slots and opened via `pseudoOpenShort`/`pseudoOpenLong`.
 
 ### Config keys
 
@@ -391,10 +395,35 @@ Matching: for each ticker in the base pool, each active slot is evaluated as `s.
 | `miwPicks` / `micPicks` | `3` | Max entries per cycle (range 1–10) |
 | `miwShareCapEnabled` / `micShareCapEnabled` | `true` | Whether the share cap is active |
 | `miwShareCapPct` / `micShareCapPct` | `100` | Plugin's max share of `maxPos` (%) |
+| `miwCascadeEnabled` / `micCascadeEnabled` | `false` | Cascade exit toggle |
+| `miwCascadePct` / `micCascadePct` | `25` | Collective uPnL trigger as % of avg base margin |
+| `miwSacrificeEnabled` / `micSacrificeEnabled` | `false` | Sacrifice exit toggle |
+| `miwSacrificePct` / `micSacrificePct` | `25` | Collective uLoss trigger as % of avg base margin |
+| `miwKlineVolMin` / `micKlineVolMin` | `25` | Lower bound of the 1h vol spike band (% above 24h hourly average) |
+| `miwKlineVolMax` / `micKlineVolMax` | `50` | Upper bound of the 1h vol spike band |
+| `miwKlineScanCap` / `micKlineScanCap` | `50` | Max tickers randomly sampled per cycle for LSA/LBA kline fetches (range 10–500, step 10) |
 
 **Default slots — Winter** (shorts): `[['+fund','+24h','>10pct'],['-fund','-24h','<10pct']]`
 
 **Default slots — Chaser** (longs): `[['-fund','+24h','>10pct'],['+fund','-24h','<10pct']]`
+
+### 1h kline analysis (LSA/LBA)
+
+When any active slot includes `lsa` or `lba`, a random subsample of the base pool is drawn (Fisher-Yates in-place shuffle, then sliced to `miwKlineScanCap`/`micKlineScanCap`) and `GET /v5/market/kline?category=linear&symbol=X&interval=60&limit=2` is fetched for each — `list[1]` is the last completed candle. Results are cached in `_miwKlineCache`/`_micKlineCache` keyed by symbol with the candle's UTC start epoch; a cache hit at the same hourly boundary skips the fetch entirely. Fetches run in batches of 10 concurrent requests.
+
+Vol spike check: `kline.volume / (ticker.volume24h / 24)` must fall within `[1 + miwKlineVolMin/100, 1 + miwKlineVolMax/100]` (default +25%…+50% above the 24h hourly average). A ratio below the lower bound is too weak; above the upper bound is too violent and likely noise — both evaluate `false`.
+
+Candle direction: `lsa` additionally requires `kline.close < kline.open` (red candle); `lba` requires `kline.close > kline.open` (green candle). A candle that spikes in volume but closes flat satisfies neither.
+
+### Cascade and Sacrifice exits
+
+Two optional group-exit features run on a 5-second timer (`_miwExitTimer`/`_micExitTimer`), independent of the scan cycle.
+
+**Cascade** (`miwCascadeEnabled`/`micCascadeEnabled`): fires when the collective unrealized PnL of all MIW/MIC positions reaches `± avgMargin × cascadePct / 100`. When triggered, every MIW/MIC position is closed via `pseudoClosePosition` with reason `'cascade'`. Designed to bank a profitable group move before it reverses.
+
+**Sacrifice** (`miwSacrificeEnabled`/`micSacrificeEnabled`): same collective measurement on the loss side — fires when collective uPnL falls to `−avgMargin × sacrificePct / 100`. Closes all MIW/MIC positions to cap the group drawdown. Distinct from the host's drawdown throttle, which gates new entries; Sacrifice closes existing ones.
+
+Both checks run before `_origScan` inside the `runScan` wrap, so a cascade or sacrifice resolves before any new entries open in the same cycle.
 
 ### CoinGecko market cap data
 

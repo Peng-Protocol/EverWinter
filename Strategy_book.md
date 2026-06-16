@@ -11,7 +11,7 @@
      - [Over-Extension Filter](#over-extension-filter)
    - [Reactive Techniques](#reactive-techniques)
 3. [Strategies](#strategies)
-   - [Scattershot](#scattershot-strategy)
+   - [Multi-Indicator](#multi-indicator-strategy)
    - [Psycho Mode](#psycho-mode)
 4. [Sizing](#sizing)
 5. [Conclusion](#conclusion)
@@ -225,7 +225,7 @@ Each strategy is a specific combination of techniques.
 
 **Slots**: The entry logic is built from "slots" — each slot is a set of criteria that must all be true at the same time. A ticker qualifies for entry if it satisfies every criterion in any one slot. Think of each slot as a distinct thesis about when to open: "funding rate elevated and price trending up" is a different case than "high participation confirming momentum." Both can be active simultaneously; each runs on its own terms.
 
-**The six criteria**:
+**The criteria**:
 
 - **+fund** — The funding rate is above the threshold (typically 0.1%). Longs are paying shorts. There is a premium embedded in holding the short side, and heavy long positioning often signals a crowded trade vulnerable to reversal.
 - **-fund** — The funding rate is below the negative threshold. Shorts are paying longs. This is the mirror: an overcrowded short side with embedded carry for longs.
@@ -233,20 +233,26 @@ Each strategy is a specific combination of techniques.
 - **-24h** — The 24-hour price change is negative. The day is currently bearish for this coin.
 - **>10%** — The ticker's 24-hour trading volume exceeds 10% of its total market capitalization. A significant fraction of the coin's entire value changed hands in a day — unusually high participation that confirms momentum is broadly backed, not a thin-market artifact.
 - **<10%** — The volume is below 10% of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
+- **LSA (Sell Spike)** — The last completed hourly candle had a volume spike above the daily average in the configured range, and it closed lower than it opened. A high-volume down candle is sell-side pressure with the market actively participating — not drifting, not choppy, but decisively pointing down. Use this to confirm bearish momentum with volume backing before entering the short side.
+- **LBA (Buy Spike)** — The mirror: high volume in the configured range, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
 
-**Default configuration**: The four default slots cover the same ground as the approaches they replaced. Winter (shorts): positive funding + rising price; negative funding + falling price; rising price with high participation; falling price with low participation. Chaser (longs): the directional mirrors of the same. Any slot can be edited, removed, or replaced to build entirely different configurations.
+**Default configuration**: The default slots cover the primary entry cases. The short side uses: positive funding with price rising, negative funding with price falling, rising price with high participation, and falling price with low participation. The long side uses the directional mirrors of the same. Any slot can be edited, removed, or replaced to build entirely different configurations.
 
-**Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
+**Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume before the position opens. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
+
+**The slot system is designed to grow.** New criteria can be introduced over time and dropped directly into any slot combination without rebuilding the strategy from scratch. Rather than a fixed approach, this is a composable framework — each criterion is a Lego brick, and each slot is a configuration you assemble from them. A slot strategy that felt right six months ago can be extended with a new signal the moment it becomes available. This is why the Multi-Indicator approach reduces the need for entirely separate strategy plugins: if a new edge can be expressed as a set of conditions a ticker must meet simultaneously, it belongs here as a criterion, not as a standalone plugin.
 
 **Exits**: All exits use the standard take-profit and stop-loss settings — no strategy-specific timer or force close. The Multi-Indicator plugin is agnostic to how long a position is held; that is entirely in the hands of the host's exit system.
 
 **Components used**:
-- Slot-based AND-gate filter (user-configurable; up to six criteria per slot, unlimited slots)
+- Slot-based AND-gate filter (user-configurable; any combination of criteria per slot, unlimited slots)
 - Funding rate threshold gate (+fund, -fund)
 - 24-hour price direction (+24h, -24h)
 - Vol/mcap ratio filter (>10%, <10%) with CoinGecko market cap data
+- 1h volume spike + candle direction filter (LSA, LBA) with configurable spike band
 - Drawdown throttle and gains lock
 - Climate gate (learned market-structure profile, when Permafrost or Ashfall is loaded)
+- Optional group exits: Cascade (close all on collective profit target) and Sacrifice (close all on collective loss limit)
 
 ---
 
