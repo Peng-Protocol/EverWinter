@@ -24,8 +24,8 @@ When in doubt, increment the patch number.
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.3.3 |
-| `PseudoChaser.html` | v1.0.2 |
+| `PseudoWinter.html` | v1.3.4 |
+| `PseudoChaser.html` | v1.0.3 |
 | `PsychoWinter1.0.html` | v1.0 |
 
 > Always update the table above after bumping a version so this document stays accurate.
