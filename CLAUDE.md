@@ -24,8 +24,8 @@ When in doubt, increment the patch number.
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.3.7 |
-| `PseudoChaser.html` | v1.0.6 |
+| `PseudoWinter.html` | v1.3.8 |
+| `PseudoChaser.html` | v1.0.7 |
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.0.6 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.0.6 |
