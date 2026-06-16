@@ -81,7 +81,7 @@
               <div class="g" style="margin-top:8px">
                 <div class="lbl">Max Entries / Cycle <b x-text="(cfg.micPicks??3)"></b></div>
                 <input type="range" min="1" max="10" step="1" x-model.number="cfg.micPicks" @change="persist()">
-                <div class="mic-hint">Ranked by highest absolute funding rate first; opens until this limit, max positions, or a halt.</div>
+                <div class="mic-hint">Split equally across slots (slot order first, then |FR|); earlier slots get the extra pick when picks don't divide evenly.</div>
               </div>
               <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.micShareCapEnabled=!(cfg.micShareCapEnabled??true);persist()}">
                 <div class="tog-t" :class="(cfg.micShareCapEnabled??true)?'on':''"><div class="tog-k"></div></div>
@@ -252,11 +252,13 @@
 
           const needsMcap = slots.some(s => s.includes('>10pct') || s.includes('<10pct'));
 
+          const micWaitlist = this._micWaitlist || {};
           const basePool = allTickers.filter(t =>
             t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
             && parseFloat(t.lastPrice || 0) >= 0.001
             && !activeSyms.has(t.symbol)
             && !(this._isSymbolBanned?.(t.symbol))
+            && !(freshAt > 0 && micWaitlist[t.symbol] === freshAt)
           );
 
           // Resolve market caps for vol/mcap criteria if any slot requires them.
@@ -288,15 +290,15 @@
 
           const pool = basePool
             .map(t => {
-              const fr      = parseFloat(t.fundingRate || 0) * 100;
-              const is24hUp = parseFloat(t.price24hPcnt || 0) > 0;
-              const mcap    = mcapMap[t.symbol];
-              const ratio   = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
-              const matched = slots.find(s => s.every(c => checkCrit(c, fr, is24hUp, ratio)));
-              return matched ? { t, criteria: matched } : null;
+              const fr       = parseFloat(t.fundingRate || 0) * 100;
+              const is24hUp  = parseFloat(t.price24hPcnt || 0) > 0;
+              const mcap     = mcapMap[t.symbol];
+              const ratio    = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
+              const slotIdx  = slots.findIndex(s => s.every(c => checkCrit(c, fr, is24hUp, ratio)));
+              return slotIdx !== -1 ? { t, criteria: slots[slotIdx], slotIdx } : null;
             })
             .filter(Boolean)
-            .sort((a, b) => Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
+            .sort((a, b) => a.slotIdx - b.slotIdx || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
 
           if (!_mwPool.length) this._micLastActedAt = freshAt;
 
@@ -312,16 +314,23 @@
             return;
           }
 
+          // Distribute picks equally across slots; later slots lose the remainder.
+          const base       = Math.floor(picks / slots.length);
+          const extra      = picks % slots.length;
+          const slotQuota  = slots.map((_, i) => base + (i < extra ? 1 : 0));
+          const slotOpened = new Array(slots.length).fill(0);
+
           let opened = 0;
           this._logBatchBegin?.();
           try {
-            for (const { t, criteria } of pool) {
+            for (const { t, criteria, slotIdx } of pool) {
               if (opened >= picks) break;
               if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) break;
-              if (await this._micOpen(t, criteria)) opened++;
+              if (slotOpened[slotIdx] >= slotQuota[slotIdx]) continue;
+              if (await this._micOpen(t, criteria)) { opened++; slotOpened[slotIdx]++; }
             }
           } finally { this._logBatchEnd?.('[MIC] 💡 Entry roll-up'); }
-          this.log(`[MIC] 💡 ${pool.length} tickers matched — ${opened}/${picks} opened`, 'info');
+          this.log(`[MIC] 💡 ${pool.length} tickers matched — ${opened}/${picks} opened (quota: ${slotQuota.map((q,i)=>`s${i+1}:${slotOpened[i]}/${q}`).join(' ')})`, 'info');
         },
 
         async _micOpen(t, criteria) {
@@ -408,6 +417,9 @@
           if (isMic && (this.closedTrades?.length ?? 0) > prevLen) {
             this.closedTrades[0]._mic = true;
             if (criteria) this.closedTrades[0]._micCriteria = criteria;
+            // Waitlist: block reopening until the next bulk ticker fetch
+            this._micWaitlist = this._micWaitlist || {};
+            this._micWaitlist[pos.symbol] = this._lastAllTickersAt || 0;
             this.persist?.();
             this.renderTradeFeed?.();
           }
