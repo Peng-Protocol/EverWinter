@@ -347,51 +347,70 @@ Note: for the first weeks the plugin behaves almost exactly like the stock timer
 
 ---
 
-## Blizzard / Firestorm Plugins
+## Multi-Indicator Plugin
 
-`plugins/strategies/Blizzard-Winter.html` (id `blizzard-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/Firestorm-Chaser.html` (id `firestorm-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Same code, two profiles. Strategy rationale lives in the Strategy Book's **Scattershot** section; this section documents the implementation.
+`plugins/strategies/MultiIndicator-Winter.html` (id `multiindicator-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/MultiIndicator-Chaser.html` (id `multiindicator-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Strategy rationale lives in the Strategy Book's **Multi-Indicator** section; this section documents the implementation.
 
-A vol/mcap-filtered scattershot bet on the market at large: each scan cycle ranks the baseline-qualifying pool by 24h turnover, inspects the top 10, fetches market cap per ticker from CoinGecko, and selects only those whose turnover-to-mcap ratio signals alignment with the bot's direction. Blizzard (short) requires vol < 10% of mcap — low relative volume suggests the broad market has not yet chased the move, making it a fade candidate. Firestorm (long) requires vol > 10% of mcap — high relative volume confirms momentum is actively backing the move. If none of the inspected tickers pass, the cycle logs this and skips entry. Passing tickers are opened with a fixed SL and a far TP; survivors force-close after 12 hours. The barrier geometry (TP 105% buffered → 70% functional / SL 18% by default) means one TP win covers ~3.9 SL exits; the edge is meant to come from broad market drift combined with the vol/mcap filter providing directional signal quality. Drawdown throttle and gains lock gate all entries; Permafrost/Ashfall governs those halts when loaded.
+A slot-based entry filter that combines funding rate, 24-hour price direction, and vol/mcap signals in user-configurable AND-gate combinations. Each "slot" is a set of criteria that must all be true simultaneously for a ticker to qualify. If any slot matches, the ticker enters the candidate pool. Entry pool fires once per fresh bulk ticker fetch (`_lastAllTickersAt`) — the plugin tracks the cache timestamp in `_miwLastActedAt`/`_micLastActedAt` and skips re-scanning the same snapshot. TP, SL, and all exit logic use the host's settings. Positions are stamped `_miw`/`_mic` and badged `💡 MULTI` (ice for Winter, ember for Chaser).
 
-### Entry pass (`_blzRunScan` / `_fstRunScan`)
+### Criteria
 
-Appended to `runScan`. Skips the cycle when disabled, at `maxPos`, drawdown-halted, or gains-locked — logging a brief `"Scatter skipped"` line each time. Candidate pool: the host's `_lastAllTickers` cache (fallback fetch when stale), filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, |24h%| ≥ `blizzardBaselinePct`/`firestormBaselinePct` (default 6%, range 1–20%) in **either direction**, excluding held and banned symbols. The pool is sorted by `turnover24h` descending and the **top 10** are inspected: for each, `_blzGetMcap`/`_fstGetMcap` resolves a CoinGecko market cap (see Market cap data below) and computes `turnover24h / mcap`. Blizzard keeps tickers where the ratio is **< 0.10**; Firestorm keeps tickers where the ratio is **> 0.10**. If zero tickers pass, the cycle logs `"none met vol/mcap criteria"` and exits without opening. Otherwise up to `blizzardPicks`/`firestormPicks` (default 3, range 1–10) are drawn at random from the passing set, retried up to 3× picks on failed opens. Each cycle logs the baseline pool size, the passing count, and opens.
+| Key | Meaning |
+|---|---|
+| `+fund` | `fundingRate × 100 ≥ miwFrThreshold` (longs paying shorts) |
+| `-fund` | `fundingRate × 100 ≤ −miwFrThreshold` (shorts paying longs) |
+| `+24h` | `price24hPcnt > 0` (ticker up on the day) |
+| `-24h` | `price24hPcnt ≤ 0` (ticker down on the day) |
+| `>10pct` | `turnover24h / marketCap > 0.10` (high relative participation) |
+| `<10pct` | `turnover24h / marketCap < 0.10` (low relative participation) |
 
-### Market cap data (CoinGecko)
+A slot may contain any subset of these criteria. An empty slot never matches. Any single criterion can appear in multiple slots independently.
 
-Blizzard and Firestorm are the only plugins in the suite that call an external third-party API. A two-level cache limits traffic:
+### Slot UI
 
-- **ID cache** (permanent, session-scoped) — maps base symbol (e.g. `eth`) to a CoinGecko coin ID (e.g. `ethereum`). Populated on first encounter via `GET /api/v3/search?query={base}`; never expires. After the first scan cycle touching a symbol the search call is never repeated.
-- **Market cap cache** (1-hour TTL) — maps coin ID to `usd_market_cap` from `GET /api/v3/simple/price?ids={id}&vs_currencies=usd&include_market_cap=true`. Refreshed at most once per hour per symbol regardless of scan frequency.
+The accordion exposes the slot system under a "Entry Slots" heading. Clicking any slot block selects it and opens a criteria picker row above the blocks — six labeled buttons, each toggling that criterion into or out of the selected slot. Active criteria render with highlighted borders; inactive ones are dimmed. Clicking the selected slot again deselects it and hides the picker. A ✕ button on each block deletes the slot; a `+` button appends a new empty slot. All controls respect the config lock.
 
-**Call budget per cycle**: unknown symbols → 1 search call each (once per symbol per session); known symbols with stale mcap → 1 price call each. After warm-up: 0–10 calls per cycle total.
+### Entry pass (`_miwRunScan` / `_micRunScan`)
 
-**Limitations:**
+Appended to `runScan`. Skips when disabled, at `maxPos`, drawdown-halted, or gains-locked. Reads `cfg.miwSlots`/`cfg.micSlots` (arrays of criterion arrays), discards empty slots, then proceeds. If the share cap is enabled, the headroom is capped at `floor(maxPos × shareCapPct / 100) − currently held _miw/_mic positions`.
 
-- Symbol resolution uses the first search result. For well-known symbols this is reliable; for symbols shared by multiple tokens the matched coin may be incorrect, producing a wrong market cap and a false ratio result. This only affects candidate selection — it cannot cause incorrect exits on open positions.
-- Tickers that fail to resolve (no search hit, API error, or zero market cap returned) are excluded from the candidate pool. If all 10 inspected tickers fail to resolve, the log reads `"none met vol/mcap criteria"` — indistinguishable from tickers that resolved but failed the ratio test.
-- The free CoinGecko tier enforces rate limits (~10–30 req/min). With up to 20 calls on a cold start this is well within limits; a burst of cold-start cycles in quick succession could trigger throttling (HTTP 429), causing lookups to return `null` and the cycle to defer entry silently.
-- **No API key is required.** If CoinGecko is unreachable, all lookups return `null` silently and the cycle defers entry to the next scan.
+Base pool: `_lastAllTickers` filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, excluding held and banned symbols. If any active slot contains `>10pct` or `<10pct`, the top 30 tickers by `turnover24h` are inspected and their market caps pre-fetched (see CoinGecko below); the resulting `mcapMap` is keyed by symbol. Tickers outside the top 30 cannot satisfy vol/mcap criteria (their `ratio` resolves to `null`).
 
-### Open mechanics (cfg-swap)
+Matching: for each ticker in the base pool, each active slot is evaluated as `s.every(criterion passes)`. The first matching slot qualifies the ticker. Qualified tickers are sorted by descending `|fundingRate|` and the top `picks` (default 3) are opened via `pseudoOpenShort`/`pseudoOpenLong`.
 
-Both the sim hosts and the live plugins read binary-mode TP/SL from `cfg` at open time, so `_blzOpen`/`_fstOpen` swaps `binaryModeEnabled: true`, `binaryTpPct`, and `binarySlPct` in around the `pseudoOpenShort` call and restores them in `finally` (re-persisting the restored cfg). Entries are therefore always binary-style: TP and SL stamped at entry, no DCA ladder. The TP slider (`blizzardTpPct`/`firestormTpPct`, default 105, range 20–300) is the **buffered (EV)** value, same convention as the general-settings TP UI — it is passed straight through as `binaryTpPct` and the host derives the functional TP as slider ÷ `_buffMul` (105% → 70% at +50% offset; a one-time v1.1 migration resets stored pre-buffer values to the new default). Main lock-in bumps are suppressed during the call (Drifters precedent — scatter entries are not signal trades); RSIs are fetched for the position record. New positions are stamped `_blizzard`/`_firestorm` plus `_slPctOverride`.
+### Config keys
 
-### Cascade
+| Key | Default | Description |
+|---|---|---|
+| `miwEnabled` / `micEnabled` | `false` | Master on/off toggle |
+| `miwSlots` / `micSlots` | See defaults | Array of criterion arrays — the slot configuration |
+| `miwActiveSlot` / `micActiveSlot` | `null` | Index of the currently selected slot in the UI |
+| `miwFrThreshold` / `micFrThreshold` | `0.1` | Funding rate magnitude gate for `+fund`/`-fund` criteria (%) |
+| `miwPicks` / `micPicks` | `3` | Max entries per cycle (range 1–10) |
+| `miwShareCapEnabled` / `micShareCapEnabled` | `true` | Whether the share cap is active |
+| `miwShareCapPct` / `micShareCapPct` | `50` | Plugin's max share of `maxPos` (%) |
 
-`blizzardCascadeEnabled`/`firestormCascadeEnabled` (default **on**, toggle in the accordion): each watcher pass, before the per-position checks, the plugin sums uPnL across **all** open positions (scatter and stock alike). When the collective total reaches the TP target — `TpPct% × base margin` (`minNotional ÷ leverage`), $1.05 at default settings — every open position is bailed at mark price with reason `'cascade'` for a net profit. The realized PnL feeds the host's gains-lock window (readily triggering it) and, when Permafrost/Ashfall is loaded, seeds its climate profile with favorable samples. Active only while the scatter mode itself is enabled; an in-flight guard prevents re-entry while a cascade is closing.
+**Default slots — Winter** (shorts): `[['+fund','+24h'],['-fund','-24h'],['+24h','>10pct'],['-24h','<10pct']]`
 
-`_slPctOverride` is a small host accommodation added for this plugin but usable by any: the watcher's binary **SL drift-correction** (which re-targets `slPrice` from the global `cfg.binarySlPct` each tick) and the position-card SL display honor a per-position override when present, so a plugin-set SL survives instead of being corrected back to the global slider.
+**Default slots — Chaser** (longs): `[['-fund','+24h'],['+fund','-24h'],['+24h','>10pct'],['-24h','<10pct']]`
 
-### Exits
+### CoinGecko market cap data
 
-The plugin's `pseudoWatchPositions` wrap is the authoritative exit for stamped positions (it manages them even if the mode is toggled off mid-flight): per tick it computes ROI as `upnl / margin` and closes at `roi ≥ TP% ÷ buffMul` (`'tp'`, the functional level), `roi ≤ −SL%` (`'sl'`), or age ≥ 12h (`'blizzard-12h'`/`'firestorm-12h'`), always at mark price. The host enforces the same TP/SL independently (exchange-native in live mode — note the live TP order sits at the buffered slider value since the live open does not divide by the buffer; the wrap closes at the functional level first). Closed records carry the stamp and the trade feed badges them `BLZ` (ice) / `FST` (ember).
+When any active slot contains `>10pct` or `<10pct`, the plugin resolves market caps for the top 30 tickers by turnover in two API calls:
+
+- **`window.__cgCoinList`** — `/api/v3/coins/list` fetched once per page session (24-hour TTL in `localStorage` under `__cgCoinList`). Shared across both Multi-Indicator plugins and any other plugin using the same global. Maps base symbol (e.g. `eth`) to CoinGecko coin ID (e.g. `ethereum`) via first-match on `c.symbol`.
+- **`/api/v3/simple/price`** — one batch call for all IDs with stale or missing market caps. Results cached in `_miwMcapCache`/`_micMcapCache` with a 1-hour TTL per coin ID.
+
+**No API key is required.** If CoinGecko is unreachable or a ticker fails to resolve, its `ratio` is `null` — vol/mcap criteria evaluate to `false` for that ticker (it can still qualify via other slots that do not use vol/mcap criteria). Rate-limit responses (HTTP 429) are handled silently; the cycle defers entry for that pass.
+
+Symbol resolution uses the first match on `c.symbol` in the coin list. For well-known symbols this is reliable; for symbols shared by multiple tokens the result may be incorrect, affecting candidate selection only — it cannot cause incorrect exits on open positions.
 
 ### Interactions
 
-- **EDa** — scatter positions participate fully: they hold debt shares, can be elected laggard, and their SL losses feed `_lostValue` redistribution. (TP targets survive EDa recomputes via `_baseTpPct`, which stores the swapped value.)
-- **Drawdown throttle / gains lock** — scatter PnL feeds both windows, and both halts block new scatter entries.
-- **maxPos** — shared with the stock strategy; scatter entries stop at the global cap.
+- **EDa** — Multi-Indicator positions participate fully: they hold debt shares, can be elected laggard, and their closes feed `_lostValue`/`_laggardLostValue` redistribution.
+- **Drawdown throttle / gains lock / PLK** — all halt new entries. `_isDrawdownHalted()` is the single check point; Permafrost/Ashfall PLK rides this gate automatically.
+- **maxPos** — shared with the stock strategy; entries stop at the global cap.
+- **Symbol ban list** — banned symbols are excluded from the base pool before slot evaluation.
 
 ---
 

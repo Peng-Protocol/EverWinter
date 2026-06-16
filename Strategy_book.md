@@ -219,35 +219,34 @@ Each strategy is a specific combination of techniques.
 
 ---
 
-### Scattershot Strategy
+### Multi-Indicator Strategy
 
-**The premise**: A bet on the market at large rather than on any single ticker. Reading one coin's next move is hard; reading the day's broad drift is easier. If the market is drifting your way, a random sample of its biggest movers — held behind asymmetric barriers — profits without ever predicting which specific ticker will move. The randomness is the point: no ticker-level thesis exists to be wrong about.
+**The premise**: Rather than betting on a single signal, build an entry condition from a combination of signals that must align simultaneously. Funding rate, 24-hour price direction, and relative volume each capture something different about a ticker's current state. When several of these point the same way at once, the case for entry is stronger than any one of them alone — and the combination defines a tradeable edge without requiring a ticker-level price prediction.
 
-**Candidate pool**: Every ticker whose 24-hour change clears a configured baseline in either direction — at or above +6%, or at or below −6%, by default. Big movers are chosen because they are the coins the day's character is actually expressing itself through; quiet tickers carry no information about the drift. Within the pool, the highest-volume movers are prioritized — they are the coins where the day's character is most actively expressed.
+**Slots**: The entry logic is built from "slots" — each slot is a set of criteria that must all be true at the same time. A ticker qualifies for entry if it satisfies every criterion in any one slot. Think of each slot as a distinct thesis about when to open: "funding rate elevated and price trending up" is a different case than "high participation confirming momentum." Both can be active simultaneously; each runs on its own terms.
 
-**Vol/mcap ratio**: The selection criterion is the relationship between a ticker's 24-hour trading volume and its total market capitalization. A ratio above 10% means a significant fraction of the coin's entire market value changed hands in a single day — unusually high participation that confirms momentum is broadly backed. A ratio below 10% means the move happened on relatively modest turnover relative to the coin's size — the broader market has not yet committed to the direction.
+**The six criteria**:
 
-**Firestorm (long)** enters only tickers where vol exceeds 10% of market cap. High participation is the confirmation: the move is not a thin-market artifact, it has genuine buyers behind it.
+- **+fund** — The funding rate is above the threshold (typically 0.1%). Longs are paying shorts. There is a premium embedded in holding the short side, and heavy long positioning often signals a crowded trade vulnerable to reversal.
+- **-fund** — The funding rate is below the negative threshold. Shorts are paying longs. This is the mirror: an overcrowded short side with embedded carry for longs.
+- **+24h** — The ticker's 24-hour price change is positive. The day's character is currently bullish for this coin.
+- **-24h** — The 24-hour price change is negative. The day is currently bearish for this coin.
+- **>10%** — The ticker's 24-hour trading volume exceeds 10% of its total market capitalization. A significant fraction of the coin's entire value changed hands in a day — unusually high participation that confirms momentum is broadly backed, not a thin-market artifact.
+- **<10%** — The volume is below 10% of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
 
-**Blizzard (short)** enters only tickers where vol is below 10% of market cap. The market moved but did not chase it — a candidate to fade. If no tickers in the pool meet the relevant threshold, the round passes without opening positions.
+**Default configuration**: The four default slots cover the same ground as the approaches they replaced. Winter (shorts): positive funding + rising price; negative funding + falling price; rising price with high participation; falling price with low participation. Chaser (longs): the directional mirrors of the same. Any slot can be edited, removed, or replaced to build entirely different configurations.
 
-**Asymmetric barriers**: Every entry opens binary — one fixed stop loss (default 18%) and one far take profit (default 105% buffered, closing functionally at 70% — the buffered value ÷ the profit-offset buffer, the same convention as the standard TP). The barrier geometry is the whole edge: one functional TP win covers roughly four stop-loss exits. The strategy does not need to be right often — it needs the broad drift to occasionally carry a random pick a long way.
+**Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
 
-**12-hour force close**: Any survivor that has hit neither barrier closes at 12 hours regardless of PnL. A stale random pick holds no thesis worth waiting on; the capital re-rolls into a fresh sample.
-
-**Cascade** (on by default): When collective unrealized PnL across the whole open book reaches the take-profit target (TP% × base margin — $1.05 at default sizing), every position closes at once for a net profit. Many small collective harvests beat waiting for individual far TPs: the realized gains trip the gains lock readily and, where a climate profile is learning, seed it with favorable samples.
-
-**Climate deferral**: When a learned climate profile has sufficient evidence and reads the current market structure as hostile, the cycle defers — the scattershot only fires when the broad market is not demonstrably leaning against it. With a thin or stale profile the strategy fires on its own judgment; the gate only ever vetoes.
-
-**Why "Scattershot"**: Pellets, not a bullet. No individual aim, but the pattern lands where the market is moving.
+**Exits**: All exits use the standard take-profit and stop-loss settings — no strategy-specific timer or force close. The Multi-Indicator plugin is agnostic to how long a position is held; that is entirely in the hands of the host's exit system.
 
 **Components used**:
-- Binary Mode (fixed SL, far buffered TP — asymmetric barrier geometry)
-- Vol/mcap ratio filter — vol > 10% of market cap for longs (Firestorm), vol < 10% for shorts (Blizzard)
-- 12-hour force close
-- Cascade — collective profit bail across the open book
-- Climate gate (learned market-structure profile)
+- Slot-based AND-gate filter (user-configurable; up to six criteria per slot, unlimited slots)
+- Funding rate threshold gate (+fund, -fund)
+- 24-hour price direction (+24h, -24h)
+- Vol/mcap ratio filter (>10%, <10%) with CoinGecko market cap data
 - Drawdown throttle and gains lock
+- Climate gate (learned market-structure profile, when Permafrost or Ashfall is loaded)
 
 ---
 
