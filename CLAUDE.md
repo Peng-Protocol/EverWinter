@@ -27,7 +27,7 @@ When in doubt, increment the patch number.
 | `PseudoWinter.html` | v1.3.5 |
 | `PseudoChaser.html` | v1.0.4 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.0.4 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.0.4 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.0.5 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.0.5 |
 
 > Always update the table above after bumping a version so this document stays accurate.
