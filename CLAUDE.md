@@ -39,3 +39,4 @@ When in doubt, increment the patch number.
 - **When a task hits more than one dead end, stop and ask.** Don't burn compute cycling through approaches. Surface the blocker and let the user redirect.
 - **Never remove or change something whose purpose is unclear without asking first.** Investigate, then confirm before acting.
 - **Prefer the minimal correct change.** Don't clean up, refactor, or extend beyond what was explicitly asked.
+- **Log behavioral corrections.** Whenever the user gives a behavioral correction or long-term instruction — signalled by phrases like "why didn't you…", "why are you…", "you should always…", "you should never…", or any direct criticism of approach — add the lesson to this file before finishing the response.
