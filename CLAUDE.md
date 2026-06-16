@@ -13,11 +13,9 @@ Each file carries its version in two places — update **both**:
 
 ### Increment rules
 
-- **Patch** (`x.y.Z`): bug fixes, cosmetic tweaks, minor behaviour changes
-- **Minor** (`x.Y.0`): new features, new UI sections, new strategy logic
-- **Major** (`X.0.0`): breaking redesigns, protocol changes, complete rewrites of a module
-
-When in doubt, increment the patch number.
+- **Patch** (`x.y.Z`): adjustments to existing functionality or UI (tweaks, fixes, tooltip changes, restyling)
+- **Minor** (`x.Y.0`): added or removed functionality (new controls, new logic, new UI sections, removed features)
+- **Major** (`X.0.0`): only when explicitly requested by the user
 
 ### Per-file current versions (update this table when you bump)
 
