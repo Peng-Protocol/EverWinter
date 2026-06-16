@@ -1,0 +1,403 @@
+<!--
+  Multi-Indicator Strategy Plugin for PseudoWinter
+  Slot-based entry filter combining fund rate, 24hr price direction, and vol/mcap signals.
+
+  Each "slot" is an AND-condition over any combination of six criteria:
+    +fund  — funding rate ≥ threshold (longs paying shorts)
+    -fund  — funding rate ≤ −threshold (shorts paying longs)
+    +24h   — ticker's 24hr price change is positive
+    -24h   — ticker's 24hr price change is negative
+    >10%   — 24hr turnover exceeds 10% of market cap (high participation)
+    <10%   — 24hr turnover is below 10% of market cap (low relative participation)
+
+  A ticker qualifies for entry if it satisfies ALL criteria in ANY slot. Slots that contain
+  a vol/mcap criterion trigger a CoinGecko market cap lookup via the shared window.__cgCoinList
+  cache; fund and 24h criteria run entirely from the host's bulk ticker cache.
+
+  Entry pool fires once per fresh bulk ticker fetch (_lastAllTickersAt) — will not re-scan
+  the same cached snapshot twice. TP, SL, and all exit logic use the host's settings.
+  Drawdown throttle and gains lock gate all entries.
+
+  Load via Plugin Manager in PseudoWinter's config panel.
+  Load AFTER EverWinter if using live trading — see README Plugin Stack Order.
+  targetBot: pseudowinter
+-->
+<script>
+(function () {
+  'use strict';
+
+  const DEFAULT_SLOTS = [['+fund','+24h','>10pct'],['-fund','-24h','<10pct']];
+
+  // Per-criterion emoji for position badges. Fund emoji is app-relative:
+  // +fund = longs paying = good carry for shorts (🤑), bad for longs (💸).
+  // -fund = shorts paying = bad for shorts (💸), good for longs (🤑).
+  const CRIT_EMOJI = { '+fund': '🤑', '-fund': '💸', '+24h': '⬆️', '-24h': '⬇️', '>10pct': '🔊', '<10pct': '🔉' };
+  const CRIT_DESC  = { '+fund': '+fund (longs paying)', '-fund': '-fund (shorts paying)', '+24h': '+24h (up on day)', '-24h': '-24h (down on day)', '>10pct': '>10% vol/mcap', '<10pct': '<10% vol/mcap' };
+
+  window.__BotPlugin = {
+    id:        'multiindicator-winter',
+    name:      'Multi-Indicator (Winter)',
+    version:   '1.0.0',
+    targetBot: 'pseudowinter',
+    after:     ['everwinter', 'permafrost-winter'],
+    before:    [],
+    conflicts: [],
+    requires:  [],
+    touches:   ['init', 'runScan', 'pseudoClosePosition'],
+
+    css: `
+      .miw-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+      .miw-slot { display:inline-flex; flex-direction:column; align-items:center; gap:3px; padding:6px 5px; border-radius:3px; border:1px solid; cursor:pointer; min-width:52px; font-size:9px; font-family:var(--mono); text-align:center; transition:border-color .15s,background .15s; }
+      .miw-crit { font-size:8px; padding:1px 4px; border-radius:2px; background:rgba(96,210,255,.12); border:1px solid rgba(96,210,255,.3); color:var(--ice); white-space:nowrap; }
+      .miw-opt { padding:5px 7px; font-size:9px; font-family:var(--mono); border-radius:2px; border:1px solid; cursor:pointer; background:none; transition:border-color .12s,background .12s,color .12s; }
+    `,
+
+    slots: {
+      'mode-label-extra': `<span x-show="cfg.miwEnabled"> + Multi</span>`,
+      'strategy-accordions': `
+        <div x-data="{ open: false }">
+          <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span>❄ Multi-Indicator</span>
+              <span x-show="cfg.miwEnabled" style="font-size:8px;padding:1px 5px;background:rgba(96,210,255,.15);border:1px solid rgba(96,210,255,.3);border-radius:2px;color:var(--ice);letter-spacing:1px">ON</span>
+              <span x-show="!cfg.miwEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
+            </div>
+            <span class="cfg-acc-arrow" :class="open?'open':''">▶</span>
+          </button>
+          <div x-show="open" x-transition.opacity class="cfg-acc-body">
+            <label class="tog" @click.prevent="if(!cfgLocked){cfg.miwEnabled=!cfg.miwEnabled;persist()}">
+              <div class="tog-t" :class="cfg.miwEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Multi-Indicator Mode</div>
+                <div class="miw-hint">Shorts tickers matching any active entry slot; fires once per bulk ticker fetch using host TP/SL settings.</div>
+              </div>
+            </label>
+            <div x-show="cfg.miwEnabled" style="margin-top:8px">
+              <div class="g">
+                <div class="lbl">Funding Threshold <b x-text="'±'+(cfg.miwFrThreshold??0.1).toFixed(2)+'%'"></b></div>
+                <input type="range" min="0.01" max="1" step="0.01" x-model.number="cfg.miwFrThreshold" @change="persist()">
+                <div class="miw-hint">Applies to +fund and -fund criteria: fires when |FR| ≥ this threshold.</div>
+              </div>
+              <div class="g" style="margin-top:8px">
+                <div class="lbl">Max Entries / Cycle <b x-text="(cfg.miwPicks??3)"></b></div>
+                <input type="range" min="1" max="10" step="1" x-model.number="cfg.miwPicks" @change="persist()">
+                <div class="miw-hint">Ranked by highest absolute funding rate first; opens until this limit, max positions, or a halt.</div>
+              </div>
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.miwShareCapEnabled=!(cfg.miwShareCapEnabled??true);persist()}">
+                <div class="tog-t" :class="(cfg.miwShareCapEnabled??true)?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Position Share Cap</div>
+                  <div class="miw-hint">Reserves position headroom for other strategy plugins running alongside this one.</div>
+                </div>
+              </label>
+              <div class="g" x-show="cfg.miwShareCapEnabled??true" style="margin-top:8px">
+                <div class="lbl">Max Share <b x-text="(cfg.miwShareCapPct??50)+'% ('+Math.max(1,Math.floor((cfg.maxPos??5)*((cfg.miwShareCapPct??50)/100)))+' of '+(cfg.maxPos??5)+' slots)'"></b></div>
+                <input type="range" min="10" max="100" step="5" x-model.number="cfg.miwShareCapPct" @change="persist()">
+              </div>
+
+              <!-- Entry Slots -->
+              <div style="margin-top:12px">
+                <div class="lbl" style="margin-bottom:6px">Entry Slots <span style="font-size:9px;font-weight:normal;color:var(--text-lo)">(click slot to edit · click criteria to toggle)</span></div>
+
+                <!-- Criteria picker — visible when a slot is selected -->
+                <div x-show="cfg.miwActiveSlot !== null && cfg.miwActiveSlot !== undefined && cfg.miwActiveSlot < (cfg.miwSlots||[]).length"
+                     style="display:flex;gap:3px;flex-wrap:wrap;align-items:center;margin-bottom:7px;padding:6px 7px;background:rgba(255,255,255,.04);border-radius:3px;border:1px solid rgba(255,255,255,.08)">
+                  <span style="font-size:9px;color:var(--text-lo);margin-right:2px">Slot <span x-text="(cfg.miwActiveSlot??0)+1"></span>:</span>
+                  <template x-for="c in ['+fund','-fund','+24h','-24h','>10pct','<10pct']" :key="c">
+                    <button class="miw-opt"
+                      @click.prevent="if(!cfgLocked) _miwToggle(cfg.miwActiveSlot, c)"
+                      :style="(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).includes(c) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent'"
+                      x-text="c.replace('>10pct','>10%').replace('<10pct','<10%')">
+                    </button>
+                  </template>
+                </div>
+
+                <!-- Slot blocks -->
+                <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:flex-start">
+                  <template x-for="(slot, i) in (cfg.miwSlots||[])" :key="i">
+                    <div class="miw-slot"
+                      @click.prevent="if(!cfgLocked){cfg.miwActiveSlot=(cfg.miwActiveSlot===i?null:i);persist()}"
+                      :style="cfg.miwActiveSlot===i ? 'border-color:rgba(96,210,255,.7);background:rgba(96,210,255,.07)' : 'border-color:var(--border);background:transparent'">
+                      <div style="font-size:8px;color:var(--text-lo)">Slot <span x-text="i+1"></span></div>
+                      <div style="display:flex;flex-direction:column;gap:2px;min-height:14px">
+                        <template x-for="c in slot" :key="c">
+                          <span class="miw-crit" x-text="c.replace('>10pct','>10%').replace('<10pct','<10%')"></span>
+                        </template>
+                        <span x-show="!slot.length" style="font-size:8px;color:var(--text-lo);font-style:italic">empty</span>
+                      </div>
+                      <button x-show="!cfgLocked"
+                        @click.stop.prevent="_miwDelSlot(i)"
+                        style="font-size:8px;color:var(--text-lo);background:none;border:none;cursor:pointer;padding:0;margin-top:2px;line-height:1;opacity:.7">✕</button>
+                    </div>
+                  </template>
+                  <button x-show="!cfgLocked"
+                    @click.prevent="_miwAddSlot()"
+                    style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(96,210,255,.06);border:1px dashed rgba(96,210,255,.3);border-radius:3px;color:var(--ice);cursor:pointer">+</button>
+                </div>
+                <div class="miw-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. Vol/mcap criteria (>10%,&lt;10%) pull market cap from CoinGecko for the top 30 tickers by turnover.</div>
+                <div class="miw-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑 +fund (longs paying — good carry) · 💸 -fund (shorts paying — bad carry) · ⬆️ +24h · ⬇️ -24h · 🔊 &gt;10% vol/mcap · 🔉 &lt;10% vol/mcap. Badge shows the matched slot's criteria at entry time.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _origInit  = def.init;
+      const _origScan  = def.runScan;
+      const _origClose = def.pseudoClosePosition;
+
+      return Object.assign({}, def, {
+
+        async init() {
+          await _origInit.call(this);
+          if (this.cfg.miwEnabled         === undefined) this.cfg.miwEnabled         = false;
+          if (this.cfg.miwPicks           === undefined) this.cfg.miwPicks           = 3;
+          if (this.cfg.miwFrThreshold     === undefined) this.cfg.miwFrThreshold     = 0.1;
+          if (this.cfg.miwShareCapEnabled === undefined) this.cfg.miwShareCapEnabled = true;
+          if (this.cfg.miwShareCapPct     === undefined) this.cfg.miwShareCapPct     = 100;
+          if (this.cfg.miwActiveSlot      === undefined) this.cfg.miwActiveSlot      = null;
+          if (!Array.isArray(this.cfg.miwSlots) || !this.cfg.miwSlots.length)
+            this.cfg.miwSlots = DEFAULT_SLOTS.map(s => [...s]);
+          this.registerRoleBadge?.(item => {
+            if (!item || !item._miw) return null;
+            const crits  = item._miwCriteria || [];
+            const emoji  = crits.map(c => CRIT_EMOJI[c] || c).join('');
+            const title  = crits.length ? 'Multi: ' + crits.map(c => CRIT_DESC[c] || c).join(' + ') : 'Multi-Indicator';
+            return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(96,210,255,.45);color:var(--ice);background:rgba(96,210,255,.10)" title="${title}">${emoji || 'Multi'}</span>`;
+          });
+          this.log(`[MIW] Multi-Indicator (Winter) v1.0.0 loaded — ${this.cfg.miwEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.miwSlots||[]).length} slots | ${this.cfg.miwPicks}/cycle`, 'info');
+          this.renderTradeFeed?.();
+        },
+
+        _miwToggle(i, c) {
+          const slots = (this.cfg.miwSlots || []).map(s => [...s]);
+          if (!slots[i]) return;
+          const idx = slots[i].indexOf(c);
+          if (idx === -1) slots[i].push(c); else slots[i].splice(idx, 1);
+          this.cfg.miwSlots = slots;
+          this.persist?.();
+        },
+
+        _miwDelSlot(i) {
+          const slots = (this.cfg.miwSlots || []).map(s => [...s]);
+          slots.splice(i, 1);
+          this.cfg.miwSlots = slots;
+          if (this.cfg.miwActiveSlot !== null) {
+            if (slots.length === 0) this.cfg.miwActiveSlot = null;
+            else if (this.cfg.miwActiveSlot >= slots.length) this.cfg.miwActiveSlot = slots.length - 1;
+          }
+          this.persist?.();
+        },
+
+        _miwAddSlot() {
+          const slots = (this.cfg.miwSlots || []).map(s => [...s]);
+          slots.push([]);
+          this.cfg.miwSlots = slots;
+          this.cfg.miwActiveSlot = slots.length - 1;
+          this.persist?.();
+        },
+
+        async runScan() {
+          await _origScan.call(this);
+          await this._miwRunScan();
+        },
+
+        async _miwRunScan() {
+          if (!this.cfg.miwEnabled) return;
+          if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
+            this.log(`[MIW] 💡 Skipped — ${this._isGainsLocked?.() ? 'gains lock' : 'drawdown halt'} active`, 'info');
+            return;
+          }
+          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
+
+          const freshAt = this._lastAllTickersAt || 0;
+          if (!freshAt || freshAt === this._miwLastActedAt) return;
+
+          const allTickers = this._lastAllTickers || [];
+          if (!allTickers.length) return;
+
+          const slots = (this.cfg.miwSlots || []).filter(s => s.length > 0);
+          if (!slots.length) {
+            this._miwLastActedAt = freshAt;
+            this.log('[MIW] 💡 No active slots — skipping', 'info');
+            return;
+          }
+
+          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
+          if (this.cfg.miwShareCapEnabled ?? true) {
+            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.miwShareCapPct ?? 50) / 100)));
+            const miwCount = (this.positions || []).filter(p => p._miw).length;
+            headroom = Math.min(headroom, capSlots - miwCount);
+            if (headroom < 1) {
+              this.log('[MIW] 💡 Share cap reached — no slots available', 'info');
+              this._miwLastActedAt = freshAt;
+              return;
+            }
+          }
+          const picks = Math.min(Math.max(1, Math.round(this.cfg.miwPicks ?? 3)), headroom);
+          const frThreshold = this.cfg.miwFrThreshold ?? 0.1;
+          const activeSyms  = new Set((this.positions || []).map(p => p.symbol));
+
+          const needsMcap = slots.some(s => s.includes('>10pct') || s.includes('<10pct'));
+
+          const basePool = allTickers.filter(t =>
+            t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
+            && parseFloat(t.lastPrice || 0) >= 0.001
+            && !activeSyms.has(t.symbol)
+            && !(this._isSymbolBanned?.(t.symbol))
+          );
+
+          // Resolve market caps for vol/mcap criteria if any slot requires them.
+          // Inspect top 30 by turnover; tickers outside that set fall through without a cap.
+          const mcapMap = {};
+          if (needsMcap) {
+            const top30 = [...basePool]
+              .sort((a, b) => parseFloat(b.turnover24h || 0) - parseFloat(a.turnover24h || 0))
+              .slice(0, 30);
+            const bases = top30.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
+            await this._miwPrefetchMcaps(bases);
+            for (const t of top30) {
+              const mcap = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase());
+              if (mcap) mcapMap[t.symbol] = mcap;
+            }
+          }
+
+          // Build pool: for each ticker find the first matching slot and record it.
+          // The matched slot's criteria are stamped on the position for dynamic badge rendering.
+          const checkCrit = (c, fr, is24hUp, ratio) => {
+            if (c === '+fund')  return fr >= frThreshold;
+            if (c === '-fund')  return fr <= -frThreshold;
+            if (c === '+24h')   return is24hUp;
+            if (c === '-24h')   return !is24hUp;
+            if (c === '>10pct') return ratio !== null && ratio > 0.10;
+            if (c === '<10pct') return ratio !== null && ratio < 0.10;
+            return false;
+          };
+
+          const pool = basePool
+            .map(t => {
+              const fr      = parseFloat(t.fundingRate || 0) * 100;
+              const is24hUp = parseFloat(t.price24hPcnt || 0) > 0;
+              const mcap    = mcapMap[t.symbol];
+              const ratio   = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
+              const matched = slots.find(s => s.every(c => checkCrit(c, fr, is24hUp, ratio)));
+              return matched ? { t, criteria: matched } : null;
+            })
+            .filter(Boolean)
+            .sort((a, b) => Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
+
+          this._miwLastActedAt = freshAt;
+
+          if (!pool.length) {
+            const slotDesc = slots.map(s => `[${s.join(',')}]`).join(' ');
+            this.log(`[MIW] 💡 No tickers matched slots ${slotDesc}`, 'info');
+            return;
+          }
+
+          let opened = 0;
+          this._logBatchBegin?.();
+          try {
+            for (const { t, criteria } of pool) {
+              if (opened >= picks) break;
+              if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) break;
+              if (await this._miwOpen(t, criteria)) opened++;
+            }
+          } finally { this._logBatchEnd?.('[MIW] 💡 Entry roll-up'); }
+          this.log(`[MIW] 💡 ${pool.length} tickers matched — ${opened}/${picks} opened`, 'info');
+        },
+
+        async _miwOpen(t, criteria) {
+          const sym   = t.symbol;
+          const price = parseFloat(t.lastPrice || 0);
+          if (!price) return false;
+          const change = parseFloat(t.price24hPcnt || 0) * 100;
+          const fr     = parseFloat(t.fundingRate  || 0) * 100;
+          const lenBefore = (this.positions || []).length;
+          await this.pseudoOpenShort({ symbol: sym, price, change, fundingRate: fr, _miw: true });
+          if ((this.positions || []).length > lenBefore) {
+            const pos = this.positions[this.positions.length - 1];
+            pos._miw = true;
+            pos._miwCriteria = criteria || [];
+            if (typeof this.persist === 'function') this.persist();
+            return true;
+          }
+          return false;
+        },
+
+        // Two-level CoinGecko cache shared via window.__cgCoinList (24h TTL, localStorage).
+        // ID cache: base symbol → CoinGecko coin id (session-scoped, permanent).
+        // Mcap cache: coin id → { mcap, ts } (1h TTL).
+        async _miwPrefetchMcaps(bases) {
+          if (!this._miwCoinIdCache) this._miwCoinIdCache = {};
+          if (!this._miwMcapCache)   this._miwMcapCache   = {};
+          const now     = Date.now();
+          const unknown = bases.filter(b => this._miwCoinIdCache[b] === undefined);
+          if (unknown.length) {
+            if (!window.__cgCoinList) {
+              try {
+                const s = JSON.parse(localStorage.getItem('__cgCoinList') || 'null');
+                if (s?.list?.length && Date.now() - s.ts < 86_400_000) window.__cgCoinList = s.list;
+              } catch(e) {}
+            }
+            if (!window.__cgCoinList) {
+              try {
+                const r = await fetch('https://api.coingecko.com/api/v3/coins/list?include_platform=false');
+                if (r.ok) {
+                  window.__cgCoinList = await r.json();
+                  try { localStorage.setItem('__cgCoinList', JSON.stringify({ list: window.__cgCoinList, ts: Date.now() })); } catch(e) {}
+                }
+              } catch(e) {}
+            }
+            if (window.__cgCoinList) {
+              for (const base of unknown) {
+                const hit = window.__cgCoinList.find(c => c.symbol === base);
+                this._miwCoinIdCache[base] = hit?.id || '';
+              }
+            }
+          }
+          const ids = [...new Set(
+            bases.map(b => this._miwCoinIdCache[b]).filter(id => {
+              if (!id) return false;
+              const c = this._miwMcapCache[id];
+              return !c || now - c.ts >= 3_600_000;
+            })
+          )];
+          if (!ids.length) return;
+          try {
+            const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids.join(',')}&vs_currencies=usd&include_market_cap=true`);
+            if (r.ok) {
+              const d = await r.json();
+              for (const id of ids) {
+                const mcap = d?.[id]?.usd_market_cap;
+                if (mcap) this._miwMcapCache[id] = { mcap, ts: now };
+              }
+            }
+          } catch(e) {}
+        },
+
+        _miwGetMcapSync(base) {
+          const id = this._miwCoinIdCache?.[base];
+          if (!id) return null;
+          const c = this._miwMcapCache?.[id];
+          return (c && Date.now() - c.ts < 3_600_000) ? c.mcap : null;
+        },
+
+        async pseudoClosePosition(pos, reason, fillPrice) {
+          const isMiw    = pos._miw === true;
+          const criteria = pos._miwCriteria;
+          const prevLen  = this.closedTrades?.length ?? 0;
+          await _origClose.call(this, pos, reason, fillPrice);
+          if (isMiw && (this.closedTrades?.length ?? 0) > prevLen) {
+            this.closedTrades[0]._miw = true;
+            if (criteria) this.closedTrades[0]._miwCriteria = criteria;
+            this.persist?.();
+            this.renderTradeFeed?.();
+          }
+        },
+      });
+    },
+  };
+})();
+</script>
