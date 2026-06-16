@@ -28,6 +28,12 @@
 
   const DEFAULT_SLOTS = [['-fund','+24h','>10pct'],['+fund','-24h','<10pct']];
 
+  // Per-criterion emoji for position badges. Fund emoji is app-relative:
+  // -fund = shorts paying = good carry for longs (🤑), bad for shorts (💸).
+  // +fund = longs paying = bad for longs (💸), good for shorts (🤑).
+  const CRIT_EMOJI = { '+fund': '💸', '-fund': '🤑', '+24h': '⬆️', '-24h': '⬇️', '>10pct': '🔊', '<10pct': '🔉' };
+  const CRIT_DESC  = { '+fund': '+fund (longs paying)', '-fund': '-fund (shorts paying)', '+24h': '+24h (up on day)', '-24h': '-24h (down on day)', '>10pct': '>10% vol/mcap', '<10pct': '<10% vol/mcap' };
+
   window.__BotPlugin = {
     id:        'multiindicator-chaser',
     name:      'Multi-Indicator (Chaser)',
@@ -129,6 +135,7 @@
                     style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(255,150,80,.06);border:1px dashed rgba(255,150,80,.3);border-radius:3px;color:#ff9650;cursor:pointer">+</button>
                 </div>
                 <div class="mic-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. Vol/mcap criteria (>10%,&lt;10%) pull market cap from CoinGecko for the top 30 tickers by turnover.</div>
+                <div class="mic-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑 -fund (shorts paying — good carry) · 💸 +fund (longs paying — bad carry) · ⬆️ +24h · ⬇️ -24h · 🔊 &gt;10% vol/mcap · 🔉 &lt;10% vol/mcap. Badge shows the matched slot's criteria at entry time.</div>
               </div>
             </div>
           </div>
@@ -153,9 +160,13 @@
           if (this.cfg.micActiveSlot      === undefined) this.cfg.micActiveSlot      = null;
           if (!Array.isArray(this.cfg.micSlots) || !this.cfg.micSlots.length)
             this.cfg.micSlots = DEFAULT_SLOTS.map(s => [...s]);
-          this.registerRoleBadge?.(item => (item && item._mic)
-            ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)">Multi</span>`
-            : null);
+          this.registerRoleBadge?.(item => {
+            if (!item || !item._mic) return null;
+            const crits  = item._micCriteria || [];
+            const emoji  = crits.map(c => CRIT_EMOJI[c] || c).join('');
+            const title  = crits.length ? 'Multi: ' + crits.map(c => CRIT_DESC[c] || c).join(' + ') : 'Multi-Indicator';
+            return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)" title="${title}">${emoji || 'Multi'}</span>`;
+          });
           this.log(`[MIC] Multi-Indicator (Chaser) v1.0.0 loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle`, 'info');
           this.renderTradeFeed?.();
         },
@@ -253,23 +264,29 @@
             }
           }
 
+          // Build pool: for each ticker find the first matching slot and record it.
+          // The matched slot's criteria are stamped on the position for dynamic badge rendering.
+          const checkCrit = (c, fr, is24hUp, ratio) => {
+            if (c === '+fund')  return fr >= frThreshold;
+            if (c === '-fund')  return fr <= -frThreshold;
+            if (c === '+24h')   return is24hUp;
+            if (c === '-24h')   return !is24hUp;
+            if (c === '>10pct') return ratio !== null && ratio > 0.10;
+            if (c === '<10pct') return ratio !== null && ratio < 0.10;
+            return false;
+          };
+
           const pool = basePool
-            .filter(t => {
+            .map(t => {
               const fr      = parseFloat(t.fundingRate || 0) * 100;
               const is24hUp = parseFloat(t.price24hPcnt || 0) > 0;
               const mcap    = mcapMap[t.symbol];
               const ratio   = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
-              return slots.some(s => s.every(c => {
-                if (c === '+fund')  return fr >= frThreshold;
-                if (c === '-fund')  return fr <= -frThreshold;
-                if (c === '+24h')   return is24hUp;
-                if (c === '-24h')   return !is24hUp;
-                if (c === '>10pct') return ratio !== null && ratio > 0.10;
-                if (c === '<10pct') return ratio !== null && ratio < 0.10;
-                return false;
-              }));
+              const matched = slots.find(s => s.every(c => checkCrit(c, fr, is24hUp, ratio)));
+              return matched ? { t, criteria: matched } : null;
             })
-            .sort((a, b) => Math.abs(parseFloat(b.fundingRate || 0)) - Math.abs(parseFloat(a.fundingRate || 0)));
+            .filter(Boolean)
+            .sort((a, b) => Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
 
           this._micLastActedAt = freshAt;
 
@@ -282,16 +299,16 @@
           let opened = 0;
           this._logBatchBegin?.();
           try {
-            for (const t of pool) {
+            for (const { t, criteria } of pool) {
               if (opened >= picks) break;
               if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) break;
-              if (await this._micOpen(t)) opened++;
+              if (await this._micOpen(t, criteria)) opened++;
             }
           } finally { this._logBatchEnd?.('[MIC] 💡 Entry roll-up'); }
           this.log(`[MIC] 💡 ${pool.length} tickers matched — ${opened}/${picks} opened`, 'info');
         },
 
-        async _micOpen(t) {
+        async _micOpen(t, criteria) {
           const sym   = t.symbol;
           const price = parseFloat(t.lastPrice || 0);
           if (!price) return false;
@@ -302,6 +319,7 @@
           if ((this.positions || []).length > lenBefore) {
             const pos = this.positions[this.positions.length - 1];
             pos._mic = true;
+            pos._micCriteria = criteria || [];
             if (typeof this.persist === 'function') this.persist();
             return true;
           }
@@ -367,11 +385,13 @@
         },
 
         async pseudoClosePosition(pos, reason, fillPrice) {
-          const isMic   = pos._mic === true;
-          const prevLen = this.closedTrades?.length ?? 0;
+          const isMic    = pos._mic === true;
+          const criteria = pos._micCriteria;
+          const prevLen  = this.closedTrades?.length ?? 0;
           await _origClose.call(this, pos, reason, fillPrice);
           if (isMic && (this.closedTrades?.length ?? 0) > prevLen) {
             this.closedTrades[0]._mic = true;
+            if (criteria) this.closedTrades[0]._micCriteria = criteria;
             this.persist?.();
             this.renderTradeFeed?.();
           }

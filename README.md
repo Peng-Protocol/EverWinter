@@ -351,18 +351,20 @@ Note: for the first weeks the plugin behaves almost exactly like the stock timer
 
 `plugins/strategies/MultiIndicator-Winter.html` (id `multiindicator-winter`, `after: ['everwinter', 'permafrost-winter']`) targets PseudoWinter; `plugins/strategies/MultiIndicator-Chaser.html` (id `multiindicator-chaser`, `after: ['sunchaser', 'ashfall-chaser']`) targets PseudoChaser. Strategy rationale lives in the Strategy Book's **Multi-Indicator** section; this section documents the implementation.
 
-A slot-based entry filter that combines funding rate, 24-hour price direction, and vol/mcap signals in user-configurable AND-gate combinations. Each "slot" is a set of criteria that must all be true simultaneously for a ticker to qualify. If any slot matches, the ticker enters the candidate pool. Entry pool fires once per fresh bulk ticker fetch (`_lastAllTickersAt`) — the plugin tracks the cache timestamp in `_miwLastActedAt`/`_micLastActedAt` and skips re-scanning the same snapshot. TP, SL, and all exit logic use the host's settings. Positions are stamped `_miw`/`_mic` and badged `💡 MULTI` (ice for Winter, ember for Chaser).
+A slot-based entry filter that combines funding rate, 24-hour price direction, and vol/mcap signals in user-configurable AND-gate combinations. Each "slot" is a set of criteria that must all be true simultaneously for a ticker to qualify. If any slot matches, the ticker enters the candidate pool. Entry pool fires once per fresh bulk ticker fetch (`_lastAllTickersAt`) — the plugin tracks the cache timestamp in `_miwLastActedAt`/`_micLastActedAt` and skips re-scanning the same snapshot. TP, SL, and all exit logic use the host's settings. Positions are stamped `_miw`/`_mic` and carry a dynamic badge reflecting the matched slot's criteria at entry time (ice for Winter, ember for Chaser). Closed trades also carry `_miwCriteria`/`_micCriteria` (array of criterion strings) so the badge persists across reloads.
 
 ### Criteria
 
-| Key | Meaning |
-|---|---|
-| `+fund` | `fundingRate × 100 ≥ miwFrThreshold` (longs paying shorts) |
-| `-fund` | `fundingRate × 100 ≤ −miwFrThreshold` (shorts paying longs) |
-| `+24h` | `price24hPcnt > 0` (ticker up on the day) |
-| `-24h` | `price24hPcnt ≤ 0` (ticker down on the day) |
-| `>10pct` | `turnover24h / marketCap > 0.10` (high relative participation) |
-| `<10pct` | `turnover24h / marketCap < 0.10` (low relative participation) |
+| Key | Badge emoji (Winter) | Badge emoji (Chaser) | Meaning |
+|---|---|---|---|
+| `+fund` | 🤑 (good carry) | 💸 (bad carry) | `fundingRate × 100 ≥ miwFrThreshold` — longs paying shorts |
+| `-fund` | 💸 (bad carry) | 🤑 (good carry) | `fundingRate × 100 ≤ −miwFrThreshold` — shorts paying longs |
+| `+24h` | ⬆️ | ⬆️ | `price24hPcnt > 0` — ticker up on the day |
+| `-24h` | ⬇️ | ⬇️ | `price24hPcnt ≤ 0` — ticker down on the day |
+| `>10pct` | 🔊 | 🔊 | `turnover24h / marketCap > 0.10` — high relative participation |
+| `<10pct` | 🔉 | 🔉 | `turnover24h / marketCap < 0.10` — low relative participation |
+
+The badge is **app-relative** for funding: 🤑 always means the funding rate is favorable for the position direction (carry income), 💸 means the funding rate is adverse. Hovering the badge in the trades or market menu shows a plain-text tooltip with the matched criteria names. Old positions without saved criteria show `Multi` as fallback.
 
 A slot may contain any subset of these criteria. An empty slot never matches. Any single criterion can appear in multiple slots independently.
 
