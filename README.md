@@ -388,11 +388,11 @@ Matching: for each ticker in the base pool, each active slot is evaluated as `s.
 | `miwFrThreshold` / `micFrThreshold` | `0.1` | Funding rate magnitude gate for `+fund`/`-fund` criteria (%) |
 | `miwPicks` / `micPicks` | `3` | Max entries per cycle (range 1–10) |
 | `miwShareCapEnabled` / `micShareCapEnabled` | `true` | Whether the share cap is active |
-| `miwShareCapPct` / `micShareCapPct` | `50` | Plugin's max share of `maxPos` (%) |
+| `miwShareCapPct` / `micShareCapPct` | `100` | Plugin's max share of `maxPos` (%) |
 
-**Default slots — Winter** (shorts): `[['+fund','+24h'],['-fund','-24h'],['+24h','>10pct'],['-24h','<10pct']]`
+**Default slots — Winter** (shorts): `[['+fund','+24h','>10pct'],['-fund','-24h','<10pct']]`
 
-**Default slots — Chaser** (longs): `[['-fund','+24h'],['+fund','-24h'],['+24h','>10pct'],['-24h','<10pct']]`
+**Default slots — Chaser** (longs): `[['-fund','+24h','>10pct'],['+fund','-24h','<10pct']]`
 
 ### CoinGecko market cap data
 
