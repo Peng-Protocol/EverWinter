@@ -24,10 +24,18 @@ When in doubt, increment the patch number.
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.3.8 |
-| `PseudoChaser.html` | v1.0.7 |
+| `PseudoWinter.html` | v1.3.9 |
+| `PseudoChaser.html` | v1.0.8 |
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.0.6 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.0.6 |
 
 > Always update the table above after bumping a version so this document stays accurate.
+
+## Working Style (REQUIRED)
+
+- **When uncertain, ask.** Never guess at intent or silently pick an interpretation. A one-line question costs nothing; a wrong implementation costs context and time.
+- **When something seems strange or confusing, ask.** The user usually knows why — they're often the one who introduced it.
+- **When a task hits more than one dead end, stop and ask.** Don't burn compute cycling through approaches. Surface the blocker and let the user redirect.
+- **Never remove or change something whose purpose is unclear without asking first.** Investigate, then confirm before acting.
+- **Prefer the minimal correct change.** Don't clean up, refactor, or extend beyond what was explicitly asked.
