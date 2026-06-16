@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'multiindicator-chaser',
     name:      'Multi-Indicator (Chaser)',
-    version:   '1.0.2',
+    version:   '1.0.3',
     targetBot: 'pseudochaser',
     after:     ['sunchaser', 'ashfall-chaser'],
     before:    [],
@@ -93,6 +93,20 @@
               <div class="g" x-show="cfg.micShareCapEnabled??true" style="margin-top:8px">
                 <div class="lbl">Max Share <b x-text="(cfg.micShareCapPct??50)+'% ('+Math.max(1,Math.floor((cfg.maxPos??5)*((cfg.micShareCapPct??50)/100)))+' of '+(cfg.maxPos??5)+' slots)'"></b></div>
                 <input type="range" min="10" max="100" step="5" x-model.number="cfg.micShareCapPct" @change="persist()">
+              </div>
+
+              <!-- Cascade -->
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.micCascadeEnabled=!cfg.micCascadeEnabled;persist()}">
+                <div class="tog-t" :class="cfg.micCascadeEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Cascade Exit</div>
+                  <div class="mic-hint">Bails all MIC positions when their collective unrealized profit reaches a % of total base margin.</div>
+                </div>
+              </label>
+              <div class="g" x-show="cfg.micCascadeEnabled" style="margin-top:8px">
+                <div class="lbl">Trigger at <b x-text="(cfg.micCascadePct??25)+'% of base margin'"></b></div>
+                <input type="range" min="5" max="200" step="5" x-model.number="cfg.micCascadePct" @change="persist()">
+                <div class="mic-hint" x-text="(()=>{ const pos=(positions||[]).filter(p=>p._mic); const margin=pos.reduce((s,p)=>s+(p.margin||0),0); const upnl=pos.reduce((s,p)=>s+(p.upnl||0),0); const thr=margin*((cfg.micCascadePct??25)/100); return pos.length ? 'Active: '+pos.length+' pos · margin '+margin.toFixed(4)+' · uPnL '+(upnl>=0?'+':'')+upnl.toFixed(4)+' · trigger @ +'+(thr).toFixed(4)+' USDT' : 'No active MIC positions.'; })()"></div>
               </div>
 
               <!-- Entry Slots -->
@@ -183,6 +197,8 @@
           if (!Array.isArray(this.cfg.micSlots) || !this.cfg.micSlots.length)
             this.cfg.micSlots = DEFAULT_SLOTS.map(s => [...s]);
           if (!this._micWaitlist) this._micWaitlist = {};
+          if (this.cfg.micCascadeEnabled === undefined) this.cfg.micCascadeEnabled = false;
+          if (this.cfg.micCascadePct     === undefined) this.cfg.micCascadePct     = 25;
           this.registerRoleBadge?.(item => {
             if (!item || !item._mic) return null;
             const crits  = item._micCriteria || [];
@@ -190,7 +206,7 @@
             const title  = crits.length ? 'Multi: ' + crits.map(c => CRIT_DESC[c] || c).join(' + ') : 'Multi-Indicator';
             return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)" title="${title}">${emoji || 'Multi'}</span>`;
           });
-          this.log(`[MIC] Multi-Indicator (Chaser) v1.0.2 loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle`, 'info');
+          this.log(`[MIC] Multi-Indicator (Chaser) v1.0.3 loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle`, 'info');
           this.renderTradeFeed?.();
         },
 
@@ -222,7 +238,26 @@
           this.persist?.();
         },
 
+        async _micCheckCascade() {
+          if (!this.cfg.micCascadeEnabled) return;
+          const micPositions = (this.positions || []).filter(p => p._mic);
+          if (!micPositions.length) return;
+          const totalMargin = micPositions.reduce((s, p) => s + (p.margin || 0), 0);
+          const totalUPnL   = micPositions.reduce((s, p) => s + (p.upnl   || 0), 0);
+          const threshold   = totalMargin * ((this.cfg.micCascadePct ?? 25) / 100);
+          if (totalUPnL >= threshold) {
+            this.log(`[MIC] 🌊 Cascade triggered — collective uPnL +${totalUPnL.toFixed(4)} ≥ ${threshold.toFixed(4)} USDT (${this.cfg.micCascadePct ?? 25}% of ${totalMargin.toFixed(4)} margin) — bailing ${micPositions.length} position(s)`, 'info');
+            this._logBatchBegin?.();
+            try {
+              for (const pos of micPositions) {
+                await this.pseudoClosePosition(pos, 'cascade');
+              }
+            } finally { this._logBatchEnd?.('[MIC] 🌊 Cascade roll-up'); }
+          }
+        },
+
         async runScan() {
+          await this._micCheckCascade();
           const tsBefore = this._lastAllTickersAt || 0;
           await _origScan.call(this);
           // If _origScan returned without fetching fresh tickers (halt/lock/cache-hit after a
