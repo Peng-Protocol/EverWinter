@@ -7,8 +7,6 @@
 1. [Philosophy Overview](#philosophy-overview)
 2. [Techniques](#techniques)
    - [Proactive Techniques](#proactive-techniques)
-     - [RSI Gating](#rsi-gating)
-     - [Over-Extension Filter](#over-extension-filter)
    - [Reactive Techniques](#reactive-techniques)
 3. [Strategies](#strategies)
    - [Multi-Indicator](#multi-indicator-strategy)
@@ -53,32 +51,6 @@ Display convention: UI surfaces, watchlists, position cards, trade menus, and ac
 ### Proactive Techniques
 
 Proactive techniques decide whether and when to enter. They filter noise from signal at the entry gate.
-
----
-
-#### RSI Gating
-
-RSI is measured across three timeframes (RSI6, RSI12, RSI24) using Wilder's method. The multi-timeframe requirement ensures the condition is present at multiple levels of resolution simultaneously — a single timeframe spike is noise; alignment across three is signal.
-
-**Floor gates** confirm upward momentum is sufficiently developed. **Ceiling gates** confirm downward momentum is sufficiently developed. A ticker failing its respective gate is not ready.
-
-The default **floor gate is 30-30-30**: RSI6 ≥ 30, RSI12 ≥ 30, RSI24 ≥ 30. The default **ceiling gate is 30-30-30**: RSI6 ≤ 30, RSI12 ≤ 30, RSI24 ≤ 30. All six thresholds are independently configurable.
-
-The space above 30 and below 70 is where most tickers spend most of their time. Standard gating at 30-30-30 captures the boundary of oversold/overbought territory — momentum entering or leaving this zone is the signal.
-
----
-
-#### Over-Extension Filter
-
-Tickers at the extremes of the RSI range are excluded from entry even when all gate conditions are otherwise met. A ticker that has moved too aggressively has lost its predictability — its next move can go either way with roughly equal conviction, which is not a setup worth taking.
-
-**Upper over-extension** (RSI6 above the configured ceiling, default 90): bad for shorts and bad for longs. A short risks entering a parabolic extension that keeps running; a long risks entering right before the inevitable violent snap-back. Neither side has an edge when a ticker is that stretched upward.
-
-**Lower over-extension** (RSI6 below the configured floor, default 10): equally bad in both directions. A long into capitulation risks catching a coin still in freefall; a short risks the violent snap-back that low RSI coins are prone to when selling pressure finally exhausts. The pattern is the same: the extremes strip out directional certainty.
-
-**Over-extension applies to both gainer and loser setups.** A gainer that has pushed RSI above 90 does not become a better short because it is "more overbought" — it becomes a worse one. A loser that has collapsed below RSI 10 does not become a better long because it is "more oversold" — it becomes a worse one. At those levels the move has already happened; what comes next is a coin flip.
-
-**Skip the over-extended, in either direction, on either side.**
 
 ---
 
@@ -240,19 +212,16 @@ Each strategy is a specific combination of techniques.
 
 **Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume before the position opens. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
 
-**The slot system is designed to grow.** New criteria can be introduced over time and dropped directly into any slot combination without rebuilding the strategy from scratch. Rather than a fixed approach, this is a composable framework — each criterion is a Lego brick, and each slot is a configuration you assemble from them. A slot strategy that felt right six months ago can be extended with a new signal the moment it becomes available. This is why the Multi-Indicator approach reduces the need for entirely separate strategy plugins: if a new edge can be expressed as a set of conditions a ticker must meet simultaneously, it belongs here as a criterion, not as a standalone plugin.
-
 **Exits**: All exits use the standard take-profit and stop-loss settings — no strategy-specific timer or force close. The Multi-Indicator plugin is agnostic to how long a position is held; that is entirely in the hands of the host's exit system.
 
 **Components used**:
 - Slot-based AND-gate filter (user-configurable; any combination of criteria per slot, unlimited slots)
 - Funding rate threshold gate (+fund, -fund)
 - 24-hour price direction (+24h, -24h)
-- Vol/mcap ratio filter (>10%, <10%) with CoinGecko market cap data
-- 1h volume spike + candle direction filter (LSA, LBA) with configurable spike band
+- Vol/mcap ratio filter (>10%, <10%)
+- 1h volume spike and candle direction (LSA, LBA)
 - Drawdown throttle and gains lock
 - Climate gate (learned market-structure profile, when Permafrost or Ashfall is loaded)
-- Optional group exits: Cascade (close all on collective profit target) and Sacrifice (close all on collective loss limit)
 
 ---
 
