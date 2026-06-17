@@ -6,10 +6,11 @@ Every time you modify an `.html` file in this repo, you **must** increment its v
 
 ### Where versions live
 
-Each file carries its version in two places — update **both**:
+Each file carries its version in two or three places — update **all** that apply:
 
 1. `<title>` tag — e.g. `<title>❄ ChartWinter v1.0 — …</title>`
 2. Subtitle/logo span — e.g. `<div class="logo-sub">… · v1.0 · …</div>` or `<span …>v1.0</span>`
+3. **Plugin manifest `version:` field** (plugins only) — e.g. `version: '1.9.0'` near the top of each plugin file. This is what the plugin manager UI displays — it must match the other version strings.
 
 ### Increment rules
 
