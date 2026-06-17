@@ -25,8 +25,8 @@ Each file carries its version in two places — update **both**:
 | `PseudoWinter.html` | v1.4.0 |
 | `PseudoChaser.html` | v1.0.9 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.1.0 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.1.0 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.2.0 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.2.0 |
 | `plugins/analytics/Permafrost-Winter.html` | v1.6.1 |
 | `plugins/analytics/Ashfall-Chaser.html` | v1.6.1 |
 
