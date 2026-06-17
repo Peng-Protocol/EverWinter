@@ -22,8 +22,8 @@ Each file carries its version in two places — update **both**:
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.4.0 |
-| `PseudoChaser.html` | v1.0.9 |
+| `PseudoWinter.html` | v1.5.0 |
+| `PseudoChaser.html` | v1.1.0 |
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.4.0 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.4.0 |
