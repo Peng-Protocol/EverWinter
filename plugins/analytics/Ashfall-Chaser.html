@@ -24,6 +24,8 @@
   'use strict';
 
   const ASH_KEY        = '__ashfall_chaser_v1';
+  const CROSS_KEY      = '__everwinter_cross_v1';
+  const CROSS_TTL      = 6 * 3600 * 1000;
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old burns fade
   const EVENT_W        = 10;                   // halt events are strong anchors
@@ -56,7 +58,7 @@
   window.__BotPlugin = {
     id:        'ashfall-chaser',
     name:      'Ashfall (Chaser)',
-    version:   '1.7.0',
+    version:   '1.8.0',
     targetBot: 'pseudochaser',
     after:     ['sunchaser'],
     before:    [],
@@ -91,6 +93,14 @@
                 <div class="ash-hint">Learns which market climates correlate with drawdowns vs gains locks, building a historical structure profile over time.</div>
               </div>
             </label>
+            <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.ashfallCrossEnabled=!cfg.ashfallCrossEnabled;persist()}">
+              <div class="tog-t" :class="cfg.ashfallCrossEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Cross-Signal (Permafrost)</div>
+                <div class="ash-hint">Winter cascade → halt + bail all. Winter sacrifice → lift halt.</div>
+              </div>
+            </label>
+            <div x-show="cfg.ashfallCrossEnabled && afCrossEvents.length" class="ash-hint" style="margin-top:5px" x-text="afCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Winter — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
             <div x-show="cfg.ashfallEnabled" style="margin-top:8px">
               <div class="g" x-show="cfg.ashfallEnabled" style="margin-top:10px">
                 <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=afStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
@@ -151,6 +161,9 @@
       const _origScan  = def.runScan;
       const _origClose = def.pseudoClosePosition;
 
+      let _afCrossLastCascadeActed  = 0;
+      let _afCrossLastSacrificeActed = 0;
+
       return Object.assign({}, def, {
 
         afEvents:  [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth, gCount, lCount, gSum, lSum }
@@ -159,6 +172,7 @@
         afWave:    [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
         _afStructureList: null, _afStructureAt: 0, // own 3h ticker cache independent of host
         afStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
+        afCrossEvents: [],
 
         async init() {
           await _origInit.call(this);
@@ -167,6 +181,7 @@
           if (this.cfg.ashfallIoEnabled        === undefined) this.cfg.ashfallIoEnabled        = true;
           if (this.cfg.ashfallWaveShowVol      === undefined) this.cfg.ashfallWaveShowVol      = true;
           if (this.cfg.ashfallWaveShowIo       === undefined) this.cfg.ashfallWaveShowIo       = true;
+          if (this.cfg.ashfallCrossEnabled     === undefined) this.cfg.ashfallCrossEnabled     = true;
           try {
             const raw = localStorage.getItem(ASH_KEY);
             if (raw) {
@@ -177,7 +192,7 @@
               if (Array.isArray(s.wave))    this.afWave    = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
             }
           } catch(e) {}
-          this.log(`[ASH] Ashfall (Chaser) v1.7.0 loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
+          this.log(`[ASH] Ashfall (Chaser) v1.8.0 loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
         },
 
         persist() {
@@ -326,6 +341,62 @@
         _afEffectiveScore(score, mass, inherent) {
           const massFrac = Math.max(0, Math.min(1, (mass || 0) / STRONG_MASS));
           return score === null ? inherent : massFrac * score + (1 - massFrac) * inherent;
+        },
+
+        _afCrossRead() {
+          try {
+            const raw = localStorage.getItem(CROSS_KEY);
+            if (!raw) return [];
+            const cut = Date.now() - CROSS_TTL;
+            return (JSON.parse(raw).events || []).filter(e => e.ts >= cut);
+          } catch(e) { return []; }
+        },
+
+        _afCrossWrite(kind) {
+          try {
+            const events = this._afCrossRead();
+            events.push({ ts: Date.now(), kind, source: 'chaser' });
+            localStorage.setItem(CROSS_KEY, JSON.stringify({ events }));
+          } catch(e) {}
+        },
+
+        async _afCheckCross() {
+          if (!this.cfg.ashfallCrossEnabled) return;
+          const fromWinter = this._afCrossRead().filter(e => e.source === 'winter');
+          this.afCrossEvents = fromWinter.slice(-10);
+
+          const cascades = fromWinter.filter(e => e.kind === 'cascade' && e.ts > _afCrossLastCascadeActed);
+          if (cascades.length) {
+            const newest = cascades.reduce((m, e) => e.ts > m.ts ? e : m, cascades[0]);
+            _afCrossLastCascadeActed = newest.ts;
+            const haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+            this._drawdownHaltUntil = Date.now() + haltMs;
+            this.log(`[ASH] ♨ Cross-signal — Winter cascade at ${new Date(newest.ts).toISOString().slice(11,19)} UTC → drawdown halt ${this.cfg.drawdownHaltHours ?? 6}h + bailing all Chaser positions`, 'warn');
+            this.bailAll().catch(() => {});
+            this._afFetchStructure().then(r => {
+              if (!r) return;
+              this.afEvents.push({ ts: r.ts, kind: 'drawdown', skew: r.skew, breadth: r.breadth, gCount: r.gCount, lCount: r.lCount, gSum: r.gSum, lSum: r.lSum, _cross: true });
+              if (this.afEvents.length > EVENTS_CAP) this.afEvents = this.afEvents.slice(-EVENTS_CAP);
+              this._afPushWave(r);
+              this.persist();
+            }).catch(() => {});
+          }
+
+          const sacrifices = fromWinter.filter(e => e.kind === 'sacrifice' && e.ts > _afCrossLastSacrificeActed);
+          if (sacrifices.length && this._isDrawdownHalted()) {
+            const newest = sacrifices.reduce((m, e) => e.ts > m.ts ? e : m, sacrifices[0]);
+            _afCrossLastSacrificeActed = newest.ts;
+            this._drawdownHaltUntil = 0;
+            this._drawdownWindow = [];
+            this.log(`[ASH] ♨ Cross-signal — Winter sacrifice at ${new Date(newest.ts).toISOString().slice(11,19)} UTC → drawdown halt lifted, Chaser re-enabled`, 'success');
+            this._afFetchStructure().then(r => {
+              if (!r) return;
+              this.afEvents.push({ ts: r.ts, kind: 'gainslock', skew: r.skew, breadth: r.breadth, gCount: r.gCount, lCount: r.lCount, gSum: r.gSum, lSum: r.lSum, _cross: true });
+              if (this.afEvents.length > EVENTS_CAP) this.afEvents = this.afEvents.slice(-EVENTS_CAP);
+              this._afPushWave(r);
+              this.persist();
+            }).catch(() => {});
+          }
         },
 
         // Inline SVG wave plot — time-based 1-week window, bins data into pixel columns so
@@ -488,6 +559,7 @@
         async runScan() {
           await _origScan.call(this);
           if (!this.cfg.ashfallEnabled) return;
+          this._afCheckCross().catch(() => {});
           this._afFetchStructure().then(r => {
             if (!r) return;
             this._afAddSample(r);
@@ -510,6 +582,9 @@
               this.afPnl.push({ ts: now, pnl });
               this.afPnl = this.afPnl.filter(e => now - e.ts < PNL_LOG_TTL);
             }
+          }
+          if ((reason === 'cascade' || reason === 'sacrifice') && this.cfg.ashfallCrossEnabled) {
+            this._afCrossWrite(reason);
           }
         },
 
