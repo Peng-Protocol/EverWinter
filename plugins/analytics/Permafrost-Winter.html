@@ -45,6 +45,8 @@
   'use strict';
 
   const PFR_KEY        = '__permafrost_winter_v1';
+  const CROSS_KEY      = '__everwinter_cross_v1';
+  const CROSS_TTL      = 6 * 3600 * 1000;
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old scars fade
   const EVENT_W        = 10;                   // halt events are strong anchors
@@ -77,7 +79,7 @@
   window.__BotPlugin = {
     id:        'permafrost-winter',
     name:      'Permafrost (Winter)',
-    version:   '1.6.0',
+    version:   '1.8.2',
     targetBot: 'pseudowinter',
     after:     ['everwinter'],
     before:    [],
@@ -109,45 +111,22 @@
               <div class="tog-t" :class="cfg.permafrostEnabled?'on':''"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l">Permafrost Mode</div>
-                <div class="pfr-hint">Learns which market climates trigger drawdowns vs gains locks, then thaws halts when structure leaves the hostile zone instead of waiting out the clock. Thin profile = stock 12h behavior.</div>
+                <div class="pfr-hint">Learns which market climates correlate with drawdowns vs gains locks, building a historical structure profile over time.</div>
               </div>
             </label>
+            <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.permafrostCrossEnabled=!cfg.permafrostCrossEnabled;persist()}">
+              <div class="tog-t" :class="cfg.permafrostCrossEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Cross-Signal (Ashfall)</div>
+                <div class="pfr-hint">Chaser cascade → halt + bail all. Chaser sacrifice → lift halt.</div>
+              </div>
+            </label>
+            <div x-show="cfg.permafrostCrossEnabled && pfCrossEvents.length" class="pfr-hint" style="margin-top:5px" x-text="pfCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Chaser — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
             <div x-show="cfg.permafrostEnabled" style="margin-top:8px">
-              <div class="g">
-                <div class="lbl">Thaw Score <b x-text="(cfg.permafrostThawScore??0).toFixed(2)"></b></div>
-                <input type="range" min="-0.5" max="0.5" step="0.05" x-model.number="cfg.permafrostThawScore" @change="persist()">
-                <div class="pfr-hint">Profile score (−1 hostile … +1 favorable) the current structure must reach to lift a halt early. 0 = at least neutral history nearby.</div>
-              </div>
-              <div class="g" style="margin-top:8px">
-                <div class="lbl">Strong Bias Score <b x-text="'±'+(cfg.permafrostStrongScore??0.30).toFixed(2)"></b></div>
-                <input type="range" min="0.10" max="0.60" step="0.05" x-model.number="cfg.permafrostStrongScore" @change="persist()">
-                <div class="pfr-hint">|score| at/above which the history counts as a <em>strong bias</em> (also needs evidence mass ≥ 12). Default 12h halts only stretch toward the hard cap, or thaw early, when the bias is this strong — otherwise 12h prevails and the lock is never lifted early.</div>
-              </div>
-              <div class="g" style="margin-top:8px">
-                <div class="lbl">Hard Cap <b x-text="(cfg.permafrostCapHours??24)+'h'"></b></div>
-                <input type="range" min="12" max="48" step="1" x-model.number="cfg.permafrostCapHours" @change="persist()">
-                <div class="pfr-hint">Maximum halt duration under a strong historical bias (the extreme case). Without one, halts run the default 12h. Resumes regardless once reached — stale scars must be re-tested.</div>
-              </div>
-              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.permafrostPlkEnabled=!(cfg.permafrostPlkEnabled??true);persist()}">
-                <div class="tog-t" :class="(cfg.permafrostPlkEnabled??true)?'on':''"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Preemptive Lock (PLK)</div>
-                  <div class="pfr-hint">Proactive rather than reactive: when a routine structure check reads a climate that is historically bad (score at or below the trigger, with sufficient evidence), entries lock preemptively — before any PnL damage. The lock's duration scales with the strength of the bias, up to the Hard Cap (arbitrary, e.g. 3h 20m). Lifts early when structure clears the Thaw Score under a strong bias, when its duration elapses, or manually from the topbar pill.</div>
-                </div>
-              </label>
-              <div class="g" x-show="cfg.permafrostPlkEnabled??true" style="margin-top:8px">
-                <div class="lbl">PLK Trigger Score <b x-text="(cfg.permafrostPlkScore??-0.15).toFixed(2)"></b></div>
-                <input type="range" min="-0.5" max="-0.05" step="0.05" x-model.number="cfg.permafrostPlkScore" @change="persist()">
-                <div class="pfr-hint">Profile score at or below which the preemptive lock engages. Closer to 0 = more cautious (locks earlier); more negative = only the worst climates trigger it.</div>
-              </div>
-              <div class="g" x-show="cfg.permafrostPlkEnabled??true" style="margin-top:8px">
-                <div class="lbl">PLK Cooldown <b>dynamic</b></div>
-                <div class="pfr-hint">After a preemptive lock ends, the next one can't engage until the same span as the last lock has passed (it matches that lock's duration) — no back-to-back locks. Last lock: <span x-text="pfPlkLastDurationMs>0?(Math.floor(pfPlkLastDurationMs/3600000)+'h '+String(Math.round((pfPlkLastDurationMs%3600000)/60000)).padStart(2,'0')+'m'):'—'"></span>.</div>
-              </div>
-              <div class="g" x-show="cfg.permafrostEnabled" style="margin-top:10px">
+              <div class="g" style="margin-top:10px">
                 <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=pfStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
                 <div x-html="_pfWaveSvg()" style="margin-top:4px;border:1px solid rgba(96,210,255,.15);border-radius:3px;background:rgba(96,210,255,.03)"></div>
-                <div class="pfr-hint">Path of the market's structure lean (bull ↑ / bear ↓), retained for as long as there is data — up to ~a week. The plugin reads where the wave is <em>heading</em>, not just where it is — folding an inherent bull⇄bear oscillation in as a fallback so it won't short into the start of a pump. History stays primary when the profile is rich.</div>
+                <div class="pfr-hint">Structure lean path (bull ↑ / bear ↓), up to ~1 week of history. Direction matters — rising tape reads negative for shorts even if mildly bearish. History takes priority over the inherent wave when the profile is rich.</div>
                 <div class="lbl" style="margin-top:8px">Slope Window <b x-text="(cfg.permafrostSlopeWindowHours??6)+'h'"></b></div>
                 <input type="range" min="1" max="24" step="1" x-model.number="cfg.permafrostSlopeWindowHours" @change="persist()">
                 <div class="pfr-hint">Timeframe for the directional comparison — "turning bullish/bearish" means the avg lean over the last N hours has shifted vs the N hours before it. Default 6h; raise to 12h for a slower, less reactive signal.</div>
@@ -161,16 +140,22 @@
                 <div x-show="cfg.permafrostIoEnabled && pfStatus.ioScore != null" class="pfr-hint" style="margin-top:3px">
                   IO <span x-text="pfStatus.ioScore>=0?'+':''"></span><span x-text="(pfStatus.ioScore??0).toFixed(2)"></span> — <span x-text="(pfStatus.ioScore??0)>0.2?'crowd net long':(pfStatus.ioScore??0)<-0.2?'crowd net short':'crowd neutral'"></span>
                 </div>
+                <div style="margin-top:6px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                  <span class="pfr-hint" style="margin:0">Chart lines:</span>
+                  <label class="tog" style="font-size:9px" @click="cfg.permafrostWaveShowVol=!(cfg.permafrostWaveShowVol??true);persist()">
+                    <div class="tog-t" :class="(cfg.permafrostWaveShowVol??true)?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">Vol</span>
+                  </label>
+                  <label class="tog" style="font-size:9px" @click="cfg.permafrostWaveShowIo=!(cfg.permafrostWaveShowIo??true);persist()">
+                    <div class="tog-t" :class="(cfg.permafrostWaveShowIo??true)?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">IO</span>
+                  </label>
+                </div>
               </div>
               <div class="pfr-stat" style="margin-top:10px;padding:8px 10px;background:rgba(96,210,255,.05);border:1px solid rgba(96,210,255,.15);border-radius:3px">
                 <div>PROFILE — <span x-text="(pfEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(pfEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(pfSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
                 <div x-show="pfStatus.at">READING — mag <span x-text="(pfStatus.skew??0).toFixed(2)"></span> | breadth <span x-text="(pfStatus.breadth??0).toFixed(2)"></span> | score <span x-text="pfStatus.score===null?'—':pfStatus.score.toFixed(2)"></span> | mass <span x-text="pfStatus.mass.toFixed(1)"></span></div>
                 <div x-show="pfStatus.at">STRUCTURE — lean <span x-text="(pfStatus.lean??0).toFixed(2)"></span> | slope <span x-text="(pfStatus.slope>=0?'+':'')+(pfStatus.slope??0).toFixed(2)"></span> | effective <span x-text="pfStatus.eff===null||pfStatus.eff===undefined?'—':((pfStatus.eff>=0?'+':'')+pfStatus.eff.toFixed(2))"></span> for shorts</div>
-                <div x-show="pfHalt && pfHalt.kind!=='plk'" style="color:var(--ice)">HALT — <span x-text="pfHalt?.kind"></span> (<span x-text="pfHalt?.strong?'strong bias — up to '+(cfg.permafrostCapHours??24)+'h / early thaw':pfHalt?.informed?'default 12h':'timer fallback'"></span>) <span x-text="(()=>{ void tick; return pfHalt? Math.floor((Date.now()-pfHalt.at)/3600000)+'h elapsed':''; })()"></span></div>
-                <div x-show="pfHalt && pfHalt.kind==='plk'" style="color:var(--ice);display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                  <span x-text="(()=>{ void tick; if(!pfHalt||!pfHalt.until) return 'PLK active'; const rem=Math.max(0,pfHalt.until-Date.now()); const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); const s=Math.floor((rem%60000)/1000); return 'PLK'+(pfHalt.strong?' (strong)':'')+' — '+h+'h '+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s left'; })()"></span>
-                  <button @click="_pfLiftPlk()" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border:1px solid rgba(96,210,255,.5);border-radius:2px;background:none;color:var(--ice);cursor:pointer;letter-spacing:.5px">Lift PLK</button>
-                </div>
                 <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
                   <button @click="pfExport()" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(96,210,255,.4);border-radius:2px;background:none;color:var(--ice);cursor:pointer;letter-spacing:.5px">Export</button>
                   <button @click="if(confirm('Import will replace your current events, samples, and wave history. This cannot be undone — export first if you want to keep the existing profile.\n\nContinue?')){document.getElementById('pfr-import-file').click()}" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(96,210,255,.4);border-radius:2px;background:none;color:var(--ice);cursor:pointer;letter-spacing:.5px">Import</button>
@@ -182,8 +167,8 @@
             <div x-data="{ dzOpen:false }" style="margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
               <button @click="dzOpen=!dzOpen" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border:1px solid rgba(255,69,96,.25);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px;display:flex;align-items:center;gap:4px"><span x-text="dzOpen?'▾':'▸'"></span>&nbsp;Danger Zone</button>
               <div x-show="dzOpen" x-transition.opacity style="margin-top:6px;padding:8px;background:rgba(255,69,96,.04);border:1px solid rgba(255,69,96,.18);border-radius:3px">
-                <button @click="if(!cfgLocked&&confirm('Wipe ALL Permafrost plugin data from browser storage?\n\nThis clears events, samples, wave history, halt state, and the storage key itself — nothing will remain. Export first if you want to preserve the profile.\n\nThis cannot be undone.')){localStorage.removeItem('__permafrost_winter_v1');pfEvents=[];pfSamples=[];pfPnl=[];pfWave=[];pfHalt=null;pfPlkLastLift=0;pfPlkLastDurationMs=0;persist();log('[PFR] Plugin state cleared from storage.','warn')}" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Clear Plugin State</button>
-                <div class="pfr-hint" style="margin-top:4px">Wipes all Permafrost data from browser storage — events, samples, wave history, and halt state. Also clears the storage key so no orphaned data lingers if the plugin is removed. Export first if you want to preserve the profile.</div>
+                <button @click="if(!cfgLocked&&confirm('Wipe ALL Permafrost plugin data from browser storage?\n\nThis clears events, samples, wave history, and the storage key itself — nothing will remain. Export first if you want to preserve the profile.\n\nThis cannot be undone.')){localStorage.removeItem('__permafrost_winter_v1');pfEvents=[];pfSamples=[];pfPnl=[];pfWave=[];persist();log('[PFR] Plugin state cleared from storage.','warn')}" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Clear Plugin State</button>
+                <div class="pfr-hint" style="margin-top:4px">Wipes all Permafrost data from browser storage — events, samples, and wave history. Also clears the storage key so no orphaned data lingers if the plugin is removed. Export first if you want to preserve the profile.</div>
               </div>
             </div>
           </div>
@@ -196,14 +181,9 @@
       const _origPers  = def.persist;
       const _origScan  = def.runScan;
       const _origClose = def.pseudoClosePosition;
-      const _origDD    = def._checkDrawdownThrottle;
-      const _origGL    = def._checkGainsLock;
-      const _origMH    = def.activateManualHalt;
-      const _origIsDD  = def._isDrawdownHalted;
-      const _origIsGL  = def._isGainsLocked;
 
-      // Slow sampler handle lives outside the Alpine proxy (see Timer architecture)
-      let _pfrTimer = null;
+      let _pfCrossLastCascadeActed  = 0;
+      let _pfCrossLastSacrificeActed = 0;
 
       return Object.assign({}, def, {
 
@@ -211,23 +191,18 @@
         pfSamples: [],   // { ts, skew, breadth, label } — label null until the 6h window resolves
         pfPnl:     [],   // { ts, pnl } — plugin-owned closed-trade log for sample labeling
         pfWave:    [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
-        pfHalt:    null, // { kind, at, informed, strong, until?, durMs? } while a halt is being governed (until/durMs are PLK-only)
-        pfPlkLastLift: 0, // when the last PLK ended — gates the (dynamic) PLK cooldown
-        pfPlkLastDurationMs: 0, // duration of the last PLK — the cooldown matches it
         _pfStructureList: null, _pfStructureAt: 0, // own 3h ticker cache independent of host
         pfStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
+        pfCrossEvents: [],
 
         async init() {
           await _origInit.call(this);
-          if (this.cfg.permafrostEnabled   === undefined) this.cfg.permafrostEnabled   = false;
-          if (this.cfg.permafrostThawScore === undefined) this.cfg.permafrostThawScore = 0;
-          if (this.cfg.permafrostStrongScore === undefined) this.cfg.permafrostStrongScore = STRONG_SCORE;
-          if (this.cfg.permafrostCapHours  === undefined) this.cfg.permafrostCapHours  = 24;
-          if (this.cfg.permafrostPlkEnabled === undefined) this.cfg.permafrostPlkEnabled = true;
-          if (this.cfg.permafrostPlkScore   === undefined) this.cfg.permafrostPlkScore   = -0.15;
-          if (this.cfg.permafrostPlkCooldownHours === undefined) this.cfg.permafrostPlkCooldownHours = 24;
+          if (this.cfg.permafrostEnabled          === undefined) this.cfg.permafrostEnabled          = false;
           if (this.cfg.permafrostSlopeWindowHours === undefined) this.cfg.permafrostSlopeWindowHours = 6;
-          if (this.cfg.permafrostIoEnabled       === undefined) this.cfg.permafrostIoEnabled       = true;
+          if (this.cfg.permafrostIoEnabled        === undefined) this.cfg.permafrostIoEnabled        = true;
+          if (this.cfg.permafrostWaveShowVol      === undefined) this.cfg.permafrostWaveShowVol      = true;
+          if (this.cfg.permafrostWaveShowIo       === undefined) this.cfg.permafrostWaveShowIo       = true;
+          if (this.cfg.permafrostCrossEnabled     === undefined) this.cfg.permafrostCrossEnabled     = true;
           try {
             const raw = localStorage.getItem(PFR_KEY);
             if (raw) {
@@ -236,87 +211,20 @@
               if (Array.isArray(s.samples)) this.pfSamples = s.samples.slice(-SAMPLES_CAP);
               if (Array.isArray(s.pnl))     this.pfPnl     = s.pnl.filter(e => Date.now() - e.ts < PNL_LOG_TTL);
               if (Array.isArray(s.wave))    this.pfWave    = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
-              if (s.halt && s.halt.at) this.pfHalt = s.halt;
-              if (typeof s.plkLastLift === 'number') this.pfPlkLastLift = s.plkLastLift;
-              if (typeof s.plkLastDurationMs === 'number') this.pfPlkLastDurationMs = s.plkLastDurationMs;
+              if (typeof s.crossLastCascadeActed  === 'number') _pfCrossLastCascadeActed  = s.crossLastCascadeActed;
+              if (typeof s.crossLastSacrificeActed === 'number') _pfCrossLastSacrificeActed = s.crossLastSacrificeActed;
             }
           } catch(e) {}
-          // Drop a stale governed-halt record if the underlying halt is gone (manual clear, expiry).
-          // A PLK has no backing host timer — it expires on its own scaled duration instead.
-          if (this.pfHalt?.kind === 'plk') {
-            if (!this.pfHalt.until || Date.now() >= this.pfHalt.until) {
-              this.pfPlkLastDurationMs = this.pfHalt.until ? (this.pfHalt.until - this.pfHalt.at) : this.pfPlkLastDurationMs;
-              this.pfHalt = null; this.pfPlkLastLift = Date.now();
-            }
-          } else if (this.pfHalt && !_origIsDD.call(this) && !_origIsGL.call(this)) this.pfHalt = null;
-          if (this.pfHalt) this._pfEnsureSampler();
-          this.log(`[PFR] Permafrost (Winter) v1.6.0 loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
-        },
-
-        // ── PLK (preemptive lock) — proactive halt on historically bad structure ──
-        _pfPlkActive() {
-          if (!this.cfg.permafrostEnabled || !(this.cfg.permafrostPlkEnabled ?? true)) return false;
-          return this.pfHalt?.kind === 'plk';
-        },
-
-        // PLK duration scales with the strength of the effective read (|eff|, which
-        // already blends learned history with the inherent structure wave), as a
-        // fraction of the hard cap. Floored at 1h, capped at the hard cap — so it
-        // lands on arbitrary values like 3h 20m, never a fixed block.
-        _pfPlkDurationMs(eff) {
-          const capMs    = (this.cfg.permafrostCapHours ?? 24) * 3600 * 1000;
-          const strength = Math.min(1, Math.abs(eff || 0));
-          return Math.min(capMs, Math.max(MIN_HALT_MS, Math.round(strength * capMs)));
-        },
-
-        // Remaining ms on the active PLK (0 if none) — read by the host's deferral logs
-        _plkRemainingMs() {
-          if (this.pfHalt?.kind !== 'plk' || !this.pfHalt.until) return 0;
-          return Math.max(0, this.pfHalt.until - Date.now());
-        },
-
-        // Topbar pill for an active PLK — labelled "PLK" with a live countdown and
-        // click-to-lift, instead of the host's drawdown (DDT) pill.
-        _extraStatusPills() {
-          if (!this._pfPlkActive() || !this.pfHalt?.until) return [];
-          void this.tick;
-          const rem = Math.max(0, this.pfHalt.until - Date.now());
-          const s   = Math.floor(rem / 1000);
-          const remStr = `${Math.floor(s/3600)}h ${String(Math.floor((s%3600)/60)).padStart(2,'0')}m ${String(s%60).padStart(2,'0')}s`;
-          return [{
-            pip:        'warn',
-            pipStyle:   'background:var(--ice)',
-            label:      `PLK ${remStr}`,
-            labelStyle: 'color:var(--ice)',
-            border:     'border-color:rgba(96,210,255,.45);background:rgba(96,210,255,.06)',
-            title:      `Preemptive lock active — entries locked for ${remStr}. Click to lift.`,
-            action:     () => this._pfLiftPlk(),
-          }];
-        },
-
-        // Manual PLK lift — clears the lock and starts the dynamic cooldown (which
-        // matches the duration this lock was set for).
-        _pfLiftPlk() {
-          if (this.pfHalt?.kind !== 'plk') return;
-          this.pfPlkLastDurationMs = Math.max(0, (this.pfHalt.until || Date.now()) - this.pfHalt.at);
-          this.pfPlkLastLift = Date.now();
-          this.pfHalt = null;
-          this._pfStopSampler();
-          this.log('[PFR] 🔓 PLK lifted manually — new entries re-enabled', 'warn');
-          this.persist();
-        },
-
-        // PLK rides the drawdown gate: every entry choke point (host scans and
-        // plugins) that respects the drawdown halt respects a preemptive lock too.
-        _isDrawdownHalted() {
-          return _origIsDD.call(this) || this._pfPlkActive();
+          this.log(`[PFR] Permafrost (Winter) v1.8.2 loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
         },
 
         persist() {
           _origPers.call(this);
           try {
             localStorage.setItem(PFR_KEY, JSON.stringify({
-              events: this.pfEvents, samples: this.pfSamples, pnl: this.pfPnl, wave: this.pfWave, halt: this.pfHalt, plkLastLift: this.pfPlkLastLift, plkLastDurationMs: this.pfPlkLastDurationMs,
+              events: this.pfEvents, samples: this.pfSamples, pnl: this.pfPnl, wave: this.pfWave,
+              crossLastCascadeActed: _pfCrossLastCascadeActed,
+              crossLastSacrificeActed: _pfCrossLastSacrificeActed,
             }));
           } catch(e) {}
         },
@@ -480,6 +388,62 @@
           return score === null ? inherent : massFrac * score + (1 - massFrac) * inherent;
         },
 
+        _pfCrossRead() {
+          try {
+            const raw = localStorage.getItem(CROSS_KEY);
+            if (!raw) return [];
+            const cut = Date.now() - CROSS_TTL;
+            return (JSON.parse(raw).events || []).filter(e => e.ts >= cut);
+          } catch(e) { return []; }
+        },
+
+        _pfCrossWrite(kind) {
+          try {
+            const events = this._pfCrossRead();
+            events.push({ ts: Date.now(), kind, source: 'winter' });
+            localStorage.setItem(CROSS_KEY, JSON.stringify({ events }));
+          } catch(e) {}
+        },
+
+        async _pfCheckCross() {
+          if (!this.cfg.permafrostCrossEnabled) return;
+          const fromChaser = this._pfCrossRead().filter(e => e.source === 'chaser');
+          this.pfCrossEvents = fromChaser.slice(-10);
+
+          const lat = kind => fromChaser.filter(e => e.kind === kind).reduce((m, e) => !m || e.ts > m.ts ? e : m, null);
+          const latCascade  = lat('cascade');
+          const latSacrifice = lat('sacrifice');
+
+          if (latCascade && latCascade.ts > _pfCrossLastCascadeActed) {
+            _pfCrossLastCascadeActed = latCascade.ts;
+            const haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+            this._drawdownHaltUntil = Date.now() + haltMs;
+            this.log(`[PFR] ❄ Cross-signal — Chaser cascade at ${new Date(latCascade.ts).toISOString().slice(11,19)} UTC → drawdown halt ${this.cfg.drawdownHaltHours ?? 6}h + bailing all Winter positions`, 'warn');
+            this.bailAll().catch(() => {});
+            this._pfFetchStructure().then(r => {
+              if (!r) return;
+              this.pfEvents.push({ ts: r.ts, kind: 'drawdown', skew: r.skew, breadth: r.breadth, gCount: r.gCount, lCount: r.lCount, gSum: r.gSum, lSum: r.lSum, _cross: true });
+              if (this.pfEvents.length > EVENTS_CAP) this.pfEvents = this.pfEvents.slice(-EVENTS_CAP);
+              this._pfPushWave(r);
+              this.persist();
+            }).catch(() => {});
+          }
+
+          if (latSacrifice && latSacrifice.ts > _pfCrossLastSacrificeActed && this._isDrawdownHalted()) {
+            _pfCrossLastSacrificeActed = latSacrifice.ts;
+            this._drawdownHaltUntil = null;
+            this._drawdownWindow = [];
+            this.log(`[PFR] ❄ Cross-signal — Chaser sacrifice at ${new Date(latSacrifice.ts).toISOString().slice(11,19)} UTC → drawdown halt lifted, Winter re-enabled`, 'success');
+            this._pfFetchStructure().then(r => {
+              if (!r) return;
+              this.pfEvents.push({ ts: r.ts, kind: 'gainslock', skew: r.skew, breadth: r.breadth, gCount: r.gCount, lCount: r.lCount, gSum: r.gSum, lSum: r.lSum, _cross: true });
+              if (this.pfEvents.length > EVENTS_CAP) this.pfEvents = this.pfEvents.slice(-EVENTS_CAP);
+              this._pfPushWave(r);
+              this.persist();
+            }).catch(() => {});
+          }
+        },
+
         // Inline SVG wave plot — time-based 1-week window, bins data into pixel columns so
         // the chart compacts automatically as history grows (no index stretching).
         _pfWaveSvg() {
@@ -546,6 +510,8 @@
             ioSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.io).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.io).toFixed(1)}" stroke="rgba(200,150,255,0.5)" stroke-width="1" stroke-dasharray="3 2"/>`;
           }
 
+          const showVol = this.cfg.permafrostWaveShowVol ?? true;
+          const showIo  = this.cfg.permafrostWaveShowIo  ?? true;
           const cur = pts[pts.length - 1].lean;
           const col = cur > 0.05 ? 'var(--profit)' : cur < -0.05 ? 'var(--short)' : 'var(--ice)';
           const polyPts = pts.map(p => `${p.x.toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ');
@@ -554,14 +520,14 @@
             + `<line x1="0" y1="${pad}" x2="${W}" y2="${pad}" stroke="rgba(0,229,160,.12)"/>`
             + `<line x1="0" y1="${(H-pad).toFixed(1)}" x2="${W}" y2="${(H-pad).toFixed(1)}" stroke="rgba(255,69,96,.12)"/>`
             + `<line x1="0" y1="${mid.toFixed(1)}" x2="${W}" y2="${mid.toFixed(1)}" stroke="rgba(255,255,255,.18)" stroke-dasharray="3 3"/>`
-            + volSvg
-            + ioSvg
+            + (showVol ? volSvg : '')
+            + (showIo  ? ioSvg  : '')
             + `<polyline points="${polyPts}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>`
             + `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.5" fill="${col}"/>`
             + `<text x="2" y="${pad+7}" fill="rgba(0,229,160,.5)" font-size="8" font-family="monospace">bull</text>`
             + `<text x="2" y="${(H-pad-1).toFixed(1)}" fill="rgba(255,69,96,.5)" font-size="8" font-family="monospace">bear</text>`
-            + `<text x="${W-18}" y="${pad+7}" fill="rgba(255,185,50,.45)" font-size="8" font-family="monospace">vol</text>`
-            + (ioPts.length >= 2 ? `<text x="${W-10}" y="${pad+17}" fill="rgba(200,150,255,.45)" font-size="8" font-family="monospace">io</text>` : '')
+            + (showVol ? `<text x="${W-18}" y="${pad+7}" fill="rgba(255,185,50,.45)" font-size="8" font-family="monospace">vol</text>` : '')
+            + (showIo && ioPts.length >= 2 ? `<text x="${W-10}" y="${pad+17}" fill="rgba(200,150,255,.45)" font-size="8" font-family="monospace">io</text>` : '')
             + `</svg>`;
         },
 
@@ -589,88 +555,6 @@
           const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
           const eff = this._pfEffectiveScore(score, mass, inherent);
           this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, ioScore: reading.ioScore ?? null, at: reading.ts };
-        },
-
-        // ── Halt event: record the climate, decide informed cap vs timer fallback ──
-        async _pfOnHaltTriggered(kind) {
-          const reading = await this._pfFetchStructure();
-          if (!reading) { this.pfHalt = { kind, at: Date.now(), informed: false }; this.persist(); return; }
-          this.pfEvents.push({ ts: reading.ts, kind, skew: reading.skew, breadth: reading.breadth, gCount: reading.gCount, lCount: reading.lCount, gSum: reading.gSum, lSum: reading.lSum });
-          if (this.pfEvents.length > EVENTS_CAP) this.pfEvents = this.pfEvents.slice(-EVENTS_CAP);
-          this._pfPushWave(reading);
-          const { score, mass } = this._pfScore(reading);
-          const lean     = (reading.skew + reading.breadth) / 2;
-          const slope    = this._pfTrajectory().slope;
-          const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
-          const eff      = this._pfEffectiveScore(score, mass, inherent);
-          this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, ioScore: reading.ioScore ?? null, at: reading.ts };
-          const informed = mass >= MIN_MASS;
-          const strong   = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.permafrostStrongScore ?? STRONG_SCORE);
-          // The stock 12h horizon is the default. Only a *strong* historical bias
-          // extends the halt toward the 24h hard cap (and unlocks early thaw); a
-          // merely-informed profile rides the host's 12h timer unchanged.
-          if (strong) {
-            const capUntil = reading.ts + (this.cfg.permafrostCapHours ?? 24) * 3600 * 1000;
-            if (kind === 'drawdown') this._drawdownHaltUntil = capUntil;
-            else                     this._gainsLockHaltUntil = capUntil;
-          }
-          if (this.pfHalt?.kind === 'plk') this.pfPlkLastLift = Date.now(); // superseded PLK still starts the cooldown
-          this.pfHalt = { kind, at: reading.ts, informed, strong };
-          const _d = this._pfDescribe(reading, score, mass);
-          this.log(`[PFR] 🧊 ${kind === 'drawdown' ? 'Drawdown' : 'Gains lock'} activated — market structure is ${_d.desc} | ${_d.bias} → ${strong ? `strong historical bias — profile-governed (may extend to the ${this.cfg.permafrostCapHours ?? 24}h cap or thaw early)` : informed ? 'default 12h halt — early thaw needs a strong bias' : 'profile too thin — stock 12h timer'}`, 'warn');
-          this._pfEnsureSampler();
-          this.persist();
-        },
-
-        _pfEnsureSampler() {
-          if (_pfrTimer) return;
-          const iv = Math.max(3600 * 1000, 4 * (this.cfg.scanMins || 15) * 60 * 1000);
-          _pfrTimer = setInterval(() => this._pfSamplerTick(), iv);
-        },
-
-        _pfStopSampler() {
-          if (_pfrTimer) { clearInterval(_pfrTimer); _pfrTimer = null; }
-        },
-
-        async _pfSamplerTick() {
-          const ddActive = _origIsDD.call(this), glActive = this._isGainsLocked();
-          const isPlk    = this.pfHalt?.kind === 'plk';
-          if (!this.cfg.permafrostEnabled || !this.pfHalt || (!isPlk && !ddActive && !glActive)) {
-            this.pfHalt = null; this._pfStopSampler(); this.persist(); return;
-          }
-          const reading = await this._pfFetchStructure();
-          if (!reading) return;
-          this._pfAddSample(reading);
-          const { score, mass, eff } = this.pfStatus;
-          const elapsed = Date.now() - this.pfHalt.at;
-          const strong  = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.permafrostStrongScore ?? STRONG_SCORE);
-          // Early thaw is reserved for a strong historical bias — without one, the
-          // lock is never lifted arbitrarily; it simply runs its 12h horizon. For
-          // drawdown/gains-lock that horizon is the host's own timer; PLK has none,
-          // so it self-caps below. The thaw compares the *effective* read (history +
-          // structure trajectory) so we don't lift straight into a reversal.
-          if (strong && elapsed >= MIN_HALT_MS && (eff ?? score) >= (this.cfg.permafrostThawScore ?? 0)) {
-            const kind = this.pfHalt.kind;
-            if      (kind === 'drawdown')  { this._drawdownHaltUntil = null; this._drawdownWindow = []; }
-            else if (kind === 'gainslock') { this._gainsLockHaltUntil = null; this._gainsWindow = []; }
-            // 'plk' has no host timer to clear — dropping pfHalt lifts it; record its
-            // duration so the cooldown matches it
-            if (kind === 'plk') { this.pfPlkLastDurationMs = Math.max(0, (this.pfHalt.until || Date.now()) - this.pfHalt.at); this.pfPlkLastLift = Date.now(); }
-            this.pfHalt = null;
-            this._pfStopSampler();
-            this.log(`[PFR] 🌊 Thaw — strong bias cleared the ${kind} zone after ${(elapsed / 3600000).toFixed(1)}h (score ${score.toFixed(2)} ≥ ${(this.cfg.permafrostThawScore ?? 0).toFixed(2)}, mass ${mass.toFixed(1)}) — new entries re-enabled`, 'success');
-          } else if (isPlk && Date.now() >= (this.pfHalt.until || 0)) {
-            // PLK duration elapsed — the lock's strength-scaled run is over
-            this.pfPlkLastDurationMs = Math.max(0, (this.pfHalt.until || Date.now()) - this.pfHalt.at);
-            this.pfPlkLastLift = Date.now(); // start the re-trigger cooldown (matches this duration)
-            this.pfHalt = null;
-            this._pfStopSampler();
-            this.log(`[PFR] 🛑 PLK duration elapsed after ${(elapsed / 3600000).toFixed(1)}h — preemptive lock lifted for re-test`, 'warn');
-          } else {
-            const _d = this._pfDescribe(reading, score, mass);
-            this.log(`[PFR] 🧊 Halt check (${(elapsed / 3600000).toFixed(1)}h elapsed) — market is ${_d.desc} | ${_d.bias} — holding`, 'info');
-          }
-          this.persist();
         },
 
         pfExport() {
@@ -705,36 +589,13 @@
         async runScan() {
           await _origScan.call(this);
           if (!this.cfg.permafrostEnabled) return;
+          this._pfCheckCross().catch(() => {});
           this._pfFetchStructure().then(r => {
             if (!r) return;
             this._pfAddSample(r);
-            const { score, mass, eff } = this.pfStatus;
+            const { score, mass } = this.pfStatus;
             const _d = this._pfDescribe(r, score, mass);
             this.log(`[PFR] 🧊 Routine market structure check — market is ${_d.desc} | ${_d.bias}`, 'info');
-            // PLK — proactive rather than reactive: when the *effective* read (learned
-            // history primary, the inherent structure wave as fallback) is bad for the
-            // bot's direction, lock entries preemptively before PnL damage. This is
-            // what keeps us from shorting into the start of a pump — a mildly bearish
-            // tape that is turning up reads negative once the trajectory is folded in.
-            // Duration scales with the strength of that read; the re-trigger cooldown
-            // matches the last lock's duration so locks can't fire back to back.
-            const _plkCooldownMs = this.pfPlkLastDurationMs > 0
-              ? this.pfPlkLastDurationMs
-              : (this.cfg.permafrostPlkCooldownHours ?? 24) * 3600 * 1000;
-            const _plkTrip = (this.cfg.permafrostPlkScore ?? -0.15);
-            if ((this.cfg.permafrostPlkEnabled ?? true) && !this.pfHalt
-                && Date.now() - (this.pfPlkLastLift || 0) >= _plkCooldownMs
-                && !_origIsDD.call(this) && !_origIsGL.call(this)
-                && eff !== null && eff !== undefined && eff <= _plkTrip) {
-              const plkStrong = mass >= STRONG_MASS && score !== null && Math.abs(score) >= (this.cfg.permafrostStrongScore ?? STRONG_SCORE);
-              const durMs = this._pfPlkDurationMs(eff);
-              const now   = Date.now();
-              this.pfHalt = { kind: 'plk', at: now, until: now + durMs, durMs, informed: mass >= MIN_MASS, strong: plkStrong };
-              const _dh = Math.floor(durMs / 3600000), _dm = Math.round((durMs % 3600000) / 60000);
-              const _src = mass >= MIN_MASS ? `history+structure read ${eff.toFixed(2)}` : `inherent structure read ${eff.toFixed(2)} (thin history)`;
-              this.log(`[PFR] 🛑 PLK — ${_d.desc} is bad for shorts (${_src} ≤ ${_plkTrip.toFixed(2)}) — preemptive lock engaged for ${_dh}h ${String(_dm).padStart(2,'0')}m${plkStrong ? ' (strong bias)' : ''}; cooldown will match`, 'warn');
-              this._pfEnsureSampler();
-            }
             this.persist();
           }).catch(() => {});
         },
@@ -752,33 +613,11 @@
               this.pfPnl = this.pfPnl.filter(e => now - e.ts < PNL_LOG_TTL);
             }
           }
-        },
-
-        _checkDrawdownThrottle() {
-          // Compare the host's own gate — the wrapped one reads true under a PLK
-          const prevActive = _origIsDD.call(this);
-          _origDD.call(this);
-          if (!this.cfg.permafrostEnabled) return;
-          if (!prevActive && _origIsDD.call(this)) {
-            // A real drawdown halt supersedes an active PLK (kind is overwritten)
-            this._pfOnHaltTriggered('drawdown').catch(() => {});
+          if ((reason === 'cascade' || reason === 'sacrifice') && this.cfg.permafrostCrossEnabled) {
+            this._pfCrossWrite(reason);
           }
         },
 
-        _checkGainsLock() {
-          const prevActive = this._isGainsLocked();
-          _origGL.call(this);
-          if (!this.cfg.permafrostEnabled) return;
-          if (!prevActive && this._isGainsLocked()) {
-            this._pfOnHaltTriggered('gainslock').catch(() => {});
-          }
-        },
-
-        activateManualHalt() {
-          _origMH.call(this);
-          if (!this.cfg.permafrostEnabled) return;
-          this._pfOnHaltTriggered('drawdown').catch(() => {});
-        },
       });
     },
   };

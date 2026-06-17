@@ -13,24 +13,29 @@ Each file carries its version in two places — update **both**:
 
 ### Increment rules
 
-- **Patch** (`x.y.Z`): bug fixes, cosmetic tweaks, minor behaviour changes
-- **Minor** (`x.Y.0`): new features, new UI sections, new strategy logic
-- **Major** (`X.0.0`): breaking redesigns, protocol changes, complete rewrites of a module
-
-When in doubt, increment the patch number.
+- **Patch** (`x.y.Z`): adjustments to existing functionality or UI (tweaks, fixes, tooltip changes, restyling)
+- **Minor** (`x.Y.0`): added or removed functionality (new controls, new logic, new UI sections, removed features)
+- **Major** (`X.0.0`): only when explicitly requested by the user
 
 ### Per-file current versions (update this table when you bump)
 
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.4.0 |
-| `PseudoChaser.html` | v1.0.9 |
+| `PseudoWinter.html` | v1.5.0 |
+| `PseudoChaser.html` | v1.1.0 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.0.9 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.0.9 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.4.0 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.4.0 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.8.2 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.8.2 |
 
 > Always update the table above after bumping a version so this document stays accurate.
+
+## Documentation Writing Style (REQUIRED)
+
+- **README.md**: Technical and code-focused. Use precise API names, config key names, function names, variable names, and implementation details. Refer to bots by their technical names (PseudoWinter, PseudoChaser, etc.).
+- **Strategy_book.md**: Prescriptive human tone. No code references, no config key names, no function names, no bot or file names. Write for a trader, not a developer — describe what to do and why, not how it is implemented.
 
 ## Working Style (REQUIRED)
 
@@ -40,3 +45,4 @@ When in doubt, increment the patch number.
 - **Never remove or change something whose purpose is unclear without asking first.** Investigate, then confirm before acting.
 - **Prefer the minimal correct change.** Don't clean up, refactor, or extend beyond what was explicitly asked.
 - **Log behavioral corrections.** Whenever the user gives a behavioral correction or long-term instruction — signalled by phrases like "why didn't you…", "why are you…", "you should always…", "you should never…", or any direct criticism of approach — add the lesson to this file before finishing the response.
+- **Tooltip length.** In-app tooltips (hint text, x-text descriptions, title attributes) must be at most 3 phrases. Aim for 1.
