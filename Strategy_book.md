@@ -11,8 +11,11 @@
 3. [Strategies](#strategies)
    - [Multi-Indicator](#multi-indicator-strategy)
    - [Psycho Mode](#psycho-mode)
-4. [Sizing](#sizing)
-5. [Conclusion](#conclusion)
+4. [Market Intelligence](#market-intelligence)
+   - [Structure Learning](#structure-learning)
+   - [Cross-Side Coordination](#cross-side-coordination)
+5. [Sizing](#sizing)
+6. [Conclusion](#conclusion)
 
 ---
 
@@ -248,6 +251,46 @@ Psycho Mode is the reactive approach in its purest form — no RSI gates, no loc
 - *Anti-Martingale (AMa)* (optional) — flat adds into winning positions; TP at −22% after seven adds
 
 **Why individual exhumation rather than collective payback**: A large reactive book with 2× DCA escalation and aggressive absorption accumulates losses faster than any single laggard could realistically recover. Each position owning its own debt is the only workable model at this scale.
+
+---
+
+## Market Intelligence
+
+The system learns over time. Beyond the slot-based filters and technique configuration, there is an observational layer that watches how the market behaves at the moments that matter most — when positions are closed at a gain or at a loss — and builds a record of what the market looked like in those moments. That record becomes a guide for future sessions.
+
+---
+
+### Structure Learning
+
+Every time a meaningful event occurs — a position closes at target, a drawdown halt triggers, a relief rally is detected — the system takes a snapshot of what the broader market looked like at that moment: how many coins are trending up versus down, the balance of buying and selling pressure, the velocity of the trend. Over many sessions, these snapshots accumulate into a profile.
+
+Before opening new positions, the system compares current market conditions against this profile. If conditions closely resemble what the market looked like during previous drawdown events, the entry gate narrows. If conditions match what the market looked like during profitable periods, the gate opens wider.
+
+This is not a prediction. The system does not know what the market will do next. What it knows is what the market has looked like in the past when things went well and when they went badly — and it lets that pattern shift its confidence before each decision.
+
+The profile improves with time. A fresh installation has no history and places no weight on past structure. After weeks of operation, the profile represents a genuine statistical record of the market's behavior during this system's sessions, shaped by its own entry logic and sizing decisions. It is, in that sense, a learned intuition specific to how this system trades.
+
+---
+
+### Cross-Side Coordination
+
+Each side of the system — the long side and the short side — trades independently. But their outcomes are not independent. When one side is closing positions at a loss, the market is moving against it, which means the market is moving *in favor of* the other side. When one side is closing at a profit and exiting, the move that made those longs profitable is the same move that should be warning the short side to get out.
+
+**The signals:**
+
+A **cascade** on one side — a wave of positions closing at profit — means the market made a decisive move in that direction. For the side that just cashed out, the run may be over. For the *other* side, it is a warning: the market just moved hard against you, and any open positions you're holding into that momentum are likely bleeding. The correct response is to halt new entries and close whatever is exposed.
+
+A **sacrifice** on one side — a wave of positions closing at a loss, absorbed and cut — means the market moved decisively against that side. The same move is relief for the other side. If the other side had been halted waiting for conditions to improve, this is the signal that the pressure has shifted. The halt lifts; entries can resume.
+
+**Why speed matters:**
+
+These trends can reverse within a few hours. A market that cascades bullish in the morning can sacrifice by afternoon. Waiting for manual confirmation introduces the exact delay that turns a signal into yesterday's news. The window for acting on a cross-side signal is narrow — the value is in responding immediately, not in confirming it after the fact.
+
+**The larger vision:**
+
+The goal is a system that never needs to be manually overridden. A human monitoring both sides would notice when the long side starts closing profitably and would manually pause the short side — but that requires attention, correct interpretation, and quick action. The cross-side coordination handles this automatically. Each side watches the other's outcomes and adjusts in real time.
+
+Combined with the structure-learning layer, this produces a system that gets progressively less reliant on fixed rules and more responsive to the actual conditions it encounters. Fixed configuration handles the stable environment it was tuned for; learned structure handles drift; cross-side signals handle intraday regime shifts. The goal, reached incrementally, is a system that corrects itself before the damage accumulates — without requiring any intervention from the trader.
 
 ---
 
