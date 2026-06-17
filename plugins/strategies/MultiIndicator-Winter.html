@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'multiindicator-winter',
     name:      'Multi-Indicator (Winter)',
-    version:   '1.3.0',
+    version:   '1.4.0',
     targetBot: 'pseudowinter',
     after:     ['everwinter', 'permafrost-winter'],
     before:    [],
@@ -260,7 +260,7 @@
             const title  = crits.length ? 'Multi: ' + crits.map(c => CRIT_DESC[c] || c).join(' + ') : 'Multi-Indicator';
             return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(96,210,255,.45);color:var(--ice);background:rgba(96,210,255,.10)" title="${title}">${emoji || 'Multi'}</span>`;
           });
-          this.log(`[MIW] Multi-Indicator (Winter) v1.3.0 loaded — ${this.cfg.miwEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.miwSlots||[]).length} slots | ${this.cfg.miwPicks}/cycle`, 'info');
+          this.log(`[MIW] Multi-Indicator (Winter) v1.4.0 loaded — ${this.cfg.miwEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.miwSlots||[]).length} slots | ${this.cfg.miwPicks}/cycle`, 'info');
           this.renderTradeFeed?.();
           if (this._miwExitTimer) clearInterval(this._miwExitTimer);
           this._miwExitTimer = setInterval(() => { this._miwCheckCascade(); this._miwCheckSacrifice(); }, 5000);
@@ -487,10 +487,16 @@
             return;
           }
 
-          // Distribute picks equally across slots; later slots lose the remainder.
-          const base       = Math.floor(picks / slots.length);
-          const extra      = picks % slots.length;
-          const slotQuota  = slots.map((_, i) => base + (i < extra ? 1 : 0));
+          // Quota per slot = floor(maxPos / slotCount), minimum 1; later slots lose the remainder.
+          // Accounts for already-open positions per slot so deferred capacity carries across cycles.
+          const maxPos     = this.cfg.maxPos ?? 5;
+          const openPerSlot = new Array(slots.length).fill(0);
+          for (const p of (this.positions || []).filter(p => p._miw)) {
+            const si = p._miwSlotIdx ?? 0;
+            if (si < slots.length) openPerSlot[si]++;
+          }
+          const baseQuota  = Math.max(1, Math.floor(maxPos / slots.length));
+          const slotQuota  = slots.map((_, i) => Math.max(0, baseQuota - openPerSlot[i]));
           const slotOpened = new Array(slots.length).fill(0);
 
           let opened = 0, attempted = 0, blocked = 0, slotSkipped = 0;
@@ -498,19 +504,22 @@
           try {
             for (const { t, criteria, slotIdx } of pool) {
               if (opened >= picks) break;
-              if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) break;
+              if ((this.positions?.length ?? 0) >= maxPos) break;
+              if (slotQuota[slotIdx] <= 0) { slotSkipped++; continue; }
               if (slotOpened[slotIdx] >= slotQuota[slotIdx]) { slotSkipped++; continue; }
               attempted++;
-              if (await this._miwOpen(t, criteria)) { opened++; slotOpened[slotIdx]++; }
+              if (await this._miwOpen(t, criteria, slotIdx)) { opened++; slotOpened[slotIdx]++; }
               else { blocked++; }
             }
           } finally { this._logBatchEnd?.('[MIW] 💡 Entry roll-up'); }
           const _miwBlockNote = blocked     ? `, ${blocked} blocked (qty/lev)`  : '';
           const _miwSkipNote  = slotSkipped ? `, ${slotSkipped} slot-skipped`   : '';
-          this.log(`[MIW] 💡 ${pool.length} qualified — ${opened} opened${_miwBlockNote}${_miwSkipNote} (quota: ${slotQuota.map((q,i)=>`s${i+1}:${slotOpened[i]}/${q}`).join(' ')})`, 'info');
+          const quotaParts    = slotQuota.map((q, i) => (slotOpened[i] > 0 || q > 0) ? `s${i+1}:${slotOpened[i]}/${q}` : null).filter(Boolean);
+          const quotaNote     = quotaParts.length ? ` (quota: ${quotaParts.join(' ')})` : '';
+          this.log(`[MIW] 💡 ${pool.length} qualified — ${opened} opened${_miwBlockNote}${_miwSkipNote}${quotaNote}`, 'info');
         },
 
-        async _miwOpen(t, criteria) {
+        async _miwOpen(t, criteria, slotIdx) {
           const sym   = t.symbol;
           const price = parseFloat(t.lastPrice || 0);
           if (!price) return false;
@@ -521,6 +530,7 @@
           if ((this.positions || []).length > lenBefore) {
             const pos = this.positions[this.positions.length - 1];
             pos._miw = true;
+            pos._miwSlotIdx  = slotIdx ?? 0;
             pos._miwCriteria = criteria || [];
             if (typeof this.persist === 'function') this.persist();
             return true;
