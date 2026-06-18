@@ -44,10 +44,13 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.10.1';
+  const VERSION        = '1.11.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
+  const SCORE_KEY      = '__everwinter_scorecard_v1';
+  const SCORE_TTL      = 30 * 24 * 3600 * 1000;
+  const PF_CRIT_EMOJI  = { '+fund': '🤑', '-fund': '💸', '+24h': '⬆️', '-24h': '⬇️', '>10pct': '🔊', '<10pct': '🔉', 'lsa': '🟥', 'lba': '🟩', 'rasl': '🔴', 'rabl': '🟢' };
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old scars fade
   const EVENT_W        = 10;                   // halt events are strong anchors
@@ -137,6 +140,17 @@
               </div>
             </label>
             <div x-show="cfg.permafrostCrossEnabled && pfCrossEvents.length" class="pfr-hint" style="margin-top:5px" x-text="pfCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Chaser — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
+            <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.permafrostScorecardEnabled=!cfg.permafrostScorecardEnabled;_pfScoreBuild();persist()}">
+              <div class="tog-t" :class="cfg.permafrostScorecardEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Slot Scorecard</div>
+                <div class="pfr-hint">Scores each MIW slot type by win/loss across both bots. Partner closes are direction-inverted. Best → worst, left to right.</div>
+              </div>
+            </label>
+            <div x-show="cfg.permafrostScorecardEnabled" style="margin-top:6px;padding:6px 8px;background:rgba(96,210,255,.03);border:1px solid rgba(96,210,255,.1);border-radius:3px">
+              <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);margin-bottom:5px">SLOT SCORECARD (WINTER VIEW)</div>
+              <div x-html="_pfScorecardHtml()" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+            </div>
             <div x-show="cfg.permafrostEnabled" style="margin-top:8px">
               <div class="g" style="margin-top:10px">
                 <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=pfStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
@@ -200,10 +214,11 @@
 
       return Object.assign({}, def, {
 
-        pfEvents:  [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth, gCount, lCount, gSum, lSum }
-        pfSamples: [],   // { ts, skew, breadth, label } — label null until the 6h window resolves
-        pfPnl:     [],   // { ts, pnl } — plugin-owned closed-trade log for sample labeling
-        pfWave:    [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
+        pfEvents:     [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth, gCount, lCount, gSum, lSum }
+        pfSamples:    [],   // { ts, skew, breadth, label } — label null until the 6h window resolves
+        pfPnl:        [],   // { ts, pnl } — plugin-owned closed-trade log for sample labeling
+        pfWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
+        pfScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
         _pfStructureList: null, _pfStructureAt: 0, // own 3h ticker cache independent of host
         pfStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
         pfCrossEvents: [],
@@ -218,7 +233,9 @@
           if (this.cfg.permafrostWaveShowIo       === undefined) this.cfg.permafrostWaveShowIo       = true;
           if (this.cfg.permafrostCrossEnabled        === undefined) this.cfg.permafrostCrossEnabled        = true;
           if (this.cfg.permafrostCrossWinLossEnabled  === undefined) this.cfg.permafrostCrossWinLossEnabled  = false;
-          if (this.cfg.permafrostCrossStatusEnabled   === undefined) this.cfg.permafrostCrossStatusEnabled   = false;
+          if (this.cfg.permafrostCrossStatusEnabled    === undefined) this.cfg.permafrostCrossStatusEnabled    = false;
+          if (this.cfg.permafrostScorecardEnabled      === undefined) this.cfg.permafrostScorecardEnabled      = false;
+          this._pfScoreBuild();
           try {
             const raw = localStorage.getItem(PFR_KEY);
             if (raw) {
@@ -429,6 +446,45 @@
         _pfEffectiveScore(score, mass, inherent) {
           const massFrac = Math.max(0, Math.min(1, (mass || 0) / STRONG_MASS));
           return score === null ? inherent : massFrac * score + (1 - massFrac) * inherent;
+        },
+
+        _pfScoreRead() {
+          try {
+            const raw = localStorage.getItem(SCORE_KEY);
+            if (!raw) return [];
+            const cut = Date.now() - SCORE_TTL;
+            return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
+          } catch(e) { return []; }
+        },
+        _pfScoreWrite(criteria, win) {
+          try {
+            const records = this._pfScoreRead();
+            records.push({ ts: Date.now(), criteria, win, source: 'winter' });
+            localStorage.setItem(SCORE_KEY, JSON.stringify(records));
+          } catch(e) {}
+        },
+        _pfScoreBuild() {
+          const records = this._pfScoreRead();
+          const map = {};
+          for (const r of records) {
+            const key = [...r.criteria].sort().join(',');
+            if (!map[key]) map[key] = { criteria: r.criteria, net: 0, wins: 0, losses: 0 };
+            const isWin = r.source === 'winter' ? r.win : !r.win;
+            if (isWin) { map[key].wins++; map[key].net++; } else { map[key].losses++; map[key].net--; }
+          }
+          this.pfScoreboard = Object.values(map).sort((a, b) => b.net - a.net);
+        },
+        _pfScorecardHtml() {
+          if (!this.pfScoreboard.length) return '<span style="font-size:9px;color:var(--text-lo)">No MIW closes recorded yet.</span>';
+          return this.pfScoreboard.map(s => {
+            const emoji = s.criteria.map(c => PF_CRIT_EMOJI[c] || c).join('');
+            const clr = s.net > 0 ? 'rgba(96,210,255,.9)' : s.net < 0 ? 'var(--short)' : 'var(--text-lo)';
+            const bg  = s.net > 0 ? 'rgba(96,210,255,.08)' : s.net < 0 ? 'rgba(255,80,80,.08)' : 'rgba(255,255,255,.04)';
+            const bdr = s.net > 0 ? 'rgba(96,210,255,.35)' : s.net < 0 ? 'rgba(255,80,80,.35)' : 'rgba(255,255,255,.12)';
+            const score = (s.net > 0 ? '+' : '') + s.net;
+            const title = `W:${s.wins} L:${s.losses} | ${s.criteria.join(' + ')}`;
+            return `<span title="${title}" style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${emoji || '?'} <b>${score}</b></span>`;
+          }).join('');
         },
 
         _pfCrossRead() {
@@ -687,6 +743,14 @@
           if (this.cfg.permafrostCrossEnabled && this.cfg.permafrostCrossWinLossEnabled) {
             if (reason === 'sl') this._pfCrossWrite('sacrifice');
             else if (reason === 'tp') this._pfCrossWrite('cascade');
+          }
+          if (this.cfg.permafrostScorecardEnabled && pos._miw && pos._miwCriteria?.length) {
+            const _t = this.closedTrades?.[0];
+            const _pnl = _t?.totalPnl ?? _t?.pnl;
+            if (typeof _pnl === 'number') {
+              this._pfScoreWrite(pos._miwCriteria, _pnl > 0);
+              this._pfScoreBuild();
+            }
           }
         },
 

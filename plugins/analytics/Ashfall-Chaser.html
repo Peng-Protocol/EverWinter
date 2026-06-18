@@ -23,10 +23,13 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.10.1';
+  const VERSION        = '1.11.0';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
+  const SCORE_KEY      = '__everwinter_scorecard_v1';
+  const SCORE_TTL      = 30 * 24 * 3600 * 1000;
+  const AF_CRIT_EMOJI  = { '+fund': '💸', '-fund': '🤑', '+24h': '⬆️', '-24h': '⬇️', '>10pct': '🔊', '<10pct': '🔉', 'lsa': '🟥', 'lba': '🟩', 'rasl': '🔴', 'rabl': '🟢' };
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old burns fade
   const EVENT_W        = 10;                   // halt events are strong anchors
@@ -116,6 +119,17 @@
               </div>
             </label>
             <div x-show="cfg.ashfallCrossEnabled && afCrossEvents.length" class="ash-hint" style="margin-top:5px" x-text="afCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Winter — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
+            <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.ashfallScorecardEnabled=!cfg.ashfallScorecardEnabled;_afScoreBuild();persist()}">
+              <div class="tog-t" :class="cfg.ashfallScorecardEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Slot Scorecard</div>
+                <div class="ash-hint">Scores each MIC slot type by win/loss across both bots. Partner closes are direction-inverted. Best → worst, left to right.</div>
+              </div>
+            </label>
+            <div x-show="cfg.ashfallScorecardEnabled" style="margin-top:6px;padding:6px 8px;background:rgba(255,150,80,.03);border:1px solid rgba(255,150,80,.1);border-radius:3px">
+              <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);margin-bottom:5px">SLOT SCORECARD (CHASER VIEW)</div>
+              <div x-html="_afScorecardHtml()" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+            </div>
             <div x-show="cfg.ashfallEnabled" style="margin-top:8px">
               <div class="g" x-show="cfg.ashfallEnabled" style="margin-top:10px">
                 <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=afStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
@@ -179,10 +193,11 @@
 
       return Object.assign({}, def, {
 
-        afEvents:  [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth, gCount, lCount, gSum, lSum }
-        afSamples: [],   // { ts, skew, breadth, label } — label null until the 6h window resolves
-        afPnl:     [],   // { ts, pnl } — plugin-owned closed-trade log for sample labeling
-        afWave:    [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
+        afEvents:     [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth, gCount, lCount, gSum, lSum }
+        afSamples:    [],   // { ts, skew, breadth, label } — label null until the 6h window resolves
+        afPnl:        [],   // { ts, pnl } — plugin-owned closed-trade log for sample labeling
+        afWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
+        afScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
         _afStructureList: null, _afStructureAt: 0, // own 3h ticker cache independent of host
         afStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
         afCrossEvents: [],
@@ -198,6 +213,8 @@
           if (this.cfg.ashfallCrossEnabled        === undefined) this.cfg.ashfallCrossEnabled        = true;
           if (this.cfg.ashfallCrossWinLossEnabled  === undefined) this.cfg.ashfallCrossWinLossEnabled  = false;
           if (this.cfg.ashfallCrossStatusEnabled   === undefined) this.cfg.ashfallCrossStatusEnabled   = false;
+          if (this.cfg.ashfallScorecardEnabled     === undefined) this.cfg.ashfallScorecardEnabled     = false;
+          this._afScoreBuild();
           try {
             const raw = localStorage.getItem(ASH_KEY);
             if (raw) {
@@ -388,6 +405,45 @@
         _afEffectiveScore(score, mass, inherent) {
           const massFrac = Math.max(0, Math.min(1, (mass || 0) / STRONG_MASS));
           return score === null ? inherent : massFrac * score + (1 - massFrac) * inherent;
+        },
+
+        _afScoreRead() {
+          try {
+            const raw = localStorage.getItem(SCORE_KEY);
+            if (!raw) return [];
+            const cut = Date.now() - SCORE_TTL;
+            return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
+          } catch(e) { return []; }
+        },
+        _afScoreWrite(criteria, win) {
+          try {
+            const records = this._afScoreRead();
+            records.push({ ts: Date.now(), criteria, win, source: 'chaser' });
+            localStorage.setItem(SCORE_KEY, JSON.stringify(records));
+          } catch(e) {}
+        },
+        _afScoreBuild() {
+          const records = this._afScoreRead();
+          const map = {};
+          for (const r of records) {
+            const key = [...r.criteria].sort().join(',');
+            if (!map[key]) map[key] = { criteria: r.criteria, net: 0, wins: 0, losses: 0 };
+            const isWin = r.source === 'chaser' ? r.win : !r.win;
+            if (isWin) { map[key].wins++; map[key].net++; } else { map[key].losses++; map[key].net--; }
+          }
+          this.afScoreboard = Object.values(map).sort((a, b) => b.net - a.net);
+        },
+        _afScorecardHtml() {
+          if (!this.afScoreboard.length) return '<span style="font-size:9px;color:var(--text-lo)">No MIC closes recorded yet.</span>';
+          return this.afScoreboard.map(s => {
+            const emoji = s.criteria.map(c => AF_CRIT_EMOJI[c] || c).join('');
+            const clr = s.net > 0 ? 'rgba(100,220,150,.9)' : s.net < 0 ? 'var(--short)' : 'var(--text-lo)';
+            const bg  = s.net > 0 ? 'rgba(100,220,150,.08)' : s.net < 0 ? 'rgba(255,80,80,.08)' : 'rgba(255,255,255,.04)';
+            const bdr = s.net > 0 ? 'rgba(100,220,150,.35)' : s.net < 0 ? 'rgba(255,80,80,.35)' : 'rgba(255,255,255,.12)';
+            const score = (s.net > 0 ? '+' : '') + s.net;
+            const title = `W:${s.wins} L:${s.losses} | ${s.criteria.join(' + ')}`;
+            return `<span title="${title}" style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${emoji || '?'} <b>${score}</b></span>`;
+          }).join('');
         },
 
         _afCrossRead() {
@@ -661,6 +717,14 @@
           if (this.cfg.ashfallCrossEnabled && this.cfg.ashfallCrossWinLossEnabled) {
             if (reason === 'sl') this._afCrossWrite('sacrifice');
             else if (reason === 'tp') this._afCrossWrite('cascade');
+          }
+          if (this.cfg.ashfallScorecardEnabled && pos._mic && pos._micCriteria?.length) {
+            const _t = this.closedTrades?.[0];
+            const _pnl = _t?.totalPnl ?? _t?.pnl;
+            if (typeof _pnl === 'number') {
+              this._afScoreWrite(pos._micCriteria, _pnl > 0);
+              this._afScoreBuild();
+            }
           }
         },
 
