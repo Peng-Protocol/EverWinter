@@ -356,12 +356,9 @@ Optional cross-communicator scorecard that tracks PnL per MIC/MIW criteria combi
 
 **CLEAR button**: resets all scorecard records (wipes `SCORE_KEY` and clears in-memory display). Also clears all auto-block state since blocks are computed from these records.
 
-**Auto-block** (`permafrostAutoBlock`/`ashfallAutoBlock`): when enabled, `_pfScoreBuild`/`_afScoreBuild` computes `miwBlockedSlots`/`micBlockedSlots` from raw per-source PnL and writes it to the shared Alpine instance. Block state machine (computed fresh each build, no separate storage):
-- `'disabled'` — own loss ≥ `permafrostSlotLossThreshold × baseMargin` and partner loss < threshold
-- `'hardblocked'` — own loss ≥ `permafrostSlotHardBlockThreshold × baseMargin` (persists regardless of partner)
-- `'preemptive'` — partner win ≥ loss threshold and partner loss < threshold
+**Auto-block** (`permafrostAutoBlock`/`ashfallAutoBlock`): when enabled, `_pfScoreBuild`/`_afScoreBuild` computes `miwBlockedSlots`/`micBlockedSlots` from the scoreboard and writes it to the shared Alpine instance. A slot is `'blocked'` when its `totalPnl ≤ -(lossThresh)`. Since `totalPnl` already combines own and partner PnL with direction inversion, partner wins push the score down (deepening a block) and partner losses push it back up (potentially unblocking). The block state is computed fresh on every scorecard rebuild — no separate storage.
 
-`baseMargin = cfg.minNotional / cfg.leverage`. Config defaults: `permafrostSlotLossThreshold = 0.25`, `permafrostSlotHardBlockThreshold = 0.50`.
+`baseMargin = cfg.minNotional / cfg.leverage`. Config default: `permafrostSlotLossThreshold = 0.25` (25% of base margin).
 
 **Constants**: `SCORE_KEY = '__everwinter_scorecard_v1'`, `SCORE_TTL = 30 * 24 * 3600 * 1000`. Methods: `_afScoreRead`, `_afScoreWrite` (writes with `source: 'chaser'`), `_afScoreBuild` (assembles display array, computes `micBlockedSlots`), `_afScorecardHtml` (renders chips).
 
@@ -379,7 +376,7 @@ Both plugins use standard green (`rgba(80,200,80,.55)`) for the green bar.
 - **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, PLK toggle and trigger slider, **Slot Scorecard** toggle, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours). Buttons: **Export** (JSON download of events, samples, and wave history), **Import** (replaces current events, samples, and wave from a JSON file — guarded by `confirm()`), and **Clear Profile** (zeroes events, samples, PnL log, and wave — guarded by `confirm()`). All controls respect the config lock.
 - **Structure Sampling bar** — two-sided horizontal chart below the IO score row, showing red/green 1h candle distribution from the kline cache.
 - **Slot Scorecard** — chip row sorted by total PnL (best→worst) below the Structure Sampling bar; only visible when `ashfallScorecardEnabled`/`permafrostScorecardEnabled` and at least one record exists. Includes a **CLEAR** button to wipe all records and block state.
-- **Auto Block** — collapsible section in the scorecard area (shown when scorecard enabled): toggle for `permafrostAutoBlock`/`ashfallAutoBlock`, loss threshold slider, hard-block threshold slider, and live block count status.
+- **Auto Block** — collapsible section in the scorecard area (shown when scorecard enabled): toggle for `permafrostAutoBlock`/`ashfallAutoBlock`, block threshold slider, and live blocked slot count.
 - **Danger Zone** — collapsible section always visible at the bottom of the accordion (outside the enabled-guard). Contains **Clear Plugin State**: removes the plugin's localStorage key entirely and resets all in-memory data including halt and PLK state. Guarded by `confirm()`. Use before uninstalling to prevent orphaned data, or to guarantee a fully clean slate.
 - **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with mag/breadth/slope/io/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score. `mag` = the magnitude lens (`skew` in code); `breadth` = the participation lens; `slope` = wave trajectory direction; `io` = crowd funding-rate sentiment (omitted when unavailable).
 
@@ -419,9 +416,7 @@ The accordion exposes the slot system under a "Entry Slots" heading. An **Auto**
 **Auto mode** (`miwAutoSlots`/`micAutoSlots`): the manual builder is replaced by a size picker. The plugin generates all C(n, size) combinations of the available criteria (where n = number of distinct criteria) — no duplicate combinations by order. The count of generated and currently active (unblocked) slots is shown. `miwAutoSlotSize`/`micAutoSlotSize` (default 2) controls how many criteria per slot.
 
 **Block feedback** (both modes): slots whose sorted key appears in `miwBlockedSlots`/`micBlockedSlots` render with a colored border and a status badge:
-- Orange border + "⛔ off" — `'disabled'` (soft block, partner hasn't matched losses yet)
-- Red border + "🔒 locked" — `'hardblocked'` (own loss ≥ hard-block threshold, persists until CLEAR)
-- Purple border + "⚠️ pre" — `'preemptive'` (partner winning too much, blocked in advance)
+- Red border + "⛔ blocked" — `'blocked'` (combined slot score ≤ -threshold)
 
 All controls respect the config lock.
 

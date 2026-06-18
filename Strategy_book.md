@@ -265,7 +265,7 @@ The scorecard tracks realized PnL per entry combination. Every time a position o
 
 Combinations are displayed sorted by total PnL. When both sides run simultaneously, the scores account for direction: a win on the short side is a loss for the long side, so each side inverts the other's records in its own view.
 
-**Auto-correction**: when enabled, the system uses scorecard data to block combinations automatically. A combination that has lost more than a configured threshold of base margin is disabled until the opposing side loses the same amount — confirming the conditions that hurt this side are no longer favorable to the other. A combination where the opposing side has been consistently winning can be preemptively blocked before it causes losses. A combination that has crossed the hard-block threshold stays disabled regardless of partner behavior, until records are manually cleared.
+**Auto-correction**: when enabled, the system uses scorecard data to block combinations automatically. Each combination has a single combined score — own wins raise it, own losses lower it, partner wins lower it further, partner losses raise it back. When the score drops below a configured threshold the combination is blocked. When it recovers above the threshold — because conditions shifted and the partner started losing on it — it unblocks automatically. Combinations that sink deep stay blocked indefinitely; combinations near the threshold fluctuate with the market.
 
 The **CLEAR** button resets all scorecard records and lifts all auto-blocks.
 
