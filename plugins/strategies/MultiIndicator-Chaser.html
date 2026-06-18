@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.4.1';
+  const VERSION       = '1.4.2';
   const DEFAULT_SLOTS = [['-fund','+24h','>10pct'],['+fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -145,6 +145,20 @@
                 <div class="mic-hint" x-text="(()=>{ const pos=(positions||[]).filter(p=>p._mic); if(!pos.length) return 'No active MIC positions.'; const oldest=pos.reduce((m,p)=>Math.min(m,p.openedAt||Date.now()),Date.now()); const ageMs=Date.now()-oldest; const halvMs=(cfg.micHalvingHours??3)*3600000; const mul=Math.pow(0.5,ageMs/halvMs); const h=Math.floor(ageMs/3600000); const m=Math.floor((ageMs%3600000)/60000); return 'Oldest: '+h+'h '+String(m).padStart(2,'0')+'m old → ×'+mul.toFixed(3)+' on trigger'; })()"></div>
               </div>
 
+              <!-- Fade Away -->
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.micFadeAwayEnabled=!cfg.micFadeAwayEnabled;persist()}">
+                <div class="tog-t" :class="cfg.micFadeAwayEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Fade Away</div>
+                  <div class="mic-hint">Closes the oldest MIC position when the structure sample is mostly bearish by a set threshold.</div>
+                </div>
+              </label>
+              <div class="g" x-show="cfg.micFadeAwayEnabled" style="margin-top:8px">
+                <div class="lbl">Bearish Threshold <b x-text="(cfg.micFadeAwayPct??50)+'%'"></b></div>
+                <input type="range" min="10" max="100" step="5" x-model.number="cfg.micFadeAwayPct" @change="persist()">
+                <div class="mic-hint" x-text="(()=>{ const cache=_micKlineCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(r/t*100).toFixed(0)+'% bearish (trigger @ '+(cfg.micFadeAwayPct??50)+'%)' : 'No kline data yet.'; })()"></div>
+              </div>
+
               <!-- Entry Slots -->
               <div style="margin-top:12px">
                 <div class="lbl" style="margin-bottom:6px">Entry Slots <span style="font-size:9px;font-weight:normal;color:var(--text-lo)">(click slot to edit · click criteria to toggle)</span></div>
@@ -261,6 +275,8 @@
           if (this.cfg.micKlineScanCap     === undefined) this.cfg.micKlineScanCap     = 50;
           if (this.cfg.micHalvingEnabled   === undefined) this.cfg.micHalvingEnabled   = false;
           if (this.cfg.micHalvingHours     === undefined) this.cfg.micHalvingHours     = 3;
+          if (this.cfg.micFadeAwayEnabled  === undefined) this.cfg.micFadeAwayEnabled  = false;
+          if (this.cfg.micFadeAwayPct      === undefined) this.cfg.micFadeAwayPct      = 50;
           this.registerRoleBadge?.(item => {
             if (!item || !item._mic) return null;
             const crits  = item._micCriteria || [];
@@ -370,6 +386,29 @@
             this._micLastActedAt = 0;
           }
           await this._micRunScan();
+          await this._micCheckFadeAway();
+        },
+
+        async _micCheckFadeAway() {
+          if (!this.cfg.micFadeAwayEnabled) return;
+          const micPositions = (this.positions || []).filter(p => p._mic);
+          if (!micPositions.length) return;
+          const cache = this._micKlineCache || {};
+          const lastHourStart = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
+          let red = 0, green = 0;
+          for (const e of Object.values(cache)) {
+            if (e.candleStart !== lastHourStart) continue;
+            if (e.close < e.open) red++;
+            else if (e.close > e.open) green++;
+          }
+          const total = red + green;
+          if (!total) return;
+          const threshold = (this.cfg.micFadeAwayPct ?? 50) / 100;
+          if (red / total >= threshold) {
+            const oldest = micPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
+            this.log(`[MIC] 🌬 Fade Away — sample ${red}R/${green}G (${(red / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
+            await this.pseudoClosePosition(oldest, 'sacrifice');
+          }
         },
 
         async _micRunScan() {

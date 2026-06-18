@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.4.2';
+  const VERSION       = '1.4.3';
   const DEFAULT_SLOTS = [['+fund','+24h','>10pct'],['-fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -145,6 +145,20 @@
                 <div class="miw-hint" x-text="(()=>{ const pos=(positions||[]).filter(p=>p._miw); if(!pos.length) return 'No active MIW positions.'; const oldest=pos.reduce((m,p)=>Math.min(m,p.openedAt||Date.now()),Date.now()); const ageMs=Date.now()-oldest; const halvMs=(cfg.miwHalvingHours??3)*3600000; const mul=Math.pow(0.5,ageMs/halvMs); const h=Math.floor(ageMs/3600000); const m=Math.floor((ageMs%3600000)/60000); return 'Oldest: '+h+'h '+String(m).padStart(2,'0')+'m old → ×'+mul.toFixed(3)+' on trigger'; })()"></div>
               </div>
 
+              <!-- Fade Away -->
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.miwFadeAwayEnabled=!cfg.miwFadeAwayEnabled;persist()}">
+                <div class="tog-t" :class="cfg.miwFadeAwayEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Fade Away</div>
+                  <div class="miw-hint">Closes the oldest MIW position when the structure sample is mostly bullish by a set threshold.</div>
+                </div>
+              </label>
+              <div class="g" x-show="cfg.miwFadeAwayEnabled" style="margin-top:8px">
+                <div class="lbl">Bullish Threshold <b x-text="(cfg.miwFadeAwayPct??50)+'%'"></b></div>
+                <input type="range" min="10" max="100" step="5" x-model.number="cfg.miwFadeAwayPct" @change="persist()">
+                <div class="miw-hint" x-text="(()=>{ const cache=_miwKlineCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(g/t*100).toFixed(0)+'% bullish (trigger @ '+(cfg.miwFadeAwayPct??50)+'%)' : 'No kline data yet.'; })()"></div>
+              </div>
+
               <!-- Entry Slots -->
               <div style="margin-top:12px">
                 <div class="lbl" style="margin-bottom:6px">Entry Slots <span style="font-size:9px;font-weight:normal;color:var(--text-lo)">(click slot to edit · click criteria to toggle)</span></div>
@@ -261,6 +275,8 @@
           if (this.cfg.miwKlineScanCap     === undefined) this.cfg.miwKlineScanCap     = 50;
           if (this.cfg.miwHalvingEnabled   === undefined) this.cfg.miwHalvingEnabled   = false;
           if (this.cfg.miwHalvingHours     === undefined) this.cfg.miwHalvingHours     = 3;
+          if (this.cfg.miwFadeAwayEnabled  === undefined) this.cfg.miwFadeAwayEnabled  = false;
+          if (this.cfg.miwFadeAwayPct      === undefined) this.cfg.miwFadeAwayPct      = 50;
           this.registerRoleBadge?.(item => {
             if (!item || !item._miw) return null;
             const crits  = item._miwCriteria || [];
@@ -370,6 +386,29 @@
             this._miwLastActedAt = 0;
           }
           await this._miwRunScan();
+          await this._miwCheckFadeAway();
+        },
+
+        async _miwCheckFadeAway() {
+          if (!this.cfg.miwFadeAwayEnabled) return;
+          const miwPositions = (this.positions || []).filter(p => p._miw);
+          if (!miwPositions.length) return;
+          const cache = this._miwKlineCache || {};
+          const lastHourStart = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
+          let red = 0, green = 0;
+          for (const e of Object.values(cache)) {
+            if (e.candleStart !== lastHourStart) continue;
+            if (e.close < e.open) red++;
+            else if (e.close > e.open) green++;
+          }
+          const total = red + green;
+          if (!total) return;
+          const threshold = (this.cfg.miwFadeAwayPct ?? 50) / 100;
+          if (green / total >= threshold) {
+            const oldest = miwPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
+            this.log(`[MIW] 🌬 Fade Away — sample ${red}R/${green}G (${(green / total * 100).toFixed(0)}% bullish ≥ ${this.cfg.miwFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
+            await this.pseudoClosePosition(oldest, 'sacrifice');
+          }
         },
 
         async _miwRunScan() {
