@@ -344,17 +344,26 @@ The 15-second slow-tick interval fires `_afFetchStructure()`/`_pfFetchStructure(
 
 ### Slot Scorecard
 
-Optional cross-communicator scorecard that tracks win/loss per MIC/MIW criteria combination (slot type). Controlled by `ashfallScorecardEnabled`/`permafrostScorecardEnabled` (toggle in the accordion, peer-level, not under the cross-comm toggle).
+Optional cross-communicator scorecard that tracks PnL per MIC/MIW criteria combination (slot type). Controlled by `ashfallScorecardEnabled`/`permafrostScorecardEnabled` (toggle in the accordion, peer-level, not under the cross-comm toggle).
 
 **Storage**: `__everwinter_scorecard_v1` in `localStorage` (30-day TTL, written by both plugins under their own `source` field: `'chaser'` for Ashfall, `'winter'` for Permafrost).
 
-**Recording**: `pseudoClosePosition` writes a record when a closed position has `pos._mic`/`pos._miw` set, `pos._micCriteria`/`pos._miwCriteria` is non-empty, and the scorecard is enabled. `pnl > 0` is a win; `pnl ≤ 0` is a loss.
+**Recording**: `pseudoClosePosition` writes a record when a closed position has `pos._mic`/`pos._miw` set, `pos._micCriteria`/`pos._miwCriteria` is non-empty, and the scorecard is enabled. Each record stores `pnl: number` (realized PnL from the close).
 
 **Criteria key**: the criteria array is sorted and joined (e.g. `'-fund,+24h,>10pct'`) to produce a stable slot key. Records store raw criterion strings, not emojis — each plugin applies its own direction-relative `CRIT_EMOJI` at render time.
 
-**Display**: horizontal chip row in the accordion, sorted by net score (wins − losses) descending. Each chip shows the slot emoji string, a bold net count, and inline dimmed W/L counts. Cross-bot (partner) records are **direction-inverted**: a Winter win = price fell = Chaser would have lost, so partner records apply `win → −1` / `loss → +1` when computing the display score. Net scores can go negative.
+**Display**: horizontal chip row in the accordion, sorted by total PnL descending. Each chip shows the slot emoji string, bold total PnL, and dimmed win/loss counts. Cross-bot (partner) records are **direction-inverted**: a Winter win (positive PnL) = price fell = Chaser loss, so partner PnL is negated when computing this side's display score. Net PnL can go negative.
 
-**Constants**: `SCORE_KEY = '__everwinter_scorecard_v1'`, `SCORE_TTL = 30 * 24 * 3600 * 1000`. Methods: `_afScoreRead`, `_afScoreWrite` (writes with `source: 'chaser'`), `_afScoreBuild` (assembles the display array from own + inverted partner records), `_afScorecardHtml` (renders chips).
+**CLEAR button**: resets all scorecard records (wipes `SCORE_KEY` and clears in-memory display). Also clears all auto-block state since blocks are computed from these records.
+
+**Auto-block** (`permafrostAutoBlock`/`ashfallAutoBlock`): when enabled, `_pfScoreBuild`/`_afScoreBuild` computes `miwBlockedSlots`/`micBlockedSlots` from raw per-source PnL and writes it to the shared Alpine instance. Block state machine (computed fresh each build, no separate storage):
+- `'disabled'` — own loss ≥ `permafrostSlotLossThreshold × baseMargin` and partner loss < threshold
+- `'hardblocked'` — own loss ≥ `permafrostSlotHardBlockThreshold × baseMargin` (persists regardless of partner)
+- `'preemptive'` — partner win ≥ loss threshold and partner loss < threshold
+
+`baseMargin = cfg.minNotional / cfg.leverage`. Config defaults: `permafrostSlotLossThreshold = 0.25`, `permafrostSlotHardBlockThreshold = 0.50`.
+
+**Constants**: `SCORE_KEY = '__everwinter_scorecard_v1'`, `SCORE_TTL = 30 * 24 * 3600 * 1000`. Methods: `_afScoreRead`, `_afScoreWrite` (writes with `source: 'chaser'`), `_afScoreBuild` (assembles display array, computes `micBlockedSlots`), `_afScorecardHtml` (renders chips).
 
 ### Structure Sampling bar chart
 
@@ -362,14 +371,15 @@ Two-sided horizontal bar chart rendered in the accordion below the IO score, abo
 
 The method reads all cache entries whose `candleStart === lastHourStart` (last completed 1h UTC epoch), counting `close < open` (red) and `close > open` (green). These counts are stored in `afKlineBar`/`pfKlineBar: { red, green, max }` where `max = cfg.micKlineScanCap ?? 50`. Bar widths are `Math.min(100, count / max * 100)%`. The red side anchors right, the green side anchors left; both emanate from a center divider.
 
-Permafrost uses `rgba(96,210,255,.55)` (ice blue) for the green bar instead of standard green.
+Both plugins use standard green (`rgba(80,200,80,.55)`) for the green bar.
 
 ### UI Elements
 
 - **Mode label suffix** — "+ Permafrost" / "+ Ashfall" via `mode-label-extra` while enabled.
 - **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, PLK toggle and trigger slider, **Slot Scorecard** toggle, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours). Buttons: **Export** (JSON download of events, samples, and wave history), **Import** (replaces current events, samples, and wave from a JSON file — guarded by `confirm()`), and **Clear Profile** (zeroes events, samples, PnL log, and wave — guarded by `confirm()`). All controls respect the config lock.
 - **Structure Sampling bar** — two-sided horizontal chart below the IO score row, showing red/green 1h candle distribution from the kline cache.
-- **Slot Scorecard** — chip row sorted best→worst below the Structure Sampling bar; only visible when `ashfallScorecardEnabled`/`permafrostScorecardEnabled` and at least one record exists.
+- **Slot Scorecard** — chip row sorted by total PnL (best→worst) below the Structure Sampling bar; only visible when `ashfallScorecardEnabled`/`permafrostScorecardEnabled` and at least one record exists. Includes a **CLEAR** button to wipe all records and block state.
+- **Auto Block** — collapsible section in the scorecard area (shown when scorecard enabled): toggle for `permafrostAutoBlock`/`ashfallAutoBlock`, loss threshold slider, hard-block threshold slider, and live block count status.
 - **Danger Zone** — collapsible section always visible at the bottom of the accordion (outside the enabled-guard). Contains **Clear Plugin State**: removes the plugin's localStorage key entirely and resets all in-memory data including halt and PLK state. Guarded by `confirm()`. Use before uninstalling to prevent orphaned data, or to guarantee a fully clean slate.
 - **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with mag/breadth/slope/io/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score. `mag` = the magnitude lens (`skew` in code); `breadth` = the participation lens; `slope` = wave trajectory direction; `io` = crowd funding-rate sentiment (omitted when unavailable).
 
@@ -402,11 +412,22 @@ A slot may contain any subset of these criteria. An empty slot never matches. An
 
 ### Slot UI
 
-The accordion exposes the slot system under a "Entry Slots" heading. Clicking any slot block selects it and opens a criteria picker row above the blocks — six labeled buttons, each toggling that criterion into or out of the selected slot. Active criteria render with highlighted borders; inactive ones are dimmed. Clicking the selected slot again deselects it and hides the picker. A ✕ button on each block deletes the slot; a `+` button appends a new empty slot. All controls respect the config lock.
+The accordion exposes the slot system under a "Entry Slots" heading. An **Auto** toggle switches between manual and algorithmic slot modes.
+
+**Manual mode**: clicking any slot block selects it and opens a criteria picker row — labeled buttons toggle each criterion in or out of the selected slot. Active criteria render with highlighted borders; inactive ones are dimmed. Clicking the selected slot again deselects it. A ✕ button deletes the slot; a `+` button appends a new empty slot.
+
+**Auto mode** (`miwAutoSlots`/`micAutoSlots`): the manual builder is replaced by a size picker. The plugin generates all C(n, size) combinations of the available criteria (where n = number of distinct criteria) — no duplicate combinations by order. The count of generated and currently active (unblocked) slots is shown. `miwAutoSlotSize`/`micAutoSlotSize` (default 2) controls how many criteria per slot.
+
+**Block feedback** (both modes): slots whose sorted key appears in `miwBlockedSlots`/`micBlockedSlots` render with a colored border and a status badge:
+- Orange border + "⛔ off" — `'disabled'` (soft block, partner hasn't matched losses yet)
+- Red border + "🔒 locked" — `'hardblocked'` (own loss ≥ hard-block threshold, persists until CLEAR)
+- Purple border + "⚠️ pre" — `'preemptive'` (partner winning too much, blocked in advance)
+
+All controls respect the config lock.
 
 ### Entry pass (`_miwRunScan` / `_micRunScan`)
 
-Appended to `runScan`. Skips when disabled, at `maxPos`, drawdown-halted, or gains-locked. Reads `cfg.miwSlots`/`cfg.micSlots` (arrays of criterion arrays), discards empty slots, then proceeds. If the share cap is enabled, the headroom is capped at `floor(maxPos × shareCapPct / 100) − currently held _miw/_mic positions`.
+Appended to `runScan`. Skips when disabled, at `maxPos`, drawdown-halted, or gains-locked. Calls `_miwEffectiveSlots()`/`_micEffectiveSlots()` to get the active slot list — returns either the manual `cfg.miwSlots` list or auto-generated combinations depending on `miwAutoSlots`, with slots whose sorted key appears in `miwBlockedSlots`/`micBlockedSlots` filtered out. Then proceeds. If the share cap is enabled, the headroom is capped at `floor(maxPos × shareCapPct / 100) − currently held _miw/_mic positions`.
 
 Base pool: `_lastAllTickers` filtered to USDT pairs, no BTCUSDT, `lastPrice ≥ 0.001`, excluding held and banned symbols. If any active slot contains `>10pct` or `<10pct`, the top 30 tickers by `turnover24h` are inspected and their market caps pre-fetched (see CoinGecko below); the resulting `mcapMap` is keyed by symbol. Tickers outside the top 30 cannot satisfy vol/mcap criteria (their `ratio` resolves to `null`).
 
@@ -435,6 +456,8 @@ Matching: for each ticker in the base pool, each active slot is evaluated as `s.
 | `miwRollingSacrificeEnabled` / `micRollingSacrificeEnabled` | `false` | When enabled, Sacrifice closes only the oldest MIW/MIC position instead of bailing all |
 | `miwFadeAwayEnabled` / `micFadeAwayEnabled` | `false` | Fade Away toggle — closes oldest position when structure sample is majority bearish (MIC) or bullish (MIW) |
 | `miwFadeAwayPct` / `micFadeAwayPct` | `50` | Directional majority threshold for Fade Away (%) |
+| `miwAutoSlots` / `micAutoSlots` | `false` | When true, replaces manual slot list with algorithmically generated C(n, size) combinations |
+| `miwAutoSlotSize` / `micAutoSlotSize` | `2` | Number of criteria per auto-generated slot (range 1–4) |
 
 **Default slots — Winter** (shorts): `[['+fund','+24h','>10pct'],['-fund','-24h','<10pct']]`
 

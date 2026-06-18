@@ -36,7 +36,7 @@ Each file carries its version in two or three places — update **all** that app
 ## Documentation Writing Style (REQUIRED)
 
 - **README.md**: Technical and code-focused. Use precise API names, config key names, function names, variable names, and implementation details. Refer to bots by their technical names (PseudoWinter, PseudoChaser, etc.).
-- **Strategy_book.md**: Prescriptive human tone. No code references, no config key names, no function names, no bot or file names. Write for a trader, not a developer — describe what to do and why, not how it is implemented.
+- **Strategy_book.md**: Prescriptive human tone. No code references, no config key names, no function names, no bot or file names. Write for a trader, not a developer — describe what to do and why, not how it is implemented. Avoid meandering language — be direct and use as few phrases as possible.
 
 ## Working Style (REQUIRED)
 
