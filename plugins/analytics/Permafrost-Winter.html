@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.12.0';
+  const VERSION        = '1.13.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
@@ -154,6 +154,22 @@
               </div>
               <div x-html="_pfScorecardHtml()" style="display:flex;flex-wrap:wrap;gap:4px"></div>
             </div>
+            <div x-show="cfg.permafrostScorecardEnabled" style="margin-top:8px">
+              <label class="tog" @click.prevent="if(!cfgLocked){cfg.permafrostAutoBlock=!cfg.permafrostAutoBlock;_pfScoreBuild();persist()}">
+                <div class="tog-t" :class="cfg.permafrostAutoBlock?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Auto Block</div>
+                  <div class="pfr-hint">Disables MIW slots that accumulate enough own losses. Re-enables when the opposing bot loses on the same slot by the same measure. Clear scorecard to reset hard-blocks.</div>
+                </div>
+              </label>
+              <div x-show="cfg.permafrostAutoBlock" style="margin-top:6px;padding:6px 8px;background:rgba(255,80,80,.03);border:1px solid rgba(255,80,80,.1);border-radius:3px">
+                <div class="lbl">Loss Threshold <b x-text="'$'+(((cfg.minNotional||6)/(cfg.leverage||6))*(cfg.permafrostSlotLossThreshold??0.25)).toFixed(2)"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'('+(Math.round((cfg.permafrostSlotLossThreshold??0.25)*100))+'% margin)'"></span></div>
+                <input type="range" min="0.05" max="1.00" step="0.05" x-model.number="cfg.permafrostSlotLossThreshold" @change="_pfScoreBuild();persist()">
+                <div class="lbl" style="margin-top:5px">Hard Block <b x-text="'$'+(((cfg.minNotional||6)/(cfg.leverage||6))*(cfg.permafrostSlotHardBlockThreshold??0.50)).toFixed(2)"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'('+(Math.round((cfg.permafrostSlotHardBlockThreshold??0.50)*100))+'% margin · clear scorecard to reset)'"></span></div>
+                <input type="range" min="0.10" max="2.00" step="0.10" x-model.number="cfg.permafrostSlotHardBlockThreshold" @change="_pfScoreBuild();persist()">
+                <div class="pfr-hint" style="margin-top:4px" x-text="(()=>{ const b=Object.values(miwBlockedSlots||{}); const d=b.filter(v=>v==='disabled').length,h=b.filter(v=>v==='hardblocked').length,p=b.filter(v=>v==='preemptive').length; return d+h+p===0?'No MIW slots blocked.':[d?d+' disabled':'',h?h+' hard-blocked':'',p?p+' preemptive (partner winning)':''].filter(Boolean).join(' · '); })()"></div>
+              </div>
+            </div>
             <div x-show="cfg.permafrostEnabled" style="margin-top:8px">
               <div class="g" style="margin-top:10px">
                 <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=pfStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
@@ -251,7 +267,10 @@
           if (this.cfg.permafrostCrossEnabled        === undefined) this.cfg.permafrostCrossEnabled        = true;
           if (this.cfg.permafrostCrossWinLossEnabled  === undefined) this.cfg.permafrostCrossWinLossEnabled  = false;
           if (this.cfg.permafrostCrossStatusEnabled    === undefined) this.cfg.permafrostCrossStatusEnabled    = false;
-          if (this.cfg.permafrostScorecardEnabled      === undefined) this.cfg.permafrostScorecardEnabled      = false;
+          if (this.cfg.permafrostScorecardEnabled        === undefined) this.cfg.permafrostScorecardEnabled        = false;
+          if (this.cfg.permafrostAutoBlock               === undefined) this.cfg.permafrostAutoBlock               = false;
+          if (this.cfg.permafrostSlotLossThreshold       === undefined) this.cfg.permafrostSlotLossThreshold       = 0.25;
+          if (this.cfg.permafrostSlotHardBlockThreshold  === undefined) this.cfg.permafrostSlotHardBlockThreshold  = 0.50;
           this._pfScoreBuild();
           try {
             const raw = localStorage.getItem(PFR_KEY);
@@ -500,14 +519,39 @@
           for (const r of records) {
             const key = [...r.criteria].sort().join(',');
             if (!map[key]) map[key] = { criteria: r.criteria, totalPnl: 0, wins: 0, losses: 0 };
-            // Support legacy records that stored win:bool instead of pnl:number
             const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
-            // Invert partner's PnL — opposite direction bot, a partner win is our loss signal
             const ownPnl = r.source === 'winter' ? pnl : -pnl;
             map[key].totalPnl += ownPnl;
             if (ownPnl > 0) map[key].wins++; else map[key].losses++;
           }
           this.pfScoreboard = Object.values(map).sort((a, b) => b.totalPnl - a.totalPnl);
+          // Compute MIW slot block state from raw per-source PnL
+          if (this.cfg.permafrostAutoBlock) {
+            const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+            const lossThresh = baseMargin * (this.cfg.permafrostSlotLossThreshold ?? 0.25);
+            const hardThresh = baseMargin * (this.cfg.permafrostSlotHardBlockThreshold ?? 0.50);
+            const sm = {};
+            for (const r of records) {
+              const key = [...r.criteria].sort().join(',');
+              if (!sm[key]) sm[key] = { ownLoss: 0, partnerLoss: 0, partnerWin: 0 };
+              const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
+              if (r.source === 'winter') {
+                if (pnl < 0) sm[key].ownLoss += Math.abs(pnl);
+              } else {
+                if (pnl < 0) sm[key].partnerLoss += Math.abs(pnl);
+                else if (pnl > 0) sm[key].partnerWin += pnl;
+              }
+            }
+            const blocks = {};
+            for (const [key, m] of Object.entries(sm)) {
+              if (m.ownLoss >= hardThresh) blocks[key] = 'hardblocked';
+              else if (m.ownLoss >= lossThresh && m.partnerLoss < lossThresh) blocks[key] = 'disabled';
+              else if (m.partnerWin >= lossThresh && m.partnerLoss < lossThresh) blocks[key] = 'preemptive';
+            }
+            this.miwBlockedSlots = blocks;
+          } else {
+            this.miwBlockedSlots = {};
+          }
         },
         _pfScorecardHtml() {
           if (!this.pfScoreboard.length) return '<span style="font-size:9px;color:var(--text-lo)">No MIW closes recorded yet.</span>';
