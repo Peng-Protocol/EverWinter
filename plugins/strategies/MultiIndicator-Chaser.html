@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.5.3';
+  const VERSION       = '1.5.4';
   const DEFAULT_SLOTS = [['-fund','+24h','>10pct'],['+fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -150,13 +150,15 @@
                 <div class="tog-t" :class="cfg.micFadeAwayEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Fade Away</div>
-                  <div class="mic-hint">Closes the oldest MIC position when the structure sample is mostly bearish by a set threshold.</div>
+                  <div class="mic-hint">When any MIC position is in loss ≥ threshold, fetches a fresh kline sample. Bad structure → closes oldest position. Good structure → locks until next scan.</div>
                 </div>
               </label>
               <div class="g" x-show="cfg.micFadeAwayEnabled" style="margin-top:8px">
-                <div class="lbl">Bearish Threshold <b x-text="(cfg.micFadeAwayPct??50)+'%'"></b></div>
+                <div class="lbl">Loss Trigger <b x-text="'$'+((cfg.minNotional||6)/(cfg.leverage||6)*(cfg.micFadeAwayLossPct??25)/100).toFixed(2)"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'('+(cfg.micFadeAwayLossPct??25)+'% base margin)'"></span></div>
+                <input type="range" min="5" max="200" step="5" x-model.number="cfg.micFadeAwayLossPct" @change="persist()">
+                <div class="lbl" style="margin-top:5px">Bearish Threshold <b x-text="(cfg.micFadeAwayPct??50)+'%'"></b></div>
                 <input type="range" min="10" max="100" step="5" x-model.number="cfg.micFadeAwayPct" @change="persist()">
-                <div class="mic-hint" x-text="(()=>{ const cache=_micKlineCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(r/t*100).toFixed(0)+'% bearish (trigger @ '+(cfg.micFadeAwayPct??50)+'%)' : 'No kline data yet.'; })()"></div>
+                <div class="mic-hint" x-text="(()=>{ if(_micFadeAwayLocked) return '🔒 Locked — good structure detected. Resets on next scan.'; const cache=_micFadeAwayCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(r/t*100).toFixed(0)+'% bearish (trigger @ '+(cfg.micFadeAwayPct??50)+'%)' : 'No sample yet.'; })()"></div>
               </div>
 
               <!-- Entry Slots -->
@@ -276,6 +278,8 @@
       return Object.assign({}, def, {
 
         micBlockedSlots: {},
+        _micFadeAwayLocked: false,
+        _micFadeAwayCache: {},
 
         async init() {
           await _origInit.call(this);
@@ -300,6 +304,9 @@
           if (this.cfg.micHalvingHours     === undefined) this.cfg.micHalvingHours     = 3;
           if (this.cfg.micFadeAwayEnabled  === undefined) this.cfg.micFadeAwayEnabled  = false;
           if (this.cfg.micFadeAwayPct      === undefined) this.cfg.micFadeAwayPct      = 50;
+          if (this.cfg.micFadeAwayLossPct  === undefined) this.cfg.micFadeAwayLossPct  = 25;
+          this._micFadeAwayLocked = false;
+          this._micFadeAwayCache  = {};
           if (this.cfg.micAutoSlots        === undefined) this.cfg.micAutoSlots        = false;
           if (this.cfg.micAutoSlotSize     === undefined) this.cfg.micAutoSlotSize     = 2;
           this.registerRoleBadge?.(item => {
@@ -312,7 +319,7 @@
           this.log(`[MIC] Multi-Indicator (Chaser) v${VERSION} loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle`, 'info');
           this.renderTradeFeed?.();
           if (this._micExitTimer) clearInterval(this._micExitTimer);
-          this._micExitTimer = setInterval(() => { this._micCheckCascade(); this._micCheckSacrifice(); }, 5000);
+          this._micExitTimer = setInterval(() => { this._micCheckCascade(); this._micCheckSacrifice(); this._micCheckFadeAway(); }, 5000);
         },
 
         _micToggle(i, c) {
@@ -400,6 +407,7 @@
         },
 
         async runScan() {
+          this._micFadeAwayLocked = false;
           await this._micCheckCascade();
           await this._micCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -411,17 +419,50 @@
             this._micLastActedAt = 0;
           }
           await this._micRunScan();
-          await this._micCheckFadeAway();
         },
 
         async _micCheckFadeAway() {
           if (!this.cfg.micFadeAwayEnabled) return;
+          if (this._micFadeAwayLocked) return;
           const micPositions = (this.positions || []).filter(p => p._mic);
           if (!micPositions.length) return;
-          const cache = this._micKlineCache || {};
-          const lastHourStart = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const lossTrig = baseMargin * (this.cfg.micFadeAwayLossPct ?? 25) / 100;
+          const inLoss = micPositions.some(p => (p.unrealizedPnl ?? p.uPnl ?? 0) <= -lossTrig);
+          if (!inLoss) return;
+          const cap = this.cfg.micKlineScanCap ?? 50;
+          const allTickers = this._lastAllTickers || [];
+          let syms = allTickers
+            .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
+            .map(t => t.symbol);
+          if (syms.length > cap) {
+            for (let i = syms.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [syms[i], syms[j]] = [syms[j], syms[i]];
+            }
+            syms = syms.slice(0, cap);
+          }
+          if (!syms.length) return;
+          const now = Date.now();
+          const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
+          const faCache = {};
+          const CONC = 10;
+          for (let i = 0; i < syms.length; i += CONC) {
+            await Promise.all(syms.slice(i, i + CONC).map(async sym => {
+              try {
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
+                if (!r.ok) return;
+                const d = await r.json();
+                const list = d?.result?.list;
+                if (!list || list.length < 2) return;
+                const candle = list[1];
+                faCache[sym] = { candleStart: parseInt(candle[0]), open: parseFloat(candle[1]), close: parseFloat(candle[4]), volume: parseFloat(candle[5]) };
+              } catch(e) {}
+            }));
+          }
+          this._micFadeAwayCache = faCache;
           let red = 0, green = 0;
-          for (const e of Object.values(cache)) {
+          for (const e of Object.values(faCache)) {
             if (e.candleStart !== lastHourStart) continue;
             if (e.close < e.open) red++;
             else if (e.close > e.open) green++;
@@ -431,8 +472,11 @@
           const threshold = (this.cfg.micFadeAwayPct ?? 50) / 100;
           if (red / total >= threshold) {
             const oldest = micPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
-            this.log(`[MIC] 🌬 Fade Away — sample ${red}R/${green}G (${(red / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
+            this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G (${(red / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
             await this.pseudoClosePosition(oldest, 'sacrifice');
+          } else {
+            this._micFadeAwayLocked = true;
+            this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G — structure ok, locked until next scan`, 'info');
           }
         },
 
