@@ -57,6 +57,8 @@ The bulk ticker call is reused for funding rate seeding and 24h change data. A s
 
 The full response is also cached on the instance as `_lastAllTickers`, with `_lastAllTickersAt` (epoch ms) recording when it was fetched. **Strategy plugins that append their own scan pass should reuse this cache when it is under 60 s old instead of re-fetching the endpoint** — a pass appended via the `runScan` wrap runs seconds after the host scan populated it. The age check makes the fallback fetch kick in automatically when the cache is stale (e.g. samplers running during a halt, when scans are skipped before the fetch).
 
+**Halt log dedup**: `_haltLoggedKind` (string | null) is stored on the bot instance. Before the early-return for each halt kind (`'mhl'`, `'dwn'`, `'plk'`, `'glk'`), the halt message is only logged if `_haltLoggedKind !== kind`. The field is set to `kind` on log and cleared to `null` immediately before the cycle body runs — ensuring the message reappears if the halt re-engages after a run.
+
 ---
 
 ## Position Watcher (`pseudoWatchPositions`)
@@ -336,10 +338,38 @@ Under a **strong bias** (`mass ≥ 12` and `|score| ≥ cfg.*StrongScore`, defau
 
 Transform hooks touched: `init`, `persist`, `runScan`, `pseudoClosePosition`, plus the two halt seams per bot. Profile persists under `__permafrost_winter_v1` / `__ashfall_chaser_v1` (events capped at 200, samples at 1000, wave at 2000 points with 7-day TTL). **These keys are plugin-owned and are not touched when the plugin is removed** — data survives an uninstall and is restored automatically on reinstall.
 
+### DDH structure fetch during halts
+
+The 15-second slow-tick interval fires `_afFetchStructure()`/`_pfFetchStructure()` when the host scan is halted. Since scanner cache refreshes do not occur during halts, the plugin fetches its own bulk ticker copy. To avoid duplicate samples more frequently than the bulk ticker cooldown allows, the fetch is gated: it only runs if `Date.now() - (this._afStructureAt || 0) >= _cdMs` where `_cdMs` is derived from `cfg.ashfallCooldown`/`cfg.permafrostCooldown`. The timestamp `_afStructureAt`/`_pfStructureAt` is written on each successful fetch.
+
+### Slot Scorecard
+
+Optional cross-communicator scorecard that tracks win/loss per MIC/MIW criteria combination (slot type). Controlled by `ashfallScorecardEnabled`/`permafrostScorecardEnabled` (toggle in the accordion, peer-level, not under the cross-comm toggle).
+
+**Storage**: `__everwinter_scorecard_v1` in `localStorage` (30-day TTL, written by both plugins under their own `source` field: `'chaser'` for Ashfall, `'winter'` for Permafrost).
+
+**Recording**: `pseudoClosePosition` writes a record when a closed position has `pos._mic`/`pos._miw` set, `pos._micCriteria`/`pos._miwCriteria` is non-empty, and the scorecard is enabled. `pnl > 0` is a win; `pnl ≤ 0` is a loss.
+
+**Criteria key**: the criteria array is sorted and joined (e.g. `'-fund,+24h,>10pct'`) to produce a stable slot key. Records store raw criterion strings, not emojis — each plugin applies its own direction-relative `CRIT_EMOJI` at render time.
+
+**Display**: horizontal chip row in the accordion, sorted by net score (wins − losses) descending. Each chip shows the slot emoji string, a bold net count, and inline dimmed W/L counts. Cross-bot (partner) records are **direction-inverted**: a Winter win = price fell = Chaser would have lost, so partner records apply `win → −1` / `loss → +1` when computing the display score. Net scores can go negative.
+
+**Constants**: `SCORE_KEY = '__everwinter_scorecard_v1'`, `SCORE_TTL = 30 * 24 * 3600 * 1000`. Methods: `_afScoreRead`, `_afScoreWrite` (writes with `source: 'chaser'`), `_afScoreBuild` (assembles the display array from own + inverted partner records), `_afScorecardHtml` (renders chips).
+
+### Structure Sampling bar chart
+
+Two-sided horizontal bar chart rendered in the accordion below the IO score, above the PROFILE block. Data source: `_micKlineCache`/`_miwKlineCache` (populated by the MIC/MIW scan pass). Updated by `_afUpdateKlineBar()`/`_pfUpdateKlineBar()` called from `runScan` after `_origScan`.
+
+The method reads all cache entries whose `candleStart === lastHourStart` (last completed 1h UTC epoch), counting `close < open` (red) and `close > open` (green). These counts are stored in `afKlineBar`/`pfKlineBar: { red, green, max }` where `max = cfg.micKlineScanCap ?? 50`. Bar widths are `Math.min(100, count / max * 100)%`. The red side anchors right, the green side anchors left; both emanate from a center divider.
+
+Permafrost uses `rgba(96,210,255,.55)` (ice blue) for the green bar instead of standard green.
+
 ### UI Elements
 
 - **Mode label suffix** — "+ Permafrost" / "+ Ashfall" via `mode-label-extra` while enabled.
-- **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, PLK toggle and trigger slider, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours). Buttons: **Export** (JSON download of events, samples, and wave history), **Import** (replaces current events, samples, and wave from a JSON file — guarded by `confirm()`), and **Clear Profile** (zeroes events, samples, PnL log, and wave — guarded by `confirm()`). All controls respect the config lock.
+- **Config accordion** — "❄ Permafrost" (ice chip) / "♨ Ashfall" (ember chip) in `strategy-accordions`: mode toggle, **Thaw/Settle Score** slider, **Hard Cap** slider, PLK toggle and trigger slider, **Slot Scorecard** toggle, and a live status block (event/sample counts, latest reading with score and mass, active-halt state with governed/fallback mode and elapsed hours). Buttons: **Export** (JSON download of events, samples, and wave history), **Import** (replaces current events, samples, and wave from a JSON file — guarded by `confirm()`), and **Clear Profile** (zeroes events, samples, PnL log, and wave — guarded by `confirm()`). All controls respect the config lock.
+- **Structure Sampling bar** — two-sided horizontal chart below the IO score row, showing red/green 1h candle distribution from the kline cache.
+- **Slot Scorecard** — chip row sorted best→worst below the Structure Sampling bar; only visible when `ashfallScorecardEnabled`/`permafrostScorecardEnabled` and at least one record exists.
 - **Danger Zone** — collapsible section always visible at the bottom of the accordion (outside the enabled-guard). Contains **Clear Plugin State**: removes the plugin's localStorage key entirely and resets all in-memory data including halt and PLK state. Guarded by `confirm()`. Use before uninstalling to prevent orphaned data, or to guarantee a fully clean slate.
 - **Activity log** — `[PFR]`/`[ASH]` lines: climate recorded at each halt (with mag/breadth/slope/io/score/mass and whether the halt is profile-governed), and the early-lift line with elapsed hours and clearing score. `mag` = the magnitude lens (`skew` in code); `breadth` = the participation lens; `slope` = wave trajectory direction; `io` = crowd funding-rate sentiment (omitted when unavailable).
 
@@ -402,6 +432,9 @@ Matching: for each ticker in the base pool, each active slot is evaluated as `s.
 | `miwKlineVolMin` / `micKlineVolMin` | `25` | Lower bound of the 1h vol spike band (% above 24h hourly average) |
 | `miwKlineVolMax` / `micKlineVolMax` | `50` | Upper bound of the 1h vol spike band |
 | `miwKlineScanCap` / `micKlineScanCap` | `50` | Max tickers randomly sampled per cycle for LSA/LBA kline fetches (range 10–500, step 10) |
+| `miwRollingSacrificeEnabled` / `micRollingSacrificeEnabled` | `false` | When enabled, Sacrifice closes only the oldest MIW/MIC position instead of bailing all |
+| `miwFadeAwayEnabled` / `micFadeAwayEnabled` | `false` | Fade Away toggle — closes oldest position when structure sample is majority bearish (MIC) or bullish (MIW) |
+| `miwFadeAwayPct` / `micFadeAwayPct` | `50` | Directional majority threshold for Fade Away (%) |
 
 **Default slots — Winter** (shorts): `[['+fund','+24h','>10pct'],['-fund','-24h','<10pct']]`
 
@@ -421,9 +454,23 @@ Two optional group-exit features run on a 5-second timer (`_miwExitTimer`/`_micE
 
 **Cascade** (`miwCascadeEnabled`/`micCascadeEnabled`): fires when the collective unrealized PnL of all MIW/MIC positions reaches `± avgMargin × cascadePct / 100`. When triggered, every MIW/MIC position is closed via `pseudoClosePosition` with reason `'cascade'`. Designed to bank a profitable group move before it reverses.
 
-**Sacrifice** (`miwSacrificeEnabled`/`micSacrificeEnabled`): same collective measurement on the loss side — fires when collective uPnL falls to `−avgMargin × sacrificePct / 100`. Closes all MIW/MIC positions to cap the group drawdown. Distinct from the host's drawdown throttle, which gates new entries; Sacrifice closes existing ones.
+**Sacrifice** (`miwSacrificeEnabled`/`micSacrificeEnabled`): same collective measurement on the loss side — fires when collective uPnL falls to `−avgMargin × sacrificePct / 100`. Closes MIW/MIC positions to cap the group drawdown. Distinct from the host's drawdown throttle, which gates new entries; Sacrifice closes existing ones.
+
+**Rolling Window Sacrifice** (`miwRollingSacrificeEnabled`/`micRollingSacrificeEnabled`): sub-mode of Sacrifice. When active, the sacrifice exit closes only the **oldest** MIW/MIC position by `openedAt` instead of bailing all at once. Logic lives in `_miwCheckSacrifice`/`_micCheckSacrifice` — the positions are collected, sorted by `openedAt` ascending, and `reduce` picks the minimum; a single `pseudoClosePosition` call follows. This disables the bail-all branch for that trigger cycle. The toggle is nested under the Sacrifice `x-show` block in the UI.
 
 Both checks run before `_origScan` inside the `runScan` wrap, so a cascade or sacrifice resolves before any new entries open in the same cycle.
+
+### Fade Away
+
+`_miwCheckFadeAway()` / `_micCheckFadeAway()` — called in `runScan` after `_miwRunScan()`/`_micRunScan()` completes.
+
+Reads `_miwKlineCache`/`_micKlineCache` (already populated by the scan pass), counts entries whose `candleStart === lastHourStart` where `close < open` (red) or `close > open` (green). If the directional majority meets the threshold, the **oldest** MIW/MIC position (by `openedAt`) is closed with reason `'sacrifice'`. At most one position closes per scan cycle.
+
+Direction triggers:
+- **MIW** (Winter — shorts): `green / total ≥ miwFadeAwayPct / 100` — a broadly bullish tape fades the short book.
+- **MIC** (Chaser — longs): `red / total ≥ micFadeAwayPct / 100` — a broadly bearish tape fades the long book.
+
+Config keys: `miwFadeAwayEnabled` (default `false`), `miwFadeAwayPct` (default `50`, range 10–100 step 5); mirrors for MIC. The hint line under the threshold slider reads live kline state from `_miwKlineCache`/`_micKlineCache` at render time (e.g. `23R / 27G — 46% bearish (trigger @ 50%)`).
 
 ### CoinGecko market cap data
 

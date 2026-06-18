@@ -6,10 +6,11 @@ Every time you modify an `.html` file in this repo, you **must** increment its v
 
 ### Where versions live
 
-Each file carries its version in two places — update **both**:
+Each file carries its version in two or three places — update **all** that apply:
 
 1. `<title>` tag — e.g. `<title>❄ ChartWinter v1.0 — …</title>`
 2. Subtitle/logo span — e.g. `<div class="logo-sub">… · v1.0 · …</div>` or `<span …>v1.0</span>`
+3. **Plugin `const VERSION`** (plugins only) — a single `const VERSION = 'x.y.z'` declared near the top of each plugin's `<script>` block. Both the manifest `version: VERSION` field and the load-log string use it via template literal (`v${VERSION}`), so there is only **one line to change** per plugin file when bumping.
 
 ### Increment rules
 
@@ -22,13 +23,13 @@ Each file carries its version in two places — update **both**:
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.5.0 |
-| `PseudoChaser.html` | v1.1.0 |
+| `PseudoWinter.html` | v1.6.1 |
+| `PseudoChaser.html` | v1.2.1 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.4.0 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.4.0 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.8.2 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.8.2 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.4.3 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.4.2 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.11.2 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.11.2 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 

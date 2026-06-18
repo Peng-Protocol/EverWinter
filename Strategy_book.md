@@ -10,11 +10,13 @@
    - [Reactive Techniques](#reactive-techniques)
 3. [Strategies](#strategies)
    - [Multi-Indicator](#multi-indicator-strategy)
-   - [Psycho Mode](#psycho-mode)
 4. [Market Intelligence](#market-intelligence)
    - [Structure Learning](#structure-learning)
+   - [Structure Sampling](#structure-sampling)
+   - [Slot Scorecard](#slot-scorecard)
    - [Cross-Side Coordination](#cross-side-coordination)
-5. [Sizing](#sizing)
+5. [Psycho Mode](#psycho-mode)
+6. [Sizing](#sizing)
 6. [Conclusion](#conclusion)
 
 ---
@@ -35,7 +37,7 @@ Neither system predicts the day in advance. The approach is to run both sides si
 
 **Two approaches coexist within this system:**
 
-**Proactive**: Design budget spent at the entry gate — RSI filters across timeframes, lock-in ratchets. Binary mode bounds every position at entry with a fixed TP and SL; no DCA, no extended exposure. A missed entry is acceptable; a bad entry costs exactly the configured SL percentage and nothing more.
+**Proactive**: Design budget spent at the entry gate — slot-based multi-criterion filters. Binary mode bounds every position at entry with a fixed TP and SL; no DCA, no extended exposure. A missed entry is acceptable; a bad entry costs exactly the configured SL percentage and nothing more.
 
 **Reactive (Psycho Mode)**: Design budget spent in the exit system — DCA escalation, aggressive absorption, laggard debt tracking, cascade triggers. Entry filter is one change-percent threshold. Accepts that many entries will be wrong and structures for it mechanically. Capital headroom is the tradeoff.
 
@@ -72,18 +74,6 @@ Binary Mode suits the meta-structure approach: when the read is correct, positio
 When session drawdown exceeds the configured threshold, the scan stops opening new positions. The throttle lifts automatically when PnL recovers.
 
 A session where both sides lose consistently signals a choppy, untradeable environment or a wrong meta-read. Pausing new entries prevents compounding losses into a market that isn't cooperating.
-
----
-
-#### Lock-in System
-
-When a position opens, the symbol's RSI at entry is recorded with a 6-hour TTL. Future re-entries into the same ticker are gated by that stored value. Both lock-ins share the same rationale: a ticker that just moved hard often reverses sharply before resuming. The lock-in makes you follow the move rather than re-enter at the worst point of the cycle.
-
-- **Bullish lock-in**: stored RSI is a **rising floor** — ratchets to the maximum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is below the floor. The ticker must pump to a higher RSI than the last entry before it qualifies again.
-
-- **Bearish lock-in**: stored RSI is a **falling ceiling** — ratchets to the minimum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is above the ceiling. The ticker must decline to a lower RSI than the last entry before it qualifies again.
-
-As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many bearish-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many bullish-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves.
 
 ---
 
@@ -210,12 +200,22 @@ Each strategy is a specific combination of techniques.
 - **<10%** — The volume is below 10% of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
 - **LSA (Sell Spike)** — The last completed hourly candle had a volume spike above the daily average in the configured range, and it closed lower than it opened. A high-volume down candle is sell-side pressure with the market actively participating — not drifting, not choppy, but decisively pointing down. Use this to confirm bearish momentum with volume backing before entering the short side.
 - **LBA (Buy Spike)** — The mirror: high volume in the configured range, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
+- **R-ASL (Quiet Red)** — The last completed hourly candle closed red and its volume was *below* the configured lower spike bound — meaning the market moved down without a volume surge. This is quiet, uncontested selling: no crowd participation, no obvious catalyst. It can signal a slow bleed or a low-conviction pullback that is easier to trade than a violent spike.
+- **R-ABL (Quiet Green)** — The mirror: a green candle with volume below the spike threshold. The market drifted up without conviction. Useful for entries where you expect a measured continuation rather than a sharp move.
 
 **Default configuration**: The default slots cover the primary entry cases. The short side uses: positive funding with price rising, negative funding with price falling, rising price with high participation, and falling price with low participation. The long side uses the directional mirrors of the same. Any slot can be edited, removed, or replaced to build entirely different configurations.
 
 **Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume before the position opens. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
 
-**Exits**: All exits use the standard take-profit and stop-loss settings — no strategy-specific timer or force close. The Multi-Indicator plugin is agnostic to how long a position is held; that is entirely in the hands of the host's exit system.
+**Exits**: All positions opened through this strategy exit through the standard take-profit and stop-loss settings by default. Three optional group-exit modes add further control.
+
+**Group exit: Cascade** — when the combined unrealized profit of all positions opened through this strategy crosses a configured threshold (as a percentage of average entry margin), every one of those positions closes at once. This banks the move before it can reverse. Use it when you want to enforce collective profit-taking across the whole group rather than waiting for each position to reach its individual target.
+
+~~**Group exit: Sacrifice** — the mirror of cascade. When combined unrealized loss crosses a threshold, all positions in the group close to cap the damage. This is a group stop-loss — it fires when the thesis has clearly broken down across the book and further holding would only deepen the loss.~~
+
+**Rolling Window Sacrifice** — a softer version of sacrifice. When the loss threshold is crossed, instead of closing all positions at once, only the oldest one closes. The exposure is reduced gradually, one position per trigger, rather than being eliminated in a single action. Use this when you want staged de-risking rather than a clean sweep.
+
+**Fade Away** — a directional market response. If the broad sample of hourly candles is skewed sufficiently in one direction (configurable threshold, default 50%), the oldest open position closes. For the short side, the trigger is a broadly bullish tape — when the market is broadly going up, the oldest short gets cut first. For the long side, the trigger is a broadly bearish tape. Like rolling sacrifice, this closes one position per cycle. The difference is the trigger: sacrifice fires on your own portfolio's loss level; fade away fires on the market's structural direction as read from the candle sample.
 
 **Components used**:
 - Slot-based AND-gate filter (user-configurable; any combination of criteria per slot, unlimited slots)
@@ -223,12 +223,71 @@ Each strategy is a specific combination of techniques.
 - 24-hour price direction (+24h, -24h)
 - Vol/mcap ratio filter (>10%, <10%)
 - 1h volume spike and candle direction (LSA, LBA)
+- Group cascade exit, group sacrifice exit, rolling window sacrifice, fade away
 - Drawdown throttle and gains lock
-- Climate gate (learned market-structure profile, when Permafrost or Ashfall is loaded)
+- Climate gate (learned market-structure profile, when Structure Learning plugins are loaded)
 
 ---
 
-### Psycho Mode
+## Market Intelligence
+
+The system learns over time. Beyond the slot-based filters and technique configuration, there is an observational layer that watches how the market behaves at the moments that matter most — when positions are closed at a gain or at a loss — and builds a record of what the market looked like in those moments. That record becomes a guide for future sessions.
+
+---
+
+### Structure Learning
+
+Every time a meaningful event occurs — a position closes at target, a drawdown halt triggers, a relief rally is detected — the system takes a snapshot of what the broader market looked like at that moment: how many coins are trending up versus down, the balance of buying and selling pressure, the velocity of the trend. Over many sessions, these snapshots accumulate into a profile.
+
+Before opening new positions, the system compares current market conditions against this profile. If conditions closely resemble what the market looked like during previous drawdown events, the entry gate narrows. If conditions match what the market looked like during profitable periods, the gate opens wider.
+
+This is not a prediction. The system does not know what the market will do next. What it knows is what the market has looked like in the past when things went well and when they went badly — and it lets that pattern shift its confidence before each decision.
+
+The profile improves with time. A fresh installation has no history and places no weight on past structure. After weeks of operation, the profile represents a genuine statistical record of the market's behavior during this system's sessions, shaped by its own entry logic and sizing decisions. It is, in that sense, a learned intuition specific to how this system trades.
+
+---
+
+### Structure Sampling
+
+Before each entry pass, the system reads the last completed hourly candle for a random sample of tickers across the market and counts how many closed red versus how many closed green. The result is displayed as a two-sided bar — red on one end, green on the other — that gives a live read on the market's hourly directional balance.
+
+This is a snapshot, not a forecast. It tells you what the broad market actually did in the last hour, not what it will do next. Paired with the Fade Away exit, it forms a closed loop: the same candle sample that is plotted in the bar is the one that triggers the position close when the balance is sufficiently one-sided. When the bar skews heavily in one direction, the positions exposed to that direction are at risk — Fade Away uses that observation to act automatically.
+
+---
+
+### Slot Scorecard
+
+The scorecard tracks how each entry combination has performed historically. Every time a position opened through the slot-based strategy closes, the system records whether it was a win or a loss and ties that outcome to the specific combination of criteria that triggered the entry.
+
+Over time, the scorecard surfaces which combinations have been consistently profitable and which have been consistently losing. The combinations are displayed as chips sorted from highest net score to lowest. When two sides are running simultaneously, the scores account for direction: a win on the short side represents the same market move as a loss on the long side, so the long side's scorecard inverts the short side's records when displaying them — and vice versa. The result is a single view where each combination is judged relative to the direction of the side showing it.
+
+The scorecard is a diagnostic, not a control. It does not automatically enable or disable slots — it informs the trader which combinations are earning their keep. A combination that consistently shows a negative net score is a candidate for removal or reconfiguration; one with strong wins is worth preserving or even expanding.
+
+---
+
+### Cross-Side Coordination
+
+Each side of the system — the long side and the short side — trades independently. But their outcomes are not independent. When one side is closing positions at a loss, the market is moving against it, which means the market is moving *in favor of* the other side. When one side is closing at a profit and exiting, the move that made those longs profitable is the same move that should be warning the short side to get out.
+
+**The signals:**
+
+A **cascade** on one side — a wave of positions closing at profit — means the market made a decisive move in that direction. For the side that just cashed out, the run may be over. For the *other* side, it is a warning: the market just moved hard against you, and any open positions you're holding into that momentum are likely bleeding. The correct response is to halt new entries and close whatever is exposed.
+
+~~A **sacrifice** on one side — a wave of positions closing at a loss, absorbed and cut — means the market moved decisively against that side. The same move is relief for the other side. If the other side had been halted waiting for conditions to improve, this is the signal that the pressure has shifted. The halt lifts; entries can resume.~~
+
+**Why speed matters:**
+
+These trends can reverse within a few hours. A market that cascades bullish in the morning can ~~sacrifice~~ by afternoon. Waiting for manual confirmation introduces the exact delay that turns a signal into yesterday's news. The window for acting on a cross-side signal is narrow — the value is in responding immediately, not in confirming it after the fact.
+
+**The larger vision:**
+
+The goal is a system that never needs to be manually overridden. A human monitoring both sides would notice when the long side starts closing profitably and would manually pause the short side — but that requires attention, correct interpretation, and quick action. The cross-side coordination handles this automatically. Each side watches the other's outcomes and adjusts in real time.
+
+Combined with the structure-learning layer, this produces a system that gets progressively less reliant on fixed rules and more responsive to the actual conditions it encounters. Fixed configuration handles the stable environment it was tuned for; learned structure handles drift; cross-side signals handle intraday regime shifts. The goal, reached incrementally, is a system that corrects itself before the damage accumulates — without requiring any intervention from the trader.
+
+---
+
+## Psycho Mode
 
 Psycho Mode is the reactive approach in its purest form — no RSI gates, no lock-in, no binary mode. The only filter is absolute 24-hour change exceeding a threshold. All design budget is in the exit system.
 
@@ -251,46 +310,6 @@ Psycho Mode is the reactive approach in its purest form — no RSI gates, no loc
 - *Anti-Martingale (AMa)* (optional) — flat adds into winning positions; TP at −22% after seven adds
 
 **Why individual exhumation rather than collective payback**: A large reactive book with 2× DCA escalation and aggressive absorption accumulates losses faster than any single laggard could realistically recover. Each position owning its own debt is the only workable model at this scale.
-
----
-
-## Market Intelligence
-
-The system learns over time. Beyond the slot-based filters and technique configuration, there is an observational layer that watches how the market behaves at the moments that matter most — when positions are closed at a gain or at a loss — and builds a record of what the market looked like in those moments. That record becomes a guide for future sessions.
-
----
-
-### Structure Learning
-
-Every time a meaningful event occurs — a position closes at target, a drawdown halt triggers, a relief rally is detected — the system takes a snapshot of what the broader market looked like at that moment: how many coins are trending up versus down, the balance of buying and selling pressure, the velocity of the trend. Over many sessions, these snapshots accumulate into a profile.
-
-Before opening new positions, the system compares current market conditions against this profile. If conditions closely resemble what the market looked like during previous drawdown events, the entry gate narrows. If conditions match what the market looked like during profitable periods, the gate opens wider.
-
-This is not a prediction. The system does not know what the market will do next. What it knows is what the market has looked like in the past when things went well and when they went badly — and it lets that pattern shift its confidence before each decision.
-
-The profile improves with time. A fresh installation has no history and places no weight on past structure. After weeks of operation, the profile represents a genuine statistical record of the market's behavior during this system's sessions, shaped by its own entry logic and sizing decisions. It is, in that sense, a learned intuition specific to how this system trades.
-
----
-
-### Cross-Side Coordination
-
-Each side of the system — the long side and the short side — trades independently. But their outcomes are not independent. When one side is closing positions at a loss, the market is moving against it, which means the market is moving *in favor of* the other side. When one side is closing at a profit and exiting, the move that made those longs profitable is the same move that should be warning the short side to get out.
-
-**The signals:**
-
-A **cascade** on one side — a wave of positions closing at profit — means the market made a decisive move in that direction. For the side that just cashed out, the run may be over. For the *other* side, it is a warning: the market just moved hard against you, and any open positions you're holding into that momentum are likely bleeding. The correct response is to halt new entries and close whatever is exposed.
-
-A **sacrifice** on one side — a wave of positions closing at a loss, absorbed and cut — means the market moved decisively against that side. The same move is relief for the other side. If the other side had been halted waiting for conditions to improve, this is the signal that the pressure has shifted. The halt lifts; entries can resume.
-
-**Why speed matters:**
-
-These trends can reverse within a few hours. A market that cascades bullish in the morning can sacrifice by afternoon. Waiting for manual confirmation introduces the exact delay that turns a signal into yesterday's news. The window for acting on a cross-side signal is narrow — the value is in responding immediately, not in confirming it after the fact.
-
-**The larger vision:**
-
-The goal is a system that never needs to be manually overridden. A human monitoring both sides would notice when the long side starts closing profitably and would manually pause the short side — but that requires attention, correct interpretation, and quick action. The cross-side coordination handles this automatically. Each side watches the other's outcomes and adjusts in real time.
-
-Combined with the structure-learning layer, this produces a system that gets progressively less reliant on fixed rules and more responsive to the actual conditions it encounters. Fixed configuration handles the stable environment it was tuned for; learned structure handles drift; cross-side signals handle intraday regime shifts. The goal, reached incrementally, is a system that corrects itself before the damage accumulates — without requiring any intervention from the trader.
 
 ---
 
