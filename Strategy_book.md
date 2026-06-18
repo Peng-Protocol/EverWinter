@@ -10,13 +10,13 @@
    - [Reactive Techniques](#reactive-techniques)
 3. [Strategies](#strategies)
    - [Multi-Indicator](#multi-indicator-strategy)
-   - [Psycho Mode](#psycho-mode)
 4. [Market Intelligence](#market-intelligence)
    - [Structure Learning](#structure-learning)
    - [Structure Sampling](#structure-sampling)
    - [Slot Scorecard](#slot-scorecard)
    - [Cross-Side Coordination](#cross-side-coordination)
-5. [Sizing](#sizing)
+5. [Psycho Mode](#psycho-mode)
+6. [Sizing](#sizing)
 6. [Conclusion](#conclusion)
 
 ---
@@ -37,7 +37,7 @@ Neither system predicts the day in advance. The approach is to run both sides si
 
 **Two approaches coexist within this system:**
 
-**Proactive**: Design budget spent at the entry gate — RSI filters across timeframes, lock-in ratchets. Binary mode bounds every position at entry with a fixed TP and SL; no DCA, no extended exposure. A missed entry is acceptable; a bad entry costs exactly the configured SL percentage and nothing more.
+**Proactive**: Design budget spent at the entry gate — slot-based multi-criterion filters. Binary mode bounds every position at entry with a fixed TP and SL; no DCA, no extended exposure. A missed entry is acceptable; a bad entry costs exactly the configured SL percentage and nothing more.
 
 **Reactive (Psycho Mode)**: Design budget spent in the exit system — DCA escalation, aggressive absorption, laggard debt tracking, cascade triggers. Entry filter is one change-percent threshold. Accepts that many entries will be wrong and structures for it mechanically. Capital headroom is the tradeoff.
 
@@ -74,18 +74,6 @@ Binary Mode suits the meta-structure approach: when the read is correct, positio
 When session drawdown exceeds the configured threshold, the scan stops opening new positions. The throttle lifts automatically when PnL recovers.
 
 A session where both sides lose consistently signals a choppy, untradeable environment or a wrong meta-read. Pausing new entries prevents compounding losses into a market that isn't cooperating.
-
----
-
-#### Lock-in System
-
-When a position opens, the symbol's RSI at entry is recorded with a 6-hour TTL. Future re-entries into the same ticker are gated by that stored value. Both lock-ins share the same rationale: a ticker that just moved hard often reverses sharply before resuming. The lock-in makes you follow the move rather than re-enter at the worst point of the cycle.
-
-- **Bullish lock-in**: stored RSI is a **rising floor** — ratchets to the maximum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is below the floor. The ticker must pump to a higher RSI than the last entry before it qualifies again.
-
-- **Bearish lock-in**: stored RSI is a **falling ceiling** — ratchets to the minimum RSI seen at entry across the TTL window. Re-entry is blocked when current RSI is above the ceiling. The ticker must decline to a lower RSI than the last entry before it qualifies again.
-
-As a session progresses, lock-ins accumulate. The count on each side reflects how many tickers have already moved hard enough in that direction to have been entered and locked out. A session with many bearish-side lock-ins has been producing declining, oversold coins at a high rate — it leaned bearish. A session with many bullish-side lock-ins leaned bullish. The relative density of locked-in tickers is an implicit record of recent market character, written by the trades themselves.
 
 ---
 
@@ -212,6 +200,8 @@ Each strategy is a specific combination of techniques.
 - **<10%** — The volume is below 10% of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
 - **LSA (Sell Spike)** — The last completed hourly candle had a volume spike above the daily average in the configured range, and it closed lower than it opened. A high-volume down candle is sell-side pressure with the market actively participating — not drifting, not choppy, but decisively pointing down. Use this to confirm bearish momentum with volume backing before entering the short side.
 - **LBA (Buy Spike)** — The mirror: high volume in the configured range, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
+- **R-ASL (Quiet Red)** — The last completed hourly candle closed red and its volume was *below* the configured lower spike bound — meaning the market moved down without a volume surge. This is quiet, uncontested selling: no crowd participation, no obvious catalyst. It can signal a slow bleed or a low-conviction pullback that is easier to trade than a violent spike.
+- **R-ABL (Quiet Green)** — The mirror: a green candle with volume below the spike threshold. The market drifted up without conviction. Useful for entries where you expect a measured continuation rather than a sharp move.
 
 **Default configuration**: The default slots cover the primary entry cases. The short side uses: positive funding with price rising, negative funding with price falling, rising price with high participation, and falling price with low participation. The long side uses the directional mirrors of the same. Any slot can be edited, removed, or replaced to build entirely different configurations.
 
@@ -236,32 +226,6 @@ Each strategy is a specific combination of techniques.
 - Group cascade exit, group sacrifice exit, rolling window sacrifice, fade away
 - Drawdown throttle and gains lock
 - Climate gate (learned market-structure profile, when Structure Learning plugins are loaded)
-
----
-
-### Psycho Mode
-
-Psycho Mode is the reactive approach in its purest form — no RSI gates, no lock-in, no binary mode. The only filter is absolute 24-hour change exceeding a threshold. All design budget is in the exit system.
-
-**"Short everything."**
-
-**Book configuration:**
-- 7 DCA stages at 2× escalation — each add doubles the last
-- 25% entry TP ROI, decaying per stage (floored at 3%)
-- Up to 50 concurrent positions, 12 tickers per cycle
-- 48-hour hard deadline as backstop
-
-**Techniques in use:**
-- *Aggressive Absorption* — threshold-triggered, halving cooldown
-- *Laggard debt repository* — uncapped debt holder; non-laggard caps push overflow back to laggard
-- *Exhumation* — absorbed positions receive personalized EH TP; regular TP and laggard rules suspended
-- *DCA Delay* — prevents premature stage commitment on fast-moving tickers
-- *Second Wind* — defers SL when absorption has reduced position below expected margin
-- *Sacrifice* — closes recoverable positions when book has DCA'd heavily
-- *Cascade Triggers* — CPC and PPC; exhumed positions excluded
-- *Anti-Martingale (AMa)* (optional) — flat adds into winning positions; TP at −22% after seven adds
-
-**Why individual exhumation rather than collective payback**: A large reactive book with 2× DCA escalation and aggressive absorption accumulates losses faster than any single laggard could realistically recover. Each position owning its own debt is the only workable model at this scale.
 
 ---
 
@@ -309,17 +273,43 @@ Each side of the system — the long side and the short side — trades independ
 
 A **cascade** on one side — a wave of positions closing at profit — means the market made a decisive move in that direction. For the side that just cashed out, the run may be over. For the *other* side, it is a warning: the market just moved hard against you, and any open positions you're holding into that momentum are likely bleeding. The correct response is to halt new entries and close whatever is exposed.
 
-A **sacrifice** on one side — a wave of positions closing at a loss, absorbed and cut — means the market moved decisively against that side. The same move is relief for the other side. If the other side had been halted waiting for conditions to improve, this is the signal that the pressure has shifted. The halt lifts; entries can resume.
+~~A **sacrifice** on one side — a wave of positions closing at a loss, absorbed and cut — means the market moved decisively against that side. The same move is relief for the other side. If the other side had been halted waiting for conditions to improve, this is the signal that the pressure has shifted. The halt lifts; entries can resume.~~
 
 **Why speed matters:**
 
-These trends can reverse within a few hours. A market that cascades bullish in the morning can sacrifice by afternoon. Waiting for manual confirmation introduces the exact delay that turns a signal into yesterday's news. The window for acting on a cross-side signal is narrow — the value is in responding immediately, not in confirming it after the fact.
+These trends can reverse within a few hours. A market that cascades bullish in the morning can ~~sacrifice~~ by afternoon. Waiting for manual confirmation introduces the exact delay that turns a signal into yesterday's news. The window for acting on a cross-side signal is narrow — the value is in responding immediately, not in confirming it after the fact.
 
 **The larger vision:**
 
 The goal is a system that never needs to be manually overridden. A human monitoring both sides would notice when the long side starts closing profitably and would manually pause the short side — but that requires attention, correct interpretation, and quick action. The cross-side coordination handles this automatically. Each side watches the other's outcomes and adjusts in real time.
 
 Combined with the structure-learning layer, this produces a system that gets progressively less reliant on fixed rules and more responsive to the actual conditions it encounters. Fixed configuration handles the stable environment it was tuned for; learned structure handles drift; cross-side signals handle intraday regime shifts. The goal, reached incrementally, is a system that corrects itself before the damage accumulates — without requiring any intervention from the trader.
+
+---
+
+## Psycho Mode
+
+Psycho Mode is the reactive approach in its purest form — no RSI gates, no lock-in, no binary mode. The only filter is absolute 24-hour change exceeding a threshold. All design budget is in the exit system.
+
+**"Short everything."**
+
+**Book configuration:**
+- 7 DCA stages at 2× escalation — each add doubles the last
+- 25% entry TP ROI, decaying per stage (floored at 3%)
+- Up to 50 concurrent positions, 12 tickers per cycle
+- 48-hour hard deadline as backstop
+
+**Techniques in use:**
+- *Aggressive Absorption* — threshold-triggered, halving cooldown
+- *Laggard debt repository* — uncapped debt holder; non-laggard caps push overflow back to laggard
+- *Exhumation* — absorbed positions receive personalized EH TP; regular TP and laggard rules suspended
+- *DCA Delay* — prevents premature stage commitment on fast-moving tickers
+- *Second Wind* — defers SL when absorption has reduced position below expected margin
+- *Sacrifice* — closes recoverable positions when book has DCA'd heavily
+- *Cascade Triggers* — CPC and PPC; exhumed positions excluded
+- *Anti-Martingale (AMa)* (optional) — flat adds into winning positions; TP at −22% after seven adds
+
+**Why individual exhumation rather than collective payback**: A large reactive book with 2× DCA escalation and aggressive absorption accumulates losses faster than any single laggard could realistically recover. Each position owning its own debt is the only workable model at this scale.
 
 ---
 
