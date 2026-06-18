@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.4.2';
+  const VERSION       = '1.5.7';
   const DEFAULT_SLOTS = [['-fund','+24h','>10pct'],['+fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -150,18 +150,38 @@
                 <div class="tog-t" :class="cfg.micFadeAwayEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Fade Away</div>
-                  <div class="mic-hint">Closes the oldest MIC position when the structure sample is mostly bearish by a set threshold.</div>
+                  <div class="mic-hint">When any MIC position is in loss ≥ threshold, fetches a fresh kline sample. Bad structure → closes oldest position. Good structure → locks until next scan.</div>
                 </div>
               </label>
               <div class="g" x-show="cfg.micFadeAwayEnabled" style="margin-top:8px">
-                <div class="lbl">Bearish Threshold <b x-text="(cfg.micFadeAwayPct??50)+'%'"></b></div>
+                <div class="lbl">Loss Trigger <b x-text="'$'+((cfg.minNotional||6)/(cfg.leverage||6)*(cfg.micFadeAwayLossPct??25)/100).toFixed(2)"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'('+(cfg.micFadeAwayLossPct??25)+'% base margin)'"></span></div>
+                <input type="range" min="5" max="200" step="5" x-model.number="cfg.micFadeAwayLossPct" @change="persist()">
+                <div class="lbl" style="margin-top:5px">Bearish Threshold <b x-text="(cfg.micFadeAwayPct??50)+'%'"></b></div>
                 <input type="range" min="10" max="100" step="5" x-model.number="cfg.micFadeAwayPct" @change="persist()">
-                <div class="mic-hint" x-text="(()=>{ const cache=_micKlineCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(r/t*100).toFixed(0)+'% bearish (trigger @ '+(cfg.micFadeAwayPct??50)+'%)' : 'No kline data yet.'; })()"></div>
+                <div class="mic-hint" x-text="(()=>{ if(_micFadeAwayLocked) return '🔒 Locked — good structure detected. Resets on next scan.'; const cache=_micFadeAwayCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(r/t*100).toFixed(0)+'% bearish (trigger @ '+(cfg.micFadeAwayPct??50)+'%)' : 'No sample yet.'; })()"></div>
               </div>
 
               <!-- Entry Slots -->
               <div style="margin-top:12px">
-                <div class="lbl" style="margin-bottom:6px">Entry Slots <span style="font-size:9px;font-weight:normal;color:var(--text-lo)">(click slot to edit · click criteria to toggle)</span></div>
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                  <div class="lbl" style="margin-bottom:0">Entry Slots</div>
+                  <label class="tog" style="font-size:9px" @click="if(!cfgLocked){cfg.micAutoSlots=!cfg.micAutoSlots;persist()}">
+                    <div class="tog-t" :class="cfg.micAutoSlots?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">Auto</span>
+                  </label>
+                </div>
+
+                <!-- Auto slots controls -->
+                <div x-show="cfg.micAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(255,150,80,.04);border:1px solid rgba(255,150,80,.12);border-radius:3px">
+                  <div class="lbl">Criteria per Slot <b x-text="cfg.micAutoSlotSize??2"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.micAutoSlotSize??2,k=10;let r=1;for(let i=0;i<n;i++)r=r*(k-i)/(i+1);return Math.round(r)})()+' slots'"></span></div>
+                  <input type="range" min="1" max="5" step="1" x-model.number="cfg.micAutoSlotSize" @change="persist()">
+                  <div class="mic-hint">Generates all combinations of the 10 criteria taken N at a time. Manual slots are preserved and restored when Auto is off.</div>
+                  <div x-show="Object.keys(micBlockedSlots||{}).length" class="mic-hint" style="margin-top:3px" x-text="Object.values(micBlockedSlots||{}).filter(v=>v==='blocked').length+' slot(s) blocked (excluded from scan)'"></div>
+                </div>
+
+                <!-- Manual slot builder — hidden when Auto is on -->
+                <div x-show="!cfg.micAutoSlots">
+                  <div class="mic-hint" style="margin-bottom:6px;color:var(--text-lo)">(click slot to edit · click criteria to toggle)</div>
 
                 <!-- Criteria picker — visible when a slot is selected -->
                 <div x-show="cfg.micActiveSlot !== null && cfg.micActiveSlot !== undefined && cfg.micActiveSlot < (cfg.micSlots||[]).length"
@@ -181,7 +201,7 @@
                   <template x-for="(slot, i) in (cfg.micSlots||[])" :key="i">
                     <div class="mic-slot"
                       @click.prevent="if(!cfgLocked){cfg.micActiveSlot=(cfg.micActiveSlot===i?null:i);persist()}"
-                      :style="cfg.micActiveSlot===i ? 'border-color:rgba(255,150,80,.7);background:rgba(255,150,80,.07)' : 'border-color:var(--border);background:transparent'">
+                      :style="(()=>{ const bs=micBlockedSlots[[...slot].sort().join(',')]; return bs==='blocked'?'border-color:rgba(255,80,80,.7);background:rgba(255,80,80,.07)':cfg.micActiveSlot===i?'border-color:rgba(255,150,80,.7);background:rgba(255,150,80,.07)':'border-color:var(--border);background:transparent'; })()">
                       <div style="font-size:8px;color:var(--text-lo)">Slot <span x-text="i+1"></span></div>
                       <div style="display:flex;flex-direction:column;gap:2px;min-height:14px">
                         <template x-for="c in slot" :key="c">
@@ -189,6 +209,7 @@
                         </template>
                         <span x-show="!slot.length" style="font-size:8px;color:var(--text-lo);font-style:italic">empty</span>
                       </div>
+                      <div x-show="micBlockedSlots[[...slot].sort().join(',')]==='blocked'" style="font-size:7px;color:rgba(255,80,80,.7);margin-top:2px;line-height:1.2">⛔ blocked</div>
                       <button x-show="!cfgLocked"
                         @click.stop.prevent="_micDelSlot(i)"
                         style="font-size:8px;color:var(--text-lo);background:none;border:none;cursor:pointer;padding:0;margin-top:2px;line-height:1;opacity:.7">✕</button>
@@ -200,7 +221,8 @@
                 </div>
                 <div class="mic-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. Vol/mcap criteria pull market cap from CoinGecko (1h cache). LSA/LBA/R-ASL/R-ABL fetch the last completed 1h kline per ticker.</div>
                 <div class="mic-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑 -fund · 💸 +fund · ⬆️ +24h · ⬇️ -24h · 🔊 &gt;10% vol/mcap · 🔉 &lt;10% vol/mcap · 🟥 LSA · 🟩 LBA · 🔴 R-ASL · 🟢 R-ABL</div>
-                <div class="g" x-show="(cfg.micSlots||[]).some(s=>s.includes('lsa')||s.includes('lba')||s.includes('rasl')||s.includes('rabl'))" style="margin-top:8px;padding:7px;background:rgba(255,255,255,.03);border-radius:3px;border:1px solid rgba(255,255,255,.07)">
+                </div><!-- end manual builder -->
+                <div class="g" x-show="cfg.micAutoSlots || (cfg.micSlots||[]).some(s=>s.includes('lsa')||s.includes('lba')||s.includes('rasl')||s.includes('rabl'))" style="margin-top:8px;padding:7px;background:rgba(255,255,255,.03);border-radius:3px;border:1px solid rgba(255,255,255,.07)">
                   <div class="lbl">1h Vol Bands <b x-text="'LSA/LBA +'+(cfg.micKlineVolMin??25)+'%→+'+(cfg.micKlineVolMax??50)+'% · R-ASL/R-ABL -'+(cfg.micKlineVolMax??50)+'%→-'+(cfg.micKlineVolMin??25)+'% vs 24h avg'"></b></div>
                   <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:5px">
                     <div>
@@ -229,9 +251,11 @@
           <div class="sec-ttl">MIC Graylist</div>
           <div x-data="{
             get syms() {
-              const ts = _lastAllTickersAt || 0;
-              if (!ts || !_micWaitlist) return [];
-              return Object.keys(_micWaitlist).filter(s => _micWaitlist[s] === ts);
+              void tick;
+              if (!_micWaitlist) return [];
+              const ttl = (cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
+              const now = Date.now();
+              return Object.keys(_micWaitlist).filter(s => _micWaitlist[s] > 0 && now - _micWaitlist[s] < ttl);
             }
           }">
             <div x-show="syms.length === 0" style="font-family:var(--mono);font-size:10px;color:var(--text-lo);padding:2px 0">None — all tickers eligible.</div>
@@ -255,8 +279,15 @@
 
       return Object.assign({}, def, {
 
+        micBlockedSlots: {},
+        micSlotRanks: {},
+        _micFadeAwayLocked: false,
+        _micFadeAwayCache: {},
+
         async init() {
           await _origInit.call(this);
+          if (!this.micBlockedSlots) this.micBlockedSlots = {};
+          if (!this.micSlotRanks) this.micSlotRanks = {};
           if (this.cfg.micEnabled         === undefined) this.cfg.micEnabled         = false;
           if (this.cfg.micPicks           === undefined) this.cfg.micPicks           = 3;
           if (this.cfg.micFrThreshold     === undefined) this.cfg.micFrThreshold     = 0.1;
@@ -277,6 +308,11 @@
           if (this.cfg.micHalvingHours     === undefined) this.cfg.micHalvingHours     = 3;
           if (this.cfg.micFadeAwayEnabled  === undefined) this.cfg.micFadeAwayEnabled  = false;
           if (this.cfg.micFadeAwayPct      === undefined) this.cfg.micFadeAwayPct      = 50;
+          if (this.cfg.micFadeAwayLossPct  === undefined) this.cfg.micFadeAwayLossPct  = 25;
+          this._micFadeAwayLocked = false;
+          this._micFadeAwayCache  = {};
+          if (this.cfg.micAutoSlots        === undefined) this.cfg.micAutoSlots        = false;
+          if (this.cfg.micAutoSlotSize     === undefined) this.cfg.micAutoSlotSize     = 2;
           this.registerRoleBadge?.(item => {
             if (!item || !item._mic) return null;
             const crits  = item._micCriteria || [];
@@ -287,7 +323,7 @@
           this.log(`[MIC] Multi-Indicator (Chaser) v${VERSION} loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle`, 'info');
           this.renderTradeFeed?.();
           if (this._micExitTimer) clearInterval(this._micExitTimer);
-          this._micExitTimer = setInterval(() => { this._micCheckCascade(); this._micCheckSacrifice(); }, 5000);
+          this._micExitTimer = setInterval(() => { this._micCheckCascade(); this._micCheckSacrifice(); this._micCheckFadeAway(); }, 5000);
         },
 
         _micToggle(i, c) {
@@ -375,6 +411,7 @@
         },
 
         async runScan() {
+          this._micFadeAwayLocked = false;
           await this._micCheckCascade();
           await this._micCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -386,17 +423,50 @@
             this._micLastActedAt = 0;
           }
           await this._micRunScan();
-          await this._micCheckFadeAway();
         },
 
         async _micCheckFadeAway() {
           if (!this.cfg.micFadeAwayEnabled) return;
+          if (this._micFadeAwayLocked) return;
           const micPositions = (this.positions || []).filter(p => p._mic);
           if (!micPositions.length) return;
-          const cache = this._micKlineCache || {};
-          const lastHourStart = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const lossTrig = baseMargin * (this.cfg.micFadeAwayLossPct ?? 25) / 100;
+          const inLoss = micPositions.some(p => (p.unrealizedPnl ?? p.uPnl ?? 0) <= -lossTrig);
+          if (!inLoss) return;
+          const cap = this.cfg.micKlineScanCap ?? 50;
+          const allTickers = this._lastAllTickers || [];
+          let syms = allTickers
+            .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
+            .map(t => t.symbol);
+          if (syms.length > cap) {
+            for (let i = syms.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [syms[i], syms[j]] = [syms[j], syms[i]];
+            }
+            syms = syms.slice(0, cap);
+          }
+          if (!syms.length) return;
+          const now = Date.now();
+          const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
+          const faCache = {};
+          const CONC = 10;
+          for (let i = 0; i < syms.length; i += CONC) {
+            await Promise.all(syms.slice(i, i + CONC).map(async sym => {
+              try {
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
+                if (!r.ok) return;
+                const d = await r.json();
+                const list = d?.result?.list;
+                if (!list || list.length < 2) return;
+                const candle = list[1];
+                faCache[sym] = { candleStart: parseInt(candle[0]), open: parseFloat(candle[1]), close: parseFloat(candle[4]), volume: parseFloat(candle[5]) };
+              } catch(e) {}
+            }));
+          }
+          this._micFadeAwayCache = faCache;
           let red = 0, green = 0;
-          for (const e of Object.values(cache)) {
+          for (const e of Object.values(faCache)) {
             if (e.candleStart !== lastHourStart) continue;
             if (e.close < e.open) red++;
             else if (e.close > e.open) green++;
@@ -406,8 +476,11 @@
           const threshold = (this.cfg.micFadeAwayPct ?? 50) / 100;
           if (red / total >= threshold) {
             const oldest = micPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
-            this.log(`[MIC] 🌬 Fade Away — sample ${red}R/${green}G (${(red / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
+            this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G (${(red / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
             await this.pseudoClosePosition(oldest, 'sacrifice');
+          } else {
+            this._micFadeAwayLocked = true;
+            this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G — structure ok, locked until next scan`, 'info');
           }
         },
 
@@ -425,7 +498,7 @@
           const freshAt = this._lastAllTickersAt || 0;
           if (!freshAt || freshAt === this._micLastActedAt) return;
 
-          const slots = (this.cfg.micSlots || []).filter(s => s.length > 0);
+          const slots = this._micEffectiveSlots();
           if (!slots.length) {
             this._micLastActedAt = freshAt;
             this.log('[MIC] 💡 No active slots — skipping', 'info');
@@ -451,12 +524,14 @@
           const needsKline = slots.some(s => s.includes('lsa') || s.includes('lba') || s.includes('rasl') || s.includes('rabl'));
 
           const micWaitlist = this._micWaitlist || {};
+          const _wlTtl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
+          const _wlNow = Date.now();
           const basePool = allTickers.filter(t =>
             t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
             && parseFloat(t.lastPrice || 0) >= 0.001
             && !activeSyms.has(t.symbol)
             && !(this._isSymbolBanned?.(t.symbol))
-            && !(freshAt > 0 && micWaitlist[t.symbol] === freshAt)
+            && !(micWaitlist[t.symbol] > 0 && _wlNow - micWaitlist[t.symbol] < _wlTtl)
           );
 
           // Resolve market caps for vol/mcap criteria if any slot requires them.
@@ -574,8 +649,14 @@
 
         async _micOpen(t, criteria, slotIdx) {
           const sym   = t.symbol;
-          const price = parseFloat(t.lastPrice || 0);
+          let price = parseFloat(t.lastPrice || 0);
           if (!price) return false;
+          try {
+            const r  = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+            const d  = await r.json();
+            const lp = parseFloat(d?.result?.list?.[0]?.lastPrice);
+            if (lp > 0) price = lp;
+          } catch(e) {}
           const change = parseFloat(t.price24hPcnt || 0) * 100;
           const fr     = parseFloat(t.fundingRate  || 0) * 100;
           const lenBefore = (this.positions || []).length;
@@ -649,14 +730,41 @@
           return (c && Date.now() - c.ts < (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000) ? c.mcap : null;
         },
 
+        _micGenerateCombos(size) {
+          const all = ['+fund','-fund','+24h','-24h','>10pct','<10pct','lsa','lba','rasl','rabl'];
+          const result = [];
+          const pick = (start, current) => {
+            if (current.length === size) { result.push([...current]); return; }
+            for (let i = start; i < all.length; i++) {
+              current.push(all[i]);
+              pick(i + 1, current);
+              current.pop();
+            }
+          };
+          pick(0, []);
+          return result;
+        },
+
+        _micEffectiveSlots() {
+          const raw = this.cfg.micAutoSlots
+            ? this._micGenerateCombos(this.cfg.micAutoSlotSize ?? 2)
+            : (this.cfg.micSlots || []).filter(s => s.length > 0);
+          const blocks = this.micBlockedSlots || {};
+          const filtered = Object.keys(blocks).length ? raw.filter(s => !blocks[[...s].sort().join(',')]) : raw;
+          const ranks = this.micSlotRanks || {};
+          if (!Object.keys(ranks).length) return filtered;
+          return filtered.slice().sort((a, b) => {
+            const ka = [...a].sort().join(','), kb = [...b].sort().join(',');
+            const ra = ranks[ka] ?? -Infinity, rb = ranks[kb] ?? -Infinity;
+            return rb - ra;
+          });
+        },
+
         async _micPrefetchKlines(symbols) {
-          if (!this._micKlineCache) this._micKlineCache = {};
+          this._micKlineCache = {};
           const now = Date.now();
           const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
-          const toFetch = symbols.filter(sym => {
-            const c = this._micKlineCache[sym];
-            return !c || c.candleStart !== lastHourStart;
-          });
+          const toFetch = symbols;
           const CONC = 10;
           for (let i = 0; i < toFetch.length; i += CONC) {
             await Promise.all(toFetch.slice(i, i + CONC).map(async sym => {
@@ -687,12 +795,14 @@
           const criteria = pos._micCriteria;
           const prevLen  = this.closedTrades?.length ?? 0;
           await _origClose.call(this, pos, reason, fillPrice);
-          if (isMic && (this.closedTrades?.length ?? 0) > prevLen) {
-            this.closedTrades[0]._mic = true;
-            if (criteria) this.closedTrades[0]._micCriteria = criteria;
-            // Waitlist: block reopening until the next bulk ticker fetch
+          if ((this.closedTrades?.length ?? 0) > prevLen) {
+            // Stamp waitlist for every close — strategy-agnostic, TTL-based
             this._micWaitlist = this._micWaitlist || {};
-            this._micWaitlist[pos.symbol] = this._lastAllTickersAt || 0;
+            this._micWaitlist[pos.symbol] = Date.now();
+            if (isMic) {
+              this.closedTrades[0]._mic = true;
+              if (criteria) this.closedTrades[0]._micCriteria = criteria;
+            }
             this.persist?.();
             this.renderTradeFeed?.();
           }

@@ -207,6 +207,8 @@ Each strategy is a specific combination of techniques.
 
 **Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume before the position opens. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
 
+**Auto-slot builder**: instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with ten available criteria, it produces 45 distinct slots — every pair of signals that could align simultaneously. At size 3, 120 slots. Combined with auto-correction, this creates a self-pruning strategy: all combinations run, and the ones that consistently lose are disabled without manual intervention.
+
 **Exits**: All positions opened through this strategy exit through the standard take-profit and stop-loss settings by default. Three optional group-exit modes add further control.
 
 **Group exit: Cascade** — when the combined unrealized profit of all positions opened through this strategy crosses a configured threshold (as a percentage of average entry margin), every one of those positions closes at once. This banks the move before it can reverse. Use it when you want to enforce collective profit-taking across the whole group rather than waiting for each position to reach its individual target.
@@ -219,6 +221,7 @@ Each strategy is a specific combination of techniques.
 
 **Components used**:
 - Slot-based AND-gate filter (user-configurable; any combination of criteria per slot, unlimited slots)
+- Auto-slot builder (generates all combinations at configured size)
 - Funding rate threshold gate (+fund, -fund)
 - 24-hour price direction (+24h, -24h)
 - Vol/mcap ratio filter (>10%, <10%)
@@ -226,6 +229,7 @@ Each strategy is a specific combination of techniques.
 - Group cascade exit, group sacrifice exit, rolling window sacrifice, fade away
 - Drawdown throttle and gains lock
 - Climate gate (learned market-structure profile, when Structure Learning plugins are loaded)
+- Slot auto-correction (PnL-based auto-disable/re-enable, when Structure Learning plugins are loaded)
 
 ---
 
@@ -257,11 +261,13 @@ This is a snapshot, not a forecast. It tells you what the broad market actually 
 
 ### Slot Scorecard
 
-The scorecard tracks how each entry combination has performed historically. Every time a position opened through the slot-based strategy closes, the system records whether it was a win or a loss and ties that outcome to the specific combination of criteria that triggered the entry.
+The scorecard tracks realized PnL per entry combination. Every time a position opened through the slot-based strategy closes, the outcome is tied to the specific combination of criteria that triggered the entry.
 
-Over time, the scorecard surfaces which combinations have been consistently profitable and which have been consistently losing. The combinations are displayed as chips sorted from highest net score to lowest. When two sides are running simultaneously, the scores account for direction: a win on the short side represents the same market move as a loss on the long side, so the long side's scorecard inverts the short side's records when displaying them — and vice versa. The result is a single view where each combination is judged relative to the direction of the side showing it.
+Combinations are displayed sorted by total PnL. When both sides run simultaneously, the scores account for direction: a win on the short side is a loss for the long side, so each side inverts the other's records in its own view.
 
-The scorecard is a diagnostic, not a control. It does not automatically enable or disable slots — it informs the trader which combinations are earning their keep. A combination that consistently shows a negative net score is a candidate for removal or reconfiguration; one with strong wins is worth preserving or even expanding.
+**Auto-correction**: when enabled, the system uses scorecard data to block combinations automatically. Each combination has a single combined score — own wins raise it, own losses lower it, partner wins lower it further, partner losses raise it back. When the score drops below a configured threshold the combination is blocked. When it recovers above the threshold — because conditions shifted and the partner started losing on it — it unblocks automatically. Combinations that sink deep stay blocked indefinitely; combinations near the threshold fluctuate with the market.
+
+The **CLEAR** button resets all scorecard records and lifts all auto-blocks.
 
 ---
 

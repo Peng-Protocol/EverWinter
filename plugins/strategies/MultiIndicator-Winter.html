@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.4.3';
+  const VERSION       = '1.5.7';
   const DEFAULT_SLOTS = [['+fund','+24h','>10pct'],['-fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -150,18 +150,38 @@
                 <div class="tog-t" :class="cfg.miwFadeAwayEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Fade Away</div>
-                  <div class="miw-hint">Closes the oldest MIW position when the structure sample is mostly bullish by a set threshold.</div>
+                  <div class="miw-hint">When any MIW position is in loss ≥ threshold, fetches a fresh kline sample. Bad structure → closes oldest position. Good structure → locks until next scan.</div>
                 </div>
               </label>
               <div class="g" x-show="cfg.miwFadeAwayEnabled" style="margin-top:8px">
-                <div class="lbl">Bullish Threshold <b x-text="(cfg.miwFadeAwayPct??50)+'%'"></b></div>
+                <div class="lbl">Loss Trigger <b x-text="'$'+((cfg.minNotional||6)/(cfg.leverage||6)*(cfg.miwFadeAwayLossPct??25)/100).toFixed(2)"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'('+(cfg.miwFadeAwayLossPct??25)+'% base margin)'"></span></div>
+                <input type="range" min="5" max="200" step="5" x-model.number="cfg.miwFadeAwayLossPct" @change="persist()">
+                <div class="lbl" style="margin-top:5px">Bullish Threshold <b x-text="(cfg.miwFadeAwayPct??50)+'%'"></b></div>
                 <input type="range" min="10" max="100" step="5" x-model.number="cfg.miwFadeAwayPct" @change="persist()">
-                <div class="miw-hint" x-text="(()=>{ const cache=_miwKlineCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(g/t*100).toFixed(0)+'% bullish (trigger @ '+(cfg.miwFadeAwayPct??50)+'%)' : 'No kline data yet.'; })()"></div>
+                <div class="miw-hint" x-text="(()=>{ if(_miwFadeAwayLocked) return '🔒 Locked — good structure detected. Resets on next scan.'; const cache=_miwFadeAwayCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(g/t*100).toFixed(0)+'% bullish (trigger @ '+(cfg.miwFadeAwayPct??50)+'%)' : 'No sample yet.'; })()"></div>
               </div>
 
               <!-- Entry Slots -->
               <div style="margin-top:12px">
-                <div class="lbl" style="margin-bottom:6px">Entry Slots <span style="font-size:9px;font-weight:normal;color:var(--text-lo)">(click slot to edit · click criteria to toggle)</span></div>
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+                  <div class="lbl" style="margin-bottom:0">Entry Slots</div>
+                  <label class="tog" style="font-size:9px" @click="if(!cfgLocked){cfg.miwAutoSlots=!cfg.miwAutoSlots;persist()}">
+                    <div class="tog-t" :class="cfg.miwAutoSlots?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">Auto</span>
+                  </label>
+                </div>
+
+                <!-- Auto slots controls -->
+                <div x-show="cfg.miwAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(96,210,255,.04);border:1px solid rgba(96,210,255,.12);border-radius:3px">
+                  <div class="lbl">Criteria per Slot <b x-text="cfg.miwAutoSlotSize??2"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.miwAutoSlotSize??2,k=10;let r=1;for(let i=0;i<n;i++)r=r*(k-i)/(i+1);return Math.round(r)})()+' slots'"></span></div>
+                  <input type="range" min="1" max="5" step="1" x-model.number="cfg.miwAutoSlotSize" @change="persist()">
+                  <div class="miw-hint">Generates all combinations of the 10 criteria taken N at a time. Manual slots are preserved and restored when Auto is off.</div>
+                  <div x-show="Object.keys(miwBlockedSlots||{}).length" class="miw-hint" style="margin-top:3px" x-text="Object.values(miwBlockedSlots||{}).filter(v=>v==='blocked').length+' slot(s) blocked (excluded from scan)'"></div>
+                </div>
+
+                <!-- Manual slot builder — hidden when Auto is on -->
+                <div x-show="!cfg.miwAutoSlots">
+                  <div class="miw-hint" style="margin-bottom:6px;color:var(--text-lo)">(click slot to edit · click criteria to toggle)</div>
 
                 <!-- Criteria picker — visible when a slot is selected -->
                 <div x-show="cfg.miwActiveSlot !== null && cfg.miwActiveSlot !== undefined && cfg.miwActiveSlot < (cfg.miwSlots||[]).length"
@@ -181,7 +201,7 @@
                   <template x-for="(slot, i) in (cfg.miwSlots||[])" :key="i">
                     <div class="miw-slot"
                       @click.prevent="if(!cfgLocked){cfg.miwActiveSlot=(cfg.miwActiveSlot===i?null:i);persist()}"
-                      :style="cfg.miwActiveSlot===i ? 'border-color:rgba(96,210,255,.7);background:rgba(96,210,255,.07)' : 'border-color:var(--border);background:transparent'">
+                      :style="(()=>{ const bs=miwBlockedSlots[[...slot].sort().join(',')]; return bs==='blocked'?'border-color:rgba(255,80,80,.7);background:rgba(255,80,80,.07)':cfg.miwActiveSlot===i?'border-color:rgba(96,210,255,.7);background:rgba(96,210,255,.07)':'border-color:var(--border);background:transparent'; })()">
                       <div style="font-size:8px;color:var(--text-lo)">Slot <span x-text="i+1"></span></div>
                       <div style="display:flex;flex-direction:column;gap:2px;min-height:14px">
                         <template x-for="c in slot" :key="c">
@@ -189,6 +209,7 @@
                         </template>
                         <span x-show="!slot.length" style="font-size:8px;color:var(--text-lo);font-style:italic">empty</span>
                       </div>
+                      <div x-show="miwBlockedSlots[[...slot].sort().join(',')]==='blocked'" style="font-size:7px;color:rgba(255,80,80,.7);margin-top:2px;line-height:1.2">⛔ blocked</div>
                       <button x-show="!cfgLocked"
                         @click.stop.prevent="_miwDelSlot(i)"
                         style="font-size:8px;color:var(--text-lo);background:none;border:none;cursor:pointer;padding:0;margin-top:2px;line-height:1;opacity:.7">✕</button>
@@ -200,7 +221,8 @@
                 </div>
                 <div class="miw-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. Vol/mcap criteria pull market cap from CoinGecko (1h cache). LSA/LBA/R-ASL/R-ABL fetch the last completed 1h kline per ticker.</div>
                 <div class="miw-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑 +fund · 💸 -fund · ⬆️ +24h · ⬇️ -24h · 🔊 &gt;10% vol/mcap · 🔉 &lt;10% vol/mcap · 🟥 LSA · 🟩 LBA · 🔴 R-ASL · 🟢 R-ABL</div>
-                <div class="g" x-show="(cfg.miwSlots||[]).some(s=>s.includes('lsa')||s.includes('lba')||s.includes('rasl')||s.includes('rabl'))" style="margin-top:8px;padding:7px;background:rgba(255,255,255,.03);border-radius:3px;border:1px solid rgba(255,255,255,.07)">
+                </div><!-- end manual builder -->
+                <div class="g" x-show="cfg.miwAutoSlots || (cfg.miwSlots||[]).some(s=>s.includes('lsa')||s.includes('lba')||s.includes('rasl')||s.includes('rabl'))" style="margin-top:8px;padding:7px;background:rgba(255,255,255,.03);border-radius:3px;border:1px solid rgba(255,255,255,.07)">
                   <div class="lbl">1h Vol Bands <b x-text="'LSA/LBA +'+(cfg.miwKlineVolMin??25)+'%→+'+(cfg.miwKlineVolMax??50)+'% · R-ASL/R-ABL -'+(cfg.miwKlineVolMax??50)+'%→-'+(cfg.miwKlineVolMin??25)+'% vs 24h avg'"></b></div>
                   <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:5px">
                     <div>
@@ -229,9 +251,11 @@
           <div class="sec-ttl">MIW Graylist</div>
           <div x-data="{
             get syms() {
-              const ts = _lastAllTickersAt || 0;
-              if (!ts || !_miwWaitlist) return [];
-              return Object.keys(_miwWaitlist).filter(s => _miwWaitlist[s] === ts);
+              void tick;
+              if (!_miwWaitlist) return [];
+              const ttl = (cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
+              const now = Date.now();
+              return Object.keys(_miwWaitlist).filter(s => _miwWaitlist[s] > 0 && now - _miwWaitlist[s] < ttl);
             }
           }">
             <div x-show="syms.length === 0" style="font-family:var(--mono);font-size:10px;color:var(--text-lo);padding:2px 0">None — all tickers eligible.</div>
@@ -255,8 +279,15 @@
 
       return Object.assign({}, def, {
 
+        miwBlockedSlots: {},
+        miwSlotRanks: {},
+        _miwFadeAwayLocked: false,
+        _miwFadeAwayCache: {},
+
         async init() {
           await _origInit.call(this);
+          if (!this.miwBlockedSlots) this.miwBlockedSlots = {};
+          if (!this.miwSlotRanks) this.miwSlotRanks = {};
           if (this.cfg.miwEnabled         === undefined) this.cfg.miwEnabled         = false;
           if (this.cfg.miwPicks           === undefined) this.cfg.miwPicks           = 3;
           if (this.cfg.miwFrThreshold     === undefined) this.cfg.miwFrThreshold     = 0.1;
@@ -277,6 +308,11 @@
           if (this.cfg.miwHalvingHours     === undefined) this.cfg.miwHalvingHours     = 3;
           if (this.cfg.miwFadeAwayEnabled  === undefined) this.cfg.miwFadeAwayEnabled  = false;
           if (this.cfg.miwFadeAwayPct      === undefined) this.cfg.miwFadeAwayPct      = 50;
+          if (this.cfg.miwFadeAwayLossPct  === undefined) this.cfg.miwFadeAwayLossPct  = 25;
+          this._miwFadeAwayLocked = false;
+          this._miwFadeAwayCache  = {};
+          if (this.cfg.miwAutoSlots        === undefined) this.cfg.miwAutoSlots        = false;
+          if (this.cfg.miwAutoSlotSize     === undefined) this.cfg.miwAutoSlotSize     = 2;
           this.registerRoleBadge?.(item => {
             if (!item || !item._miw) return null;
             const crits  = item._miwCriteria || [];
@@ -287,7 +323,7 @@
           this.log(`[MIW] Multi-Indicator (Winter) v${VERSION} loaded — ${this.cfg.miwEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.miwSlots||[]).length} slots | ${this.cfg.miwPicks}/cycle`, 'info');
           this.renderTradeFeed?.();
           if (this._miwExitTimer) clearInterval(this._miwExitTimer);
-          this._miwExitTimer = setInterval(() => { this._miwCheckCascade(); this._miwCheckSacrifice(); }, 5000);
+          this._miwExitTimer = setInterval(() => { this._miwCheckCascade(); this._miwCheckSacrifice(); this._miwCheckFadeAway(); }, 5000);
         },
 
         _miwToggle(i, c) {
@@ -375,6 +411,7 @@
         },
 
         async runScan() {
+          this._miwFadeAwayLocked = false;
           await this._miwCheckCascade();
           await this._miwCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -391,12 +428,47 @@
 
         async _miwCheckFadeAway() {
           if (!this.cfg.miwFadeAwayEnabled) return;
+          if (this._miwFadeAwayLocked) return;
           const miwPositions = (this.positions || []).filter(p => p._miw);
           if (!miwPositions.length) return;
-          const cache = this._miwKlineCache || {};
-          const lastHourStart = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const lossTrig = baseMargin * (this.cfg.miwFadeAwayLossPct ?? 25) / 100;
+          const inLoss = miwPositions.some(p => (p.unrealizedPnl ?? p.uPnl ?? 0) <= -lossTrig);
+          if (!inLoss) return;
+          // Impromptu kline fetch into a separate cache (does not flush _miwKlineCache)
+          const cap = this.cfg.miwKlineScanCap ?? 50;
+          const allTickers = this._lastAllTickers || [];
+          let syms = allTickers
+            .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
+            .map(t => t.symbol);
+          if (syms.length > cap) {
+            for (let i = syms.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [syms[i], syms[j]] = [syms[j], syms[i]];
+            }
+            syms = syms.slice(0, cap);
+          }
+          if (!syms.length) return;
+          const now = Date.now();
+          const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
+          const faCache = {};
+          const CONC = 10;
+          for (let i = 0; i < syms.length; i += CONC) {
+            await Promise.all(syms.slice(i, i + CONC).map(async sym => {
+              try {
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
+                if (!r.ok) return;
+                const d = await r.json();
+                const list = d?.result?.list;
+                if (!list || list.length < 2) return;
+                const candle = list[1];
+                faCache[sym] = { candleStart: parseInt(candle[0]), open: parseFloat(candle[1]), close: parseFloat(candle[4]), volume: parseFloat(candle[5]) };
+              } catch(e) {}
+            }));
+          }
+          this._miwFadeAwayCache = faCache;
           let red = 0, green = 0;
-          for (const e of Object.values(cache)) {
+          for (const e of Object.values(faCache)) {
             if (e.candleStart !== lastHourStart) continue;
             if (e.close < e.open) red++;
             else if (e.close > e.open) green++;
@@ -406,8 +478,11 @@
           const threshold = (this.cfg.miwFadeAwayPct ?? 50) / 100;
           if (green / total >= threshold) {
             const oldest = miwPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
-            this.log(`[MIW] 🌬 Fade Away — sample ${red}R/${green}G (${(green / total * 100).toFixed(0)}% bullish ≥ ${this.cfg.miwFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
+            this.log(`[MIW] 🌬 Fade Away — ${red}R/${green}G (${(green / total * 100).toFixed(0)}% bullish ≥ ${this.cfg.miwFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
             await this.pseudoClosePosition(oldest, 'sacrifice');
+          } else {
+            this._miwFadeAwayLocked = true;
+            this.log(`[MIW] 🌬 Fade Away — ${red}R/${green}G — structure ok, locked until next scan`, 'info');
           }
         },
 
@@ -425,7 +500,7 @@
           const freshAt = this._lastAllTickersAt || 0;
           if (!freshAt || freshAt === this._miwLastActedAt) return;
 
-          const slots = (this.cfg.miwSlots || []).filter(s => s.length > 0);
+          const slots = this._miwEffectiveSlots();
           if (!slots.length) {
             this._miwLastActedAt = freshAt;
             this.log('[MIW] 💡 No active slots — skipping', 'info');
@@ -451,12 +526,14 @@
           const needsKline = slots.some(s => s.includes('lsa') || s.includes('lba') || s.includes('rasl') || s.includes('rabl'));
 
           const miwWaitlist = this._miwWaitlist || {};
+          const _wlTtl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
+          const _wlNow = Date.now();
           const basePool = allTickers.filter(t =>
             t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
             && parseFloat(t.lastPrice || 0) >= 0.001
             && !activeSyms.has(t.symbol)
             && !(this._isSymbolBanned?.(t.symbol))
-            && !(freshAt > 0 && miwWaitlist[t.symbol] === freshAt)
+            && !(miwWaitlist[t.symbol] > 0 && _wlNow - miwWaitlist[t.symbol] < _wlTtl)
           );
 
           // Resolve market caps for vol/mcap criteria if any slot requires them.
@@ -568,8 +645,14 @@
 
         async _miwOpen(t, criteria, slotIdx) {
           const sym   = t.symbol;
-          const price = parseFloat(t.lastPrice || 0);
+          let price = parseFloat(t.lastPrice || 0);
           if (!price) return false;
+          try {
+            const r  = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+            const d  = await r.json();
+            const lp = parseFloat(d?.result?.list?.[0]?.lastPrice);
+            if (lp > 0) price = lp;
+          } catch(e) {}
           const change = parseFloat(t.price24hPcnt || 0) * 100;
           const fr     = parseFloat(t.fundingRate  || 0) * 100;
           const lenBefore = (this.positions || []).length;
@@ -643,15 +726,42 @@
           return (c && Date.now() - c.ts < (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000) ? c.mcap : null;
         },
 
+        _miwGenerateCombos(size) {
+          const all = ['+fund','-fund','+24h','-24h','>10pct','<10pct','lsa','lba','rasl','rabl'];
+          const result = [];
+          const pick = (start, current) => {
+            if (current.length === size) { result.push([...current]); return; }
+            for (let i = start; i < all.length; i++) {
+              current.push(all[i]);
+              pick(i + 1, current);
+              current.pop();
+            }
+          };
+          pick(0, []);
+          return result;
+        },
+
+        _miwEffectiveSlots() {
+          const raw = this.cfg.miwAutoSlots
+            ? this._miwGenerateCombos(this.cfg.miwAutoSlotSize ?? 2)
+            : (this.cfg.miwSlots || []).filter(s => s.length > 0);
+          const blocks = this.miwBlockedSlots || {};
+          const filtered = Object.keys(blocks).length ? raw.filter(s => !blocks[[...s].sort().join(',')]) : raw;
+          const ranks = this.miwSlotRanks || {};
+          if (!Object.keys(ranks).length) return filtered;
+          return filtered.slice().sort((a, b) => {
+            const ka = [...a].sort().join(','), kb = [...b].sort().join(',');
+            const ra = ranks[ka] ?? -Infinity, rb = ranks[kb] ?? -Infinity;
+            return rb - ra;
+          });
+        },
+
         async _miwPrefetchKlines(symbols) {
-          if (!this._miwKlineCache) this._miwKlineCache = {};
+          this._miwKlineCache = {};
           const now = Date.now();
           // Last completed 1h candle start — current UTC hour minus one hour
           const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
-          const toFetch = symbols.filter(sym => {
-            const c = this._miwKlineCache[sym];
-            return !c || c.candleStart !== lastHourStart;
-          });
+          const toFetch = symbols;
           const CONC = 10;
           for (let i = 0; i < toFetch.length; i += CONC) {
             await Promise.all(toFetch.slice(i, i + CONC).map(async sym => {
@@ -682,12 +792,14 @@
           const criteria = pos._miwCriteria;
           const prevLen  = this.closedTrades?.length ?? 0;
           await _origClose.call(this, pos, reason, fillPrice);
-          if (isMiw && (this.closedTrades?.length ?? 0) > prevLen) {
-            this.closedTrades[0]._miw = true;
-            if (criteria) this.closedTrades[0]._miwCriteria = criteria;
-            // Waitlist: block reopening until the next bulk ticker fetch
+          if ((this.closedTrades?.length ?? 0) > prevLen) {
+            // Stamp waitlist for every close — strategy-agnostic, TTL-based
             this._miwWaitlist = this._miwWaitlist || {};
-            this._miwWaitlist[pos.symbol] = this._lastAllTickersAt || 0;
+            this._miwWaitlist[pos.symbol] = Date.now();
+            if (isMiw) {
+              this.closedTrades[0]._miw = true;
+              if (criteria) this.closedTrades[0]._miwCriteria = criteria;
+            }
             this.persist?.();
             this.renderTradeFeed?.();
           }
