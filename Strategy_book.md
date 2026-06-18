@@ -13,6 +13,8 @@
    - [Psycho Mode](#psycho-mode)
 4. [Market Intelligence](#market-intelligence)
    - [Structure Learning](#structure-learning)
+   - [Structure Sampling](#structure-sampling)
+   - [Slot Scorecard](#slot-scorecard)
    - [Cross-Side Coordination](#cross-side-coordination)
 5. [Sizing](#sizing)
 6. [Conclusion](#conclusion)
@@ -215,7 +217,15 @@ Each strategy is a specific combination of techniques.
 
 **Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume before the position opens. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
 
-**Exits**: All exits use the standard take-profit and stop-loss settings — no strategy-specific timer or force close. The Multi-Indicator plugin is agnostic to how long a position is held; that is entirely in the hands of the host's exit system.
+**Exits**: All positions opened through this strategy exit through the standard take-profit and stop-loss settings by default. Three optional group-exit modes add further control.
+
+**Group exit: Cascade** — when the combined unrealized profit of all positions opened through this strategy crosses a configured threshold (as a percentage of average entry margin), every one of those positions closes at once. This banks the move before it can reverse. Use it when you want to enforce collective profit-taking across the whole group rather than waiting for each position to reach its individual target.
+
+**Group exit: Sacrifice** — the mirror of cascade. When combined unrealized loss crosses a threshold, all positions in the group close to cap the damage. This is a group stop-loss — it fires when the thesis has clearly broken down across the book and further holding would only deepen the loss.
+
+**Rolling Window Sacrifice** — a softer version of sacrifice. When the loss threshold is crossed, instead of closing all positions at once, only the oldest one closes. The exposure is reduced gradually, one position per trigger, rather than being eliminated in a single action. Use this when you want staged de-risking rather than a clean sweep.
+
+**Fade Away** — a directional market response. If the broad sample of hourly candles is skewed sufficiently in one direction (configurable threshold, default 50%), the oldest open position closes. For the short side, the trigger is a broadly bullish tape — when the market is broadly going up, the oldest short gets cut first. For the long side, the trigger is a broadly bearish tape. Like rolling sacrifice, this closes one position per cycle. The difference is the trigger: sacrifice fires on your own portfolio's loss level; fade away fires on the market's structural direction as read from the candle sample.
 
 **Components used**:
 - Slot-based AND-gate filter (user-configurable; any combination of criteria per slot, unlimited slots)
@@ -223,8 +233,9 @@ Each strategy is a specific combination of techniques.
 - 24-hour price direction (+24h, -24h)
 - Vol/mcap ratio filter (>10%, <10%)
 - 1h volume spike and candle direction (LSA, LBA)
+- Group cascade exit, group sacrifice exit, rolling window sacrifice, fade away
 - Drawdown throttle and gains lock
-- Climate gate (learned market-structure profile, when Permafrost or Ashfall is loaded)
+- Climate gate (learned market-structure profile, when Structure Learning plugins are loaded)
 
 ---
 
@@ -269,6 +280,24 @@ Before opening new positions, the system compares current market conditions agai
 This is not a prediction. The system does not know what the market will do next. What it knows is what the market has looked like in the past when things went well and when they went badly — and it lets that pattern shift its confidence before each decision.
 
 The profile improves with time. A fresh installation has no history and places no weight on past structure. After weeks of operation, the profile represents a genuine statistical record of the market's behavior during this system's sessions, shaped by its own entry logic and sizing decisions. It is, in that sense, a learned intuition specific to how this system trades.
+
+---
+
+### Structure Sampling
+
+Before each entry pass, the system reads the last completed hourly candle for a random sample of tickers across the market and counts how many closed red versus how many closed green. The result is displayed as a two-sided bar — red on one end, green on the other — that gives a live read on the market's hourly directional balance.
+
+This is a snapshot, not a forecast. It tells you what the broad market actually did in the last hour, not what it will do next. Paired with the Fade Away exit, it forms a closed loop: the same candle sample that is plotted in the bar is the one that triggers the position close when the balance is sufficiently one-sided. When the bar skews heavily in one direction, the positions exposed to that direction are at risk — Fade Away uses that observation to act automatically.
+
+---
+
+### Slot Scorecard
+
+The scorecard tracks how each entry combination has performed historically. Every time a position opened through the slot-based strategy closes, the system records whether it was a win or a loss and ties that outcome to the specific combination of criteria that triggered the entry.
+
+Over time, the scorecard surfaces which combinations have been consistently profitable and which have been consistently losing. The combinations are displayed as chips sorted from highest net score to lowest. When two sides are running simultaneously, the scores account for direction: a win on the short side represents the same market move as a loss on the long side, so the long side's scorecard inverts the short side's records when displaying them — and vice versa. The result is a single view where each combination is judged relative to the direction of the side showing it.
+
+The scorecard is a diagnostic, not a control. It does not automatically enable or disable slots — it informs the trader which combinations are earning their keep. A combination that consistently shows a negative net score is a candidate for removal or reconfiguration; one with strong wins is worth preserving or even expanding.
 
 ---
 
