@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.6.0';
+  const VERSION       = '1.7.0';
   const DEFAULT_SLOTS = [['+fund','+24h','>10pct'],['-fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -171,6 +171,30 @@
                 </label>
               </div>
 
+              <!-- Liq Fade Away -->
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.miwLiqFadeEnabled=!cfg.miwLiqFadeEnabled;persist()}">
+                <div class="tog-t" :class="cfg.miwLiqFadeEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Liq Fade Away</div>
+                  <div class="miw-hint">Sums raw USDT liquidation turnover across the Permafrost sample. B-Liq dominant → closes all positions and locks entries for 1h.</div>
+                </div>
+              </label>
+              <div class="g" x-show="cfg.miwLiqFadeEnabled" style="margin-top:8px">
+                <div class="lbl">B-Liq Threshold <b x-text="(cfg.miwLiqFadePct??50)+'%'"></b></div>
+                <input type="range" min="10" max="100" step="5" x-model.number="cfg.miwLiqFadePct" @change="persist()">
+                <div class="miw-hint" x-text="(()=>{ const r=Object.values(_liqResults||{}); if(!r.length) return 'No liq data yet.'; let s=0,b=0; for(const e of r){s+=e.sLiqRaw||0;b+=e.bLiqRaw||0;} const t=s+b; if(!t) return 'No turnover data.'; const lock=_miwLiqFadeLockedUntil||0; const locked=Date.now()<lock; return (b/t*100).toFixed(0)+'% B-Liq / '+(s/t*100).toFixed(0)+'% S-Liq across '+r.length+' tickers'+(locked?' · locked ~'+Math.ceil((lock-Date.now())/60000)+'m':''); })()"></div>
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.miwLiqFadeBlockEntries=!cfg.miwLiqFadeBlockEntries;persist()}">
+                  <div class="tog-t" :class="cfg.miwLiqFadeBlockEntries?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Block Entries on Bad Liq</div>
+                    <div style="display:flex;align-items:center;gap:5px;margin-top:2px">
+                      <div class="miw-hint" style="margin-top:0">Blocks new entries when B-Liq dominates. Lifts at next hourly check.</div>
+                      <span x-show="cfg.miwLiqFadeBlockEntries && _miwLiqBlocked" style="flex-shrink:0;font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;background:rgba(255,80,80,.12);border:1px solid rgba(255,80,80,.45);color:rgba(255,80,80,.9);letter-spacing:.5px">⛔ BLOCKING</span>
+                    </div>
+                  </div>
+                </label>
+              </div>
+
               <!-- Entry Slots -->
               <div style="margin-top:12px">
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
@@ -293,6 +317,8 @@
         _miwFadeAwayLocked: false,
         _miwFadeAwayCache: {},
         _miwStructureBlocked: false,
+        _miwLiqFadeLockedUntil: 0,
+        _miwLiqBlocked: false,
 
         async init() {
           await _origInit.call(this);
@@ -322,6 +348,11 @@
           this._miwFadeAwayLocked   = false;
           this._miwFadeAwayCache    = {};
           this._miwStructureBlocked = false;
+          if (this.cfg.miwLiqFadeEnabled      === undefined) this.cfg.miwLiqFadeEnabled      = false;
+          if (this.cfg.miwLiqFadePct          === undefined) this.cfg.miwLiqFadePct          = 50;
+          if (this.cfg.miwLiqFadeBlockEntries === undefined) this.cfg.miwLiqFadeBlockEntries = false;
+          this._miwLiqFadeLockedUntil = 0;
+          this._miwLiqBlocked         = false;
           if (this.cfg.miwAutoSlots        === undefined) this.cfg.miwAutoSlots        = false;
           if (this.cfg.miwAutoSlotSize     === undefined) this.cfg.miwAutoSlotSize     = 2;
           this.registerRoleBadge?.(item => {
@@ -424,6 +455,7 @@
         async runScan() {
           this._miwFadeAwayLocked = false;
           await this._miwCheckFadeAway();
+          await this._miwCheckLiqFadeAway();
           await this._miwCheckCascade();
           await this._miwCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -504,6 +536,32 @@
           }
         },
 
+        async _miwCheckLiqFadeAway() {
+          if (!this.cfg.miwLiqFadeEnabled) { this._miwLiqBlocked = false; return; }
+          if (Date.now() < (this._miwLiqFadeLockedUntil || 0)) return;
+          const results = Object.values(this._liqResults || {});
+          if (!results.length) return;
+          let totalS = 0, totalB = 0;
+          for (const r of results) { totalS += r.sLiqRaw || 0; totalB += r.bLiqRaw || 0; }
+          const total = totalS + totalB;
+          if (!total) return;
+          const threshold = (this.cfg.miwLiqFadePct ?? 50) / 100;
+          this._miwLiqFadeLockedUntil = Date.now() + 3_600_000;
+          if (totalB / total >= threshold) {
+            if (this.cfg.miwLiqFadeBlockEntries) this._miwLiqBlocked = true;
+            const miwPositions = (this.positions || []).filter(p => p._miw);
+            if (miwPositions.length) {
+              this.log(`[MIW] 🥶 Liq Fade Away — B-Liq ${(totalB / total * 100).toFixed(0)}% ≥ ${this.cfg.miwLiqFadePct ?? 50}% — closing all ${miwPositions.length} position(s), locked 1h${this.cfg.miwLiqFadeBlockEntries ? ' | entries blocked' : ''}`, 'info');
+              for (const pos of [...miwPositions]) {
+                await this.pseudoClosePosition(pos, 'sacrifice');
+              }
+            }
+          } else {
+            if (this._miwLiqBlocked) this.log('[MIW] 🥶 Liq Fade Away — block lifted, locked 1h', 'info');
+            this._miwLiqBlocked = false;
+          }
+        },
+
         async _miwRunScan() {
           if (!this.cfg.miwEnabled) return;
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
@@ -512,6 +570,10 @@
           }
           if (this._miwStructureBlocked) {
             this.log('[MIW] 🌬 Entries blocked — bad market structure', 'info');
+            return;
+          }
+          if (this._miwLiqBlocked) {
+            this.log('[MIW] 🥶 Entries blocked — bad liq structure', 'info');
             return;
           }
           if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
