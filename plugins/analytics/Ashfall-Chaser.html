@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.13.5';
+  const VERSION        = '1.13.6';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
@@ -265,6 +265,7 @@
         afWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
         afScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
         afKlineBar:   { red: 0, green: 0, max: 50 }, // last-cycle kline close direction counts
+        _afKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
         _afStructureList: null, _afStructureAt: 0, // own 3h ticker cache independent of host
         afStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
         afCrossEvents: [],
@@ -477,17 +478,54 @@
           return score === null ? inherent : massFrac * score + (1 - massFrac) * inherent;
         },
 
-        _afUpdateKlineBar() {
-          const cache = this._micKlineCache;
-          if (!cache) return;
+        async _afUpdateKlineBar() {
           const lastHourStart = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
-          let red = 0, green = 0;
-          for (const e of Object.values(cache)) {
-            if (e.candleStart !== lastHourStart) continue;
-            if (e.close < e.open) red++;
-            else if (e.close > e.open) green++;
+          // Piggyback on MIC's cache when it's populated for the right hour
+          const cache = this._micKlineCache;
+          if (cache && Object.keys(cache).length > 0) {
+            let red = 0, green = 0;
+            for (const e of Object.values(cache)) {
+              if (e.candleStart !== lastHourStart) continue;
+              if (e.close < e.open) red++;
+              else if (e.close > e.open) green++;
+            }
+            if (red > 0 || green > 0) {
+              this.afKlineBar = { red, green, max: this.cfg.micKlineScanCap ?? 50 };
+              return;
+            }
           }
-          this.afKlineBar = { red, green, max: this.cfg.micKlineScanCap ?? 50 };
+          // MIC didn't fetch klines this cycle — own sample, cached per completed hourly candle
+          if (this._afKlineBarAt === lastHourStart && (this.afKlineBar.red > 0 || this.afKlineBar.green > 0)) return;
+          try {
+            const allTickers = this._lastAllTickers || [];
+            const cap = this.cfg.micKlineScanCap ?? 50;
+            let syms = allTickers
+              .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
+              .map(t => t.symbol);
+            if (!syms.length) return;
+            for (let i = syms.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [syms[i], syms[j]] = [syms[j], syms[i]];
+            }
+            syms = syms.slice(0, cap);
+            let red = 0, green = 0;
+            await Promise.all(syms.map(async sym => {
+              try {
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
+                const d = await r.json();
+                if (d.retCode !== 0) return;
+                const list = d?.result?.list;
+                if (!list || list.length < 2) return;
+                const candle = list[1];
+                if (parseInt(candle[0]) !== lastHourStart) return;
+                const open = parseFloat(candle[1]), close = parseFloat(candle[4]);
+                if (close < open) red++;
+                else if (close > open) green++;
+              } catch(e) {}
+            }));
+            this._afKlineBarAt = lastHourStart;
+            this.afKlineBar = { red, green, max: cap };
+          } catch(e) {}
         },
 
         _afScoreRead() {
