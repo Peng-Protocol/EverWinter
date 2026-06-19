@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.14.9';
+  const VERSION        = '1.15.0';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY    = '__ash_liq_batches';
   const CROSS_KEY      = '__everwinter_cross_v1';
@@ -235,9 +235,9 @@
               </label>
               <div x-show="cfg.ashLiqEnabled" style="margin-top:8px">
                 <div class="g">
-                  <div class="lbl">Threshold <b x-text="(cfg.ashLiqThresholdPct??10)+'%'"></b> of 24h turnover</div>
-                  <input type="range" min="1" max="50" step="1" x-model.number="cfg.ashLiqThresholdPct" @change="persist()">
-                  <div class="ash-hint">Liq turnover must exceed this % of the ticker's 24h volume to qualify S-Liq or B-Liq.</div>
+                  <div class="lbl">S/B Dominance Threshold <b x-text="(cfg.ashLiqThresholdPct??50)+'%'"></b></div>
+                  <input type="range" min="10" max="90" step="5" x-model.number="cfg.ashLiqThresholdPct" @change="persist()">
+                  <div class="ash-hint">Qualifies S-Liq or B-Liq when that side represents ≥ this share of the ticker's total liquidation turnover in the cycle.</div>
                 </div>
                 <div class="g" style="margin-top:6px">
                   <div class="lbl">Batch Size <b x-text="(cfg.ashLiqBatchSize??20)"></b> tickers</div>
@@ -328,7 +328,7 @@
           if (this.cfg.ashfallSlotLossThreshold          === undefined) this.cfg.ashfallSlotLossThreshold          = 0.25;
           if (this.cfg.ashLiqEnabled      === undefined) this.cfg.ashLiqEnabled      = false;
           if (this.cfg.ashLiqBatchSize    === undefined) this.cfg.ashLiqBatchSize    = 20;
-          if (this.cfg.ashLiqThresholdPct === undefined) this.cfg.ashLiqThresholdPct = 10;
+          if (this.cfg.ashLiqThresholdPct === undefined) this.cfg.ashLiqThresholdPct = 50;
           try {
             const saved = JSON.parse(localStorage.getItem(ASH_LIQ_KEY) || 'null');
             if (Array.isArray(saved) && this.cfg.ashLiqEnabled) {
@@ -1101,17 +1101,14 @@
           if (batch._endTimer) { clearTimeout(batch._endTimer); batch._endTimer = null; }
           try { if (batch.ws && batch.ws.readyState !== WebSocket.CLOSED) batch.ws.close(); } catch(_) {}
           batch.ws = null;
-          const allTickers = this._lastAllTickers || [];
-          const tickerMap  = Object.fromEntries(allTickers.map(t => [t.symbol, t]));
-          const threshold  = this.cfg.ashLiqThresholdPct ?? 10;
+          const threshold  = this.cfg.ashLiqThresholdPct ?? 50;
           const results    = batch.symbols.map(sym => {
-            const t       = tickerMap[sym];
-            const tvr     = t ? parseFloat(t.turnover24h || 0) : 0;
-            const sLiqRaw = batch.sLiqTurnover[sym] || 0;
-            const bLiqRaw = batch.bLiqTurnover[sym] || 0;
-            const sLiqPct = tvr > 0 ? (sLiqRaw / tvr) * 100 : 0;
-            const bLiqPct = tvr > 0 ? (bLiqRaw / tvr) * 100 : 0;
-            return { sym, sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, sPass: sLiqPct >= threshold, bPass: bLiqPct >= threshold };
+            const sLiqRaw  = batch.sLiqTurnover[sym] || 0;
+            const bLiqRaw  = batch.bLiqTurnover[sym] || 0;
+            const liqTotal = sLiqRaw + bLiqRaw;
+            const sLiqPct  = liqTotal > 0 ? (sLiqRaw / liqTotal) * 100 : 0;
+            const bLiqPct  = liqTotal > 0 ? (bLiqRaw / liqTotal) * 100 : 0;
+            return { sym, sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, sPass: liqTotal > 0 && sLiqPct >= threshold, bPass: liqTotal > 0 && bLiqPct >= threshold };
           });
           const _now = Date.now();
           const _liqPatch = {};
@@ -1141,47 +1138,45 @@
           if (!history.length) return '';
           const W = 260, H = 80, padL = 28, padB = 16, padT = 6, padR = 4;
           const plotW = W - padL - padR, plotH = H - padT - padB;
-          const threshold = this.cfg.ashLiqThresholdPct ?? 10;
           const shown = history.slice(-10);
           const cycleW = plotW / shown.length;
-          let maxPct = threshold * 2;
-          for (const cycle of shown) for (const r of cycle.results) maxPct = Math.max(maxPct, r.sLiqPct, r.bLiqPct);
-          maxPct = Math.max(maxPct, 1);
-          const yVal = v => padT + plotH - (v / maxPct) * plotH;
-          const threshY = yVal(threshold);
+          let maxRaw = 0;
+          for (const cycle of shown) for (const r of cycle.results) maxRaw = Math.max(maxRaw, (r.sLiqRaw || 0) + (r.bLiqRaw || 0));
+          if (maxRaw <= 0) maxRaw = 1;
+          const fmt = v => v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(0) + 'K' : v.toFixed(0);
+          const yVal = v => padT + plotH - (v / maxRaw) * plotH;
           let bars = '';
           shown.forEach((cycle, ci) => {
             const cx = padL + ci * cycleW;
             const n  = cycle.results.length;
             const bw = Math.max(1, Math.min(4, cycleW * 0.9 / n));
             cycle.results.forEach((r, ri) => {
-              const x   = cx + (ri / n) * cycleW * 0.9;
-              const pct = Math.max(r.sLiqPct, r.bLiqPct);
-              const isS = r.sLiqPct >= r.bLiqPct;
-              const q   = r.sPass || r.bPass;
-              const clr = isS ? `rgba(100,220,150,${q ? 1 : 0.4})` : `rgba(255,80,80,${q ? 1 : 0.4})`;
-              const bh  = Math.max(1, (pct / maxPct) * plotH);
-              bars += `<rect x="${x.toFixed(1)}" y="${(padT + plotH - bh).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" fill="${clr}"/>`;
+              const x    = cx + (ri / n) * cycleW * 0.9;
+              const bRaw = r.bLiqRaw || 0;
+              const sRaw = r.sLiqRaw || 0;
+              if (bRaw + sRaw <= 0) return;
+              const bH = Math.max(1, (bRaw / maxRaw) * plotH);
+              const sH = Math.max(0, (sRaw / maxRaw) * plotH);
+              bars += `<rect x="${x.toFixed(1)}" y="${(padT + plotH - bH).toFixed(1)}" width="${bw.toFixed(1)}" height="${bH.toFixed(1)}" fill="rgba(255,80,80,${r.bPass ? 0.85 : 0.35})"/>`;
+              if (sH > 0) bars += `<rect x="${x.toFixed(1)}" y="${(padT + plotH - bH - sH).toFixed(1)}" width="${bw.toFixed(1)}" height="${sH.toFixed(1)}" fill="rgba(100,220,150,${r.sPass ? 0.85 : 0.35})"/>`;
             });
             if (ci > 0) bars += `<line x1="${cx.toFixed(1)}" y1="${padT}" x2="${cx.toFixed(1)}" y2="${(padT + plotH).toFixed(1)}" stroke="rgba(255,255,255,.08)" stroke-width="0.5"/>`;
             const d = new Date(cycle.ts);
             const label = `${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}`;
             bars += `<text x="${(cx + cycleW / 2).toFixed(1)}" y="${H - 2}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="middle">${label}</text>`;
           });
-          const yLabels = [0, threshold, maxPct].map(v => `<text x="${padL - 3}" y="${(yVal(v) + 3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${v.toFixed(0)}%</text>`).join('');
+          const yLabels = [0, maxRaw / 2, maxRaw].map(v => `<text x="${padL - 3}" y="${(yVal(v) + 3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${fmt(v)}</text>`).join('');
           return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block">`
             + `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + plotH}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`
             + `<line x1="${padL}" y1="${(padT + plotH).toFixed(1)}" x2="${W - padR}" y2="${(padT + plotH).toFixed(1)}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`
-            + `<line x1="${padL}" y1="${threshY.toFixed(1)}" x2="${W - padR}" y2="${threshY.toFixed(1)}" stroke="rgba(255,200,50,.4)" stroke-width="0.8" stroke-dasharray="3 2"/>`
             + bars + yLabels
-            + `<text x="${(W - padR).toFixed(1)}" y="${(threshY - 2).toFixed(1)}" fill="rgba(255,200,50,.5)" font-size="7" font-family="monospace" text-anchor="end">thr</text>`
             + `</svg>`;
         },
 
         _liqInfoHtml() {
           void this.tick;
           const results   = this._liqLatestResults || [];
-          const threshold = this.cfg.ashLiqThresholdPct ?? 10;
+          const threshold = this.cfg.ashLiqThresholdPct ?? 50;
           return results.map(r => {
             const sQ  = r.sLiqPct >= threshold, bQ = r.bLiqPct >= threshold;
             const dom = r.sLiqPct >= r.bLiqPct;
