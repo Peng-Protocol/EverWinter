@@ -23,8 +23,9 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.13.6';
+  const VERSION        = '1.14.7';
   const ASH_KEY        = '__ashfall_chaser_v1';
+  const ASH_LIQ_KEY    = '__ash_liq_batches';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
   const SCORE_KEY      = '__everwinter_scorecard_v1';
@@ -223,6 +224,41 @@
                 </div>
               </div>
             </div>
+            <!-- Liquidation Surveillance -->
+            <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
+              <label class="tog" @click.prevent="if(!cfgLocked){cfg.ashLiqEnabled=!cfg.ashLiqEnabled;if(!cfg.ashLiqEnabled)_liqCloseAll();persist()}">
+                <div class="tog-t" :class="cfg.ashLiqEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Liquidation Surveillance</div>
+                  <div class="ash-hint">Subscribes to Bybit live liq feed for a random sample of volatile tickers. Enables 🥵 S-Liq and 🥶 B-Liq criteria in MIC slots.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ashLiqEnabled" style="margin-top:8px">
+                <div class="g">
+                  <div class="lbl">Threshold <b x-text="(cfg.ashLiqThresholdPct??10)+'%'"></b> of 24h turnover</div>
+                  <input type="range" min="1" max="50" step="1" x-model.number="cfg.ashLiqThresholdPct" @change="persist()">
+                  <div class="ash-hint">Liq turnover must exceed this % of the ticker's 24h volume to qualify S-Liq or B-Liq.</div>
+                </div>
+                <div class="g" style="margin-top:6px">
+                  <div class="lbl">Batch Size <b x-text="(cfg.ashLiqBatchSize??20)"></b> tickers</div>
+                  <input type="range" min="5" max="50" step="5" x-model.number="cfg.ashLiqBatchSize" @change="persist()">
+                  <div class="ash-hint">Random draw per 1h window from ≥6% 24h move pool, disjoint across concurrent batches.</div>
+                </div>
+                <div class="ash-hint" style="margin-top:5px" x-text="(()=>{ const n=(_liqBatches||[]).length; const last=(_liqCycleHistory||[]).length?_liqCycleHistory[_liqCycleHistory.length-1]:null; const ago=last?Math.round((Date.now()-last.ts)/60000)+'m ago':'never'; return n+' feed'+(n!==1?'s':'')+' active · last closed: '+ago+' · '+(_liqCycleHistory||[]).length+' recorded'; })()"></div>
+                <div x-show="(_liqBatches||[]).length>0" style="margin-top:6px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
+                  <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">FEED WATCHER</div>
+                  <div x-html="_liqFeedWatcherHtml()" style="padding:2px 8px 4px"></div>
+                </div>
+                <div x-show="(_liqCycleHistory||[]).length>0" style="margin-top:6px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
+                  <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">LIQUIDATION SAMPLE</div>
+                  <div x-html="_liqChartSvg()" style="padding:4px 6px"></div>
+                </div>
+                <div x-show="(_liqLatestResults||[]).length>0" style="margin-top:6px">
+                  <div style="font-family:var(--mono);font-size:8px;color:var(--text-lo);margin-bottom:4px;letter-spacing:1px">LATEST CYCLE</div>
+                  <div x-html="_liqInfoHtml()" style="display:flex;flex-wrap:wrap;gap:3px"></div>
+                </div>
+              </div>
+            </div>
             <div x-data="{ dzOpen:false }" style="margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
               <button @click="dzOpen=!dzOpen" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border:1px solid rgba(255,69,96,.25);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px;display:flex;align-items:center;gap:4px"><span x-text="dzOpen?'▾':'▸'"></span>&nbsp;Danger Zone</button>
               <div x-show="dzOpen" x-transition.opacity style="margin-top:6px;padding:8px;background:rgba(255,69,96,.04);border:1px solid rgba(255,69,96,.18);border-radius:3px">
@@ -269,6 +305,12 @@
         _afStructureList: null, _afStructureAt: 0, // own 3h ticker cache independent of host
         afStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
         afCrossEvents: [],
+        _liqBatches: [],
+        _liqResults: {},
+        _liqResultsVersion: 0,
+        _liqCycleHistory: [],
+        _liqLatestResults: [],
+        _liqCycleCounter: 0,
 
         async init() {
           await _origInit.call(this);
@@ -284,6 +326,19 @@
           if (this.cfg.ashfallScorecardEnabled           === undefined) this.cfg.ashfallScorecardEnabled           = false;
           if (this.cfg.ashfallAutoBlock                  === undefined) this.cfg.ashfallAutoBlock                  = false;
           if (this.cfg.ashfallSlotLossThreshold          === undefined) this.cfg.ashfallSlotLossThreshold          = 0.25;
+          if (this.cfg.ashLiqEnabled      === undefined) this.cfg.ashLiqEnabled      = false;
+          if (this.cfg.ashLiqBatchSize    === undefined) this.cfg.ashLiqBatchSize    = 20;
+          if (this.cfg.ashLiqThresholdPct === undefined) this.cfg.ashLiqThresholdPct = 10;
+          try {
+            const saved = JSON.parse(localStorage.getItem(ASH_LIQ_KEY) || 'null');
+            if (Array.isArray(saved) && this.cfg.ashLiqEnabled) {
+              const valid = saved.filter(s => s.endsAt > Date.now());
+              if (valid.length) {
+                this._liqCycleCounter = Math.max(this._liqCycleCounter, ...valid.map(s => s.id));
+                for (const s of valid) this._liqResumeBatch(s);
+              }
+            }
+          } catch(_) {}
           this._afScoreBuild();
           try {
             const raw = localStorage.getItem(ASH_KEY);
@@ -319,6 +374,7 @@
                 this._afFetchStructure().then(r => {
                   if (!r) return;
                   this._afAddSample(r);
+                  if (!r._fresh) return;
                   const { score, mass } = this.afStatus;
                   const _d = this._afDescribe(r, score, mass);
                   this.log(`[ASH] ♨ Structure check (halt-tick) — market is ${_d.desc} | ${_d.bias}`, 'info');
@@ -345,20 +401,30 @@
             // Reuse the host scan's bulk ticker response when fresh (slow-tick
             // sampling during halts falls back to fetching — scans don't run then)
             const cooldownMs = (this.cfg.bulkTickerCooldownHours ?? 3) * 3600 * 1000;
-            let list;
+            let list, _freshData = false;
             if (this._afStructureList?.length && (Date.now() - (this._afStructureAt || 0)) < cooldownMs) {
               list = this._afStructureList; // own cache within cooldown
             } else if (this._lastAllTickers?.length && (Date.now() - (this._lastAllTickersAt || 0)) < 60000) {
               list = this._lastAllTickers;  // host just fetched this tick — piggyback
               this._afStructureList = list;
               this._afStructureAt   = this._lastAllTickersAt;
+              _freshData = true;
             } else {
-              const r = await fetch(`${this.base}/v5/market/tickers?category=linear`);
-              const d = await r.json();
-              if (d.retCode !== 0) return null;
-              list = d.result?.list || [];
-              this._afStructureList = list;
-              this._afStructureAt   = Date.now();
+              const _shared = this._sharedRead?.('bulkTickers');
+              if (_shared?.data?.tickers?.length && (Date.now() - (_shared.ts || 0)) < cooldownMs) {
+                list = _shared.data.tickers; // partner fetched recently — adopt
+                this._afStructureList = list;
+                this._afStructureAt   = _shared.ts;
+                _freshData = true;
+              } else {
+                const r = await fetch(`${this.base}/v5/market/tickers?category=linear`);
+                const d = await r.json();
+                if (d.retCode !== 0) return null;
+                list = d.result?.list || [];
+                this._afStructureList = list;
+                this._afStructureAt   = Date.now();
+                _freshData = true;
+              }
             }
             let gSum = 0, lSum = 0, gCount = 0, lCount = 0;
             let gTurnover = 0, lTurnover = 0;
@@ -390,7 +456,7 @@
               breadth: cntT > 0 ? (gCount - lCount) / cntT : 0,
               gCount, lCount,
               gSum: +gSum.toFixed(1), lSum: +lSum.toFixed(1),
-              vol, volAbs, ioScore,
+              vol, volAbs, ioScore, _fresh: _freshData,
             };
           } catch(e) { return null; }
         },
@@ -827,6 +893,7 @@
           }
           await _origScan.call(this);
           this.cfg.maxPos = _savedMaxPos;
+          if (this.cfg.ashLiqEnabled) this._liqLaunchBatch();
           if (!this.cfg.ashfallEnabled) return;
           this._afCheckCross().catch(() => {});
           // Deferred so MIC's _micRunScan (which fetches klines) finishes first —
@@ -835,6 +902,7 @@
           this._afFetchStructure().then(r => {
             if (!r) return;
             this._afAddSample(r);
+            if (!r._fresh) return;
             const { score, mass } = this.afStatus;
             const _d = this._afDescribe(r, score, mass);
             this.log(`[ASH] ♨ Routine market structure check — market is ${_d.desc} | ${_d.bias}`, 'info');
@@ -870,6 +938,258 @@
               this._afScoreBuild();
             }
           }
+        },
+
+        // ── Liquidation surveillance ──
+
+        _liqCloseAll() {
+          for (const b of (this._liqBatches || [])) {
+            if (b._endTimer) clearTimeout(b._endTimer);
+            try { if (b.ws && b.ws.readyState !== WebSocket.CLOSED) b.ws.close(); } catch(_) {}
+          }
+          this._liqBatches = [];
+          try { localStorage.removeItem(ASH_LIQ_KEY); } catch(_) {}
+        },
+
+        _liqPersistBatches() {
+          try {
+            const snapshots = (this._liqBatches || []).map(b => ({
+              id: b.id, startedAt: b.startedAt, endsAt: b.endsAt, symbols: b.symbols,
+              sLiqTurnover: { ...b.sLiqTurnover }, bLiqTurnover: { ...b.bLiqTurnover }
+            }));
+            localStorage.setItem(ASH_LIQ_KEY, JSON.stringify(snapshots));
+          } catch(_) {}
+        },
+
+        _liqResumeBatch(snapshot) {
+          const remaining = snapshot.endsAt - Date.now();
+          if (remaining <= 0) return;
+          const batch = {
+            id: snapshot.id, startedAt: snapshot.startedAt, endsAt: snapshot.endsAt,
+            symbols: snapshot.symbols,
+            sLiqTurnover: { ...snapshot.sLiqTurnover },
+            bLiqTurnover: { ...snapshot.bLiqTurnover },
+            ws: null, _endTimer: null
+          };
+          this._liqBatches.push(batch);
+          const id = batch.id;
+          const handleMsg = (ev) => {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (!msg.data) return;
+              const events = Array.isArray(msg.data) ? msg.data : [msg.data];
+              for (const e of events) {
+                const sym = e.s;
+                if (!sym || !Object.prototype.hasOwnProperty.call(batch.sLiqTurnover, sym)) continue;
+                const turnover = parseFloat(e.v || 0) * parseFloat(e.p || 0);
+                if (!isFinite(turnover) || turnover <= 0) continue;
+                if (e.S === 'Buy')       batch.sLiqTurnover[sym] += turnover;
+                else if (e.S === 'Sell') batch.bLiqTurnover[sym] += turnover;
+              }
+              this._liqPersistBatches();
+            } catch(_) {}
+          };
+          const openWs = () => {
+            try {
+              const ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+              batch.ws = ws;
+              ws.onopen    = () => ws.send(JSON.stringify({ op: 'subscribe', args: batch.symbols.map(s => `allLiquidation.${s}`) }));
+              ws.onmessage = handleMsg;
+              ws.onerror   = () => {};
+              ws.onclose   = () => {
+                if (Date.now() >= batch.endsAt || !this._liqBatches.some(b => b.id === id)) return;
+                setTimeout(openWs, 5000);
+              };
+            } catch(_) {}
+          };
+          openWs();
+          batch._endTimer = setTimeout(() => this._liqCloseBatch(batch), remaining);
+          this.log(`[ASH] 💧 Liq cycle #${id} resumed — ${batch.symbols.length} tickers, ${Math.round(remaining / 60000)}m remaining`, 'info');
+        },
+
+        _liqFeedWatcherHtml() {
+          void this.tick;
+          const batches = this._liqBatches || [];
+          if (!batches.length) return '';
+          const fmt = v => v >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'K' : v.toFixed(0);
+          return batches.map(b => {
+            const rem  = Math.max(0, b.endsAt - Date.now());
+            const remM = Math.floor(rem / 60000);
+            const remS = Math.floor((rem % 60000) / 1000);
+            let totalS = 0, totalB = 0;
+            for (const s of b.symbols) { totalS += b.sLiqTurnover[s] || 0; totalB += b.bLiqTurnover[s] || 0; }
+            const dom  = totalS > totalB ? 'S' : totalB > totalS ? 'B' : '·';
+            const clr  = dom === 'S' ? 'rgba(100,220,150,.9)' : dom === 'B' ? 'rgba(255,80,80,.9)' : 'var(--text-lo)';
+            return `<div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">` +
+              `<span style="color:var(--text-lo);min-width:18px">#${b.id}</span>` +
+              `<span style="color:var(--text-lo)">${b.symbols.length}t</span>` +
+              `<span style="color:rgba(100,220,150,.8)">S:${fmt(totalS)}</span>` +
+              `<span style="color:rgba(255,80,80,.8)">B:${fmt(totalB)}</span>` +
+              `<span style="color:${clr};font-weight:bold">${dom}</span>` +
+              `<span style="margin-left:auto;color:var(--text-lo)">${remM}m${String(remS).padStart(2, '0')}s</span>` +
+              `</div>`;
+          }).join('');
+        },
+
+        _liqLaunchBatch() {
+          const allTickers = this._lastAllTickers || [];
+          if (!allTickers.length) return;
+          const activeSyms = new Set((this._liqBatches || []).flatMap(b => b.symbols));
+          const eligible = allTickers.filter(t =>
+            t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
+            && parseFloat(t.lastPrice || 0) >= 0.001
+            && Math.abs(parseFloat(t.price24hPcnt || 0)) >= 0.06
+            && !activeSyms.has(t.symbol)
+          );
+          if (!eligible.length) {
+            this.log('[ASH] 💧 Liq batch skipped — no eligible tickers (≥6% 24h move, not already surveilled)', 'info');
+            return;
+          }
+          for (let i = eligible.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [eligible[i], eligible[j]] = [eligible[j], eligible[i]];
+          }
+          const batchSize = Math.min(this.cfg.ashLiqBatchSize ?? 20, eligible.length);
+          const symbols   = eligible.slice(0, batchSize).map(t => t.symbol);
+          const id        = ++this._liqCycleCounter;
+          const startedAt = Date.now();
+          const batch     = { id, startedAt, endsAt: startedAt + 3600000, symbols,
+            sLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
+            bLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
+            ws: null, _endTimer: null };
+          this._liqBatches.push(batch);
+          this._liqPersistBatches();
+          const handleMsg = (ev) => {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (!msg.data) return;
+              const events = Array.isArray(msg.data) ? msg.data : [msg.data];
+              for (const e of events) {
+                const sym = e.s;
+                if (!sym || !Object.prototype.hasOwnProperty.call(batch.sLiqTurnover, sym)) continue;
+                const turnover = parseFloat(e.v || 0) * parseFloat(e.p || 0);
+                if (!isFinite(turnover) || turnover <= 0) continue;
+                if (e.S === 'Buy')       batch.sLiqTurnover[sym] += turnover;
+                else if (e.S === 'Sell') batch.bLiqTurnover[sym] += turnover;
+              }
+              this._liqPersistBatches();
+            } catch(_) {}
+          };
+          const openWs = () => {
+            try {
+              const ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+              batch.ws = ws;
+              ws.onopen    = () => ws.send(JSON.stringify({ op: 'subscribe', args: symbols.map(s => `allLiquidation.${s}`) }));
+              ws.onmessage = handleMsg;
+              ws.onerror   = () => {};
+              ws.onclose   = () => {
+                if (Date.now() >= batch.endsAt || !this._liqBatches.some(b => b.id === id)) return;
+                setTimeout(openWs, 5000);
+              };
+            } catch(_) {}
+          };
+          openWs();
+          batch._endTimer = setTimeout(() => this._liqCloseBatch(batch), 3600000);
+          this.log(`[ASH] 💧 Liq cycle #${id} started — ${symbols.length} tickers (${symbols.map(s => s.replace('USDT', '')).join(', ')})`, 'info');
+        },
+
+        _liqCloseBatch(batch) {
+          this._liqBatches = (this._liqBatches || []).filter(b => b.id !== batch.id);
+          this._liqPersistBatches();
+          if (batch._endTimer) { clearTimeout(batch._endTimer); batch._endTimer = null; }
+          try { if (batch.ws && batch.ws.readyState !== WebSocket.CLOSED) batch.ws.close(); } catch(_) {}
+          batch.ws = null;
+          const allTickers = this._lastAllTickers || [];
+          const tickerMap  = Object.fromEntries(allTickers.map(t => [t.symbol, t]));
+          const threshold  = this.cfg.ashLiqThresholdPct ?? 10;
+          const results    = batch.symbols.map(sym => {
+            const t       = tickerMap[sym];
+            const tvr     = t ? parseFloat(t.turnover24h || 0) : 0;
+            const sLiqRaw = batch.sLiqTurnover[sym] || 0;
+            const bLiqRaw = batch.bLiqTurnover[sym] || 0;
+            const sLiqPct = tvr > 0 ? (sLiqRaw / tvr) * 100 : 0;
+            const bLiqPct = tvr > 0 ? (bLiqRaw / tvr) * 100 : 0;
+            return { sym, sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, sPass: sLiqPct >= threshold, bPass: bLiqPct >= threshold };
+          });
+          for (const r of results) {
+          const _now = Date.now();
+          const _liqPatch = {};
+          for (const r of results) {
+            const _entry = { sLiqPct: r.sLiqPct, bLiqPct: r.bLiqPct, sLiqRaw: r.sLiqRaw, bLiqRaw: r.bLiqRaw, cycleId: batch.id, ts: _now };
+            this._liqResults[r.sym] = _entry;
+            _liqPatch[r.sym] = _entry;
+          }
+          this._liqResultsVersion = (this._liqResultsVersion || 0) + 1;
+          const _prevSharedVer = this._sharedRead?.('liqResults')?.ver ?? 0;
+          this._sharedMerge?.('liqResults', _liqPatch, { ver: Math.max(this._liqResultsVersion, _prevSharedVer + 1) });
+          const entry = { id: batch.id, ts: _now, results };
+          this._liqCycleHistory.push(entry);
+          if (this._liqCycleHistory.length > 30) this._liqCycleHistory = this._liqCycleHistory.slice(-30);
+          this._liqLatestResults = results;
+          const qualifiers = results.filter(r => r.sPass || r.bPass);
+          const logParts   = results.map(r => {
+            const flags = (r.sPass ? '✓sliq' : '') + (r.bPass ? (r.sPass ? '/✓bliq' : '✓bliq') : '');
+            return `${r.sym.replace('USDT', '')}: S+${r.sLiqPct.toFixed(1)}% B+${r.bLiqPct.toFixed(1)}%${flags ? ' [' + flags + ']' : ''}`;
+          }).join(' | ');
+          this.log(`[ASH] 💧 Liq cycle #${batch.id} complete — ${results.length} tickers, threshold ${threshold}% — ${qualifiers.length} qualified | ${logParts}`, 'info');
+        },
+
+        _liqChartSvg() {
+          void this.tick;
+          const history = this._liqCycleHistory || [];
+          if (!history.length) return '';
+          const W = 260, H = 80, padL = 28, padB = 16, padT = 6, padR = 4;
+          const plotW = W - padL - padR, plotH = H - padT - padB;
+          const threshold = this.cfg.ashLiqThresholdPct ?? 10;
+          const shown = history.slice(-10);
+          const cycleW = plotW / shown.length;
+          let maxPct = threshold * 2;
+          for (const cycle of shown) for (const r of cycle.results) maxPct = Math.max(maxPct, r.sLiqPct, r.bLiqPct);
+          maxPct = Math.max(maxPct, 1);
+          const yVal = v => padT + plotH - (v / maxPct) * plotH;
+          const threshY = yVal(threshold);
+          let bars = '';
+          shown.forEach((cycle, ci) => {
+            const cx = padL + ci * cycleW;
+            const n  = cycle.results.length;
+            const bw = Math.max(1, Math.min(4, cycleW * 0.9 / n));
+            cycle.results.forEach((r, ri) => {
+              const x   = cx + (ri / n) * cycleW * 0.9;
+              const pct = Math.max(r.sLiqPct, r.bLiqPct);
+              const isS = r.sLiqPct >= r.bLiqPct;
+              const q   = r.sPass || r.bPass;
+              const clr = isS ? `rgba(100,220,150,${q ? 1 : 0.4})` : `rgba(255,80,80,${q ? 1 : 0.4})`;
+              const bh  = Math.max(1, (pct / maxPct) * plotH);
+              bars += `<rect x="${x.toFixed(1)}" y="${(padT + plotH - bh).toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" fill="${clr}"/>`;
+            });
+            if (ci > 0) bars += `<line x1="${cx.toFixed(1)}" y1="${padT}" x2="${cx.toFixed(1)}" y2="${(padT + plotH).toFixed(1)}" stroke="rgba(255,255,255,.08)" stroke-width="0.5"/>`;
+            const d = new Date(cycle.ts);
+            const label = `${String(d.getUTCHours()).padStart(2,'0')}:${String(d.getUTCMinutes()).padStart(2,'0')}`;
+            bars += `<text x="${(cx + cycleW / 2).toFixed(1)}" y="${H - 2}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="middle">${label}</text>`;
+          });
+          const yLabels = [0, threshold, maxPct].map(v => `<text x="${padL - 3}" y="${(yVal(v) + 3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${v.toFixed(0)}%</text>`).join('');
+          return `<svg width="100%" viewBox="0 0 ${W} ${H}" style="display:block">`
+            + `<line x1="${padL}" y1="${padT}" x2="${padL}" y2="${padT + plotH}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`
+            + `<line x1="${padL}" y1="${(padT + plotH).toFixed(1)}" x2="${W - padR}" y2="${(padT + plotH).toFixed(1)}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`
+            + `<line x1="${padL}" y1="${threshY.toFixed(1)}" x2="${W - padR}" y2="${threshY.toFixed(1)}" stroke="rgba(255,200,50,.4)" stroke-width="0.8" stroke-dasharray="3 2"/>`
+            + bars + yLabels
+            + `<text x="${(W - padR).toFixed(1)}" y="${(threshY - 2).toFixed(1)}" fill="rgba(255,200,50,.5)" font-size="7" font-family="monospace" text-anchor="end">thr</text>`
+            + `</svg>`;
+        },
+
+        _liqInfoHtml() {
+          void this.tick;
+          const results   = this._liqLatestResults || [];
+          const threshold = this.cfg.ashLiqThresholdPct ?? 10;
+          return results.map(r => {
+            const sQ  = r.sLiqPct >= threshold, bQ = r.bLiqPct >= threshold;
+            const dom = r.sLiqPct >= r.bLiqPct;
+            const clr = (sQ || bQ) ? (dom && sQ ? 'rgba(100,220,150,.9)' : !dom && bQ ? 'rgba(255,80,80,.9)' : sQ ? 'rgba(100,220,150,.9)' : 'rgba(255,80,80,.9)') : 'rgba(255,255,255,.3)';
+            const bg  = (sQ || bQ) ? (dom && sQ ? 'rgba(100,220,150,.07)' : !dom && bQ ? 'rgba(255,80,80,.07)' : sQ ? 'rgba(100,220,150,.07)' : 'rgba(255,80,80,.07)') : 'rgba(255,255,255,.03)';
+            const bdr = (sQ || bQ) ? (dom && sQ ? 'rgba(100,220,150,.4)' : !dom && bQ ? 'rgba(255,80,80,.4)' : sQ ? 'rgba(100,220,150,.4)' : 'rgba(255,80,80,.4)') : 'rgba(255,255,255,.1)';
+            const badge = (sQ || bQ) ? (dom && sQ ? '🥵' : '🥶') : '';
+            return `<span title="${r.sym}: S-Liq ${r.sLiqPct.toFixed(1)}% / B-Liq ${r.bLiqPct.toFixed(1)}%" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${badge}${r.sym.replace('USDT','')} <span style="opacity:.65">S${r.sLiqPct.toFixed(1)}% B${r.bLiqPct.toFixed(1)}%</span></span>`;
+          }).join('');
         },
 
       });

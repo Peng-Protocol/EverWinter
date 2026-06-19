@@ -23,13 +23,13 @@ Each file carries its version in two or three places — update **all** that app
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.6.7 |
-| `PseudoChaser.html` | v1.2.6 |
+| `PseudoWinter.html` | v1.6.8 |
+| `PseudoChaser.html` | v1.2.7 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.5.16 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.5.16 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.13.7 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.13.6 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.7.3 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.7.3 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.14.7 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.14.7 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
