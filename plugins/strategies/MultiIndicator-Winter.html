@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.5.11';
+  const VERSION       = '1.5.12';
   const DEFAULT_SLOTS = [['+fund','+24h','>10pct'],['-fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -158,7 +158,14 @@
                 <input type="range" min="5" max="200" step="5" x-model.number="cfg.miwFadeAwayLossPct" @change="persist()">
                 <div class="lbl" style="margin-top:5px">Bullish Threshold <b x-text="(cfg.miwFadeAwayPct??50)+'%'"></b></div>
                 <input type="range" min="10" max="100" step="5" x-model.number="cfg.miwFadeAwayPct" @change="persist()">
-                <div class="miw-hint" x-text="(()=>{ if(_miwFadeAwayLocked) return '🔒 Locked — good structure detected. Resets on next scan.'; const cache=_miwFadeAwayCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(g/t*100).toFixed(0)+'% bullish (trigger @ '+(cfg.miwFadeAwayPct??50)+'%)' : 'No sample yet.'; })()"></div>
+                <div class="miw-hint" x-text="(()=>{ if(_miwStructureBlocked) return '⛔ Entries blocked — bad structure. Clears when structure improves.'; if(_miwFadeAwayLocked) return '🔒 Locked — good structure detected. Resets on next scan.'; const cache=_miwFadeAwayCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(g/t*100).toFixed(0)+'% bullish (trigger @ '+(cfg.miwFadeAwayPct??50)+'%)' : 'No sample yet.'; })()"></div>
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.miwFadeAwayBlockEntries=!cfg.miwFadeAwayBlockEntries;persist()}">
+                  <div class="tog-t" :class="cfg.miwFadeAwayBlockEntries?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Block Entries on Bad Structure</div>
+                    <div class="miw-hint">When bullish threshold is met, new MIW entries are blocked until structure improves.</div>
+                  </div>
+                </label>
               </div>
 
               <!-- Entry Slots -->
@@ -282,6 +289,7 @@
         miwSlotRanks: {},
         _miwFadeAwayLocked: false,
         _miwFadeAwayCache: {},
+        _miwStructureBlocked: false,
 
         async init() {
           await _origInit.call(this);
@@ -306,9 +314,11 @@
           if (this.cfg.miwHalvingHours     === undefined) this.cfg.miwHalvingHours     = 3;
           if (this.cfg.miwFadeAwayEnabled  === undefined) this.cfg.miwFadeAwayEnabled  = false;
           if (this.cfg.miwFadeAwayPct      === undefined) this.cfg.miwFadeAwayPct      = 50;
-          if (this.cfg.miwFadeAwayLossPct  === undefined) this.cfg.miwFadeAwayLossPct  = 25;
-          this._miwFadeAwayLocked = false;
-          this._miwFadeAwayCache  = {};
+          if (this.cfg.miwFadeAwayLossPct      === undefined) this.cfg.miwFadeAwayLossPct      = 25;
+          if (this.cfg.miwFadeAwayBlockEntries  === undefined) this.cfg.miwFadeAwayBlockEntries  = false;
+          this._miwFadeAwayLocked    = false;
+          this._miwFadeAwayCache     = {};
+          this._miwStructureBlocked  = false;
           if (this.cfg.miwAutoSlots        === undefined) this.cfg.miwAutoSlots        = false;
           if (this.cfg.miwAutoSlotSize     === undefined) this.cfg.miwAutoSlotSize     = 2;
           this.registerRoleBadge?.(item => {
@@ -410,6 +420,7 @@
 
         async runScan() {
           this._miwFadeAwayLocked = false;
+          await this._miwCheckFadeAway();
           await this._miwCheckCascade();
           await this._miwCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -421,14 +432,13 @@
             this._miwLastActedAt = 0;
           }
           await this._miwRunScan();
-          await this._miwCheckFadeAway();
         },
 
         async _miwCheckFadeAway() {
-          if (!this.cfg.miwFadeAwayEnabled) return;
+          if (!this.cfg.miwFadeAwayEnabled) { this._miwStructureBlocked = false; return; }
           if (this._miwFadeAwayLocked) return;
           const miwPositions = (this.positions || []).filter(p => p._miw);
-          if (!miwPositions.length) return;
+          if (!miwPositions.length) { this._miwStructureBlocked = false; return; }
           const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const lossTrig = baseMargin * (this.cfg.miwFadeAwayLossPct ?? 25) / 100;
           const inLoss = miwPositions.some(p => (p.unrealizedPnl ?? p.uPnl ?? 0) <= -lossTrig);
@@ -477,13 +487,15 @@
             else if (e.close > e.open) green++;
           }
           const total = red + green;
-          if (!total) return;
+          if (!total) { this._miwStructureBlocked = false; return; }
           const threshold = (this.cfg.miwFadeAwayPct ?? 50) / 100;
           if (green / total >= threshold) {
+            if (this.cfg.miwFadeAwayBlockEntries) this._miwStructureBlocked = true;
             const oldest = miwPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
-            this.log(`[MIW] 🌬 Fade Away — ${red}R/${green}G (${(green / total * 100).toFixed(0)}% bullish ≥ ${this.cfg.miwFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
+            this.log(`[MIW] 🌬 Fade Away — ${red}R/${green}G (${(green / total * 100).toFixed(0)}% bullish ≥ ${this.cfg.miwFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}${this.cfg.miwFadeAwayBlockEntries ? ' | entries blocked' : ''}`, 'info');
             await this.pseudoClosePosition(oldest, 'sacrifice');
           } else {
+            this._miwStructureBlocked = false;
             this._miwFadeAwayLocked = true;
             this.log(`[MIW] 🌬 Fade Away — ${red}R/${green}G — structure ok, locked until next scan`, 'info');
           }
@@ -493,6 +505,10 @@
           if (!this.cfg.miwEnabled) return;
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
             this.log(`[MIW] 💡 Skipped — ${this._isGainsLocked?.() ? 'gains lock' : 'drawdown halt'} active`, 'info');
+            return;
+          }
+          if (this._miwStructureBlocked) {
+            this.log('[MIW] 🌬 Entries blocked — bad market structure', 'info');
             return;
           }
           if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;

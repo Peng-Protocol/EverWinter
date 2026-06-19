@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.5.11';
+  const VERSION       = '1.5.12';
   const DEFAULT_SLOTS = [['-fund','+24h','>10pct'],['+fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -158,7 +158,14 @@
                 <input type="range" min="5" max="200" step="5" x-model.number="cfg.micFadeAwayLossPct" @change="persist()">
                 <div class="lbl" style="margin-top:5px">Bearish Threshold <b x-text="(cfg.micFadeAwayPct??50)+'%'"></b></div>
                 <input type="range" min="10" max="100" step="5" x-model.number="cfg.micFadeAwayPct" @change="persist()">
-                <div class="mic-hint" x-text="(()=>{ if(_micFadeAwayLocked) return '🔒 Locked — good structure detected. Resets on next scan.'; const cache=_micFadeAwayCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(r/t*100).toFixed(0)+'% bearish (trigger @ '+(cfg.micFadeAwayPct??50)+'%)' : 'No sample yet.'; })()"></div>
+                <div class="mic-hint" x-text="(()=>{ if(_micStructureBlocked) return '⛔ Entries blocked — bad structure. Clears when structure improves.'; if(_micFadeAwayLocked) return '🔒 Locked — good structure detected. Resets on next scan.'; const cache=_micFadeAwayCache||{}; const lastHourStart=Math.floor(Date.now()/3600000)*3600000-3600000; let r=0,g=0; for(const e of Object.values(cache)){if(e.candleStart!==lastHourStart)continue;if(e.close<e.open)r++;else if(e.close>e.open)g++;} const t=r+g; return t ? r+'R / '+g+'G — '+(r/t*100).toFixed(0)+'% bearish (trigger @ '+(cfg.micFadeAwayPct??50)+'%)' : 'No sample yet.'; })()"></div>
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.micFadeAwayBlockEntries=!cfg.micFadeAwayBlockEntries;persist()}">
+                  <div class="tog-t" :class="cfg.micFadeAwayBlockEntries?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Block Entries on Bad Structure</div>
+                    <div class="mic-hint">When bearish threshold is met, new MIC entries are blocked until structure improves.</div>
+                  </div>
+                </label>
               </div>
 
               <!-- Entry Slots -->
@@ -282,6 +289,7 @@
         micSlotRanks: {},
         _micFadeAwayLocked: false,
         _micFadeAwayCache: {},
+        _micStructureBlocked: false,
 
         async init() {
           await _origInit.call(this);
@@ -306,9 +314,11 @@
           if (this.cfg.micHalvingHours     === undefined) this.cfg.micHalvingHours     = 3;
           if (this.cfg.micFadeAwayEnabled  === undefined) this.cfg.micFadeAwayEnabled  = false;
           if (this.cfg.micFadeAwayPct      === undefined) this.cfg.micFadeAwayPct      = 50;
-          if (this.cfg.micFadeAwayLossPct  === undefined) this.cfg.micFadeAwayLossPct  = 25;
-          this._micFadeAwayLocked = false;
-          this._micFadeAwayCache  = {};
+          if (this.cfg.micFadeAwayLossPct      === undefined) this.cfg.micFadeAwayLossPct      = 25;
+          if (this.cfg.micFadeAwayBlockEntries  === undefined) this.cfg.micFadeAwayBlockEntries  = false;
+          this._micFadeAwayLocked    = false;
+          this._micFadeAwayCache     = {};
+          this._micStructureBlocked  = false;
           if (this.cfg.micAutoSlots        === undefined) this.cfg.micAutoSlots        = false;
           if (this.cfg.micAutoSlotSize     === undefined) this.cfg.micAutoSlotSize     = 2;
           this.registerRoleBadge?.(item => {
@@ -410,6 +420,7 @@
 
         async runScan() {
           this._micFadeAwayLocked = false;
+          await this._micCheckFadeAway();
           await this._micCheckCascade();
           await this._micCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -421,14 +432,13 @@
             this._micLastActedAt = 0;
           }
           await this._micRunScan();
-          await this._micCheckFadeAway();
         },
 
         async _micCheckFadeAway() {
-          if (!this.cfg.micFadeAwayEnabled) return;
+          if (!this.cfg.micFadeAwayEnabled) { this._micStructureBlocked = false; return; }
           if (this._micFadeAwayLocked) return;
           const micPositions = (this.positions || []).filter(p => p._mic);
-          if (!micPositions.length) return;
+          if (!micPositions.length) { this._micStructureBlocked = false; return; }
           const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const lossTrig = baseMargin * (this.cfg.micFadeAwayLossPct ?? 25) / 100;
           const inLoss = micPositions.some(p => (p.unrealizedPnl ?? p.uPnl ?? 0) <= -lossTrig);
@@ -477,13 +487,15 @@
             else if (e.close > e.open) green++;
           }
           const total = red + green;
-          if (!total) return;
+          if (!total) { this._micStructureBlocked = false; return; }
           const threshold = (this.cfg.micFadeAwayPct ?? 50) / 100;
           if (red / total >= threshold) {
+            if (this.cfg.micFadeAwayBlockEntries) this._micStructureBlocked = true;
             const oldest = micPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
-            this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G (${(red / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}`, 'info');
+            this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G (${(red / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}${this.cfg.micFadeAwayBlockEntries ? ' | entries blocked' : ''}`, 'info');
             await this.pseudoClosePosition(oldest, 'sacrifice');
           } else {
+            this._micStructureBlocked = false;
             this._micFadeAwayLocked = true;
             this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G — structure ok, locked until next scan`, 'info');
           }
@@ -493,6 +505,10 @@
           if (!this.cfg.micEnabled) return;
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
             this.log(`[MIC] 💡 Skipped — ${this._isGainsLocked?.() ? 'gains lock' : 'drawdown halt'} active`, 'info');
+            return;
+          }
+          if (this._micStructureBlocked) {
+            this.log('[MIC] 🌬 Entries blocked — bad market structure', 'info');
             return;
           }
           if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
