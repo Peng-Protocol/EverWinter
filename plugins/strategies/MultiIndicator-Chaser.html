@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.5.9';
+  const VERSION       = '1.5.10';
   const DEFAULT_SLOTS = [['-fund','+24h','>10pct'],['+fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -150,7 +150,7 @@
                 <div class="tog-t" :class="cfg.micFadeAwayEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Fade Away</div>
-                  <div class="mic-hint">When any MIC position is in loss ≥ threshold, fetches a fresh kline sample. Bad structure → closes oldest position. Good structure → locks until next scan.</div>
+                  <div class="mic-hint">Runs every scan cycle using cached klines. If any MIC position is in loss ≥ threshold, fetches fresh klines instead. Bad structure → closes oldest position.</div>
                 </div>
               </label>
               <div class="g" x-show="cfg.micFadeAwayEnabled" style="margin-top:8px">
@@ -421,6 +421,7 @@
             this._micLastActedAt = 0;
           }
           await this._micRunScan();
+          await this._micCheckFadeAway();
         },
 
         async _micCheckFadeAway() {
@@ -431,38 +432,44 @@
           const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const lossTrig = baseMargin * (this.cfg.micFadeAwayLossPct ?? 25) / 100;
           const inLoss = micPositions.some(p => (p.unrealizedPnl ?? p.uPnl ?? 0) <= -lossTrig);
-          if (!inLoss) return;
-          const cap = this.cfg.micKlineScanCap ?? 50;
-          const allTickers = this._lastAllTickers || [];
-          let syms = allTickers
-            .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
-            .map(t => t.symbol);
-          if (syms.length > cap) {
-            for (let i = syms.length - 1; i > 0; i--) {
-              const j = Math.floor(Math.random() * (i + 1));
-              [syms[i], syms[j]] = [syms[j], syms[i]];
-            }
-            syms = syms.slice(0, cap);
-          }
-          if (!syms.length) return;
           const now = Date.now();
           const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
-          const faCache = {};
-          const CONC = 10;
-          for (let i = 0; i < syms.length; i += CONC) {
-            await Promise.all(syms.slice(i, i + CONC).map(async sym => {
-              try {
-                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
-                if (!r.ok) return;
-                const d = await r.json();
-                const list = d?.result?.list;
-                if (!list || list.length < 2) return;
-                const candle = list[1];
-                faCache[sym] = { candleStart: parseInt(candle[0]), open: parseFloat(candle[1]), close: parseFloat(candle[4]), volume: parseFloat(candle[5]) };
-              } catch(e) {}
-            }));
+          let faCache;
+          if (inLoss) {
+            // Fresh kline fetch when a position is in loss
+            const cap = this.cfg.micKlineScanCap ?? 50;
+            const allTickers = this._lastAllTickers || [];
+            let syms = allTickers
+              .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
+              .map(t => t.symbol);
+            if (syms.length > cap) {
+              for (let i = syms.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [syms[i], syms[j]] = [syms[j], syms[i]];
+              }
+              syms = syms.slice(0, cap);
+            }
+            if (!syms.length) return;
+            faCache = {};
+            const CONC = 10;
+            for (let i = 0; i < syms.length; i += CONC) {
+              await Promise.all(syms.slice(i, i + CONC).map(async sym => {
+                try {
+                  const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
+                  if (!r.ok) return;
+                  const d = await r.json();
+                  const list = d?.result?.list;
+                  if (!list || list.length < 2) return;
+                  const candle = list[1];
+                  faCache[sym] = { candleStart: parseInt(candle[0]), open: parseFloat(candle[1]), close: parseFloat(candle[4]), volume: parseFloat(candle[5]) };
+                } catch(e) {}
+              }));
+            }
+            this._micFadeAwayCache = faCache;
+          } else {
+            // Use scan-cycle kline cache
+            faCache = this._micKlineCache || {};
           }
-          this._micFadeAwayCache = faCache;
           let red = 0, green = 0;
           for (const e of Object.values(faCache)) {
             if (e.candleStart !== lastHourStart) continue;
