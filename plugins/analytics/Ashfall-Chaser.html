@@ -23,8 +23,9 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.14.3';
+  const VERSION        = '1.14.4';
   const ASH_KEY        = '__ashfall_chaser_v1';
+  const ASH_LIQ_KEY    = '__ash_liq_batches';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
   const SCORE_KEY      = '__everwinter_scorecard_v1';
@@ -328,6 +329,16 @@
           if (this.cfg.ashLiqEnabled      === undefined) this.cfg.ashLiqEnabled      = false;
           if (this.cfg.ashLiqBatchSize    === undefined) this.cfg.ashLiqBatchSize    = 20;
           if (this.cfg.ashLiqThresholdPct === undefined) this.cfg.ashLiqThresholdPct = 10;
+          try {
+            const saved = JSON.parse(localStorage.getItem(ASH_LIQ_KEY) || 'null');
+            if (Array.isArray(saved) && this.cfg.ashLiqEnabled) {
+              const valid = saved.filter(s => s.endsAt > Date.now());
+              if (valid.length) {
+                this._liqCycleCounter = Math.max(this._liqCycleCounter, ...valid.map(s => s.id));
+                for (const s of valid) this._liqResumeBatch(s);
+              }
+            }
+          } catch(_) {}
           this._afScoreBuild();
           try {
             const raw = localStorage.getItem(ASH_KEY);
@@ -925,6 +936,63 @@
             try { if (b.ws && b.ws.readyState !== WebSocket.CLOSED) b.ws.close(); } catch(_) {}
           }
           this._liqBatches = [];
+          try { localStorage.removeItem(ASH_LIQ_KEY); } catch(_) {}
+        },
+
+        _liqPersistBatches() {
+          try {
+            const snapshots = (this._liqBatches || []).map(b => ({
+              id: b.id, startedAt: b.startedAt, endsAt: b.endsAt, symbols: b.symbols,
+              sLiqTurnover: { ...b.sLiqTurnover }, bLiqTurnover: { ...b.bLiqTurnover }
+            }));
+            localStorage.setItem(ASH_LIQ_KEY, JSON.stringify(snapshots));
+          } catch(_) {}
+        },
+
+        _liqResumeBatch(snapshot) {
+          const remaining = snapshot.endsAt - Date.now();
+          if (remaining <= 0) return;
+          const batch = {
+            id: snapshot.id, startedAt: snapshot.startedAt, endsAt: snapshot.endsAt,
+            symbols: snapshot.symbols,
+            sLiqTurnover: { ...snapshot.sLiqTurnover },
+            bLiqTurnover: { ...snapshot.bLiqTurnover },
+            ws: null, _endTimer: null
+          };
+          this._liqBatches.push(batch);
+          const id = batch.id;
+          const handleMsg = (ev) => {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (!msg.data) return;
+              const events = Array.isArray(msg.data) ? msg.data : [msg.data];
+              for (const e of events) {
+                const sym = e.s;
+                if (!sym || !Object.prototype.hasOwnProperty.call(batch.sLiqTurnover, sym)) continue;
+                const turnover = parseFloat(e.v || 0) * parseFloat(e.p || 0);
+                if (!isFinite(turnover) || turnover <= 0) continue;
+                if (e.S === 'Buy')       batch.sLiqTurnover[sym] += turnover;
+                else if (e.S === 'Sell') batch.bLiqTurnover[sym] += turnover;
+              }
+              this._liqPersistBatches();
+            } catch(_) {}
+          };
+          const openWs = () => {
+            try {
+              const ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+              batch.ws = ws;
+              ws.onopen    = () => ws.send(JSON.stringify({ op: 'subscribe', args: batch.symbols.map(s => `allLiquidation.${s}`) }));
+              ws.onmessage = handleMsg;
+              ws.onerror   = () => {};
+              ws.onclose   = () => {
+                if (Date.now() >= batch.endsAt || !this._liqBatches.some(b => b.id === id)) return;
+                setTimeout(openWs, 5000);
+              };
+            } catch(_) {}
+          };
+          openWs();
+          batch._endTimer = setTimeout(() => this._liqCloseBatch(batch), remaining);
+          this.log(`[ASH] 💧 Liq cycle #${id} resumed — ${batch.symbols.length} tickers, ${Math.round(remaining / 60000)}m remaining`, 'info');
         },
 
         _liqFeedWatcherHtml() {
@@ -978,6 +1046,7 @@
             bLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
             ws: null, _endTimer: null };
           this._liqBatches.push(batch);
+          this._liqPersistBatches();
           const handleMsg = (ev) => {
             try {
               const msg = JSON.parse(ev.data);
@@ -991,6 +1060,7 @@
                 if (e.S === 'Buy')       batch.sLiqTurnover[sym] += turnover;
                 else if (e.S === 'Sell') batch.bLiqTurnover[sym] += turnover;
               }
+              this._liqPersistBatches();
             } catch(_) {}
           };
           const openWs = () => {
@@ -1013,6 +1083,7 @@
 
         _liqCloseBatch(batch) {
           this._liqBatches = (this._liqBatches || []).filter(b => b.id !== batch.id);
+          this._liqPersistBatches();
           if (batch._endTimer) { clearTimeout(batch._endTimer); batch._endTimer = null; }
           try { if (batch.ws && batch.ws.readyState !== WebSocket.CLOSED) batch.ws.close(); } catch(_) {}
           batch.ws = null;
