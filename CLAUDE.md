@@ -38,6 +38,10 @@ Each file carries its version in two or three places — update **all** that app
 - **README.md**: Technical and code-focused. Use precise API names, config key names, function names, variable names, and implementation details. Refer to bots by their technical names (PseudoWinter, PseudoChaser, etc.).
 - **Strategy_book.md**: Prescriptive human tone. No code references, no config key names, no function names, no bot or file names. Write for a trader, not a developer — describe what to do and why, not how it is implemented. Avoid meandering language — be direct and use as few phrases as possible.
 
+## Scope (REQUIRED)
+
+Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser.html** and their associated plugins (`plugins/analytics/`, `plugins/strategies/`). Do not touch other files unless explicitly directed.
+
 ## Working Style (REQUIRED)
 
 - **When uncertain, ask.** Never guess at intent or silently pick an interpretation. A one-line question costs nothing; a wrong implementation costs context and time.
