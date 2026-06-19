@@ -23,13 +23,13 @@ Each file carries its version in two or three places — update **all** that app
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.6.1 |
-| `PseudoChaser.html` | v1.2.1 |
+| `PseudoWinter.html` | v1.6.7 |
+| `PseudoChaser.html` | v1.2.6 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.5.7 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.5.7 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.13.3 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.13.3 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.5.16 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.5.16 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.13.7 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.13.6 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
@@ -37,6 +37,10 @@ Each file carries its version in two or three places — update **all** that app
 
 - **README.md**: Technical and code-focused. Use precise API names, config key names, function names, variable names, and implementation details. Refer to bots by their technical names (PseudoWinter, PseudoChaser, etc.).
 - **Strategy_book.md**: Prescriptive human tone. No code references, no config key names, no function names, no bot or file names. Write for a trader, not a developer — describe what to do and why, not how it is implemented. Avoid meandering language — be direct and use as few phrases as possible.
+
+## Scope (REQUIRED)
+
+Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser.html** and their associated plugins (`plugins/analytics/`, `plugins/strategies/`). Do not touch other files unless explicitly directed.
 
 ## Working Style (REQUIRED)
 
@@ -47,3 +51,4 @@ Each file carries its version in two or three places — update **all** that app
 - **Prefer the minimal correct change.** Don't clean up, refactor, or extend beyond what was explicitly asked.
 - **Log behavioral corrections.** Whenever the user gives a behavioral correction or long-term instruction — signalled by phrases like "why didn't you…", "why are you…", "you should always…", "you should never…", or any direct criticism of approach — add the lesson to this file before finishing the response.
 - **Tooltip length.** In-app tooltips (hint text, x-text descriptions, title attributes) must be at most 3 phrases. Aim for 1.
+- **Never use `window.confirm()`, `window.alert()`, or `window.prompt()` in plugin or bot UI.** These are blocked when the app runs in an iframe, silently returning `false`/`undefined` and making buttons appear unresponsive with no feedback. Use inline Alpine confirmation UI instead: wrap the button in `<span x-data="{c:false}">`, show the action button when `!c`, and when clicked set `c=true` to reveal inline "Sure? Yes / No" buttons that execute the action or reset `c`.
