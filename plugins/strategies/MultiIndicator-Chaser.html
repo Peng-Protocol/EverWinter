@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.7.1';
+  const VERSION       = '1.7.2';
   const DEFAULT_SLOTS = [['-fund','+24h','>10pct'],['+fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -538,10 +538,14 @@
 
         async _micCheckLiqFadeAway() {
           if (!this.cfg.micLiqFadeEnabled) { this._micLiqBlocked = false; return; }
-          const ver = this._liqResultsVersion ?? 0;
+          const sharedLiq = this._sharedRead('liqResults');
+          const sharedVer = sharedLiq?.ver ?? 0;
+          const localVer  = this._liqResultsVersion ?? 0;
+          const ver = Math.max(localVer, sharedVer);
           if (this._micLiqFadeCheckedVer === ver) return;
           this._micLiqFadeCheckedVer = ver;
-          const results = Object.values(this._liqResults || {});
+          const combined = { ...(sharedLiq?.data || {}), ...(this._liqResults || {}) };
+          const results = Object.values(combined);
           if (!results.length) return;
           let totalS = 0, totalB = 0;
           for (const r of results) { totalS += r.sLiqRaw || 0; totalB += r.bLiqRaw || 0; }
@@ -790,11 +794,21 @@
               }
             }
           }
+          // Seed from shared mcap — avoids refetching what partner already resolved
+          const sharedMcap = this._sharedRead('mcap');
+          const mcapTtl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
+          if (sharedMcap?.data) {
+            for (const [id, entry] of Object.entries(sharedMcap.data)) {
+              if (entry?.mcap && (now - (entry.ts || 0)) < mcapTtl && !this._micMcapCache[id]) {
+                this._micMcapCache[id] = { mcap: entry.mcap, ts: entry.ts };
+              }
+            }
+          }
           const ids = [...new Set(
             bases.map(b => this._micCoinIdCache[b]).filter(id => {
               if (!id) return false;
               const c = this._micMcapCache[id];
-              return !c || now - c.ts >= (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
+              return !c || now - c.ts >= mcapTtl;
             })
           )];
           if (!ids.length) return;
@@ -802,10 +816,15 @@
             const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids.join(',')}&vs_currencies=usd&include_market_cap=true`);
             if (r.ok) {
               const d = await r.json();
+              const _patch = {};
               for (const id of ids) {
                 const mcap = d?.[id]?.usd_market_cap;
-                if (mcap) this._micMcapCache[id] = { mcap, ts: now };
+                if (mcap) {
+                  this._micMcapCache[id] = { mcap, ts: now };
+                  _patch[id] = { mcap, ts: now };
+                }
               }
+              if (Object.keys(_patch).length) this._sharedMerge('mcap', _patch);
             }
           } catch(e) {}
         },
@@ -848,10 +867,19 @@
         },
 
         async _micPrefetchKlines(symbols) {
-          this._micKlineCache = {};
-          const now = Date.now();
+          const now           = Date.now();
           const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
-          const toFetch = symbols;
+          const scanMs        = (this.cfg.scanMins || 15) * 60 * 1000;
+          const sharedKlines  = this._sharedRead('klines_1h_last');
+          const seedCache = {};
+          if (sharedKlines?.data) {
+            for (const sym of symbols) {
+              const e = sharedKlines.data[sym];
+              if (e && e.candleStart >= lastHourStart && e.ts && (now - e.ts) < scanMs) seedCache[sym] = e;
+            }
+          }
+          this._micKlineCache = { ...seedCache };
+          const toFetch = symbols.filter(sym => !seedCache[sym]);
           const CONC = 10;
           for (let i = 0; i < toFetch.length; i += CONC) {
             await Promise.all(toFetch.slice(i, i + CONC).map(async sym => {
@@ -867,10 +895,14 @@
                   open:  parseFloat(candle[1]),
                   close: parseFloat(candle[4]),
                   volume: parseFloat(candle[5]),
+                  ts: now,
                 };
               } catch(e) {}
             }));
           }
+          const patch = {};
+          for (const sym of toFetch) { if (this._micKlineCache[sym]) patch[sym] = this._micKlineCache[sym]; }
+          if (Object.keys(patch).length) this._sharedMerge('klines_1h_last', patch);
         },
 
         _micGetKlineSync(symbol) {
