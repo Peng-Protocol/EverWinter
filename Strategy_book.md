@@ -202,12 +202,14 @@ Each strategy is a specific combination of techniques.
 - **LBA (Buy Spike)** — The mirror: high volume in the configured range, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
 - **R-ASL (Quiet Red)** — The last completed hourly candle closed red and its volume was *below* the configured lower spike bound — meaning the market moved down without a volume surge. This is quiet, uncontested selling: no crowd participation, no obvious catalyst. It can signal a slow bleed or a low-conviction pullback that is easier to trade than a violent spike.
 - **R-ABL (Quiet Green)** — The mirror: a green candle with volume below the spike threshold. The market drifted up without conviction. Useful for entries where you expect a measured continuation rather than a sharp move.
+- **S-Liq** — Short positions were liquidated above the configured threshold as a share of 24-hour turnover, across the live liquidation sample. Short liquidations are bullish — the market forced out the short side. Use this to confirm that the long case has real pressure behind it.
+- **B-Liq** — Long positions were liquidated above the threshold. Long liquidations are bearish — the market forced out the long side. Use this to confirm that the short case has real pressure behind it.
 
 **Default configuration**: The default slots cover the primary entry cases. The short side uses: positive funding with price rising, negative funding with price falling, rising price with high participation, and falling price with low participation. The long side uses the directional mirrors of the same. Any slot can be edited, removed, or replaced to build entirely different configurations.
 
 **Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume before the position opens. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
 
-**Auto-slot builder**: instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with ten available criteria, it produces 45 distinct slots — every pair of signals that could align simultaneously. At size 3, 120 slots. Combined with auto-correction, this creates a self-pruning strategy: all combinations run, and the ones that consistently lose are disabled without manual intervention.
+**Auto-slot builder**: instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 distinct slots — every pair of signals that could align simultaneously. At size 3, 220 slots. Combined with auto-correction, this creates a self-pruning strategy: all combinations run, and the ones that consistently lose are disabled without manual intervention.
 
 **Exits**: All positions opened through this strategy exit through the standard take-profit and stop-loss settings by default. Three optional group-exit modes add further control.
 
@@ -219,14 +221,18 @@ Each strategy is a specific combination of techniques.
 
 **Fade Away** — a directional market response. If the broad sample of hourly candles is skewed sufficiently in one direction (configurable threshold, default 50%), the oldest open position closes. For the short side, the trigger is a broadly bullish tape — when the market is broadly going up, the oldest short gets cut first. For the long side, the trigger is a broadly bearish tape. Like rolling sacrifice, this closes one position per cycle. The difference is the trigger: sacrifice fires on your own portfolio's loss level; fade away fires on the market's structural direction as read from the candle sample.
 
+**Liq Fade Away** — the same graduated response, driven by liquidation flow instead of candle direction. The liquidation surveillance layer accumulates real-money forced-close events across a rolling sample of volatile tickers. Once a sample batch closes, the balance of short liquidations versus long liquidations is evaluated. If long liquidations dominate beyond the threshold, the short side interprets this as adverse pressure and closes its oldest position. If short liquidations dominate, the long side responds the same way. Because liquidation data is collected over an hour-long window, this trigger is slower than candle-based Fade Away but carries more weight — a liquidation event represents actual margin destruction, not just candle direction. An optional block-entries mode holds new positions until the adverse signal clears.
+
 **Components used**:
 - Slot-based AND-gate filter (user-configurable; any combination of criteria per slot, unlimited slots)
 - Auto-slot builder (generates all combinations at configured size)
 - Funding rate threshold gate (+fund, -fund)
 - 24-hour price direction (+24h, -24h)
 - Vol/mcap ratio filter (>10%, <10%)
-- 1h volume spike and candle direction (LSA, LBA)
-- Group cascade exit, group sacrifice exit, rolling window sacrifice, fade away
+- 1h volume spike and candle direction (LSA, LBA, R-ASL, R-ABL)
+- Liquidation flow criteria (S-Liq, B-Liq — requires Liquidation Surveillance active)
+- Group cascade exit, group sacrifice exit, rolling window sacrifice, fade away, liq fade away
+- Liquidation surveillance (live WebSocket feed, per-scan rolling batches)
 - Drawdown throttle and gains lock
 - Climate gate (learned market-structure profile, when Structure Learning plugins are loaded)
 - Slot auto-correction (PnL-based auto-disable/re-enable, when Structure Learning plugins are loaded)
