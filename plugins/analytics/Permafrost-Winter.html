@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.14.2';
+  const VERSION        = '1.14.3';
   const PFR_KEY        = '__permafrost_winter_v1';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
@@ -246,7 +246,7 @@
             </div>
             <!-- Liquidation Surveillance -->
             <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
-              <label class="tog" @click.prevent="if(!cfgLocked){cfg.pfLiqEnabled=!cfg.pfLiqEnabled;_liqStartScheduler();persist()}">
+              <label class="tog" @click.prevent="if(!cfgLocked){cfg.pfLiqEnabled=!cfg.pfLiqEnabled;if(!cfg.pfLiqEnabled)_liqCloseAll();persist()}">
                 <div class="tog-t" :class="cfg.pfLiqEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Liquidation Surveillance</div>
@@ -264,13 +264,12 @@
                   <input type="range" min="5" max="50" step="5" x-model.number="cfg.pfLiqBatchSize" @change="persist()">
                   <div class="pfr-hint">Random draw per 1h window from ≥6% 24h move pool, disjoint across concurrent batches.</div>
                 </div>
-                <div class="g" style="margin-top:6px">
-                  <div class="lbl">Stagger <b x-text="(m=>(m>=3600000?Math.round(m/3600000)+'h':Math.round(m/60000)+'m'))(cfg.pfLiqStaggerMs??1800000)"></b> between batches</div>
-                  <input type="range" min="900000" max="7200000" step="300000" x-model.number="cfg.pfLiqStaggerMs" @change="_liqStartScheduler();persist()">
-                  <div class="pfr-hint">How often a new 1h window starts. 30m default → ~2 batches concurrent.</div>
+                <div class="pfr-hint" style="margin-top:5px" x-text="(()=>{ const n=(_liqBatches||[]).length; const last=(_liqCycleHistory||[]).length?_liqCycleHistory[_liqCycleHistory.length-1]:null; const ago=last?Math.round((Date.now()-last.ts)/60000)+'m ago':'never'; return n+' feed'+(n!==1?'s':'')+' active · last closed: '+ago+' · '+(_liqCycleHistory||[]).length+' recorded'; })()"></div>
+                <div x-show="(_liqBatches||[]).length>0" style="margin-top:6px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
+                  <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">FEED WATCHER</div>
+                  <div x-html="_liqFeedWatcherHtml()" style="padding:2px 8px 4px"></div>
                 </div>
-                <div class="pfr-hint" style="margin-top:5px" x-text="(()=>{ const n=(_liqBatches||[]).length; const last=(_liqCycleHistory||[]).length?_liqCycleHistory[_liqCycleHistory.length-1]:null; const ago=last?Math.round((Date.now()-last.ts)/60000)+'m ago':'never'; return n+' batch'+(n!==1?'es':'')+' active · last cycle: '+ago+' · '+(_liqCycleHistory||[]).length+' recorded'; })()"></div>
-                <div x-show="(_liqCycleHistory||[]).length>0" style="margin-top:8px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
+                <div x-show="(_liqCycleHistory||[]).length>0" style="margin-top:6px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
                   <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">LIQUIDATION SAMPLE</div>
                   <div x-html="_liqChartSvg()" style="padding:4px 6px"></div>
                 </div>
@@ -332,7 +331,6 @@
         _liqCycleHistory: [],
         _liqLatestResults: [],
         _liqCycleCounter: 0,
-        _liqSchedulerTimer: null,
 
         async init() {
           await _origInit.call(this);
@@ -351,7 +349,6 @@
           if (this.cfg.pfLiqEnabled      === undefined) this.cfg.pfLiqEnabled      = false;
           if (this.cfg.pfLiqBatchSize    === undefined) this.cfg.pfLiqBatchSize    = 20;
           if (this.cfg.pfLiqThresholdPct === undefined) this.cfg.pfLiqThresholdPct = 10;
-          if (this.cfg.pfLiqStaggerMs    === undefined) this.cfg.pfLiqStaggerMs    = 1800000;
           this._pfScoreBuild();
           try {
             const raw = localStorage.getItem(PFR_KEY);
@@ -394,7 +391,6 @@
               }
             }
           }, 15000);
-          this._liqStartScheduler();
         },
 
         persist() {
@@ -901,6 +897,7 @@
           }
           await _origScan.call(this);
           this.cfg.maxPos = _savedMaxPos;
+          if (this.cfg.pfLiqEnabled) this._liqLaunchBatch();
           if (!this.cfg.permafrostEnabled) return;
           this._pfCheckCross().catch(() => {});
           // Deferred so MIW's _miwRunScan (which fetches klines) finishes first —
@@ -948,21 +945,36 @@
 
         // ── Liquidation surveillance ──
 
-        _liqStartScheduler() {
-          if (this._liqSchedulerTimer) { clearInterval(this._liqSchedulerTimer); this._liqSchedulerTimer = null; }
-          if (!this.cfg.pfLiqEnabled) {
-            for (const b of (this._liqBatches || [])) {
-              if (b._endTimer) clearTimeout(b._endTimer);
-              try { if (b.ws && b.ws.readyState !== WebSocket.CLOSED) b.ws.close(); } catch(_) {}
-            }
-            this._liqBatches = [];
-            return;
+        _liqCloseAll() {
+          for (const b of (this._liqBatches || [])) {
+            if (b._endTimer) clearTimeout(b._endTimer);
+            try { if (b.ws && b.ws.readyState !== WebSocket.CLOSED) b.ws.close(); } catch(_) {}
           }
-          this._liqLaunchBatch();
-          this._liqSchedulerTimer = setInterval(() => {
-            if (!this.cfg.pfLiqEnabled) { clearInterval(this._liqSchedulerTimer); this._liqSchedulerTimer = null; return; }
-            this._liqLaunchBatch();
-          }, this.cfg.pfLiqStaggerMs ?? 1800000);
+          this._liqBatches = [];
+        },
+
+        _liqFeedWatcherHtml() {
+          void this.tick;
+          const batches = this._liqBatches || [];
+          if (!batches.length) return '';
+          const fmt = v => v >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'K' : v.toFixed(0);
+          return batches.map(b => {
+            const rem  = Math.max(0, b.endsAt - Date.now());
+            const remM = Math.floor(rem / 60000);
+            const remS = Math.floor((rem % 60000) / 1000);
+            let totalS = 0, totalB = 0;
+            for (const s of b.symbols) { totalS += b.sLiqTurnover[s] || 0; totalB += b.bLiqTurnover[s] || 0; }
+            const dom  = totalS > totalB ? 'S' : totalB > totalS ? 'B' : '·';
+            const clr  = dom === 'S' ? 'rgba(100,220,150,.9)' : dom === 'B' ? 'rgba(255,80,80,.9)' : 'var(--text-lo)';
+            return `<div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">` +
+              `<span style="color:var(--text-lo);min-width:18px">#${b.id}</span>` +
+              `<span style="color:var(--text-lo)">${b.symbols.length}t</span>` +
+              `<span style="color:rgba(100,220,150,.8)">S:${fmt(totalS)}</span>` +
+              `<span style="color:rgba(255,80,80,.8)">B:${fmt(totalB)}</span>` +
+              `<span style="color:${clr};font-weight:bold">${dom}</span>` +
+              `<span style="margin-left:auto;color:var(--text-lo)">${remM}m${String(remS).padStart(2, '0')}s</span>` +
+              `</div>`;
+          }).join('');
         },
 
         _liqLaunchBatch() {
