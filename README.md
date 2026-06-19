@@ -202,7 +202,7 @@ All calls target `https://api.bybit.com` with `category=linear`.
 
 | Endpoint | Usage |
 |---|---|
-| `wss://stream.bybit.com/v5/public/linear` | Liquidation feed — Permafrost/Ashfall subscribe `allLiquidation.{symbol}` per batch. Message: `{ topic, data: [{ s, S, v, p, T }] }`. `S:"Buy"` = short liq (S-Liq); `S:"Sell"` = long liq (B-Liq). Turnover = `parseFloat(v) × parseFloat(p)` USDT. |
+| `wss://stream.bybit.com/v5/public/linear` | Liquidation feed — Permafrost/Ashfall subscribe `allLiquidation.{symbol}` per batch. Message: `{ topic, ts, type, data: { symbol, side, size, price } }` (Bybit v5 verbose fields; code falls back to compact `s/S/v/p` for legacy compatibility). `side:"Buy"` = short liquidated (S-Liq); `side:"Sell"` = long liquidated (B-Liq). Turnover per event: `parseFloat(size) × parseFloat(price)` USDT. |
 
 ### Public (no auth required)
 
@@ -438,11 +438,11 @@ Background WebSocket engine that accumulates live liquidation flow data across a
 
 **Eligible tickers**: USDT-margined, `|price24hPcnt| ≥ 6%`, `lastPrice ≥ 0.001`. A Fisher-Yates shuffle draws up to `pfLiqBatchSize`/`ashLiqBatchSize` (default 20) from this pool, excluding symbols already being watched by any active batch.
 
-**WebSocket**: `wss://stream.bybit.com/v5/public/linear`. Subscribes to `allLiquidation.{symbol}` for each symbol in the batch. Message shape: `{ topic, data: [{ s, S, v, p, T }] }` where `S: "Buy"` = short position liquidated (bullish signal, S-Liq) and `S: "Sell"` = long position liquidated (bearish signal, B-Liq). Turnover per event: `parseFloat(v) × parseFloat(p)` USDT. Per-symbol raw totals accumulate in `batch.sLiqTurnover[sym]` / `batch.bLiqTurnover[sym]`. Reconnects on unexpected close (5 s delay); stops once `batch.endsAt` passes.
+**WebSocket**: `wss://stream.bybit.com/v5/public/linear`. Subscribes to `allLiquidation.{symbol}` for each symbol in the batch. Message shape: `{ topic, ts, type, data: { symbol, side, size, price } }` (Bybit v5 verbose fields; code also accepts compact `s/S/v/p` as fallback). `side: "Buy"` = short position liquidated (S-Liq, bullish flow); `side: "Sell"` = long position liquidated (B-Liq, bearish flow). Turnover per event: `parseFloat(size) × parseFloat(price)` USDT. Per-symbol raw totals accumulate in `batch.sLiqTurnover[sym]` / `batch.bLiqTurnover[sym]`. Reconnects on unexpected close (5 s delay); stops once `batch.endsAt` passes.
 
-**Batch close** (`_liqCloseBatch`): WS closes, raw totals (`sLiqRaw`, `bLiqRaw`) and percentage-of-24h-turnover values (`sLiqPct`, `bLiqPct`) are computed per symbol and written to `this._liqResults[sym]`. `_liqResultsVersion` is incremented each time, signalling MIW/MIC Liq Fade Away to re-evaluate. Cycle summary is pushed to `_liqCycleHistory` (capped at 30); `_liqLatestResults` is updated.
+**Batch close** (`_liqCloseBatch`): WS closes, raw totals (`sLiqRaw`, `bLiqRaw`) and cycle-relative percentages (`sLiqPct`, `bLiqPct`) are computed per symbol and written to `this._liqResults[sym]`. `sLiqPct = sLiqRaw / (sLiqRaw + bLiqRaw) × 100` — shares of the cycle's own total; they always sum to 100% when any liq occurred. `_liqResultsVersion` is incremented each time, signalling MIW/MIC Liq Fade Away to re-evaluate. Cycle summary is pushed to `_liqCycleHistory` (capped at 30); `_liqLatestResults` is updated.
 
-**Qualification**: `sLiqPct ≥ threshold` marks a symbol as S-Liq qualified; `bLiqPct ≥ threshold` marks it B-Liq qualified. Used by MIW/MIC `checkCrit` for `sliq`/`bliq` slot criteria.
+**Qualification**: A symbol qualifies as S-Liq when `liqTotal > 0 && sLiqPct ≥ threshold` (S-Liq dominates by threshold% of cycle total); B-Liq when `bLiqPct ≥ threshold`. At the default 50%, a symbol qualifies when one side accounts for at least half the cycle's liquidation turnover. Used by MIW/MIC `checkCrit` for `sliq`/`bliq` slot criteria.
 
 **Disable**: `_liqCloseAll()` closes all active WS connections, clears `_liqBatches`, and removes the persistence key from localStorage. Called when the toggle is turned off; `_liqLaunchBatch()` guards against launching while disabled.
 
@@ -452,9 +452,9 @@ Background WebSocket engine that accumulates live liquidation flow data across a
 
 **State vars**: `_liqBatches` (active batch objects, each containing `id`, `symbols`, `sLiqTurnover`, `bLiqTurnover`, `startedAt`, `endsAt`, `ws`, `_endTimer`), `_liqResults` (symbol → `{ sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, cycleId, ts }`), `_liqResultsVersion` (monotonic counter, incremented per closed batch), `_liqCycleHistory`, `_liqLatestResults`, `_liqCycleCounter`.
 
-**Config keys**: `pfLiqEnabled`/`ashLiqEnabled` (default `false`), `pfLiqBatchSize`/`ashLiqBatchSize` (default `20`, range 5–50 step 5), `pfLiqThresholdPct`/`ashLiqThresholdPct` (default `10`, range 1–50).
+**Config keys**: `pfLiqEnabled`/`ashLiqEnabled` (default `false`), `pfLiqBatchSize`/`ashLiqBatchSize` (default `20`, range 5–50 step 5), `pfLiqThresholdPct`/`ashLiqThresholdPct` (default `50`, range 10–90 step 5).
 
-**UI**: Feed Watcher panel (visible while feeds are active — each row shows batch ID, ticker count, live S/B USDT accumulator totals, dominant side, and countdown to close; driven by `_liqFeedWatcherHtml()` with `void this.tick` reactivity), Liquidation Sample chart (`_liqChartSvg()` — SVG bar chart of last 10 closed cycles, bars green for S-dominant, red for B-dominant, full opacity if any ticker qualified), Latest Cycle chip grid (`_liqInfoHtml()` — one chip per ticker showing S/B percentages with qualification-side border color and 🥵/🥶 badge for qualifiers).
+**UI**: Feed Watcher panel (visible while feeds are active — each row shows batch ID, ticker count, live S/B USDT accumulator totals, dominant side, and countdown to close; driven by `_liqFeedWatcherHtml()` with `void this.tick` reactivity), Liquidation Sample chart (`_liqChartSvg()` — stacked vertical bar SVG of last 10 closed cycles; B-Liq (red) on the bottom, S-Liq (green) stacked above; Y-axis in raw USDT; full opacity for qualifying segments, dim for non-qualifying — no threshold line), Latest Cycle chip grid (`_liqInfoHtml()` — one chip per ticker showing S/B percentages with qualification-side border color and 🥵/🥶 badge for qualifiers).
 
 ### Structure Sampling bar chart
 
@@ -496,8 +496,8 @@ A slot-based entry filter that combines funding rate, 24-hour price direction, a
 | `<10pct` | 🔉 | 🔉 | `turnover24h / marketCap < 0.10` — low relative participation |
 | `lsa` | 🟥 | 🟥 | Last completed 1h kline volume in the configured spike band above 24h hourly average AND `close < open` — sell-side liquidity spike |
 | `lba` | 🟩 | 🟩 | Same spike band condition AND `close > open` — buy-side liquidity spike |
-| `sliq` | 🥶 | 🥶 | `_liqResults[sym].sLiqPct ≥ pfLiqThresholdPct` — short positions liquidated ≥ threshold % of 24h turnover in the Permafrost/Ashfall sample window; bullish flow signal. No per-scan fetch — reads directly from `_liqResults` (requires Permafrost/Ashfall with liquidation surveillance enabled). |
-| `bliq` | 🥵 | 🥵 | `_liqResults[sym].bLiqPct ≥ pfLiqThresholdPct` — long positions liquidated ≥ threshold %; bearish flow signal. Same data source as `sliq`. |
+| `sliq` | 🥶 | 🥶 | `_liqResults[sym].sLiqPct ≥ pfLiqThresholdPct` — short positions (S-Liq) accounted for ≥ threshold% of the cycle's total liquidation turnover; bullish flow signal. No per-scan fetch — reads directly from `_liqResults` (requires Permafrost/Ashfall with liquidation surveillance enabled). |
+| `bliq` | 🥵 | 🥵 | `_liqResults[sym].bLiqPct ≥ pfLiqThresholdPct` — long positions (B-Liq) accounted for ≥ threshold% of the cycle's total liquidation turnover; bearish flow signal. Same data source as `sliq`. |
 
 The badge is **app-relative** for funding: 🤑 always means the funding rate is favorable for the position direction (carry income), 💸 means the funding rate is adverse. Hovering the badge in the trades or market menu shows a plain-text tooltip with the matched criteria names. Old positions without saved criteria show `Multi` as fallback.
 
@@ -593,9 +593,11 @@ Config keys: `miwFadeAwayEnabled` (default `false`), `miwFadeAwayPct` (default `
 
 Reads `_liqResults` merged with the shared registry (`{ ...(sharedLiq?.data || {}), ...(this._liqResults || {}) }` — own data takes precedence) and sums `sLiqRaw`/`bLiqRaw` across all symbols. The version gate uses `Math.max(localVer, sharedVer)` so either bot advancing the counter triggers an evaluation. Evaluates only when the combined version has advanced since the last check (`_miwLiqFadeCheckedVer`/`_micLiqFadeCheckedVer`), ensuring exactly one evaluation per new liquidation batch regardless of scan cadence.
 
-Direction triggers:
-- **MIW** (Winter — shorts): `totalB / total ≥ miwLiqFadePct / 100` — long liquidations dominating means the market has been punishing longs, signalling adverse conditions for shorts.
-- **MIC** (Chaser — longs): `totalS / total ≥ micLiqFadePct / 100` — short liquidations dominating means the market has been punishing shorts.
+**Scorecard bias gate**: before evaluating the directional trigger, `_miwLiqScorecardBias('bliq')` / `_micLiqScorecardBias('sliq')` is called and the result stored in the reactive property `_miwLiqBias` / `_micLiqBias`. The helper reads `__everwinter_scorecard_v1`, filters to records within the 30-day TTL that contain the relevant criterion, groups them by slot key, and computes direction-adjusted PnL per slot (`source === 'winter' ? pnl : -pnl` for MIW; `source === 'chaser' ? pnl : -pnl` for MIC). It counts slots with positive vs. negative total PnL, returning `'bad'` when loss slots outnumber profit slots, `'good'` when reversed, or `null` on a tie or no data. The fade only fires when `_miwLiqBias === 'bad'` / `_micLiqBias === 'bad'`.
+
+Direction triggers (both conditions must hold):
+- **MIW** (Winter — shorts): `totalB / total ≥ miwLiqFadePct / 100` **and** `_miwLiqBias === 'bad'` — B-Liq dominates and scorecard confirms B-Liq slots have historically lost for Winter.
+- **MIC** (Chaser — longs): `totalS / total ≥ micLiqFadePct / 100` **and** `_micLiqBias === 'bad'` — S-Liq dominates and scorecard confirms S-Liq slots have historically lost for Chaser.
 
 When triggered: closes the **oldest** MIW/MIC position (by `openedAt`) with reason `'sacrifice'`; optionally sets `_miwLiqBlocked`/`_micLiqBlocked` to gate new entries until the signal clears. Block lifts automatically on the next evaluation when the adverse condition no longer holds.
 
