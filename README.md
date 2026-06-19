@@ -27,6 +27,62 @@ Each bot is a single self-contained HTML file. No build step, no backend, no ser
 
 **Module-level state**: `_closingIds` (Set), `_klineCache` (object), `_instrCache` (object), `_auditRunning`, `_auditPromise` are all declared outside the Alpine component. They are shared across all method calls for the lifetime of the page.
 
+**Cross-tab constants**: `BOT_ID` (`'winter'` / `'chaser'`), `SHARED_KEY` (`'__ew_shared_v1'`), and `_sharedChannel` (a `BroadcastChannel('ew_shared')` instance, or `null` when the API is unavailable) are declared at module scope, outside the Alpine component.
+
+---
+
+## Cross-Tab Data Pool
+
+When both PseudoWinter and PseudoChaser are open simultaneously (same origin, different tabs), they cooperate through a shared data registry backed by `localStorage.__ew_shared_v1` and notified via `BroadcastChannel('ew_shared')`. Either bot works normally solo — the registry is simply absent and all ladder checks fall through to normal fetches.
+
+### Registry format
+
+`__ew_shared_v1` is a JSON object keyed by data type. Each entry is `{ data, ts, by }` — `data` is type-specific, `ts` is the write epoch ms, `by` is the `BOT_ID` of the writer (`'winter'` or `'chaser'`). Map-type entries (`klines_1h`, `klines_1h_last`, `mcap`, `liqResults`, `watchTickers`) carry the additional sub-fields for individual entries inside `data`; scalar-type entries (`bulkTickers`) store the payload directly. Writes are last-write-wins — no merge conflict resolution.
+
+`BroadcastChannel` fires on every write so the other tab can react immediately; `localStorage` provides persistence for tabs opened after a write.
+
+### Helper methods (base app, both bots)
+
+| Method | Purpose |
+|---|---|
+| `_sharedRead(type)` | Returns `registry[type]` or `null` — never throws |
+| `_sharedWrite(type, data)` | Overwrites `registry[type]` with `{ data, ts, by }` and posts to BroadcastChannel |
+| `_sharedMerge(type, patch, extra)` | Merges `patch` into existing `data` map; applies `extra` fields at the entry level (used for `ver` on `liqResults`) |
+| `_seedFromTickers(allTickers)` | Seeds `_klineCache[fr_*]` funding-rate entries, calls `symDataWrite` for `lastPrice`, and rebuilds `_mktWatch`; called from both the adopt path and the fetch path so both produce identical side-effects |
+
+### Bulk ticker ladder (`runScan`)
+
+Before fetching `GET /v5/market/tickers`, `runScan` checks the shared registry entry for `bulkTickers`:
+
+1. **Own data is fresh** (within own `bulkTickerCooldownHours` window from `_lastAllTickersAt`): skip fetch, use in-memory `_lastAllTickers`.
+2. **Partner's data is fresh** (shared `ts` within own cooldown window): adopt shared `ts` as own `_lastAllTickersAt`, call `_seedFromTickers` on shared `data.tickers`, and skip the REST fetch.
+3. **No fresh data**: fetch, write `_sharedWrite('bulkTickers', { tickers: allTickers })`, call `_seedFromTickers`.
+
+### watchTickers group adoption (`pseudoWatchPositions`)
+
+The full-ticker batch inside the position watcher is throttled to `TICKER_THROTTLE_MS` (15 s). If the shared `watchTickers` entry is less than `TICKER_THROTTLE_MS` old:
+
+- **Adopt**: set `this._lastTickerFetch = shared.ts` and fill `tickMap` from `shared.data` — no REST fetch at all.
+- **Otherwise**: fetch `GET /v5/market/tickers`, merge new entries into the shared registry via `_sharedMerge('watchTickers', patch)`.
+
+### klines_1h sharing (PseudoWinter)
+
+`getKlines1h(symbol)` checks `_sharedRead('klines_1h')` for a valid entry (same hourly boundary, `ts` not stale) before fetching. After a fresh fetch, writes the entry via `_sharedMerge('klines_1h', { [symbol]: entry })`.
+
+### klines_1h_last sharing (MIW / MIC)
+
+`_miwPrefetchKlines` / `_micPrefetchKlines` seeds the plugin kline cache from `_sharedRead('klines_1h_last')`. An entry is used only if `candleStart >= lastHourStart` AND its `ts` falls within the requesting bot's own scan interval. Symbols not seeded from shared are fetched individually and the new entries are written back via `_sharedMerge('klines_1h_last', patch)`. Each entry in the patch carries `{ open, high, low, close, volume, candleStart, ts }`.
+
+### mcap sharing (MIW / MIC)
+
+`_miwPrefetchMcaps` / `_micPrefetchMcaps` seeds `_miwMcapCache` / `_micMcapCache` from `_sharedRead('mcap')` for entries within the mcap TTL (`bulkTickerCooldownHours × 3600000` ms) before computing which IDs need a fresh CoinGecko fetch. After a successful `simple/price` response, new entries are written via `_sharedMerge('mcap', patch)` where `patch` is `{ [coinId]: { mcap, ts } }`.
+
+### liqResults sharing (Permafrost / Ashfall → MIW / MIC)
+
+On each batch close, `_liqCloseBatch` in Permafrost-Winter and Ashfall-Chaser writes liq results to the shared registry via `_sharedMerge('liqResults', patch, { ver: Math.max(localVer, prevSharedVer + 1) })`. The `ver` field is a monotonic counter across both bots; each side takes `Math.max` to avoid version regression on concurrent writes.
+
+`_miwCheckLiqFadeAway` / `_micCheckLiqFadeAway` reads `_sharedRead('liqResults')`, extracts `sharedVer`, and takes `Math.max(localVer, sharedVer)` as the version gate (`_miwLiqFadeCheckedVer` / `_micLiqFadeCheckedVer`). The evaluation merges `{ ...(sharedLiq?.data || {}), ...(this._liqResults || {}) }` — own results take precedence over the partner's.
+
 ---
 
 ## Timers and Cycle Timing
@@ -118,6 +174,14 @@ RSI6, RSI12, RSI24 each use this function with `period = 6`, `12`, `24` on 60-mi
 | Key | Contents |
 |---|---|
 | `cw_v1` | Config, pinned tickers, saved price/candle lines per symbol |
+
+### Cross-Tab and Plugin
+
+| Key | Contents |
+|---|---|
+| `__ew_shared_v1` | Cross-tab shared data registry (see Cross-Tab Data Pool). Entries: `bulkTickers`, `watchTickers`, `klines_1h`, `klines_1h_last`, `mcap`, `liqResults`. Not bot-specific — written and read by both bots. |
+| `__pf_liq_batches` | Permafrost-Winter: snapshots of active liq batches (`id`, `startedAt`, `endsAt`, `symbols`, `sLiqTurnover`, `bLiqTurnover`). Written on each launch and each WS message. Read on `init()` to resume valid (not-yet-expired) batches. Removed by `_liqCloseAll`. |
+| `__ash_liq_batches` | Ashfall-Chaser: same structure as `__pf_liq_batches`. |
 
 ### Live Trading Plugins
 
@@ -380,7 +444,11 @@ Background WebSocket engine that accumulates live liquidation flow data across a
 
 **Qualification**: `sLiqPct ≥ threshold` marks a symbol as S-Liq qualified; `bLiqPct ≥ threshold` marks it B-Liq qualified. Used by MIW/MIC `checkCrit` for `sliq`/`bliq` slot criteria.
 
-**Disable**: `_liqCloseAll()` closes all active WS connections and clears `_liqBatches`. Called when the toggle is turned off; `_liqLaunchBatch()` guards against launching while disabled.
+**Disable**: `_liqCloseAll()` closes all active WS connections, clears `_liqBatches`, and removes the persistence key from localStorage. Called when the toggle is turned off; `_liqLaunchBatch()` guards against launching while disabled.
+
+**Safe-continue**: `_liqPersistBatches()` serializes snapshots of all active batches (`id`, `startedAt`, `endsAt`, `symbols`, `sLiqTurnover`, `bLiqTurnover`) to `localStorage.__pf_liq_batches` / `localStorage.__ash_liq_batches` on every launch and on every WS message. On `init()`, stored snapshots are read, filtered to `endsAt > Date.now()`, and passed to `_liqResumeBatch(snapshot)`, which restores each batch and opens a new WebSocket with the remaining duration (`snapshot.endsAt - Date.now()`). `_liqCycleCounter` is advanced for each resumed batch so cycle IDs remain monotonic.
+
+**Shared write**: at `_liqCloseBatch`, `_liqResults` is updated and a patch is immediately merged into the shared registry via `_sharedMerge('liqResults', patch, { ver: ... })`. See the Cross-Tab Data Pool section.
 
 **State vars**: `_liqBatches` (active batch objects, each containing `id`, `symbols`, `sLiqTurnover`, `bLiqTurnover`, `startedAt`, `endsAt`, `ws`, `_endTimer`), `_liqResults` (symbol → `{ sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, cycleId, ts }`), `_liqResultsVersion` (monotonic counter, incremented per closed batch), `_liqCycleHistory`, `_liqLatestResults`, `_liqCycleCounter`.
 
@@ -523,7 +591,7 @@ Config keys: `miwFadeAwayEnabled` (default `false`), `miwFadeAwayPct` (default `
 
 **Liq Fade Away** (`_miwCheckLiqFadeAway()` / `_micCheckLiqFadeAway()`) — version-gated variant that operates on liquidation turnover rather than kline direction. Called in `runScan` after the kline Fade Away check.
 
-Reads `_liqResults` (written by Permafrost/Ashfall) and sums `sLiqRaw`/`bLiqRaw` across all symbols. Evaluates only when `_liqResultsVersion` has advanced since the last check (`_miwLiqFadeCheckedVer`/`_micLiqFadeCheckedVer`), ensuring exactly one evaluation per new liquidation batch regardless of scan cadence.
+Reads `_liqResults` merged with the shared registry (`{ ...(sharedLiq?.data || {}), ...(this._liqResults || {}) }` — own data takes precedence) and sums `sLiqRaw`/`bLiqRaw` across all symbols. The version gate uses `Math.max(localVer, sharedVer)` so either bot advancing the counter triggers an evaluation. Evaluates only when the combined version has advanced since the last check (`_miwLiqFadeCheckedVer`/`_micLiqFadeCheckedVer`), ensuring exactly one evaluation per new liquidation batch regardless of scan cadence.
 
 Direction triggers:
 - **MIW** (Winter — shorts): `totalB / total ≥ miwLiqFadePct / 100` — long liquidations dominating means the market has been punishing longs, signalling adverse conditions for shorts.
