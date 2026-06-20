@@ -156,6 +156,7 @@ Depth gate: `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. 
 | **Liq Fade Away** (`miwLiqFadeEnabled`/`micLiqFadeEnabled`) | Closes the oldest position when liquidation flow is adverse AND the scorecard confirms that signal has historically lost. Both conditions must hold. |
 | **Liq Fade %** (`miwLiqFadePct`/`micLiqFadePct`) | Adverse liq dominance threshold for Liq Fade Away. |
 | **Liq Block Entries** (`miwLiqFadeBlockEntries`/`micLiqFadeBlockEntries`) | When on, new entries are also blocked while the adverse liq signal is active. |
+| **Liq Result Max Age** (`miwLiqResultMaxCycles`/`micLiqResultMaxCycles`) | How many scan cycles a liq result stays valid for sliq/bliq slot criteria. Results older than this are treated as if absent, and the criterion evaluates false. Default 2. |
 | **Auto Slots** (`miwAutoSlots`/`micAutoSlots`) | Replaces the manual slot list with every possible combination of the available criteria at the chosen size. |
 | **Auto Slot Size** (`miwAutoSlotSize`/`micAutoSlotSize`) | How many criteria per auto-generated combination (1–4). |
 | **Exclude from Auto** (`miwAutoSlotExclude`/`micAutoSlotExclude`) | Criteria omitted from auto-generated combinations and from scorecard scoring. |
