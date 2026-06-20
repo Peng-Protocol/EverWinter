@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.8.3';
+  const VERSION       = '1.9.0';
   const DEFAULT_SLOTS = [['+fund','+24h','>10pct'],['-fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -102,7 +102,7 @@
                     <div class="lbl">Criteria per Slot <b x-text="cfg.miwAutoSlotSize??2"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.miwAutoSlotSize??2,k=12;let r=1;for(let i=0;i<n;i++)r=r*(k-i)/(i+1);return Math.round(r)})()+' slots'"></span></div>
                     <input type="range" min="1" max="5" step="1" x-model.number="cfg.miwAutoSlotSize" @change="persist()">
                     <div class="miw-hint">Generates all combinations of the 12 criteria taken N at a time. Manual slots are preserved and restored when Auto is off.</div>
-                    <div x-show="Object.keys(miwBlockedSlots||{}).length" class="miw-hint" style="margin-top:3px" x-text="Object.values(miwBlockedSlots||{}).filter(v=>v==='blocked').length+' slot(s) blocked (excluded from scan)'"></div>
+                    <div x-show="Object.keys(miwBlockedSlots||{}).length" class="miw-hint" style="margin-top:3px" x-text="Object.values(miwBlockedSlots||{}).filter(v=>v==='blocked').length+' slot(s) blocked — matched tickers graylisted for '+(cfg.miwBlockedSlotCooldownHours??6)+'h'"></div>
                   </div>
 
                   <!-- Manual slot builder — hidden when Auto is on -->
@@ -152,6 +152,11 @@
                     <div class="lbl">Kline Scan Cap <b x-text="(cfg.miwKlineScanCap??50)"></b> tickers</div>
                     <input type="range" min="10" max="500" step="10" x-model.number="cfg.miwKlineScanCap" @change="persist()">
                     <div class="miw-hint">Random sample of tickers checked for kline criteria per cycle.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl">Blocked Slot Cooldown <b x-text="(cfg.miwBlockedSlotCooldownHours??6)+'h'"></b></div>
+                    <input type="number" class="inp" min="0.5" max="48" step="0.5" x-model.number="cfg.miwBlockedSlotCooldownHours" @change="persist()" style="width:70px">
+                    <div class="miw-hint">Tickers matching a blocked slot are graylisted for this duration.</div>
                   </div>
                 </div><!-- end entry slots section -->
               </div><!-- end entry zone -->
@@ -282,6 +287,28 @@
             </div>
           </div>
         </div>
+        <div class="sec">
+          <div class="sec-ttl">Slot Graylist</div>
+          <div x-data="{
+            get syms() {
+              void tick;
+              if (!_miwSlotGraylist) return [];
+              const ttl = (cfg.miwBlockedSlotCooldownHours ?? 6) * 3_600_000;
+              const now = Date.now();
+              return Object.keys(_miwSlotGraylist).filter(s => _miwSlotGraylist[s] > 0 && now - _miwSlotGraylist[s] < ttl);
+            }
+          }">
+            <div x-show="syms.length === 0" style="font-family:var(--mono);font-size:10px;color:var(--text-lo);padding:2px 0">None — no blocked-slot matches.</div>
+            <div x-show="syms.length > 0">
+              <div style="font-family:var(--mono);font-size:9.5px;color:var(--text-lo);margin-bottom:5px" x-text="'Graylisted from blocked slot ('+syms.length+'):'" ></div>
+              <div style="display:flex;flex-wrap:wrap;gap:3px">
+                <template x-for="sym in syms" :key="sym">
+                  <span style="padding:1px 6px;border-radius:2px;background:rgba(255,80,80,.07);border:1px solid rgba(255,80,80,.3);color:rgba(255,80,80,.85);font-family:var(--mono);font-size:9px" x-text="sym.replace('USDT','')"></span>
+                </template>
+              </div>
+            </div>
+          </div>
+        </div>
       `,
     },
 
@@ -298,6 +325,7 @@
         _miwStructureBlocked: false,
         _miwLiqBlocked: false,
         _miwLiqBias: null,
+        _miwSlotGraylist: {},
 
         async init() {
           await _origInit.call(this);
@@ -332,8 +360,10 @@
           if (this.cfg.miwLiqFadeBlockEntries === undefined) this.cfg.miwLiqFadeBlockEntries = false;
           this._miwLiqBlocked        = false;
           this._miwLiqBias           = null;
-          if (this.cfg.miwAutoSlots        === undefined) this.cfg.miwAutoSlots        = false;
-          if (this.cfg.miwAutoSlotSize     === undefined) this.cfg.miwAutoSlotSize     = 2;
+          if (this.cfg.miwAutoSlots                  === undefined) this.cfg.miwAutoSlots                  = false;
+          if (this.cfg.miwAutoSlotSize               === undefined) this.cfg.miwAutoSlotSize               = 2;
+          if (this.cfg.miwBlockedSlotCooldownHours   === undefined) this.cfg.miwBlockedSlotCooldownHours   = 6;
+          if (!this._miwSlotGraylist) this._miwSlotGraylist = {};
           this.registerRoleBadge?.(item => {
             if (!item || !item._miw) return null;
             const crits  = item._miwCriteria || [];
@@ -590,7 +620,6 @@
             this.log('[MIW] 🥶 Entries blocked — bad liq structure', 'info');
             return;
           }
-          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
 
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) return;
@@ -598,39 +627,47 @@
           const freshAt = this._lastAllTickersAt || 0;
           if (!freshAt || freshAt === this._miwLastActedAt) return;
 
+          // Non-blocked entry slots
           const slots = this._miwEffectiveSlots();
-          if (!slots.length) {
+
+          // Blocked slots — scanned to graylist matching tickers, never used for entry
+          const blockedSlotKeys = new Set(
+            Object.entries(this.miwBlockedSlots || {})
+              .filter(([, v]) => v === 'blocked')
+              .map(([k]) => k)
+          );
+          const allRawSlots = this.cfg.miwAutoSlots
+            ? this._miwGenerateCombos(this.cfg.miwAutoSlotSize ?? 2)
+            : (this.cfg.miwSlots || []).filter(s => s.length > 0);
+          const blockedSlots = blockedSlotKeys.size
+            ? allRawSlots.filter(s => blockedSlotKeys.has([...s].sort().join(',')))
+            : [];
+
+          if (!slots.length && !blockedSlots.length) {
             this._miwLastActedAt = freshAt;
             this.log('[MIW] 💡 No active slots — skipping', 'info');
             return;
           }
 
-          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
-          if (this.cfg.miwShareCapEnabled ?? true) {
-            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.miwShareCapPct ?? 100) / 100)));
-            const miwCount = (this.positions || []).filter(p => p._miw).length;
-            headroom = Math.min(headroom, capSlots - miwCount);
-            if (headroom < 1) {
-              this.log('[MIW] 💡 Share cap reached — no slots available', 'info');
-              this._miwLastActedAt = freshAt;
-              return;
-            }
-          }
-          const picks = Math.min(Math.max(1, Math.round(this.cfg.miwPicks ?? 5)), headroom);
           const frThreshold = this.cfg.miwFrThreshold ?? 0.1;
           const activeSyms  = new Set((this.positions || []).map(p => p.symbol));
 
-          const needsMcap  = slots.some(s => s.includes('>10pct') || s.includes('<10pct'));
-          const needsKline = slots.some(s => s.includes('lsa') || s.includes('lba') || s.includes('rasl') || s.includes('rabl'));
+          // Include blocked slots when deciding whether to prefetch mcap/klines
+          const allSlots   = [...slots, ...blockedSlots];
+          const needsMcap  = allSlots.some(s => s.includes('>10pct') || s.includes('<10pct'));
+          const needsKline = allSlots.some(s => s.includes('lsa') || s.includes('lba') || s.includes('rasl') || s.includes('rabl'));
 
           const _glNow = Date.now();
           const _glTtl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
+          const _slTtl = (this.cfg.miwBlockedSlotCooldownHours ?? 6) * 3_600_000;
+          if (!this._miwSlotGraylist) this._miwSlotGraylist = {};
           const basePool = allTickers.filter(t =>
             t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
             && parseFloat(t.lastPrice || 0) >= 0.001
             && !activeSyms.has(t.symbol)
             && !(this._isSymbolBanned?.(t.symbol))
             && !((this._tickerGraylist?.[t.symbol] ?? 0) > 0 && _glNow - this._tickerGraylist[t.symbol] < _glTtl)
+            && !((this._miwSlotGraylist[t.symbol] ?? 0) > 0 && _glNow - this._miwSlotGraylist[t.symbol] < _slTtl)
           );
 
           // Resolve market caps for vol/mcap criteria if any slot requires them.
@@ -657,8 +694,6 @@
             await this._miwPrefetchKlines(klineSyms);
           }
 
-          // Build pool: for each ticker find the first matching slot and record it.
-          // The matched slot's criteria are stamped on the position for dynamic badge rendering.
           const klineVolMin = this.cfg.miwKlineVolMin ?? 25;
           const klineVolMax = this.cfg.miwKlineVolMax ?? 50;
           const checkCrit = (c, fr, is24hUp, ratio, t) => {
@@ -688,8 +723,44 @@
             return false;
           };
 
+          // Blocked slot scan: graylist tickers that match any blocked slot
+          if (blockedSlots.length) {
+            let newlyGraylisted = 0;
+            for (const t of basePool) {
+              const fr      = parseFloat(t.fundingRate || 0) * 100;
+              const is24hUp = parseFloat(t.price24hPcnt || 0) > 0;
+              const mcap    = mcapMap[t.symbol];
+              const ratio   = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
+              if (blockedSlots.some(s => s.every(c => checkCrit(c, fr, is24hUp, ratio, t)))) {
+                this._miwSlotGraylist[t.symbol] = _glNow;
+                newlyGraylisted++;
+              }
+            }
+            if (newlyGraylisted) this.log(`[MIW] ⛔ ${newlyGraylisted} ticker(s) graylisted for ${this.cfg.miwBlockedSlotCooldownHours ?? 6}h (blocked slot match)`, 'info');
+          }
+
+          this._miwLastActedAt = freshAt;
+
+          // Entry logic only runs when there are non-blocked slots and capacity
+          if (!slots.length) return;
+          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
+
+          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
+          if (this.cfg.miwShareCapEnabled ?? true) {
+            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.miwShareCapPct ?? 100) / 100)));
+            const miwCount = (this.positions || []).filter(p => p._miw).length;
+            headroom = Math.min(headroom, capSlots - miwCount);
+            if (headroom < 1) {
+              this.log('[MIW] 💡 Share cap reached — no slots available', 'info');
+              return;
+            }
+          }
+          const picks = Math.min(Math.max(1, Math.round(this.cfg.miwPicks ?? 5)), headroom);
+
+          // Build pool: non-blocked slots only, excluding newly slot-graylisted tickers
           const pool = basePool
             .map(t => {
+              if ((this._miwSlotGraylist[t.symbol] ?? 0) > 0 && _glNow - this._miwSlotGraylist[t.symbol] < _slTtl) return null;
               const fr       = parseFloat(t.fundingRate || 0) * 100;
               const is24hUp  = parseFloat(t.price24hPcnt || 0) > 0;
               const mcap     = mcapMap[t.symbol];
@@ -700,13 +771,10 @@
             .filter(Boolean)
             .sort((a, b) => a.slotIdx - b.slotIdx || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
 
-          this._miwLastActedAt = freshAt;
-
           if (!pool.length) {
             const slotDesc = slots.map(s => `[${s.join(',')}]`).join(' ');
-            const frThresh = frThreshold;
-            const posFund  = basePool.filter(t => parseFloat(t.fundingRate || 0) * 100 >= frThresh).length;
-            const negFund  = basePool.filter(t => parseFloat(t.fundingRate || 0) * 100 <= -frThresh).length;
+            const posFund  = basePool.filter(t => parseFloat(t.fundingRate || 0) * 100 >= frThreshold).length;
+            const negFund  = basePool.filter(t => parseFloat(t.fundingRate || 0) * 100 <= -frThreshold).length;
             const up24h    = basePool.filter(t => parseFloat(t.price24hPcnt || 0) > 0).length;
             const mcapHits  = Object.keys(mcapMap).length;
             const klineHits = needsKline ? Object.keys(this._miwKlineCache||{}).length : 0;
