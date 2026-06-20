@@ -190,6 +190,8 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Slot Scorecard** (`permafrostScorecardEnabled`/`ashfallScorecardEnabled`) | Records realized PnL per MIW/MIC criteria combination. Shows which slot types have been profitable or losing over time. |
 | **Auto Block** (`permafrostAutoBlock`/`ashfallAutoBlock`) | Automatically blocks losing slot combinations in the MIW/MIC entry filter based on scorecard history. |
 | **Block Threshold** (`permafrostSlotLossThreshold`/`ashfallSlotLossThreshold`) | Total loss (as a fraction of entry margin) a slot must accumulate before being blocked. |
+| **Cross Broadcast** (`permafrostCrossEnabled`/`ashfallCrossEnabled`) | Writes cascade/sacrifice closes and drawdown halt/gains-lock transitions to a shared log that the partner bot can read. Required for Mutual DDH Lift. |
+| **Mutual DDH Lift** (`permafrostMutualDdLiftEnabled`/`ashfallMutualDdLiftEnabled`) | When both bots are simultaneously in drawdown halt, lifts this bot's halt. Checked every 15 s. Requires Cross Broadcast to be on. |
 | **Liquidation Surveillance** (`pfLiqEnabled`/`ashLiqEnabled`) | Opens WebSocket connections to track live liquidation flow across a rolling sample of volatile tickers. Required for `sliq`/`bliq` criteria in MIW/MIC. |
 | **Liq Batch Size** (`pfLiqBatchSize`/`ashLiqBatchSize`) | Tickers per liquidation batch (5–50). More tickers = broader market coverage per cycle. |
 | **Liq Threshold %** (`pfLiqThresholdPct`/`ashLiqThresholdPct`) | Minimum share of a cycle's total liquidation turnover one side must hold to qualify (10–90%). At 50%, one side must account for at least half. |
