@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.15.8';
+  const VERSION        = '1.16.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -134,22 +134,8 @@
               <label class="tog" @click.prevent="if(!cfgLocked){cfg.permafrostCrossEnabled=!cfg.permafrostCrossEnabled;persist()}">
                 <div class="tog-t" :class="cfg.permafrostCrossEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
-                  <div class="tog-l">Cross-Signal (Ashfall)</div>
-                  <div class="pfr-hint">Chaser cascade → halt + bail all. Chaser sacrifice → lift halt.</div>
-                </div>
-              </label>
-              <label class="tog" style="margin-top:6px;margin-left:20px" x-show="cfg.permafrostCrossEnabled" @click.prevent="if(!cfgLocked){cfg.permafrostCrossWinLossEnabled=!cfg.permafrostCrossWinLossEnabled;persist()}">
-                <div class="tog-t" :class="cfg.permafrostCrossWinLossEnabled?'on':''"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Win/Loss Broadcast</div>
-                  <div class="pfr-hint">SL hit → broadcast sacrifice. TP hit → broadcast cascade. Only full SL/TP closes.</div>
-                </div>
-              </label>
-              <label class="tog" style="margin-top:6px;margin-left:20px" x-show="cfg.permafrostCrossEnabled" @click.prevent="if(!cfgLocked){cfg.permafrostCrossStatusEnabled=!cfg.permafrostCrossStatusEnabled;persist()}">
-                <div class="tog-t" :class="cfg.permafrostCrossStatusEnabled?'on':''"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Halt Status Sync</div>
-                  <div class="pfr-hint">Broadcasts DDH/gains-lock transitions to partner. When Chaser is in drawdown, Winter maxPos doubles.</div>
+                  <div class="tog-l">Cross Broadcast (Ashfall)</div>
+                  <div class="pfr-hint">Broadcasts cascade/sacrifice on close and DDH/gains-lock transitions to Ashfall. No cross-reactions.</div>
                 </div>
               </label>
               <div x-show="cfg.permafrostCrossEnabled && pfCrossEvents.length" class="pfr-hint" style="margin-top:5px" x-text="pfCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Chaser — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
@@ -327,10 +313,6 @@
       const _origScan  = def.runScan;
       const _origClose = def.pseudoClosePosition;
 
-      let _pfCrossLastCascadeActed   = 0;
-      let _pfCrossLastSacrificeActed = 0;
-      let _pfPartnerInDDH            = false;
-      let _pfPartnerInGLK            = false;
       let _pfWasHalted               = false;
       let _pfWasGainsLocked          = false;
 
@@ -362,8 +344,6 @@
           if (this.cfg.permafrostWaveShowVol      === undefined) this.cfg.permafrostWaveShowVol      = true;
           if (this.cfg.permafrostWaveShowIo       === undefined) this.cfg.permafrostWaveShowIo       = true;
           if (this.cfg.permafrostCrossEnabled        === undefined) this.cfg.permafrostCrossEnabled        = true;
-          if (this.cfg.permafrostCrossWinLossEnabled  === undefined) this.cfg.permafrostCrossWinLossEnabled  = false;
-          if (this.cfg.permafrostCrossStatusEnabled    === undefined) this.cfg.permafrostCrossStatusEnabled    = false;
           if (this.cfg.permafrostScorecardEnabled        === undefined) this.cfg.permafrostScorecardEnabled        = false;
           if (this.cfg.permafrostAutoBlock               === undefined) this.cfg.permafrostAutoBlock               = false;
           if (this.cfg.permafrostSlotLossThreshold       === undefined) this.cfg.permafrostSlotLossThreshold       = 0.25;
@@ -400,15 +380,13 @@
               if (Array.isArray(s.samples)) this.pfSamples = s.samples.slice(-SAMPLES_CAP);
               if (Array.isArray(s.pnl))     this.pfPnl     = s.pnl.filter(e => Date.now() - e.ts < PNL_LOG_TTL);
               if (Array.isArray(s.wave))    this.pfWave    = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
-              if (typeof s.crossLastCascadeActed  === 'number') _pfCrossLastCascadeActed  = s.crossLastCascadeActed;
-              if (typeof s.crossLastSacrificeActed === 'number') _pfCrossLastSacrificeActed = s.crossLastSacrificeActed;
             }
           } catch(e) {}
           this.log(`[PFR] Permafrost (Winter) v${VERSION} loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
           setInterval(() => {
             if (this.cfg.permafrostCrossEnabled) this._pfCheckCross().catch(() => {});
             if (this.cfg.permafrostScorecardEnabled) this._pfScoreBuild();
-            if (this.cfg.permafrostCrossEnabled && this.cfg.permafrostCrossStatusEnabled) {
+            if (this.cfg.permafrostCrossEnabled) {
               const _halted  = this._isDrawdownHalted?.() ?? false;
               const _glocked = this._isGainsLocked?.()    ?? false;
               if (_halted !== _pfWasHalted) {
@@ -441,8 +419,6 @@
           try {
             localStorage.setItem(PFR_KEY, JSON.stringify({
               events: this.pfEvents, samples: this.pfSamples, pnl: this.pfPnl, wave: this.pfWave,
-              crossLastCascadeActed: _pfCrossLastCascadeActed,
-              crossLastSacrificeActed: _pfCrossLastSacrificeActed,
             }));
           } catch(e) {}
         },
@@ -746,58 +722,6 @@
           if (!this.cfg.permafrostCrossEnabled) return;
           const fromChaser = this._pfCrossRead().filter(e => e.source === 'chaser');
           this.pfCrossEvents = fromChaser.slice(-10);
-
-          const lat = kind => fromChaser.filter(e => e.kind === kind).reduce((m, e) => !m || e.ts > m.ts ? e : m, null);
-          const latCascade  = lat('cascade');
-          const latSacrifice = lat('sacrifice');
-
-          if (latCascade && latCascade.ts > _pfCrossLastCascadeActed) {
-            _pfCrossLastCascadeActed = latCascade.ts;
-            const haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
-            this._drawdownHaltUntil = Date.now() + haltMs;
-            this.log(`[PFR] ❄ Cross-signal — Chaser cascade at ${new Date(latCascade.ts).toISOString().slice(11,19)} UTC → drawdown halt ${this.cfg.drawdownHaltHours ?? 6}h + bailing all Winter positions`, 'warn');
-            this.bailAll().catch(() => {});
-            this._pfFetchStructure().then(r => {
-              if (!r) return;
-              this.pfEvents.push({ ts: r.ts, kind: 'drawdown', skew: r.skew, breadth: r.breadth, gCount: r.gCount, lCount: r.lCount, gSum: r.gSum, lSum: r.lSum, _cross: true });
-              if (this.pfEvents.length > EVENTS_CAP) this.pfEvents = this.pfEvents.slice(-EVENTS_CAP);
-              this._pfPushWave(r);
-              this.persist();
-            }).catch(() => {});
-          }
-
-          if (latSacrifice && latSacrifice.ts > _pfCrossLastSacrificeActed && this._isDrawdownHalted()) {
-            _pfCrossLastSacrificeActed = latSacrifice.ts;
-            this._drawdownHaltUntil = null;
-            this._drawdownWindow = [];
-            this.log(`[PFR] ❄ Cross-signal — Chaser sacrifice at ${new Date(latSacrifice.ts).toISOString().slice(11,19)} UTC → drawdown halt lifted, Winter re-enabled`, 'success');
-            this._pfFetchStructure().then(r => {
-              if (!r) return;
-              this.pfEvents.push({ ts: r.ts, kind: 'gainslock', skew: r.skew, breadth: r.breadth, gCount: r.gCount, lCount: r.lCount, gSum: r.gSum, lSum: r.lSum, _cross: true });
-              if (this.pfEvents.length > EVENTS_CAP) this.pfEvents = this.pfEvents.slice(-EVENTS_CAP);
-              this._pfPushWave(r);
-              this.persist();
-            }).catch(() => {});
-          }
-
-          if (this.cfg.permafrostCrossStatusEnabled) {
-            const latDDHStart = lat('ddh-start');
-            const latDDHEnd   = lat('ddh-end');
-            const nowInDDH    = !!(latDDHStart && (!latDDHEnd || latDDHStart.ts > latDDHEnd.ts));
-            if (nowInDDH !== _pfPartnerInDDH) {
-              _pfPartnerInDDH = nowInDDH;
-              if (nowInDDH) this.log(`[PFR] ❄ Cross-status — Chaser entered drawdown halt → Winter maxPos ×2`, 'warn');
-              else          this.log(`[PFR] ❄ Cross-status — Chaser drawdown lifted → Winter maxPos restored`, 'info');
-            }
-            const latGLKStart = lat('glk-start');
-            const latGLKEnd   = lat('glk-end');
-            const nowInGLK    = !!(latGLKStart && (!latGLKEnd || latGLKStart.ts > latGLKEnd.ts));
-            if (nowInGLK !== _pfPartnerInGLK) {
-              _pfPartnerInGLK = nowInGLK;
-              if (nowInGLK) this.log(`[PFR] ❄ Cross-status — Chaser entered gains lock`, 'info');
-              else          this.log(`[PFR] ❄ Cross-status — Chaser gains lock lifted`, 'info');
-            }
-          }
         },
 
         // Inline SVG wave plot — time-based 1-week window, bins data into pixel columns so
@@ -944,12 +868,7 @@
         },
 
         async runScan() {
-          const _savedMaxPos = this.cfg.maxPos;
-          if (this.cfg.permafrostCrossEnabled && this.cfg.permafrostCrossStatusEnabled && _pfPartnerInDDH) {
-            this.cfg.maxPos = (this.cfg.maxPos ?? 5) * 2;
-          }
           await _origScan.call(this);
-          this.cfg.maxPos = _savedMaxPos;
           if (this.cfg.pfLiqEnabled) this._liqLaunchBatch();
           if (!this.cfg.permafrostEnabled) return;
           this._pfCheckCross().catch(() => {});
@@ -982,8 +901,6 @@
           }
           if (this.cfg.permafrostCrossEnabled) {
             if (reason === 'cascade' || reason === 'sacrifice') this._pfCrossWrite(reason);
-          }
-          if (this.cfg.permafrostCrossEnabled && this.cfg.permafrostCrossWinLossEnabled) {
             if (reason === 'sl') this._pfCrossWrite('sacrifice');
             else if (reason === 'tp') this._pfCrossWrite('cascade');
           }

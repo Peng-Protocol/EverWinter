@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.15.8';
+  const VERSION        = '1.16.0';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
@@ -113,22 +113,8 @@
               <label class="tog" @click.prevent="if(!cfgLocked){cfg.ashfallCrossEnabled=!cfg.ashfallCrossEnabled;persist()}">
                 <div class="tog-t" :class="cfg.ashfallCrossEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
-                  <div class="tog-l">Cross-Signal (Permafrost)</div>
-                  <div class="ash-hint">Winter cascade → halt + bail all. Winter sacrifice → lift halt.</div>
-                </div>
-              </label>
-              <label class="tog" style="margin-top:6px;margin-left:20px" x-show="cfg.ashfallCrossEnabled" @click.prevent="if(!cfgLocked){cfg.ashfallCrossWinLossEnabled=!cfg.ashfallCrossWinLossEnabled;persist()}">
-                <div class="tog-t" :class="cfg.ashfallCrossWinLossEnabled?'on':''"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Win/Loss Broadcast</div>
-                  <div class="ash-hint">SL hit → broadcast sacrifice. TP hit → broadcast cascade. Only full SL/TP closes.</div>
-                </div>
-              </label>
-              <label class="tog" style="margin-top:6px;margin-left:20px" x-show="cfg.ashfallCrossEnabled" @click.prevent="if(!cfgLocked){cfg.ashfallCrossStatusEnabled=!cfg.ashfallCrossStatusEnabled;persist()}">
-                <div class="tog-t" :class="cfg.ashfallCrossStatusEnabled?'on':''"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Halt Status Sync</div>
-                  <div class="ash-hint">Broadcasts DDH/gains-lock transitions to partner. When Winter is in drawdown, Chaser maxPos doubles.</div>
+                  <div class="tog-l">Cross Broadcast (Permafrost)</div>
+                  <div class="ash-hint">Broadcasts cascade/sacrifice on close and DDH/gains-lock transitions to Permafrost. No cross-reactions.</div>
                 </div>
               </label>
               <div x-show="cfg.ashfallCrossEnabled && afCrossEvents.length" class="ash-hint" style="margin-top:5px" x-text="afCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Winter — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
@@ -306,10 +292,6 @@
       const _origScan  = def.runScan;
       const _origClose = def.pseudoClosePosition;
 
-      let _afCrossLastCascadeActed   = 0;
-      let _afCrossLastSacrificeActed = 0;
-      let _afPartnerInDDH            = false;
-      let _afPartnerInGLK            = false;
       let _afWasHalted               = false;
       let _afWasGainsLocked          = false;
 
@@ -341,8 +323,6 @@
           if (this.cfg.ashfallWaveShowVol      === undefined) this.cfg.ashfallWaveShowVol      = true;
           if (this.cfg.ashfallWaveShowIo       === undefined) this.cfg.ashfallWaveShowIo       = true;
           if (this.cfg.ashfallCrossEnabled        === undefined) this.cfg.ashfallCrossEnabled        = true;
-          if (this.cfg.ashfallCrossWinLossEnabled  === undefined) this.cfg.ashfallCrossWinLossEnabled  = false;
-          if (this.cfg.ashfallCrossStatusEnabled   === undefined) this.cfg.ashfallCrossStatusEnabled   = false;
           if (this.cfg.ashfallScorecardEnabled           === undefined) this.cfg.ashfallScorecardEnabled           = false;
           if (this.cfg.ashfallAutoBlock                  === undefined) this.cfg.ashfallAutoBlock                  = false;
           if (this.cfg.ashfallSlotLossThreshold          === undefined) this.cfg.ashfallSlotLossThreshold          = 0.25;
@@ -379,15 +359,13 @@
               if (Array.isArray(s.samples)) this.afSamples = s.samples.slice(-SAMPLES_CAP);
               if (Array.isArray(s.pnl))     this.afPnl     = s.pnl.filter(e => Date.now() - e.ts < PNL_LOG_TTL);
               if (Array.isArray(s.wave))    this.afWave    = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
-              if (typeof s.crossLastCascadeActed  === 'number') _afCrossLastCascadeActed  = s.crossLastCascadeActed;
-              if (typeof s.crossLastSacrificeActed === 'number') _afCrossLastSacrificeActed = s.crossLastSacrificeActed;
             }
           } catch(e) {}
           this.log(`[ASH] Ashfall (Chaser) v${VERSION} loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afEvents.length} events, ${this.afSamples.length} samples on record`, 'info');
           setInterval(() => {
             if (this.cfg.ashfallCrossEnabled) this._afCheckCross().catch(() => {});
             if (this.cfg.ashfallScorecardEnabled) this._afScoreBuild();
-            if (this.cfg.ashfallCrossEnabled && this.cfg.ashfallCrossStatusEnabled) {
+            if (this.cfg.ashfallCrossEnabled) {
               const _halted  = this._isDrawdownHalted?.() ?? false;
               const _glocked = this._isGainsLocked?.()    ?? false;
               if (_halted !== _afWasHalted) {
@@ -420,8 +398,6 @@
           try {
             localStorage.setItem(ASH_KEY, JSON.stringify({
               events: this.afEvents, samples: this.afSamples, pnl: this.afPnl, wave: this.afWave,
-              crossLastCascadeActed: _afCrossLastCascadeActed,
-              crossLastSacrificeActed: _afCrossLastSacrificeActed,
             }));
           } catch(e) {}
         },
@@ -705,58 +681,6 @@
           if (!this.cfg.ashfallCrossEnabled) return;
           const fromWinter = this._afCrossRead().filter(e => e.source === 'winter');
           this.afCrossEvents = fromWinter.slice(-10);
-
-          const lat = kind => fromWinter.filter(e => e.kind === kind).reduce((m, e) => !m || e.ts > m.ts ? e : m, null);
-          const latCascade  = lat('cascade');
-          const latSacrifice = lat('sacrifice');
-
-          if (latCascade && latCascade.ts > _afCrossLastCascadeActed) {
-            _afCrossLastCascadeActed = latCascade.ts;
-            const haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
-            this._drawdownHaltUntil = Date.now() + haltMs;
-            this.log(`[ASH] ♨ Cross-signal — Winter cascade at ${new Date(latCascade.ts).toISOString().slice(11,19)} UTC → drawdown halt ${this.cfg.drawdownHaltHours ?? 6}h + bailing all Chaser positions`, 'warn');
-            this.bailAll().catch(() => {});
-            this._afFetchStructure().then(r => {
-              if (!r) return;
-              this.afEvents.push({ ts: r.ts, kind: 'drawdown', skew: r.skew, breadth: r.breadth, gCount: r.gCount, lCount: r.lCount, gSum: r.gSum, lSum: r.lSum, _cross: true });
-              if (this.afEvents.length > EVENTS_CAP) this.afEvents = this.afEvents.slice(-EVENTS_CAP);
-              this._afPushWave(r);
-              this.persist();
-            }).catch(() => {});
-          }
-
-          if (latSacrifice && latSacrifice.ts > _afCrossLastSacrificeActed && this._isDrawdownHalted()) {
-            _afCrossLastSacrificeActed = latSacrifice.ts;
-            this._drawdownHaltUntil = 0;
-            this._drawdownWindow = [];
-            this.log(`[ASH] ♨ Cross-signal — Winter sacrifice at ${new Date(latSacrifice.ts).toISOString().slice(11,19)} UTC → drawdown halt lifted, Chaser re-enabled`, 'success');
-            this._afFetchStructure().then(r => {
-              if (!r) return;
-              this.afEvents.push({ ts: r.ts, kind: 'gainslock', skew: r.skew, breadth: r.breadth, gCount: r.gCount, lCount: r.lCount, gSum: r.gSum, lSum: r.lSum, _cross: true });
-              if (this.afEvents.length > EVENTS_CAP) this.afEvents = this.afEvents.slice(-EVENTS_CAP);
-              this._afPushWave(r);
-              this.persist();
-            }).catch(() => {});
-          }
-
-          if (this.cfg.ashfallCrossStatusEnabled) {
-            const latDDHStart = lat('ddh-start');
-            const latDDHEnd   = lat('ddh-end');
-            const nowInDDH    = !!(latDDHStart && (!latDDHEnd || latDDHStart.ts > latDDHEnd.ts));
-            if (nowInDDH !== _afPartnerInDDH) {
-              _afPartnerInDDH = nowInDDH;
-              if (nowInDDH) this.log(`[ASH] ♨ Cross-status — Winter entered drawdown halt → Chaser maxPos ×2`, 'warn');
-              else          this.log(`[ASH] ♨ Cross-status — Winter drawdown lifted → Chaser maxPos restored`, 'info');
-            }
-            const latGLKStart = lat('glk-start');
-            const latGLKEnd   = lat('glk-end');
-            const nowInGLK    = !!(latGLKStart && (!latGLKEnd || latGLKStart.ts > latGLKEnd.ts));
-            if (nowInGLK !== _afPartnerInGLK) {
-              _afPartnerInGLK = nowInGLK;
-              if (nowInGLK) this.log(`[ASH] ♨ Cross-status — Winter entered gains lock`, 'info');
-              else          this.log(`[ASH] ♨ Cross-status — Winter gains lock lifted`, 'info');
-            }
-          }
         },
 
         // Inline SVG wave plot — time-based 1-week window, bins data into pixel columns so
@@ -918,12 +842,7 @@
         },
 
         async runScan() {
-          const _savedMaxPos = this.cfg.maxPos;
-          if (this.cfg.ashfallCrossEnabled && this.cfg.ashfallCrossStatusEnabled && _afPartnerInDDH) {
-            this.cfg.maxPos = (this.cfg.maxPos ?? 5) * 2;
-          }
           await _origScan.call(this);
-          this.cfg.maxPos = _savedMaxPos;
           if (this.cfg.ashLiqEnabled) this._liqLaunchBatch();
           if (!this.cfg.ashfallEnabled) return;
           this._afCheckCross().catch(() => {});
@@ -956,8 +875,6 @@
           }
           if (this.cfg.ashfallCrossEnabled) {
             if (reason === 'cascade' || reason === 'sacrifice') this._afCrossWrite(reason);
-          }
-          if (this.cfg.ashfallCrossEnabled && this.cfg.ashfallCrossWinLossEnabled) {
             if (reason === 'sl') this._afCrossWrite('sacrifice');
             else if (reason === 'tp') this._afCrossWrite('cascade');
           }
