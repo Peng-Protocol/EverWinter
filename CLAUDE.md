@@ -23,19 +23,25 @@ Each file carries its version in two or three places — update **all** that app
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.0 |
-| `PseudoWinter.html` | v1.7.2 |
-| `PseudoChaser.html` | v1.3.3 |
+| `PseudoWinter.html` | v1.7.3 |
+| `PseudoChaser.html` | v1.3.4 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.10.0 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.10.0 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.18.1 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.18.1 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.12.1 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.12.1 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.18.9 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.18.9 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
 ## Documentation Writing Style (REQUIRED)
 
-- **README.md**: Technical and code-focused. Use precise API names, config key names, function names, variable names, and implementation details. Refer to bots by their technical names (PseudoWinter, PseudoChaser, etc.).
+- **README.md**: A user manual for setup and operation. Use precise config key names, UI panel names, and localStorage keys where relevant to help the user identify what they're looking at. Refer to bots by technical name (PseudoWinter, PseudoChaser). **Every section must serve setup, operation, or troubleshooting — cut anything that is purely implementation detail with no operational consequence.** Specifically:
+  - Config toggles: explain every toggle in "what does this button do?" terms — one sentence on what it does when on, and the practical consequence.
+  - Stats menu: explain session stats, the Actions dropdown, and the activity log (what it shows, color codes, what entries mean).
+  - Trades menu: explain only what the user may observe but not fully understand — the roll-up card, the PnL chart drawer, and the CLEAR button confirmation flow.
+  - Do NOT include: internal architecture (Alpine component pattern, timer vars, module-level state), RSI or EDa maths, transform pipeline details, plugin manifest fields, API endpoint tables, cross-tab registry format, Bybit signing algorithm. These are developer internals with no operational value.
+  - Cross-tab cooperation: 2 sentences max — what it does and the user-visible benefit.
+  - Plugin loading: how to load a file, the reload requirement. No manifest table, no transform pipeline.
 - **Strategy_book.md**: Prescriptive human tone. No code references, no config key names, no function names, no bot or file names. Write for a trader, not a developer — describe what to do and why, not how it is implemented. Avoid meandering language — be direct and use as few phrases as possible.
 
 ## Scope (REQUIRED)

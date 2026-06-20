@@ -8,15 +8,13 @@
 2. [Techniques](#techniques)
    - [Proactive Techniques](#proactive-techniques)
    - [Reactive Techniques](#reactive-techniques)
-3. [Strategies](#strategies)
-   - [Multi-Indicator](#multi-indicator-strategy)
-4. [Market Intelligence](#market-intelligence)
+3. [Market Intelligence](#market-intelligence)
    - [Structure Learning](#structure-learning)
    - [Structure Sampling](#structure-sampling)
    - [Slot Scorecard](#slot-scorecard)
    - [Cross-Side Coordination](#cross-side-coordination)
-5. [Psycho Mode](#psycho-mode)
-6. [Sizing](#sizing)
+4. [Psycho Mode](#psycho-mode)
+5. [Sizing](#sizing)
 6. [Conclusion](#conclusion)
 
 ---
@@ -35,6 +33,8 @@ On a **volatile day**: neither side dominates. Coins pump and dump freely in bot
 
 Neither system predicts the day in advance. The approach is to run both sides simultaneously and let drawdown throttling limit damage on the side that is wrong today. The side aligned with the day's meta-structure runs profitably; the opposing side hits its SLs cleanly and closes bounded losses. Over a session the net of both sides reflects the actual character of that day.
 
+Meta-structure is necessary but not sufficient. It is possible to trade with the structure and still lose when the specific signals driving entries are not genuinely aligned with it. Knowing which indicators are actually bullish or bearish within the current environment — not just nominally available — determines whether the entries within a favorable structure produce profit or drag. The slot scorecard system addresses this directly: it tracks which entry combinations have historically won and lost and prunes the ones that are not working. This same mechanism benefits the counter-structure side too. Rather than absorbing consistent losses, it identifies pockets where the counter-trend case is supported — and in some sessions, the scorecard data is enough to put the counter-structure side in profit despite the broader directional headwind.
+
 **Two approaches coexist within this system:**
 
 **Proactive**: Design budget spent at the entry gate — slot-based multi-criterion filters. Binary mode bounds every position at entry with a fixed TP and SL; no DCA, no extended exposure. A missed entry is acceptable; a bad entry costs exactly the configured SL percentage and nothing more.
@@ -49,8 +49,6 @@ Neither is strictly better. Proactive suits tighter risk tolerance and cleaner b
 
 Techniques are the building blocks. Each strategy assembles a specific combination of them.
 
-Display convention: UI surfaces, watchlists, position cards, trade menus, and activity logs show compact ticker symbols without the `USDT` suffix; full exchange symbols remain internal for API calls and persistence.
-
 ---
 
 ### Proactive Techniques
@@ -61,7 +59,7 @@ Proactive techniques decide whether and when to enter. They filter noise from si
 
 #### Binary Mode
 
-Binary Mode is the default position structure. Each position opens with exactly one take profit and one stop loss set natively on the exchange at entry. No DCA orders. TP and SL percentages are configurable (default 18% both).
+Binary Mode is the default position structure. Each position opens with exactly one take profit and one stop loss set natively on the exchange at entry. No DCA orders. TP and SL percentages are configurable.
 
 The philosophy is a hard commitment to bounded exposure. The thesis is either right within the configured range, or wrong and closed at a fixed cost. There is no middle state.
 
@@ -71,9 +69,44 @@ Binary Mode suits the meta-structure approach: when the read is correct, positio
 
 #### Drawdown Throttling
 
-When session drawdown exceeds the configured threshold, the scan stops opening new positions. The throttle lifts automatically when PnL recovers.
+A session that consistently loses on both sides is either a choppy, undirected market or a wrong read on the day's character. In either case, opening more positions compounds the damage. When drawdown reaches the configured threshold, stop entering new positions and wait. The market will either clarify its direction — at which point recovery begins naturally — or it stays choppy, in which case standing down was the right call. The throttle lifts when PnL recovers past the threshold. Do not override it early.
 
-A session where both sides lose consistently signals a choppy, untradeable environment or a wrong meta-read. Pausing new entries prevents compounding losses into a market that isn't cooperating.
+---
+
+#### Market Reading
+
+The entry gate is built from slots. Each slot is a set of criteria that must all be true simultaneously. A ticker qualifies for entry when it satisfies every criterion in any one slot. Each slot is a distinct thesis — "funding rate elevated and price rising" is a different case from "high participation confirming momentum." Both can be active at the same time; each runs on its own terms. A position opens when any slot is satisfied; when none are, the scan passes.
+
+**The criteria:**
+
+- **+fund** — The funding rate is above the threshold. Longs are paying shorts. There is carry embedded in holding the short side, and heavy long positioning often signals a crowded trade vulnerable to reversal.
+- **-fund** — The funding rate is below the negative threshold. Shorts are paying longs. An overcrowded short side with embedded carry for longs.
+- **+24h** — The ticker's 24-hour price change is positive. The day's character is currently bullish for this coin.
+- **-24h** — The 24-hour price change is negative. The day is currently bearish for this coin.
+- **>10%** — The ticker's 24-hour trading volume exceeds 10% of its total market capitalization. A significant fraction of the coin's entire value changed hands in a day — unusually high participation that confirms momentum is broadly backed, not a thin-market artifact.
+- **<10%** — The volume is below 10% of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
+- **LSA (Sell Spike)** — The last completed hourly candle had a volume spike above the daily average in the configured range, and it closed lower than it opened. A high-volume down candle is sell-side pressure with the market actively participating — not drifting, not choppy, but decisively pointing down. Use this to confirm bearish momentum with volume backing before entering the short side.
+- **LBA (Buy Spike)** — The mirror: high volume in the configured range, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
+- **R-ASL (Quiet Red)** — The last completed hourly candle closed red and its volume was *below* the configured lower spike bound — the market moved down without a volume surge. Quiet, uncontested selling: no crowd participation, no obvious catalyst. Can signal a slow bleed or a low-conviction pullback that is easier to trade than a violent spike.
+- **R-ABL (Quiet Green)** — The mirror: a green candle with volume below the spike threshold. The market drifted up without conviction. Useful for entries where you expect a measured continuation rather than a sharp move.
+- **S-Liq (Sell-Liquidation)** — Short positions accounted for the majority of liquidation turnover in the cycle, above the configured threshold. Short liquidations are bullish — the market forced out the short side. Use this to confirm that the long case has real pressure behind it. An optional depth gate can additionally require the liq flow to be above or below a certain intensity relative to the ticker's typical hourly liq volume — use this to filter for unusually heavy or unusually light signals beyond the threshold.
+- **B-Liq (Buy-Liquidation)** — Long positions accounted for the majority of liquidation turnover above the threshold. Long liquidations are bearish — the market forced out the long side. Use this to confirm that the short case has real pressure behind it. The same optional depth gate applies.
+
+**Building slots**: A slot containing only "+fund" behaves exactly like a fund-chasing filter. A slot containing "+24h" and ">10%" behaves like a momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume. The building-block design lets you dial the filter from permissive to strict without changing the underlying logic.
+
+**Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 distinct slots. At size 3, 220 slots. Combined with auto-correction, this creates a self-pruning strategy: all combinations run, and the ones that consistently lose are disabled without manual intervention.
+
+**Group exits**: Positions opened through this strategy exit at their individual TP or SL by default. Three optional group modes add further control.
+
+**Cascade** — when the combined unrealized profit of all positions crosses a configured threshold, every position closes at once. This banks the move before it can reverse. Use it when you want to enforce collective profit-taking rather than waiting for each position to reach its individual target.
+
+**Rolling Window Sacrifice** — when combined unrealized loss crosses a threshold, instead of closing all positions at once, only the oldest one closes. Exposure is reduced gradually, one position per trigger. Use this for staged de-risking rather than a clean sweep.
+
+**Fade Away** — if the broad hourly candle sample is skewed sufficiently in one direction, the oldest open position closes. For the short side, the trigger is a broadly bullish tape; for the long side, a broadly bearish tape. Like rolling sacrifice, this closes one position per cycle. The difference is the trigger: sacrifice fires on your own portfolio's loss level; fade away fires on the market's structural direction as read from the candle sample.
+
+**Liq Fade Away** — the same graduated response, driven by liquidation flow instead of candle direction. The liquidation surveillance layer accumulates real-money forced-close events across a rolling sample of volatile tickers. The fade only triggers when two conditions are met simultaneously: the adverse liquidation type dominates beyond the threshold, **and** the slot scorecard shows that this liquidation type has historically corresponded to losses for positions opened through the same slots. If the scorecard has no history, or the record is ambiguous, the fade does not fire. An optional block-entries mode holds new positions until the adverse signal clears.
+
+When a position is opened via a liquidation signal, the intensity of that signal is recorded alongside the trade outcome. The scorecard bias check accounts for this intensity tag, so outcomes from heavy signals and light signals are tracked separately — the bias verdict is drawn from trades opened under comparable conditions, not from a flat average.
 
 ---
 
@@ -178,82 +211,21 @@ A perfect AMa run returns roughly **709% on the original entry margin** at 6× l
 
 ---
 
-## Strategies
-
-Each strategy is a specific combination of techniques.
-
----
-
-### Multi-Indicator Strategy
-
-**The premise**: Rather than betting on a single signal, build an entry condition from a combination of signals that must align simultaneously. Funding rate, 24-hour price direction, and relative volume each capture something different about a ticker's current state. When several of these point the same way at once, the case for entry is stronger than any one of them alone — and the combination defines a tradeable edge without requiring a ticker-level price prediction.
-
-**Slots**: The entry logic is built from "slots" — each slot is a set of criteria that must all be true at the same time. A ticker qualifies for entry if it satisfies every criterion in any one slot. Think of each slot as a distinct thesis about when to open: "funding rate elevated and price trending up" is a different case than "high participation confirming momentum." Both can be active simultaneously; each runs on its own terms.
-
-**The criteria**:
-
-- **+fund** — The funding rate is above the threshold (typically 0.1%). Longs are paying shorts. There is a premium embedded in holding the short side, and heavy long positioning often signals a crowded trade vulnerable to reversal.
-- **-fund** — The funding rate is below the negative threshold. Shorts are paying longs. This is the mirror: an overcrowded short side with embedded carry for longs.
-- **+24h** — The ticker's 24-hour price change is positive. The day's character is currently bullish for this coin.
-- **-24h** — The 24-hour price change is negative. The day is currently bearish for this coin.
-- **>10%** — The ticker's 24-hour trading volume exceeds 10% of its total market capitalization. A significant fraction of the coin's entire value changed hands in a day — unusually high participation that confirms momentum is broadly backed, not a thin-market artifact.
-- **<10%** — The volume is below 10% of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
-- **LSA (Sell Spike)** — The last completed hourly candle had a volume spike above the daily average in the configured range, and it closed lower than it opened. A high-volume down candle is sell-side pressure with the market actively participating — not drifting, not choppy, but decisively pointing down. Use this to confirm bearish momentum with volume backing before entering the short side.
-- **LBA (Buy Spike)** — The mirror: high volume in the configured range, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
-- **R-ASL (Quiet Red)** — The last completed hourly candle closed red and its volume was *below* the configured lower spike bound — meaning the market moved down without a volume surge. This is quiet, uncontested selling: no crowd participation, no obvious catalyst. It can signal a slow bleed or a low-conviction pullback that is easier to trade than a violent spike.
-- **R-ABL (Quiet Green)** — The mirror: a green candle with volume below the spike threshold. The market drifted up without conviction. Useful for entries where you expect a measured continuation rather than a sharp move.
-- **S-Liq (Sell-Liquidation)** — Short positions accounted for the majority of liquidation turnover in the cycle, above the configured threshold. Short liquidations are bullish — the market forced out the short side. Use this to confirm that the long case has real pressure behind it.
-- **B-Liq (Buy-Liquidation)** — Long positions accounted for the majority of liquidation turnover above the threshold. Long liquidations are bearish — the market forced out the long side. Use this to confirm that the short case has real pressure behind it.
-
-**Default configuration**: The default slots cover the primary entry cases. The short side uses: positive funding with price rising, negative funding with price falling, rising price with high participation, and falling price with low participation. The long side uses the directional mirrors of the same. Any slot can be edited, removed, or replaced to build entirely different configurations.
-
-**Why this is flexible**: A slot containing only "+fund" behaves exactly like the fund-chasing approach. A slot containing "+24h" and ">10%" behaves like the momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume before the position opens. The building-block design lets you dial the filter from permissive (one broad criterion) to strict (multiple simultaneous conditions) without changing the underlying logic.
-
-**Auto-slot builder**: instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 distinct slots — every pair of signals that could align simultaneously. At size 3, 220 slots. Combined with auto-correction, this creates a self-pruning strategy: all combinations run, and the ones that consistently lose are disabled without manual intervention.
-
-**Exits**: All positions opened through this strategy exit through the standard take-profit and stop-loss settings by default. Three optional group-exit modes add further control.
-
-**Group exit: Cascade** — when the combined unrealized profit of all positions opened through this strategy crosses a configured threshold (as a percentage of average entry margin), every one of those positions closes at once. This banks the move before it can reverse. Use it when you want to enforce collective profit-taking across the whole group rather than waiting for each position to reach its individual target.
-
-~~**Group exit: Sacrifice** — the mirror of cascade. When combined unrealized loss crosses a threshold, all positions in the group close to cap the damage. This is a group stop-loss — it fires when the thesis has clearly broken down across the book and further holding would only deepen the loss.~~
-
-**Rolling Window Sacrifice** — a softer version of sacrifice. When the loss threshold is crossed, instead of closing all positions at once, only the oldest one closes. The exposure is reduced gradually, one position per trigger, rather than being eliminated in a single action. Use this when you want staged de-risking rather than a clean sweep.
-
-**Fade Away** — a directional market response. If the broad sample of hourly candles is skewed sufficiently in one direction (configurable threshold, default 50%), the oldest open position closes. For the short side, the trigger is a broadly bullish tape — when the market is broadly going up, the oldest short gets cut first. For the long side, the trigger is a broadly bearish tape. Like rolling sacrifice, this closes one position per cycle. The difference is the trigger: sacrifice fires on your own portfolio's loss level; fade away fires on the market's structural direction as read from the candle sample.
-
-**Liq Fade Away** — the same graduated response, driven by liquidation flow instead of candle direction. The liquidation surveillance layer accumulates real-money forced-close events across a rolling sample of volatile tickers. Once a sample batch closes, the balance of short liquidations versus long liquidations is evaluated. The fade only triggers when two conditions are met simultaneously: the adverse liquidation type dominates beyond the threshold, **and** the slot scorecard shows that this liquidation type has historically corresponded to losses for positions opened through the same slots. If the scorecard has no history, or the record is ambiguous, the fade does not fire — it only acts when past outcomes support the signal. If long liquidations dominate and the scorecard confirms they have been bad for the short side, the short side closes its oldest position; the mirror applies for the long side. Because liquidation data is collected over an hour-long window, this trigger is slower than candle-based Fade Away but carries more weight — a liquidation event represents actual margin destruction, not just candle direction. An optional block-entries mode holds new positions until the adverse signal clears.
-
-**Components used**:
-- Slot-based AND-gate filter (user-configurable; any combination of criteria per slot, unlimited slots)
-- Auto-slot builder (generates all combinations at configured size)
-- Funding rate threshold gate (+fund, -fund)
-- 24-hour price direction (+24h, -24h)
-- Vol/mcap ratio filter (>10%, <10%)
-- 1h volume spike and candle direction (LSA, LBA, R-ASL, R-ABL)
-- Liquidation flow criteria (S-Liq, B-Liq — requires Liquidation Surveillance active)
-- Group cascade exit, group sacrifice exit, rolling window sacrifice, fade away, liq fade away
-- Liquidation surveillance (live WebSocket feed, per-scan rolling batches)
-- Drawdown throttle and gains lock
-- Climate gate (learned market-structure profile, when Structure Learning plugins are loaded)
-- Slot auto-correction (PnL-based auto-disable/re-enable, when Structure Learning plugins are loaded)
-
----
-
 ## Market Intelligence
 
-The system learns over time. Beyond the slot-based filters and technique configuration, there is an observational layer that watches how the market behaves at the moments that matter most — when positions are closed at a gain or at a loss — and builds a record of what the market looked like in those moments. That record becomes a guide for future sessions.
+Market Intelligence is the strategy used by PseudoWinter and PseudoChaser. Rather than trading on a single signal or a fixed rule, it builds a living picture of the market — learning what conditions have preceded wins and losses, tracking what the broad tape is doing right now, and filtering entries against everything the system has observed so far.
 
 ---
 
 ### Structure Learning
 
-Every time a meaningful event occurs — a position closes at target, a drawdown halt triggers, a relief rally is detected — the system takes a snapshot of what the broader market looked like at that moment: how many coins are trending up versus down, the balance of buying and selling pressure, the velocity of the trend. Over many sessions, these snapshots accumulate into a profile.
+Structure Learning is the observational counterpart to Psycho Mode's mechanical approach. Where Psycho Mode handles the position book mechanically — absorbing, escalating, exhuming — Structure Learning watches the broader market and asks what conditions surrounded past wins and losses.
 
-Before opening new positions, the system compares current market conditions against this profile. If conditions closely resemble what the market looked like during previous drawdown events, the entry gate narrows. If conditions match what the market looked like during profitable periods, the gate opens wider.
+Every significant event — a position closes at target, a drawdown halt triggers, a relief rally is detected — captures a snapshot of what the market looked like at that moment: trend balance, buying and selling pressure, velocity. Over many sessions these accumulate into a profile.
 
-This is not a prediction. The system does not know what the market will do next. What it knows is what the market has looked like in the past when things went well and when they went badly — and it lets that pattern shift its confidence before each decision.
+Before each entry pass, current conditions are compared against the profile. Conditions resembling past drawdown events narrow the entry gate. Conditions resembling profitable periods widen it.
 
-The profile improves with time. A fresh installation has no history and places no weight on past structure. After weeks of operation, the profile represents a genuine statistical record of the market's behavior during this system's sessions, shaped by its own entry logic and sizing decisions. It is, in that sense, a learned intuition specific to how this system trades.
+A fresh installation has no history and places no weight on structure. After weeks of operation, the profile reflects the market as this system has actually experienced it — a learned intuition shaped by its own trading logic, not a generic market model.
 
 ---
 
