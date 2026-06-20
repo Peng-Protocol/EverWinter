@@ -26,10 +26,10 @@ Each file carries its version in two or three places — update **all** that app
 | `PseudoWinter.html` | v1.7.3 |
 | `PseudoChaser.html` | v1.3.4 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.11.1 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.11.1 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.18.8 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.18.8 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.12.0 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.12.0 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.18.9 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.18.9 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
