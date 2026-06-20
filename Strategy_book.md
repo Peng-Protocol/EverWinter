@@ -31,15 +31,13 @@ On a **bearish day**: gainers that ran up are likely to retrace, and losers are 
 
 On a **volatile day**: neither side dominates. Coins pump and dump freely in both directions — overbought tickers snap back, oversold tickers bounce hard. Both the short side and the long side can be profitable simultaneously because the market is producing clear extremes on both ends.
 
-Neither system predicts the day in advance. The approach is to run both sides simultaneously and let drawdown throttling limit damage on the side that is wrong today. The side aligned with the day's meta-structure runs profitably; the opposing side hits its SLs cleanly and closes bounded losses. Over a session the net of both sides reflects the actual character of that day.
-
-Meta-structure is necessary but not sufficient. It is possible to trade with the structure and still lose when the specific signals driving entries are not genuinely aligned with it. Knowing which indicators are actually bullish or bearish within the current environment — not just nominally available — determines whether the entries within a favorable structure produce profit or drag. The slot scorecard system addresses this directly: it tracks which entry combinations have historically won and lost and prunes the ones that are not working. This same mechanism benefits the counter-structure side too. Rather than absorbing consistent losses, it identifies pockets where the counter-trend case is supported — and in some sessions, the scorecard data is enough to put the counter-structure side in profit despite the broader directional headwind.
+Neither system predicts the day in advance. Both sides run simultaneously; drawdown throttling limits damage on the side that is wrong while the aligned side runs with the current. Over a session the net reflects the actual character of that day — but meta-structure is necessary without being sufficient. Trading with the structure still produces losses when the specific signals driving entries are not genuinely aligned with it. Knowing which indicators are actually bullish or bearish in the current environment — not just nominally available — determines whether entries within a favorable structure produce profit or drag. This is directly addressed by a scoring system that tracks which entry combinations have historically won and lost, pruning the ones that are not working. This same mechanism benefits the counter-structure side: rather than absorbing consistent losses, it identifies pockets where the counter-trend case is supported — and in some sessions, the scorecard data is enough to put the counter-structure side in profit despite the broader directional headwind.
 
 **Two approaches coexist within this system:**
 
-**Proactive**: Design budget spent at the entry gate — slot-based multi-criterion filters. Binary mode bounds every position at entry with a fixed TP and SL; no DCA, no extended exposure. A missed entry is acceptable; a bad entry costs exactly the configured SL percentage and nothing more.
+**Proactive**: Design budget spent at the entry gate — this asks what tickers are best to enter based on certain behavior or traits the ticker may be exhibiting.
 
-**Reactive (Psycho Mode)**: Design budget spent in the exit system — DCA escalation, aggressive absorption, laggard debt tracking, cascade triggers. Entry filter is one change-percent threshold. Accepts that many entries will be wrong and structures for it mechanically. Capital headroom is the tradeoff.
+**Reactive**: Design budget spent in the exit system — this asks what techniques are best to use to exit a ticker that is not cooperating.
 
 Neither is strictly better. Proactive suits tighter risk tolerance and cleaner books. Reactive suits traders comfortable with simultaneous multi-stage drawdown and wider capital headroom in exchange for higher throughput.
 
@@ -53,7 +51,7 @@ Techniques are the building blocks. Each strategy assembles a specific combinati
 
 ### Proactive Techniques
 
-Proactive techniques decide whether and when to enter. They filter noise from signal at the entry gate.
+Proactive techniques decide whether, how, and when to enter. They filter noise from signal at the entry gate.
 
 ---
 
@@ -69,7 +67,7 @@ Binary Mode suits the meta-structure approach: when the read is correct, positio
 
 #### Drawdown Throttling
 
-A session that consistently loses on both sides is either a choppy, undirected market or a wrong read on the day's character. In either case, opening more positions compounds the damage. When drawdown reaches the configured threshold, stop entering new positions and wait. The market will either clarify its direction — at which point recovery begins naturally — or it stays choppy, in which case standing down was the right call. The throttle lifts when PnL recovers past the threshold. Do not override it early.
+A session that consistently loses on both sides is either a choppy, undirected market or a wrong read on the day's character. In either case, opening more positions compounds the damage. When drawdown reaches the configured threshold, stop entering new positions and wait. The market will either clarify its direction — at which point recovery begins naturally — or it stays choppy, in which case standing down was the right call. The throttle can be lifted either after a fixed interval or if the opposing directional side suffers a similar drawdown, indicating a shift in market direction. Do not override it early.
 
 ---
 
@@ -83,8 +81,8 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 - **-fund** — The funding rate is below the negative threshold. Shorts are paying longs. An overcrowded short side with embedded carry for longs.
 - **+24h** — The ticker's 24-hour price change is positive. The day's character is currently bullish for this coin.
 - **-24h** — The 24-hour price change is negative. The day is currently bearish for this coin.
-- **>10%** — The ticker's 24-hour trading volume exceeds 10% of its total market capitalization. A significant fraction of the coin's entire value changed hands in a day — unusually high participation that confirms momentum is broadly backed, not a thin-market artifact.
-- **<10%** — The volume is below 10% of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
+- **>10% (v/m)** — The ticker's 24-hour trading volume exceeds 10% of its total market capitalization. A significant fraction of the coin's entire value changed hands in a day — unusually high participation that confirms momentum is broadly backed, not a thin-market artifact.
+- **<10% (v/m)** — The volume is below 10% of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
 - **LSA (Sell Spike)** — The last completed hourly candle had a volume spike above the daily average in the configured range, and it closed lower than it opened. A high-volume down candle is sell-side pressure with the market actively participating — not drifting, not choppy, but decisively pointing down. Use this to confirm bearish momentum with volume backing before entering the short side.
 - **LBA (Buy Spike)** — The mirror: high volume in the configured range, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
 - **R-ASL (Quiet Red)** — The last completed hourly candle closed red and its volume was *below* the configured lower spike bound — the market moved down without a volume surge. Quiet, uncontested selling: no crowd participation, no obvious catalyst. Can signal a slow bleed or a low-conviction pullback that is easier to trade than a violent spike.
@@ -94,25 +92,13 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 
 **Building slots**: A slot containing only "+fund" behaves exactly like a fund-chasing filter. A slot containing "+24h" and ">10%" behaves like a momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume. The building-block design lets you dial the filter from permissive to strict without changing the underlying logic.
 
-**Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 distinct slots. At size 3, 220 slots. Combined with auto-correction, this creates a self-pruning strategy: all combinations run, and the ones that consistently lose are disabled without manual intervention.
-
-**Group exits**: Positions opened through this strategy exit at their individual TP or SL by default. Three optional group modes add further control.
-
-**Cascade** — when the combined unrealized profit of all positions crosses a configured threshold, every position closes at once. This banks the move before it can reverse. Use it when you want to enforce collective profit-taking rather than waiting for each position to reach its individual target.
-
-**Rolling Window Sacrifice** — when combined unrealized loss crosses a threshold, instead of closing all positions at once, only the oldest one closes. Exposure is reduced gradually, one position per trigger. Use this for staged de-risking rather than a clean sweep.
-
-**Fade Away** — if the broad hourly candle sample is skewed sufficiently in one direction, the oldest open position closes. For the short side, the trigger is a broadly bullish tape; for the long side, a broadly bearish tape. Like rolling sacrifice, this closes one position per cycle. The difference is the trigger: sacrifice fires on your own portfolio's loss level; fade away fires on the market's structural direction as read from the candle sample.
-
-**Liq Fade Away** — the same graduated response, driven by liquidation flow instead of candle direction. The liquidation surveillance layer accumulates real-money forced-close events across a rolling sample of volatile tickers. The fade only triggers when two conditions are met simultaneously: the adverse liquidation type dominates beyond the threshold, **and** the slot scorecard shows that this liquidation type has historically corresponded to losses for positions opened through the same slots. If the scorecard has no history, or the record is ambiguous, the fade does not fire. An optional block-entries mode holds new positions until the adverse signal clears.
-
-When a position is opened via a liquidation signal, the intensity of that signal is recorded alongside the trade outcome. The scorecard bias check accounts for this intensity tag, so outcomes from heavy signals and light signals are tracked separately — the bias verdict is drawn from trades opened under comparable conditions, not from a flat average.
+**Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 distinct slots. At size 3, 220 slots. Some criteria are inherently opposed and cannot coexist: +24h and -24h, +fund and -fund, LSA and LBA, R-ASL and R-ABL — and LSA/LBA are opposed to R-ASL/R-ABL. Auto-generated slots containing both sides of any pair will never see a position. Combined with auto-correction, this creates a self-pruning strategy: all valid combinations run, and the ones that consistently lose are disabled without manual intervention.
 
 ---
 
 ### Reactive Techniques
 
-Reactive techniques manage positions after entry. They fire in response to position behavior, not to market conditions at the time of entry. Reactive techniques are used exclusively by Psycho Mode in the current system.
+Reactive techniques manage positions after entry. They fire in response to position behavior or evolving market conditions, not to conditions at the time of entry.
 
 ---
 
@@ -183,8 +169,6 @@ When the timer fires, the queued stage's price is checked against current price.
 
 When the final DCA stage fills and absorption has reduced position margin significantly below expected cumulative margin, the stage count is recalibrated and new DCA orders are queued from current price. SL is deferred until the recalibrated count fills.
 
-**Passive Second Wind**: When absorption reaches the margin floor, accumulated saved margin funds additional DCA stages placed 6% above the prior stage — no new capital from the book.
-
 ---
 
 #### Sacrifice and Retraction
@@ -192,6 +176,12 @@ When the final DCA stage fills and absorption has reduced position margin signif
 **Sacrifice** monitors allocated margin. When allocated margin exceeds 4× the baseline per-position cost, new entries pause and one recoverable position is closed each cycle until the ratio drops. Priority: positions with at least one DCA stage triggered and PnL above −3%.
 
 **Retraction** adds a separate tripwire: when collective unrealized PnL falls below −2.5× entry margin, sacrifice mode activates regardless of margin ratio.
+
+---
+
+#### Rolling Window Sacrifice
+
+When combined unrealized loss crosses a threshold, instead of closing all positions at once, only the oldest one closes. Exposure is reduced gradually, one position per trigger. Use this for staged de-risking rather than a clean sweep.
 
 ---
 
@@ -208,6 +198,16 @@ When the final DCA stage fills and absorption has reduced position margin signif
 Positions open with no TP; as price moves in the profitable direction, flat adds are placed at −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% from entry. At the seventh add, a TP is set at −22% from the original entry.
 
 A perfect AMa run returns roughly **709% on the original entry margin** at 6× leverage. If price reverses and a DCA level triggers, AMa cancels and a standard stage-based TP is set against the current weighted average.
+
+---
+
+#### Group Exits
+
+Positions opened through the slot-based strategy exit at their individual TP or SL by default. Two optional group exit modes add further control.
+
+**Fade Away** — Routine hourly candle fetches across a random sample of tickers (drawn fresh each cycle, up to a fixed cap) are required for this to function. When the sample is skewed sufficiently in one direction, the oldest open position closes. For the short side, the trigger is a broadly bullish tape; for the long side, a broadly bearish tape. New positions should be deferred when adverse conditions are confirmed. Like rolling sacrifice, this closes one position per cycle — the difference is the trigger: rolling sacrifice fires on the portfolio's own loss level; fade away fires on the market's structural direction as read from the candle sample.
+
+**Liq Fade Away** — the same graduated response, driven by liquidation flow instead of candle direction. The liquidation surveillance layer accumulates real-money forced-close events across a rolling sample of volatile tickers. The fade only triggers when two conditions are met simultaneously: the adverse liquidation type dominates beyond the threshold, **and** the slot scorecard shows that this liquidation type has historically corresponded to losses for positions opened through the same slots. If the scorecard has no history, or the record is ambiguous, the fade does not fire.
 
 ---
 
@@ -231,7 +231,7 @@ A fresh installation has no history and places no weight on structure. After wee
 
 ### Structure Sampling
 
-Before each entry pass, the system reads the last completed hourly candle for a random sample of tickers across the market and counts how many closed red versus how many closed green. The result is displayed as a two-sided bar — red on one end, green on the other — that gives a live read on the market's hourly directional balance.
+At each cycle, a random sample of tickers is drawn from across the market and their last completed hourly candle tallied — how many closed red, how many closed green. The result is displayed as a two-sided bar — red on one end, green on the other — giving a live read on the market's hourly directional balance.
 
 This is a snapshot, not a forecast. It tells you what the broad market actually did in the last hour, not what it will do next. Paired with the Fade Away exit, it forms a closed loop: the same candle sample that is plotted in the bar is the one that triggers the position close when the balance is sufficiently one-sided. When the bar skews heavily in one direction, the positions exposed to that direction are at risk — Fade Away uses that observation to act automatically.
 
@@ -247,6 +247,8 @@ Combinations are displayed sorted by total PnL. When both sides run simultaneous
 
 The **CLEAR** button resets all scorecard records and lifts all auto-blocks.
 
+When a position is opened via a liquidation signal, the intensity of that signal is recorded alongside the trade outcome. The scorecard bias check accounts for this intensity tag, so outcomes from heavy signals and light signals are tracked separately — the bias verdict is drawn from trades opened under comparable conditions, not from a flat average.
+
 ---
 
 ### Cross-Side Coordination
@@ -257,11 +259,9 @@ Each side of the system — the long side and the short side — trades independ
 
 A **cascade** on one side — a wave of positions closing at profit — means the market made a decisive move in that direction. For the side that just cashed out, the run may be over. For the *other* side, it is a warning: the market just moved hard against you, and any open positions you're holding into that momentum are likely bleeding. The correct response is to halt new entries and close whatever is exposed.
 
-~~A **sacrifice** on one side — a wave of positions closing at a loss, absorbed and cut — means the market moved decisively against that side. The same move is relief for the other side. If the other side had been halted waiting for conditions to improve, this is the signal that the pressure has shifted. The halt lifts; entries can resume.~~
-
 **Why speed matters:**
 
-These trends can reverse within a few hours. A market that cascades bullish in the morning can ~~sacrifice~~ by afternoon. Waiting for manual confirmation introduces the exact delay that turns a signal into yesterday's news. The window for acting on a cross-side signal is narrow — the value is in responding immediately, not in confirming it after the fact.
+These trends can reverse within a few hours. A market that cascades bullish in the morning can reverse by afternoon. Waiting for manual confirmation introduces the exact delay that turns a signal into yesterday's news. The window for acting on a cross-side signal is narrow — the value is in responding immediately, not in confirming it after the fact.
 
 **The larger vision:**
 
