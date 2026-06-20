@@ -85,7 +85,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list, EDa state) as a `.json` file.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list, EDa state) as a `.json` file. Plugins with their own data (Permafrost/Ashfall profile, scorecard) have separate Export buttons inside their own accordions — the Stats menu Export covers the base bot state only.
 - **Import** — Restores state from a previously exported `.json` file. Config fields merge field-by-field; positions replace wholesale. A 5s debounce prevents accidental double-imports.
 - **Clear Closed Trades** — Wipes the closed trades list and resets session stats. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -99,6 +99,8 @@ Timestamped entries for every significant bot event. Color coding:
 - **Red** — errors (API failures, plugin conflicts)
 
 Common prefixes: `[MHL]` drawdown halt · `[GLK]` gains lock · `[PLK]` preemptive lock · `[PFR]`/`[ASH]` climate plugin events · `[MIW]`/`[MIC]` multi-indicator events.
+
+The log is capped at 300 entries in memory and in localStorage. Oldest entries are dropped when the cap is exceeded.
 
 ---
 
@@ -165,7 +167,7 @@ Depth gate: `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. 
 
 **Manual mode**: click a slot to select it, then toggle criteria on/off in the picker row below. ✕ deletes the slot; `+` adds a new empty one.
 
-**Auto mode**: the manual builder is replaced by a size picker and an exclusion chip row. The combo count shown reflects how many slots are active after exclusions and blocks.
+**Auto mode**: the manual builder is replaced by a size picker and an exclusion chip row. The combo count shown reflects how many slots are active after exclusions and blocks. Note that many generated combinations are contradictory and will never match any ticker — a slot containing both `+fund` and `-fund`, or both `+24h` and `-24h`, can never be satisfied simultaneously. The same applies to `lsa`/`rasl` (direct opposites) and `lba`/`rabl`. At size 2 these pairs are common, so the effective slot count is lower than the number shown. Excluding one side of each pair removes the dead combinations. Additionally, `lsa`/`lba`/`rasl`/`rabl` almost never co-qualify with `>10pct`/`<10pct` in the same slot: vol/mcap criteria apply only to the top 30 tickers by turnover, while kline criteria apply to a random sample drawn from the full pool — the overlap between those two subsets is small in practice.
 
 **Blocked slots** show a red border and ⛔ badge. A slot is blocked when the Permafrost/Ashfall scorecard has recorded enough losses for that criteria combination to cross the loss threshold.
 
