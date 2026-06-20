@@ -31,7 +31,7 @@ On a **bearish day**: gainers that ran up are likely to retrace, and losers are 
 
 On a **volatile day**: neither side dominates. Coins pump and dump freely in both directions — overbought tickers snap back, oversold tickers bounce hard. Both the short side and the long side can be profitable simultaneously because the market is producing clear extremes on both ends.
 
-Neither system predicts the day in advance. Both sides run simultaneously; drawdown throttling limits damage on the side that is wrong while the aligned side runs with the current. Over a session the net reflects the actual character of that day — but meta-structure is necessary without being sufficient. Trading with the structure still produces losses when the specific signals driving entries are not genuinely aligned with it. Knowing which indicators are actually bullish or bearish in the current environment — not just nominally available — determines whether entries within a favorable structure produce profit or drag. This is directly addressed by a scoring system that tracks which entry combinations have historically won and lost, pruning the ones that are not working. This same mechanism benefits the counter-structure side: rather than absorbing consistent losses, it identifies pockets where the counter-trend case is supported — and in some sessions, the scorecard data is enough to put the counter-structure side in profit despite the broader directional headwind.
+Neither system predicts the day in advance. Both sides run simultaneously; drawdown throttling limits damage on the side that is wrong while the aligned side runs with the current. Over a session the net reflects the actual character of that day — meta-structure is necessary without being sufficient. Trading with the structure still produces losses when the specific signals driving entries are not genuinely aligned with it. Knowing which indicators are actually bullish or bearish in the current environment — not just nominally available — determines whether entries within a favorable structure produce profit or drag. This is directly addressed by a scoring system that tracks which entry combinations have historically won and lost, pruning the ones that are not working. This same mechanism benefits the counter-structure side: rather than absorbing consistent losses, it identifies pockets where the counter-trend case is supported — and in some sessions, the scorecard data is enough to put the counter-structure side in profit despite the broader directional headwind.
 
 **Two approaches coexist within this system:**
 
@@ -119,7 +119,7 @@ DCA is the core position rescue structure for reactive strategies. When price mo
 
 #### Stop Loss (SL)
 
-A hard exit set after all configured DCA stages have filled. Above that point nothing else can improve the average entry; there is no further reason to hold through an unlimited adverse move.
+Unlike Binary Mode — where a stop loss is placed at entry as a hard bracket — the reactive SL is not set until all configured DCA stages have filled. Above that point nothing else can improve the average entry; there is no further reason to hold through an unlimited adverse move.
 
 **Placement**: Set live only after the final stage triggers — this prevents exposing the SL price during the DCA progression, where a live SL at a known price is a stop-hunt invitation.
 
@@ -129,11 +129,11 @@ The default threshold is −105% of entry margin. For isolated margin accounts, 
 
 #### Loss Absorption
 
-Loss absorption trims positions consuming capital without recovering, freeing margin for healthier positions and progressively reducing exposure on the worst performers.
+When a position's unrealized loss exceeds the configured threshold, a partial close is made — a cut — reducing its size without closing it outright. The position remains open; the average entry is unchanged; but the capital tied up in it shrinks. Each cut shortens a cooldown timer: the interval between cuts halves with every successive cut, down to a 30-second floor. A position that keeps losing gets cut faster. When it recovers above the threshold, the cut count resets.
 
-**Trigger model**: A cut is considered only when the position's unrealized loss breaches its configured threshold. A per-position cooldown prevents back-to-back cuts.
+If the position has been reduced to the minimum tradeable size and is still in loss, the next trigger closes it outright rather than cutting further.
 
-**Cut sizing and floors**: Stage 1 and below preserve the strategy's relative sizing; stage 2 and deeper can cut toward base margin so future adds have more average-entry leverage.
+An outlier mode handles positions whose size is too large to trim cleanly in a single cut — it defers the cut and locks the cooldown to a 30-second minimum until the position can be reduced without slippage concerns.
 
 DCA and absorption work the same problem from opposite ends: DCA improves where a position needs to be to close; absorption reduces how much of the position still needs to get there.
 
@@ -181,7 +181,7 @@ When the final DCA stage fills and absorption has reduced position margin signif
 
 #### Rolling Window Sacrifice
 
-When combined unrealized loss crosses a threshold, instead of closing all positions at once, only the oldest one closes. Exposure is reduced gradually, one position per trigger. Use this for staged de-risking rather than a clean sweep.
+When combined unrealized loss crosses a threshold, one can either close all positions at once or only the oldest — one position per trigger. The former sweeps exposure clean; the latter reduces it gradually. Use the staged approach when you want to de-risk without abandoning the book entirely.
 
 ---
 
@@ -202,8 +202,6 @@ A perfect AMa run returns roughly **709% on the original entry margin** at 6× l
 ---
 
 #### Group Exits
-
-Positions opened through the slot-based strategy exit at their individual TP or SL by default. Two optional group exit modes add further control.
 
 **Fade Away** — Routine hourly candle fetches across a random sample of tickers (drawn fresh each cycle, up to a fixed cap) are required for this to function. When the sample is skewed sufficiently in one direction, the oldest open position closes. For the short side, the trigger is a broadly bullish tape; for the long side, a broadly bearish tape. New positions should be deferred when adverse conditions are confirmed. Like rolling sacrifice, this closes one position per cycle — the difference is the trigger: rolling sacrifice fires on the portfolio's own loss level; fade away fires on the market's structural direction as read from the candle sample.
 
@@ -231,9 +229,9 @@ A fresh installation has no history and places no weight on structure. After wee
 
 ### Structure Sampling
 
-At each cycle, a random sample of tickers is drawn from across the market and their last completed hourly candle tallied — how many closed red, how many closed green. The result is displayed as a two-sided bar — red on one end, green on the other — giving a live read on the market's hourly directional balance.
+At each cycle, a random sample of tickers is drawn from across the market and their last completed hourly candle tallied — how many closed red, how many closed green. The result can be charted as a two-sided bar — red on one end, green on the other — for better comprehension.
 
-This is a snapshot, not a forecast. It tells you what the broad market actually did in the last hour, not what it will do next. Paired with the Fade Away exit, it forms a closed loop: the same candle sample that is plotted in the bar is the one that triggers the position close when the balance is sufficiently one-sided. When the bar skews heavily in one direction, the positions exposed to that direction are at risk — Fade Away uses that observation to act automatically.
+This is a snapshot, not a forecast. It tells you what a portion of the market did in the last hour (which may differ on the next random sampling), not what it will do next. Paired with the Fade Away exit, it forms a closed loop: the same candle sample that is charted is the one that triggers the position close when the balance is sufficiently one-sided. When the bar skews heavily in one direction, the positions exposed to that direction are at risk — Fade Away uses that observation to act automatically.
 
 ---
 
@@ -243,9 +241,7 @@ The scorecard tracks realized PnL per entry combination. Every time a position o
 
 Combinations are displayed sorted by total PnL. When both sides run simultaneously, the scores account for direction: a win on the short side is a loss for the long side, so each side inverts the other's records in its own view.
 
-**Auto-correction**: when enabled, the system uses scorecard data to block combinations automatically. Each combination has a single combined score — own wins raise it, own losses lower it, partner wins lower it further, partner losses raise it back. When the score drops below a configured threshold the combination is blocked. When it recovers above the threshold — because conditions shifted and the partner started losing on it — it unblocks automatically. Combinations that sink deep stay blocked indefinitely; combinations near the threshold fluctuate with the market.
-
-The **CLEAR** button resets all scorecard records and lifts all auto-blocks.
+**Auto-correction**: when enabled, each slot combination carries a running score. Own wins add to it; own losses subtract; partner wins subtract further; partner losses add back. When a combination's score falls below the configured threshold, entries stop opening through it. When conditions shift and the partner starts losing on the same combination, the score recovers and the block lifts. Combinations that sink deep stay blocked; combinations near the threshold fluctuate with the market.
 
 When a position is opened via a liquidation signal, the intensity of that signal is recorded alongside the trade outcome. The scorecard bias check accounts for this intensity tag, so outcomes from heavy signals and light signals are tracked separately — the bias verdict is drawn from trades opened under comparable conditions, not from a flat average.
 
@@ -253,21 +249,7 @@ When a position is opened via a liquidation signal, the intensity of that signal
 
 ### Cross-Side Coordination
 
-Each side of the system — the long side and the short side — trades independently. But their outcomes are not independent. When one side is closing positions at a loss, the market is moving against it, which means the market is moving *in favor of* the other side. When one side is closing at a profit and exiting, the move that made those longs profitable is the same move that should be warning the short side to get out.
-
-**The signals:**
-
-A **cascade** on one side — a wave of positions closing at profit — means the market made a decisive move in that direction. For the side that just cashed out, the run may be over. For the *other* side, it is a warning: the market just moved hard against you, and any open positions you're holding into that momentum are likely bleeding. The correct response is to halt new entries and close whatever is exposed.
-
-**Why speed matters:**
-
-These trends can reverse within a few hours. A market that cascades bullish in the morning can reverse by afternoon. Waiting for manual confirmation introduces the exact delay that turns a signal into yesterday's news. The window for acting on a cross-side signal is narrow — the value is in responding immediately, not in confirming it after the fact.
-
-**The larger vision:**
-
-The goal is a system that never needs to be manually overridden. A human monitoring both sides would notice when the long side starts closing profitably and would manually pause the short side — but that requires attention, correct interpretation, and quick action. The cross-side coordination handles this automatically. Each side watches the other's outcomes and adjusts in real time.
-
-Combined with the structure-learning layer, this produces a system that gets progressively less reliant on fixed rules and more responsive to the actual conditions it encounters. Fixed configuration handles the stable environment it was tuned for; learned structure handles drift; cross-side signals handle intraday regime shifts. The goal, reached incrementally, is a system that corrects itself before the damage accumulates — without requiring any intervention from the trader.
+Both sides trade independently, but their drawdown throttles can interact. When one side enters drawdown and halts new entries, the other side continues running. If that other side subsequently hits its own drawdown threshold, it signals that the market is now moving against both directions simultaneously — a shift in character rather than a persistent directional move. At that point the original throttle can lift: the condition that justified the halt no longer holds.
 
 ---
 
