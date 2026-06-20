@@ -422,6 +422,10 @@ Optional cross-communicator scorecard that tracks PnL per MIC/MIW criteria combi
 
 **Criteria key**: the criteria array is sorted and joined (e.g. `'-fund,+24h,>10pct'`) to produce a stable slot key. Records store raw criterion strings, not emojis — each plugin applies its own direction-relative `CRIT_EMOJI` at render time.
 
+**Depth-tagging at entry**: when `pos._miwCriteria`/`pos._micCriteria` is stamped at position open, any criterion matching `^sliq` or `^bliq` is remapped to a depth-tagged string using the live value from `_liqResults[sym].sDepth`/`bDepth` at that moment: e.g. plain `sliq` becomes `sliq+3` or `sliq-1`. This means the scorecard groups outcomes by the depth at which each trade was opened. Slot depth-gate suffixes (`sliq>N`) are stored verbatim and the remapping does not apply to them.
+
+**Legacy purge**: `_pfScoreRead`/`_afScoreRead` filter out records where any criterion exactly equals `'bliq'` or `'sliq'` (untiered, no depth suffix) — these are pre-tiering records that cannot be matched by any current slot key and would distort slot scoring. The filter was added in v1.18.2 as a lazy purge: records failing the predicate are excluded from all reads, and the next `_pfScoreWrite`/`_afScoreWrite` call (which calls `_pfScoreRead` first) physically removes them from localStorage.
+
 **Display**: horizontal chip row in the accordion, sorted by total PnL descending. Each chip shows the slot emoji string, bold total PnL, and dimmed win/loss counts. Cross-bot (partner) records are **direction-inverted**: a Winter win (positive PnL) = price fell = Chaser loss, so partner PnL is negated when computing this side's display score. Net PnL can go negative.
 
 **CLEAR button**: resets all scorecard records (wipes `SCORE_KEY` and clears in-memory display). Also clears all auto-block state since blocks are computed from these records.
@@ -450,7 +454,9 @@ Background WebSocket engine that accumulates live liquidation flow data across a
 
 **Shared write**: at `_liqCloseBatch`, `_liqResults` is updated and a patch is immediately merged into the shared registry via `_sharedMerge('liqResults', patch, { ver: ... })`. See the Cross-Tab Data Pool section.
 
-**State vars**: `_liqBatches` (active batch objects, each containing `id`, `symbols`, `sLiqTurnover`, `bLiqTurnover`, `startedAt`, `endsAt`, `ws`, `_endTimer`), `_liqResults` (symbol → `{ sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, cycleId, ts }`), `_liqResultsVersion` (monotonic counter, incremented per closed batch), `_liqCycleHistory`, `_liqLatestResults`, `_liqCycleCounter`.
+**State vars**: `_liqBatches` (active batch objects, each containing `id`, `symbols`, `sLiqTurnover`, `bLiqTurnover`, `avgHourlyTurnover`, `startedAt`, `endsAt`, `ws`, `_endTimer`), `_liqResults` (symbol → `{ sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, sDepth, bDepth, cycleId, ts }`), `_liqResultsVersion` (monotonic counter, incremented per closed batch), `_liqCycleHistory`, `_liqLatestResults`, `_liqCycleCounter`.
+
+`sDepth`/`bDepth` are integer scores computed per batch close: `Math.trunc(clamp((raw / avgHourlyTurnover − 1) × 10, −25, 25))`. Positive = liq turnover above the ticker's hourly average; zero = at average; negative = below. Slot criteria can gate on these values via `sliq>N`/`sliq<N` and `bliq>N`/`bliq<N` suffixes (see Criteria table above).
 
 **Config keys**: `pfLiqEnabled`/`ashLiqEnabled` (default `false`), `pfLiqBatchSize`/`ashLiqBatchSize` (default `20`, range 5–50 step 5), `pfLiqThresholdPct`/`ashLiqThresholdPct` (default `50`, range 10–90 step 5).
 
@@ -496,8 +502,8 @@ A slot-based entry filter that combines funding rate, 24-hour price direction, a
 | `<10pct` | 🔉 | 🔉 | `turnover24h / marketCap < 0.10` — low relative participation |
 | `lsa` | 🟥 | 🟥 | Last completed 1h kline volume in the configured spike band above 24h hourly average AND `close < open` — sell-side liquidity spike |
 | `lba` | 🟩 | 🟩 | Same spike band condition AND `close > open` — buy-side liquidity spike |
-| `sliq` | 🥶 | 🥶 | `_liqResults[sym].sLiqPct ≥ pfLiqThresholdPct` — short positions (S-Liq) accounted for ≥ threshold% of the cycle's total liquidation turnover; bullish flow signal. No per-scan fetch — reads directly from `_liqResults` (requires Permafrost/Ashfall with liquidation surveillance enabled). |
-| `bliq` | 🥵 | 🥵 | `_liqResults[sym].bLiqPct ≥ pfLiqThresholdPct` — long positions (B-Liq) accounted for ≥ threshold% of the cycle's total liquidation turnover; bearish flow signal. Same data source as `sliq`. |
+| `sliq` / `sliq>N` / `sliq<N` | 🥶 | 🥶 | `_liqResults[sym].sLiqPct ≥ pfLiqThresholdPct` — short positions (S-Liq) accounted for ≥ threshold% of the cycle's total liquidation turnover; bullish flow signal. No per-scan fetch — reads directly from `_liqResults` (requires Permafrost/Ashfall with liquidation surveillance enabled). Optional depth gate suffix: `sliq>N` additionally requires `_liqResults[sym].sDepth >= N`; `sliq<N` requires `sDepth <= N`. Without a suffix the depth gate is skipped. |
+| `bliq` / `bliq>N` / `bliq<N` | 🥵 | 🥵 | `_liqResults[sym].bLiqPct ≥ pfLiqThresholdPct` — long positions (B-Liq) accounted for ≥ threshold% of the cycle's total liquidation turnover; bearish flow signal. Same data source and depth gate mechanism as `sliq`. |
 
 The badge is **app-relative** for funding: 🤑 always means the funding rate is favorable for the position direction (carry income), 💸 means the funding rate is adverse. Hovering the badge in the trades or market menu shows a plain-text tooltip with the matched criteria names. Old positions without saved criteria show `Multi` as fallback.
 
@@ -593,7 +599,7 @@ Config keys: `miwFadeAwayEnabled` (default `false`), `miwFadeAwayPct` (default `
 
 Reads `_liqResults` merged with the shared registry (`{ ...(sharedLiq?.data || {}), ...(this._liqResults || {}) }` — own data takes precedence) and sums `sLiqRaw`/`bLiqRaw` across all symbols. The version gate uses `Math.max(localVer, sharedVer)` so either bot advancing the counter triggers an evaluation. Evaluates only when the combined version has advanced since the last check (`_miwLiqFadeCheckedVer`/`_micLiqFadeCheckedVer`), ensuring exactly one evaluation per new liquidation batch regardless of scan cadence.
 
-**Scorecard bias gate**: before evaluating the directional trigger, `_miwLiqScorecardBias('bliq')` / `_micLiqScorecardBias('sliq')` is called and the result stored in the reactive property `_miwLiqBias` / `_micLiqBias`. The helper reads `__everwinter_scorecard_v1`, filters to records within the 30-day TTL that contain the relevant criterion, groups them by slot key, and computes direction-adjusted PnL per slot (`source === 'winter' ? pnl : -pnl` for MIW; `source === 'chaser' ? pnl : -pnl` for MIC). It counts slots with positive vs. negative total PnL, returning `'bad'` when loss slots outnumber profit slots, `'good'` when reversed, or `null` on a tie or no data. The fade only fires when `_miwLiqBias === 'bad'` / `_micLiqBias === 'bad'`.
+**Scorecard bias gate**: before evaluating the directional trigger, `_miwLiqScorecardBias('bliq')` / `_micLiqScorecardBias('sliq')` is called and the result stored in the reactive property `_miwLiqBias` / `_micLiqBias`. The helper reads `__everwinter_scorecard_v1` directly (bypassing `_pfScoreRead`/`_afScoreRead` to include all live records), filters to records within the 30-day TTL whose criteria contain the relevant criterion — matched via `c === crit || c.startsWith(crit)` so all tiered variants (`bliq+2`, `bliq-1`, `bliq>3`, etc.) are matched alongside a bare `bliq`. Records are grouped by sorted slot key; direction-adjusted PnL is summed per slot (`source === 'winter' ? pnl : -pnl` for MIW; `source === 'chaser' ? pnl : -pnl` for MIC). It counts slots with positive vs. negative total PnL, returning `'bad'` when loss slots outnumber profit slots, `'good'` when reversed, or `null` on a tie or no data. The fade only fires when `_miwLiqBias === 'bad'` / `_micLiqBias === 'bad'`.
 
 Direction triggers (both conditions must hold):
 - **MIW** (Winter — shorts): `totalB / total ≥ miwLiqFadePct / 100` **and** `_miwLiqBias === 'bad'` — B-Liq dominates and scorecard confirms B-Liq slots have historically lost for Winter.
