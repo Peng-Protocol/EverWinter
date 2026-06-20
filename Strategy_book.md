@@ -129,11 +129,11 @@ The default threshold is −105% of entry margin. For isolated margin accounts, 
 
 #### Loss Absorption
 
-When a position's unrealized loss exceeds the configured threshold, a partial close is made — a cut — reducing its size without closing it outright. The position remains open; the average entry is unchanged; but the capital tied up in it shrinks. Each cut shortens a cooldown timer: the interval between cuts halves with every successive cut, down to a 30-second floor. A position that keeps losing gets cut faster. When it recovers above the threshold, the cut count resets.
+A losing position that has been left to run will eventually consume more capital than it can realistically return. The answer is not to hold and hope — it is to trim. Cut a portion of the position at a loss, accept it, and carry a smaller stake forward. The average entry does not improve, but the exposure does.
 
-If the position has been reduced to the minimum tradeable size and is still in loss, the next trigger closes it outright rather than cutting further.
+The first cut fires when the loss crosses the threshold. If the position is still losing at the next check, cut again — and check sooner. Each successive cut halves the wait: a position that keeps losing gets trimmed faster until it recovers or reaches the minimum tradeable size, at which point the remainder closes outright. When it does recover above the threshold, the pace resets.
 
-An outlier mode handles positions whose size is too large to trim cleanly in a single cut — it defers the cut and locks the cooldown to a 30-second minimum until the position can be reduced without slippage concerns.
+For positions too large to trim cleanly in a single move, the cut is deferred and the interval locked short until the size is manageable.
 
 DCA and absorption work the same problem from opposite ends: DCA improves where a position needs to be to close; absorption reduces how much of the position still needs to get there.
 
@@ -255,7 +255,7 @@ Both sides trade independently, but their drawdown throttles can interact. When 
 
 ## Psycho Mode
 
-Psycho Mode is the reactive approach in its purest form — no RSI gates, no lock-in, no binary mode. The only filter is absolute 24-hour change exceeding a threshold. All design budget is in the exit system.
+Psycho Mode is the reactive approach in its purest form — no market astrology, no data voyeurism, no binary mode. The only filter is absolute 24-hour change exceeding a threshold. All design budget is in the exit system.
 
 **"Short everything."**
 
