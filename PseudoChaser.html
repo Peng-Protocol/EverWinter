@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.3.4 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.3.8 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -590,7 +590,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.3.4 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.3.8 · Long Only · No Real Orders</div>
     </div>
     <div class="pills">
       <!-- SIM state pill — always visible -->
@@ -697,15 +697,6 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               Arms a 5min audit when price is within the proximity % of TP. Checks a 6min kline window for TP touch.
             </div>
 
-            <!-- Leverage slider -->
-            <div class="g" style="margin-top:10px">
-              <div class="lbl">
-                Leverage <b x-text="cfg.leverage+'×'"></b>
-                <span style="font-size:9px;color:var(--text-mid);font-weight:700;margin-left:6px" title="Applies to all positions. Faders inherit this leverage setting.">ⓘ Affects all fader &amp; gainer entries</span>
-              </div>
-              <input type="range" min="6" max="20" x-model.number="cfg.leverage" :disabled="bot.running" @change="persist()">
-            </div>
-
             <!-- Scan Every slider -->
             <div class="g">
               <div class="lbl">Scan Every <b x-text="cfg.scanMins+'min'"></b></div>
@@ -741,6 +732,22 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   <div class="lbl">List Size <b x-text="cfg.mktWatchSize??10"></b></div>
                   <input type="range" min="5" max="50" step="5" x-model.number="cfg.mktWatchSize" @change="persist()">
                 </div>
+              </div>
+            </div>
+            <!-- REST Price Polling -->
+            <div class="g" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+              <div class="lbl" style="margin-bottom:6px;letter-spacing:1px">Position Price Feed</div>
+              <label class="tog" @click.prevent="cfg.restPollEnabled=!cfg.restPollEnabled;persist()">
+                <div class="tog-t" :class="cfg.restPollEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">REST Polling</div>
+                  <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Fetch position prices via REST instead of WebSocket. Use if WS prices appear incorrect.</div>
+                </div>
+              </label>
+              <div x-show="cfg.restPollEnabled" style="margin-top:8px">
+                <div class="lbl">Base Interval <b x-text="(cfg.restPollBaseSec??5)+'s'"></b></div>
+                <input type="range" min="5" max="30" step="5" x-model.number="cfg.restPollBaseSec" @change="persist()">
+                <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Doubles per symbol when price moves &lt;0.1% between ticks, up to 60s max.</div>
               </div>
             </div>
           </div><!-- /SCAN zone -->
@@ -839,6 +846,14 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
 
           <!-- SIZE zone -->
           <div x-show="tSz" class="pw-zone">
+            <!-- Leverage slider -->
+            <div class="g" style="margin-bottom:10px">
+              <div class="lbl">
+                Leverage <b x-text="cfg.leverage+'×'"></b>
+                <span style="font-size:9px;color:var(--text-mid);font-weight:700;margin-left:6px">ⓘ Affects all strategies</span>
+              </div>
+              <input type="range" min="6" max="20" x-model.number="cfg.leverage" :disabled="bot.running" @change="persist()">
+            </div>
             <div class="g">
               <div class="lbl">Notional per entry &amp; DCA add <b x-text="'$'+cfg.minNotional"></b></div>
               <input type="number" class="inp" min="6" max="666" step="6"
@@ -1623,6 +1638,7 @@ function pw() { return {
     leverage:6, minNotional:6, addNotional:6,
     rsi6Min:30, rsi12Min:30, rsi24Min:30, rsi6Max:10, maxPos:10, scanMins:15, topN:25, // unused — kept for compat
     bulkTickerCooldownEnabled: true, bulkTickerCooldownHours: 1,
+    restPollEnabled: false, restPollBaseSec: 5,
     entryTpRoi: 18,    // TP ROI % — the single TP target (bufferedEV basis), parallel with the SL %
     runtimeHours: 12,
 
@@ -2767,7 +2783,8 @@ function pw() { return {
 
 
   async pseudoOpenLong(candidate) {
-    const { symbol, price, change=0, rsi6=null, rsi12=null, rsi24=null, fundingRate=null } = candidate;
+    const { symbol, price: _candidatePrice, change=0, rsi6=null, rsi12=null, rsi24=null, fundingRate=null } = candidate;
+    let price = _candidatePrice;
     // Hard cap at the open itself — every sim entry path flows through here, so no
     // caller (scan, strategy plugin, manual) can overshoot maxPos.
     if (this.positions.length >= this.cfg.maxPos) {
@@ -2780,6 +2797,11 @@ function pw() { return {
       this.log(`[PC-OPEN-01] ${symbol}: instrument info unavailable — skipping`, 'warn');
       return;
     }
+    { const _wt = wsTicker(symbol);
+      if (_wt) { const _lp = parseFloat(_wt.lastPrice || 0); if (_lp > 0) price = _lp; }
+      else { try { const _r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${symbol}`);
+        const _d = await _r.json(); const _lp = parseFloat(_d?.result?.list?.[0]?.lastPrice);
+        if (_lp > 0) price = _lp; } catch(e) {} } }
 
     const lev       = this.cfg.leverage;
     const notional  = this.cfg.minNotional;
@@ -2946,58 +2968,89 @@ function pw() { return {
       try {
         {
           const tickMap = {};
-          const missing = [];
-          for (const pos of this.positions) {
-            if (!pos._pseudo) continue;
-            const wt = wsTicker(pos.symbol);
-            if (wt) {
-              tickMap[pos.symbol] = parseFloat(wt.lastPrice || 0);
-              // WS tickers don't carry fundingIntervalHour — refresh the rate only when
-              // intervalMs is already cached, so the fr_ entry stays complete for calcFundingFee.
-              const prevFr = this._klineCache[`fr_${pos.symbol}`];
-              if (wt.fundingRate != null && prevFr?.intervalMs) {
-                this._klineCache[`fr_${pos.symbol}`] = {
-                  rate: parseFloat(wt.fundingRate) * 100,
-                  intervalMs: prevFr.intervalMs,
-                  ts: now,
-                };
-              }
-            } else {
-              missing.push(pos.symbol);
-            }
-          }
-          // REST fallback: per-symbol tickers for anything the WS hasn't covered yet
-          // Check shared watchTickers first — if partner fetched recently, adopt and skip REST round
-          if (missing.length) {
-            const _sw = this._sharedRead('watchTickers');
-            const _swFresh = _sw && (now - (_sw.ts || 0)) < TICKER_THROTTLE_MS;
-            if (_swFresh) {
-              this._lastTickerFetch = _sw.ts;
-              for (const sym of missing) {
-                const e = _sw.data?.[sym];
-                if (e) {
-                  tickMap[sym] = e.price;
-                  if (e.fr != null) this._klineCache[`fr_${sym}`] = { rate: e.fr, intervalMs: e.frInterval ?? 8*3600000, ts: _sw.ts };
-                }
-              }
-            } else if (tickerStale) {
-              this._lastTickerFetch = now;
-              const _patch = {};
-              for (const sym of missing) {
+          if (this.cfg.restPollEnabled) {
+            if (!this._restPollState) this._restPollState = {};
+            const _baseMs = (this.cfg.restPollBaseSec ?? 5) * 1000;
+            const _maxMs  = 60000;
+            const _syms   = [...new Set(this.positions.filter(p => p._pseudo).map(p => p.symbol))];
+            for (const sym of _syms) {
+              if (!this._restPollState[sym]) this._restPollState[sym] = { lastPrice: 0, nextFetchAt: 0, currentInterval: _baseMs };
+              const _st = this._restPollState[sym];
+              if (now >= _st.nextFetchAt) {
                 try {
-                  const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
-                  const td = await tr.json();
-                  const t = (td && td.retCode === 0) ? td.result?.list?.[0] : null;
-                  if (!t) continue;
-                  const price = parseFloat(t.lastPrice || 0);
-                  const fr    = t.fundingRate != null ? parseFloat(t.fundingRate || 0) * 100 : null;
-                  const frInt = t.fundingIntervalHour ? parseInt(t.fundingIntervalHour, 10) * 3600000 : 8 * 3600000;
-                  tickMap[sym] = price;
-                  if (fr != null) this._klineCache[`fr_${sym}`] = { rate: fr, intervalMs: frInt, ts: now };
-                  _patch[sym] = { price, fr, frInterval: frInt, ts: now };
-                } catch { /* keep last known mark for this symbol */ }
+                  const _tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+                  const _td = await _tr.json();
+                  const _t  = (_td && _td.retCode === 0) ? _td.result?.list?.[0] : null;
+                  if (_t) {
+                    const _lp = parseFloat(_t.lastPrice || 0);
+                    if (_lp > 0) {
+                      const _moved = _st.lastPrice > 0 ? Math.abs(_lp - _st.lastPrice) / _st.lastPrice : 1;
+                      _st.currentInterval = _moved < 0.001 ? Math.min(_st.currentInterval * 2, _maxMs) : _baseMs;
+                      _st.lastPrice = _lp;
+                    }
+                    const _fr    = _t.fundingRate != null ? parseFloat(_t.fundingRate || 0) * 100 : null;
+                    const _frInt = _t.fundingIntervalHour ? parseInt(_t.fundingIntervalHour, 10) * 3600000 : 8 * 3600000;
+                    if (_fr != null) this._klineCache[`fr_${sym}`] = { rate: _fr, intervalMs: _frInt, ts: now };
+                  }
+                } catch { /* keep last known mark */ }
+                _st.nextFetchAt = now + _st.currentInterval;
               }
-              if (Object.keys(_patch).length) this._sharedMerge('watchTickers', _patch);
+              if (_st.lastPrice > 0) tickMap[sym] = _st.lastPrice;
+            }
+          } else {
+            const missing = [];
+            for (const pos of this.positions) {
+              if (!pos._pseudo) continue;
+              const wt = wsTicker(pos.symbol);
+              if (wt) {
+                tickMap[pos.symbol] = parseFloat(wt.lastPrice || 0);
+                // WS tickers don't carry fundingIntervalHour — refresh the rate only when
+                // intervalMs is already cached, so the fr_ entry stays complete for calcFundingFee.
+                const prevFr = this._klineCache[`fr_${pos.symbol}`];
+                if (wt.fundingRate != null && prevFr?.intervalMs) {
+                  this._klineCache[`fr_${pos.symbol}`] = {
+                    rate: parseFloat(wt.fundingRate) * 100,
+                    intervalMs: prevFr.intervalMs,
+                    ts: now,
+                  };
+                }
+              } else {
+                missing.push(pos.symbol);
+              }
+            }
+            // REST fallback: per-symbol tickers for anything the WS hasn't covered yet
+            // Check shared watchTickers first — if partner fetched recently, adopt and skip REST round
+            if (missing.length) {
+              const _sw = this._sharedRead('watchTickers');
+              const _swFresh = _sw && (now - (_sw.ts || 0)) < TICKER_THROTTLE_MS;
+              if (_swFresh) {
+                this._lastTickerFetch = _sw.ts;
+                for (const sym of missing) {
+                  const e = _sw.data?.[sym];
+                  if (e) {
+                    tickMap[sym] = e.price;
+                    if (e.fr != null) this._klineCache[`fr_${sym}`] = { rate: e.fr, intervalMs: e.frInterval ?? 8*3600000, ts: _sw.ts };
+                  }
+                }
+              } else if (tickerStale) {
+                this._lastTickerFetch = now;
+                const _patch = {};
+                for (const sym of missing) {
+                  try {
+                    const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+                    const td = await tr.json();
+                    const t = (td && td.retCode === 0) ? td.result?.list?.[0] : null;
+                    if (!t) continue;
+                    const price = parseFloat(t.lastPrice || 0);
+                    const fr    = t.fundingRate != null ? parseFloat(t.fundingRate || 0) * 100 : null;
+                    const frInt = t.fundingIntervalHour ? parseInt(t.fundingIntervalHour, 10) * 3600000 : 8 * 3600000;
+                    tickMap[sym] = price;
+                    if (fr != null) this._klineCache[`fr_${sym}`] = { rate: fr, intervalMs: frInt, ts: now };
+                    _patch[sym] = { price, fr, frInterval: frInt, ts: now };
+                  } catch { /* keep last known mark for this symbol */ }
+                }
+                if (Object.keys(_patch).length) this._sharedMerge('watchTickers', _patch);
+              }
             }
           }
           this._lastTickerMap = { ...(this._lastTickerMap || {}), ...tickMap }; // shared with ftWatchPositions

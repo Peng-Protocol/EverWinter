@@ -66,6 +66,8 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Runtime Limit** (`runtimeHours`) | Maximum position age. Forces a close at the deadline if TP hasn't been hit. |
 | **TP Reduce** (`tpReduceMins`) | Minutes before the runtime deadline when TP is tightened to improve close probability. |
 | **Symbol Banlist** (`banlistEnabled`) | When on, symbols on the ban list are excluded from all scans. Entries expire after 7 days. |
+| **Position Price Feed** (`restPollEnabled`) | When on, replaces the WebSocket price stream for open positions with periodic REST API calls. Use if the WS feed returns stale or incorrect prices. Off by default. |
+| **Price Poll Interval** (`restPollBaseSec`) | Base polling interval in seconds for REST mode. The interval doubles automatically when price moves less than 0.1% between ticks and resets to base on any meaningful move. |
 | **Config Lock** (`cfgLocked`) | Locks all config controls to prevent accidental changes while the bot is running. |
 
 ---
@@ -156,7 +158,7 @@ Depth gate: `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. 
 | **Sacrifice %** (`miwSacrificePct`/`micSacrificePct`) | Collective uLoss trigger as a % of average entry margin. |
 | **Rolling Sacrifice** (`miwRollingSacrificeEnabled`/`micRollingSacrificeEnabled`) | When on, Sacrifice closes only the oldest MIW/MIC position at a time instead of all at once. |
 | **Fade Away** (`miwFadeAwayEnabled`/`micFadeAwayEnabled`) | Closes the oldest MIW/MIC position when the majority of scanned 1h candles are moving against the position direction. |
-| **Fade Away %** (`miwFadeAwayPct`/`micFadeAwayPct`) | Directional majority threshold. At 50%, more than half the sampled candles must be adverse to trigger. |
+| **Fade Away %** (`miwFadeAwayPct`/`micFadeAwayPct`) | Directional majority threshold based on aggregate % change per side. At 50%, the adverse side must account for at least half of the total sampled movement — a single large candle outweighs many small ones. |
 | **Liq Fade Away** (`miwLiqFadeEnabled`/`micLiqFadeEnabled`) | Closes the oldest position when liquidation flow is adverse AND the scorecard confirms that signal has historically lost. Both conditions must hold. |
 | **Liq Fade %** (`miwLiqFadePct`/`micLiqFadePct`) | Adverse liq dominance threshold for Liq Fade Away. |
 | **Liq Block Entries** (`miwLiqFadeBlockEntries`/`micLiqFadeBlockEntries`) | When on, new entries are also blocked while the adverse liq signal is active. |
@@ -192,8 +194,8 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **PLK Trigger Score** (`permafrostPlkScore`/`ashfallPlkScore`) | How hostile the climate must be (−0.05 to −0.50) to engage a preemptive lock. More negative = harder to trigger. |
 | **IO Sentiment** | Includes funding rate sentiment (which side is paying) in the climate score. |
 | **Slot Scorecard** (`permafrostScorecardEnabled`/`ashfallScorecardEnabled`) | Records realized PnL per MIW/MIC criteria combination. Shows which slot types have been profitable or losing over time. |
-| **Auto Block** (`permafrostAutoBlock`/`ashfallAutoBlock`) | Automatically blocks losing slot combinations in the MIW/MIC entry filter based on scorecard history. |
-| **Block Threshold** (`permafrostSlotLossThreshold`/`ashfallSlotLossThreshold`) | Total loss (as a fraction of entry margin) a slot must accumulate before being blocked. |
+| **Auto Block** (`permafrostAutoBlock`/`ashfallAutoBlock`) | Automatically blocks slot combinations that have accumulated too many losses. A slot is blocked when own losses OR partner wins independently exceed the threshold — a coin-flip slot that breaks even overall can still be blocked if one side is consistently losing. |
+| **Block Threshold** (`permafrostSlotLossThreshold`/`ashfallSlotLossThreshold`) | Loss threshold (as a fraction of entry margin) applied independently to own-side gross losses and partner-side gross wins. Wins never offset losses — a slot that loses $1 and wins $0.90 is still blocked by the loss side alone. Raising Min Notional raises the threshold proportionally, which can naturally unblock slots without clearing the scorecard. |
 | **Cross Broadcast** (`permafrostCrossEnabled`/`ashfallCrossEnabled`) | Writes cascade/sacrifice closes and drawdown halt/gains-lock transitions to a shared log that the partner bot can read. Required for Mutual DDH Lift. |
 | **Mutual DDH Lift** (`permafrostMutualDdLiftEnabled`/`ashfallMutualDdLiftEnabled`) | When both bots are simultaneously in drawdown halt, lifts this bot's halt. Checked every 15 s. Requires Cross Broadcast to be on. |
 | **Liquidation Surveillance** (`pfLiqEnabled`/`ashLiqEnabled`) | Opens WebSocket connections to track live liquidation flow across a rolling sample of volatile tickers. Required for `sliq`/`bliq` criteria in MIW/MIC. |
@@ -206,7 +208,11 @@ Shows the current climate reading (magnitude, breadth, slope, IO score, effectiv
 
 ### Slot Scorecard
 
-Chip row sorted by total PnL. Each chip shows the criteria emoji string, net PnL in bold, and win/loss count. Partner bot data is included with PnL inverted — a Winter win implies a Chaser loss and counts against the Chaser scorecard. **CLEAR** wipes all records and resets all auto-blocks.
+Chip row showing each criteria combination with its net PnL in bold and win/loss count. Blocked slots render in purple. The **Combined / Own** toggle at the bottom switches between two views: Combined includes partner bot trades with PnL inverted (a Winter win counts against Chaser's scorecard) sorted by blended total; Own shows and sorts by this bot's own trades only.
+
+**Clicking a chip** reveals the gross figure that drives the block decision — in Combined mode this shows the raw partner win total; in Own mode it shows the raw own loss total. Clicking again or switching sort mode returns to the normal view. Auto-block decisions always use the full split data regardless of which view is active.
+
+**CLEAR** wipes all records and resets all auto-blocks.
 
 ### Liquidation Feed
 

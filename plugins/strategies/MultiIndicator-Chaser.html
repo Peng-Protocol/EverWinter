@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.12.1';
+  const VERSION       = '1.13.2';
   const DEFAULT_SLOTS = [['-fund','+24h','>10pct'],['+fund','-24h','<10pct']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -587,25 +587,26 @@
             // Normal scan path — use cached klines from this cycle
             faCache = this._micKlineCache || {};
           }
-          let red = 0, green = 0;
+          let bearSum = 0, bullSum = 0;
           for (const e of Object.values(faCache)) {
-            if (e.candleStart !== lastHourStart) continue;
-            if (e.close < e.open) red++;
-            else if (e.close > e.open) green++;
+            if (e.candleStart !== lastHourStart || !e.open) continue;
+            const pct = (e.close - e.open) / e.open * 100;
+            if (pct < 0) bearSum += -pct;
+            else if (pct > 0) bullSum += pct;
           }
-          const total = red + green;
+          const total = bearSum + bullSum;
           if (!total) return;
           const threshold = (this.cfg.micFadeAwayPct ?? 50) / 100;
-          if (red / total >= threshold) {
+          if (bearSum / total >= threshold) {
             if (this.cfg.micFadeAwayBlockEntries) this._micStructureBlocked = true;
             const oldest = micPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
-            this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G (${(red / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}${this.cfg.micFadeAwayBlockEntries ? ' | entries blocked' : ''}`, 'info');
+            this.log(`[MIC] 🌬 Fade Away — bear:${bearSum.toFixed(1)}% bull:${bullSum.toFixed(1)}% (${(bearSum / total * 100).toFixed(0)}% bearish ≥ ${this.cfg.micFadeAwayPct ?? 50}%) — closing oldest: ${oldest.symbol}${this.cfg.micFadeAwayBlockEntries ? ' | entries blocked' : ''}`, 'info');
             await this.pseudoClosePosition(oldest, 'sacrifice');
           } else {
             if (this._micStructureBlocked) this.log('[MIC] 🌬 Entry block lifted — structure recovered', 'info');
             this._micStructureBlocked = false;
             this._micFadeAwayLocked = true;
-            this.log(`[MIC] 🌬 Fade Away — ${red}R/${green}G — structure ok, locked until next scan`, 'info');
+            this.log(`[MIC] 🌬 Fade Away — bear:${bearSum.toFixed(1)}% bull:${bullSum.toFixed(1)}% — structure ok, locked until next scan`, 'info');
           }
         },
 
@@ -690,6 +691,9 @@
           const freshAt = this._lastAllTickersAt || 0;
           if (!freshAt || freshAt === this._micLastActedAt) return;
 
+          // Rebuild block state from scorecard immediately before any slot or pool decisions
+          this._afScoreBuild?.();
+
           // Non-blocked entry slots
           const slots = this._micEffectiveSlots();
 
@@ -737,6 +741,12 @@
             && !((this._micSlotGraylist[t.symbol] ?? 0) > 0 && _glNow - this._micSlotGraylist[t.symbol] < _slTtl)
             && (!this.cfg.micRequireLiqData || _liqFresh(t.symbol))
           );
+
+          if (!basePool.length && this.cfg.micRequireLiqData && !Object.keys(_allLiqResults).length) {
+            this._micLastActedAt = freshAt;
+            this.log('[MIC] 💡 No pool — liq surveillance has no samples yet; waiting for first cycle (~1h)', 'warn');
+            return;
+          }
 
           // Resolve market caps for vol/mcap criteria if any slot requires them.
           const mcapMap = {};
@@ -899,6 +909,13 @@
           const sym   = t.symbol;
           let price = parseFloat(t.lastPrice || 0);
           if (!price) return false;
+          const slotKey = [...(criteria || [])].sort().join(',');
+          if (slotKey && (this.micBlockedSlots || {})[slotKey] === 'blocked') {
+            this._micSlotGraylist = this._micSlotGraylist || {};
+            this._micSlotGraylist[sym] = Date.now();
+            this.log(`[MIC] ⛔ Blocked slot at open — graylisting ${sym} 6h`, 'warn');
+            return false;
+          }
           try {
             const r  = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
             const d  = await r.json();
