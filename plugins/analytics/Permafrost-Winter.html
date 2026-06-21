@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.19.0';
+  const VERSION        = '1.20.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -220,6 +220,9 @@
                 </span>
               </div>
               <div x-html="_pfScorecardHtml()" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+              <div style="margin-top:5px;display:flex;justify-content:flex-end">
+                <button @click="pfScorecardView = pfScorecardView === 'combined' ? 'own' : 'combined'" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(96,210,255,.3);background:rgba(96,210,255,.06);color:rgba(96,210,255,.8);cursor:pointer;letter-spacing:.5px" x-text="pfScorecardView === 'own' ? 'Own' : 'Combined'"></button>
+              </div>
             </div>
             <div x-show="cfg.permafrostEnabled" style="margin-top:8px">
               <div class="g" style="margin-top:10px">
@@ -339,6 +342,7 @@
         pfPnl:        [],   // { ts, pnl } — plugin-owned closed-trade log for sample labeling
         pfWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
         pfScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
+        pfScorecardView: 'combined', // 'combined' | 'own'
         pfKlineBar:   { red: 0, green: 0, max: 50 }, // last-cycle kline close direction counts
         _pfKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
         _pfStructureList: null, _pfStructureAt: 0, // own 3h ticker cache independent of host
@@ -694,12 +698,18 @@
           for (const r of records) {
             if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
             const key = [...r.criteria].sort().join(',');
-            if (!map[key]) map[key] = { criteria: r.criteria, totalPnl: 0, wins: 0, losses: 0 };
+            if (!map[key]) map[key] = { criteria: r.criteria, ownPnl: 0, ownWins: 0, ownLosses: 0, partnerPnl: 0, partnerWins: 0, partnerLosses: 0 };
             const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
-            const ownPnl = r.source === 'winter' ? pnl : -pnl;
-            map[key].totalPnl += ownPnl;
-            if (ownPnl > 0) map[key].wins++; else map[key].losses++;
+            if (r.source === 'winter') {
+              map[key].ownPnl += pnl;
+              if (pnl > 0) map[key].ownWins++; else map[key].ownLosses++;
+            } else {
+              const inv = -pnl;
+              map[key].partnerPnl += inv;
+              if (inv > 0) map[key].partnerWins++; else map[key].partnerLosses++;
+            }
           }
+          for (const s of Object.values(map)) s.totalPnl = s.ownPnl + s.partnerPnl;
           this.pfScoreboard = Object.values(map).sort((a, b) => b.totalPnl - a.totalPnl);
           if (this.cfg.permafrostAutoBlock) {
             const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
@@ -707,7 +717,7 @@
             const blocks = {};
             for (const s of this.pfScoreboard) {
               const key = [...s.criteria].sort().join(',');
-              if (s.totalPnl <= -lossThresh) blocks[key] = 'blocked';
+              if (s.ownPnl <= -lossThresh || s.partnerPnl <= -lossThresh) blocks[key] = 'blocked';
             }
             this.miwBlockedSlots = blocks;
           } else {
@@ -722,14 +732,19 @@
         },
         _pfScorecardHtml() {
           if (!this.pfScoreboard.length) return '<span style="font-size:9px;color:var(--text-lo)">No MIW closes recorded yet.</span>';
-          return this.pfScoreboard.map(s => {
+          const own = (this.pfScorecardView || 'combined') === 'own';
+          const sorted = own ? [...this.pfScoreboard].sort((a, b) => b.ownPnl - a.ownPnl) : this.pfScoreboard;
+          return sorted.map(s => {
+            const val    = own ? s.ownPnl : s.totalPnl;
+            const wins   = own ? s.ownWins   : s.ownWins   + s.partnerWins;
+            const losses = own ? s.ownLosses : s.ownLosses + s.partnerLosses;
             const emoji = s.criteria.map(c => /^sliq/.test(c) ? '🥵' + c.slice(4) : /^bliq/.test(c) ? '🥶' + c.slice(4) : (PF_CRIT_EMOJI[c] || c)).join('');
-            const clr = s.totalPnl > 0 ? 'rgba(100,220,150,.9)' : s.totalPnl < 0 ? 'var(--short)' : 'var(--text-lo)';
-            const bg  = s.totalPnl > 0 ? 'rgba(100,220,150,.08)' : s.totalPnl < 0 ? 'rgba(255,80,80,.08)' : 'rgba(255,255,255,.04)';
-            const bdr = s.totalPnl > 0 ? 'rgba(100,220,150,.35)' : s.totalPnl < 0 ? 'rgba(255,80,80,.35)' : 'rgba(255,255,255,.12)';
-            const pnlStr = (s.totalPnl >= 0 ? '+$' : '-$') + Math.abs(s.totalPnl).toFixed(2);
+            const clr = val > 0 ? 'rgba(100,220,150,.9)' : val < 0 ? 'var(--short)' : 'var(--text-lo)';
+            const bg  = val > 0 ? 'rgba(100,220,150,.08)' : val < 0 ? 'rgba(255,80,80,.08)' : 'rgba(255,255,255,.04)';
+            const bdr = val > 0 ? 'rgba(100,220,150,.35)' : val < 0 ? 'rgba(255,80,80,.35)' : 'rgba(255,255,255,.12)';
+            const pnlStr = (val >= 0 ? '+$' : '-$') + Math.abs(val).toFixed(2);
             const title = s.criteria.join(' + ');
-            return `<span title="${title}" style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${emoji || '?'} <b>${pnlStr}</b> <span style="opacity:.55;font-size:8px">${s.wins}W ${s.losses}L</span></span>`;
+            return `<span title="${title}" style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${emoji || '?'} <b>${pnlStr}</b> <span style="opacity:.55;font-size:8px">${wins}W ${losses}L</span></span>`;
           }).join('');
         },
 
