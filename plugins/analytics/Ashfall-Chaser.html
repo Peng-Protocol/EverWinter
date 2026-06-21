@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.20.0';
+  const VERSION        = '1.21.0';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
@@ -217,17 +217,17 @@
                   IO <span x-text="afStatus.ioScore>=0?'+':''"></span><span x-text="(afStatus.ioScore??0).toFixed(2)"></span> — <span x-text="(afStatus.ioScore??0)>0.2?'crowd net long':(afStatus.ioScore??0)<-0.2?'crowd net short':'crowd neutral'"></span>
                 </div>
                 <div style="margin-top:10px">
-                  <div class="lbl">Structure Sampling <b x-text="afKlineBar.red > 0 || afKlineBar.green > 0 ? '🔴 '+afKlineBar.red+' · 🟢 '+afKlineBar.green+' · of '+afKlineBar.max : '—'"></b></div>
+                  <div class="lbl">Structure Sampling <b x-text="afKlineBar.bearSum > 0 || afKlineBar.bullSum > 0 ? '🔴 '+afKlineBar.bearSum.toFixed(1)+'% · 🟢 '+afKlineBar.bullSum.toFixed(1)+'%' : '—'"></b></div>
                   <div style="display:flex;height:14px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
                     <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,80,80,.04)">
-                      <div :style="'width:'+Math.min(100,afKlineBar.red/afKlineBar.max*100)+'%;background:rgba(255,80,80,.55)'"></div>
+                      <div :style="'width:'+(afKlineBar.bearSum+afKlineBar.bullSum>0?Math.min(100,afKlineBar.bearSum/(afKlineBar.bearSum+afKlineBar.bullSum)*100):0)+'%;background:rgba(255,80,80,.55)'"></div>
                     </div>
                     <div style="width:1px;background:rgba(255,255,255,.18);flex-shrink:0"></div>
                     <div style="flex:1;display:flex;justify-content:flex-start;background:rgba(100,220,150,.04)">
-                      <div :style="'width:'+Math.min(100,afKlineBar.green/afKlineBar.max*100)+'%;background:rgba(100,220,150,.55)'"></div>
+                      <div :style="'width:'+(afKlineBar.bearSum+afKlineBar.bullSum>0?Math.min(100,afKlineBar.bullSum/(afKlineBar.bearSum+afKlineBar.bullSum)*100):0)+'%;background:rgba(100,220,150,.55)'"></div>
                     </div>
                   </div>
-                  <div class="ash-hint" style="margin-top:2px">1h candle close direction — last kline sample. Red ← bears · bulls → Green.</div>
+                  <div class="ash-hint" style="margin-top:2px">1h candle aggregate % change — last kline sample. Red ← bears · bulls → Green.</div>
                 </div>
               </div>
             </div>
@@ -322,7 +322,7 @@
         afWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
         afScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
         afScorecardView: 'combined', // 'combined' | 'own'
-        afKlineBar:   { red: 0, green: 0, max: 50 }, // last-cycle kline close direction counts
+        afKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // last-cycle aggregate % change sums
         _afKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
         _afStructureList: null, _afStructureAt: 0, // own 3h ticker cache independent of host
         afStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
@@ -589,19 +589,20 @@
           // Piggyback on MIC's cache when it's populated for the right hour
           const cache = this._micKlineCache;
           if (cache && Object.keys(cache).length > 0) {
-            let red = 0, green = 0;
+            let bearSum = 0, bullSum = 0;
             for (const e of Object.values(cache)) {
-              if (e.candleStart !== lastHourStart) continue;
-              if (e.close < e.open) red++;
-              else if (e.close > e.open) green++;
+              if (e.candleStart !== lastHourStart || !e.open) continue;
+              const pct = (e.close - e.open) / e.open * 100;
+              if (pct < 0) bearSum += -pct;
+              else if (pct > 0) bullSum += pct;
             }
-            if (red > 0 || green > 0) {
-              this.afKlineBar = { red, green, max: this.cfg.micKlineScanCap ?? 50 };
+            if (bearSum > 0 || bullSum > 0) {
+              this.afKlineBar = { bearSum, bullSum, max: this.cfg.micKlineScanCap ?? 50 };
               return;
             }
           }
           // MIC didn't fetch klines this cycle — own sample, cached per completed hourly candle
-          if (this._afKlineBarAt === lastHourStart && (this.afKlineBar.red > 0 || this.afKlineBar.green > 0)) return;
+          if (this._afKlineBarAt === lastHourStart && (this.afKlineBar.bearSum > 0 || this.afKlineBar.bullSum > 0)) return;
           try {
             const allTickers = this._lastAllTickers || [];
             const cap = this.cfg.micKlineScanCap ?? 50;
@@ -614,7 +615,7 @@
               [syms[i], syms[j]] = [syms[j], syms[i]];
             }
             syms = syms.slice(0, cap);
-            let red = 0, green = 0;
+            let bearSum = 0, bullSum = 0;
             await Promise.all(syms.map(async sym => {
               try {
                 const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
@@ -625,12 +626,14 @@
                 const candle = list[1];
                 if (parseInt(candle[0]) !== lastHourStart) return;
                 const open = parseFloat(candle[1]), close = parseFloat(candle[4]);
-                if (close < open) red++;
-                else if (close > open) green++;
+                if (!open) return;
+                const pct = (close - open) / open * 100;
+                if (pct < 0) bearSum += -pct;
+                else if (pct > 0) bullSum += pct;
               } catch(e) {}
             }));
             this._afKlineBarAt = lastHourStart;
-            this.afKlineBar = { red, green, max: cap };
+            this.afKlineBar = { bearSum, bullSum, max: cap };
           } catch(e) {}
         },
 
