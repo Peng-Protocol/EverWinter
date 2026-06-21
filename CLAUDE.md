@@ -29,7 +29,7 @@ Each file carries its version in two or three places — update **all** that app
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.12.1 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.12.1 |
 | `plugins/analytics/Permafrost-Winter.html` | v1.19.0 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.18.9 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.19.0 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
