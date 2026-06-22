@@ -23,14 +23,14 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.21.3';
+  const VERSION        = '1.21.4';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
   const SCORE_KEY      = '__everwinter_scorecard_v1';
-  const SCORE_TTL      = 30 * 24 * 3600 * 1000;
+  const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
   const AF_CRIT_EMOJI  = { '+fund': '💸', '-fund': '🤑', '+24h': '⬆️', '-24h': '⬇️', '>10pct': '🔊', '<10pct': '🔉', 'lsa': '🟥', 'lba': '🟩', 'rasl': '🔴', 'rabl': '🟢', 'sliq': '🥵', 'bliq': '🥶' };
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old burns fade
@@ -137,7 +137,12 @@
                 </div>
               </label>
               <div x-show="cfg.ashfallScorecardEnabled" style="margin-top:8px">
-                <label class="tog" @click.prevent="if(!cfgLocked){cfg.ashfallAutoBlock=!cfg.ashfallAutoBlock;_afScoreBuild();persist()}">
+                <div class="g">
+                  <div class="lbl">Sponge Quota <b x-text="cfg.afSpongeQuota??30"></b> closes/slot</div>
+                  <input type="range" min="10" max="200" step="10" x-model.number="cfg.afSpongeQuota" @change="_afScoreBuild();persist()">
+                  <div class="ash-hint">Max recent closes per slot used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation.</div>
+                </div>
+                <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ashfallAutoBlock=!cfg.ashfallAutoBlock;_afScoreBuild();persist()}">
                   <div class="tog-t" :class="cfg.ashfallAutoBlock?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Auto Block</div>
@@ -350,6 +355,7 @@
           if (this.cfg.ashfallScorecardEnabled           === undefined) this.cfg.ashfallScorecardEnabled           = false;
           if (this.cfg.ashfallAutoBlock                  === undefined) this.cfg.ashfallAutoBlock                  = false;
           if (this.cfg.ashfallSlotLossThreshold          === undefined) this.cfg.ashfallSlotLossThreshold          = 0.25;
+          if (this.cfg.afSpongeQuota                     === undefined) this.cfg.afSpongeQuota                     = 30;
           if (this.cfg.ashLiqEnabled      === undefined) this.cfg.ashLiqEnabled      = false;
           if (this.cfg.ashLiqBatchSize    === undefined) this.cfg.ashLiqBatchSize    = 25;
           if (this.cfg.ashLiqThresholdPct === undefined) this.cfg.ashLiqThresholdPct = 50;
@@ -642,7 +648,7 @@
           try {
             const raw = localStorage.getItem(SCORE_KEY);
             if (!raw) return [];
-            const cut = Date.now() - SCORE_TTL;
+            const cut = Date.now() - SCORE_SAFETY_TTL;
             return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
           } catch(e) { return []; }
         },
@@ -650,17 +656,32 @@
           try {
             const records = this._afScoreRead();
             records.push({ ts: Date.now(), criteria, pnl, source: 'chaser' });
-            localStorage.setItem(SCORE_KEY, JSON.stringify(records));
+            const quota = this.cfg.afSpongeQuota ?? 30;
+            const bySlot = {};
+            for (const r of records) {
+              const k = [...r.criteria].sort().join(',');
+              if (!bySlot[k]) bySlot[k] = [];
+              bySlot[k].push(r);
+            }
+            const trimmed = [];
+            for (const recs of Object.values(bySlot)) {
+              recs.sort((a, b) => b.ts - a.ts);
+              trimmed.push(...recs.slice(0, quota));
+            }
+            localStorage.setItem(SCORE_KEY, JSON.stringify(trimmed));
           } catch(e) {}
         },
         _afScoreBuild() {
           const records = this._afScoreRead();
           const exclude = new Set(this.cfg.micAutoSlotExclude || []);
+          const quota = this.cfg.afSpongeQuota ?? 30;
           const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
+          const slotCount = {};
           const map = {};
-          for (const r of records) {
+          for (const r of [...records].sort((a, b) => b.ts - a.ts)) {
             if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
             const key = [...r.criteria].sort().join(',');
+            if ((slotCount[key] = (slotCount[key] ?? 0) + 1) > quota) continue;
             if (!map[key]) map[key] = { criteria: r.criteria, ownPnl: 0, ownWins: 0, ownLosses: 0, ownLossSum: 0, partnerPnl: 0, partnerWins: 0, partnerLosses: 0, partnerWinSum: 0 };
             const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
             if (r.source === 'chaser') {

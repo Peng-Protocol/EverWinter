@@ -44,14 +44,14 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.21.3';
+  const VERSION        = '1.21.4';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
   const SCORE_KEY      = '__everwinter_scorecard_v1';
-  const SCORE_TTL      = 30 * 24 * 3600 * 1000;
+  const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
   const PF_CRIT_EMOJI  = { '+fund': '🤑', '-fund': '💸', '+24h': '⬆️', '-24h': '⬇️', '>10pct': '🔊', '<10pct': '🔉', 'lsa': '🟥', 'lba': '🟩', 'rasl': '🔴', 'rabl': '🟢', 'sliq': '🥵', 'bliq': '🥶' };
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old scars fade
@@ -158,7 +158,12 @@
                 </div>
               </label>
               <div x-show="cfg.permafrostScorecardEnabled" style="margin-top:8px">
-                <label class="tog" @click.prevent="if(!cfgLocked){cfg.permafrostAutoBlock=!cfg.permafrostAutoBlock;_pfScoreBuild();persist()}">
+                <div class="g">
+                  <div class="lbl">Sponge Quota <b x-text="cfg.pfSpongeQuota??30"></b> closes/slot</div>
+                  <input type="range" min="10" max="200" step="10" x-model.number="cfg.pfSpongeQuota" @change="_pfScoreBuild();persist()">
+                  <div class="pfr-hint">Max recent closes per slot used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation.</div>
+                </div>
+                <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.permafrostAutoBlock=!cfg.permafrostAutoBlock;_pfScoreBuild();persist()}">
                   <div class="tog-t" :class="cfg.permafrostAutoBlock?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Auto Block</div>
@@ -371,6 +376,7 @@
           if (this.cfg.permafrostScorecardEnabled        === undefined) this.cfg.permafrostScorecardEnabled        = false;
           if (this.cfg.permafrostAutoBlock               === undefined) this.cfg.permafrostAutoBlock               = false;
           if (this.cfg.permafrostSlotLossThreshold       === undefined) this.cfg.permafrostSlotLossThreshold       = 0.25;
+          if (this.cfg.pfSpongeQuota                     === undefined) this.cfg.pfSpongeQuota                     = 30;
           if (this.cfg.pfLiqEnabled      === undefined) this.cfg.pfLiqEnabled      = false;
           if (this.cfg.pfLiqBatchSize    === undefined) this.cfg.pfLiqBatchSize    = 25;
           if (this.cfg.pfLiqThresholdPct === undefined) this.cfg.pfLiqThresholdPct = 50;
@@ -683,7 +689,7 @@
           try {
             const raw = localStorage.getItem(SCORE_KEY);
             if (!raw) return [];
-            const cut = Date.now() - SCORE_TTL;
+            const cut = Date.now() - SCORE_SAFETY_TTL;
             return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
           } catch(e) { return []; }
         },
@@ -691,17 +697,32 @@
           try {
             const records = this._pfScoreRead();
             records.push({ ts: Date.now(), criteria, pnl, source: 'winter' });
-            localStorage.setItem(SCORE_KEY, JSON.stringify(records));
+            const quota = this.cfg.pfSpongeQuota ?? 30;
+            const bySlot = {};
+            for (const r of records) {
+              const k = [...r.criteria].sort().join(',');
+              if (!bySlot[k]) bySlot[k] = [];
+              bySlot[k].push(r);
+            }
+            const trimmed = [];
+            for (const recs of Object.values(bySlot)) {
+              recs.sort((a, b) => b.ts - a.ts);
+              trimmed.push(...recs.slice(0, quota));
+            }
+            localStorage.setItem(SCORE_KEY, JSON.stringify(trimmed));
           } catch(e) {}
         },
         _pfScoreBuild() {
           const records = this._pfScoreRead();
           const exclude = new Set(this.cfg.miwAutoSlotExclude || []);
+          const quota = this.cfg.pfSpongeQuota ?? 30;
           const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
+          const slotCount = {};
           const map = {};
-          for (const r of records) {
+          for (const r of [...records].sort((a, b) => b.ts - a.ts)) {
             if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
             const key = [...r.criteria].sort().join(',');
+            if ((slotCount[key] = (slotCount[key] ?? 0) + 1) > quota) continue;
             if (!map[key]) map[key] = { criteria: r.criteria, ownPnl: 0, ownWins: 0, ownLosses: 0, ownLossSum: 0, partnerPnl: 0, partnerWins: 0, partnerLosses: 0, partnerWinSum: 0 };
             const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
             if (r.source === 'winter') {
