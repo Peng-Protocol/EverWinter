@@ -157,6 +157,8 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Share Cap %** (`miwShareCapPct`/`micShareCapPct`) | The cap percentage. At 50% with maxPos=6, MIW/MIC can hold at most 3 positions. |
 | **Kline Scan Cap** (`miwKlineScanCap`/`micKlineScanCap`) | Max tickers sampled per cycle for kline-based criteria (lsa/lba/rasl/rabl) fetches. Higher = broader coverage, more API calls. |
 | **V/M Scan Cap** (`miwMcapScanCap`/`micMcapScanCap`) | Max tickers for which CoinGecko market cap is fetched per scan cycle. Tickers are pre-screened by fund rate and 24h direction before the cap is applied, so only genuine candidates count against it. Bounding this keeps the CG request small and prevents failed fetches from leaving stale market cap data in the pool. Default 50. |
+| **Fresh V/M Only** (`miwRequireMcapData`/`micRequireMcapData`) | When on, `vm` and `iom` criteria only pass for tickers whose market cap was retrieved from CoinGecko within the freshness window this cycle. Prevents stale or bad cached market cap data from producing unrealistically high V/M values. Off by default. |
+| **V/M Freshness** (`miwMcapFreshCycles`/`micMcapFreshCycles`) | How many scan cycles old a CoinGecko mcap fetch can be before it is treated as stale for Fresh V/M Only. Default 6. Only visible when Fresh V/M Only is on. |
 | **Fund Step** (`miwFundStep`/`micFundStep`) | Tier step size for `fund` criteria in % of funding rate. Default 0.25 — one tier per 0.25% FR. At this step, `fund>1` requires FR ≥ 0.25%. |
 | **V/M Step** (`miwVmStep`/`micVmStep`) | Tier step size for `vm` criteria in % of volume/market cap ratio. Default 1. `vm>10` at step 1 requires V/M ≥ 10%. |
 | **Spike Step** (`miwSpikeStep`/`micSpikeStep`) | Tier step size for `lsa`, `lba`, `rasl`, and `rabl` in % above or below the 24h hourly average. Default 1. `lsa>25` at step 1 requires volume ≥ 25% above average. |
@@ -210,6 +212,7 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Cross Broadcast** (`permafrostCrossEnabled`/`ashfallCrossEnabled`) | Writes cascade/sacrifice closes and drawdown halt/gains-lock transitions to a shared log that the partner bot can read. Required for Mutual DDH Lift. |
 | **Mutual DDH Lift** (`permafrostMutualDdLiftEnabled`/`ashfallMutualDdLiftEnabled`) | When both bots are simultaneously in drawdown halt, lifts this bot's halt. Checked every 15 s. Requires Cross Broadcast to be on. |
 | **Stale Slot Purge** (`pfStaleSlotDays`/`afStaleSlotDays`) | Slots with no new close in this many days are fully removed from the scorecard on the next trim. Keeps the scorecard clean when criteria combinations fall out of use. Default 7, configurable 1–90 days. |
+| **Collapsed Ranks** (`pfCollapsedRanks`/`afCollapsedRanks`) | When on, the scorecard aggregates by individual criterion instead of full slot combination — tiers are stripped and PnL pools across every slot that contained each criterion. Also switches slot ordering in MIW/MIC: slots are ranked by the sum of their constituent criteria scores rather than the slot's own history. Useful when Auto Slots generates too many distinct combinations for per-slot records to carry statistical weight. |
 | **Liquidation Surveillance** (`pfLiqEnabled`/`ashLiqEnabled`) | Opens WebSocket connections to track live liquidation flow across a rolling sample of volatile tickers. Required for `sliq`/`bliq` criteria in MIW/MIC. |
 | **Liq Batch Size** (`pfLiqBatchSize`/`ashLiqBatchSize`) | Tickers per liquidation batch (5–50). More tickers = broader market coverage per cycle. |
 | **Liq Threshold %** (`pfLiqThresholdPct`/`ashLiqThresholdPct`) | Minimum share of a cycle's total liquidation turnover one side must hold to qualify (10–90%). At 50%, one side must account for at least half. |
@@ -220,7 +223,11 @@ Shows the current climate reading (magnitude, breadth, slope, IO score, effectiv
 
 ### Slot Scorecard
 
-Chip row showing each criteria combination with its net PnL in bold and win/loss count. Each close writes one record; the Sponge Quota controls how many recent records per slot are factored in, so scores always reflect the most recent N closes. Blocked slots render in purple. The **Combined / Own** toggle at the bottom switches between two views: Combined includes partner bot trades with PnL inverted (a Winter win counts against Chaser's scorecard) sorted by blended total; Own shows and sorts by this bot's own trades only.
+Chip row showing each criteria combination with its net PnL in bold and win/loss count. Each close writes one record; the Sponge Quota controls how many recent records per slot are factored in, so scores always reflect the most recent N closes. Blocked slots render in purple. Two toggles at the bottom right control the view:
+
+The **Tiered / Collapsed** toggle switches the chip row between per-slot and per-criterion views. In Collapsed mode, one chip appears per base criterion (e.g. `fund>`, `vm>`, `+24h`) with PnL pooled across all slots that contained it. This also changes how MIW/MIC orders its entry queue — slots are ranked by the sum of their individual criteria scores rather than the slot's own record.
+
+The **Combined / Own** toggle switches between: Combined (includes partner bot trades, PnL inverted) sorted by blended total; and Own (this bot's trades only).
 
 **Clicking a chip** reveals the gross figure that drives the block decision — in Combined mode this shows the raw partner win total; in Own mode it shows the raw own loss total. Clicking again or switching sort mode returns to the normal view. Auto-block decisions always use the full split data regardless of which view is active.
 
