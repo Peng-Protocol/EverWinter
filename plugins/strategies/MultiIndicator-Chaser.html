@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.15.3';
+  const VERSION       = '1.16.0';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -318,6 +318,13 @@
                       <div class="mic-hint">Only considers tickers with a fresh liquidation surveillance result. Requires Liquidation Surveillance in Ashfall. Adds ~1h startup delay. Staleness limit: Liq Result Max Age (Fade tab).</div>
                     </div>
                   </label>
+                  <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.micRequireMcapData=!cfg.micRequireMcapData;persist()}">
+                    <div class="tog-t" :class="cfg.micRequireMcapData?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Fresh V/M Only</div>
+                      <div class="mic-hint">V/M and OI/MCap criteria only pass if market cap was fetched this scan cycle. Rejects stale CoinGecko data.</div>
+                    </div>
+                  </label>
                 </div><!-- end entry slots section -->
               </div><!-- end entry zone -->
 
@@ -504,6 +511,7 @@
         _micLiqBlocked: false,
         _micLiqBias: null,
         _micSlotGraylist: {},
+        _micFreshMcapBases: null,
 
         async init() {
           await _origInit.call(this);
@@ -539,6 +547,8 @@
           if (this.cfg.micLiqFadeBlockEntries    === undefined) this.cfg.micLiqFadeBlockEntries    = false;
           if (this.cfg.micLiqResultMaxCycles   === undefined) this.cfg.micLiqResultMaxCycles   = 2;
           if (this.cfg.micRequireLiqData       === undefined) this.cfg.micRequireLiqData       = false;
+          if (this.cfg.micRequireMcapData      === undefined) this.cfg.micRequireMcapData      = false;
+          this._micFreshMcapBases    = null;
           this._micLiqBlocked        = false;
           this._micLiqBias           = null;
           if (this.cfg.micAutoSlots                  === undefined) this.cfg.micAutoSlots                  = false;
@@ -909,7 +919,12 @@
             });
             if (mcapPool.length > mcapCap) mcapPool = mcapPool.slice(0, mcapCap);
             const bases = mcapPool.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
+            const _mcapCycleTs = Date.now();
             await this._micPrefetchMcaps(bases);
+            this._micFreshMcapBases = new Set(bases.filter(b => {
+              const id = this._micCoinIdCache?.[b];
+              return id && (this._micMcapCache?.[id]?.ts ?? 0) >= _mcapCycleTs;
+            }));
             for (const t of mcapPool) {
               const mcap = this._micGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase());
               if (mcap) mcapMap[t.symbol] = mcap;
@@ -941,6 +956,7 @@
             if (c === '-24h') return !is24hUp;
             if (/^vm/.test(c)) {
               if (ratio === null) return false;
+              if (this.cfg.micRequireMcapData && !this._micFreshMcapBases?.has(t.symbol.replace(/USDT$/i,'').toLowerCase())) return false;
               const step = this.cfg.micVmStep ?? 1;
               const tier = Math.floor(ratio * 100 / step);
               const m = c.match(/^vm([<>])(\d+)$/);
@@ -989,6 +1005,7 @@
               const oi = parseFloat(t.openInterestValue || 0);
               const mc = mcapMap[t.symbol];
               if (oi <= 0 || !mc || mc <= 0) return false;
+              if (this.cfg.micRequireMcapData && !this._micFreshMcapBases?.has(t.symbol.replace(/USDT$/i,'').toLowerCase())) return false;
               const step = this.cfg.micIomStep ?? 1;
               const tier = Math.floor(oi / mc * 100 / step);
               const iomM = c.match(/^iom([<>])(\d+)$/);
@@ -1203,13 +1220,7 @@
               }
             }
           }
-          const ids = [...new Set(
-            bases.map(b => this._micCoinIdCache[b]).filter(id => {
-              if (!id) return false;
-              const c = this._micMcapCache[id];
-              return !c || now - c.ts >= mcapTtl;
-            })
-          )];
+          const ids = [...new Set(bases.map(b => this._micCoinIdCache[b]).filter(id => !!id))];
           if (!ids.length) return;
           try {
             const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids.join(',')}&vs_currencies=usd&include_market_cap=true`);
