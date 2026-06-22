@@ -194,6 +194,7 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **PLK Trigger Score** (`permafrostPlkScore`/`ashfallPlkScore`) | How hostile the climate must be (−0.05 to −0.50) to engage a preemptive lock. More negative = harder to trigger. |
 | **IO Sentiment** | Includes funding rate sentiment (which side is paying) in the climate score. |
 | **Slot Scorecard** (`permafrostScorecardEnabled`/`ashfallScorecardEnabled`) | Records realized PnL per MIW/MIC criteria combination. Shows which slot types have been profitable or losing over time. |
+| **Sponge Quota** (`pfSpongeQuota`/`afSpongeQuota`) | How many recent closes per slot are used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation to recent performance; higher = more stable scores that smooth out short streaks. Default 30. |
 | **Auto Block** (`permafrostAutoBlock`/`ashfallAutoBlock`) | Automatically blocks slot combinations that have accumulated too many losses. A slot is blocked when own losses OR partner wins independently exceed the threshold — a coin-flip slot that breaks even overall can still be blocked if one side is consistently losing. |
 | **Block Threshold** (`permafrostSlotLossThreshold`/`ashfallSlotLossThreshold`) | Loss threshold (as a fraction of entry margin) applied independently to own-side gross losses and partner-side gross wins. Wins never offset losses — a slot that loses $1 and wins $0.90 is still blocked by the loss side alone. Raising Min Notional raises the threshold proportionally, which can naturally unblock slots without clearing the scorecard. |
 | **Cross Broadcast** (`permafrostCrossEnabled`/`ashfallCrossEnabled`) | Writes cascade/sacrifice closes and drawdown halt/gains-lock transitions to a shared log that the partner bot can read. Required for Mutual DDH Lift. |
@@ -208,7 +209,7 @@ Shows the current climate reading (magnitude, breadth, slope, IO score, effectiv
 
 ### Slot Scorecard
 
-Chip row showing each criteria combination with its net PnL in bold and win/loss count. Blocked slots render in purple. The **Combined / Own** toggle at the bottom switches between two views: Combined includes partner bot trades with PnL inverted (a Winter win counts against Chaser's scorecard) sorted by blended total; Own shows and sorts by this bot's own trades only.
+Chip row showing each criteria combination with its net PnL in bold and win/loss count. Each close writes one record; the Sponge Quota controls how many recent records per slot are factored in, so scores always reflect the most recent N closes. Blocked slots render in purple. The **Combined / Own** toggle at the bottom switches between two views: Combined includes partner bot trades with PnL inverted (a Winter win counts against Chaser's scorecard) sorted by blended total; Own shows and sorts by this bot's own trades only.
 
 **Clicking a chip** reveals the gross figure that drives the block decision — in Combined mode this shows the raw partner win total; in Own mode it shows the raw own loss total. Clicking again or switching sort mode returns to the normal view. Auto-block decisions always use the full split data regardless of which view is active.
 
@@ -243,7 +244,7 @@ Developer-level detail with no operational consequence. Included for reference.
 | `__ash_liq_batches` | Ashfall active liq batch snapshots |
 | `__permafrost_winter_v1` | Permafrost profile: events, samples, wave history |
 | `__ashfall_chaser_v1` | Ashfall profile |
-| `__everwinter_scorecard_v1` | Shared slot scorecard written by both plugins, 30-day TTL |
+| `__everwinter_scorecard_v1` | Shared slot scorecard written by both plugins. Each close is one record; each slot retains up to the Sponge Quota most recent records. |
 | `__cgCoinList` | CoinGecko coin list cache (24-hour TTL) |
 | `__ew_creds` | EverWinter live plugin API credentials |
 | `__sc_creds` | SunChaser live plugin API credentials |
