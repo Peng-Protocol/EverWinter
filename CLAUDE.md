@@ -62,3 +62,4 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 ## Pending Tasks
 
 - **ChartWinter mcap stale fix** — ChartWinter likely has the same large-pool CoinGecko staleness issue fixed in MIW/MIC v1.15.2. When working on ChartWinter, apply the same bounded topical prefetch pattern: pre-screen tickers by fast criteria (fund rate, 24h direction) before counting against a configurable scan cap. Delete this bullet once done.
+- **ChartWinter RSI toggle** — Add a toggle to disable RSI filtering in ChartWinter. Default off (RSI disabled). RSI is too flaky to be on by default. Delete this bullet once done.
