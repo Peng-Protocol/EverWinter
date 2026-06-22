@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.15.1';
+  const VERSION       = '1.15.2';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -269,6 +269,11 @@
                     <div class="lbl">Kline Scan Cap <b x-text="(cfg.miwKlineScanCap??50)"></b> tickers</div>
                     <input type="range" min="10" max="500" step="10" x-model.number="cfg.miwKlineScanCap" @change="persist()">
                     <div class="miw-hint">Random sample of tickers checked for kline criteria per cycle.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl">V/M Scan Cap <b x-text="(cfg.miwMcapScanCap??50)"></b> tickers</div>
+                    <input type="range" min="10" max="200" step="10" x-model.number="cfg.miwMcapScanCap" @change="persist()">
+                    <div class="miw-hint">Max tickers for CoinGecko market cap fetch per cycle. Pre-screened by fund rate and 24h direction first.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <div class="lbl" style="margin-bottom:4px">Tier Step Sizes</div>
@@ -519,6 +524,7 @@
           if (this.cfg.miwKlineVolMin      === undefined) this.cfg.miwKlineVolMin      = 25;
           if (this.cfg.miwKlineVolMax      === undefined) this.cfg.miwKlineVolMax      = 50;
           if (this.cfg.miwKlineScanCap     === undefined) this.cfg.miwKlineScanCap     = 50;
+          if (this.cfg.miwMcapScanCap      === undefined) this.cfg.miwMcapScanCap      = 50;
           if (this.cfg.miwHalvingEnabled   === undefined) this.cfg.miwHalvingEnabled   = false;
           if (this.cfg.miwHalvingHours     === undefined) this.cfg.miwHalvingHours     = 3;
           if (this.cfg.miwFadeAwayEnabled  === undefined) this.cfg.miwFadeAwayEnabled  = false;
@@ -886,11 +892,26 @@
           }
 
           // Resolve market caps for vol/mcap criteria if any slot requires them.
+          // Pre-screen to tickers that pass non-mcap fast criteria (fund, 24h) so the CG
+          // request stays small and bounded — large-pool fetches fail silently and leave stale data.
           const mcapMap = {};
           if (needsMcap) {
-            const bases = basePool.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
+            const mcapCap     = this.cfg.miwMcapScanCap ?? 50;
+            const fundStep_   = this.cfg.miwFundStep ?? 0.25;
+            const mcapSlots   = allSlots.filter(s => s.some(c => /^(vm|iom)/.test(c)));
+            const fastFilters = mcapSlots.map(s => s.filter(c => /^fund/.test(c) || c === '+24h' || c === '-24h'));
+            let mcapPool = basePool.filter(t => {
+              const fr_      = parseFloat(t.fundingRate || 0) * 100;
+              const is24hUp_ = parseFloat(t.price24hPcnt || 0) > 0;
+              return fastFilters.some(ff => !ff.length || ff.every(c => {
+                if (/^fund/.test(c)) { const tier_ = Math.floor(fr_ / fundStep_); const m_ = c.match(/^fund([<>])(-?\d+)$/); if (!m_) return true; return m_[1] === '>' ? tier_ >= parseInt(m_[2],10) : tier_ <= parseInt(m_[2],10); }
+                return c === '+24h' ? is24hUp_ : !is24hUp_;
+              }));
+            });
+            if (mcapPool.length > mcapCap) mcapPool = mcapPool.slice(0, mcapCap);
+            const bases = mcapPool.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
             await this._miwPrefetchMcaps(bases);
-            for (const t of basePool) {
+            for (const t of mcapPool) {
               const mcap = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase());
               if (mcap) mcapMap[t.symbol] = mcap;
             }

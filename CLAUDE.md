@@ -26,8 +26,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PseudoWinter.html` | v1.7.7 |
 | `PseudoChaser.html` | v1.3.8 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.15.1 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.15.1 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.15.2 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.15.2 |
 | `plugins/analytics/Permafrost-Winter.html` | v1.21.5 |
 | `plugins/analytics/Ashfall-Chaser.html` | v1.21.5 |
 
@@ -58,3 +58,7 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 - **Log behavioral corrections.** Whenever the user gives a behavioral correction or long-term instruction — signalled by phrases like "why didn't you…", "why are you…", "you should always…", "you should never…", or any direct criticism of approach — add the lesson to this file before finishing the response.
 - **Tooltip length.** In-app tooltips (hint text, x-text descriptions, title attributes) must be at most 3 phrases. Aim for 1.
 - **Never use `window.confirm()`, `window.alert()`, or `window.prompt()` in plugin or bot UI.** These are blocked when the app runs in an iframe, silently returning `false`/`undefined` and making buttons appear unresponsive with no feedback. Use inline Alpine confirmation UI instead: wrap the button in `<span x-data="{c:false}">`, show the action button when `!c`, and when clicked set `c=true` to reveal inline "Sure? Yes / No" buttons that execute the action or reset `c`.
+
+## Pending Tasks
+
+- **ChartWinter mcap stale fix** — ChartWinter likely has the same large-pool CoinGecko staleness issue fixed in MIW/MIC v1.15.2. When working on ChartWinter, apply the same bounded topical prefetch pattern: pre-screen tickers by fast criteria (fund rate, 24h direction) before counting against a configurable scan cap. Delete this bullet once done.

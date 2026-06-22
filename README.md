@@ -156,6 +156,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Share Cap** (`miwShareCapEnabled`/`micShareCapEnabled`) | Limits plugin entries to a percentage of `maxPos`. Prevents MIW/MIC from filling all position slots. |
 | **Share Cap %** (`miwShareCapPct`/`micShareCapPct`) | The cap percentage. At 50% with maxPos=6, MIW/MIC can hold at most 3 positions. |
 | **Kline Scan Cap** (`miwKlineScanCap`/`micKlineScanCap`) | Max tickers sampled per cycle for kline-based criteria (lsa/lba/rasl/rabl) fetches. Higher = broader coverage, more API calls. |
+| **V/M Scan Cap** (`miwMcapScanCap`/`micMcapScanCap`) | Max tickers for which CoinGecko market cap is fetched per scan cycle. Tickers are pre-screened by fund rate and 24h direction before the cap is applied, so only genuine candidates count against it. Bounding this keeps the CG request small and prevents failed fetches from leaving stale market cap data in the pool. Default 50. |
 | **Fund Step** (`miwFundStep`/`micFundStep`) | Tier step size for `fund` criteria in % of funding rate. Default 0.25 — one tier per 0.25% FR. At this step, `fund>1` requires FR ≥ 0.25%. |
 | **V/M Step** (`miwVmStep`/`micVmStep`) | Tier step size for `vm` criteria in % of volume/market cap ratio. Default 1. `vm>10` at step 1 requires V/M ≥ 10%. |
 | **Spike Step** (`miwSpikeStep`/`micSpikeStep`) | Tier step size for `lsa`, `lba`, `rasl`, and `rabl` in % above or below the 24h hourly average. Default 1. `lsa>25` at step 1 requires volume ≥ 25% above average. |
