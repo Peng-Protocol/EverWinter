@@ -87,12 +87,12 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 - **LBA (Buy Spike)** — The mirror: high volume in the configured range, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
 - **R-ASL (Quiet Red)** — The last completed hourly candle closed red and its volume was *below* the configured lower spike bound — the market moved down without a volume surge. Quiet, uncontested selling: no crowd participation, no obvious catalyst. Can signal a slow bleed or a low-conviction pullback that is easier to trade than a violent spike.
 - **R-ABL (Quiet Green)** — The mirror: a green candle with volume below the spike threshold. The market drifted up without conviction. Useful for entries where you expect a measured continuation rather than a sharp move.
-- **S-Liq (Sell-Liquidation)** — Short positions accounted for the majority of liquidation turnover in the cycle, above the configured threshold. Short liquidations are bullish — the market forced out the short side. Use this to confirm that the long case has real pressure behind it. An optional depth gate can additionally require the liq flow to be above or below a certain intensity relative to the ticker's typical hourly liq volume — use this to filter for unusually heavy or unusually light signals beyond the threshold.
+- **S-Liq (Sell-Liquidation)** — Short positions accounted for the majority of liquidation turnover in the cycle, above the configured threshold. Short liquidations are bullish — the market forced out the short side. Use this to confirm that the long case has real pressure behind it. An optional depth gate can additionally require the liq flow to be above or below a certain intensity relative to the ticker's typical hourly turnover — use this to filter for unusually heavy or unusually light signals beyond the threshold.
 - **B-Liq (Buy-Liquidation)** — Long positions accounted for the majority of liquidation turnover above the threshold. Long liquidations are bearish — the market forced out the long side. Use this to confirm that the short case has real pressure behind it. The same optional depth gate applies.
 
 **Building slots**: A slot containing only "+fund" behaves exactly like a fund-chasing filter. A slot containing "+24h" and ">10%" behaves like a momentum filter. A slot with all three — "+24h", ">10%", and "+fund" — requires momentum, participation, and a funding premium to align before opening. Adding "LSA" to a bearish slot demands that the last hourly candle confirm the move with volume. The building-block design lets you dial the filter from permissive to strict without changing the underlying logic.
 
-**Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 distinct slots. At size 3, 220 slots. Some criteria are inherently opposed and cannot coexist: +24h and -24h, +fund and -fund, LSA and LBA, R-ASL and R-ABL — and LSA/LBA are opposed to R-ASL/R-ABL. Auto-generated slots containing both sides of any pair will never see a position. Combined with auto-correction, this creates a self-pruning strategy: all valid combinations run, and the ones that consistently lose are disabled without manual intervention.
+**Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 distinct slots. At size 3, 220 slots. Some criteria are inherently opposed and cannot coexist: +24h and -24h, +fund and -fund, LSA and LBA, R-ASL and R-ABL — LSA/LBA are opposed to R-ASL/R-ABL. Auto-generated slots containing both sides of any pair will never see a position. Combined with auto-correction, this creates a self-pruning strategy: all valid combinations run, and the ones that consistently lose are disabled without manual intervention.
 
 ---
 
@@ -114,6 +114,16 @@ DCA is the core position rescue structure for reactive strategies. When price mo
 **TP ROI by Stage**: The entry ROI% is divided by the stage number — stage 0 gets the full target, stage 1 half, stage 2 one-third, and so on — floored at 3%.
 
 **Final stage**: A fill on the last add is itself an invalidation of the thesis. It exists as an emergency harness, not a planned outcome.
+
+---
+
+#### Add-Sizing Modes
+
+Two modes control each add's notional contribution:
+
+**Flat**: Every add equals the base notional. Predictable and conservative.
+
+**DCA Escalation (Martingale)**: Each add multiplies by a configurable factor (default ×2). Positions rescue much faster and average entry improves aggressively, but margin scales exponentially. For traders comfortable with heavy per-position commitment in exchange for faster exits.
 
 ---
 
