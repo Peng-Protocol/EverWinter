@@ -225,7 +225,7 @@ Shows the current climate reading (magnitude, breadth, slope, IO score, effectiv
 
 Chip row showing each criteria combination with its net PnL in bold and win/loss count. Each close writes one record; the Sponge Quota controls how many recent records per slot are factored in, so scores always reflect the most recent N closes. Blocked slots render in purple. Two toggles at the bottom right control the view:
 
-The **Tiered / Collapsed** toggle switches the chip row between per-slot and per-criterion views. In Collapsed mode, one chip appears per base criterion (e.g. `fund>`, `vm>`, `+24h`) with PnL pooled across all slots that contained it. This also changes how MIW/MIC orders its entry queue — slots are ranked by the sum of their individual criteria scores rather than the slot's own record.
+The **Tiered / Collapsed** toggle switches the chip row between per-slot and per-criterion views. In Collapsed mode, one chip appears per base criterion (e.g. `fund>`, `vm>`, `+24h`) with PnL pooled across all slots that contained it. This also changes how MIW/MIC orders its entry queue — slots are ranked by the sum of their individual criteria scores rather than the slot's own record. Scores are additive: a slot with one losing criterion and one winning criterion ranks by their combined total — the loser drags rank down but does not block the slot. Only the Auto Block threshold produces a hard block.
 
 The **Combined / Own** toggle switches between: Combined (includes partner bot trades, PnL inverted) sorted by blended total; and Own (this bot's trades only).
 
