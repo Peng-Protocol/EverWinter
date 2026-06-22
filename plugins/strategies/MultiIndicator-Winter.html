@@ -2,13 +2,19 @@
   Multi-Indicator Strategy Plugin for PseudoWinter
   Slot-based entry filter combining fund rate, 24hr price direction, and vol/mcap signals.
 
-  Each "slot" is an AND-condition over any combination of six criteria:
-    +fund  — funding rate ≥ threshold (longs paying shorts)
-    -fund  — funding rate ≤ −threshold (shorts paying longs)
+  Each "slot" is an AND-condition over any combination of twelve criteria:
+    fund   — tiered funding rate (fund>N longs paying, fund<-N shorts paying)
     +24h   — ticker's 24hr price change is positive
     -24h   — ticker's 24hr price change is negative
-    >10%   — 24hr turnover exceeds 10% of market cap (high participation)
-    <10%   — 24hr turnover is below 10% of market cap (low relative participation)
+    vm     — tiered vol/mcap ratio (vm>N high participation)
+    lsa    — tiered 1h sell spike above avg (lsa>N)
+    lba    — tiered 1h buy spike above avg (lba>N)
+    rasl   — tiered 1h low-vol red candle (rasl>N)
+    rabl   — tiered 1h low-vol green candle (rabl>N)
+    sliq   — sell-liquidation depth gate
+    bliq   — buy-liquidation depth gate
+    iot    — tiered OI vs Turnover ratio
+    iom    — tiered OI vs MCap ratio
 
   A ticker qualifies for entry if it satisfies ALL criteria in ANY slot. Slots that contain
   a vol/mcap criterion trigger a CoinGecko market cap lookup via the shared window.__cgCoinList
@@ -26,22 +32,55 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.13.2';
-  const DEFAULT_SLOTS = [['+fund','+24h','>10pct'],['-fund','-24h','<10pct']];
+  const VERSION       = '1.15.3';
+  const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
   // +fund = longs paying = good carry for shorts (🤑), bad for longs (💸).
   // -fund = shorts paying = bad for shorts (💸), good for longs (🤑).
-  const CRIT_EMOJI = { '+fund': '🤑', '-fund': '💸', '+24h': '⬆️', '-24h': '⬇️', '>10pct': '🔊', '<10pct': '🔉', 'lsa': '🟥', 'lba': '🟩', 'rasl': '🔴', 'rabl': '🟢', 'sliq': '🥵', 'bliq': '🥶' };
-  const CRIT_DESC  = { '+fund': '+fund (longs paying)', '-fund': '-fund (shorts paying)', '+24h': '+24h (up on day)', '-24h': '-24h (down on day)', '>10pct': '>10% vol/mcap', '<10pct': '<10% vol/mcap', 'lsa': 'LSA (1h sell spike)', 'lba': 'LBA (1h buy spike)', 'rasl': 'R-ASL (1h low-vol red)', 'rabl': 'R-ABL (1h low-vol green)', 'sliq': 'S-Liq (Sell-Liquidation: short positions liquidated ≥ threshold)', 'bliq': 'B-Liq (Buy-Liquidation: long positions liquidated ≥ threshold)' };
+  const CRIT_EMOJI = { '+24h': '⬆️', '-24h': '⬇️', 'fund': '💰', 'vm': '🔊', 'sliq': '🥵', 'bliq': '🥶', 'iot': '🎲', 'iom': '🧲' };
+  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', '+24h': '+24h (up on day)', '-24h': '-24h (down on day)', 'vm': 'V/M (vol/mcap ratio)', 'lsa': 'LSA (1h sell spike)', 'lba': 'LBA (1h buy spike)', 'rasl': 'R-ASL (1h low-vol red)', 'rabl': 'R-ABL (1h low-vol green)', 'sliq': 'S-Liq (Sell-Liquidation: short positions liquidated ≥ threshold)', 'bliq': 'B-Liq (Buy-Liquidation: long positions liquidated ≥ threshold)', 'iot': 'IO/T (OI vs Turnover — conviction/stickiness)', 'iom': 'IO/M (OI vs MCap — leverage concentration)' };
 
-  const critEmoji = c => /^sliq/.test(c) ? '🥵' + c.slice(4) : /^bliq/.test(c) ? '🥶' + c.slice(4) : (CRIT_EMOJI[c] || '');
+  const critEmoji = c => {
+    if (/^fund/.test(c)) { const s = c.slice(4); const num = parseFloat(s.replace(/^[<>]/,'')); return (num < 0 ? '💸' : '🤑') + s; }
+    if (/^vm/.test(c)) return '🔊' + c.slice(2);
+    if (/^lsa/.test(c)) return '🟥' + c.slice(3);
+    if (/^lba/.test(c)) return '🟩' + c.slice(3);
+    if (/^rasl/.test(c)) return '🔴' + c.slice(4);
+    if (/^rabl/.test(c)) return '🟢' + c.slice(4);
+    if (/^sliq/.test(c)) return '🥵' + c.slice(4);
+    if (/^bliq/.test(c)) return '🥶' + c.slice(4);
+    if (/^iot/.test(c)) return '🎲' + c.slice(3);
+    if (/^iom/.test(c)) return '🧲' + c.slice(3);
+    return CRIT_EMOJI[c] || '';
+  };
   const critLabel = c => {
+    const fM = c.match(/^fund([<>])(-?\d+)$/);
+    if (fM) return 'Fund ' + fM[1] + fM[2];
+    const fA = c.match(/^fund([+-]-?\d*)$/);
+    if (fA) return 'Fund t' + fA[1];
+    if (c === 'fund') return 'Fund';
+    const vM = c.match(/^vm([<>])(\d+)$/);
+    if (vM) return 'V/M ' + vM[1] + vM[2];
+    const vA = c.match(/^vm([+-]\d+)$/);
+    if (vA) return 'V/M t' + vA[1];
+    if (c === 'vm') return 'V/M';
+    const kM = c.match(/^(lsa|lba|rasl|rabl)([<>])(\d+)$/);
+    if (kM) return kM[1].toUpperCase().replace('RASL','R-ASL').replace('RABL','R-ABL') + ' ' + kM[2] + kM[3];
+    const kA = c.match(/^(lsa|lba|rasl|rabl)([+-]\d+)$/);
+    if (kA) return kA[1].toUpperCase().replace('RASL','R-ASL').replace('RABL','R-ABL') + ' t' + kA[2];
+    if (c === 'lsa') return 'LSA'; if (c === 'lba') return 'LBA';
+    if (c === 'rasl') return 'R-ASL'; if (c === 'rabl') return 'R-ABL';
     const m = c.match(/^(sliq|bliq)([<>])([+-]?\d+)$/);
     if (m) return (m[1] === 'sliq' ? 'S-Liq' : 'B-Liq') + ' ' + m[2] + m[3];
     const n = c.match(/^(sliq|bliq)([+-]\d+)$/);
     if (n) return (n[1] === 'sliq' ? 'S-Liq' : 'B-Liq') + ' ' + n[2];
     if (c === 'sliq') return 'S-Liq'; if (c === 'bliq') return 'B-Liq';
+    const o = c.match(/^(iot|iom)([<>])(\d+)$/);
+    if (o) return (o[1] === 'iot' ? 'IO/T' : 'IO/M') + ' ' + o[2] + o[3];
+    const p = c.match(/^(iot|iom)([+-]\d+)$/);
+    if (p) return (p[1] === 'iot' ? 'IO/T' : 'IO/M') + ' t' + p[2];
+    if (c === 'iot') return 'IO/T'; if (c === 'iom') return 'IO/M';
     return CRIT_DESC[c] || c;
   };
 
@@ -109,18 +148,18 @@
 
                   <!-- Auto slots controls -->
                   <div x-show="cfg.miwAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(96,210,255,.04);border:1px solid rgba(96,210,255,.12);border-radius:3px">
-                    <div class="lbl">Criteria per Slot <b x-text="cfg.miwAutoSlotSize??2"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.miwAutoSlotSize??2,k=12-(cfg.miwAutoSlotExclude||[]).length;if(k<n)return 0;let r=1;for(let i=0;i<n;i++)r=r*(k-i)/(i+1);return Math.round(r)})()+' slots'"></span></div>
+                    <div class="lbl">Criteria per Slot <b x-text="cfg.miwAutoSlotSize??2"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.miwAutoSlotSize??2,k=12-(cfg.miwAutoSlotExclude||[]).length;if(k<n)return 0;let r=1;for(let i=0;i<n;i++)r=r*(k-i)/(i+1);return Math.round(r)})()+' base slots (tiers add more)'"></span></div>
                     <input type="range" min="1" max="5" step="1" x-model.number="cfg.miwAutoSlotSize" @change="persist()">
                     <div class="lbl" style="margin-top:5px;margin-bottom:3px">Exclude from Auto</div>
                     <div style="display:flex;flex-wrap:wrap;gap:3px">
-                      <template x-for="c in ['+fund','-fund','+24h','-24h','>10pct','<10pct','lsa','lba','rasl','rabl','sliq','bliq']" :key="c">
+                      <template x-for="c in ['fund','+24h','-24h','vm','lsa','lba','rasl','rabl','sliq','bliq','iot','iom']" :key="c">
                         <button @click.prevent="if(!cfgLocked){ const ex=(cfg.miwAutoSlotExclude||[]).slice(); const i=ex.indexOf(c); if(i>=0) ex.splice(i,1); else ex.push(c); cfg.miwAutoSlotExclude=ex; persist(); }"
                                 :style="'font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;cursor:pointer;border:1px solid;' + ((cfg.miwAutoSlotExclude||[]).includes(c) ? 'border-color:rgba(255,80,80,.5);background:rgba(255,80,80,.15);color:rgba(255,80,80,.8)' : 'border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)')"
-                                x-text="c.replace('>10pct','>10%').replace('<10pct','<10%').replace('lsa','LSA').replace('lba','LBA').replace('rasl','R-ASL').replace('rabl','R-ABL').replace('sliq','S-Liq').replace('bliq','B-Liq')">
+                                x-text="c.replace('fund','Fund').replace('vm','V/M').replace('lsa','LSA').replace('lba','LBA').replace('rasl','R-ASL').replace('rabl','R-ABL').replace('sliq','S-Liq').replace('bliq','B-Liq').replace('iot','IO/T').replace('iom','IO/M')">
                         </button>
                       </template>
                     </div>
-                    <div class="miw-hint" style="margin-top:4px">Excluded criteria are omitted from all auto combos and scorecard scoring. Manual slots are preserved when Auto is off.</div>
+                    <div class="miw-hint" style="margin-top:4px">Excluded criteria are omitted from all auto combos and scorecard scoring. Manual slots are preserved when Auto is off. Tiered criteria (Fund, V/M, spike, IO/T, IO/M) record a tier value at entry — each distinct tier produces a separate scorecard key, so the actual scored variety exceeds the base slot count shown above.</div>
                     <div x-show="Object.keys(miwBlockedSlots||{}).length" class="miw-hint" style="margin-top:3px" x-text="Object.values(miwBlockedSlots||{}).filter(v=>v==='blocked').length+' slot(s) blocked — matched tickers graylisted for '+(cfg.miwBlockedSlotCooldownHours??6)+'h'"></div>
                   </div>
 
@@ -130,15 +169,26 @@
 
                     <!-- Criteria picker — visible when a slot is selected -->
                     <div x-show="cfg.miwActiveSlot !== null && cfg.miwActiveSlot !== undefined && cfg.miwActiveSlot < (cfg.miwSlots||[]).length"
-                         x-data="{ liqFocus: null, liqDir: '>', liqVal: 2 }"
-                         @click.outside="liqFocus = null"
+                         x-data="{ liqFocus: null, liqDir: '>', liqVal: 2, ratioFocus: null, ratioDir: '>', ratioTier: 5, gateFocus: null, gateDir: '>', gateTier: 1 }"
+                         @click.outside="liqFocus = null; ratioFocus = null; gateFocus = null"
                          style="display:flex;gap:3px;flex-wrap:wrap;align-items:center;margin-bottom:7px;padding:6px 7px;background:rgba(255,255,255,.04);border-radius:3px;border:1px solid rgba(255,255,255,.08)">
                       <span style="font-size:9px;color:var(--text-lo);margin-right:2px">Slot <span x-text="(cfg.miwActiveSlot??0)+1"></span>:</span>
-                      <template x-for="c in ['+fund','-fund','+24h','-24h','>10pct','<10pct','lsa','lba','rasl','rabl','sliq','bliq']" :key="c">
+                      <template x-for="c in ['fund','+24h','-24h','vm','lsa','lba','rasl','rabl','sliq','bliq','iot','iom']" :key="c">
                         <button class="miw-opt"
-                          @click.prevent="if(!cfgLocked){ if(c==='sliq'||c==='bliq'){ liqFocus=(liqFocus===c?null:c); if(liqFocus){ const ex=(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:sliq|bliq)([<>])([+-]?\d+)$/); if(m){liqDir=m[1];liqVal=parseInt(m[2],10)} } } } else { liqFocus=null; _miwToggle(cfg.miwActiveSlot, c) } }"
-                          :style="(c==='sliq'||c==='bliq') ? (liqFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.miwSlots?.[cfg.miwActiveSlot]||[]).includes(c) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
-                          x-text="c.replace('>10pct','>10%').replace('<10pct','<10%').replace('lsa','LSA').replace('lba','LBA').replace('rasl','R-ASL').replace('rabl','R-ABL').replace('sliq','S-Liq').replace('bliq','B-Liq')">
+                          @click.prevent="if(!cfgLocked){
+                            if(c==='sliq'||c==='bliq'){
+                              liqFocus=(liqFocus===c?null:c); ratioFocus=null; gateFocus=null;
+                              if(liqFocus){ const ex=(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:sliq|bliq)([<>])([+-]?\d+)$/); if(m){liqDir=m[1];liqVal=parseInt(m[2],10)} } }
+                            } else if(c==='iot'||c==='iom'){
+                              ratioFocus=(ratioFocus===c?null:c); liqFocus=null; gateFocus=null;
+                              if(ratioFocus){ const ex=(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:iot|iom)([<>])(\d+)$/); if(m){ratioDir=m[1];ratioTier=parseInt(m[2],10)} } }
+                            } else if(c==='fund'||c==='vm'||c==='lsa'||c==='lba'||c==='rasl'||c==='rabl'){
+                              gateFocus=(gateFocus===c?null:c); liqFocus=null; ratioFocus=null;
+                              if(gateFocus){ const ex=(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:fund|vm|lsa|lba|rasl|rabl)([<>])(-?\d+)$/); if(m){gateDir=m[1];gateTier=parseInt(m[2],10)} } else { gateDir='>'; gateTier=c==='fund'?1:c==='vm'?10:25; } }
+                            } else { liqFocus=null; ratioFocus=null; gateFocus=null; _miwToggle(cfg.miwActiveSlot, c) }
+                          }"
+                          :style="(c==='sliq'||c==='bliq') ? (liqFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='iot'||c==='iom') ? (ratioFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='vm'||c==='lsa'||c==='lba'||c==='rasl'||c==='rabl') ? (gateFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.miwSlots?.[cfg.miwActiveSlot]||[]).includes(c) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
+                          x-text="c.replace('fund','Fund').replace('vm','V/M').replace('lsa','LSA').replace('lba','LBA').replace('rasl','R-ASL').replace('rabl','R-ABL').replace('sliq','S-Liq').replace('bliq','B-Liq').replace('iot','IO/T').replace('iom','IO/M')">
                         </button>
                       </template>
                       <!-- Liq depth config panel -->
@@ -156,6 +206,37 @@
                           </button>
                         </div>
                       </div>
+                      <!-- IO/T and IO/M tier config panel -->
+                      <div x-show="ratioFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(96,210,255,.06);border:1px solid rgba(96,210,255,.2);border-radius:3px">
+                        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                          <span style="font-size:9px;color:var(--text-lo)" x-text="(ratioFocus==='iot'?'IO/T':'IO/M')+' tier'"></span>
+                          <button @click.prevent="ratioDir=(ratioDir==='>'?'<':'>')"
+                            style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(96,210,255,.1);border:1px solid rgba(96,210,255,.35);border-radius:2px;color:var(--ice);cursor:pointer"
+                            x-text="ratioDir"></button>
+                          <input type="range" min="0" max="500" step="1" x-model.number="ratioTier" style="flex:1;min-width:60px">
+                          <span style="font-size:9px;color:var(--ice);min-width:52px;text-align:right" x-text="ratioTier+' (≈'+(ratioTier*(ratioFocus==='iot'?(cfg.miwIotStep??1):(cfg.miwIomStep??1))/100).toFixed(2)+')'"></span>
+                          <button @click.prevent="if(!cfgLocked&&ratioFocus){ const slots=(cfg.miwSlots||[]).map(s=>[...s]); const si=cfg.miwActiveSlot; if(!slots[si]) return; const existIdx=slots[si].findIndex(x=>x.startsWith(ratioFocus)); if(existIdx!==-1){ slots[si].splice(existIdx,1); } else { slots[si].push(ratioFocus+ratioDir+ratioTier); } cfg.miwSlots=slots; persist?.(); }"
+                            :style="(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(ratioFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(96,210,255,.1);border:1px solid rgba(96,210,255,.35);color:var(--ice)'"
+                            x-text="(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(ratioFocus??'__')) ? 'Remove' : 'Add'">
+                          </button>
+                        </div>
+                      </div>
+                      <!-- Fund/VM/Spike gate config panel -->
+                      <div x-show="gateFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(96,210,255,.06);border:1px solid rgba(96,210,255,.2);border-radius:3px">
+                        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                          <span style="font-size:9px;color:var(--text-lo)" x-text="({fund:'Fund',vm:'V/M',lsa:'LSA',lba:'LBA',rasl:'R-ASL',rabl:'R-ABL'})[gateFocus]||gateFocus"></span>
+                          <button @click.prevent="gateDir=(gateDir==='>'?'<':'>')"
+                            style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(96,210,255,.1);border:1px solid rgba(96,210,255,.35);border-radius:2px;color:var(--ice);cursor:pointer"
+                            x-text="gateDir"></button>
+                          <input type="range" :min="gateFocus==='fund'?-100:0" max="200" step="1" x-model.number="gateTier" style="flex:1;min-width:60px">
+                          <span style="font-size:9px;color:var(--ice);min-width:52px;text-align:right"
+                            x-text="gateTier+' (≈'+(Math.abs(gateTier)*(gateFocus==='fund'?(cfg.miwFundStep??0.25):gateFocus==='vm'?(cfg.miwVmStep??1):(cfg.miwSpikeStep??1))).toFixed(2)+'%)'"></span>
+                          <button @click.prevent="if(!cfgLocked&&gateFocus){ const slots=(cfg.miwSlots||[]).map(s=>[...s]); const si=cfg.miwActiveSlot; if(!slots[si]) return; const existIdx=slots[si].findIndex(x=>x.startsWith(gateFocus)); if(existIdx!==-1){ slots[si].splice(existIdx,1); } else { slots[si].push(gateFocus+gateDir+gateTier); } cfg.miwSlots=slots; persist?.(); }"
+                            :style="(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(gateFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(96,210,255,.1);border:1px solid rgba(96,210,255,.35);color:var(--ice)'"
+                            x-text="(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(gateFocus??'__')) ? 'Remove' : 'Add'">
+                          </button>
+                        </div>
+                      </div>
                     </div>
 
                     <!-- Slot blocks -->
@@ -167,7 +248,7 @@
                           <div style="font-size:8px;color:var(--text-lo)">Slot <span x-text="i+1"></span></div>
                           <div style="display:flex;flex-direction:column;gap:2px;min-height:14px">
                             <template x-for="c in slot" :key="c">
-                              <span class="miw-crit" x-text="c.replace('>10pct','>10%').replace('<10pct','<10%').replace('lsa','LSA').replace('lba','LBA').replace('rasl','R-ASL').replace('rabl','R-ABL').replace('sliq','S-Liq').replace('bliq','B-Liq')"></span>
+                              <span class="miw-crit" x-text="c.replace('fund','Fund').replace('vm','V/M').replace('lsa','LSA').replace('lba','LBA').replace('rasl','R-ASL').replace('rabl','R-ABL').replace('sliq','S-Liq').replace('bliq','B-Liq').replace('iot','IO/T').replace('iom','IO/M')"></span>
                             </template>
                             <span x-show="!slot.length" style="font-size:8px;color:var(--text-lo);font-style:italic">empty</span>
                           </div>
@@ -182,12 +263,48 @@
                         style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(96,210,255,.06);border:1px dashed rgba(96,210,255,.3);border-radius:3px;color:var(--ice);cursor:pointer">+</button>
                     </div>
                     <div class="miw-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. Vol/mcap criteria pull market cap from CoinGecko (1h cache). LSA/LBA/R-ASL/R-ABL fetch the last completed 1h kline per ticker.</div>
-                    <div class="miw-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑 +fund · 💸 -fund · ⬆️ +24h · ⬇️ -24h · 🔊 &gt;10% vol/mcap · 🔉 &lt;10% vol/mcap · 🟥 LSA · 🟩 LBA · 🔴 R-ASL · 🟢 R-ABL · 🥵 S-Liq · 🥶 B-Liq — click S-Liq/B-Liq to configure depth gate (direction + threshold)</div>
+                    <div class="miw-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑/💸 Fund · ⬆️ +24h · ⬇️ -24h · 🔊 V/M · 🟥 LSA · 🟩 LBA · 🔴 R-ASL · 🟢 R-ABL · 🥵 S-Liq · 🥶 B-Liq · 🎲 IO/T · 🧲 IO/M — click any tiered criterion to configure gate</div>
                   </div><!-- end manual builder -->
                   <div class="g" style="margin-top:8px">
                     <div class="lbl">Kline Scan Cap <b x-text="(cfg.miwKlineScanCap??50)"></b> tickers</div>
                     <input type="range" min="10" max="500" step="10" x-model.number="cfg.miwKlineScanCap" @change="persist()">
                     <div class="miw-hint">Random sample of tickers checked for kline criteria per cycle.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl">V/M Scan Cap <b x-text="(cfg.miwMcapScanCap??50)"></b> tickers</div>
+                    <input type="range" min="10" max="200" step="10" x-model.number="cfg.miwMcapScanCap" @change="persist()">
+                    <div class="miw-hint">Max tickers for CoinGecko market cap fetch per cycle. Pre-screened by fund rate and 24h direction first.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl" style="margin-bottom:4px">Tier Step Sizes</div>
+                    <div style="display:flex;flex-direction:column;gap:4px">
+                      <div style="display:flex;align-items:center;gap:6px">
+                        <span style="font-size:9px;color:var(--text-lo);min-width:52px">💰 Fund</span>
+                        <input type="number" class="inp" min="0.01" max="5" step="0.01" x-model.number="cfg.miwFundStep" @change="persist()" style="width:60px">
+                        <span style="font-size:9px;color:var(--text-lo)">% / tier</span>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:6px">
+                        <span style="font-size:9px;color:var(--text-lo);min-width:52px">🔊 V/M</span>
+                        <input type="number" class="inp" min="0.1" max="10" step="0.1" x-model.number="cfg.miwVmStep" @change="persist()" style="width:60px">
+                        <span style="font-size:9px;color:var(--text-lo)">% / tier</span>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:6px">
+                        <span style="font-size:9px;color:var(--text-lo);min-width:52px">🟥 Spike</span>
+                        <input type="number" class="inp" min="0.1" max="10" step="0.1" x-model.number="cfg.miwSpikeStep" @change="persist()" style="width:60px">
+                        <span style="font-size:9px;color:var(--text-lo)">% / tier</span>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:6px">
+                        <span style="font-size:9px;color:var(--text-lo);min-width:52px">🎲 IO/T</span>
+                        <input type="number" class="inp" min="0.1" max="10" step="0.1" x-model.number="cfg.miwIotStep" @change="persist()" style="width:60px">
+                        <span style="font-size:9px;color:var(--text-lo)">% / tier</span>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:6px">
+                        <span style="font-size:9px;color:var(--text-lo);min-width:52px">🧲 IO/M</span>
+                        <input type="number" class="inp" min="0.1" max="10" step="0.1" x-model.number="cfg.miwIomStep" @change="persist()" style="width:60px">
+                        <span style="font-size:9px;color:var(--text-lo)">% / tier</span>
+                      </div>
+                    </div>
+                    <div class="miw-hint" style="margin-top:3px">Tier = floor(value / step). "lsa>25" at 1% step means spike ≥ 25% above average.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <div class="lbl">Blocked Slot Cooldown <b x-text="(cfg.miwBlockedSlotCooldownHours??6)+'h'"></b></div>
@@ -407,6 +524,7 @@
           if (this.cfg.miwKlineVolMin      === undefined) this.cfg.miwKlineVolMin      = 25;
           if (this.cfg.miwKlineVolMax      === undefined) this.cfg.miwKlineVolMax      = 50;
           if (this.cfg.miwKlineScanCap     === undefined) this.cfg.miwKlineScanCap     = 50;
+          if (this.cfg.miwMcapScanCap      === undefined) this.cfg.miwMcapScanCap      = 50;
           if (this.cfg.miwHalvingEnabled   === undefined) this.cfg.miwHalvingEnabled   = false;
           if (this.cfg.miwHalvingHours     === undefined) this.cfg.miwHalvingHours     = 3;
           if (this.cfg.miwFadeAwayEnabled  === undefined) this.cfg.miwFadeAwayEnabled  = false;
@@ -428,6 +546,41 @@
           if (this.cfg.miwAutoSlotExclude            === undefined) this.cfg.miwAutoSlotExclude            = [];
           if (this.cfg.miwBlockedSlotCooldownHours   === undefined) this.cfg.miwBlockedSlotCooldownHours   = 6;
           if (!this._miwSlotGraylist) this._miwSlotGraylist = {};
+          if (this.cfg.miwFundStep  === undefined) this.cfg.miwFundStep  = 0.25;
+          if (this.cfg.miwVmStep    === undefined) this.cfg.miwVmStep    = 1;
+          if (this.cfg.miwSpikeStep === undefined) this.cfg.miwSpikeStep = 1;
+          if (this.cfg.miwIotStep   === undefined) this.cfg.miwIotStep   = 1;
+          if (this.cfg.miwIomStep   === undefined) this.cfg.miwIomStep   = 1;
+          // Legacy migration: convert old +fund/-fund/>10pct/<10pct/bare lsa/lba/rasl/rabl to tiered form
+          {
+            const _fundStep   = this.cfg.miwFundStep  ?? 0.25;
+            const _vmStep     = this.cfg.miwVmStep    ?? 1;
+            const _spikeStep  = this.cfg.miwSpikeStep ?? 1;
+            const _frThr      = this.cfg.miwFrThreshold ?? 0.1;
+            const _volMin     = this.cfg.miwKlineVolMin  ?? 25;
+            const _vmTier     = Math.max(1, Math.round(10 / _vmStep));
+            const _frTier     = Math.max(1, Math.ceil(_frThr / _fundStep));
+            const _migCrit = c => {
+              if (c === '+fund')   return `fund>${_frTier}`;
+              if (c === '-fund')   return `fund<-${_frTier}`;
+              if (c === '>10pct')  return `vm>${_vmTier}`;
+              if (c === '<10pct')  return `vm<${_vmTier}`;
+              if (c === 'lsa')     return `lsa>${_volMin}`;
+              if (c === 'lba')     return `lba>${_volMin}`;
+              if (c === 'rasl')    return `rasl>${_volMin}`;
+              if (c === 'rabl')    return `rabl>${_volMin}`;
+              return c;
+            };
+            const _legacyNames = new Set(['+fund','-fund','>10pct','<10pct','lsa','lba','rasl','rabl']);
+            if (Array.isArray(this.cfg.miwSlots) && this.cfg.miwSlots.some(s => s.some(c => _legacyNames.has(c)))) {
+              this.cfg.miwSlots = this.cfg.miwSlots.map(s => s.map(_migCrit));
+              this.persist();
+            }
+            if (Array.isArray(this.cfg.miwAutoSlotExclude) && this.cfg.miwAutoSlotExclude.some(c => _legacyNames.has(c))) {
+              this.cfg.miwAutoSlotExclude = this.cfg.miwAutoSlotExclude.map(_migCrit);
+              this.persist();
+            }
+          }
           this.registerRoleBadge?.(item => {
             if (!item || !item._miw) return null;
             const crits  = item._miwCriteria || [];
@@ -611,29 +764,19 @@
         },
 
         _miwLiqScorecardBias(crit) {
-          // Returns 'bad', 'good', or null (no data / tie) by reading PF slot scorecard from localStorage.
-          // Counts how many slots containing `crit` are in net profit vs net loss (from Winter's perspective).
+          // Uses the already-built PF scoreboard (sponge-quota-respecting) rather than raw localStorage.
           try {
-            const raw = JSON.parse(localStorage.getItem('__everwinter_scorecard_v1') || 'null');
-            if (!Array.isArray(raw) || !raw.length) return null;
-            const cut = Date.now() - 30 * 24 * 3600 * 1000;
-            const map = {};
-            for (const r of raw) {
-              if (r.ts < cut || !Array.isArray(r.criteria) || !r.criteria.some(c => c === crit || c.startsWith(crit))) continue;
-              const key = [...r.criteria].sort().join(',');
-              if (!map[key]) map[key] = { totalPnl: 0 };
-              const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
-              map[key].totalPnl += r.source === 'winter' ? pnl : -pnl;
+            const scoreboard = this.pfScoreboard;
+            if (!Array.isArray(scoreboard) || !scoreboard.length) return null;
+            let net = 0, hasData = false;
+            for (const s of scoreboard) {
+              if (!Array.isArray(s.criteria) || !s.criteria.some(c => c === crit || c.startsWith(crit))) continue;
+              net += s.totalPnl;
+              hasData = true;
             }
-            const slots = Object.values(map);
-            if (!slots.length) return null;
-            let profitSlots = 0, lossSlots = 0;
-            for (const s of slots) {
-              if (s.totalPnl > 0) profitSlots++;
-              else if (s.totalPnl < 0) lossSlots++;
-            }
-            if (lossSlots > profitSlots) return 'bad';
-            if (profitSlots > lossSlots) return 'good';
+            if (!hasData) return null;
+            if (net < 0) return 'bad';
+            if (net > 0) return 'good';
             return null;
           } catch(_) { return null; }
         },
@@ -717,7 +860,6 @@
             return;
           }
 
-          const frThreshold = this.cfg.miwFrThreshold ?? 0.1;
           const activeSyms  = new Set((this.positions || []).map(p => p.symbol));
 
           const _liqMaxAge     = (this.cfg.miwLiqResultMaxCycles ?? 2) * (this.cfg.scanMins ?? 15) * 60000;
@@ -726,8 +868,8 @@
 
           // Include blocked slots when deciding whether to prefetch mcap/klines
           const allSlots   = [...slots, ...blockedSlots];
-          const needsMcap  = allSlots.some(s => s.includes('>10pct') || s.includes('<10pct'));
-          const needsKline = allSlots.some(s => s.includes('lsa') || s.includes('lba') || s.includes('rasl') || s.includes('rabl'));
+          const needsKline = allSlots.some(s => s.some(c => /^(lsa|lba|rasl|rabl)/.test(c)));
+          const needsMcap  = allSlots.some(s => s.some(c => /^vm/.test(c) || /^iom/.test(c)));
 
           const _glNow = Date.now();
           const _glTtl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
@@ -750,11 +892,26 @@
           }
 
           // Resolve market caps for vol/mcap criteria if any slot requires them.
+          // Pre-screen to tickers that pass non-mcap fast criteria (fund, 24h) so the CG
+          // request stays small and bounded — large-pool fetches fail silently and leave stale data.
           const mcapMap = {};
           if (needsMcap) {
-            const bases = basePool.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
+            const mcapCap     = this.cfg.miwMcapScanCap ?? 50;
+            const fundStep_   = this.cfg.miwFundStep ?? 0.25;
+            const mcapSlots   = allSlots.filter(s => s.some(c => /^(vm|iom)/.test(c)));
+            const fastFilters = mcapSlots.map(s => s.filter(c => /^fund/.test(c) || c === '+24h' || c === '-24h'));
+            let mcapPool = basePool.filter(t => {
+              const fr_      = parseFloat(t.fundingRate || 0) * 100;
+              const is24hUp_ = parseFloat(t.price24hPcnt || 0) > 0;
+              return fastFilters.some(ff => !ff.length || ff.every(c => {
+                if (/^fund/.test(c)) { const tier_ = Math.floor(fr_ / fundStep_); const m_ = c.match(/^fund([<>])(-?\d+)$/); if (!m_) return true; return m_[1] === '>' ? tier_ >= parseInt(m_[2],10) : tier_ <= parseInt(m_[2],10); }
+                return c === '+24h' ? is24hUp_ : !is24hUp_;
+              }));
+            });
+            if (mcapPool.length > mcapCap) mcapPool = mcapPool.slice(0, mcapCap);
+            const bases = mcapPool.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
             await this._miwPrefetchMcaps(bases);
-            for (const t of basePool) {
+            for (const t of mcapPool) {
               const mcap = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase());
               if (mcap) mcapMap[t.symbol] = mcap;
             }
@@ -773,29 +930,39 @@
             await this._miwPrefetchKlines(klineSyms);
           }
 
-          const klineVolMin = this.cfg.miwKlineVolMin ?? 25;
-          const klineVolMax = this.cfg.miwKlineVolMax ?? 50;
           const checkCrit = (c, fr, is24hUp, ratio, t) => {
-            if (c === '+fund')  return fr >= frThreshold;
-            if (c === '-fund')  return fr <= -frThreshold;
-            if (c === '+24h')   return is24hUp;
-            if (c === '-24h')   return !is24hUp;
-            if (c === '>10pct') return ratio !== null && ratio > 0.10;
-            if (c === '<10pct') return ratio !== null && ratio < 0.10;
-            if (c === 'lsa' || c === 'lba' || c === 'rasl' || c === 'rabl') {
+            if (/^fund/.test(c)) {
+              const step = this.cfg.miwFundStep ?? 0.25;
+              const tier = Math.floor(fr / step);
+              const m = c.match(/^fund([<>])(-?\d+)$/);
+              if (!m) return true;
+              return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
+            }
+            if (c === '+24h') return is24hUp;
+            if (c === '-24h') return !is24hUp;
+            if (/^vm/.test(c)) {
+              if (ratio === null) return false;
+              const step = this.cfg.miwVmStep ?? 1;
+              const tier = Math.floor(ratio * 100 / step);
+              const m = c.match(/^vm([<>])(\d+)$/);
+              if (!m) return true;
+              return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
+            }
+            if (/^(lsa|lba|rasl|rabl)/.test(c)) {
               const kline = this._miwGetKlineSync(t.symbol);
               if (!kline) return false;
               const avgHourly = parseFloat(t.volume24h || 0) / 24;
               if (avgHourly <= 0) return false;
               const mult = kline.volume / avgHourly;
-              let inBand;
-              if (c === 'lsa' || c === 'lba') {
-                inBand = mult >= 1 + klineVolMin / 100 && mult <= 1 + klineVolMax / 100;
-              } else {
-                inBand = mult >= 1 - klineVolMax / 100 && mult <= 1 - klineVolMin / 100;
-              }
-              if (!inBand) return false;
-              return (c === 'lsa' || c === 'rasl') ? kline.close < kline.open : kline.close > kline.open;
+              const base = c.match(/^(lsa|lba|rasl|rabl)/)[1];
+              const isAbove = base === 'lsa' || base === 'lba';
+              if (isAbove && mult <= 1) return false;
+              if (!isAbove && mult >= 1) return false;
+              const step = this.cfg.miwSpikeStep ?? 1;
+              const tier = Math.floor((isAbove ? mult - 1 : 1 - mult) * 100 / step);
+              const m = c.match(/^(?:lsa|lba|rasl|rabl)([<>])(\d+)$/);
+              if (m && (m[1] === '>' ? tier < parseInt(m[2],10) : tier > parseInt(m[2],10))) return false;
+              return (base === 'lsa' || base === 'rasl') ? kline.close < kline.open : kline.close > kline.open;
             }
             if (/^sliq/.test(c) || /^bliq/.test(c)) {
               const kind = c.startsWith('sliq') ? 'sliq' : 'bliq';
@@ -808,6 +975,26 @@
               if (!liqM) return true;
               const depth = kind === 'sliq' ? (r.sDepth ?? 0) : (r.bDepth ?? 0);
               return liqM[1] === '>' ? depth >= parseInt(liqM[2], 10) : depth <= parseInt(liqM[2], 10);
+            }
+            if (/^iot/.test(c)) {
+              const oi = parseFloat(t.openInterestValue || 0);
+              const tv = parseFloat(t.turnover24h || 0);
+              if (oi <= 0 || tv <= 0) return false;
+              const step = this.cfg.miwIotStep ?? 1;
+              const tier = Math.floor(oi / tv * 100 / step);
+              const iotM = c.match(/^iot([<>])(\d+)$/);
+              if (!iotM) return true;
+              return iotM[1] === '>' ? tier >= parseInt(iotM[2], 10) : tier <= parseInt(iotM[2], 10);
+            }
+            if (/^iom/.test(c)) {
+              const oi = parseFloat(t.openInterestValue || 0);
+              const mc = mcapMap[t.symbol];
+              if (oi <= 0 || !mc || mc <= 0) return false;
+              const step = this.cfg.miwIomStep ?? 1;
+              const tier = Math.floor(oi / mc * 100 / step);
+              const iomM = c.match(/^iom([<>])(\d+)$/);
+              if (!iomM) return true;
+              return iomM[1] === '>' ? tier >= parseInt(iomM[2], 10) : tier <= parseInt(iomM[2], 10);
             }
             return false;
           };
@@ -855,22 +1042,39 @@
               const mcap     = mcapMap[t.symbol];
               const ratio    = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
               const slotIdx  = slots.findIndex(s => s.every(c => checkCrit(c, fr, is24hUp, ratio, t)));
-              return slotIdx !== -1 ? { t, criteria: slots[slotIdx], slotIdx } : null;
+              if (slotIdx === -1) return null;
+              const _liqR = _allLiqResults[t.symbol];
+              const _annotKey = [...slots[slotIdx].map(c => {
+                if (/^sliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `sliq${d >= 0 ? '+' : ''}${d}`; }
+                if (/^bliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `bliq${d >= 0 ? '+' : ''}${d}`; }
+                if (/^iot/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const tv = parseFloat(t.turnover24h || 0); const step = this.cfg.miwIotStep ?? 1; return `iot+${tv > 0 ? Math.floor(oi / tv * 100 / step) : 0}`; }
+                if (/^iom/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const mc = mcapMap[t.symbol] || 0; const step = this.cfg.miwIomStep ?? 1; return `iom+${mc > 0 ? Math.floor(oi / mc * 100 / step) : 0}`; }
+                if (/^fund/.test(c)) { const step = this.cfg.miwFundStep ?? 0.25; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_ / step); return `fund${tier>=0?'+':''}${tier}`; }
+                if (/^vm/.test(c)) { const mc = mcapMap[t.symbol]||0; const tv = parseFloat(t.turnover24h||0); const step = this.cfg.miwVmStep ?? 1; const tier = mc > 0 ? Math.floor(tv/mc*100/step) : 0; return `vm+${tier}`; }
+                if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._miwKlineCache?.[t.symbol]; const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.miwSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
+                return c;
+              })].sort().join(',');
+              if ((this.miwBlockedSlots || {})[_annotKey] === 'blocked') {
+                this._miwSlotGraylist[t.symbol] = _glNow;
+                return null;
+              }
+              return { t, criteria: slots[slotIdx], slotIdx };
             })
             .filter(Boolean)
             .sort((a, b) => a.slotIdx - b.slotIdx || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
 
           if (!pool.length) {
 
-            const posFund  = basePool.filter(t => parseFloat(t.fundingRate || 0) * 100 >= frThreshold).length;
-            const negFund  = basePool.filter(t => parseFloat(t.fundingRate || 0) * 100 <= -frThreshold).length;
+            const fundStep = this.cfg.miwFundStep ?? 0.25;
+            const posFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 >= fundStep).length;
+            const negFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 <= -fundStep).length;
             const up24h    = basePool.filter(t => parseFloat(t.price24hPcnt || 0) > 0).length;
             const mcapHits  = Object.keys(mcapMap).length;
             const klineHits = needsKline ? Object.keys(this._miwKlineCache||{}).length : 0;
             const mcapNote  = needsMcap  ? ` mcap:${mcapHits}/${basePool.length}`  : '';
             const klineNote = needsKline ? ` kline:${klineHits}/${basePool.length}` : '';
             const liqNote   = this.cfg.miwRequireLiqData ? ` liq-only:${basePool.length}surveilled` : '';
-            this.log(`[MIW] 💡 No tickers matched — pool:${basePool.length} +fund:${posFund} -fund:${negFund} +24h:${up24h}${mcapNote}${klineNote}${liqNote}`, 'info');
+            this.log(`[MIW] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund} +24h:${up24h}${mcapNote}${klineNote}${liqNote}`, 'info');
             return;
           }
 
@@ -904,7 +1108,18 @@
           const sym   = t.symbol;
           let price = parseFloat(t.lastPrice || 0);
           if (!price) return false;
-          const slotKey = [...(criteria || [])].sort().join(',');
+          const _liqR = this._liqResults?.[sym];
+          const _annotCrit = (criteria || []).map(c => {
+            if (/^sliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `sliq${d >= 0 ? '+' : ''}${d}`; }
+            if (/^bliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `bliq${d >= 0 ? '+' : ''}${d}`; }
+            if (/^iot/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const tv = parseFloat(t.turnover24h || 0); const step = this.cfg.miwIotStep ?? 1; return `iot+${tv > 0 ? Math.floor(oi / tv * 100 / step) : 0}`; }
+            if (/^iom/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase()) || 0; const step = this.cfg.miwIomStep ?? 1; return `iom+${mc > 0 ? Math.floor(oi / mc * 100 / step) : 0}`; }
+            if (/^fund/.test(c)) { const step = this.cfg.miwFundStep ?? 0.25; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_/step); return `fund${tier>=0?'+':''}${tier}`; }
+            if (/^vm/.test(c)) { const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i,'').toLowerCase())||0; const tv = parseFloat(t.turnover24h||0); const step = this.cfg.miwVmStep ?? 1; const tier = mc > 0 ? Math.floor(tv/mc*100/step) : 0; return `vm+${tier}`; }
+            if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._miwGetKlineSync(t.symbol); const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.miwSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
+            return c;
+          });
+          const slotKey = [..._annotCrit].sort().join(',');
           if (slotKey && (this.miwBlockedSlots || {})[slotKey] === 'blocked') {
             this._miwSlotGraylist = this._miwSlotGraylist || {};
             this._miwSlotGraylist[sym] = Date.now();
@@ -929,6 +1144,11 @@
             pos._miwCriteria = (criteria || []).map(c => {
               if (/^sliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `sliq${d >= 0 ? '+' : ''}${d}`; }
               if (/^bliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `bliq${d >= 0 ? '+' : ''}${d}`; }
+              if (/^iot/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const tv = parseFloat(t.turnover24h || 0); const step = this.cfg.miwIotStep ?? 1; return `iot+${tv > 0 ? Math.floor(oi / tv * 100 / step) : 0}`; }
+              if (/^iom/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase()) || 0; const step = this.cfg.miwIomStep ?? 1; return `iom+${mc > 0 ? Math.floor(oi / mc * 100 / step) : 0}`; }
+              if (/^fund/.test(c)) { const step = this.cfg.miwFundStep ?? 0.25; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_/step); return `fund${tier>=0?'+':''}${tier}`; }
+              if (/^vm/.test(c)) { const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i,'').toLowerCase())||0; const tv = parseFloat(t.turnover24h||0); const step = this.cfg.miwVmStep ?? 1; const tier = mc > 0 ? Math.floor(tv/mc*100/step) : 0; return `vm+${tier}`; }
+              if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._miwGetKlineSync(t.symbol); const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.miwSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
               return c;
             });
             if (typeof this.persist === 'function') this.persist();
@@ -1012,7 +1232,7 @@
 
         _miwGenerateCombos(size) {
           const exclude = new Set(this.cfg.miwAutoSlotExclude || []);
-          const all = ['+fund','-fund','+24h','-24h','>10pct','<10pct','lsa','lba','rasl','rabl','sliq','bliq'].filter(c => !exclude.has(c));
+          const all = ['fund','+24h','-24h','vm','lsa','lba','rasl','rabl','sliq','bliq','iot','iom'].filter(c => !exclude.has(c));
           const result = [];
           const pick = (start, current) => {
             if (current.length === size) { result.push([...current]); return; }

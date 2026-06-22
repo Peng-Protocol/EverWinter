@@ -128,18 +128,24 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 
 | Criterion | Meaning |
 |---|---|
-| `+fund` | Funding rate favors the position direction — carry income for the bot. |
-| `-fund` | Funding rate is adverse to the position direction. |
+| `fund>N` | Funding rate at or above tier N (longs paying shorts). `fund>1` at 0.25% step requires FR ≥ 0.25%. Carry income for the short side. |
+| `fund<-N` | Funding rate at or below tier −N (shorts paying longs). `fund<-1` requires FR ≤ −0.25%. Carry income for the long side. |
 | `+24h` | Ticker is up on the day. |
 | `-24h` | Ticker is down on the day. |
-| `>10pct` | 24h turnover exceeds 10% of market cap — high relative volume participation. |
-| `<10pct` | 24h turnover below 10% of market cap — low relative participation. |
-| `lsa` | Last completed 1h candle had a volume spike AND closed down — sell-side pressure. |
-| `lba` | Last completed 1h candle had a volume spike AND closed up — buy-side pressure. |
+| `vm>N` | 24h turnover/market cap ratio at or above tier N. `vm>10` at 1% step requires V/M ≥ 10% — a significant fraction of the coin's total value changed hands in a day. |
+| `vm<N` | V/M ratio below tier N — the coin moved but volume didn't follow. Fade case: momentum without conviction. |
+| `lsa>N` | Last completed 1h candle closed down with volume ≥ N% above the 24h hourly average. Sell-side pressure with participation. |
+| `lba>N` | Last completed 1h candle closed up with volume ≥ N% above average. Buy-side pressure with participation. |
+| `rasl>N` | Last completed 1h candle closed red with volume ≥ N% *below* average. Quiet, uncontested selling. |
+| `rabl>N` | Last completed 1h candle closed green with volume ≥ N% below average. Quiet, uncontested buying. |
+| `iot>N` / `iot<N` | OI vs Turnover ratio at tier N (1% step by default). High OI relative to turnover signals conviction or stickiness — the market is holding open positions rather than trading them away. |
+| `iom>N` / `iom<N` | OI vs Market Cap ratio at tier N (1% step by default). High OI relative to mcap signals leverage concentration — a large share of the coin's float is leveraged open interest. |
 | `sliq` / `sliq>N` / `sliq<N` | Short liquidations dominated the latest liq cycle for this ticker (bullish flow). Optional depth suffix gates by intensity. Requires Permafrost/Ashfall with liquidation surveillance on. |
 | `bliq` / `bliq>N` / `bliq<N` | Long liquidations dominated the latest liq cycle (bearish flow). Same depth gate mechanism as sliq. |
 
-Depth gate: `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. `sDepth` is an integer score where 0 = average hourly liq volume for that ticker, positive = above average, negative = below. Without a suffix the depth gate is skipped.
+**Tier gate**: all tiered criteria (`fund`, `vm`, `lsa`, `lba`, `rasl`, `rabl`, `iot`, `iom`) compute an integer tier as `floor(value / step)` and compare it against N. Step sizes are configurable per criterion under **Tier Step Sizes** in the Entry Zone. The same tier is recorded on the position and used as the scorecard key — `lsa>25` and `lsa+37` are different tiers and scored separately.
+
+**Depth gate** (sliq/bliq only): `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. `sDepth` is an integer score where 0 = average hourly liq volume for that ticker, positive = above, negative = below. Without a suffix the depth gate is skipped.
 
 ### Config
 
@@ -147,11 +153,15 @@ Depth gate: `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. 
 |---|---|
 | **Enabled** (`miwEnabled`/`micEnabled`) | Master on/off. When off, the plugin opens no entries and runs no exits. |
 | **Picks** (`miwPicks`/`micPicks`) | Max new entries per scan cycle (1–10). |
-| **FR Threshold** (`miwFrThreshold`/`micFrThreshold`) | Minimum funding rate magnitude (%) for `+fund`/`-fund` to qualify. |
 | **Share Cap** (`miwShareCapEnabled`/`micShareCapEnabled`) | Limits plugin entries to a percentage of `maxPos`. Prevents MIW/MIC from filling all position slots. |
 | **Share Cap %** (`miwShareCapPct`/`micShareCapPct`) | The cap percentage. At 50% with maxPos=6, MIW/MIC can hold at most 3 positions. |
-| **Vol Spike Min/Max** (`miwKlineVolMin`/`miwKlineVolMax`) | The spike band for LSA/LBA: the 1h candle volume must fall within this % range above the 24h hourly average. Too weak or too violent evaluates false. |
-| **Kline Scan Cap** (`miwKlineScanCap`/`micKlineScanCap`) | Max tickers sampled per cycle for LSA/LBA kline fetches. Higher = broader coverage, more API calls. |
+| **Kline Scan Cap** (`miwKlineScanCap`/`micKlineScanCap`) | Max tickers sampled per cycle for kline-based criteria (lsa/lba/rasl/rabl) fetches. Higher = broader coverage, more API calls. |
+| **V/M Scan Cap** (`miwMcapScanCap`/`micMcapScanCap`) | Max tickers for which CoinGecko market cap is fetched per scan cycle. Tickers are pre-screened by fund rate and 24h direction before the cap is applied, so only genuine candidates count against it. Bounding this keeps the CG request small and prevents failed fetches from leaving stale market cap data in the pool. Default 50. |
+| **Fund Step** (`miwFundStep`/`micFundStep`) | Tier step size for `fund` criteria in % of funding rate. Default 0.25 — one tier per 0.25% FR. At this step, `fund>1` requires FR ≥ 0.25%. |
+| **V/M Step** (`miwVmStep`/`micVmStep`) | Tier step size for `vm` criteria in % of volume/market cap ratio. Default 1. `vm>10` at step 1 requires V/M ≥ 10%. |
+| **Spike Step** (`miwSpikeStep`/`micSpikeStep`) | Tier step size for `lsa`, `lba`, `rasl`, and `rabl` in % above or below the 24h hourly average. Default 1. `lsa>25` at step 1 requires volume ≥ 25% above average. |
+| **IO/T Step** (`miwIotStep`/`micIotStep`) | Tier step size for `iot` criteria in % of OI/turnover ratio. Default 1. |
+| **IO/M Step** (`miwIomStep`/`micIomStep`) | Tier step size for `iom` criteria in % of OI/market cap ratio. Default 1. |
 | **Cascade** (`miwCascadeEnabled`/`micCascadeEnabled`) | Closes all MIW/MIC positions when their collective unrealized profit hits a threshold. Banks a group move before it reverses. |
 | **Cascade %** (`miwCascadePct`/`micCascadePct`) | Collective uPnL trigger as a % of average entry margin. |
 | **Sacrifice** (`miwSacrificeEnabled`/`micSacrificeEnabled`) | Closes MIW/MIC positions when their collective unrealized loss hits a threshold. Caps group drawdown. |
@@ -171,7 +181,7 @@ Depth gate: `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. 
 
 **Manual mode**: click a slot to select it, then toggle criteria on/off in the picker row below. ✕ deletes the slot; `+` adds a new empty one.
 
-**Auto mode**: the manual builder is replaced by a size picker and an exclusion chip row. The combo count shown reflects how many slots are active after exclusions and blocks. Note that many generated combinations are contradictory and will never match any ticker — a slot containing both `+fund` and `-fund`, or both `+24h` and `-24h`, can never be satisfied simultaneously. The same applies to `lsa`/`rasl` (direct opposites) and `lba`/`rabl`. At size 2 these pairs are common, so the effective slot count is lower than the number shown. Excluding one side of each pair removes the dead combinations. Additionally, `lsa`/`lba`/`rasl`/`rabl` almost never co-qualify with `>10pct`/`<10pct` in the same slot: vol/mcap criteria apply only to the top 30 tickers by turnover, while kline criteria apply to a random sample drawn from the full pool — the overlap between those two subsets is small in practice.
+**Auto mode**: the manual builder is replaced by a size picker and an exclusion chip row. The combo count shown reflects how many slots are active after exclusions and blocks. Note that many generated combinations are contradictory and will never match any ticker — a slot containing both `+24h` and `-24h` can never be satisfied simultaneously, nor can any two from the candle group (`lsa`, `lba`, `rasl`, `rabl`), since a candle can only close in one direction with one volume character at a time. At size 2 these pairs are common, so the effective slot count is lower than the number shown. Excluding one side of each pair removes the dead combinations. Additionally, `lsa`/`lba`/`rasl`/`rabl` almost never co-qualify with `vm` criteria in the same slot: `vm` criteria apply only to the top 30 tickers by turnover, while kline criteria apply to a random sample drawn from the full pool — the overlap between those two subsets is small in practice.
 
 **Blocked slots** show a red border and ⛔ badge. A slot is blocked when the Permafrost/Ashfall scorecard has recorded enough losses for that criteria combination to cross the loss threshold.
 
@@ -194,6 +204,7 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **PLK Trigger Score** (`permafrostPlkScore`/`ashfallPlkScore`) | How hostile the climate must be (−0.05 to −0.50) to engage a preemptive lock. More negative = harder to trigger. |
 | **IO Sentiment** | Includes funding rate sentiment (which side is paying) in the climate score. |
 | **Slot Scorecard** (`permafrostScorecardEnabled`/`ashfallScorecardEnabled`) | Records realized PnL per MIW/MIC criteria combination. Shows which slot types have been profitable or losing over time. |
+| **Sponge Quota** (`pfSpongeQuota`/`afSpongeQuota`) | How many recent closes per slot are used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation to recent performance; higher = more stable scores that smooth out short streaks. Default 30. |
 | **Auto Block** (`permafrostAutoBlock`/`ashfallAutoBlock`) | Automatically blocks slot combinations that have accumulated too many losses. A slot is blocked when own losses OR partner wins independently exceed the threshold — a coin-flip slot that breaks even overall can still be blocked if one side is consistently losing. |
 | **Block Threshold** (`permafrostSlotLossThreshold`/`ashfallSlotLossThreshold`) | Loss threshold (as a fraction of entry margin) applied independently to own-side gross losses and partner-side gross wins. Wins never offset losses — a slot that loses $1 and wins $0.90 is still blocked by the loss side alone. Raising Min Notional raises the threshold proportionally, which can naturally unblock slots without clearing the scorecard. |
 | **Cross Broadcast** (`permafrostCrossEnabled`/`ashfallCrossEnabled`) | Writes cascade/sacrifice closes and drawdown halt/gains-lock transitions to a shared log that the partner bot can read. Required for Mutual DDH Lift. |
@@ -208,7 +219,7 @@ Shows the current climate reading (magnitude, breadth, slope, IO score, effectiv
 
 ### Slot Scorecard
 
-Chip row showing each criteria combination with its net PnL in bold and win/loss count. Blocked slots render in purple. The **Combined / Own** toggle at the bottom switches between two views: Combined includes partner bot trades with PnL inverted (a Winter win counts against Chaser's scorecard) sorted by blended total; Own shows and sorts by this bot's own trades only.
+Chip row showing each criteria combination with its net PnL in bold and win/loss count. Each close writes one record; the Sponge Quota controls how many recent records per slot are factored in, so scores always reflect the most recent N closes. Blocked slots render in purple. The **Combined / Own** toggle at the bottom switches between two views: Combined includes partner bot trades with PnL inverted (a Winter win counts against Chaser's scorecard) sorted by blended total; Own shows and sorts by this bot's own trades only.
 
 **Clicking a chip** reveals the gross figure that drives the block decision — in Combined mode this shows the raw partner win total; in Own mode it shows the raw own loss total. Clicking again or switching sort mode returns to the normal view. Auto-block decisions always use the full split data regardless of which view is active.
 
@@ -243,7 +254,7 @@ Developer-level detail with no operational consequence. Included for reference.
 | `__ash_liq_batches` | Ashfall active liq batch snapshots |
 | `__permafrost_winter_v1` | Permafrost profile: events, samples, wave history |
 | `__ashfall_chaser_v1` | Ashfall profile |
-| `__everwinter_scorecard_v1` | Shared slot scorecard written by both plugins, 30-day TTL |
+| `__everwinter_scorecard_v1` | Shared slot scorecard written by both plugins. Each close is one record; each slot retains up to the Sponge Quota most recent records. |
 | `__cgCoinList` | CoinGecko coin list cache (24-hour TTL) |
 | `__ew_creds` | EverWinter live plugin API credentials |
 | `__sc_creds` | SunChaser live plugin API credentials |

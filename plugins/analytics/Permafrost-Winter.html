@@ -44,15 +44,30 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.21.2';
+  const VERSION        = '1.22.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
   const SCORE_KEY      = '__everwinter_scorecard_v1';
-  const SCORE_TTL      = 30 * 24 * 3600 * 1000;
-  const PF_CRIT_EMOJI  = { '+fund': '🤑', '-fund': '💸', '+24h': '⬆️', '-24h': '⬇️', '>10pct': '🔊', '<10pct': '🔉', 'lsa': '🟥', 'lba': '🟩', 'rasl': '🔴', 'rabl': '🟢', 'sliq': '🥵', 'bliq': '🥶' };
+  const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
+  const pfCritEmoji = c => {
+    if (/^fund/.test(c)) { const s = c.slice(4); const num = parseFloat(s.replace(/^[<>]/,'')); return (num < 0 ? '💸' : '🤑') + s; }
+    if (/^vm/.test(c))   return '🔊' + c.slice(2);
+    if (/^lsa/.test(c))  return '🟥' + c.slice(3);
+    if (/^lba/.test(c))  return '🟩' + c.slice(3);
+    if (/^rasl/.test(c)) return '🔴' + c.slice(4);
+    if (/^rabl/.test(c)) return '🟢' + c.slice(4);
+    if (/^sliq/.test(c)) return '🥵' + c.slice(4);
+    if (/^bliq/.test(c)) return '🥶' + c.slice(4);
+    if (/^iot/.test(c))  return '🎲' + c.slice(3);
+    if (/^iom/.test(c))  return '🧲' + c.slice(3);
+    if (c === '+24h') return '⬆️'; if (c === '-24h') return '⬇️';
+    if (c === '+fund') return '🤑'; if (c === '-fund') return '💸';
+    if (c === '>10pct') return '🔊'; if (c === '<10pct') return '🔉';
+    return c;
+  };
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old scars fade
   const EVENT_W        = 10;                   // halt events are strong anchors
@@ -158,7 +173,17 @@
                 </div>
               </label>
               <div x-show="cfg.permafrostScorecardEnabled" style="margin-top:8px">
-                <label class="tog" @click.prevent="if(!cfgLocked){cfg.permafrostAutoBlock=!cfg.permafrostAutoBlock;_pfScoreBuild();persist()}">
+                <div class="g">
+                  <div class="lbl">Sponge Quota <b x-text="cfg.pfSpongeQuota??30"></b> closes/slot</div>
+                  <input type="range" min="10" max="200" step="10" x-model.number="cfg.pfSpongeQuota" @change="_pfScoreBuild();persist()">
+                  <div class="pfr-hint">Max recent closes per slot used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation.</div>
+                </div>
+                <div class="g" style="margin-top:8px">
+                  <div class="lbl">Stale Purge <b x-text="cfg.pfStaleSlotDays??7"></b> days</div>
+                  <input type="range" min="1" max="90" step="1" x-model.number="cfg.pfStaleSlotDays" @change="_pfScoreTrim();_pfScoreBuild();persist()">
+                  <div class="pfr-hint">Slots with no new closes in this many days are fully removed from the scorecard.</div>
+                </div>
+                <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.permafrostAutoBlock=!cfg.permafrostAutoBlock;_pfScoreBuild();persist()}">
                   <div class="tog-t" :class="cfg.permafrostAutoBlock?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Auto Block</div>
@@ -371,6 +396,8 @@
           if (this.cfg.permafrostScorecardEnabled        === undefined) this.cfg.permafrostScorecardEnabled        = false;
           if (this.cfg.permafrostAutoBlock               === undefined) this.cfg.permafrostAutoBlock               = false;
           if (this.cfg.permafrostSlotLossThreshold       === undefined) this.cfg.permafrostSlotLossThreshold       = 0.25;
+          if (this.cfg.pfSpongeQuota                     === undefined) this.cfg.pfSpongeQuota                     = 30;
+          if (this.cfg.pfStaleSlotDays                   === undefined) this.cfg.pfStaleSlotDays                   = 7;
           if (this.cfg.pfLiqEnabled      === undefined) this.cfg.pfLiqEnabled      = false;
           if (this.cfg.pfLiqBatchSize    === undefined) this.cfg.pfLiqBatchSize    = 25;
           if (this.cfg.pfLiqThresholdPct === undefined) this.cfg.pfLiqThresholdPct = 50;
@@ -395,6 +422,7 @@
               this._liqCycleCounter = Math.max(this._liqCycleCounter, last.id || 0);
             }
           } catch(_) {}
+          this._pfScoreTrim();
           this._pfScoreBuild();
           try {
             const raw = localStorage.getItem(PFR_KEY);
@@ -683,25 +711,65 @@
           try {
             const raw = localStorage.getItem(SCORE_KEY);
             if (!raw) return [];
-            const cut = Date.now() - SCORE_TTL;
+            const cut = Date.now() - SCORE_SAFETY_TTL;
             return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
           } catch(e) { return []; }
+        },
+        _pfScoreTrim() {
+          try {
+            const records   = this._pfScoreRead();
+            const quota     = this.cfg.pfSpongeQuota   ?? 30;
+            const staleDays = this.cfg.pfStaleSlotDays ?? 7;
+            const staleMs   = staleDays * 24 * 3600 * 1000;
+            const now       = Date.now();
+            const LEGACY    = new Set(['+fund','-fund','>10pct','<10pct','lsa','lba','rasl','rabl']);
+            const isLegacy  = r => r.criteria.some(c => LEGACY.has(c));
+            const bySlot = {};
+            for (const r of records) {
+              if (isLegacy(r)) continue;
+              const k = [...r.criteria].sort().join(',');
+              if (!bySlot[k]) bySlot[k] = [];
+              bySlot[k].push(r);
+            }
+            const trimmed = [];
+            for (const recs of Object.values(bySlot)) {
+              recs.sort((a, b) => b.ts - a.ts);
+              const kept = recs.slice(0, quota);
+              if (kept.length && now - kept[0].ts < staleMs) trimmed.push(...kept);
+            }
+            localStorage.setItem(SCORE_KEY, JSON.stringify(trimmed));
+          } catch(e) {}
         },
         _pfScoreWrite(criteria, pnl) {
           try {
             const records = this._pfScoreRead();
             records.push({ ts: Date.now(), criteria, pnl, source: 'winter' });
-            localStorage.setItem(SCORE_KEY, JSON.stringify(records));
+            const quota = this.cfg.pfSpongeQuota ?? 30;
+            const bySlot = {};
+            for (const r of records) {
+              const k = [...r.criteria].sort().join(',');
+              if (!bySlot[k]) bySlot[k] = [];
+              bySlot[k].push(r);
+            }
+            const trimmed = [];
+            for (const recs of Object.values(bySlot)) {
+              recs.sort((a, b) => b.ts - a.ts);
+              trimmed.push(...recs.slice(0, quota));
+            }
+            localStorage.setItem(SCORE_KEY, JSON.stringify(trimmed));
           } catch(e) {}
         },
         _pfScoreBuild() {
           const records = this._pfScoreRead();
           const exclude = new Set(this.cfg.miwAutoSlotExclude || []);
+          const quota = this.cfg.pfSpongeQuota ?? 30;
           const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
+          const slotCount = {};
           const map = {};
-          for (const r of records) {
+          for (const r of [...records].sort((a, b) => b.ts - a.ts)) {
             if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
             const key = [...r.criteria].sort().join(',');
+            if ((slotCount[key] = (slotCount[key] ?? 0) + 1) > quota) continue;
             if (!map[key]) map[key] = { criteria: r.criteria, ownPnl: 0, ownWins: 0, ownLosses: 0, ownLossSum: 0, partnerPnl: 0, partnerWins: 0, partnerLosses: 0, partnerWinSum: 0 };
             const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
             if (r.source === 'winter') {
@@ -744,7 +812,7 @@
             const key = [...s.criteria].sort().join(',');
             const isBlocked = blocks[key] === 'blocked';
             const isExpanded = expanded === key;
-            const emoji = s.criteria.map(c => /^sliq/.test(c) ? '🥵' + c.slice(4) : /^bliq/.test(c) ? '🥶' + c.slice(4) : (PF_CRIT_EMOJI[c] || c)).join('');
+            const emoji = s.criteria.map(pfCritEmoji).join('');
             let clr, bg, bdr;
             if (isBlocked) {
               clr = 'rgba(180,100,255,.9)'; bg = 'rgba(180,100,255,.08)'; bdr = 'rgba(180,100,255,.7)';
