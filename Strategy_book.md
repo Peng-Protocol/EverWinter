@@ -81,8 +81,8 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 - **fund<-N** — The funding rate has reached tier −N (shorts paying longs). At the default step, `fund<-1` requires FR ≤ −0.25%. An overcrowded short side with carry embedded for the long.
 - **+24h** — The ticker's 24-hour price change is positive. The day's character is currently bullish for this coin.
 - **-24h** — The 24-hour price change is negative. The day is currently bearish for this coin.
-- **vm>N** — The ticker's 24-hour trading volume exceeds tier N of its market cap (1% step by default). `vm>10` requires volume above 10% of market cap. A significant fraction of the coin's entire value changed hands in a day — unusually high participation that confirms momentum is broadly backed, not a thin-market artifact.
-- **vm<N** — Volume below tier N of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
+- **V/M>N** — The ticker's 24-hour trading volume exceeds tier N of its market cap (1% step by default). `V/M>10` requires volume above 10% of market cap. A significant fraction of the coin's entire value changed hands in a day — unusually high participation that confirms momentum is broadly backed, not a thin-market artifact.
+- **V/M<N** — Volume below tier N of market cap. The coin moved but the market did not chase it. This is the fade case: momentum without conviction.
 - **lsa>N** — The last completed hourly candle had volume at least N tiers above the 24h hourly average and closed lower than it opened. A high-volume down candle is sell-side pressure with the market actively participating — not drifting, not choppy, but decisively pointing down. Use this to confirm bearish momentum with volume backing before entering the short side.
 - **lba>N** — The mirror: volume at least N tiers above average, green close. The market pushed up into the candle and held the gains. Use this to confirm bullish momentum with genuine buying participation before entering the long side.
 - **rasl>N** — The last completed hourly candle closed red with volume at least N tiers *below* the daily average — the market moved down without a volume surge. Quiet, uncontested selling: no crowd participation, no obvious catalyst. Can signal a slow bleed or a low-conviction pullback that is easier to trade than a violent spike.
@@ -332,7 +332,7 @@ DCA structure adds margin at each subsequent stage.
 
 ## Conclusion
 
-These strategies are designed for automation. The mental overhead of manually tracking RSI gates across three timeframes, lock-in ratchet state per symbol, drawdown throttle thresholds, EDa TP adjustments across multiple open positions, and simultaneous management of a full position book is overwhelming in real time. Automation handles it without error.
+These strategies are designed for automation. The mental overhead of manually tracking drawdown throttle states, climate profile scores, scorecard blocks, EDa TP adjustments across multiple open positions, and simultaneous management of a full position book is overwhelming in real time. Automation handles it without error.
 
 The meta-structure approach means neither side needs to be right all day — just more right than wrong over a session. Drawdown throttling enforces a hard floor on any session's loss. The system works best when you let it run and resist the impulse to override.
 
