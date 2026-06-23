@@ -26,8 +26,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PseudoWinter.html` | v1.7.7 |
 | `PseudoChaser.html` | v1.3.8 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.17.6 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.17.6 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.18.0 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.18.0 |
 | `plugins/analytics/Permafrost-Winter.html` | v1.23.3 |
 | `plugins/analytics/Ashfall-Chaser.html` | v1.23.3 |
 
@@ -60,7 +60,5 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 - **Never use `window.confirm()`, `window.alert()`, or `window.prompt()` in plugin or bot UI.** These are blocked when the app runs in an iframe, silently returning `false`/`undefined` and making buttons appear unresponsive with no feedback. Use inline Alpine confirmation UI instead: wrap the button in `<span x-data="{c:false}">`, show the action button when `!c`, and when clicked set `c=true` to reveal inline "Sure? Yes / No" buttons that execute the action or reset `c`.
 
 ## Pending Tasks
-
-- **MIW/MIC: extend sanity cap check to cover IO/M.** Currently the V/M Sanity Cap toggle only mentions vol/mcap in its tooltip, but it gates the entire `mcapMap` — so IO/M is silently affected too. When extending, consider whether the check logic or UI should be renamed/broadened to make the IO/M coverage explicit. Delete this bullet once done.
 
 - **ChartWinter: add DexScreener as third mcap source.** Free, no API key, 300 req/min. Search by symbol (`api.dexscreener.com/latest/dex/search?q={symbol}`), then validate the returned `priceUsd` against Bybit's `lastPrice` within the existing 10% tolerance — same guard used for CG/CP. Use `marketCap` directly from the response. If no pair passes the price check (e.g. Bybit uses a conflict-resolution ticker the coin isn't listed under), skip silently — same as a CG/CP miss. Slot in as second fallback after CoinPaprika. Delete this bullet once done.

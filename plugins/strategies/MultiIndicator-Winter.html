@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.17.6';
+  const VERSION       = '1.18.0';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -342,6 +342,18 @@
                     <input type="range" min="0.1" max="2" step="0.05" x-model.number="cfg.miwVmSanityCap" @change="persist()">
                     <div class="miw-hint">Tickers where turnover24h / mcap exceeds this ratio are excluded from mcapMap for this cycle.</div>
                   </div>
+                  <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwIomSanityCheck=!cfg.miwIomSanityCheck;persist()}">
+                    <div class="tog-t" :class="cfg.miwIomSanityCheck?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">IO/M Sanity Cap</div>
+                      <div class="miw-hint">Rejects tickers from mcapMap where OI/mcap exceeds the cap. Filters absurd values from wrong-coin mcap data.</div>
+                    </div>
+                  </label>
+                  <div class="g" x-show="cfg.miwIomSanityCheck" style="margin-top:8px">
+                    <div class="lbl">Cap <b x-text="((cfg.miwIomSanityCap??0.2)*100).toFixed(0)+'%'"></b> OI/mcap</div>
+                    <input type="range" min="0.05" max="1" step="0.05" x-model.number="cfg.miwIomSanityCap" @change="persist()">
+                    <div class="miw-hint">Tickers where openInterestValue / mcap exceeds this ratio are excluded from mcapMap for this cycle.</div>
+                  </div>
                 </div><!-- end entry slots section -->
               </div><!-- end entry zone -->
 
@@ -570,6 +582,8 @@
           if (this.cfg.miwMcapFreshCycles      === undefined) this.cfg.miwMcapFreshCycles      = 6;
           if (this.cfg.miwVmSanityCheck        === undefined) this.cfg.miwVmSanityCheck        = false;
           if (this.cfg.miwVmSanityCap          === undefined) this.cfg.miwVmSanityCap          = 0.5;
+          if (this.cfg.miwIomSanityCheck       === undefined) this.cfg.miwIomSanityCheck       = false;
+          if (this.cfg.miwIomSanityCap         === undefined) this.cfg.miwIomSanityCap         = 0.2;
           this._miwFreshMcapBases    = null;
           this._miwLiqBlocked        = false;
           this._miwLiqBias           = null;
@@ -949,7 +963,9 @@
               const cgId = this._miwCoinIdCache?.[b];
               if (cgId && (_mcapNow - (this._miwMcapCache?.[cgId]?.ts ?? 0)) <= _mcapMaxAge) return true;
               const cpId = this._miwCpIdCache?.[b];
-              return cpId && (_mcapNow - (this._miwSupplyCache?.[cpId]?.ts ?? 0)) <= _mcapMaxAge;
+              if (cpId && (_mcapNow - (this._miwSupplyCache?.[cpId]?.ts ?? 0)) <= _mcapMaxAge) return true;
+              const ds = this._miwDsCache?.[b];
+              return !!ds?.mcap && (_mcapNow - (ds.ts ?? 0)) <= _mcapMaxAge;
             }));
             for (const t of mcapPool) {
               const mcap = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase(), parseFloat(t.lastPrice || 0));
@@ -957,6 +973,10 @@
                 if (this.cfg.miwVmSanityCheck) {
                   const vmRatio = parseFloat(t.turnover24h || 0) / mcap;
                   if (vmRatio > (this.cfg.miwVmSanityCap ?? 0.5)) continue;
+                }
+                if (this.cfg.miwIomSanityCheck) {
+                  const iomRatio = parseFloat(t.openInterestValue || 0) / mcap;
+                  if (iomRatio > (this.cfg.miwIomSanityCap ?? 0.2)) continue;
                 }
                 mcapMap[t.symbol] = mcap;
               }
@@ -1213,11 +1233,13 @@
 
         // Supply cache via CoinPaprika (no API key). ID list cached 24h in localStorage (__cpCoinList).
         // Supply cache: CP coin id → { supply, ts } (24h TTL). Shared with partner via 'cpSupply' key.
+        // DexScreener cache: base → { mcap, dsPrice, ts } (CG_TTL). Shared with partner via 'dsMcap' key.
         async _miwPrefetchMcaps(bases) {
           if (!this._miwCoinIdCache)  this._miwCoinIdCache  = {};
           if (!this._miwMcapCache)    this._miwMcapCache    = {};
           if (!this._miwCpIdCache)    this._miwCpIdCache    = {};
           if (!this._miwSupplyCache)  this._miwSupplyCache  = {};
+          if (!this._miwDsCache)      this._miwDsCache      = {};
           const now        = Date.now();
           const CG_TTL     = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
           const SUPPLY_TTL = 86_400_000;
@@ -1350,6 +1372,50 @@
             }
             if (Object.keys(_cpPatch).length) this._sharedMerge('cpSupply', _cpPatch);
           }
+
+          // ── DexScreener fallback for CG+CP misses ─────────────────────
+          const cpMissBases = bases.filter(b => {
+            const cgId = this._miwCoinIdCache[b];
+            if (cgId && this._miwMcapCache[cgId]) return false;
+            const cpId = this._miwCpIdCache[b];
+            return !cpId || !this._miwSupplyCache[cpId];
+          });
+
+          if (cpMissBases.length) {
+            const sharedDs = this._sharedRead('dsMcap');
+            if (sharedDs?.data) {
+              for (const [base, entry] of Object.entries(sharedDs.data)) {
+                if ((now - (entry.ts || 0)) < CG_TTL && !this._miwDsCache[base]) {
+                  this._miwDsCache[base] = entry;
+                }
+              }
+            }
+
+            const dsStale = cpMissBases.filter(b => {
+              const c = this._miwDsCache[b];
+              return !c || now - c.ts >= CG_TTL;
+            });
+
+            const _dsPatch = {};
+            for (const base of dsStale) {
+              try {
+                const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(base)}`);
+                if (r.ok) {
+                  const d = await r.json();
+                  const pairs = (d?.pairs || []).filter(p => p.baseToken?.symbol?.toLowerCase() === base);
+                  let entry = { mcap: null, dsPrice: null, ts: now };
+                  for (const p of pairs) {
+                    const dsPrice = parseFloat(p.priceUsd || 0);
+                    const mcap    = p.marketCap;
+                    if (mcap && dsPrice) { entry = { mcap, dsPrice, ts: now }; break; }
+                  }
+                  this._miwDsCache[base] = entry;
+                  _dsPatch[base] = entry;
+                }
+              } catch(e) {}
+            }
+            if (Object.keys(_dsPatch).length) this._sharedMerge('dsMcap', _dsPatch);
+          }
         },
 
         _miwGetMcapSync(base, price) {
@@ -1364,6 +1430,8 @@
             const c = this._miwSupplyCache?.[cpId];
             if (c?.supply && price > 0 && ok(c.cpPrice)) return c.supply * price;
           }
+          const ds = this._miwDsCache?.[base];
+          if (ds?.mcap && ok(ds.dsPrice)) return ds.mcap;
           return null;
         },
 
