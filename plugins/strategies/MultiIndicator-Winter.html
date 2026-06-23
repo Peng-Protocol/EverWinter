@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.17.2';
+  const VERSION       = '1.17.3';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -930,8 +930,10 @@
             const bases = mcapPool.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
             await this._miwPrefetchMcaps(bases);
             this._miwFreshMcapBases = new Set(bases.filter(b => {
-              const id = this._miwCpIdCache?.[b];
-              return id && !!this._miwSupplyCache?.[id]?.supply;
+              const cgId = this._miwCoinIdCache?.[b];
+              if (cgId && this._miwMcapCache?.[cgId]) return true;
+              const cpId = this._miwCpIdCache?.[b];
+              return cpId && !!this._miwSupplyCache?.[cpId]?.supply;
             }));
             for (const t of mcapPool) {
               const mcap = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase(), parseFloat(t.lastPrice || 0));
@@ -1184,12 +1186,82 @@
         // Supply cache via CoinPaprika (no API key). ID list cached 24h in localStorage (__cpCoinList).
         // Supply cache: CP coin id → { supply, ts } (24h TTL). Shared with partner via 'cpSupply' key.
         async _miwPrefetchMcaps(bases) {
+          if (!this._miwCoinIdCache)  this._miwCoinIdCache  = {};
+          if (!this._miwMcapCache)    this._miwMcapCache    = {};
           if (!this._miwCpIdCache)    this._miwCpIdCache    = {};
           if (!this._miwSupplyCache)  this._miwSupplyCache  = {};
-          const now     = Date.now();
+          const now        = Date.now();
+          const CG_TTL     = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
           const SUPPLY_TTL = 86_400_000;
-          const unknown = bases.filter(b => this._miwCpIdCache[b] === undefined);
-          if (unknown.length) {
+
+          // ── CoinGecko primary ──────────────────────────────────────────
+          const cgUnknown = bases.filter(b => this._miwCoinIdCache[b] === undefined);
+          if (cgUnknown.length) {
+            if (!window.__cgCoinList) {
+              try {
+                const s = JSON.parse(localStorage.getItem('__cgCoinList') || 'null');
+                if (s?.list?.length && now - s.ts < 86_400_000) window.__cgCoinList = s.list;
+              } catch(e) {}
+            }
+            if (!window.__cgCoinList) {
+              try {
+                const r = await fetch('https://api.coingecko.com/api/v3/coins/list?include_platform=false');
+                if (r.ok) {
+                  window.__cgCoinList = await r.json();
+                  try { localStorage.setItem('__cgCoinList', JSON.stringify({ list: window.__cgCoinList, ts: now })); } catch(e) {}
+                }
+              } catch(e) {}
+            }
+            if (window.__cgCoinList) {
+              for (const base of cgUnknown) {
+                const hit = window.__cgCoinList.find(c => c.symbol === base);
+                this._miwCoinIdCache[base] = hit?.id || '';
+              }
+            }
+          }
+
+          // Seed CG mcap from shared (partner already price-validated)
+          const sharedMcap = this._sharedRead('mcap');
+          if (sharedMcap?.data) {
+            for (const [id, entry] of Object.entries(sharedMcap.data)) {
+              if (entry?.mcap && (now - (entry.ts || 0)) < CG_TTL && !this._miwMcapCache[id]) {
+                this._miwMcapCache[id] = { mcap: entry.mcap, cgPrice: entry.cgPrice, ts: entry.ts };
+              }
+            }
+          }
+
+          const cgIds = [...new Set(bases.map(b => this._miwCoinIdCache[b]).filter(id => {
+            if (!id) return false;
+            const c = this._miwMcapCache[id];
+            return !c || now - c.ts >= CG_TTL;
+          }))];
+
+          if (cgIds.length) {
+            try {
+              const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${cgIds.join(',')}&vs_currencies=usd&include_market_cap=true`);
+              if (r.ok) {
+                const d = await r.json();
+                const _patch = {};
+                for (const id of cgIds) {
+                  const mcap  = d?.[id]?.usd_market_cap;
+                  const price = d?.[id]?.usd;
+                  if (mcap) {
+                    this._miwMcapCache[id] = { mcap, cgPrice: price, ts: now };
+                    _patch[id] = { mcap, cgPrice: price, ts: now };
+                  }
+                }
+                if (Object.keys(_patch).length) this._sharedMerge('mcap', _patch);
+              }
+            } catch(e) {}
+          }
+
+          // ── CoinPaprika fallback for CG misses ────────────────────────
+          const cgMissBases = bases.filter(b => {
+            const id = this._miwCoinIdCache[b];
+            return !id || !this._miwMcapCache[id];
+          });
+
+          if (cgMissBases.length) {
             if (!window.__cpCoinList) {
               try {
                 const s = JSON.parse(localStorage.getItem('__cpCoinList') || 'null');
@@ -1205,8 +1277,20 @@
                 }
               } catch(e) {}
             }
-            if (window.__cpCoinList) {
-              for (const base of unknown) {
+
+            // Seed CP supply from shared
+            const sharedSupply = this._sharedRead('cpSupply');
+            if (sharedSupply?.data) {
+              for (const [id, entry] of Object.entries(sharedSupply.data)) {
+                if (entry?.supply && (now - (entry.ts || 0)) < SUPPLY_TTL && !this._miwSupplyCache[id]) {
+                  this._miwSupplyCache[id] = { supply: entry.supply, cpPrice: entry.cpPrice, ts: entry.ts };
+                }
+              }
+            }
+
+            const cpUnknown = cgMissBases.filter(b => this._miwCpIdCache[b] === undefined);
+            if (cpUnknown.length && window.__cpCoinList) {
+              for (const base of cpUnknown) {
                 const candidates = window.__cpCoinList.filter(c => c.symbol?.toLowerCase() === base);
                 const active = candidates.filter(c => c.is_active);
                 const pool = active.length ? active : candidates;
@@ -1214,42 +1298,45 @@
                 this._miwCpIdCache[base] = hit?.id || '';
               }
             }
-          }
-          // Seed from shared supply — avoids refetching what partner already resolved
-          const sharedSupply = this._sharedRead('cpSupply');
-          if (sharedSupply?.data) {
-            for (const [id, entry] of Object.entries(sharedSupply.data)) {
-              if (entry?.supply && (now - (entry.ts || 0)) < SUPPLY_TTL && !this._miwSupplyCache[id]) {
-                this._miwSupplyCache[id] = { supply: entry.supply, ts: entry.ts };
-              }
-            }
-          }
-          const staleIds = [...new Set(
-            bases.map(b => this._miwCpIdCache[b]).filter(id => {
+
+            const cpStale = [...new Set(cgMissBases.map(b => this._miwCpIdCache[b]).filter(id => {
               if (!id) return false;
               const c = this._miwSupplyCache[id];
               return !c || now - c.ts >= SUPPLY_TTL;
-            })
-          )];
-          const _patch = {};
-          for (const id of staleIds) {
-            try {
-              const r = await fetch(`https://api.coinpaprika.com/v1/tickers/${id}?quotes=USD`);
-              if (r.ok) {
-                const d = await r.json();
-                const supply = d?.circulating_supply;
-                if (supply) { this._miwSupplyCache[id] = { supply, ts: now }; _patch[id] = { supply, ts: now }; }
-              }
-            } catch(e) {}
+            }))];
+
+            const _cpPatch = {};
+            for (const id of cpStale) {
+              try {
+                const r = await fetch(`https://api.coinpaprika.com/v1/tickers/${id}?quotes=USD`);
+                if (r.ok) {
+                  const d = await r.json();
+                  const supply  = d?.circulating_supply;
+                  const cpPrice = d?.quotes?.USD?.price;
+                  if (supply) {
+                    this._miwSupplyCache[id] = { supply, cpPrice, ts: now };
+                    _cpPatch[id] = { supply, cpPrice, ts: now };
+                  }
+                }
+              } catch(e) {}
+            }
+            if (Object.keys(_cpPatch).length) this._sharedMerge('cpSupply', _cpPatch);
           }
-          if (Object.keys(_patch).length) this._sharedMerge('cpSupply', _patch);
         },
 
         _miwGetMcapSync(base, price) {
-          const id = this._miwCpIdCache?.[base];
-          if (!id) return null;
-          const c = this._miwSupplyCache?.[id];
-          return (c?.supply && price > 0) ? c.supply * price : null;
+          const ok = src => !price || !src || Math.abs(src - price) / price <= 0.10;
+          const cgId = this._miwCoinIdCache?.[base];
+          if (cgId) {
+            const c = this._miwMcapCache?.[cgId];
+            if (c && ok(c.cgPrice)) return c.mcap;
+          }
+          const cpId = this._miwCpIdCache?.[base];
+          if (cpId) {
+            const c = this._miwSupplyCache?.[cpId];
+            if (c?.supply && price > 0 && ok(c.cpPrice)) return c.supply * price;
+          }
+          return null;
         },
 
         _miwGenerateCombos(size) {
