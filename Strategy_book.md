@@ -241,9 +241,13 @@ A fresh installation has no history and places no weight on structure. After wee
 
 ### Structure Sampling
 
-At each cycle, a random sample of tickers is drawn from across the market and their last completed hourly candle tallied — how many closed red, how many closed green. The result can be charted as a two-sided bar — red on one end, green on the other — for better comprehension.
+Structure Sampling runs three parallel observations each cycle, each answering a distinct question about current market conditions.
 
-This is a snapshot, not a forecast. It tells you what a portion of the market did in the last hour (which may differ on the next random sampling), not what it will do next. Paired with the Fade Away exit, it forms a closed loop: the same candle sample that is charted is the one that triggers the position close when the balance is sufficiently one-sided. When the bar skews heavily in one direction, the positions exposed to that direction are at risk — Fade Away uses that observation to act automatically.
+**Candle direction** draws a random sample of tickers and tallies how many closed their last completed hourly candle red versus green. The result can be charted as a two-sided bar for quick comprehension. This is a snapshot, not a forecast — it tells you what a portion of the market did in the last hour, not what it will do next. Paired with the Fade Away exit, it forms a closed loop: when the bar skews heavily in one direction, positions exposed to that direction are at risk, and Fade Away uses that observation to act automatically.
+
+**Candle magnitude** goes further than red or green, sampling the actual percentage moves of those same candles. A market where everything moved ±0.2% is a different environment from one where tickers moved ±3–5%. This layer distinguishes low-conviction drift from high-conviction expansion — conditions where breakout and momentum entries carry more statistical weight. Entry criteria that reference abnormal volume relative to rolling averages draw on this magnitude reading to assess whether a spike is unusual relative to the current environment, not just large in absolute terms.
+
+**Liquidation flow** is a real-time layer running continuously alongside the candle samples. A rotating batch of volatile tickers is monitored for live liquidation activity, measuring which side — buyers or sellers — is being forced out and at what intensity. This is not a historical observation; it reflects what is happening in the market right now. Heavily one-sided liquidation pressure is an entry signal in its own right, and criteria that require it to qualify will only activate when the flow is sufficiently pronounced on the correct side.
 
 ---
 
