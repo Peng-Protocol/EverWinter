@@ -60,3 +60,5 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 - **Never use `window.confirm()`, `window.alert()`, or `window.prompt()` in plugin or bot UI.** These are blocked when the app runs in an iframe, silently returning `false`/`undefined` and making buttons appear unresponsive with no feedback. Use inline Alpine confirmation UI instead: wrap the button in `<span x-data="{c:false}">`, show the action button when `!c`, and when clicked set `c=true` to reveal inline "Sure? Yes / No" buttons that execute the action or reset `c`.
 
 ## Pending Tasks
+
+- **ChartWinter: add third mcap source option.** Currently CoinGecko (default, more reliable) and CoinPaprika are available as supply/mcap sources in MIW/MIC. Evaluate and add a third source option to ChartWinter's mcap lookup. Delete this bullet once done.
