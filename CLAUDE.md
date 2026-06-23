@@ -22,7 +22,7 @@ Each file carries its version in two or three places — update **all** that app
 
 | File | Version |
 |---|---|
-| `ChartWinter.html` | v1.4 |
+| `ChartWinter.html` | v1.5 |
 | `PseudoWinter.html` | v1.7.7 |
 | `PseudoChaser.html` | v1.3.8 |
 | `PsychoWinter1.0.html` | v1.0 |
@@ -61,4 +61,3 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 
 ## Pending Tasks
 
-- **ChartWinter: add DexScreener as third mcap source.** Free, no API key, 300 req/min. Search by symbol (`api.dexscreener.com/latest/dex/search?q={symbol}`), then validate the returned `priceUsd` against Bybit's `lastPrice` within the existing 10% tolerance — same guard used for CG/CP. Use `marketCap` directly from the response. If no pair passes the price check (e.g. Bybit uses a conflict-resolution ticker the coin isn't listed under), skip silently — same as a CG/CP miss. Slot in as second fallback after CoinPaprika. Delete this bullet once done.
