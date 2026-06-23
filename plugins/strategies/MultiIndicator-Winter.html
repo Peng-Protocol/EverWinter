@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.15.3';
+  const VERSION       = '1.17.6';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -262,7 +262,7 @@
                         @click.prevent="_miwAddSlot()"
                         style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(96,210,255,.06);border:1px dashed rgba(96,210,255,.3);border-radius:3px;color:var(--ice);cursor:pointer">+</button>
                     </div>
-                    <div class="miw-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. Vol/mcap criteria pull market cap from CoinGecko (1h cache). LSA/LBA/R-ASL/R-ABL fetch the last completed 1h kline per ticker.</div>
+                    <div class="miw-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. Vol/mcap criteria compute market cap from CoinPaprika supply × Bybit price. LSA/LBA/R-ASL/R-ABL fetch the last completed 1h kline per ticker.</div>
                     <div class="miw-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑/💸 Fund · ⬆️ +24h · ⬇️ -24h · 🔊 V/M · 🟥 LSA · 🟩 LBA · 🔴 R-ASL · 🟢 R-ABL · 🥵 S-Liq · 🥶 B-Liq · 🎲 IO/T · 🧲 IO/M — click any tiered criterion to configure gate</div>
                   </div><!-- end manual builder -->
                   <div class="g" style="margin-top:8px">
@@ -273,7 +273,7 @@
                   <div class="g" style="margin-top:8px">
                     <div class="lbl">V/M Scan Cap <b x-text="(cfg.miwMcapScanCap??50)"></b> tickers</div>
                     <input type="range" min="10" max="200" step="10" x-model.number="cfg.miwMcapScanCap" @change="persist()">
-                    <div class="miw-hint">Max tickers for CoinGecko market cap fetch per cycle. Pre-screened by fund rate and 24h direction first.</div>
+                    <div class="miw-hint">Max tickers for supply fetch per cycle. Pre-screened by fund rate and 24h direction first.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <div class="lbl" style="margin-bottom:4px">Tier Step Sizes</div>
@@ -318,6 +318,30 @@
                       <div class="miw-hint">Only considers tickers with a fresh liquidation surveillance result. Requires Liquidation Surveillance in Permafrost. Adds ~1h startup delay. Staleness limit: Liq Result Max Age (Fade tab).</div>
                     </div>
                   </label>
+                  <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwRequireMcapData=!cfg.miwRequireMcapData;persist()}">
+                    <div class="tog-t" :class="cfg.miwRequireMcapData?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Fresh V/M Only</div>
+                      <div class="miw-hint">V/M and OI/MCap criteria only pass if supply data is within the freshness window. Rejects stale data.</div>
+                    </div>
+                  </label>
+                  <div class="g" x-show="cfg.miwRequireMcapData" style="margin-top:8px">
+                    <div class="lbl">V/M Freshness <b x-text="(cfg.miwMcapFreshCycles??6)+' cycles'"></b></div>
+                    <input type="number" class="inp" min="1" max="48" step="1" x-model.number="cfg.miwMcapFreshCycles" @change="persist()" style="width:70px">
+                    <div class="miw-hint">Max age of supply data in scan cycles before a ticker is excluded.</div>
+                  </div>
+                  <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwVmSanityCheck=!cfg.miwVmSanityCheck;persist()}">
+                    <div class="tog-t" :class="cfg.miwVmSanityCheck?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">V/M Sanity Cap</div>
+                      <div class="miw-hint">Rejects tickers from mcapMap where vol/mcap exceeds the cap. Filters absurd values from wrong-coin mcap data.</div>
+                    </div>
+                  </label>
+                  <div class="g" x-show="cfg.miwVmSanityCheck" style="margin-top:8px">
+                    <div class="lbl">Cap <b x-text="((cfg.miwVmSanityCap??0.5)*100).toFixed(0)+'%'"></b> vol/mcap</div>
+                    <input type="range" min="0.1" max="2" step="0.05" x-model.number="cfg.miwVmSanityCap" @change="persist()">
+                    <div class="miw-hint">Tickers where turnover24h / mcap exceeds this ratio are excluded from mcapMap for this cycle.</div>
+                  </div>
                 </div><!-- end entry slots section -->
               </div><!-- end entry zone -->
 
@@ -498,17 +522,20 @@
 
         miwBlockedSlots: {},
         miwSlotRanks: {},
+        miwCollapsedSlotRanks: {},
         _miwFadeAwayLocked: false,
         _miwFadeAwayCache: {},
         _miwStructureBlocked: false,
         _miwLiqBlocked: false,
         _miwLiqBias: null,
         _miwSlotGraylist: {},
+        _miwFreshMcapBases: null,
 
         async init() {
           await _origInit.call(this);
           if (!this.miwBlockedSlots) this.miwBlockedSlots = {};
           if (!this.miwSlotRanks) this.miwSlotRanks = {};
+          if (!this.miwCollapsedSlotRanks) this.miwCollapsedSlotRanks = {};
           if (this.cfg.miwEnabled         === undefined) this.cfg.miwEnabled         = false;
           if (this.cfg.miwPicks           === undefined) this.cfg.miwPicks           = 5;
           if (this.cfg.miwFrThreshold     === undefined) this.cfg.miwFrThreshold     = 0.1;
@@ -539,6 +566,11 @@
           if (this.cfg.miwLiqFadeBlockEntries    === undefined) this.cfg.miwLiqFadeBlockEntries    = false;
           if (this.cfg.miwLiqResultMaxCycles   === undefined) this.cfg.miwLiqResultMaxCycles   = 2;
           if (this.cfg.miwRequireLiqData       === undefined) this.cfg.miwRequireLiqData       = false;
+          if (this.cfg.miwRequireMcapData      === undefined) this.cfg.miwRequireMcapData      = false;
+          if (this.cfg.miwMcapFreshCycles      === undefined) this.cfg.miwMcapFreshCycles      = 6;
+          if (this.cfg.miwVmSanityCheck        === undefined) this.cfg.miwVmSanityCheck        = false;
+          if (this.cfg.miwVmSanityCap          === undefined) this.cfg.miwVmSanityCap          = 0.5;
+          this._miwFreshMcapBases    = null;
           this._miwLiqBlocked        = false;
           this._miwLiqBias           = null;
           if (this.cfg.miwAutoSlots                  === undefined) this.cfg.miwAutoSlots                  = false;
@@ -911,9 +943,23 @@
             if (mcapPool.length > mcapCap) mcapPool = mcapPool.slice(0, mcapCap);
             const bases = mcapPool.map(t => t.symbol.replace(/USDT$/i, '').toLowerCase());
             await this._miwPrefetchMcaps(bases);
+            const _mcapMaxAge = (this.cfg.miwMcapFreshCycles ?? 6) * (this.cfg.scanMins ?? 15) * 60_000;
+            const _mcapNow    = Date.now();
+            this._miwFreshMcapBases = new Set(bases.filter(b => {
+              const cgId = this._miwCoinIdCache?.[b];
+              if (cgId && (_mcapNow - (this._miwMcapCache?.[cgId]?.ts ?? 0)) <= _mcapMaxAge) return true;
+              const cpId = this._miwCpIdCache?.[b];
+              return cpId && (_mcapNow - (this._miwSupplyCache?.[cpId]?.ts ?? 0)) <= _mcapMaxAge;
+            }));
             for (const t of mcapPool) {
-              const mcap = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase());
-              if (mcap) mcapMap[t.symbol] = mcap;
+              const mcap = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase(), parseFloat(t.lastPrice || 0));
+              if (mcap) {
+                if (this.cfg.miwVmSanityCheck) {
+                  const vmRatio = parseFloat(t.turnover24h || 0) / mcap;
+                  if (vmRatio > (this.cfg.miwVmSanityCap ?? 0.5)) continue;
+                }
+                mcapMap[t.symbol] = mcap;
+              }
             }
           }
 
@@ -1007,7 +1053,11 @@
               const is24hUp = parseFloat(t.price24hPcnt || 0) > 0;
               const mcap    = mcapMap[t.symbol];
               const ratio   = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
-              if (blockedSlots.some(s => s.every(c => checkCrit(c, fr, is24hUp, ratio, t)))) {
+              const _tFresh = !this.cfg.miwRequireMcapData || this._miwFreshMcapBases?.has(t.symbol.replace(/USDT$/i,'').toLowerCase());
+              if (blockedSlots.some(s => {
+                if (!_tFresh && s.some(c => /^(vm|iom)/.test(c))) return false;
+                return s.every(c => checkCrit(c, fr, is24hUp, ratio, t));
+              })) {
                 this._miwSlotGraylist[t.symbol] = _glNow;
                 newlyGraylisted++;
               }
@@ -1041,7 +1091,11 @@
               const is24hUp  = parseFloat(t.price24hPcnt || 0) > 0;
               const mcap     = mcapMap[t.symbol];
               const ratio    = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
-              const slotIdx  = slots.findIndex(s => s.every(c => checkCrit(c, fr, is24hUp, ratio, t)));
+              const _hasFreshMcap = !this.cfg.miwRequireMcapData || this._miwFreshMcapBases?.has(t.symbol.replace(/USDT$/i,'').toLowerCase());
+              const slotIdx  = slots.findIndex(s => {
+                if (!_hasFreshMcap && s.some(c => /^(vm|iom)/.test(c))) return false;
+                return s.every(c => checkCrit(c, fr, is24hUp, ratio, t));
+              });
               if (slotIdx === -1) return null;
               const _liqR = _allLiqResults[t.symbol];
               const _annotKey = [...slots[slotIdx].map(c => {
@@ -1113,9 +1167,9 @@
             if (/^sliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `sliq${d >= 0 ? '+' : ''}${d}`; }
             if (/^bliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `bliq${d >= 0 ? '+' : ''}${d}`; }
             if (/^iot/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const tv = parseFloat(t.turnover24h || 0); const step = this.cfg.miwIotStep ?? 1; return `iot+${tv > 0 ? Math.floor(oi / tv * 100 / step) : 0}`; }
-            if (/^iom/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase()) || 0; const step = this.cfg.miwIomStep ?? 1; return `iom+${mc > 0 ? Math.floor(oi / mc * 100 / step) : 0}`; }
+            if (/^iom/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase(), parseFloat(t.lastPrice || 0)) || 0; const step = this.cfg.miwIomStep ?? 1; return `iom+${mc > 0 ? Math.floor(oi / mc * 100 / step) : 0}`; }
             if (/^fund/.test(c)) { const step = this.cfg.miwFundStep ?? 0.25; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_/step); return `fund${tier>=0?'+':''}${tier}`; }
-            if (/^vm/.test(c)) { const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i,'').toLowerCase())||0; const tv = parseFloat(t.turnover24h||0); const step = this.cfg.miwVmStep ?? 1; const tier = mc > 0 ? Math.floor(tv/mc*100/step) : 0; return `vm+${tier}`; }
+            if (/^vm/.test(c)) { const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i,'').toLowerCase(), parseFloat(t.lastPrice || 0))||0; const tv = parseFloat(t.turnover24h||0); const step = this.cfg.miwVmStep ?? 1; const tier = mc > 0 ? Math.floor(tv/mc*100/step) : 0; return `vm+${tier}`; }
             if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._miwGetKlineSync(t.symbol); const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.miwSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
             return c;
           });
@@ -1145,9 +1199,9 @@
               if (/^sliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `sliq${d >= 0 ? '+' : ''}${d}`; }
               if (/^bliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `bliq${d >= 0 ? '+' : ''}${d}`; }
               if (/^iot/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const tv = parseFloat(t.turnover24h || 0); const step = this.cfg.miwIotStep ?? 1; return `iot+${tv > 0 ? Math.floor(oi / tv * 100 / step) : 0}`; }
-              if (/^iom/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase()) || 0; const step = this.cfg.miwIomStep ?? 1; return `iom+${mc > 0 ? Math.floor(oi / mc * 100 / step) : 0}`; }
+              if (/^iom/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i, '').toLowerCase(), parseFloat(t.lastPrice || 0)) || 0; const step = this.cfg.miwIomStep ?? 1; return `iom+${mc > 0 ? Math.floor(oi / mc * 100 / step) : 0}`; }
               if (/^fund/.test(c)) { const step = this.cfg.miwFundStep ?? 0.25; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_/step); return `fund${tier>=0?'+':''}${tier}`; }
-              if (/^vm/.test(c)) { const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i,'').toLowerCase())||0; const tv = parseFloat(t.turnover24h||0); const step = this.cfg.miwVmStep ?? 1; const tier = mc > 0 ? Math.floor(tv/mc*100/step) : 0; return `vm+${tier}`; }
+              if (/^vm/.test(c)) { const mc = this._miwGetMcapSync(t.symbol.replace(/USDT$/i,'').toLowerCase(), parseFloat(t.lastPrice || 0))||0; const tv = parseFloat(t.turnover24h||0); const step = this.cfg.miwVmStep ?? 1; const tier = mc > 0 ? Math.floor(tv/mc*100/step) : 0; return `vm+${tier}`; }
               if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._miwGetKlineSync(t.symbol); const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.miwSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
               return c;
             });
@@ -1157,19 +1211,24 @@
           return false;
         },
 
-        // Two-level CoinGecko cache shared via window.__cgCoinList (24h TTL, localStorage).
-        // ID cache: base symbol → CoinGecko coin id (session-scoped, permanent).
-        // Mcap cache: coin id → { mcap, ts } (1h TTL).
+        // Supply cache via CoinPaprika (no API key). ID list cached 24h in localStorage (__cpCoinList).
+        // Supply cache: CP coin id → { supply, ts } (24h TTL). Shared with partner via 'cpSupply' key.
         async _miwPrefetchMcaps(bases) {
-          if (!this._miwCoinIdCache) this._miwCoinIdCache = {};
-          if (!this._miwMcapCache)   this._miwMcapCache   = {};
-          const now     = Date.now();
-          const unknown = bases.filter(b => this._miwCoinIdCache[b] === undefined);
-          if (unknown.length) {
+          if (!this._miwCoinIdCache)  this._miwCoinIdCache  = {};
+          if (!this._miwMcapCache)    this._miwMcapCache    = {};
+          if (!this._miwCpIdCache)    this._miwCpIdCache    = {};
+          if (!this._miwSupplyCache)  this._miwSupplyCache  = {};
+          const now        = Date.now();
+          const CG_TTL     = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
+          const SUPPLY_TTL = 86_400_000;
+
+          // ── CoinGecko primary ──────────────────────────────────────────
+          const cgUnknown = bases.filter(b => this._miwCoinIdCache[b] === undefined);
+          if (cgUnknown.length) {
             if (!window.__cgCoinList) {
               try {
                 const s = JSON.parse(localStorage.getItem('__cgCoinList') || 'null');
-                if (s?.list?.length && Date.now() - s.ts < 86_400_000) window.__cgCoinList = s.list;
+                if (s?.list?.length && now - s.ts < 86_400_000) window.__cgCoinList = s.list;
               } catch(e) {}
             }
             if (!window.__cgCoinList) {
@@ -1177,57 +1236,135 @@
                 const r = await fetch('https://api.coingecko.com/api/v3/coins/list?include_platform=false');
                 if (r.ok) {
                   window.__cgCoinList = await r.json();
-                  try { localStorage.setItem('__cgCoinList', JSON.stringify({ list: window.__cgCoinList, ts: Date.now() })); } catch(e) {}
+                  try { localStorage.setItem('__cgCoinList', JSON.stringify({ list: window.__cgCoinList, ts: now })); } catch(e) {}
                 }
               } catch(e) {}
             }
             if (window.__cgCoinList) {
-              for (const base of unknown) {
+              for (const base of cgUnknown) {
                 const hit = window.__cgCoinList.find(c => c.symbol === base);
                 this._miwCoinIdCache[base] = hit?.id || '';
               }
             }
           }
-          // Seed from shared mcap — avoids refetching what partner already resolved
+
+          // Seed CG mcap from shared (partner already price-validated)
           const sharedMcap = this._sharedRead('mcap');
-          const mcapTtl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
           if (sharedMcap?.data) {
             for (const [id, entry] of Object.entries(sharedMcap.data)) {
-              if (entry?.mcap && (now - (entry.ts || 0)) < mcapTtl && !this._miwMcapCache[id]) {
-                this._miwMcapCache[id] = { mcap: entry.mcap, ts: entry.ts };
+              if (entry?.mcap && (now - (entry.ts || 0)) < CG_TTL && !this._miwMcapCache[id]) {
+                this._miwMcapCache[id] = { mcap: entry.mcap, cgPrice: entry.cgPrice, ts: entry.ts };
               }
             }
           }
-          const ids = [...new Set(
-            bases.map(b => this._miwCoinIdCache[b]).filter(id => {
-              if (!id) return false;
-              const c = this._miwMcapCache[id];
-              return !c || now - c.ts >= mcapTtl;
-            })
-          )];
-          if (!ids.length) return;
-          try {
-            const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids.join(',')}&vs_currencies=usd&include_market_cap=true`);
-            if (r.ok) {
-              const d = await r.json();
-              const _patch = {};
-              for (const id of ids) {
-                const mcap = d?.[id]?.usd_market_cap;
-                if (mcap) {
-                  this._miwMcapCache[id] = { mcap, ts: now };
-                  _patch[id] = { mcap, ts: now };
+
+          const cgIds = [...new Set(bases.map(b => this._miwCoinIdCache[b]).filter(id => {
+            if (!id) return false;
+            const c = this._miwMcapCache[id];
+            return !c || now - c.ts >= CG_TTL;
+          }))];
+
+          if (cgIds.length) {
+            try {
+              const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${cgIds.join(',')}&vs_currencies=usd&include_market_cap=true`);
+              if (r.ok) {
+                const d = await r.json();
+                const _patch = {};
+                for (const id of cgIds) {
+                  const mcap  = d?.[id]?.usd_market_cap;
+                  const price = d?.[id]?.usd;
+                  if (mcap) {
+                    this._miwMcapCache[id] = { mcap, cgPrice: price, ts: now };
+                    _patch[id] = { mcap, cgPrice: price, ts: now };
+                  }
+                }
+                if (Object.keys(_patch).length) this._sharedMerge('mcap', _patch);
+              }
+            } catch(e) {}
+          }
+
+          // ── CoinPaprika fallback for CG misses ────────────────────────
+          const cgMissBases = bases.filter(b => {
+            const id = this._miwCoinIdCache[b];
+            return !id || !this._miwMcapCache[id];
+          });
+
+          if (cgMissBases.length) {
+            if (!window.__cpCoinList) {
+              try {
+                const s = JSON.parse(localStorage.getItem('__cpCoinList') || 'null');
+                if (s?.list?.length && now - s.ts < SUPPLY_TTL) window.__cpCoinList = s.list;
+              } catch(e) {}
+            }
+            if (!window.__cpCoinList) {
+              try {
+                const r = await fetch('https://api.coinpaprika.com/v1/coins');
+                if (r.ok) {
+                  window.__cpCoinList = await r.json();
+                  try { localStorage.setItem('__cpCoinList', JSON.stringify({ list: window.__cpCoinList, ts: now })); } catch(e) {}
+                }
+              } catch(e) {}
+            }
+
+            // Seed CP supply from shared
+            const sharedSupply = this._sharedRead('cpSupply');
+            if (sharedSupply?.data) {
+              for (const [id, entry] of Object.entries(sharedSupply.data)) {
+                if (entry?.supply && (now - (entry.ts || 0)) < SUPPLY_TTL && !this._miwSupplyCache[id]) {
+                  this._miwSupplyCache[id] = { supply: entry.supply, cpPrice: entry.cpPrice, ts: entry.ts };
                 }
               }
-              if (Object.keys(_patch).length) this._sharedMerge('mcap', _patch);
             }
-          } catch(e) {}
+
+            const cpUnknown = cgMissBases.filter(b => this._miwCpIdCache[b] === undefined);
+            if (cpUnknown.length && window.__cpCoinList) {
+              for (const base of cpUnknown) {
+                const candidates = window.__cpCoinList.filter(c => c.symbol?.toLowerCase() === base);
+                const active = candidates.filter(c => c.is_active);
+                const pool = active.length ? active : candidates;
+                const hit = pool.reduce((best, c) => (!best || (c.rank > 0 && (best.rank <= 0 || c.rank < best.rank))) ? c : best, null);
+                this._miwCpIdCache[base] = hit?.id || '';
+              }
+            }
+
+            const cpStale = [...new Set(cgMissBases.map(b => this._miwCpIdCache[b]).filter(id => {
+              if (!id) return false;
+              const c = this._miwSupplyCache[id];
+              return !c || now - c.ts >= SUPPLY_TTL;
+            }))];
+
+            const _cpPatch = {};
+            for (const id of cpStale) {
+              try {
+                const r = await fetch(`https://api.coinpaprika.com/v1/tickers/${id}?quotes=USD`);
+                if (r.ok) {
+                  const d = await r.json();
+                  const supply  = d?.circulating_supply;
+                  const cpPrice = d?.quotes?.USD?.price;
+                  if (supply) {
+                    this._miwSupplyCache[id] = { supply, cpPrice, ts: now };
+                    _cpPatch[id] = { supply, cpPrice, ts: now };
+                  }
+                }
+              } catch(e) {}
+            }
+            if (Object.keys(_cpPatch).length) this._sharedMerge('cpSupply', _cpPatch);
+          }
         },
 
-        _miwGetMcapSync(base) {
-          const id = this._miwCoinIdCache?.[base];
-          if (!id) return null;
-          const c = this._miwMcapCache?.[id];
-          return (c && Date.now() - c.ts < (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000) ? c.mcap : null;
+        _miwGetMcapSync(base, price) {
+          const ok = src => !price || !src || Math.abs(src - price) / price <= 0.10;
+          const cgId = this._miwCoinIdCache?.[base];
+          if (cgId) {
+            const c = this._miwMcapCache?.[cgId];
+            if (c && ok(c.cgPrice)) return c.mcap;
+          }
+          const cpId = this._miwCpIdCache?.[base];
+          if (cpId) {
+            const c = this._miwSupplyCache?.[cpId];
+            if (c?.supply && price > 0 && ok(c.cpPrice)) return c.supply * price;
+          }
+          return null;
         },
 
         _miwGenerateCombos(size) {
@@ -1252,6 +1389,22 @@
             : (this.cfg.miwSlots || []).filter(s => s.length > 0);
           const blocks = this.miwBlockedSlots || {};
           const filtered = Object.keys(blocks).length ? raw.filter(s => !blocks[[...s].sort().join(',')]) : raw;
+          if (this.cfg.pfCollapsedRanks) {
+            const ranks = this.miwCollapsedSlotRanks || {};
+            if (!Object.keys(ranks).length) return filtered;
+            const getRank = c => {
+              if (/^sliq/.test(c)) return (ranks['sliq+'] ?? 0) + (ranks['sliq-'] ?? 0);
+              if (/^bliq/.test(c)) return (ranks['bliq+'] ?? 0) + (ranks['bliq-'] ?? 0);
+              if (c === '+fund') return ranks['fund>'] ?? 0;
+              if (c === '-fund') return ranks['fund<'] ?? 0;
+              return ranks[c.replace(/-?\d+$/, '')] ?? 0;
+            };
+            return filtered.slice().sort((a, b) => {
+              const sa = a.reduce((s, c) => s + getRank(c), 0);
+              const sb = b.reduce((s, c) => s + getRank(c), 0);
+              return sb - sa;
+            });
+          }
           const ranks = this.miwSlotRanks || {};
           if (!Object.keys(ranks).length) return filtered;
           return filtered.slice().sort((a, b) => {
