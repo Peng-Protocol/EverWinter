@@ -18,7 +18,7 @@ Copyright 2026 Peng Protocol — ChartWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>❄ ChartWinter v1.3 — Scan-Informed Charting</title>
+<title>❄ ChartWinter v1.4 — Scan-Informed Charting</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1058,7 +1058,7 @@ body::before {
     <div class="brand">
       <span class="snow">❄</span>
       <span>CHARTWINTER</span>
-      <span style="color:var(--text-lo);font-size:10px;letter-spacing:1px">v1.3</span>
+      <span style="color:var(--text-lo);font-size:10px;letter-spacing:1px">v1.4</span>
     </div>
     <div class="tb-stat">
       <span><span class="dot" :class="online?'on':''"></span><b x-text="online?'ONLINE':'OFFLINE'"></b></span>
@@ -2879,7 +2879,18 @@ function cw() { return {
     const now = Date.now();
     const CG_TTL     = (this.cfg.mcapFreshHours ?? 1) * 3_600_000;
     const SUPPLY_TTL = 86_400_000;
+    const PRICE_TOL  = 0.10; // reject match if source price diverges >10% from Bybit price
     const syms = symbols ?? this.tickers.slice(0, 50).map(t => t.symbol);
+
+    const bybitPx = sym => {
+      const raw = this.rawTickers.find(t => t.symbol === sym);
+      return raw ? parseFloat(raw.lastPrice) : 0;
+    };
+    const priceOk = (sourcePx, sym) => {
+      const bp = bybitPx(sym);
+      return !bp || !sourcePx || Math.abs(sourcePx - bp) / bp <= PRICE_TOL;
+    };
+
     try {
       const bases = syms.map(s => s.replace(/USDT$/i, '').toLowerCase());
 
@@ -2912,8 +2923,9 @@ function cw() { return {
             if (r.ok) {
               const d = await r.json();
               for (const id of chunk) {
-                const mcap = d?.[id]?.usd_market_cap;
-                if (mcap) _cwMcapCache[id] = { mcap, ts: now };
+                const mcap  = d?.[id]?.usd_market_cap;
+                const price = d?.[id]?.usd;
+                if (mcap) _cwMcapCache[id] = { mcap, price, ts: now };
               }
             } else {
               this.cwlog(`CoinGecko mcap batch HTTP ${r.status}`, 'warn', 'CG-M01');
@@ -2925,14 +2937,19 @@ function cw() { return {
         }
       }
 
-      // Assign CG values; collect misses for CP fallback
+      // Assign CG values; price-check each match; collect misses for CP fallback
       const cgMissBases = [];
+      let cgRejected = 0;
       for (const sym of syms) {
         const base = sym.replace(/USDT$/i, '').toLowerCase();
         const id   = _cwCoinIdCache[base];
         const c    = id ? _cwMcapCache[id] : null;
-        if (c) { this.mcapData[sym] = c.mcap; }
-        else    { cgMissBases.push(base); }
+        if (c) {
+          if (priceOk(c.price, sym)) { this.mcapData[sym] = c.mcap; }
+          else { cgMissBases.push(base); cgRejected++; }
+        } else {
+          cgMissBases.push(base);
+        }
       }
 
       // ── CoinPaprika fallback for CG misses ────────────────────────
@@ -2965,25 +2982,31 @@ function cw() { return {
             if (r.ok) {
               const d = await r.json();
               const supply = d?.circulating_supply;
-              if (supply) _cwSupplyCache[id] = { supply, ts: now };
+              const price  = d?.quotes?.USD?.price;
+              if (supply) _cwSupplyCache[id] = { supply, price, ts: now };
             }
           } catch(e) {}
         }
 
-        let cpFetched = 0;
+        let cpFetched = 0, cpRejected = 0;
         for (const base of cgMissBases) {
           const sym    = syms.find(s => s.replace(/USDT$/i, '').toLowerCase() === base);
           const id     = _cwCpIdCache[base];
           const cached = id ? _cwSupplyCache[id] : null;
           if (cached && sym) {
-            const raw   = this.rawTickers.find(t => t.symbol === sym);
-            const price = raw ? parseFloat(raw.lastPrice) : 0;
-            if (price > 0) { this.mcapData[sym] = cached.supply * price; cpFetched++; }
+            const bp = bybitPx(sym);
+            if (bp > 0 && priceOk(cached.price, sym)) {
+              this.mcapData[sym] = cached.supply * bp; cpFetched++;
+            } else if (bp > 0) {
+              cpRejected++;
+            }
           }
         }
 
         const cgOk = syms.length - cgMissBases.length;
-        this.cwlog(`MCap — CG:${cgOk} CP:${cpFetched} miss:${cgMissBases.length - cpFetched}/${syms.length}`, cgMissBases.length > cpFetched ? 'warn' : 'info', 'MCAP-DONE');
+        const miss  = cgMissBases.length - cpFetched;
+        const rejNote = (cgRejected + cpRejected) > 0 ? ` rej:${cgRejected + cpRejected}` : '';
+        this.cwlog(`MCap — CG:${cgOk} CP:${cpFetched} miss:${miss}${rejNote}/${syms.length}`, miss > 0 ? 'warn' : 'info', 'MCAP-DONE');
       } else {
         this.cwlog(`MCap — CG:${syms.length}/${syms.length}`, 'info', 'MCAP-DONE');
       }
