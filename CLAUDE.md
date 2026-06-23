@@ -61,4 +61,4 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 
 ## Pending Tasks
 
-- **ChartWinter: add third mcap source option.** Currently CoinGecko (default, more reliable) and CoinPaprika are available as supply/mcap sources in MIW/MIC. Evaluate and add a third source option to ChartWinter's mcap lookup. Delete this bullet once done.
+- **ChartWinter: add CoinCap as third mcap source.** Currently CoinGecko (primary, most reliable) and CoinPaprika (fallback, supply × price) are available. CoinCap (`api.coincap.io/v2/assets`) is the candidate third option — free, no API key, returns `marketCapUsd` and `supply` directly, but has narrower altcoin coverage than CoinGecko (hence "less reliable"). It would slot in as a second fallback for coins both CG and CP miss. Verify the free keyless endpoint still works before implementing (docs appear to have migrated to `pro.coincap.io`). Same integration pattern as CP: coin list/search → cache IDs → pull mcap per coin. Also extend the sanity cap check to cover IO/M (currently only guards V/M by label). Delete this bullet once both are done.
