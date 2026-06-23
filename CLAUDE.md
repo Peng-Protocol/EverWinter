@@ -22,7 +22,7 @@ Each file carries its version in two or three places — update **all** that app
 
 | File | Version |
 |---|---|
-| `ChartWinter.html` | v1.1 |
+| `ChartWinter.html` | v1.2 |
 | `PseudoWinter.html` | v1.7.7 |
 | `PseudoChaser.html` | v1.3.8 |
 | `PsychoWinter1.0.html` | v1.0 |
