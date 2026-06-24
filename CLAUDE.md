@@ -80,6 +80,6 @@ Merged into single master toggle with Structure/Liq/Funding sub-toggles. Combine
 ### Issue #7 — Historical scoring visibility (done, MIW + MIC v1.24.0)
 Pending counter moved out of config accordion. New "Hist Scoring" section in stats-eda slot shows: live pending target count, SVG bar sparkline of last 25 batches, and a full list of completed batches (newest first) with batch ID, wrote/total counts, and relative timestamp. Batch history persisted to `__miw_hist_batches` / `__mic_hist_batches`.
 
-### Issue #8 — README and Strategy Book update (pending)
-Bring README.md and Strategy_book.md up to date with all changes accumulated since the last update.
+### Issue #8 — README and Strategy Book update (done)
+README and Strategy_book.md updated for Issues #4–#7: criteria table, Fade Away config rows consolidated, msliq/mbliq added, Hist Scoring panel documented, localStorage keys table updated.
 
