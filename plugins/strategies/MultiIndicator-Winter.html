@@ -34,8 +34,9 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.23.0';
+  const VERSION       = '1.24.0';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
+  const MIW_HIST_KEY  = '__miw_hist_batches';
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
   // +fund = longs paying = good carry for shorts (🤑), bad for longs (💸).
@@ -484,7 +485,6 @@
                       <input type="range" min="0" max="100" step="10" x-model.number="cfg.miwHistSequestrPct" @change="persist()">
                       <div class="miw-hint">Share of the kline scan cap reserved each cycle for confirming pending targets. Remainder goes to discovery.</div>
                     </div>
-                    <div style="margin-top:4px;font-family:var(--mono);font-size:9px;color:var(--text-lo)" x-text="Object.keys(_miwHistPending||{}).length+' match(es) pending simulation'"></div>
                   </div>
                 </div>
               </div><!-- end fade zone -->
@@ -562,12 +562,34 @@
             </div>
           </div>
         </div>
+        <div class="sec">
+          <div class="sec-ttl">Hist Scoring</div>
+          <div>
+            <div style="display:flex;align-items:baseline;gap:6px;margin-bottom:6px">
+              <span style="font-family:var(--mono);font-size:10px;color:var(--ice)" x-text="Object.keys(_miwHistPending||{}).length"></span>
+              <span style="font-family:var(--mono);font-size:9px;color:var(--text-lo)">target(s) pending simulation</span>
+            </div>
+            <div style="margin-bottom:6px;border:1px solid rgba(96,210,255,.12);border-radius:3px;background:rgba(96,210,255,.03);overflow:hidden" x-html="_miwHistBatchSvg()"></div>
+            <div x-show="!(miwHistBatches||[]).length" style="font-family:var(--mono);font-size:9px;color:var(--text-lo)">No completed batches yet.</div>
+            <div x-show="(miwHistBatches||[]).length" style="display:flex;flex-direction:column;gap:3px">
+              <template x-for="b in (miwHistBatches||[]).slice().reverse()" :key="b.ts">
+                <div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:8.5px">
+                  <span style="color:var(--text-lo);min-width:22px" x-text="'#'+b.id"></span>
+                  <span style="color:var(--ice)" x-text="b.wrote+' written'"></span>
+                  <span style="color:var(--text-lo)" x-text="'of '+b.total"></span>
+                  <span style="color:var(--text-lo);margin-left:auto" x-text="(()=>{ const d=Date.now()-b.ts; if(d<60000) return 'just now'; if(d<3600000) return Math.floor(d/60000)+'m ago'; if(d<86400000) return Math.floor(d/3600000)+'h ago'; return Math.floor(d/86400000)+'d ago'; })()"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
       `,
     },
 
     transform(def) {
       const _origInit  = def.init;
       const _origScan  = def.runScan;
+      const _origPers  = def.persist;
 
       return Object.assign({}, def, {
 
@@ -580,14 +602,21 @@
         _miwLiqBias: null,
         _miwFundBias: null,
         _miwFundSkew: null,
+        miwHistBatches: [],
         _miwHistPending: {},
         _miwHistBatchId: 0,
         _miwSequestrUsed: 0,
         _miwSlotGraylist: {},
         _miwFreshMcapBases: null,
 
+        persist() {
+          _origPers.call(this);
+          try { localStorage.setItem(MIW_HIST_KEY, JSON.stringify((this.miwHistBatches || []).slice(-25))); } catch(e) {}
+        },
+
         async init() {
           await _origInit.call(this);
+          try { const _r = localStorage.getItem(MIW_HIST_KEY); if (_r) this.miwHistBatches = JSON.parse(_r).slice(-25); } catch(e) {}
           if (!this.miwBlockedSlots) this.miwBlockedSlots = {};
           if (!this.miwSlotRanks) this.miwSlotRanks = {};
           if (!this.miwCollapsedSlotRanks) this.miwCollapsedSlotRanks = {};
@@ -1700,7 +1729,30 @@
           }
 
           this.log(`[MIW] 📊 Hist-score batch #${_batchId} done — ${wrote} written`, 'info');
-          if (wrote) this._pfScoreBuild?.();
+          if (wrote) {
+            this._pfScoreBuild?.();
+            if (!this.miwHistBatches) this.miwHistBatches = [];
+            this.miwHistBatches.push({ id: _batchId, ts: now, wrote, total: toProcess.length });
+            if (this.miwHistBatches.length > 25) this.miwHistBatches.splice(0, this.miwHistBatches.length - 25);
+            this.persist?.();
+          }
+        },
+
+        _miwHistBatchSvg() {
+          void this.tick;
+          const batches = this.miwHistBatches || [];
+          const W = 340, H = 36, pad = 3, slots = 25;
+          if (!batches.length) return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block"><text x="${W/2}" y="${H/2+3}" fill="rgba(255,255,255,.25)" font-size="9" font-family="monospace" text-anchor="middle">no batches yet</text></svg>`;
+          const maxWrote = Math.max(...batches.map(b => b.wrote), 1);
+          const bw = (W - 2 * pad) / slots;
+          const start = Math.max(0, batches.length - slots);
+          const bars = batches.slice(start).map((b, i) => {
+            const x = (pad + i * bw).toFixed(1);
+            const barH = Math.max(2, ((H - 2 * pad) * b.wrote / maxWrote));
+            const y = (H - pad - barH).toFixed(1);
+            return `<rect x="${x}" y="${y}" width="${(bw * 0.75).toFixed(1)}" height="${barH.toFixed(1)}" fill="rgba(96,210,255,.5)" rx="1"/>`;
+          }).join('');
+          return `<svg width="100%" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block">${bars}</svg>`;
         },
 
         async _miwPrefetchKlines(symbols) {

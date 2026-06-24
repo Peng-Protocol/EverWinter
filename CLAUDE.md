@@ -26,8 +26,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PseudoWinter.html` | v1.7.7 |
 | `PseudoChaser.html` | v1.3.8 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.23.0 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.23.0 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.24.0 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.24.0 |
 | `plugins/analytics/Permafrost-Winter.html` | v1.25.6 |
 | `plugins/analytics/Ashfall-Chaser.html` | v1.25.6 |
 
@@ -77,8 +77,8 @@ Merged into single master toggle with Structure/Liq/Funding sub-toggles. Combine
 ### Issue #6 — Mixed liq condition + new mS-Liq / mB-Liq criteria (done, MIW + MIC v1.23.0)
 `sliq`/`bliq` now require ≥70% raw dominance (sLiqRaw/total). New criteria `msliq` (💦) and `mbliq` (🌨️) match the majority side when minority ≥30%. Both have depth parameters. Applied to `checkCrit`, `checkAnnotCrit`, `_annotCrits`, UI slot builder, auto-slot list, `critEmoji`, `critLabel`, `CRIT_DESC`/`CRIT_EMOJI`, header comment, badge key, and `_col` collapse function.
 
-### Issue #7 — Historical scoring visibility (pending, MIC + MIW)
-The "N match(es) pending simulation" counter is buried inside the config accordion. Move it out as a permanently visible data point (in the stats-eda slot or equivalent), expanded to show a numerical summary: targets currently pending + a list/count of recently completed hist-score batches (up to the last 25 sets).
+### Issue #7 — Historical scoring visibility (done, MIW + MIC v1.24.0)
+Pending counter moved out of config accordion. New "Hist Scoring" section in stats-eda slot shows: live pending target count, SVG bar sparkline of last 25 batches, and a full list of completed batches (newest first) with batch ID, wrote/total counts, and relative timestamp. Batch history persisted to `__miw_hist_batches` / `__mic_hist_batches`.
 
 ### Issue #8 — README and Strategy Book update (pending)
 Bring README.md and Strategy_book.md up to date with all changes accumulated since the last update.
