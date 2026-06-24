@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.18.2';
+  const VERSION       = '1.19.0';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -460,6 +460,29 @@
                   <input type="range" min="1" max="10" step="1" x-model.number="cfg.micLiqResultMaxCycles" @change="persist()">
                   <div class="mic-hint">S-Liq / B-Liq slot criteria reject results older than this many scan cycles. Applies to sliq/bliq in all slots.</div>
                 </div>
+
+                <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.micFundFadeEnabled=!cfg.micFundFadeEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.micFundFadeEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Fund Rate Fade Away</div>
+                    <div class="mic-hint">Samples funding rates across kline and liq tickers. Fades/blocks when the dominant funding direction is historically bad per the AF slot scorecard.</div>
+                  </div>
+                </label>
+                <div class="g" x-show="cfg.micFundFadeEnabled" style="margin-top:8px">
+                  <div class="lbl">Skew Threshold <b x-text="(cfg.micFundFadePct??50)+'%'"></b></div>
+                  <input type="range" min="10" max="100" step="5" x-model.number="cfg.micFundFadePct" @change="persist()">
+                  <div class="mic-hint" style="margin-top:4px" x-text="_micFundSkew ? '💰 neg:'+_micFundSkew.negPct.toFixed(0)+'% pos:'+_micFundSkew.posPct.toFixed(0)+'% · bias:'+(_micFundBias||'—') : 'No fund sample yet'"></div>
+                  <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.micFundFadeBlockEntries=!cfg.micFundFadeBlockEntries;persist()}">
+                    <div class="tog-t" :class="cfg.micFundFadeBlockEntries?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Block Entries on Bad Funding</div>
+                      <div style="display:flex;align-items:center;gap:5px;margin-top:2px">
+                        <div class="mic-hint" style="margin-top:0">Blocks entries when dominant funding direction is historically bad. Lifts each scan cycle when conditions clear.</div>
+                        <span x-show="cfg.micFundFadeBlockEntries && _micFundBlocked" style="flex-shrink:0;font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;background:rgba(255,80,80,.12);border:1px solid rgba(255,80,80,.45);color:rgba(255,80,80,.9);letter-spacing:.5px">⛔ BLOCKING</span>
+                      </div>
+                    </div>
+                  </label>
+                </div>
               </div><!-- end fade zone -->
             </div>
           </div>
@@ -552,6 +575,9 @@
         _micStructureBlocked: false,
         _micLiqBlocked: false,
         _micLiqBias: null,
+        _micFundBlocked: false,
+        _micFundBias: null,
+        _micFundSkew: null,
         _micSlotGraylist: {},
         _micFreshMcapBases: null,
 
@@ -599,6 +625,12 @@
           this._micFreshMcapBases    = null;
           this._micLiqBlocked        = false;
           this._micLiqBias           = null;
+          if (this.cfg.micFundFadeEnabled      === undefined) this.cfg.micFundFadeEnabled      = false;
+          if (this.cfg.micFundFadePct          === undefined) this.cfg.micFundFadePct          = 50;
+          if (this.cfg.micFundFadeBlockEntries === undefined) this.cfg.micFundFadeBlockEntries = false;
+          this._micFundBlocked       = false;
+          this._micFundBias          = null;
+          this._micFundSkew          = null;
           if (this.cfg.micAutoSlots                  === undefined) this.cfg.micAutoSlots                  = false;
           if (this.cfg.micAutoSlotSize               === undefined) this.cfg.micAutoSlotSize               = 2;
           if (this.cfg.micAutoSlotExclude            === undefined) this.cfg.micAutoSlotExclude            = [];
@@ -740,6 +772,7 @@
           this._micFadeAwayLocked = false;
           await this._micCheckFadeAway();
           await this._micCheckLiqFadeAway();
+          await this._micCheckFundFadeAway();
           await this._micCheckCascade();
           await this._micCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -871,6 +904,48 @@
           }
         },
 
+        async _micCheckFundFadeAway() {
+          if (!this.cfg.micFundFadeEnabled) { this._micFundBlocked = false; return; }
+          const klineSyms = Object.keys(this._micKlineCache || {});
+          const sharedLiq = this._sharedRead('liqResults');
+          const combined  = { ...(sharedLiq?.data || {}), ...(this._liqResults || {}) };
+          const liqSyms   = Object.keys(combined);
+          const unionSyms = [...new Set([...klineSyms, ...liqSyms])];
+          if (!unionSyms.length) return;
+          const tickerMap = {};
+          for (const t of (this._lastAllTickers || [])) tickerMap[t.symbol] = t;
+          let posCount = 0, negCount = 0;
+          for (const sym of unionSyms) {
+            const t = tickerMap[sym];
+            if (!t) continue;
+            const fr = parseFloat(t.fundingRate || 0) * 100;
+            if (fr > 0) posCount++;
+            else if (fr < 0) negCount++;
+          }
+          const total = posCount + negCount;
+          if (!total) return;
+          this._micFundSkew = { negPct: negCount / total * 100, posPct: posCount / total * 100 };
+          const threshold = (this.cfg.micFundFadePct ?? 50) / 100;
+          let domDir = null;
+          if (posCount / total >= threshold) domDir = 'fund+';
+          else if (negCount / total >= threshold) domDir = 'fund-';
+          if (!domDir) { this._micFundBlocked = false; return; }
+          this._micFundBias = this._micLiqScorecardBias(domDir);
+          if (this._micFundBias !== 'bad') {
+            if (this._micFundBlocked) this.log(`[MIC] 💰 Fund block not triggered — ${domDir} historically ${this._micFundBias === 'good' ? 'good' : 'unknown (no scorecard data)'}`, 'info');
+            this._micFundBlocked = false;
+            return;
+          }
+          if (this.cfg.micFundFadeBlockEntries) this._micFundBlocked = true;
+          const micPositions = (this.positions || []).filter(p => p._mic);
+          if (micPositions.length) {
+            const oldest = micPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
+            const domPct = (domDir === 'fund+' ? posCount : negCount) / total * 100;
+            this.log(`[MIC] 💰 Fund Fade Away — ${domDir} ${domPct.toFixed(0)}% ≥ ${this.cfg.micFundFadePct ?? 50}% (historically bad) — closing oldest: ${oldest.symbol}${this.cfg.micFundFadeBlockEntries ? ' | entries blocked' : ''}`, 'info');
+            await this.pseudoClosePosition(oldest, 'sacrifice');
+          }
+        },
+
         async _micRunScan() {
           if (!this.cfg.micEnabled) return;
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
@@ -883,6 +958,10 @@
           }
           if (this._micLiqBlocked) {
             this.log('[MIC] 🥵 Entries blocked — bad liq structure', 'info');
+            return;
+          }
+          if (this._micFundBlocked) {
+            this.log('[MIC] 💰 Entries blocked — bad funding climate', 'info');
             return;
           }
 

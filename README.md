@@ -175,9 +175,14 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Liq Fade %** (`miwLiqFadePct`/`micLiqFadePct`) | Adverse liq dominance threshold for Liq Fade Away. |
 | **Liq Block Entries** (`miwLiqFadeBlockEntries`/`micLiqFadeBlockEntries`) | When on, new entries are also blocked while the adverse liq signal is active. |
 | **Liq Result Max Age** (`miwLiqResultMaxCycles`/`micLiqResultMaxCycles`) | How many scan cycles a liq result stays valid for sliq/bliq slot criteria. Results older than this are treated as if absent, and the criterion evaluates false. Default 2. |
+| **Fund Rate Fade Away** (`miwFundFadeEnabled`/`micFundFadeEnabled`) | Closes the oldest position when the dominant funding direction across the kline + liq sample union is historically bad per the scorecard. Both conditions — skew dominance and bad scorecard history — must hold. |
+| **Fund Skew %** (`miwFundFadePct`/`micFundFadePct`) | Minimum fraction of tickers in the union sample that must share the dominant funding direction to trigger. Default 50%. |
+| **Fund Block Entries** (`miwFundFadeBlockEntries`/`micFundFadeBlockEntries`) | When on, new entries are also blocked while the adverse funding signal is active. |
 | **Auto Slots** (`miwAutoSlots`/`micAutoSlots`) | Replaces the manual slot list with every possible combination of the available criteria at the chosen size. |
 | **Auto Slot Size** (`miwAutoSlotSize`/`micAutoSlotSize`) | How many criteria per auto-generated combination (1–4). |
 | **Exclude from Auto** (`miwAutoSlotExclude`/`micAutoSlotExclude`) | Criteria omitted from auto-generated combinations and from scorecard scoring. |
+
+**Fade Away as a drawdown gate replacement**: The three Fade Away types — structure, liq, and fund rate — can collectively replace drawdown locking for many setups. Structure and liq fade react to market conditions in real time and close positions before losses compound; with Block Entries enabled, they also prevent new entries until the environment clears. Fund Rate Fade adds a broader market-sentiment layer sourced from a wider ticker sample. Together they provide condition-aware position management without a hard drawdown ceiling. Fund Rate Fade and Liq Fade also partially replace scorecard auto-block, since both use scorecard history to gate the trigger — they won't act unless the signal has a track record of bad outcomes in your specific slots.
 
 ### Slots UI
 

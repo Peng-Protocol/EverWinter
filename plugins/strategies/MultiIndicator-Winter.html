@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.18.2';
+  const VERSION       = '1.19.0';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -460,6 +460,29 @@
                   <input type="range" min="1" max="10" step="1" x-model.number="cfg.miwLiqResultMaxCycles" @change="persist()">
                   <div class="miw-hint">S-Liq / B-Liq slot criteria reject results older than this many scan cycles. Applies to sliq/bliq in all slots.</div>
                 </div>
+
+                <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.miwFundFadeEnabled=!cfg.miwFundFadeEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.miwFundFadeEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Fund Rate Fade Away</div>
+                    <div class="miw-hint">Samples funding rates across kline and liq tickers. Fades/blocks when the dominant funding direction is historically bad per the PF slot scorecard.</div>
+                  </div>
+                </label>
+                <div class="g" x-show="cfg.miwFundFadeEnabled" style="margin-top:8px">
+                  <div class="lbl">Skew Threshold <b x-text="(cfg.miwFundFadePct??50)+'%'"></b></div>
+                  <input type="range" min="10" max="100" step="5" x-model.number="cfg.miwFundFadePct" @change="persist()">
+                  <div class="miw-hint" style="margin-top:4px" x-text="_miwFundSkew ? '💰 neg:'+_miwFundSkew.negPct.toFixed(0)+'% pos:'+_miwFundSkew.posPct.toFixed(0)+'% · bias:'+(_miwFundBias||'—') : 'No fund sample yet'"></div>
+                  <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.miwFundFadeBlockEntries=!cfg.miwFundFadeBlockEntries;persist()}">
+                    <div class="tog-t" :class="cfg.miwFundFadeBlockEntries?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Block Entries on Bad Funding</div>
+                      <div style="display:flex;align-items:center;gap:5px;margin-top:2px">
+                        <div class="miw-hint" style="margin-top:0">Blocks entries when dominant funding direction is historically bad. Lifts each scan cycle when conditions clear.</div>
+                        <span x-show="cfg.miwFundFadeBlockEntries && _miwFundBlocked" style="flex-shrink:0;font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;background:rgba(255,80,80,.12);border:1px solid rgba(255,80,80,.45);color:rgba(255,80,80,.9);letter-spacing:.5px">⛔ BLOCKING</span>
+                      </div>
+                    </div>
+                  </label>
+                </div>
               </div><!-- end fade zone -->
             </div>
           </div>
@@ -552,6 +575,9 @@
         _miwStructureBlocked: false,
         _miwLiqBlocked: false,
         _miwLiqBias: null,
+        _miwFundBlocked: false,
+        _miwFundBias: null,
+        _miwFundSkew: null,
         _miwSlotGraylist: {},
         _miwFreshMcapBases: null,
 
@@ -599,6 +625,12 @@
           this._miwFreshMcapBases    = null;
           this._miwLiqBlocked        = false;
           this._miwLiqBias           = null;
+          if (this.cfg.miwFundFadeEnabled      === undefined) this.cfg.miwFundFadeEnabled      = false;
+          if (this.cfg.miwFundFadePct          === undefined) this.cfg.miwFundFadePct          = 50;
+          if (this.cfg.miwFundFadeBlockEntries === undefined) this.cfg.miwFundFadeBlockEntries = false;
+          this._miwFundBlocked       = false;
+          this._miwFundBias          = null;
+          this._miwFundSkew          = null;
           if (this.cfg.miwAutoSlots                  === undefined) this.cfg.miwAutoSlots                  = false;
           if (this.cfg.miwAutoSlotSize               === undefined) this.cfg.miwAutoSlotSize               = 2;
           if (this.cfg.miwAutoSlotExclude            === undefined) this.cfg.miwAutoSlotExclude            = [];
@@ -740,6 +772,7 @@
           this._miwFadeAwayLocked = false;
           await this._miwCheckFadeAway();
           await this._miwCheckLiqFadeAway();
+          await this._miwCheckFundFadeAway();
           await this._miwCheckCascade();
           await this._miwCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -872,6 +905,48 @@
           }
         },
 
+        async _miwCheckFundFadeAway() {
+          if (!this.cfg.miwFundFadeEnabled) { this._miwFundBlocked = false; return; }
+          const klineSyms = Object.keys(this._miwKlineCache || {});
+          const sharedLiq = this._sharedRead('liqResults');
+          const combined  = { ...(sharedLiq?.data || {}), ...(this._liqResults || {}) };
+          const liqSyms   = Object.keys(combined);
+          const unionSyms = [...new Set([...klineSyms, ...liqSyms])];
+          if (!unionSyms.length) return;
+          const tickerMap = {};
+          for (const t of (this._lastAllTickers || [])) tickerMap[t.symbol] = t;
+          let posCount = 0, negCount = 0;
+          for (const sym of unionSyms) {
+            const t = tickerMap[sym];
+            if (!t) continue;
+            const fr = parseFloat(t.fundingRate || 0) * 100;
+            if (fr > 0) posCount++;
+            else if (fr < 0) negCount++;
+          }
+          const total = posCount + negCount;
+          if (!total) return;
+          this._miwFundSkew = { negPct: negCount / total * 100, posPct: posCount / total * 100 };
+          const threshold = (this.cfg.miwFundFadePct ?? 50) / 100;
+          let domDir = null;
+          if (posCount / total >= threshold) domDir = 'fund+';
+          else if (negCount / total >= threshold) domDir = 'fund-';
+          if (!domDir) { this._miwFundBlocked = false; return; }
+          this._miwFundBias = this._miwLiqScorecardBias(domDir);
+          if (this._miwFundBias !== 'bad') {
+            if (this._miwFundBlocked) this.log(`[MIW] 💰 Fund block not triggered — ${domDir} historically ${this._miwFundBias === 'good' ? 'good' : 'unknown (no scorecard data)'}`, 'info');
+            this._miwFundBlocked = false;
+            return;
+          }
+          if (this.cfg.miwFundFadeBlockEntries) this._miwFundBlocked = true;
+          const miwPositions = (this.positions || []).filter(p => p._miw);
+          if (miwPositions.length) {
+            const oldest = miwPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
+            const domPct = (domDir === 'fund+' ? posCount : negCount) / total * 100;
+            this.log(`[MIW] 💰 Fund Fade Away — ${domDir} ${domPct.toFixed(0)}% ≥ ${this.cfg.miwFundFadePct ?? 50}% (historically bad) — closing oldest: ${oldest.symbol}${this.cfg.miwFundFadeBlockEntries ? ' | entries blocked' : ''}`, 'info');
+            await this.pseudoClosePosition(oldest, 'sacrifice');
+          }
+        },
+
         async _miwRunScan() {
           if (!this.cfg.miwEnabled) return;
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
@@ -884,6 +959,10 @@
           }
           if (this._miwLiqBlocked) {
             this.log('[MIW] 🥶 Entries blocked — bad liq structure', 'info');
+            return;
+          }
+          if (this._miwFundBlocked) {
+            this.log('[MIW] 💰 Entries blocked — bad funding climate', 'info');
             return;
           }
 
