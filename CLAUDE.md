@@ -26,8 +26,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PseudoWinter.html` | v1.7.7 |
 | `PseudoChaser.html` | v1.3.8 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.22.0 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.22.0 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.23.0 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.23.0 |
 | `plugins/analytics/Permafrost-Winter.html` | v1.25.6 |
 | `plugins/analytics/Ashfall-Chaser.html` | v1.25.6 |
 
@@ -68,19 +68,14 @@ Replace the single plugin Export button with a popup modal (matching base app st
 ### Issue #3 — Ticker blocking discrepancy (pending)
 Many tickers show as blocked but only 3 slots are highlighted as blocked on the scoreboard (combined PnL block active). Find the discrepancy.
 
-### Issue #4 — Structure bar ratio / emoji cleanup (pending)
-Structure sampling bar chart shows raw values instead of a ratio (the way the funding and liq sample bars work). Funding and liq bar labels have unwanted emojis next to their values.
+### Issue #4 — Structure bar ratio / emoji cleanup (done, PF v1.25.6 + AF v1.25.6)
+Structure bar now shows ratios; funding and liq labels have emoji removed.
 
 ### Issue #5 — Consolidate Fade Away toggles (done, MIW + MIC v1.22.0)
 Merged into single master toggle with Structure/Liq/Funding sub-toggles. Combined adverse score = average of enabled signal contributions. Runs every scan; also fires between scans via exit timer when any position is in loss ≥ loss trigger.
 
-### Issue #6 — Mixed liq condition + new mS-Liq / mB-Liq criteria (pending, MIC + MIW)
-Current sliq/bliq is "first side over the threshold" — no account for mixed samples. New rule:
-- `sliq` / `bliq` require ≥ 70% dominance by the indicated side.
-- A sample is **mixed** when the minority side ≥ 30% (i.e., dominant side < 70%).
-- New criterion `msliq` (mS-Liq): sell-liq is majority but buy-liq ≥ 30%.
-- New criterion `mbliq` (mB-Liq): buy-liq is majority but sell-liq ≥ 30%.
-- Applies to both MIC and MIW: criterion evaluation, `critEmoji`, `critLabel`, annotation at open, UI slot display, `CRIT_DESC`/`CRIT_EMOJI` maps, and the header comment listing criteria.
+### Issue #6 — Mixed liq condition + new mS-Liq / mB-Liq criteria (done, MIW + MIC v1.23.0)
+`sliq`/`bliq` now require ≥70% raw dominance (sLiqRaw/total). New criteria `msliq` (💦) and `mbliq` (🌨️) match the majority side when minority ≥30%. Both have depth parameters. Applied to `checkCrit`, `checkAnnotCrit`, `_annotCrits`, UI slot builder, auto-slot list, `critEmoji`, `critLabel`, `CRIT_DESC`/`CRIT_EMOJI`, header comment, badge key, and `_col` collapse function.
 
 ### Issue #7 — Historical scoring visibility (pending, MIC + MIW)
 The "N match(es) pending simulation" counter is buried inside the config accordion. Move it out as a permanently visible data point (in the stats-eda slot or equivalent), expanded to show a numerical summary: targets currently pending + a list/count of recently completed hist-score batches (up to the last 25 sets).
