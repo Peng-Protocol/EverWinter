@@ -28,8 +28,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.21.5 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.21.5 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.25.3 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.25.3 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.25.4 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.25.4 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
@@ -62,7 +62,7 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 ## Pending Tasks
 
 ### Issue #2 — Segmented export options (pending)
-Replace the single plugin Export button with three separate exports: structure wave, scorecard, and liq samples. Each downloads its own dated JSON file.
+Replace the single plugin Export button with a popup modal (matching base app stats Export style) offering three separate exports: structure wave, scorecard, and liq samples. Each downloads its own dated JSON file.
 
 ### Issue #3 — Ticker blocking discrepancy (pending)
 Many tickers show as blocked but only 3 slots are highlighted as blocked on the scoreboard (combined PnL block active). Find the discrepancy.
@@ -81,6 +81,9 @@ Current sliq/bliq is "first side over the threshold" — no account for mixed sa
 - New criterion `mbliq` (mB-Liq): buy-liq is majority but sell-liq ≥ 30%.
 - Applies to both MIC and MIW: criterion evaluation, `critEmoji`, `critLabel`, annotation at open, UI slot display, `CRIT_DESC`/`CRIT_EMOJI` maps, and the header comment listing criteria.
 
-### Issue #7 — README and Strategy Book update (pending)
+### Issue #7 — Historical scoring visibility (pending, MIC + MIW)
+The "N match(es) pending simulation" counter is buried inside the config accordion. Move it out as a permanently visible data point (in the stats-eda slot or equivalent), expanded to show a numerical summary: targets currently pending + a list/count of recently completed hist-score batches (up to the last 25 sets).
+
+### Issue #8 — README and Strategy Book update (pending)
 Bring README.md and Strategy_book.md up to date with all changes accumulated since the last update.
 
