@@ -28,8 +28,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.24.5 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.24.5 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.25.9 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.25.9 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.25.10 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.25.10 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
@@ -83,6 +83,6 @@ Pending counter moved out of config accordion. New "Hist Scoring" section in sta
 ### Issue #8 — README and Strategy Book update (done)
 README and Strategy_book.md updated for Issues #4–#7: criteria table, Fade Away config rows consolidated, msliq/mbliq added, Hist Scoring panel documented, localStorage keys table updated.
 
-### Issue #9 — mbliq/msliq emoji rendering + scorecard score filter (pending)
-mbliq and msliq emojis aren't rendering properly in the scorecard. Also add a purely visual filter toggle to the scorecard: show only historical scoring outcomes, only traded outcomes, or both.
+### Issue #9 — mbliq/msliq emoji rendering + scorecard score filter (done, PF v1.25.10 + AF v1.25.10)
+Fixed `pfCritEmoji`/`afCritEmoji` to handle `msliq` (💦) and `mbliq` (🌨️) before the `sliq`/`bliq` cases. Added `pfScorecardSource`/`afScorecardSource` state and `_srcFilter` to scorecard rendering; scorecard footer now has a cycle button (Both → Hist → Traded) to filter displayed entries by score origin.
 
