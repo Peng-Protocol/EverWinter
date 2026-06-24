@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.19.1';
+  const VERSION       = '1.19.2';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -437,23 +437,23 @@
                   <div class="tog-t" :class="cfg.miwLiqFadeEnabled?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Liq Fade Away</div>
-                    <div class="miw-hint">B-Liq = Buy-Liquidation (long positions liquidated); S-Liq = Sell-Liquidation (short positions liquidated). Fades/blocks only when the dominant type is historically bad per the PF slot scorecard.</div>
+                    <div class="miw-hint">Closes the oldest MIW position when B-Liq dominates and the PF scorecard shows it's historically bad.</div>
                   </div>
                 </label>
-                <div class="g" x-show="cfg.miwLiqFadeEnabled" style="margin-top:8px">
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.miwLiqFadeBlockEntries=!cfg.miwLiqFadeBlockEntries;persist()}">
+                  <div class="tog-t" :class="cfg.miwLiqFadeBlockEntries?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Block Entries on Bad Liq</div>
+                    <div style="display:flex;align-items:center;gap:5px;margin-top:2px">
+                      <div class="miw-hint" style="margin-top:0">Blocks new entries when B-Liq dominates and scorecard shows it's historically bad. Lifts each scan cycle when conditions clear.</div>
+                      <span x-show="cfg.miwLiqFadeBlockEntries && _miwLiqBlocked" style="flex-shrink:0;font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;background:rgba(255,80,80,.12);border:1px solid rgba(255,80,80,.45);color:rgba(255,80,80,.9);letter-spacing:.5px">⛔ BLOCKING</span>
+                    </div>
+                  </div>
+                </label>
+                <div class="g" x-show="cfg.miwLiqFadeEnabled || cfg.miwLiqFadeBlockEntries" style="margin-top:8px">
                   <div class="lbl">Liq Dominance Threshold <b x-text="(cfg.miwLiqFadePct??50)+'%'"></b></div>
                   <input type="range" min="10" max="100" step="5" x-model.number="cfg.miwLiqFadePct" @change="persist()">
                   <div class="miw-hint" x-text="(()=>{ const r=Object.values(_liqResults||{}); if(!r.length) return 'No liq data yet.'; let s=0,b=0; for(const e of r){s+=e.sLiqRaw||0;b+=e.bLiqRaw||0;} const t=s+b; if(!t) return 'No turnover data.'; const biasStr=_miwLiqBias==='bad'?' · scorecard: B-Liq bad ⚡':_miwLiqBias==='good'?' · scorecard: B-Liq good ✓':' · scorecard: no history'; return (b/t*100).toFixed(0)+'% B-Liq / '+(s/t*100).toFixed(0)+'% S-Liq across '+r.length+' tickers'+biasStr; })()"></div>
-                  <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.miwLiqFadeBlockEntries=!cfg.miwLiqFadeBlockEntries;persist()}">
-                    <div class="tog-t" :class="cfg.miwLiqFadeBlockEntries?'on':''"><div class="tog-k"></div></div>
-                    <div>
-                      <div class="tog-l">Block Entries on Bad Liq</div>
-                      <div style="display:flex;align-items:center;gap:5px;margin-top:2px">
-                        <div class="miw-hint" style="margin-top:0">Blocks entries only when B-Liq dominates and scorecard shows it's historically bad. Lifts each scan cycle when conditions clear.</div>
-                        <span x-show="cfg.miwLiqFadeBlockEntries && _miwLiqBlocked" style="flex-shrink:0;font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;background:rgba(255,80,80,.12);border:1px solid rgba(255,80,80,.45);color:rgba(255,80,80,.9);letter-spacing:.5px">⛔ BLOCKING</span>
-                      </div>
-                    </div>
-                  </label>
                 </div>
                 <div class="g" style="margin-top:8px">
                   <div class="lbl">Liq Result Max Age <b x-text="(cfg.miwLiqResultMaxCycles??2)+' cycles'"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'('+((cfg.miwLiqResultMaxCycles??2)*(cfg.scanMins??15))+' min)'"></span></div>
@@ -873,7 +873,7 @@
         },
 
         async _miwCheckLiqFadeAway() {
-          if (!this.cfg.miwLiqFadeEnabled) { this._miwLiqBlocked = false; return; }
+          if (!this.cfg.miwLiqFadeEnabled && !this.cfg.miwLiqFadeBlockEntries) { this._miwLiqBlocked = false; return; }
           const sharedLiq = this._sharedRead('liqResults');
           // Merge own _liqResults (from Permafrost on this instance) with partner's shared results
           const combined = { ...(sharedLiq?.data || {}), ...(this._liqResults || {}) };
@@ -893,11 +893,13 @@
               return;
             }
             if (this.cfg.miwLiqFadeBlockEntries) this._miwLiqBlocked = true;
-            const miwPositions = (this.positions || []).filter(p => p._miw);
-            if (miwPositions.length) {
-              const oldest = miwPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
-              this.log(`[MIW] 🥶 Liq Fade Away — B-Liq ${(totalB / total * 100).toFixed(0)}% ≥ ${this.cfg.miwLiqFadePct ?? 50}% (historically bad) — closing oldest: ${oldest.symbol}${this.cfg.miwLiqFadeBlockEntries ? ' | entries blocked' : ''}`, 'info');
-              await this.pseudoClosePosition(oldest, 'sacrifice');
+            if (this.cfg.miwLiqFadeEnabled) {
+              const miwPositions = (this.positions || []).filter(p => p._miw);
+              if (miwPositions.length) {
+                const oldest = miwPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
+                this.log(`[MIW] 🥶 Liq Fade Away — B-Liq ${(totalB / total * 100).toFixed(0)}% ≥ ${this.cfg.miwLiqFadePct ?? 50}% (historically bad) — closing oldest: ${oldest.symbol}${this.cfg.miwLiqFadeBlockEntries ? ' | entries blocked' : ''}`, 'info');
+                await this.pseudoClosePosition(oldest, 'sacrifice');
+              }
             }
           } else {
             if (this._miwLiqBlocked) this.log('[MIW] 🥶 Liq Fade Away — block lifted', 'info');
