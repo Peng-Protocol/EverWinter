@@ -61,3 +61,26 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 
 ## Pending Tasks
 
+### Issue #2 — Segmented export options (pending)
+Replace the single plugin Export button with three separate exports: structure wave, scorecard, and liq samples. Each downloads its own dated JSON file.
+
+### Issue #3 — Ticker blocking discrepancy (pending)
+Many tickers show as blocked but only 3 slots are highlighted as blocked on the scoreboard (combined PnL block active). Find the discrepancy.
+
+### Issue #4 — Structure bar ratio / emoji cleanup (pending)
+Structure sampling bar chart shows raw values instead of a ratio (the way the funding and liq sample bars work). Funding and liq bar labels have unwanted emojis next to their values.
+
+### Issue #5 — Consolidate Fade Away toggles (pending)
+Merge the three separate Fade Away types (structure, liq, fund) into a single Fade Away toggle with sub-toggles for which sample types affect decisions.
+
+### Issue #6 — Mixed liq condition + new mS-Liq / mB-Liq criteria (pending, MIC + MIW)
+Current sliq/bliq is "first side over the threshold" — no account for mixed samples. New rule:
+- `sliq` / `bliq` require ≥ 70% dominance by the indicated side.
+- A sample is **mixed** when the minority side ≥ 30% (i.e., dominant side < 70%).
+- New criterion `msliq` (mS-Liq): sell-liq is majority but buy-liq ≥ 30%.
+- New criterion `mbliq` (mB-Liq): buy-liq is majority but sell-liq ≥ 30%.
+- Applies to both MIC and MIW: criterion evaluation, `critEmoji`, `critLabel`, annotation at open, UI slot display, `CRIT_DESC`/`CRIT_EMOJI` maps, and the header comment listing criteria.
+
+### Issue #7 — README and Strategy Book update (pending)
+Bring README.md and Strategy_book.md up to date with all changes accumulated since the last update.
+
