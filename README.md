@@ -265,6 +265,14 @@ When surveillance is on: the **Feed Watcher** panel shows active batches (batch 
 
 ---
 
+## Randomized Outcomes
+
+Multiple instances of the bot running simultaneously will naturally diverge in behavior. Scan timing drifts independently per tab, so two instances launched minutes apart will hit different market states even with identical config. On top of that, several data inputs are drawn randomly each cycle: the sample of tickers used to compute market breadth (red/green candle tally), the batch of tickers watched for live liquidation flow, and the kline lookups used for spike criteria all pull from different random subsets each time. Market cap data also varies by fetch timing as the CoinGecko → CoinPaprika → DexScreener waterfall resolves at different points.
+
+The practical effect is that no two instances share the same entry triggers, exit timing, or structural reading at any given moment — even when configured identically. This is intentional. Instances that move in lockstep are easier to front-run and more likely to cluster losses at the same market event. Divergence distributes risk across slightly different entry points and market reads without requiring any coordination between instances.
+
+---
+
 ## Trivia
 
 Developer-level detail with no operational consequence. Included for reference.
