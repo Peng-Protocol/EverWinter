@@ -62,9 +62,5 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 
 ## Pending Tasks
 
-### Issue #2 — Segmented export options (pending)
-Replace the single plugin Export button with a popup modal (matching base app stats Export style) offering three separate exports: structure wave, scorecard, and liq samples. Each downloads its own dated JSON file.
-
-### Issue #3 — Ticker blocking discrepancy (pending)
-Many tickers show as blocked but only 3 slots are highlighted as blocked on the scoreboard (combined PnL block active). Find the discrepancy.
+None.
 
