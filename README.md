@@ -140,12 +140,14 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | `rabl>N` | Last completed 1h candle closed green with volume ≥ N% below average. Quiet, uncontested buying. |
 | `iot>N` / `iot<N` | OI vs Turnover ratio at tier N (1% step by default). High OI relative to turnover signals conviction or stickiness — the market is holding open positions rather than trading them away. |
 | `iom>N` / `iom<N` | OI vs Market Cap ratio at tier N (1% step by default). High OI relative to mcap signals leverage concentration — a large share of the coin's float is leveraged open interest. |
-| `sliq` / `sliq>N` / `sliq<N` | Short liquidations dominated the latest liq cycle for this ticker (bullish flow). Optional depth suffix gates by intensity. Requires Permafrost/Ashfall with liquidation surveillance on. |
-| `bliq` / `bliq>N` / `bliq<N` | Long liquidations dominated the latest liq cycle (bearish flow). Same depth gate mechanism as sliq. |
+| `sliq` / `sliq>N` / `sliq<N` | Short liquidations dominated the latest liq cycle with ≥70% of total liq turnover (bullish flow). Optional depth suffix gates by intensity. Requires Permafrost/Ashfall with liquidation surveillance on. |
+| `bliq` / `bliq>N` / `bliq<N` | Long liquidations dominated the latest liq cycle with ≥70% of total liq turnover (bearish flow). Same depth gate mechanism as sliq. |
+| `msliq` / `msliq>N` / `msliq<N` | Sell-liq majority but buy-liq ≥30% — a contested cycle with a sell lean. Passes when the cycle is mixed but not one-sided. Same depth gate as sliq. |
+| `mbliq` / `mbliq>N` / `mbliq<N` | Buy-liq majority but sell-liq ≥30% — a contested cycle with a buy lean. Same depth gate as bliq. |
 
 **Tier gate**: all tiered criteria (`fund`, `vm`, `lsa`, `lba`, `rasl`, `rabl`, `iot`, `iom`) compute an integer tier as `floor(value / step)` and compare it against N. Step sizes are configurable per criterion under **Tier Step Sizes** in the Entry Zone. The same tier is recorded on the position and used as the scorecard key — `lsa>25` and `lsa+37` are different tiers and scored separately.
 
-**Depth gate** (sliq/bliq only): `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. `sDepth` is an integer score where 0 = average hourly liq volume for that ticker, positive = above, negative = below. Without a suffix the depth gate is skipped.
+**Depth gate** (sliq/bliq/msliq/mbliq): `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. `sDepth` is an integer score where 0 = average hourly liq volume for that ticker, positive = above, negative = below. Without a suffix the depth gate is skipped. msliq and mbliq use the same depth value as sliq and bliq respectively.
 
 ### Config
 
@@ -169,15 +171,14 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Sacrifice** (`miwSacrificeEnabled`/`micSacrificeEnabled`) | Closes MIW/MIC positions when their collective unrealized loss hits a threshold. Caps group drawdown. |
 | **Sacrifice %** (`miwSacrificePct`/`micSacrificePct`) | Collective uLoss trigger as a % of average entry margin. |
 | **Rolling Sacrifice** (`miwRollingSacrificeEnabled`/`micRollingSacrificeEnabled`) | When on, Sacrifice closes only the oldest MIW/MIC position at a time instead of all at once. |
-| **Fade Away** (`miwFadeAwayEnabled`/`micFadeAwayEnabled`) | Closes the oldest MIW/MIC position when the majority of scanned 1h candles are moving against the position direction. |
-| **Fade Away %** (`miwFadeAwayPct`/`micFadeAwayPct`) | Directional majority threshold based on aggregate % change per side. At 50%, the adverse side must account for at least half of the total sampled movement — a single large candle outweighs many small ones. |
-| **Liq Fade Away** (`miwLiqFadeEnabled`/`micLiqFadeEnabled`) | Closes the oldest position when liquidation flow is adverse AND the scorecard confirms that signal has historically lost. Independent of entry blocking — can be enabled alone. |
-| **Block Entries on Bad Liq** (`miwLiqFadeBlockEntries`/`micLiqFadeBlockEntries`) | Blocks new entries when the adverse liq signal is active. Independent of the close — can be enabled without Liq Fade Away. Lifts each scan cycle when conditions clear. |
-| **Liq Fade %** (`miwLiqFadePct`/`micLiqFadePct`) | Adverse liq dominance threshold. Applies to whichever of the two above are enabled. |
-| **Liq Result Max Age** (`miwLiqResultMaxCycles`/`micLiqResultMaxCycles`) | How many scan cycles a liq result stays valid for sliq/bliq slot criteria. Results older than this are treated as if absent, and the criterion evaluates false. Default 2. |
-| **Fund Rate Fade Away** (`miwFundFadeEnabled`/`micFundFadeEnabled`) | Closes the oldest position when the dominant funding direction across the kline + liq sample union is historically bad per the scorecard. Both conditions — skew dominance and bad scorecard history — must hold. |
-| **Fund Skew %** (`miwFundFadePct`/`micFundFadePct`) | Minimum fraction of tickers in the union sample that must share the dominant funding direction to trigger. Default 50%. Funding rate *values* are always current (read from the live ticker snapshot each scan); the *set of symbols* sampled refreshes hourly on the kline side and per Liq Result Max Age on the liq side. |
-| **Fund Block Entries** (`miwFundFadeBlockEntries`/`micFundFadeBlockEntries`) | When on, new entries are also blocked while the adverse funding signal is active. |
+| **Fade Away** (`miwFadeEnabled`/`micFadeEnabled`) | Master toggle. Runs every scan; if any MIW/MIC position is in loss ≥ Loss Trigger, also fires between scans. Evaluates enabled signals as a combined adverse score — when combined score ≥ Combined Threshold, closes the oldest position. |
+| **Loss Trigger** (`miwFadeAwayLossPct`/`micFadeAwayLossPct`) | Loss threshold as a % of base margin (minNotional ÷ leverage). When any position crosses this, the combined fade check fires immediately outside the scan cycle. Default 25%. |
+| **Structure Signal** (`miwFadeStructureEnabled`/`micFadeStructureEnabled`) | Includes 1h kline momentum in the combined score. Adverse contribution = % of sampled candles moving against the position direction. |
+| **Liq Signal** (`miwFadeLiqEnabled`/`micFadeLiqEnabled`) | Includes liquidation flow in the combined score, gated by scorecard history. Adverse contribution = B-Liq% of the last cycle (for shorts). Only contributes when the Permafrost/Ashfall scorecard shows the signal has historically lost. |
+| **Funding Signal** (`miwFadeFundEnabled`/`micFadeFundEnabled`) | Includes funding rate direction in the combined score, gated by scorecard history the same way as Liq Signal. Adverse contribution = % of tickers in the kline + liq sample with adverse funding. |
+| **Combined Threshold** (`miwFadeThreshold`/`micFadeThreshold`) | % the combined adverse score must reach to trigger a close. Combined score = average of all enabled signal contributions. Default 50%. |
+| **Block Entries on Adverse Score** (`miwFadeBlockEntries`/`micFadeBlockEntries`) | Also blocks new MIW/MIC entries while the combined adverse score is at or above the threshold. Lifts each scan cycle when conditions clear. |
+| **Liq Result Max Age** (`miwLiqResultMaxCycles`/`micLiqResultMaxCycles`) | How many scan cycles a liq result stays valid for sliq/bliq/msliq/mbliq slot criteria. Results older than this are treated as absent. Default 2. |
 | **Auto Slots** (`miwAutoSlots`/`micAutoSlots`) | Replaces the manual slot list with every possible combination of the available criteria at the chosen size. |
 | **Auto Slot Size** (`miwAutoSlotSize`/`micAutoSlotSize`) | How many criteria per auto-generated combination (1–4). |
 | **Exclude from Auto** (`miwAutoSlotExclude`/`micAutoSlotExclude`) | Criteria omitted from auto-generated combinations and from scorecard scoring. |
@@ -185,7 +186,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Hist Tolerance** (`miwHistToleranceMins`/`micHistToleranceMins`) | Minimum minutes before the next hour boundary for a slot match to target that candle. If the boundary is within this window the match targets the following hour instead, ensuring the candle has enough time to fully form before observation. Default 20. |
 | **Hist Sequester %** (`miwHistSequestrPct`/`micHistSequestrPct`) | Share of the kline scan cap reserved each cycle for confirming pending hist targets. At 50% with Kline Scan Cap 50, up to 25 slots go to confirmation and 25 to discovery. Unused sequester slots roll over to discovery automatically. Default 50%. |
 
-**Fade Away as a drawdown gate replacement**: The three Fade Away types — structure, liq, and fund rate — can collectively replace drawdown locking for many setups. Structure and liq fade react to market conditions in real time and close positions before losses compound; with Block Entries enabled, they also prevent new entries until the environment clears. Fund Rate Fade adds a broader market-sentiment layer sourced from a wider ticker sample. Together they provide condition-aware position management without a hard drawdown ceiling. Fund Rate Fade and Liq Fade also partially replace scorecard auto-block, since both use scorecard history to gate the trigger — they won't act unless the signal has a track record of bad outcomes in your specific slots.
+**Fade Away as a drawdown gate replacement**: The consolidated Fade Away system — structure, liq, and funding signals averaged into a single score — can collectively replace drawdown locking for many setups. The combined score reacts to live market conditions and closes the oldest position before losses compound; with Block Entries enabled, it also prevents new entries until the environment clears. Liq and Funding signals are gated by scorecard history and won't contribute unless the signal has a track record of bad outcomes in your specific slots, making them a partial substitute for scorecard auto-block. The Loss Trigger enables between-scan checks, so a losing position can be exited before the next scheduled scan without waiting.
 
 ### Slots UI
 
@@ -276,6 +277,8 @@ See the config table above for threshold, scale factor, tier cap, and cooldown p
 
 **Graylist panel**: tickers graylisted by Collapsed Scoring or the Live Collapsed Gate appear in a list injected into the **Stats menu** by the MIW/MIC plugin. Entries are grouped by the scan timestamp when they were graylisted — each group shows the cohort time and all tickers blocked in that cycle. A single ✕ button on the group header clears all tickers in that cohort at once, removing them from the graylist immediately.
 
+**Hist Scoring panel**: when Historical Scoring is enabled, the **Stats menu** also shows a Hist Scoring section with the current count of pending simulation targets and a list of completed scoring batches (newest first). Each batch entry shows the batch number, how many entries were written to the scorecard, the batch total, and a relative timestamp.
+
 ### Liquidation Feed
 
 When surveillance is on: the **Feed Watcher** panel shows active batches (batch ID, ticker count, running S-Liq / B-Liq USDT totals, dominant side, countdown). The **Liq Sample chart** shows the last 10 closed cycles as stacked bars (S-Liq green / B-Liq red, qualifying segments at full opacity). The **Latest Cycle** chip grid shows per-ticker qualification with 🥵/🥶 badges.
@@ -314,6 +317,8 @@ Developer-level detail with no operational consequence. Included for reference.
 | `__permafrost_winter_v1` | Permafrost profile: events, samples, wave history |
 | `__ashfall_chaser_v1` | Ashfall profile |
 | `__everwinter_scorecard_v1` | Shared slot scorecard written by both plugins. Each close is one record; each slot retains up to the Sponge Quota most recent records. |
+| `__miw_hist_batches` | MIW Historical Scoring batch history. Array of up to 25 completed batch records — each contains batch ID, timestamp, entries written, and total candidates. |
+| `__mic_hist_batches` | MIC Historical Scoring batch history. Same structure as `__miw_hist_batches`. |
 | `__cgCoinList` | CoinGecko coin list cache (24-hour TTL) |
 | `__ew_creds` | EverWinter live plugin API credentials |
 | `__sc_creds` | SunChaser live plugin API credentials |
