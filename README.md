@@ -104,8 +104,6 @@ Timestamped entries for every significant bot event. Color coding:
 
 Common prefixes: `[MHL]` drawdown halt · `[GLK]` gains lock · `[PLK]` preemptive lock · `[PFR]`/`[ASH]` climate plugin events · `[MIW]`/`[MIC]` multi-indicator events.
 
-Fade Away block messages include the values that triggered the block — useful for confirming the data is current and not stale. Structure blocks show `bear:%` and `bull:%` candle aggregates; Liq blocks show the adverse liq side percentage; Fund Rate blocks show `neg:%` and `pos:%` skew across the sampled union.
-
 The log is capped at 300 entries in memory and in localStorage. Oldest entries are dropped when the cap is exceeded.
 
 ---
