@@ -26,10 +26,10 @@ Each file carries its version in two or three places — update **all** that app
 | `PseudoWinter.html` | v1.7.7 |
 | `PseudoChaser.html` | v1.3.8 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.21.0 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.21.0 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.25.1 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.25.1 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.24.5 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.24.5 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.25.10 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.25.10 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
@@ -57,7 +57,10 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 - **Prefer the minimal correct change.** Don't clean up, refactor, or extend beyond what was explicitly asked.
 - **Log behavioral corrections.** Whenever the user gives a behavioral correction or long-term instruction — signalled by phrases like "why didn't you…", "why are you…", "you should always…", "you should never…", or any direct criticism of approach — add the lesson to this file before finishing the response.
 - **Tooltip length.** In-app tooltips (hint text, x-text descriptions, title attributes) must be at most 3 phrases. Aim for 1.
+- **Fade Away loss trigger = between-scan enabler, not a scan gate.** The loss threshold causes the combined fade check to also fire via the exit timer (between scans) when any position crosses it. The check always runs every scan cycle unconditionally. "Scan bypass" means it bypasses waiting for the next scan — it does NOT skip or gate the scan-time check.
 - **Never use `window.confirm()`, `window.alert()`, or `window.prompt()` in plugin or bot UI.** These are blocked when the app runs in an iframe, silently returning `false`/`undefined` and making buttons appear unresponsive with no feedback. Use inline Alpine confirmation UI instead: wrap the button in `<span x-data="{c:false}">`, show the action button when `!c`, and when clicked set `c=true` to reveal inline "Sure? Yes / No" buttons that execute the action or reset `c`.
 
 ## Pending Tasks
+
+None.
 
