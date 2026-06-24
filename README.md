@@ -265,6 +265,8 @@ Auto Block is the coarsest gate — it operates on the base slot combination wit
 
 See the config table above for threshold, scale factor, tier cap, and cooldown parameters.
 
+**Graylist panel**: tickers graylisted by Collapsed Scoring or the Live Collapsed Gate appear in a list injected into the **Stats menu** by the MIW/MIC plugin. Entries are grouped by the scan timestamp when they were graylisted — each group shows the cohort time and all tickers blocked in that cycle. A single ✕ button on the group header clears all tickers in that cohort at once, removing them from the graylist immediately.
+
 ### Liquidation Feed
 
 When surveillance is on: the **Feed Watcher** panel shows active batches (batch ID, ticker count, running S-Liq / B-Liq USDT totals, dominant side, countdown). The **Liq Sample chart** shows the last 10 closed cycles as stacked bars (S-Liq green / B-Liq red, qualifying segments at full opacity). The **Latest Cycle** chip grid shows per-ticker qualification with 🥵/🥶 badges.
