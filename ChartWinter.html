@@ -18,7 +18,7 @@ Copyright 2026 Peng Protocol — ChartWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>❄ ChartWinter v1.4 — Scan-Informed Charting</title>
+<title>❄ ChartWinter v1.5 — Scan-Informed Charting</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1058,7 +1058,7 @@ body::before {
     <div class="brand">
       <span class="snow">❄</span>
       <span>CHARTWINTER</span>
-      <span style="color:var(--text-lo);font-size:10px;letter-spacing:1px">v1.4</span>
+      <span style="color:var(--text-lo);font-size:10px;letter-spacing:1px">v1.5</span>
     </div>
     <div class="tb-stat">
       <span><span class="dot" :class="online?'on':''"></span><b x-text="online?'ONLINE':'OFFLINE'"></b></span>
@@ -2028,6 +2028,7 @@ let   _cwCoinList     = null;      // CG coin list, fetched once per session
 const _cwCpIdCache    = {};        // base → CoinPaprika coin ID ('' = confirmed miss, fallback)
 const _cwSupplyCache  = {};        // CP coin ID → { supply, ts } (24h TTL, fallback)
 let   _cwCpCoinList   = null;      // CP coin list, fetched once per session
+const _cwDsCache      = {};        // base → { mcap, dsPrice, ts } (CG_TTL, DexScreener fallback)
 
 function _wsSend(obj) {
   try { if (_wsConn && _wsConn.readyState === WebSocket.OPEN) _wsConn.send(JSON.stringify(obj)); } catch {}
@@ -2989,6 +2990,7 @@ function cw() { return {
         }
 
         let cpFetched = 0, cpRejected = 0;
+        const cpMissBases = [];
         for (const base of cgMissBases) {
           const sym    = syms.find(s => s.replace(/USDT$/i, '').toLowerCase() === base);
           const id     = _cwCpIdCache[base];
@@ -2998,15 +3000,51 @@ function cw() { return {
             if (bp > 0 && priceOk(cached.price, sym)) {
               this.mcapData[sym] = cached.supply * bp; cpFetched++;
             } else if (bp > 0) {
-              cpRejected++;
+              cpRejected++; cpMissBases.push(base);
+            } else {
+              cpMissBases.push(base);
             }
+          } else {
+            cpMissBases.push(base);
+          }
+        }
+
+        // ── DexScreener fallback for CG+CP misses ─────────────────────
+        const dsStale = cpMissBases.filter(b => {
+          const c = _cwDsCache[b];
+          return !c || now - c.ts >= CG_TTL;
+        });
+        for (const base of dsStale) {
+          try {
+            const r = await fetch(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(base)}`);
+            if (r.ok) {
+              const d = await r.json();
+              const pairs = (d?.pairs || []).filter(p => p.baseToken?.symbol?.toLowerCase() === base);
+              let entry = { mcap: null, dsPrice: null, ts: now };
+              for (const p of pairs) {
+                const dsPrice = parseFloat(p.priceUsd || 0);
+                const mcap    = p.marketCap;
+                if (mcap && dsPrice) { entry = { mcap, dsPrice, ts: now }; break; }
+              }
+              _cwDsCache[base] = entry;
+            }
+          } catch(e) {}
+        }
+        let dsFetched = 0, dsRejected = 0;
+        for (const base of cpMissBases) {
+          if (this.mcapData[syms.find(s => s.replace(/USDT$/i,'').toLowerCase()===base)]) continue;
+          const sym = syms.find(s => s.replace(/USDT$/i, '').toLowerCase() === base);
+          const c   = _cwDsCache[base];
+          if (c?.mcap && sym) {
+            if (priceOk(c.dsPrice, sym)) { this.mcapData[sym] = c.mcap; dsFetched++; }
+            else dsRejected++;
           }
         }
 
         const cgOk = syms.length - cgMissBases.length;
-        const miss  = cgMissBases.length - cpFetched;
-        const rejNote = (cgRejected + cpRejected) > 0 ? ` rej:${cgRejected + cpRejected}` : '';
-        this.cwlog(`MCap — CG:${cgOk} CP:${cpFetched} miss:${miss}${rejNote}/${syms.length}`, miss > 0 ? 'warn' : 'info', 'MCAP-DONE');
+        const miss  = cpMissBases.length - dsFetched;
+        const rejNote = (cgRejected + cpRejected + dsRejected) > 0 ? ` rej:${cgRejected + cpRejected + dsRejected}` : '';
+        this.cwlog(`MCap — CG:${cgOk} CP:${cpFetched} DS:${dsFetched} miss:${miss}${rejNote}/${syms.length}`, miss > 0 ? 'warn' : 'info', 'MCAP-DONE');
       } else {
         this.cwlog(`MCap — CG:${syms.length}/${syms.length}`, 'info', 'MCAP-DONE');
       }
