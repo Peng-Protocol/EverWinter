@@ -216,7 +216,7 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **IO Sentiment** | Includes funding rate sentiment (which side is paying) in the climate score. |
 | **Slot Scorecard** (`permafrostScorecardEnabled`/`ashfallScorecardEnabled`) | Records realized PnL per MIW/MIC criteria combination. Shows which slot types have been profitable or losing over time. |
 | **Sponge Quota** (`pfSpongeQuota`/`afSpongeQuota`) | How many recent closes per slot are used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation to recent performance; higher = more stable scores that smooth out short streaks. Default 30. |
-| **Include Historical Scores** (`pfHistScoringEnabled`/`afHistScoringEnabled`) | When on, historical scoring records (written by the MIW/MIC Historical Scoring feature, tagged `hist: true`) are included in slot score calculations and block decisions. When off, only live closed-trade records count. On by default. |
+| **Include Historical Scores** (`pfHistScoringEnabled`/`afHistScoringEnabled`) | When on, historical scoring records (written by the MIW/MIC Historical Scoring feature, tagged `hist: true`) are included in slot score calculations and block decisions. When off, only live closed-trade records count. On by default. Note: this toggle is independent of the MIW/MIC **Historical Scoring** toggle. Turning off Historical Scoring in MIW/MIC only stops new entries from being generated — existing historical records remain in the scorecard until this toggle is turned off or the sponge quota pushes them out. Turning this off while records exist immediately reduces slot scores to the real-trade-only baseline; slots with no real-trade records disappear from the scorecard entirely until live trades accumulate. |
 | **Auto Block** (`permafrostAutoBlock`/`ashfallAutoBlock`) | Master gate for per-slot blocking based on scorecard data. When off, no blocking conditions run regardless of sub-toggle settings. Enable one or both conditions below to activate blocking. |
 | **Threshold Block** (`pfThresholdBlock`/`afThresholdBlock`) | Blocks a slot when own gross losses OR partner gross wins independently exceed the Block Threshold. Wins never offset losses — a slot that loses $1 and wins $0.90 is still blocked by the loss side alone. On by default. |
 | **Combined PnL Block** (`pfCombinedBlock`/`afCombinedBlock`) | Blocks a slot when its net PnL falls below negative Block Threshold. Unlike Threshold Block, wins offset losses here — only genuinely net-losing slots are blocked. Off by default. |
@@ -277,7 +277,7 @@ See the config table above for threshold, scale factor, tier cap, and cooldown p
 
 **Graylist panel**: tickers graylisted by Collapsed Scoring or the Live Collapsed Gate appear in a list injected into the **Stats menu** by the MIW/MIC plugin. Entries are grouped by the scan timestamp when they were graylisted — each group shows the cohort time and all tickers blocked in that cycle. A single ✕ button on the group header clears all tickers in that cohort at once, removing them from the graylist immediately.
 
-**Hist Scoring panel**: when Historical Scoring is enabled, the **Stats menu** also shows a Hist Scoring section with the current count of pending simulation targets and a list of completed scoring batches (newest first). Each batch entry shows the batch number, how many entries were written to the scorecard, the batch total, and a relative timestamp.
+**Hist Scoring panel**: when Historical Scoring is enabled, the **Stats menu** also shows a Hist Scoring section with the current count of pending simulation targets, a countdown to the next expected batch (shows "next scan" once the window has elapsed), and a list of completed scoring batches (newest first). Each batch entry shows the batch number, wrote/total counts, win count (W), loss count (L), net simulated PnL, and the clock time the batch completed (same-day batches show HH:MM; older ones show month, day, and time).
 
 ### Liquidation Feed
 
@@ -317,7 +317,7 @@ Developer-level detail with no operational consequence. Included for reference.
 | `__permafrost_winter_v1` | Permafrost profile: events, samples, wave history |
 | `__ashfall_chaser_v1` | Ashfall profile |
 | `__everwinter_scorecard_v1` | Shared slot scorecard written by both plugins. Each close is one record; each slot retains up to the Sponge Quota most recent records. |
-| `__miw_hist_batches` | MIW Historical Scoring batch history. Array of up to 25 completed batch records — each contains batch ID, timestamp, entries written, and total candidates. |
+| `__miw_hist_batches` | MIW Historical Scoring batch history. Object containing `batches` (up to 25 completed records — each with batch ID, timestamp, entries written, total candidates, win count, loss count, and net simulated PnL) and `fundSkew` (last funding sample bar state). |
 | `__mic_hist_batches` | MIC Historical Scoring batch history. Same structure as `__miw_hist_batches`. |
 | `__cgCoinList` | CoinGecko coin list cache (24-hour TTL) |
 | `__ew_creds` | EverWinter live plugin API credentials |
