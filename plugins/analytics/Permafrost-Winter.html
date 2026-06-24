@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.25.2';
+  const VERSION        = '1.25.3';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -70,17 +70,13 @@
   };
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old scars fade
-  const EVENT_W        = 10;                   // halt events are strong anchors
-  const SAMPLE_W       = 1;                    // cycle samples are weak fill
-  const MIN_MASS       = 6;                    // effective evidence mass required to override the timer
+  const MIN_MASS       = 6;                    // evidence mass (kernel-weighted closes) required to use history
   const STRONG_MASS    = 12;                   // evidence mass for a *strong* historical bias (2× MIN_MASS)
   const STRONG_SCORE   = 0.30;                 // |score| at/above which the bias counts as strong
   const DEFAULT_HALT_MS = 12 * 3600 * 1000;    // stock 12h horizon — the floor unless strong history says otherwise
   const MIN_HALT_MS    = 1 * 3600 * 1000;      // never thaw before 1h (only reachable under a strong bias)
-  const LABEL_WINDOW   = 6 * 3600 * 1000;      // samples are labeled by the realized PnL that followed
   const EVENTS_CAP     = 200;
-  const SAMPLES_CAP    = 1000;
-  const PNL_LOG_TTL    = 24 * 3600 * 1000;
+  const CLOSES_CAP     = 500;
 
   // ── Structure trajectory ("the wave") ──
   // A reading isn't just where the market is now — it's where it came from. We
@@ -397,7 +393,7 @@
               <button @click="dzOpen=!dzOpen" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border:1px solid rgba(255,69,96,.25);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px;display:flex;align-items:center;gap:4px"><span x-text="dzOpen?'▾':'▸'"></span>&nbsp;Danger Zone</button>
               <div x-show="dzOpen" x-transition.opacity style="margin-top:6px;padding:8px;background:rgba(255,69,96,.04);border:1px solid rgba(255,69,96,.18);border-radius:3px">
                 <div class="pfr-stat" style="margin-bottom:10px;padding:8px 10px;background:rgba(96,210,255,.05);border:1px solid rgba(96,210,255,.15);border-radius:3px">
-                  <div>PROFILE — <span x-text="(pfEvents||[]).filter(e=>e.kind==='drawdown').length"></span> drawdown / <span x-text="(pfEvents||[]).filter(e=>e.kind==='gainslock').length"></span> gains-lock events, <span x-text="(pfSamples||[]).filter(s=>s.label!==null).length"></span> labeled samples</div>
+                  <div>PROFILE — <span x-text="pfCloses.length"></span> closes on record</div>
                   <div x-show="pfStatus.at">READING — mag <span x-text="(pfStatus.skew??0).toFixed(2)"></span> | breadth <span x-text="(pfStatus.breadth??0).toFixed(2)"></span> | score <span x-text="pfStatus.score===null?'—':pfStatus.score.toFixed(2)"></span> | mass <span x-text="pfStatus.mass.toFixed(1)"></span></div>
                   <div x-show="pfStatus.at">STRUCTURE — lean <span x-text="(pfStatus.lean??0).toFixed(2)"></span> | slope <span x-text="(pfStatus.slope>=0?'+':'')+(pfStatus.slope??0).toFixed(2)"></span> | effective <span x-text="pfStatus.eff===null||pfStatus.eff===undefined?'—':((pfStatus.eff>=0?'+':'')+pfStatus.eff.toFixed(2))"></span> for shorts</div>
                   <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
@@ -418,7 +414,7 @@
                       <template x-if="c">
                         <span style="display:inline-flex;gap:3px;align-items:center">
                           <span style="font-family:var(--mono);font-size:8px;color:var(--short)">Sure?</span>
-                          <button @click="pfEvents=[];pfSamples=[];pfPnl=[];pfWave=[];persist();log('[PFR] Profile cleared.','warn'); c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:rgba(255,69,96,.12);color:var(--short);cursor:pointer;letter-spacing:.5px">Yes</button>
+                          <button @click="pfEvents=[];pfCloses=[];pfWave=[];persist();log('[PFR] Profile cleared.','warn'); c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:rgba(255,69,96,.12);color:var(--short);cursor:pointer;letter-spacing:.5px">Yes</button>
                           <button @click="c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
                         </span>
                       </template>
@@ -430,7 +426,7 @@
                   <template x-if="c">
                     <span style="display:inline-flex;gap:3px;align-items:center">
                       <span style="font-family:var(--mono);font-size:8px;color:var(--short)">Sure?</span>
-                      <button @click="localStorage.removeItem('__permafrost_winter_v1');pfEvents=[];pfSamples=[];pfPnl=[];pfWave=[];persist();log('[PFR] Plugin state cleared from storage.','warn'); c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:rgba(255,69,96,.12);color:var(--short);cursor:pointer;letter-spacing:.5px">Yes</button>
+                      <button @click="localStorage.removeItem('__permafrost_winter_v1');pfEvents=[];pfCloses=[];pfWave=[];persist();log('[PFR] Plugin state cleared from storage.','warn'); c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:rgba(255,69,96,.12);color:var(--short);cursor:pointer;letter-spacing:.5px">Yes</button>
                       <button @click="c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
                     </span>
                   </template>
@@ -454,9 +450,8 @@
 
       return Object.assign({}, def, {
 
-        pfEvents:     [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth, gCount, lCount, gSum, lSum }
-        pfSamples:    [],   // { ts, skew, breadth, label } — label null until the 6h window resolves
-        pfPnl:        [],   // { ts, pnl } — plugin-owned closed-trade log for sample labeling
+        pfEvents:     [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth } — kept for import compat, not scored
+        pfCloses:     [],   // { ts, pnl, skew, breadth } — per-close PnL paired with structure at close time
         pfWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
         pfScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
         pfScorecardView: 'combined', // 'combined' | 'own'
@@ -464,7 +459,7 @@
         pfKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // last-cycle aggregate % change sums
         _pfKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
         _pfStructureList: null, _pfStructureAt: 0, // own 3h ticker cache independent of host
-        pfStatus:  { skew: null, breadth: null, score: null, mass: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
+        pfStatus:  { skew: null, breadth: null, score: null, mass: 0, count: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
         pfCrossEvents: [],
         _liqBatches: [],
         _liqResults: {},
@@ -531,13 +526,12 @@
             const raw = localStorage.getItem(PFR_KEY);
             if (raw) {
               const s = JSON.parse(raw);
-              if (Array.isArray(s.events))  this.pfEvents  = s.events.slice(-EVENTS_CAP);
-              if (Array.isArray(s.samples)) this.pfSamples = s.samples.slice(-SAMPLES_CAP);
-              if (Array.isArray(s.pnl))     this.pfPnl     = s.pnl.filter(e => Date.now() - e.ts < PNL_LOG_TTL);
-              if (Array.isArray(s.wave))    this.pfWave    = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
+              if (Array.isArray(s.events)) this.pfEvents  = s.events.slice(-EVENTS_CAP);
+              if (Array.isArray(s.closes)) this.pfCloses  = s.closes.slice(-CLOSES_CAP);
+              if (Array.isArray(s.wave))   this.pfWave    = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
             }
           } catch(e) {}
-          this.log(`[PFR] Permafrost (Winter) v${VERSION} loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfEvents.length} events, ${this.pfSamples.length} samples on record`, 'info');
+          this.log(`[PFR] Permafrost (Winter) v${VERSION} loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfCloses.length} closes on record`, 'info');
           setInterval(() => {
             if (this.cfg.permafrostCrossEnabled) this._pfCheckCross().catch(() => {});
             if (this.cfg.permafrostScorecardEnabled) this._pfScoreBuild();
@@ -570,9 +564,9 @@
                   if (!r) return;
                   this._pfAddSample(r);
                   if (!r._fresh) return;
-                  const { score, mass } = this.pfStatus;
-                  const _d = this._pfDescribe(r, score, mass);
-                  this.log(`[PFR] ❄ Structure check (halt-tick) — market is ${_d.desc} | ${_d.bias}`, 'info');
+                  const { score, mass, count } = this.pfStatus;
+                  const _d = this._pfDescribe(r, score, mass, count);
+                  this.log(`[PFR] ❄ Structure check (halted) — ${_d.desc} — ${_d.bias}`, 'info');
                 }).catch(() => {});
               }
             }
@@ -583,7 +577,7 @@
           _origPers.call(this);
           try {
             localStorage.setItem(PFR_KEY, JSON.stringify({
-              events: this.pfEvents, samples: this.pfSamples, pnl: this.pfPnl, wave: this.pfWave,
+              events: this.pfEvents, closes: this.pfCloses, wave: this.pfWave,
             }));
           } catch(e) {}
         },
@@ -657,49 +651,47 @@
         // ── Human-readable structure + historical-bias phrasing for the activity log ──
         // Intensity ranges over mildly / moderately / strongly bullish (or bearish). The
         // tiers are entirely relative to this installation's own history: thresholds are
-        // the 25th / 50th / 80th percentiles of |lean| across recorded events + samples,
-        // so they shift as the profile collects more data. Fixed fallbacks
-        // (0.08 / 0.20 / 0.40) apply until at least 30 readings are on record.
-        _pfDescribe(reading, score, mass) {
+        _pfDescribe(reading, score, mass, count) {
           const lean = (reading.skew + reading.breadth) / 2;
-          const hist = [...this.pfEvents, ...this.pfSamples]
-            .map(x => Math.abs((x.skew + x.breadth) / 2))
-            .sort((a, b) => a - b);
+          const hist = this.pfCloses.map(x => Math.abs((x.skew + x.breadth) / 2)).sort((a, b) => a - b);
           const q = p => hist[Math.min(hist.length - 1, Math.floor(p * hist.length))];
           const [tFlat, tModerate, tStrong] = hist.length >= 30 ? [q(0.25), q(0.5), q(0.8)] : [0.08, 0.20, 0.40];
           const mag    = Math.abs(lean);
           const adverb = mag >= tStrong ? 'strongly ' : mag >= tModerate ? 'moderately ' : 'mildly ';
-          const struct = mag <= tFlat ? 'mixed/flat' : `${adverb}${lean > 0 ? 'bullish' : 'bearish'}`;
+          const struct = mag <= tFlat ? 'flat/mixed' : `${adverb}${lean > 0 ? 'bullish' : 'bearish'}`;
           const slope  = this._pfTrajectory().slope;
-          const trend  = slope > 0.05 ? ', rising (turning bullish)' : slope < -0.05 ? ', falling (turning bearish)' : ', steady';
-          const ioStr  = reading.ioScore != null ? `, io ${reading.ioScore >= 0 ? '+' : ''}${reading.ioScore.toFixed(2)}` : '';
-          const desc   = `${struct}${trend} (mag ${reading.skew.toFixed(2)}, breadth ${reading.breadth.toFixed(2)}, slope ${slope >= 0 ? '+' : ''}${slope.toFixed(2)}${ioStr}, ${reading.gCount}▲/${reading.lCount}▼)`;
+          const trend  = slope > 0.05 ? ', rising' : slope < -0.05 ? ', falling' : '';
+          const desc   = `${struct}${trend}`;
           const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
-          const eff      = this._pfEffectiveScore(score, mass, inherent);
+          const eff    = this._pfEffectiveScore(score, mass, inherent);
           let bias;
-          if (score === null || mass < MIN_MASS) bias = `thin history (mass ${mass.toFixed(1)} < ${MIN_MASS}) — leaning on inherent structure (${eff >= 0 ? '+' : ''}${eff.toFixed(2)} for shorts)`;
-          else if (score >= 0.15)  bias = `historically good for shorts (score +${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
-          else if (score <= -0.15) bias = `historically bad for shorts (score ${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
-          else                     bias = `historically neutral for shorts (score ${score.toFixed(2)}, mass ${mass.toFixed(1)})`;
-          if (score !== null && mass >= MIN_MASS && Math.abs(eff - score) >= 0.1) bias += ` | structure shifts the effective read to ${eff >= 0 ? '+' : ''}${eff.toFixed(2)}`;
+          if (score === null || mass < MIN_MASS) {
+            bias = 'thin history';
+          } else {
+            const entryMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+            const avgPnl = score * entryMargin;
+            const sign = avgPnl >= 0 ? '+' : '-';
+            bias = `avg ${sign}${Math.abs(avgPnl).toFixed(2)}/position (${count} similar close${count === 1 ? '' : 's'})`;
+          }
           return { desc, bias, eff };
         },
 
-        // ── Hostility score: kernel-weighted, recency-decayed vote of past events
-        // and labeled samples near the given reading. score ∈ [−1,1]; mass = evidence weight.
+        // ── Hostility score: kernel-weighted, recency-decayed, normalized by entry margin.
+        // score ∈ [−1,1]; mass = evidence weight; count = closes within kernel radius.
         _pfScore(reading) {
+          const entryMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const now = Date.now();
-          let num = 0, mass = 0;
-          const tally = (skew, breadth, label, w, ts) => {
-            const ds = reading.skew - skew, db = reading.breadth - breadth;
+          let num = 0, mass = 0, count = 0;
+          for (const c of this.pfCloses) {
+            const ds = reading.skew - c.skew, db = reading.breadth - c.breadth;
             const k  = Math.exp(-(ds * ds + db * db) / (2 * KERNEL_H * KERNEL_H));
-            const dec = Math.pow(0.5, (now - ts) / HALF_LIFE_MS);
-            num  += w * label * k * dec;
-            mass += w * k * dec;
-          };
-          for (const e of this.pfEvents) tally(e.skew, e.breadth, e.kind === 'drawdown' ? -1 : 1, EVENT_W, e.ts);
-          for (const s of this.pfSamples) { if (s.label !== null) tally(s.skew, s.breadth, s.label, SAMPLE_W, s.ts); }
-          return { score: mass > 0 ? num / mass : null, mass };
+            const dec = Math.pow(0.5, (now - c.ts) / HALF_LIFE_MS);
+            const norm = Math.max(-1, Math.min(1, c.pnl / entryMargin));
+            num  += norm * k * dec;
+            mass += k * dec;
+            if (k > 0.1) count++;
+          }
+          return { score: mass > 0 ? num / mass : null, mass, count };
         },
 
         // ── The wave: recent path of the structure lean (oldest → newest) ──
@@ -710,7 +702,7 @@
         },
 
         // Append a structure-lean point to the wave and prune by age / cap. Kept
-        // separate from pfSamples (which get pruned for scoring) so the wave
+        // separate from pfCloses (which track realized PnL) so the wave
         // retains the full trajectory for as long as we have data, up to ~a week.
         _pfPushWave(reading) {
           this.pfWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4), vol: reading.vol ?? 0, volAbs: reading.volAbs ?? 0, io: reading.ioScore ?? null });
@@ -1129,34 +1121,17 @@
             + `</svg>`;
         },
 
-        // ── Label samples whose 6h window has resolved; drop windows with no closed trades ──
-        _pfStampSamples() {
-          const now = Date.now();
-          const entryMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
-          this.pfSamples = this.pfSamples.filter(s => {
-            if (s.label !== null || now - s.ts < LABEL_WINDOW) return true;
-            const trades = this.pfPnl.filter(p => p.ts > s.ts && p.ts <= s.ts + LABEL_WINDOW);
-            if (!trades.length) return false; // nothing closed — no evidence either way
-            const pnl = trades.reduce((a, p) => a + p.pnl, 0);
-            s.label = Math.max(-1, Math.min(1, pnl / entryMargin));
-            return true;
-          });
-          if (this.pfSamples.length > SAMPLES_CAP) this.pfSamples = this.pfSamples.slice(-SAMPLES_CAP);
-        },
-
         _pfAddSample(reading) {
-          this._pfStampSamples();
-          this.pfSamples.push({ ts: reading.ts, skew: reading.skew, breadth: reading.breadth, label: null });
           this._pfPushWave(reading);
-          const { score, mass } = this._pfScore(reading);
+          const { score, mass, count } = this._pfScore(reading);
           const { lean, slope } = this._pfTrajectory();
           const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
           const eff = this._pfEffectiveScore(score, mass, inherent);
-          this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, lean, slope, inherent, eff, ioScore: reading.ioScore ?? null, at: reading.ts };
+          this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, count, lean, slope, inherent, eff, ioScore: reading.ioScore ?? null, at: reading.ts };
         },
 
         pfExport() {
-          const blob = new Blob([JSON.stringify({ exportedAt: Date.now(), events: this.pfEvents, samples: this.pfSamples, wave: this.pfWave }, null, 2)], { type: 'application/json' });
+          const blob = new Blob([JSON.stringify({ exportedAt: Date.now(), events: this.pfEvents, closes: this.pfCloses, wave: this.pfWave }, null, 2)], { type: 'application/json' });
           const a = document.createElement('a');
           a.href = URL.createObjectURL(blob);
           a.download = `permafrost-winter-${new Date().toISOString().slice(0, 10)}.json`;
@@ -1171,11 +1146,11 @@
           reader.onload = (ev) => {
             try {
               const d = JSON.parse(ev.target.result);
-              if (Array.isArray(d.events))  this.pfEvents  = d.events.slice(-EVENTS_CAP);
-              if (Array.isArray(d.samples)) this.pfSamples = d.samples.slice(-SAMPLES_CAP);
-              if (Array.isArray(d.wave))    this.pfWave    = d.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
+              if (Array.isArray(d.events)) this.pfEvents = d.events.slice(-EVENTS_CAP);
+              if (Array.isArray(d.closes)) this.pfCloses = d.closes.slice(-CLOSES_CAP);
+              if (Array.isArray(d.wave))   this.pfWave   = d.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
               this.persist();
-              this.log(`[PFR] Profile imported — ${this.pfEvents.length} events, ${this.pfSamples.length} samples, ${this.pfWave.length} wave points`, 'info');
+              this.log(`[PFR] Profile imported — ${this.pfCloses.length} closes, ${this.pfWave.length} wave points`, 'info');
             } catch(err) {
               this.log('[PFR] Import failed — file could not be parsed as a valid Permafrost profile', 'warn');
             }
@@ -1196,9 +1171,9 @@
             if (!r) return;
             this._pfAddSample(r);
             if (!r._fresh) return;
-            const { score, mass } = this.pfStatus;
-            const _d = this._pfDescribe(r, score, mass);
-            this.log(`[PFR] 🧊 Routine market structure check — market is ${_d.desc} | ${_d.bias}`, 'info');
+            const { score, mass, count } = this.pfStatus;
+            const _d = this._pfDescribe(r, score, mass, count);
+            this.log(`[PFR] 🧊 Market structure: ${_d.desc} — ${_d.bias}`, 'info');
             this.persist();
           }).catch(() => {});
         },
@@ -1210,10 +1185,10 @@
             // totalPnl (incl. funding) is what the base feeds its halt windows
             const t   = this.closedTrades[0];
             const pnl = t?.totalPnl ?? t?.pnl;
-            if (typeof pnl === 'number') {
+            if (typeof pnl === 'number' && this.pfStatus.skew !== null && this.pfStatus.skew !== undefined) {
               const now = Date.now();
-              this.pfPnl.push({ ts: now, pnl });
-              this.pfPnl = this.pfPnl.filter(e => now - e.ts < PNL_LOG_TTL);
+              this.pfCloses.push({ ts: now, pnl, skew: this.pfStatus.skew, breadth: this.pfStatus.breadth });
+              if (this.pfCloses.length > CLOSES_CAP) this.pfCloses = this.pfCloses.slice(-CLOSES_CAP);
             }
           }
           if (this.cfg.permafrostCrossEnabled) {
