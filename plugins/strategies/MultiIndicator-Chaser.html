@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.19.2';
+  const VERSION       = '1.20.0';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -483,6 +483,23 @@
                     </div>
                   </label>
                 </div>
+                <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06)">
+                  <label class="tog" @click.prevent="if(!cfgLocked){cfg.micHistScoringEnabled=!cfg.micHistScoringEnabled;persist()}">
+                    <div class="tog-t" :class="cfg.micHistScoringEnabled?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Historical Scoring</div>
+                      <div class="mic-hint">Simulates 1h-candle outcomes for pool matches and writes them to the AF scorecard as historical entries.</div>
+                    </div>
+                  </label>
+                  <div x-show="cfg.micHistScoringEnabled" style="margin-top:6px">
+                    <div class="g">
+                      <div class="lbl">Match Tolerance <b x-text="(cfg.micHistToleranceMins??20)+'m'"></b></div>
+                      <input type="range" min="5" max="55" step="5" x-model.number="cfg.micHistToleranceMins" @change="persist()">
+                      <div class="mic-hint">Minimum lead time before the target hour candle opens. Default 20m (2 scans).</div>
+                    </div>
+                    <div style="margin-top:4px;font-family:var(--mono);font-size:9px;color:var(--text-lo)" x-text="Object.keys(_micHistPending||{}).length+' match(es) pending simulation'"></div>
+                  </div>
+                </div>
               </div><!-- end fade zone -->
             </div>
           </div>
@@ -578,6 +595,7 @@
         _micFundBlocked: false,
         _micFundBias: null,
         _micFundSkew: null,
+        _micHistPending: {},
         _micSlotGraylist: {},
         _micFreshMcapBases: null,
 
@@ -628,6 +646,9 @@
           if (this.cfg.micFundFadeEnabled      === undefined) this.cfg.micFundFadeEnabled      = false;
           if (this.cfg.micFundFadePct          === undefined) this.cfg.micFundFadePct          = 50;
           if (this.cfg.micFundFadeBlockEntries === undefined) this.cfg.micFundFadeBlockEntries = false;
+          if (this.cfg.micHistScoringEnabled   === undefined) this.cfg.micHistScoringEnabled   = false;
+          if (this.cfg.micHistToleranceMins    === undefined) this.cfg.micHistToleranceMins    = 20;
+          this._micHistPending = {};
           this._micFundBlocked       = false;
           this._micFundBias          = null;
           this._micFundSkew          = null;
@@ -773,6 +794,7 @@
           await this._micCheckFadeAway();
           await this._micCheckLiqFadeAway();
           await this._micCheckFundFadeAway();
+          await this._micProcessHistMatches();
           await this._micCheckCascade();
           await this._micCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -1181,21 +1203,8 @@
 
           // Entry logic only runs when there are non-blocked slots and capacity
           if (!slots.length) return;
-          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
 
-          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
-          if (this.cfg.micShareCapEnabled ?? true) {
-            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.micShareCapPct ?? 100) / 100)));
-            const micCount = (this.positions || []).filter(p => p._mic).length;
-            headroom = Math.min(headroom, capSlots - micCount);
-            if (headroom < 1) {
-              this.log('[MIC] 💡 Share cap reached — no slots available', 'info');
-              return;
-            }
-          }
-          const picks = Math.min(Math.max(1, Math.round(this.cfg.micPicks ?? 5)), headroom);
-
-          // Build pool: non-blocked slots only, excluding newly slot-graylisted tickers
+          // Build pool before capacity check so historical matches are logged regardless
           const pool = basePool
             .map(t => {
               if ((this._micSlotGraylist[t.symbol] ?? 0) > 0 && _glNow - this._micSlotGraylist[t.symbol] < _slTtl) return null;
@@ -1236,10 +1245,26 @@
                 for (const ac of _annotCrits) _net += (_ranks[_col(ac)] ?? 0) * (1 + _sf * Math.min(_tier(ac), _cap));
                 if (_net < -_thresh) { this._micSlotGraylist[t.symbol] = _glNow; return null; }
               }
-              return { t, criteria: slots[slotIdx], slotIdx };
+              return { t, criteria: slots[slotIdx], slotIdx, annotKey: _annotKey, annotCrits: _annotCrits };
             })
             .filter(Boolean)
             .sort((a, b) => a.slotIdx - b.slotIdx || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
+
+          this._micLogHistMatches(pool);
+
+          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
+
+          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
+          if (this.cfg.micShareCapEnabled ?? true) {
+            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.micShareCapPct ?? 100) / 100)));
+            const micCount = (this.positions || []).filter(p => p._mic).length;
+            headroom = Math.min(headroom, capSlots - micCount);
+            if (headroom < 1) {
+              this.log('[MIC] 💡 Share cap reached — no slots available', 'info');
+              return;
+            }
+          }
+          const picks = Math.min(Math.max(1, Math.round(this.cfg.micPicks ?? 5)), headroom);
 
           if (!pool.length) {
 
@@ -1592,6 +1617,90 @@
           });
         },
 
+        _micLogHistMatches(pool) {
+          if (!this.cfg.micHistScoringEnabled || !pool.length) return;
+          const now = Date.now();
+          const toleranceMs = (this.cfg.micHistToleranceMins ?? 20) * 60 * 1000;
+          const targetHourStart = Math.ceil((now + toleranceMs) / 3_600_000) * 3_600_000;
+          for (const entry of pool) {
+            const dedupeKey = `${entry.t.symbol}:${entry.annotKey}:${targetHourStart}`;
+            if (!this._micHistPending[dedupeKey]) {
+              this._micHistPending[dedupeKey] = {
+                symbol: entry.t.symbol,
+                annotCrits: entry.annotCrits,
+                targetHourStart,
+              };
+            }
+          }
+        },
+
+        async _micProcessHistMatches() {
+          if (!this.cfg.micHistScoringEnabled) return;
+          const now = Date.now();
+          const MAX_AGE_MS = 24 * 3_600_000;
+          const toProcess = [];
+          for (const [key, entry] of Object.entries(this._micHistPending)) {
+            if (now - entry.targetHourStart > MAX_AGE_MS) { delete this._micHistPending[key]; continue; }
+            if (now >= entry.targetHourStart + 3_600_000) toProcess.push({ key, entry });
+          }
+          if (!toProcess.length) return;
+
+          const bySymbol = {};
+          for (const x of toProcess) {
+            if (!bySymbol[x.entry.symbol]) bySymbol[x.entry.symbol] = [];
+            bySymbol[x.entry.symbol].push(x);
+          }
+
+          const tpPct   = (this.cfg.binaryTpPct ?? 18) / 100;
+          const slPct   = (this.cfg.binarySlPct ?? 18) / 100;
+          const lev     = this.cfg.leverage ?? 6;
+          const margin  = (this.cfg.minNotional ?? 6) / lev;
+          let wrote = 0;
+          const CONC = 5;
+          const symbols = Object.keys(bySymbol);
+          for (let i = 0; i < symbols.length; i += CONC) {
+            await Promise.all(symbols.slice(i, i + CONC).map(async sym => {
+              const entries = bySymbol[sym];
+              const oldestTs  = Math.min(...entries.map(x => x.entry.targetHourStart));
+              const hoursBack = Math.min(Math.ceil((now - oldestTs) / 3_600_000) + 2, 200);
+              try {
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=${hoursBack}`);
+                if (!r.ok) return;
+                const d = await r.json();
+                const list = d?.result?.list;
+                if (!list) return;
+                const candleMap = {};
+                for (const c of list) candleMap[parseInt(c[0])] = c;
+                for (const { key, entry } of entries) {
+                  const c = candleMap[entry.targetHourStart];
+                  if (!c) { delete this._micHistPending[key]; continue; }
+                  const open  = parseFloat(c[1]);
+                  const high  = parseFloat(c[2]);
+                  const low   = parseFloat(c[3]);
+                  const close = parseFloat(c[4]);
+                  // MIC = LONG: TP when price rises, SL when price falls
+                  const tpPrice = open * (1 + tpPct / lev);
+                  const slPrice = open * (1 - slPct / lev);
+                  const hitTp = high >= tpPrice;
+                  const hitSl = low  <= slPrice;
+                  let pnl;
+                  if (hitTp && hitSl) pnl = -margin * slPct;        // adverse-first (worst case)
+                  else if (hitTp)     pnl =  margin * tpPct;
+                  else if (hitSl)     pnl = -margin * slPct;
+                  else                pnl =  margin * (close - open) / open * lev;
+                  this._afScoreWrite?.(entry.annotCrits, pnl, true);
+                  delete this._micHistPending[key];
+                  wrote++;
+                }
+              } catch(_) {}
+            }));
+          }
+          if (wrote) {
+            this.log(`[MIC] 📊 Historical scoring: ${wrote} simulated close(s) written`, 'info');
+            this._afScoreBuild?.();
+          }
+        },
+
         async _micPrefetchKlines(symbols) {
           const now           = Date.now();
           const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
@@ -1618,8 +1727,10 @@
                 const candle = list[1];
                 this._micKlineCache[sym] = {
                   candleStart: parseInt(candle[0]),
-                  open:  parseFloat(candle[1]),
-                  close: parseFloat(candle[4]),
+                  open:   parseFloat(candle[1]),
+                  high:   parseFloat(candle[2]),
+                  low:    parseFloat(candle[3]),
+                  close:  parseFloat(candle[4]),
                   volume: parseFloat(candle[5]),
                   ts: now,
                 };

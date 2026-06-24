@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.19.2';
+  const VERSION       = '1.20.0';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -483,6 +483,23 @@
                     </div>
                   </label>
                 </div>
+                <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06)">
+                  <label class="tog" @click.prevent="if(!cfgLocked){cfg.miwHistScoringEnabled=!cfg.miwHistScoringEnabled;persist()}">
+                    <div class="tog-t" :class="cfg.miwHistScoringEnabled?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Historical Scoring</div>
+                      <div class="miw-hint">Simulates 1h-candle outcomes for pool matches and writes them to the PF scorecard as historical entries.</div>
+                    </div>
+                  </label>
+                  <div x-show="cfg.miwHistScoringEnabled" style="margin-top:6px">
+                    <div class="g">
+                      <div class="lbl">Match Tolerance <b x-text="(cfg.miwHistToleranceMins??20)+'m'"></b></div>
+                      <input type="range" min="5" max="55" step="5" x-model.number="cfg.miwHistToleranceMins" @change="persist()">
+                      <div class="miw-hint">Minimum lead time before the target hour candle opens. Default 20m (2 scans).</div>
+                    </div>
+                    <div style="margin-top:4px;font-family:var(--mono);font-size:9px;color:var(--text-lo)" x-text="Object.keys(_miwHistPending||{}).length+' match(es) pending simulation'"></div>
+                  </div>
+                </div>
               </div><!-- end fade zone -->
             </div>
           </div>
@@ -578,6 +595,7 @@
         _miwFundBlocked: false,
         _miwFundBias: null,
         _miwFundSkew: null,
+        _miwHistPending: {},
         _miwSlotGraylist: {},
         _miwFreshMcapBases: null,
 
@@ -628,6 +646,9 @@
           if (this.cfg.miwFundFadeEnabled      === undefined) this.cfg.miwFundFadeEnabled      = false;
           if (this.cfg.miwFundFadePct          === undefined) this.cfg.miwFundFadePct          = 50;
           if (this.cfg.miwFundFadeBlockEntries === undefined) this.cfg.miwFundFadeBlockEntries = false;
+          if (this.cfg.miwHistScoringEnabled   === undefined) this.cfg.miwHistScoringEnabled   = false;
+          if (this.cfg.miwHistToleranceMins    === undefined) this.cfg.miwHistToleranceMins    = 20;
+          this._miwHistPending = {};
           this._miwFundBlocked       = false;
           this._miwFundBias          = null;
           this._miwFundSkew          = null;
@@ -773,6 +794,7 @@
           await this._miwCheckFadeAway();
           await this._miwCheckLiqFadeAway();
           await this._miwCheckFundFadeAway();
+          await this._miwProcessHistMatches();
           await this._miwCheckCascade();
           await this._miwCheckSacrifice();
           const tsBefore = this._lastAllTickersAt || 0;
@@ -1182,21 +1204,8 @@
 
           // Entry logic only runs when there are non-blocked slots and capacity
           if (!slots.length) return;
-          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
 
-          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
-          if (this.cfg.miwShareCapEnabled ?? true) {
-            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.miwShareCapPct ?? 100) / 100)));
-            const miwCount = (this.positions || []).filter(p => p._miw).length;
-            headroom = Math.min(headroom, capSlots - miwCount);
-            if (headroom < 1) {
-              this.log('[MIW] 💡 Share cap reached — no slots available', 'info');
-              return;
-            }
-          }
-          const picks = Math.min(Math.max(1, Math.round(this.cfg.miwPicks ?? 5)), headroom);
-
-          // Build pool: non-blocked slots only, excluding newly slot-graylisted tickers
+          // Build pool before capacity check so historical matches are logged regardless
           const pool = basePool
             .map(t => {
               if ((this._miwSlotGraylist[t.symbol] ?? 0) > 0 && _glNow - this._miwSlotGraylist[t.symbol] < _slTtl) return null;
@@ -1237,10 +1246,26 @@
                 for (const ac of _annotCrits) _net += (_ranks[_col(ac)] ?? 0) * (1 + _sf * Math.min(_tier(ac), _cap));
                 if (_net < -_thresh) { this._miwSlotGraylist[t.symbol] = _glNow; return null; }
               }
-              return { t, criteria: slots[slotIdx], slotIdx };
+              return { t, criteria: slots[slotIdx], slotIdx, annotKey: _annotKey, annotCrits: _annotCrits };
             })
             .filter(Boolean)
             .sort((a, b) => a.slotIdx - b.slotIdx || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
+
+          this._miwLogHistMatches(pool);
+
+          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
+
+          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
+          if (this.cfg.miwShareCapEnabled ?? true) {
+            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.miwShareCapPct ?? 100) / 100)));
+            const miwCount = (this.positions || []).filter(p => p._miw).length;
+            headroom = Math.min(headroom, capSlots - miwCount);
+            if (headroom < 1) {
+              this.log('[MIW] 💡 Share cap reached — no slots available', 'info');
+              return;
+            }
+          }
+          const picks = Math.min(Math.max(1, Math.round(this.cfg.miwPicks ?? 5)), headroom);
 
           if (!pool.length) {
 
@@ -1587,6 +1612,90 @@
           });
         },
 
+        _miwLogHistMatches(pool) {
+          if (!this.cfg.miwHistScoringEnabled || !pool.length) return;
+          const now = Date.now();
+          const toleranceMs = (this.cfg.miwHistToleranceMins ?? 20) * 60 * 1000;
+          const targetHourStart = Math.ceil((now + toleranceMs) / 3_600_000) * 3_600_000;
+          for (const entry of pool) {
+            const dedupeKey = `${entry.t.symbol}:${entry.annotKey}:${targetHourStart}`;
+            if (!this._miwHistPending[dedupeKey]) {
+              this._miwHistPending[dedupeKey] = {
+                symbol: entry.t.symbol,
+                annotCrits: entry.annotCrits,
+                targetHourStart,
+              };
+            }
+          }
+        },
+
+        async _miwProcessHistMatches() {
+          if (!this.cfg.miwHistScoringEnabled) return;
+          const now = Date.now();
+          const MAX_AGE_MS = 24 * 3_600_000;
+          const toProcess = [];
+          for (const [key, entry] of Object.entries(this._miwHistPending)) {
+            if (now - entry.targetHourStart > MAX_AGE_MS) { delete this._miwHistPending[key]; continue; }
+            if (now >= entry.targetHourStart + 3_600_000) toProcess.push({ key, entry });
+          }
+          if (!toProcess.length) return;
+
+          const bySymbol = {};
+          for (const x of toProcess) {
+            if (!bySymbol[x.entry.symbol]) bySymbol[x.entry.symbol] = [];
+            bySymbol[x.entry.symbol].push(x);
+          }
+
+          const tpPct   = (this.cfg.binaryTpPct ?? 18) / 100;
+          const slPct   = (this.cfg.binarySlPct ?? 18) / 100;
+          const lev     = this.cfg.leverage ?? 6;
+          const margin  = (this.cfg.minNotional ?? 6) / lev;
+          let wrote = 0;
+          const CONC = 5;
+          const symbols = Object.keys(bySymbol);
+          for (let i = 0; i < symbols.length; i += CONC) {
+            await Promise.all(symbols.slice(i, i + CONC).map(async sym => {
+              const entries = bySymbol[sym];
+              const oldestTs  = Math.min(...entries.map(x => x.entry.targetHourStart));
+              const hoursBack = Math.min(Math.ceil((now - oldestTs) / 3_600_000) + 2, 200);
+              try {
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=${hoursBack}`);
+                if (!r.ok) return;
+                const d = await r.json();
+                const list = d?.result?.list;
+                if (!list) return;
+                const candleMap = {};
+                for (const c of list) candleMap[parseInt(c[0])] = c;
+                for (const { key, entry } of entries) {
+                  const c = candleMap[entry.targetHourStart];
+                  if (!c) { delete this._miwHistPending[key]; continue; }
+                  const open  = parseFloat(c[1]);
+                  const high  = parseFloat(c[2]);
+                  const low   = parseFloat(c[3]);
+                  const close = parseFloat(c[4]);
+                  // MIW = SHORT: TP when price falls, SL when price rises
+                  const tpPrice = open * (1 - tpPct / lev);
+                  const slPrice = open * (1 + slPct / lev);
+                  const hitTp = low  <= tpPrice;
+                  const hitSl = high >= slPrice;
+                  let pnl;
+                  if (hitTp && hitSl) pnl = -margin * slPct;        // adverse-first (worst case)
+                  else if (hitTp)     pnl =  margin * tpPct;
+                  else if (hitSl)     pnl = -margin * slPct;
+                  else                pnl =  margin * (open - close) / open * lev;
+                  this._pfScoreWrite?.(entry.annotCrits, pnl, true);
+                  delete this._miwHistPending[key];
+                  wrote++;
+                }
+              } catch(_) {}
+            }));
+          }
+          if (wrote) {
+            this.log(`[MIW] 📊 Historical scoring: ${wrote} simulated close(s) written`, 'info');
+            this._pfScoreBuild?.();
+          }
+        },
+
         async _miwPrefetchKlines(symbols) {
           const now           = Date.now();
           const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
@@ -1614,8 +1723,10 @@
                 const candle = list[1];
                 this._miwKlineCache[sym] = {
                   candleStart: parseInt(candle[0]),
-                  open:  parseFloat(candle[1]),
-                  close: parseFloat(candle[4]),
+                  open:   parseFloat(candle[1]),
+                  high:   parseFloat(candle[2]),
+                  low:    parseFloat(candle[3]),
+                  close:  parseFloat(candle[4]),
                   volume: parseFloat(candle[5]),
                   ts: now,
                 };
