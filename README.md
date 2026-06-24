@@ -176,7 +176,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Liq Block Entries** (`miwLiqFadeBlockEntries`/`micLiqFadeBlockEntries`) | When on, new entries are also blocked while the adverse liq signal is active. |
 | **Liq Result Max Age** (`miwLiqResultMaxCycles`/`micLiqResultMaxCycles`) | How many scan cycles a liq result stays valid for sliq/bliq slot criteria. Results older than this are treated as if absent, and the criterion evaluates false. Default 2. |
 | **Fund Rate Fade Away** (`miwFundFadeEnabled`/`micFundFadeEnabled`) | Closes the oldest position when the dominant funding direction across the kline + liq sample union is historically bad per the scorecard. Both conditions — skew dominance and bad scorecard history — must hold. |
-| **Fund Skew %** (`miwFundFadePct`/`micFundFadePct`) | Minimum fraction of tickers in the union sample that must share the dominant funding direction to trigger. Default 50%. |
+| **Fund Skew %** (`miwFundFadePct`/`micFundFadePct`) | Minimum fraction of tickers in the union sample that must share the dominant funding direction to trigger. Default 50%. Funding rate *values* are always current (read from the live ticker snapshot each scan); the *set of symbols* sampled refreshes hourly on the kline side and per Liq Result Max Age on the liq side. |
 | **Fund Block Entries** (`miwFundFadeBlockEntries`/`micFundFadeBlockEntries`) | When on, new entries are also blocked while the adverse funding signal is active. |
 | **Auto Slots** (`miwAutoSlots`/`micAutoSlots`) | Replaces the manual slot list with every possible combination of the available criteria at the chosen size. |
 | **Auto Slot Size** (`miwAutoSlotSize`/`micAutoSlotSize`) | How many criteria per auto-generated combination (1–4). |
