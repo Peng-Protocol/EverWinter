@@ -104,6 +104,8 @@ Timestamped entries for every significant bot event. Color coding:
 
 Common prefixes: `[MHL]` drawdown halt · `[GLK]` gains lock · `[PLK]` preemptive lock · `[PFR]`/`[ASH]` climate plugin events · `[MIW]`/`[MIC]` multi-indicator events.
 
+Fade Away block messages include the values that triggered the block — useful for confirming the data is current and not stale. Structure blocks show `bear:%` and `bull:%` candle aggregates; Liq blocks show the adverse liq side percentage; Fund Rate blocks show `neg:%` and `pos:%` skew across the sampled union.
+
 The log is capped at 300 entries in memory and in localStorage. Oldest entries are dropped when the cap is exceeded.
 
 ---
@@ -181,7 +183,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Auto Slots** (`miwAutoSlots`/`micAutoSlots`) | Replaces the manual slot list with every possible combination of the available criteria at the chosen size. |
 | **Auto Slot Size** (`miwAutoSlotSize`/`micAutoSlotSize`) | How many criteria per auto-generated combination (1–4). |
 | **Exclude from Auto** (`miwAutoSlotExclude`/`micAutoSlotExclude`) | Criteria omitted from auto-generated combinations and from scorecard scoring. |
-| **Historical Scoring** (`miwHistScoringEnabled`/`micHistScoringEnabled`) | When on, tickers that match a slot during a scan are tracked past that cycle. The bot waits for the next full 1h candle to close, then simulates whether that entry would have hit TP or SL — and writes the result to the shared scorecard as a historical record tagged separately from live trades. Historical records supplement live closed-trade data, building slot history without requiring an actual open position. This also means data collection continues even when actual entries are blocked by Fade Away, Fund Rate Fade, or any other close/block mechanism — the scorecard keeps learning from slot matches regardless of whether a real trade opened. **Current limitation**: a match is only logged when the ticker's kline data happens to be fetched in the same scan where the slot match occurs. Because kline fetches are capped and randomly sampled, the overlap between a live slot match and an available kline is infrequent. Hit rate is low and will be improved in a future update. |
+| **Historical Scoring** (`miwHistScoringEnabled`/`micHistScoringEnabled`) | When on, tickers that match a slot during a scan are tracked past that cycle. The bot waits for the next full 1h candle to close, then simulates whether that entry would have hit TP or SL — and writes the result to the shared scorecard as a historical record tagged separately from live trades. Historical records supplement live closed-trade data, building slot history without requiring an actual open position. This also means data collection continues even when actual entries are blocked by Fade Away, Fund Rate Fade, or any other close/block mechanism — the scorecard keeps learning from slot matches regardless of whether a real trade opened. When a batch of pending matches is ready to resolve, the activity log emits a numbered begin message (entry and symbol count) and a completion message (entries written) — e.g. `📊 Hist-score batch #3 begun — 12 entries across 8 symbols`. Multiple batches can run in sequence within a session and are identified by their batch number (1–99, then wraps). **Current limitation**: a match is only logged when the ticker's kline data happens to be fetched in the same scan where the slot match occurs. Because kline fetches are capped and randomly sampled, the overlap between a live slot match and an available kline is infrequent. Hit rate is low and will be improved in a future update. |
 | **Hist Tolerance** (`miwHistToleranceMins`/`micHistToleranceMins`) | Minimum minutes before the next hour boundary for a slot match to target that candle. If the boundary is within this window the match targets the following hour instead, ensuring the candle has enough time to fully form before observation. Default 20. |
 | **Hist Sequester %** (`miwHistSequestrPct`/`micHistSequestrPct`) | Share of the kline scan cap reserved each cycle for confirming pending hist targets. At 50% with Kline Scan Cap 50, up to 25 slots go to confirmation and 25 to discovery. Unused sequester slots roll over to discovery automatically. Default 50%. |
 
@@ -237,6 +239,14 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 ### Status Block
 
 Shows the current climate reading (magnitude, breadth, slope, IO score, effective score, evidence mass), active halt state (profile-governed or fallback timer), and PLK countdown. The **wave graph** plots recent market structure — direction label (rising/falling/steady) reflects the recent path of the market.
+
+Three directional bar charts below the climate reading show relative dominance at a glance. Red extends left (adverse for this bot's direction), green extends right (favorable), with current values as a label:
+
+| Bar | What it shows |
+|---|---|
+| **1h Kline** | Bear vs. bull aggregate from the last completed 1h candle sample. |
+| **Funding Rate** | Neg vs. pos funding skew across the kline + liq ticker union. |
+| **Liquidation Flow** | B-Liq vs. S-Liq share of the last completed liq cycle. Only appears when Liquidation Surveillance is on and at least one cycle has closed. |
 
 ### Slot Scorecard
 
