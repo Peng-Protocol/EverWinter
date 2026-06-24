@@ -249,11 +249,13 @@ Three directional bar charts below the climate reading show relative dominance a
 
 ### Slot Scorecard
 
-Chip row showing each criteria combination with its net PnL in bold and win/loss count. Each close writes one record; the Sponge Quota controls how many recent records per slot are factored in, so scores always reflect the most recent N closes. Blocked slots render in purple. Two toggles at the bottom right control the view:
+Chip row showing each criteria combination with its net PnL in bold and win/loss count. Each close writes one record; the Sponge Quota controls how many recent records per slot are factored in, so scores always reflect the most recent N closes. Blocked slots render in purple. Three buttons at the bottom right control the view:
 
 The **Tiered / Collapsed** toggle switches the chip row between per-slot and per-criterion views. In Collapsed mode, one chip appears per base criterion (e.g. `fund>`, `vm>`, `+24h`) with PnL pooled across all slots that contained it. This also changes how MIW/MIC orders its entry queue — slots are ranked by the sum of their individual criteria scores rather than the slot's own record. Scores are additive: a slot with one losing criterion and one winning criterion ranks by their combined total.
 
 Collapsed criterion scores feed into two additional blocking mechanisms when **Collapsed Scoring** is enabled. The first is pre-computed: after each scorecard rebuild, every annotated slot key (criteria with tier suffixes, e.g. `fund+3,vm+15`) is scored by multiplying each criterion's collapsed PnL by a tier-depth scale factor, then summing. Keys whose total falls below the threshold are marked blocked — tickers matching that exact key at scan time are graylisted. The second is the **Live Collapsed Gate**: at each scan, every qualifying ticker is scored individually using its actual live criterion depths. A ticker showing a deeper tier on a historically losing criterion receives a larger penalty than one that only barely qualifies, and is graylisted if the ticker-specific aggregate falls below the threshold. Both gates use the same threshold, scale factor, and tier cap configured in the Collapsed Scoring section.
+
+The **Both / Hist / Traded** source filter cycles through which score records are included in the displayed chips. **Both** (default) shows all records. **Hist** shows only records written by the MIW/MIC Historical Scoring feature. **Traded** shows only records from actual live closed trades. This is a display-only filter — it does not affect which records count toward auto-block decisions or collapsed scoring.
 
 The **Combined / Own** toggle switches between: Combined (includes partner bot trades, PnL inverted) sorted by blended total; and Own (this bot's trades only).
 

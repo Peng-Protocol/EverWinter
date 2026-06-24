@@ -68,21 +68,3 @@ Replace the single plugin Export button with a popup modal (matching base app st
 ### Issue #3 — Ticker blocking discrepancy (pending)
 Many tickers show as blocked but only 3 slots are highlighted as blocked on the scoreboard (combined PnL block active). Find the discrepancy.
 
-### Issue #4 — Structure bar ratio / emoji cleanup (done, PF v1.25.6 + AF v1.25.6)
-Structure bar now shows ratios; funding and liq labels have emoji removed.
-
-### Issue #5 — Consolidate Fade Away toggles (done, MIW + MIC v1.22.0)
-Merged into single master toggle with Structure/Liq/Funding sub-toggles. Combined adverse score = average of enabled signal contributions. Runs every scan; also fires between scans via exit timer when any position is in loss ≥ loss trigger.
-
-### Issue #6 — Mixed liq condition + new mS-Liq / mB-Liq criteria (done, MIW + MIC v1.23.0)
-`sliq`/`bliq` now require ≥70% raw dominance (sLiqRaw/total). New criteria `msliq` (💦) and `mbliq` (🌨️) match the majority side when minority ≥30%. Both have depth parameters. Applied to `checkCrit`, `checkAnnotCrit`, `_annotCrits`, UI slot builder, auto-slot list, `critEmoji`, `critLabel`, `CRIT_DESC`/`CRIT_EMOJI`, header comment, badge key, and `_col` collapse function.
-
-### Issue #7 — Historical scoring visibility (done, MIW + MIC v1.24.0)
-Pending counter moved out of config accordion. New "Hist Scoring" section in stats-eda slot shows: live pending target count, SVG bar sparkline of last 25 batches, and a full list of completed batches (newest first) with batch ID, wrote/total counts, and relative timestamp. Batch history persisted to `__miw_hist_batches` / `__mic_hist_batches`.
-
-### Issue #8 — README and Strategy Book update (done)
-README and Strategy_book.md updated for Issues #4–#7: criteria table, Fade Away config rows consolidated, msliq/mbliq added, Hist Scoring panel documented, localStorage keys table updated.
-
-### Issue #9 — mbliq/msliq emoji rendering + scorecard score filter (done, PF v1.25.10 + AF v1.25.10)
-Fixed `pfCritEmoji`/`afCritEmoji` to handle `msliq` (💦) and `mbliq` (🌨️) before the `sliq`/`bliq` cases. Added `pfScorecardSource`/`afScorecardSource` state and `_srcFilter` to scorecard rendering; scorecard footer now has a cycle button (Both → Hist → Traded) to filter displayed entries by score origin.
-
