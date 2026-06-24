@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.21.2';
+  const VERSION       = '1.21.3';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
@@ -1015,20 +1015,17 @@
           // Non-blocked entry slots
           const slots = this._micEffectiveSlots();
 
-          // Blocked slots — scanned to graylist matching tickers, never used for entry
+          // Blocked annotated slot keys — exact tier combinations to proactively graylist
           const blockedSlotKeys = new Set(
             Object.entries(this.micBlockedSlots || {})
               .filter(([, v]) => v === 'blocked')
               .map(([k]) => k)
           );
-          const allRawSlots = this.cfg.micAutoSlots
-            ? this._micGenerateCombos(this.cfg.micAutoSlotSize ?? 2)
-            : (this.cfg.micSlots || []).filter(s => s.length > 0);
-          const blockedSlots = blockedSlotKeys.size
-            ? allRawSlots.filter(s => blockedSlotKeys.has([...s].sort().join(',')))
+          const blockedAnnotatedSets = blockedSlotKeys.size
+            ? [...blockedSlotKeys].map(k => k.split(','))
             : [];
 
-          if (!slots.length && !blockedSlots.length) {
+          if (!slots.length && !blockedAnnotatedSets.length) {
             this._micLastActedAt = freshAt;
             this.log('[MIC] 💡 No active slots — skipping', 'info');
             return;
@@ -1040,10 +1037,11 @@
           const _allLiqResults = { ...((this._sharedRead?.('liqResults'))?.data || {}), ...(this._liqResults || {}) };
           const _liqFresh      = sym => { const r = _allLiqResults[sym]; return !!r && Date.now() - (r.ts || 0) <= _liqMaxAge; };
 
-          // Include blocked slots when deciding whether to prefetch mcap/klines
-          const allSlots   = [...slots, ...blockedSlots];
-          const needsKline = allSlots.some(s => s.some(c => /^(lsa|lba|rasl|rabl)/.test(c)));
-          const needsMcap  = allSlots.some(s => s.some(c => /^vm/.test(c) || /^iom/.test(c)));
+          // Include blocked annotated sets when deciding whether to prefetch klines/mcap
+          const needsKline = slots.some(s => s.some(c => /^(lsa|lba|rasl|rabl)/.test(c)))
+            || blockedAnnotatedSets.some(crits => crits.some(ac => /^(lsa|lba|rasl|rabl)/.test(ac)));
+          const needsMcap  = slots.some(s => s.some(c => /^vm/.test(c) || /^iom/.test(c)))
+            || blockedAnnotatedSets.some(crits => crits.some(ac => /^(vm|iom)/.test(ac)));
 
           const _glNow = Date.now();
           const _glTtl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
@@ -1195,8 +1193,41 @@
             return false;
           };
 
-          // Blocked slot scan: graylist tickers that match any blocked slot
-          if (blockedSlots.length) {
+          // Blocked slot pre-scan: graylist tickers whose exact annotated tier combination matches a blocked slot
+          if (blockedAnnotatedSets.length) {
+            const checkAnnotCrit = (ac, fr, is24hUp, ratio, t, mcap, _liqRb, _kl) => {
+              if (ac === '+24h') return is24hUp;
+              if (ac === '-24h') return !is24hUp;
+              const fundM = ac.match(/^fund([+-]\d+)$/);
+              if (fundM) { const step = this.cfg.micFundStep ?? 0.25; const tier = Math.floor(fr / step); return `fund${tier >= 0 ? '+' : ''}${tier}` === ac; }
+              const spikeM = ac.match(/^(lsa|lba|rasl|rabl)\+(\d+)$/);
+              if (spikeM) {
+                const base = spikeM[1]; const targetTier = parseInt(spikeM[2], 10);
+                if (!_kl) return false;
+                const avg = parseFloat(t.volume24h || 0) / 24; if (avg <= 0) return false;
+                const mult = _kl.volume / avg; const isAbove = base === 'lsa' || base === 'lba';
+                if (isAbove && mult <= 1) return false; if (!isAbove && mult >= 1) return false;
+                const step = this.cfg.micSpikeStep ?? 1;
+                const tier = Math.floor((isAbove ? mult - 1 : 1 - mult) * 100 / step);
+                if (tier !== targetTier) return false;
+                return (base === 'lsa' || base === 'rasl') ? _kl.close < _kl.open : _kl.close > _kl.open;
+              }
+              const liqM = ac.match(/^(sliq|bliq)([+-]\d+)$/);
+              if (liqM) {
+                const kind = liqM[1]; const targetDepth = parseInt(liqM[2], 10);
+                if (!_liqRb || Date.now() - (_liqRb.ts || 0) > _liqMaxAge) return false;
+                const pct = kind === 'sliq' ? _liqRb.sLiqPct : _liqRb.bLiqPct;
+                if (pct < (this.cfg.ashLiqThresholdPct ?? 50)) return false;
+                return (kind === 'sliq' ? (_liqRb.sDepth ?? 0) : (_liqRb.bDepth ?? 0)) === targetDepth;
+              }
+              const vmM = ac.match(/^vm\+(\d+)$/);
+              if (vmM) { if (ratio === null) return false; return Math.floor(ratio * 100 / (this.cfg.micVmStep ?? 1)) === parseInt(vmM[1], 10); }
+              const iotM = ac.match(/^iot\+(\d+)$/);
+              if (iotM) { const oi = parseFloat(t.openInterestValue || 0); const tv = parseFloat(t.turnover24h || 0); if (!oi || !tv) return false; return Math.floor(oi / tv * 100 / (this.cfg.micIotStep ?? 1)) === parseInt(iotM[1], 10); }
+              const iomM = ac.match(/^iom\+(\d+)$/);
+              if (iomM) { const oi = parseFloat(t.openInterestValue || 0); if (!oi || !mcap) return false; return Math.floor(oi / mcap * 100 / (this.cfg.micIomStep ?? 1)) === parseInt(iomM[1], 10); }
+              return false;
+            };
             let newlyGraylisted = 0;
             for (const t of basePool) {
               const fr      = parseFloat(t.fundingRate || 0) * 100;
@@ -1204,9 +1235,11 @@
               const mcap    = mcapMap[t.symbol];
               const ratio   = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
               const _tFresh = !this.cfg.micRequireMcapData || this._micFreshMcapBases?.has(t.symbol.replace(/USDT$/i,'').toLowerCase());
-              if (blockedSlots.some(s => {
-                if (!_tFresh && s.some(c => /^(vm|iom)/.test(c))) return false;
-                return s.every(c => checkCrit(c, fr, is24hUp, ratio, t));
+              const _liqRb  = _allLiqResults[t.symbol];
+              const _kl     = this._micKlineCache?.[t.symbol];
+              if (blockedAnnotatedSets.some(crits => {
+                if (!_tFresh && crits.some(ac => /^(vm|iom)/.test(ac))) return false;
+                return crits.every(ac => checkAnnotCrit(ac, fr, is24hUp, ratio, t, mcap, _liqRb, _kl));
               })) {
                 this._micSlotGraylist[t.symbol] = _glNow;
                 newlyGraylisted++;
