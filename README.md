@@ -241,6 +241,20 @@ The **Combined / Own** toggle switches between: Combined (includes partner bot t
 
 **CLEAR** wipes all records and resets all auto-blocks.
 
+### Slot Blocking
+
+Three independent paths can block a ticker from entering through a slot. They operate at different points in time and have different reset conditions.
+
+| Path | When evaluated | What triggers it | Result | Resets |
+|---|---|---|---|---|
+| **Auto Block** | Each scorecard close | Own gross losses **or** partner gross wins exceed the Block Threshold independently | Slot combination marked blocked (purple chip in scorecard); no ticker enters through it | Automatically when scores recover; or CLEAR |
+| **Collapsed Scoring** | Each scorecard rebuild | Annotated slot key (criteria + tier suffixes) aggregate score — collapsed PnL × tier-depth scale factor — falls below Collapsed Threshold | Slot key graylisted for the blocked-slot cooldown; tickers matching that exact key at scan time are skipped | Next rebuild if the score recovers above threshold |
+| **Live Collapsed Gate** | Per ticker, per scan | Same scoring formula as Collapsed Scoring but computed using the ticker's actual live criterion depths at the moment of the scan | Ticker graylisted for the blocked-slot cooldown | Cooldown expiry |
+
+Auto Block is the coarsest gate — it operates on the base slot combination with no tier awareness. Collapsed Scoring is finer — the same base slot can be blocked at some tier depths and not others. The Live Collapsed Gate is the finest — a ticker's individual depth profile determines whether it passes, even if its slot key was not pre-blocked.
+
+See the config table above for threshold, scale factor, tier cap, and cooldown parameters.
+
 ### Liquidation Feed
 
 When surveillance is on: the **Feed Watcher** panel shows active batches (batch ID, ticker count, running S-Liq / B-Liq USDT totals, dominant side, countdown). The **Liq Sample chart** shows the last 10 closed cycles as stacked bars (S-Liq green / B-Liq red, qualifying segments at full opacity). The **Latest Cycle** chip grid shows per-ticker qualification with 🥵/🥶 badges.
