@@ -57,6 +57,7 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 - **Prefer the minimal correct change.** Don't clean up, refactor, or extend beyond what was explicitly asked.
 - **Log behavioral corrections.** Whenever the user gives a behavioral correction or long-term instruction — signalled by phrases like "why didn't you…", "why are you…", "you should always…", "you should never…", or any direct criticism of approach — add the lesson to this file before finishing the response.
 - **Tooltip length.** In-app tooltips (hint text, x-text descriptions, title attributes) must be at most 3 phrases. Aim for 1.
+- **Fade Away loss trigger = between-scan enabler, not a scan gate.** The loss threshold causes the combined fade check to also fire via the exit timer (between scans) when any position crosses it. The check always runs every scan cycle unconditionally. "Scan bypass" means it bypasses waiting for the next scan — it does NOT skip or gate the scan-time check.
 - **Never use `window.confirm()`, `window.alert()`, or `window.prompt()` in plugin or bot UI.** These are blocked when the app runs in an iframe, silently returning `false`/`undefined` and making buttons appear unresponsive with no feedback. Use inline Alpine confirmation UI instead: wrap the button in `<span x-data="{c:false}">`, show the action button when `!c`, and when clicked set `c=true` to reveal inline "Sure? Yes / No" buttons that execute the action or reset `c`.
 
 ## Pending Tasks
@@ -70,8 +71,8 @@ Many tickers show as blocked but only 3 slots are highlighted as blocked on the 
 ### Issue #4 — Structure bar ratio / emoji cleanup (pending)
 Structure sampling bar chart shows raw values instead of a ratio (the way the funding and liq sample bars work). Funding and liq bar labels have unwanted emojis next to their values.
 
-### Issue #5 — Consolidate Fade Away toggles (pending)
-Merge the three separate Fade Away types (structure, liq, fund) into a single Fade Away toggle with sub-toggles for which sample types affect decisions.
+### Issue #5 — Consolidate Fade Away toggles (done, MIW + MIC v1.22.0)
+Merged into single master toggle with Structure/Liq/Funding sub-toggles. Combined adverse score = average of enabled signal contributions. Runs every scan; also fires between scans via exit timer when any position is in loss ≥ loss trigger.
 
 ### Issue #6 — Mixed liq condition + new mS-Liq / mB-Liq criteria (pending, MIC + MIW)
 Current sliq/bliq is "first side over the threshold" — no account for mixed samples. New rule:
