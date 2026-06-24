@@ -83,3 +83,6 @@ Pending counter moved out of config accordion. New "Hist Scoring" section in sta
 ### Issue #8 — README and Strategy Book update (done)
 README and Strategy_book.md updated for Issues #4–#7: criteria table, Fade Away config rows consolidated, msliq/mbliq added, Hist Scoring panel documented, localStorage keys table updated.
 
+### Issue #9 — mbliq/msliq emoji rendering + scorecard score filter (pending)
+mbliq and msliq emojis aren't rendering properly in the scorecard. Also add a purely visual filter toggle to the scorecard: show only historical scoring outcomes, only traded outcomes, or both.
+
