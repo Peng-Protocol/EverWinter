@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.24.7';
+  const VERSION       = '1.24.8';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
 
@@ -442,8 +442,12 @@
                         <div class="tog-t" :class="cfg.micFadeFundEnabled?'on':''"><div class="tog-k"></div></div>
                         <span class="tog-l">Funding</span>
                       </label>
+                      <label class="tog" @click.prevent="if(!cfgLocked){cfg.micFadeVolEnabled=!cfg.micFadeVolEnabled;persist()}">
+                        <div class="tog-t" :class="cfg.micFadeVolEnabled?'on':''"><div class="tog-k"></div></div>
+                        <span class="tog-l">Volume</span>
+                      </label>
                     </div>
-                    <div class="mic-hint" style="margin-top:3px">Structure: bearish% of kline momentum (adverse for longs). Liq: S-Liq% when AF scorecard shows S-Liq historically bad. Funding: dominant rate direction% when scorecard shows it historically bad. Average of contributing signals forms the combined score.</div>
+                    <div class="mic-hint" style="margin-top:3px">Structure: bearish% of kline momentum (adverse for longs). Liq: S-Liq% when AF scorecard shows S-Liq historically bad. Funding: dominant rate direction% when scorecard shows it historically bad. Volume: dominant vol direction% (above/below avg) when scorecard shows those criteria historically bad. Average of contributing signals forms the combined score.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <div class="lbl">Combined Threshold <b x-text="(cfg.micFadeThreshold??50)+'%'"></b></div>
@@ -606,6 +610,7 @@
         _micLiqBias: null,
         _micFundBias: null,
         _micFundSkew: null,
+        _micVolSkew: null,
         micHistBatches: [],
         _micHistPending: {},
         _micHistBatchId: 0,
@@ -646,6 +651,7 @@
           if (this.cfg.micFadeStructureEnabled === undefined) this.cfg.micFadeStructureEnabled = true;
           if (this.cfg.micFadeLiqEnabled       === undefined) this.cfg.micFadeLiqEnabled       = true;
           if (this.cfg.micFadeFundEnabled      === undefined) this.cfg.micFadeFundEnabled      = true;
+          if (this.cfg.micFadeVolEnabled       === undefined) this.cfg.micFadeVolEnabled       = false;
           if (this.cfg.micFadeThreshold        === undefined) this.cfg.micFadeThreshold        = 50;
           if (this.cfg.micFadeBlockEntries     === undefined) this.cfg.micFadeBlockEntries     = false;
           if (this.cfg.micFadeAwayLossPct      === undefined) this.cfg.micFadeAwayLossPct      = 25;
@@ -663,6 +669,7 @@
           this._micLiqBias        = null;
           this._micFundBias       = null;
           this._micFundSkew       = null;
+          this._micVolSkew        = null;
           if (this.cfg.micHistScoringEnabled   === undefined) this.cfg.micHistScoringEnabled   = false;
           if (this.cfg.micHistToleranceMins    === undefined) this.cfg.micHistToleranceMins    = 20;
           if (this.cfg.micHistSequestrPct      === undefined) this.cfg.micHistSequestrPct      = 50;
@@ -896,6 +903,31 @@
             }
           }
 
+          // Volume signal: above-avg vol% or below-avg vol% — only when scorecard shows it's bad
+          if (this.cfg.micFadeVolEnabled) {
+            const tickerMap = {};
+            for (const t of (this._lastAllTickers || [])) tickerMap[t.symbol] = t;
+            let aboveSum = 0, belowSum = 0;
+            for (const [sym, kl] of Object.entries(this._micKlineCache || {})) {
+              const t = tickerMap[sym];
+              if (!t || !kl?.volume) continue;
+              const avg = parseFloat(t.volume24h || 0) / 24;
+              if (!avg) continue;
+              const mult = kl.volume / avg;
+              if (mult > 1) aboveSum += mult - 1;
+              else if (mult < 1) belowSum += 1 - mult;
+            }
+            const volTotal = aboveSum + belowSum;
+            if (volTotal > 0) {
+              this._micVolSkew = { abovePct: aboveSum / volTotal * 100, belowPct: belowSum / volTotal * 100 };
+              const domPct = Math.max(aboveSum, belowSum) / volTotal * 100;
+              const volBias = aboveSum >= belowSum
+                ? this._micVolScorecardBias(['lsa', 'lba'])
+                : this._micVolScorecardBias(['rasl', 'rabl']);
+              if (volBias === 'bad') contributions.push({ name: 'vol', score: domPct });
+            }
+          }
+
           if (!contributions.length) { this._micFadeBlocked = false; return; }
 
           const combined = contributions.reduce((s, c) => s + c.score, 0) / contributions.length;
@@ -928,6 +960,21 @@
             if (net < 0) return 'bad';
             if (net > 0) return 'good';
             return null;
+          } catch(_) { return null; }
+        },
+
+        _micVolScorecardBias(prefixes) {
+          try {
+            const scoreboard = this.afScoreboard;
+            if (!Array.isArray(scoreboard) || !scoreboard.length) return null;
+            let net = 0, hasData = false;
+            for (const s of scoreboard) {
+              if (!Array.isArray(s.criteria) || !s.criteria.some(c => prefixes.some(p => c === p || c.startsWith(p)))) continue;
+              net += s.totalPnl;
+              hasData = true;
+            }
+            if (!hasData) return null;
+            return net < 0 ? 'bad' : net > 0 ? 'good' : null;
           } catch(_) { return null; }
         },
 
