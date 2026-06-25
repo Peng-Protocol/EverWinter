@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.26.0';
+  const VERSION       = '1.27.0';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
 
@@ -1323,6 +1323,16 @@
           if (!slots.length) return;
 
           // Build pool before capacity check so historical matches are logged regardless
+          const _coQualEnabled = (this.cfg.afCollapsedSort || this.cfg.afCollapsedRanks) && this.cfg.afCoQualPenaltyEnabled;
+          const _cqRanks = _coQualEnabled ? (this.micCollapsedSlotRanks || {}) : null;
+          const _cqGetRank = c => {
+            if (!_cqRanks) return 0;
+            if (/^sliq/.test(c)) return (_cqRanks['sliq+'] ?? 0) + (_cqRanks['sliq-'] ?? 0);
+            if (/^bliq/.test(c)) return (_cqRanks['bliq+'] ?? 0) + (_cqRanks['bliq-'] ?? 0);
+            if (c === '+fund') return _cqRanks['fund>'] ?? 0;
+            if (c === '-fund') return _cqRanks['fund<'] ?? 0;
+            return _cqRanks[c.replace(/-?\d+$/, '')] ?? 0;
+          };
           const pool = basePool
             .map(t => {
               if ((this._micSlotGraylist[t.symbol] ?? 0) > 0 && _glNow - this._micSlotGraylist[t.symbol] < _slTtl) return null;
@@ -1365,10 +1375,25 @@
                 for (const ac of _annotCrits) _net += (_ranks[_col(ac)] ?? 0) * (1 + _sf * Math.min(_tier(ac), _cap));
                 if (_net < -_thresh) { this._micSlotGraylist[t.symbol] = _glNow; return null; }
               }
-              return { t, criteria: slots[slotIdx], slotIdx, annotKey: _annotKey, annotCrits: _annotCrits };
+              let compositeScore = 0;
+              if (_coQualEnabled && _cqRanks) {
+                const bestScore = slots[slotIdx].reduce((s, c) => s + _cqGetRank(c), 0);
+                let penalty = 0;
+                for (let i = 0; i < slots.length; i++) {
+                  if (i === slotIdx) continue;
+                  if (!_hasFreshMcap && slots[i].some(c => /^(vm|iom)/.test(c))) continue;
+                  if (!slots[i].every(c => checkCrit(c, fr, is24hUp, ratio, t))) continue;
+                  const sc = slots[i].reduce((s, c) => s + _cqGetRank(c), 0);
+                  if (sc < 0) penalty += sc;
+                }
+                compositeScore = bestScore + penalty;
+              }
+              return { t, criteria: slots[slotIdx], slotIdx, annotKey: _annotKey, annotCrits: _annotCrits, compositeScore };
             })
             .filter(Boolean)
-            .sort((a, b) => a.slotIdx - b.slotIdx || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
+            .sort((a, b) => _coQualEnabled
+              ? (b.compositeScore - a.compositeScore || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)))
+              : (a.slotIdx - b.slotIdx || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0))));
 
           this._micLogHistMatches(pool);
 
