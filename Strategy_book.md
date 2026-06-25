@@ -263,6 +263,8 @@ The scorecard can be switched from per-slot view to a collapsed view that shows 
 
 When a position is opened via a liquidation signal, the intensity of that signal is recorded alongside the trade outcome. The scorecard bias check accounts for this intensity tag, so outcomes from heavy signals and light signals are tracked separately — the bias verdict is drawn from trades opened under comparable conditions, not from a flat average.
 
+**Composite scoring and co-qualifying penalty**: A ticker may satisfy more than one slot simultaneously. In collapsed mode with sorting enabled, the entry pool is ranked not just by the best slot score a ticker qualifies for, but by a composite score that accounts for every slot it qualifies for. Qualifying for additional slots that have historically lost subtracts from the composite — the ticker is penalised for being associated with losing conditions even if its primary qualifying slot is strong. Only losing co-qualifiers penalise; winning ones do not boost. The result is that genuinely clean signals — tickers that match only historically profitable criteria — rise above tickers that happen to match many slots at once, some of which carry a losing track record. This filters out coincidental entries that look valid by one criterion but are entangled with conditions that have consistently underperformed.
+
 ---
 
 ### Cross-Side Coordination
