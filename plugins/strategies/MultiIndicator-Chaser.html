@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.24.8';
+  const VERSION       = '1.25.0';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
 
@@ -446,8 +446,19 @@
                         <div class="tog-t" :class="cfg.micFadeVolEnabled?'on':''"><div class="tog-k"></div></div>
                         <span class="tog-l">Volume</span>
                       </label>
+                      <label class="tog" @click.prevent="if(!cfgLocked){cfg.micFadeOiEnabled=!cfg.micFadeOiEnabled;persist()}">
+                        <div class="tog-t" :class="cfg.micFadeOiEnabled?'on':''"><div class="tog-k"></div></div>
+                        <span class="tog-l">OI Normalcy</span>
+                      </label>
                     </div>
-                    <div class="mic-hint" style="margin-top:3px">Structure: bearish% of kline momentum (adverse for longs). Liq: S-Liq% when AF scorecard shows S-Liq historically bad. Funding: dominant rate direction% when scorecard shows it historically bad. Volume: dominant vol direction% (above/below avg) when scorecard shows those criteria historically bad. Average of contributing signals forms the combined score.</div>
+                    <div x-show="cfg.micFadeOiEnabled" class="g" style="margin-top:6px">
+                      <div class="lbl">OI/MC Midpoint <b x-text="(cfg.micFadeOiMid??10)+'%'"></b></div>
+                      <input type="range" min="1" max="50" step="1" x-model.number="cfg.micFadeOiMid" @change="persist()">
+                      <div class="lbl" style="margin-top:4px">Tolerance <b x-text="'±'+(cfg.micFadeOiTol??10)+' pts'"></b></div>
+                      <input type="range" min="1" max="30" step="1" x-model.number="cfg.micFadeOiTol" @change="persist()">
+                      <div class="mic-hint" x-text="_micOiSkew ? 'OI/MC: '+_micOiSkew.ratio.toFixed(2)+'% — score: '+_micOiSkew.score.toFixed(0)+'% ('+_micOiSkew.count+' tickers with fresh mcap)' : 'Awaiting data.'"></div>
+                    </div>
+                    <div class="mic-hint" style="margin-top:3px">Structure: bearish% of kline momentum (adverse for longs). Liq: S-Liq% when AF scorecard shows S-Liq historically bad. Funding: dominant rate direction% when scorecard shows it historically bad. Volume: dominant vol direction% (above/below avg) when scorecard shows those criteria historically bad. OI Normalcy: aggregate OI/MCap ratio deviation beyond tolerance from configured midpoint. Average of contributing signals forms the combined score.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <div class="lbl">Combined Threshold <b x-text="(cfg.micFadeThreshold??50)+'%'"></b></div>
@@ -611,6 +622,7 @@
         _micFundBias: null,
         _micFundSkew: null,
         _micVolSkew: null,
+        _micOiSkew: null,
         micHistBatches: [],
         _micHistPending: {},
         _micHistBatchId: 0,
@@ -652,6 +664,9 @@
           if (this.cfg.micFadeLiqEnabled       === undefined) this.cfg.micFadeLiqEnabled       = true;
           if (this.cfg.micFadeFundEnabled      === undefined) this.cfg.micFadeFundEnabled      = true;
           if (this.cfg.micFadeVolEnabled       === undefined) this.cfg.micFadeVolEnabled       = false;
+          if (this.cfg.micFadeOiEnabled        === undefined) this.cfg.micFadeOiEnabled        = false;
+          if (this.cfg.micFadeOiMid            === undefined) this.cfg.micFadeOiMid            = 10;
+          if (this.cfg.micFadeOiTol            === undefined) this.cfg.micFadeOiTol            = 10;
           if (this.cfg.micFadeThreshold        === undefined) this.cfg.micFadeThreshold        = 50;
           if (this.cfg.micFadeBlockEntries     === undefined) this.cfg.micFadeBlockEntries     = false;
           if (this.cfg.micFadeAwayLossPct      === undefined) this.cfg.micFadeAwayLossPct      = 25;
@@ -670,6 +685,7 @@
           this._micFundBias       = null;
           this._micFundSkew       = null;
           this._micVolSkew        = null;
+          this._micOiSkew         = null;
           if (this.cfg.micHistScoringEnabled   === undefined) this.cfg.micHistScoringEnabled   = false;
           if (this.cfg.micHistToleranceMins    === undefined) this.cfg.micHistToleranceMins    = 20;
           if (this.cfg.micHistSequestrPct      === undefined) this.cfg.micHistSequestrPct      = 50;
@@ -925,6 +941,31 @@
                 ? this._micVolScorecardBias(['lsa', 'lba'])
                 : this._micVolScorecardBias(['rasl', 'rabl']);
               if (volBias === 'bad') contributions.push({ name: 'vol', score: domPct });
+            }
+          }
+
+          // OI Normalcy signal: aggregate OI/MCap ratio deviation from configured midpoint
+          if (this.cfg.micFadeOiEnabled) {
+            let oiSum = 0, mcapSum = 0, oiCount = 0;
+            for (const t of (this._lastAllTickers || [])) {
+              const oi = parseFloat(t.openInterestValue || 0);
+              if (!oi) continue;
+              const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
+              const price = parseFloat(t.lastPrice || 0);
+              const mcap = this._micGetFreshMcap(base, price);
+              if (!mcap) continue;
+              oiSum += oi; mcapSum += mcap; oiCount++;
+            }
+            if (oiCount >= 3 && mcapSum > 0) {
+              const ratio = oiSum / mcapSum * 100;
+              const mid = this.cfg.micFadeOiMid ?? 10;
+              const tol = this.cfg.micFadeOiTol ?? 10;
+              const excess = Math.max(0, Math.abs(ratio - mid) - tol);
+              const score = Math.min(100, excess / tol * 100);
+              this._micOiSkew = { ratio, mid, tol, score, count: oiCount };
+              if (score > 0) contributions.push({ name: 'oi', score });
+            } else {
+              this._micOiSkew = null;
             }
           }
 
@@ -1619,6 +1660,24 @@
           }
           const ds = this._micDsCache?.[base];
           if (ds?.mcap && ok(ds.dsPrice)) return ds.mcap;
+          return null;
+        },
+
+        _micGetFreshMcap(base, price, maxAge = 3_600_000) {
+          const now = Date.now();
+          const ok = src => !price || !src || Math.abs(src - price) / price <= 0.10;
+          const cgId = this._micCoinIdCache?.[base];
+          if (cgId) {
+            const c = this._micMcapCache?.[cgId];
+            if (c?.mcap && (now - (c.ts || 0)) <= maxAge && ok(c.cgPrice)) return c.mcap;
+          }
+          const cpId = this._micCpIdCache?.[base];
+          if (cpId) {
+            const c = this._micSupplyCache?.[cpId];
+            if (c?.supply && price > 0 && (now - (c.ts || 0)) <= maxAge && ok(c.cpPrice)) return c.supply * price;
+          }
+          const ds = this._micDsCache?.[base];
+          if (ds?.mcap && (now - (ds.ts || 0)) <= maxAge && ok(ds.dsPrice)) return ds.mcap;
           return null;
         },
 
