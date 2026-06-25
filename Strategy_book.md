@@ -257,6 +257,8 @@ The scorecard tracks realized PnL per entry combination. Every time a position o
 
 Combinations are displayed sorted by total PnL. When both sides run simultaneously, the scores account for direction: a win on the short side is a loss for the long side, so each side inverts the other's records in its own view.
 
+The scorecard can be switched from per-slot view to a collapsed view that shows one row per individual criterion rather than one row per combination. In this mode, win and loss counts appear much larger than expected — this is correct behaviour, not a data error. Because a criterion like "funding rate positive" may appear across many different slot combinations, every trade from every combination containing it contributes to the count. A criterion shared by several slots accumulates several times the records of a single-slot one.
+
 **Auto-correction**: when enabled, each slot combination carries a running score. Own wins add to it; own losses subtract; partner wins subtract further; partner losses add back. When a combination's score falls below the configured threshold, entries stop opening through it. When conditions shift and the partner starts losing on the same combination, the score recovers and the block lifts. Combinations that sink deep stay blocked; combinations near the threshold fluctuate with the market.
 
 When a position is opened via a liquidation signal, the intensity of that signal is recorded alongside the trade outcome. The scorecard bias check accounts for this intensity tag, so outcomes from heavy signals and light signals are tracked separately — the bias verdict is drawn from trades opened under comparable conditions, not from a flat average.
