@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.27.6';
+  const VERSION       = '1.27.7';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
 
@@ -633,6 +633,7 @@
         _micFundSkew: null,
         _micVolSkew: null,
         _micOiSkew: null,
+        _micWaveScore: null,
         micHistBatches: [],
         _micHistPending: {},
         _micHistBatchId: 0,
@@ -698,6 +699,7 @@
           this._micFundSkew       = null;
           this._micVolSkew        = null;
           this._micOiSkew         = null;
+          this._micWaveScore      = null;
           if (this.cfg.micHistScoringEnabled   === undefined) this.cfg.micHistScoringEnabled   = false;
           if (this.cfg.micHistToleranceMins    === undefined) this.cfg.micHistToleranceMins    = 20;
           if (this.cfg.micHistSequestrPct      === undefined) this.cfg.micHistSequestrPct      = 50;
@@ -923,6 +925,50 @@
           } else {
             this._micOiSkew = null;
           }
+
+          // Wave score: signed average of scorecard-gated signal contributions [-100, +100]
+          // Positive = favorable for Chaser (shorts); Negative = unfavorable
+          const _wC = [];
+          // Structure — bearish = good for Chaser; no scorecard gate
+          const _wHr = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
+          let _wBear = 0, _wBull = 0;
+          for (const e of Object.values(this._micKlineCache || {})) {
+            if (e.candleStart !== _wHr || !e.open) continue;
+            const _p = (e.close - e.open) / e.open * 100;
+            if (_p < 0) _wBear += -_p; else if (_p > 0) _wBull += _p;
+          }
+          const _wT = _wBear + _wBull;
+          if (_wT > 0) _wC.push((_wBear - _wBull) / _wT * 100);
+          // Funding — scorecard-gated sign
+          if (this._micFundSkew) {
+            const { domDir, domPct } = this._micFundSkew;
+            const _fb = this._micLiqScorecardBias(domDir);
+            if (_fb === 'bad') _wC.push(-domPct);
+            else if (_fb === 'good') _wC.push(+domPct);
+          }
+          // Liq — sliq adverse for Chaser (shorts squeezed = bullish = bad)
+          {
+            const _sl = this._sharedRead('liqResults');
+            const _lc = { ...((_sl?.data) || {}), ...(this._liqResults || {}) };
+            let _ls = 0, _lb = 0;
+            for (const r of Object.values(_lc)) { _ls += r.sLiqRaw || 0; _lb += r.bLiqRaw || 0; }
+            const _lt = _ls + _lb;
+            if (_lt > 0) {
+              const _liqB = this._micLiqScorecardBias('sliq');
+              if (_liqB === 'bad') _wC.push((_lb - _ls) / _lt * 100);
+              else if (_liqB === 'good') _wC.push((_ls - _lb) / _lt * 100);
+            }
+          }
+          // Vol — scorecard-gated sign
+          if (this._micVolSkew) {
+            const { aboveSum, belowSum } = this._micVolSkew;
+            const _vt = aboveSum + belowSum;
+            const _vd = Math.max(aboveSum, belowSum) / _vt * 100;
+            const _vb = aboveSum >= belowSum ? this._micVolScorecardBias(['lsa','lba']) : this._micVolScorecardBias(['rasl','rabl']);
+            if (_vb === 'bad') _wC.push(-_vd);
+            else if (_vb === 'good') _wC.push(+_vd);
+          }
+          this._micWaveScore = _wC.length ? _wC.reduce((a, b) => a + b, 0) / _wC.length : null;
         },
 
         async _micCheckCombinedFade() {

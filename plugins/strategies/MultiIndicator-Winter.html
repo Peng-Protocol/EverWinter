@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.27.6';
+  const VERSION       = '1.27.7';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
   const MIW_HIST_KEY  = '__miw_hist_batches';
 
@@ -633,6 +633,7 @@
         _miwFundSkew: null,
         _miwVolSkew: null,
         _miwOiSkew: null,
+        _miwWaveScore: null,
         miwHistBatches: [],
         _miwHistPending: {},
         _miwHistBatchId: 0,
@@ -698,6 +699,7 @@
           this._miwFundSkew       = null;
           this._miwVolSkew        = null;
           this._miwOiSkew         = null;
+          this._miwWaveScore      = null;
           if (this.cfg.miwHistScoringEnabled   === undefined) this.cfg.miwHistScoringEnabled   = false;
           if (this.cfg.miwHistToleranceMins    === undefined) this.cfg.miwHistToleranceMins    = 20;
           if (this.cfg.miwHistSequestrPct      === undefined) this.cfg.miwHistSequestrPct      = 50;
@@ -923,6 +925,50 @@
           } else {
             this._miwOiSkew = null;
           }
+
+          // Wave score: signed average of scorecard-gated signal contributions [-100, +100]
+          // Positive = bullish market conditions (good for Winter longs); Negative = bearish
+          const _wC = [];
+          // Structure — always directional; no scorecard gate
+          const _wHr = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
+          let _wBear = 0, _wBull = 0;
+          for (const e of Object.values(this._miwKlineCache || {})) {
+            if (e.candleStart !== _wHr || !e.open) continue;
+            const _p = (e.close - e.open) / e.open * 100;
+            if (_p < 0) _wBear += -_p; else if (_p > 0) _wBull += _p;
+          }
+          const _wT = _wBear + _wBull;
+          if (_wT > 0) _wC.push((_wBull - _wBear) / _wT * 100);
+          // Funding — scorecard-gated sign
+          if (this._miwFundSkew) {
+            const { domDir, domPct } = this._miwFundSkew;
+            const _fb = this._miwLiqScorecardBias(domDir);
+            if (_fb === 'bad') _wC.push(-domPct);
+            else if (_fb === 'good') _wC.push(+domPct);
+          }
+          // Liq — scorecard-gated sign
+          {
+            const _sl = this._sharedRead('liqResults');
+            const _lc = { ...((_sl?.data) || {}), ...(this._liqResults || {}) };
+            let _ls = 0, _lb = 0;
+            for (const r of Object.values(_lc)) { _ls += r.sLiqRaw || 0; _lb += r.bLiqRaw || 0; }
+            const _lt = _ls + _lb;
+            if (_lt > 0) {
+              const _liqB = this._miwLiqScorecardBias('bliq');
+              if (_liqB === 'bad') _wC.push((_ls - _lb) / _lt * 100);
+              else if (_liqB === 'good') _wC.push((_lb - _ls) / _lt * 100);
+            }
+          }
+          // Vol — scorecard-gated sign
+          if (this._miwVolSkew) {
+            const { aboveSum, belowSum } = this._miwVolSkew;
+            const _vt = aboveSum + belowSum;
+            const _vd = Math.max(aboveSum, belowSum) / _vt * 100;
+            const _vb = aboveSum >= belowSum ? this._miwVolScorecardBias(['lsa','lba']) : this._miwVolScorecardBias(['rasl','rabl']);
+            if (_vb === 'bad') _wC.push(-_vd);
+            else if (_vb === 'good') _wC.push(+_vd);
+          }
+          this._miwWaveScore = _wC.length ? _wC.reduce((a, b) => a + b, 0) / _wC.length : null;
         },
 
         async _miwCheckCombinedFade() {
