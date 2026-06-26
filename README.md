@@ -257,6 +257,8 @@ Three directional bar charts below the climate reading show relative dominance a
 | **Volume Sample** | Below-average vs. above-average volume share of the current kline sample, weighted by deviation magnitude. Gray extends left (below average) and thematic color extends right (above average). Only appears when the Volume fade signal is enabled. |
 | **OI Normalcy** | Aggregate OI as a % of market cap across tickers with market cap data fresher than 1 hour, plotted on a 0–100% scale. A notch marks the configured midpoint. Bar is thematic color when the ratio sits outside the tolerance window, gray when within. Only appears when the OI Normalcy fade signal is enabled. |
 
+> **Observational note:** The structure wave and sampling bars (kline direction, funding skew, volume skew, OI normalcy) reflect broad market conditions but do not reliably predict per-bot outcome. A declining market can coincide with Chaser winning and Winter losing, or vice versa — entry criteria are selective enough that position outcomes regularly diverge from aggregate market direction. Treat these displays as ambient market context, not predictive signals. Fade Away's usefulness comes from its scorecard gating (signals only contribute when historical scorecard data confirms they've been meaningful for this bot) — not from the raw market readings alone.
+
 ### Slot Scorecard
 
 Chip row showing each criteria combination with its net PnL in bold and win/loss count. Each close writes one record; the Sponge Quota controls how many recent records per slot are factored in, so scores always reflect the most recent N closes. Blocked slots render in purple. Three buttons at the bottom right control the view:

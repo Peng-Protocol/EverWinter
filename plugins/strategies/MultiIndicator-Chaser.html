@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.27.5';
+  const VERSION       = '1.27.6';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
 
@@ -375,7 +375,6 @@
                 <div class="g" x-show="cfg.micCascadeEnabled" style="margin-top:8px">
                   <div class="lbl">Trigger at <b x-text="(cfg.micCascadePct??25)+'% of base margin'"></b></div>
                   <input type="range" min="5" max="200" step="5" x-model.number="cfg.micCascadePct" @change="persist()">
-                  <div class="mic-hint" x-text="(()=>{ const pos=(positions||[]).filter(p=>p._mic); const upnl=pos.reduce((s,p)=>s+(p.upnl||0),0); const bm=(cfg.minNotional||6)/(cfg.leverage||6); const halvMul=cfg.micHalvingEnabled&&pos.length?Math.pow(0.5,(Date.now()-pos.reduce((m,p)=>Math.min(m,p.openedAt||Date.now()),Date.now()))/((cfg.micHalvingHours??3)*3600000)):1; const thr=bm*((cfg.micCascadePct??25)/100)*halvMul; return pos.length ? 'Active: '+pos.length+' pos · base margin '+bm.toFixed(4)+' · uPnL '+(upnl>=0?'+':'')+upnl.toFixed(4)+' · trigger @ +'+(thr).toFixed(4)+(halvMul<0.999?' (×'+halvMul.toFixed(2)+')':'')+' USDT' : 'No active MIC positions.'; })()"></div>
                 </div>
 
                 <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.micSacrificeEnabled=!cfg.micSacrificeEnabled;persist()}">
@@ -388,7 +387,6 @@
                 <div class="g" x-show="cfg.micSacrificeEnabled" style="margin-top:8px">
                   <div class="lbl">Trigger at <b x-text="'-'+(cfg.micSacrificePct??25)+'% of base margin'"></b></div>
                   <input type="range" min="5" max="200" step="5" x-model.number="cfg.micSacrificePct" @change="persist()">
-                  <div class="mic-hint" x-text="(()=>{ const pos=(positions||[]).filter(p=>p._mic); const upnl=pos.reduce((s,p)=>s+(p.upnl||0),0); const bm=(cfg.minNotional||6)/(cfg.leverage||6); const halvMul=cfg.micHalvingEnabled&&pos.length?Math.pow(0.5,(Date.now()-pos.reduce((m,p)=>Math.min(m,p.openedAt||Date.now()),Date.now()))/((cfg.micHalvingHours??3)*3600000)):1; const thr=bm*((cfg.micSacrificePct??25)/100)*halvMul; return pos.length ? 'Active: '+pos.length+' pos · base margin '+bm.toFixed(4)+' · uPnL '+(upnl>=0?'+':'')+upnl.toFixed(4)+' · trigger @ -'+(thr).toFixed(4)+(halvMul<0.999?' (×'+halvMul.toFixed(2)+')':'')+' USDT' : 'No active MIC positions.'; })()"></div>
                   <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.micRollingSacrificeEnabled=!cfg.micRollingSacrificeEnabled;persist()}">
                     <div class="tog-t" :class="cfg.micRollingSacrificeEnabled?'on':''"><div class="tog-k"></div></div>
                     <div>
@@ -866,6 +864,67 @@
           await this._micRunScan();
         },
 
+        _micComputeSamplingData() {
+          // Funding skew — always computed for AF visualization
+          const klineSyms = Object.keys(this._micKlineCache || {});
+          const sharedLiq = this._sharedRead('liqResults');
+          const fundCombined = { ...(sharedLiq?.data || {}), ...(this._liqResults || {}) };
+          const liqSyms = Object.keys(fundCombined);
+          const unionSyms = [...new Set([...klineSyms, ...liqSyms])];
+          const tickerMap = {};
+          for (const t of (this._lastAllTickers || [])) tickerMap[t.symbol] = t;
+          let posCount = 0, negCount = 0;
+          for (const sym of unionSyms) {
+            const t = tickerMap[sym];
+            if (!t) continue;
+            const fr = parseFloat(t.fundingRate || 0) * 100;
+            if (fr > 0) posCount++;
+            else if (fr < 0) negCount++;
+          }
+          const fundTotal = posCount + negCount;
+          if (fundTotal > 0) {
+            this._micFundSkew = { negPct: negCount / fundTotal * 100, posPct: posCount / fundTotal * 100, domDir: posCount >= negCount ? 'fund+' : 'fund-', domPct: Math.max(posCount, negCount) / fundTotal * 100 };
+          }
+
+          // Volume skew — always computed for AF visualization
+          let aboveSum = 0, belowSum = 0;
+          for (const [sym, kl] of Object.entries(this._micKlineCache || {})) {
+            const t = tickerMap[sym];
+            if (!t || !kl?.volume) continue;
+            const avg = parseFloat(t.volume24h || 0) / 24;
+            if (!avg) continue;
+            const mult = kl.volume / avg;
+            if (mult > 1) aboveSum += mult - 1;
+            else if (mult < 1) belowSum += 1 - mult;
+          }
+          const volTotal = aboveSum + belowSum;
+          if (volTotal > 0) {
+            this._micVolSkew = { abovePct: aboveSum / volTotal * 100, belowPct: belowSum / volTotal * 100, aboveSum, belowSum };
+          }
+
+          // OI Normalcy — always computed for AF visualization
+          let oiSum = 0, mcapSum = 0, oiCount = 0;
+          for (const t of (this._lastAllTickers || [])) {
+            const oi = parseFloat(t.openInterestValue || 0);
+            if (!oi) continue;
+            const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
+            const price = parseFloat(t.lastPrice || 0);
+            const mcap = this._micGetFreshMcap(base, price);
+            if (!mcap) continue;
+            oiSum += oi; mcapSum += mcap; oiCount++;
+          }
+          if (oiCount >= 3 && mcapSum > 0) {
+            const ratio = oiSum / mcapSum * 100;
+            const mid = this.cfg.micFadeOiMid ?? 2;
+            const tol = this.cfg.micFadeOiTol ?? 1;
+            const excess = Math.max(0, Math.abs(ratio - mid) - tol);
+            const score = Math.min(100, excess / tol * 100);
+            this._micOiSkew = { ratio, mid, tol, score, count: oiCount };
+          } else {
+            this._micOiSkew = null;
+          }
+        },
+
         async _micCheckCombinedFade() {
           if (!this.cfg.micFadeEnabled) { this._micFadeBlocked = false; return; }
           const micPositions = (this.positions || []).filter(p => p._mic);
@@ -902,83 +961,27 @@
             }
           }
 
-          // Fund signal: dominant rate direction% — only when scorecard shows it's bad
-          if (this.cfg.micFadeFundEnabled) {
-            const klineSyms = Object.keys(this._micKlineCache || {});
-            const sharedLiq = this._sharedRead('liqResults');
-            const fundCombined = { ...(sharedLiq?.data || {}), ...(this._liqResults || {}) };
-            const liqSyms = Object.keys(fundCombined);
-            const unionSyms = [...new Set([...klineSyms, ...liqSyms])];
-            const tickerMap = {};
-            for (const t of (this._lastAllTickers || [])) tickerMap[t.symbol] = t;
-            let posCount = 0, negCount = 0;
-            for (const sym of unionSyms) {
-              const t = tickerMap[sym];
-              if (!t) continue;
-              const fr = parseFloat(t.fundingRate || 0) * 100;
-              if (fr > 0) posCount++;
-              else if (fr < 0) negCount++;
-            }
-            const fundTotal = posCount + negCount;
-            if (fundTotal > 0) {
-              this._micFundSkew = { negPct: negCount / fundTotal * 100, posPct: posCount / fundTotal * 100 };
-              const domDir = posCount >= negCount ? 'fund+' : 'fund-';
-              const domPct = Math.max(posCount, negCount) / fundTotal * 100;
-              this._micFundBias = this._micLiqScorecardBias(domDir);
-              if (this._micFundBias === 'bad') {
-                contributions.push({ name: 'fund', score: domPct });
-              }
-            }
+          // Fund signal — reads pre-computed skew; contributes only when scorecard shows it's bad
+          if (this.cfg.micFadeFundEnabled && this._micFundSkew) {
+            const { domDir, domPct } = this._micFundSkew;
+            this._micFundBias = this._micLiqScorecardBias(domDir);
+            if (this._micFundBias === 'bad') contributions.push({ name: 'fund', score: domPct });
           }
 
-          // Volume signal: above-avg vol% or below-avg vol% — only when scorecard shows it's bad
-          if (this.cfg.micFadeVolEnabled) {
-            const tickerMap = {};
-            for (const t of (this._lastAllTickers || [])) tickerMap[t.symbol] = t;
-            let aboveSum = 0, belowSum = 0;
-            for (const [sym, kl] of Object.entries(this._micKlineCache || {})) {
-              const t = tickerMap[sym];
-              if (!t || !kl?.volume) continue;
-              const avg = parseFloat(t.volume24h || 0) / 24;
-              if (!avg) continue;
-              const mult = kl.volume / avg;
-              if (mult > 1) aboveSum += mult - 1;
-              else if (mult < 1) belowSum += 1 - mult;
-            }
+          // Volume signal — reads pre-computed skew; contributes only when scorecard shows it's bad
+          if (this.cfg.micFadeVolEnabled && this._micVolSkew) {
+            const { aboveSum, belowSum } = this._micVolSkew;
             const volTotal = aboveSum + belowSum;
-            if (volTotal > 0) {
-              this._micVolSkew = { abovePct: aboveSum / volTotal * 100, belowPct: belowSum / volTotal * 100 };
-              const domPct = Math.max(aboveSum, belowSum) / volTotal * 100;
-              const volBias = aboveSum >= belowSum
-                ? this._micVolScorecardBias(['lsa', 'lba'])
-                : this._micVolScorecardBias(['rasl', 'rabl']);
-              if (volBias === 'bad') contributions.push({ name: 'vol', score: domPct });
-            }
+            const domPct = Math.max(aboveSum, belowSum) / volTotal * 100;
+            const volBias = aboveSum >= belowSum
+              ? this._micVolScorecardBias(['lsa', 'lba'])
+              : this._micVolScorecardBias(['rasl', 'rabl']);
+            if (volBias === 'bad') contributions.push({ name: 'vol', score: domPct });
           }
 
-          // OI Normalcy signal: aggregate OI/MCap ratio deviation from configured midpoint
-          if (this.cfg.micFadeOiEnabled) {
-            let oiSum = 0, mcapSum = 0, oiCount = 0;
-            for (const t of (this._lastAllTickers || [])) {
-              const oi = parseFloat(t.openInterestValue || 0);
-              if (!oi) continue;
-              const base = t.symbol.replace(/USDT$/i, '').toLowerCase();
-              const price = parseFloat(t.lastPrice || 0);
-              const mcap = this._micGetFreshMcap(base, price);
-              if (!mcap) continue;
-              oiSum += oi; mcapSum += mcap; oiCount++;
-            }
-            if (oiCount >= 3 && mcapSum > 0) {
-              const ratio = oiSum / mcapSum * 100;
-              const mid = this.cfg.micFadeOiMid ?? 10;
-              const tol = this.cfg.micFadeOiTol ?? 10;
-              const excess = Math.max(0, Math.abs(ratio - mid) - tol);
-              const score = Math.min(100, excess / tol * 100);
-              this._micOiSkew = { ratio, mid, tol, score, count: oiCount };
-              if (score > 0) contributions.push({ name: 'oi', score });
-            } else {
-              this._micOiSkew = null;
-            }
+          // OI Normalcy signal — reads pre-computed skew; contributes when outside tolerance
+          if (this.cfg.micFadeOiEnabled && this._micOiSkew?.score > 0) {
+            contributions.push({ name: 'oi', score: this._micOiSkew.score });
           }
 
           if (!contributions.length) { this._micFadeBlocked = false; return; }
@@ -1178,7 +1181,8 @@
             await this._micPrefetchKlines(klineSyms);
           }
 
-          // Re-evaluate fade with fresh klines and tickers now available
+          // Always compute sampling data for AF visualizations, then re-evaluate fade
+          this._micComputeSamplingData();
           await this._micCheckCombinedFade();
           if (this._micFadeBlocked) {
             const fi = this._micFadeInfo;
