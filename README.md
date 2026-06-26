@@ -167,9 +167,9 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **IO/T Step** (`miwIotStep`/`micIotStep`) | Tier step size for `iot` criteria in % of OI/turnover ratio. Default 1. |
 | **IO/M Step** (`miwIomStep`/`micIomStep`) | Tier step size for `iom` criteria in % of OI/market cap ratio. Default 1. |
 | **Cascade** (`miwCascadeEnabled`/`micCascadeEnabled`) | Closes all MIW/MIC positions when their collective unrealized profit hits a threshold. Banks a group move before it reverses. |
-| **Cascade %** (`miwCascadePct`/`micCascadePct`) | Collective uPnL trigger as a % of average entry margin. |
+| **Cascade %** (`miwCascadePct`/`micCascadePct`) | Collective uPnL trigger as a % of base margin (minNotional ÷ leverage). |
 | **Sacrifice** (`miwSacrificeEnabled`/`micSacrificeEnabled`) | Closes MIW/MIC positions when their collective unrealized loss hits a threshold. Caps group drawdown. |
-| **Sacrifice %** (`miwSacrificePct`/`micSacrificePct`) | Collective uLoss trigger as a % of average entry margin. |
+| **Sacrifice %** (`miwSacrificePct`/`micSacrificePct`) | Collective uLoss trigger as a % of base margin (minNotional ÷ leverage). |
 | **Rolling Sacrifice** (`miwRollingSacrificeEnabled`/`micRollingSacrificeEnabled`) | When on, Sacrifice closes only the oldest MIW/MIC position at a time instead of all at once. |
 | **Fade Away** (`miwFadeEnabled`/`micFadeEnabled`) | Master toggle. Runs every scan after klines are fetched, ensuring signals use the freshest available data before any entries open. If any MIW/MIC position is in loss ≥ Loss Trigger, also fires between scans. Evaluates enabled signals as a combined adverse score — when combined score ≥ Combined Threshold, triggers whichever outcomes are enabled below (close oldest and/or block entries). |
 | **Loss Trigger** (`miwFadeAwayLossPct`/`micFadeAwayLossPct`) | Loss threshold as a % of base margin (minNotional ÷ leverage). When any position crosses this, the combined fade check fires immediately outside the scan cycle. Default 25%. |
