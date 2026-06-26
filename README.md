@@ -29,6 +29,8 @@ Open any `.html` file directly in a browser. No build step, no server, no instal
 
 **Running both bots**: open PseudoWinter and PseudoChaser in separate tabs from the same origin. When both are open simultaneously they automatically share bulk ticker fetches, kline caches, and liquidation results to halve API load. Either bot works normally on its own when the other tab isn't open.
 
+In addition to the shared data pool, the Permafrost and Ashfall plugins maintain a separate cross-bot sample state (`__ew_sample_state_v1`) written after each structure cycle and read every 15 seconds. This state carries wave score, funding skew, OI skew, kline bar data, and liquidation cycle history. When one bot is in a drawdown halt or gains lock, its plugin reads the partner's sample to keep the Status Block bars, liq chart, and WAVE score line current — the halted bot's displays stay populated from the running partner's latest readings without opening any new entries.
+
 ---
 
 ## Plugins
@@ -229,7 +231,7 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Block Threshold** (`permafrostSlotLossThreshold`/`ashfallSlotLossThreshold`) | Loss threshold (as a fraction of entry margin) used by the active blocking conditions. For Threshold Block, applied independently to own-side gross losses and partner-side gross wins. For Combined PnL Block, applied to the net total. Raising Min Notional raises the dollar threshold proportionally, which can naturally unblock slots without clearing the scorecard. |
 | **Cross Broadcast** (`permafrostCrossEnabled`/`ashfallCrossEnabled`) | Writes cascade/sacrifice closes and drawdown halt/gains-lock transitions to a shared log that the partner bot can read. Required for Mutual DDH Lift. |
 | **Mutual DDH Lift** (`permafrostMutualDdLiftEnabled`/`ashfallMutualDdLiftEnabled`) | When both bots are simultaneously in drawdown halt, lifts this bot's halt. Checked every 15 s. Requires Cross Broadcast to be on. |
-| **Gains Continuation** (`permafrostGainsContinuationEnabled`/`ashfallGainsContinuationEnabled`) | When the partner bot locks gains, restarts this bot's drawdown throttle timer from the full configured duration. Prevents new entries while the partner is in a market climate favorable to their direction but adverse to this bot. Checked every 15 s. Requires Cross Broadcast to be on. Default on. |
+| **Gains Continuation** (`permafrostGainsContinuationEnabled`/`ashfallGainsContinuationEnabled`) | When the partner bot reaches its gains threshold and broadcasts a Gains Continuation signal, resets this bot's drawdown throttle to its full configured duration. Checked every 15 s. Requires Cross Broadcast to be on. Default on. |
 | **Stale Slot Purge** (`pfStaleSlotDays`/`afStaleSlotDays`) | Slots with no new close in this many days are fully removed from the scorecard on the next trim. Keeps the scorecard clean when criteria combinations fall out of use. Default 7, configurable 1–90 days. |
 | **Collapsed Ranks** (`pfCollapsedRanks`/`afCollapsedRanks`) | Switches the scorecard chip row from per-slot to per-criterion view — tiers are stripped and PnL pools across every slot that contained each criterion. Also controls slot ordering in MIW/MIC: in Collapsed mode, slots are ranked by the sum of their constituent criteria scores rather than per-slot history, so entries are attempted through the highest-scoring combination first. Useful when Auto Slots generates too many distinct combinations for per-slot records to carry statistical weight. |
 | **Collapsed Sort** (`pfCollapsedSort`/`afCollapsedSort`) | When on, the MIW/MIC entry pool is sorted by a composite score rather than by slot index. The composite score starts with the ticker's best-matching slot score, then penalises tickers that also qualify for additional slots with negative collapsed scores (see Co-Qualifying Penalty below). Tickers that happen to match only high-scoring slots rise; those that match losing slots in addition to their best slot fall. |
@@ -248,6 +250,8 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 
 The WAVE tab overlays a **score line** on the structure wave chart and lets you configure which market signals contribute to it. The score summarises current conditions on a continuous scale: light gray = favorable, dark gray = adverse. The line is built from recent wave points and only populates forward from when metrics are configured — no retroactive backfill.
 
+**Score line during halt**: when the bot is in a drawdown halt or gains lock and its own wave score is unavailable, the score line falls back to the partner bot's most recently published wave score. This means the line stays live even when this bot is not running scans. When the scorecard is thin (all biases neutral and no kline cache), the wave score falls back to raw kline momentum from the last completed hour candles across the sampled ticker set.
+
 **Score metric picker**: each available metric (`io`, `vol`, `oi`) appears as a chip. Click a chip to focus it — a config panel opens below showing:
 - A weight slider (1–5) controlling how much that metric contributes relative to others.
 - An **Add** button (when the metric is not yet active) or **Remove** button (when it is). Changes take effect on the next wave point.
@@ -260,7 +264,7 @@ When Fade Away's OI Normalcy Signal is active, the OI metric's config panel show
 
 Shows the current climate reading (magnitude, breadth, slope, IO score, effective score, evidence mass), active halt state (profile-governed or fallback timer), and PLK countdown. The **wave graph** plots recent market structure — direction label (rising/falling/steady) reflects the recent path of the market.
 
-Three directional bar charts below the climate reading show relative dominance at a glance. Red extends left (adverse for this bot's direction), green extends right (favorable), with current values as a label:
+Three directional bar charts below the climate reading show relative dominance at a glance. Red extends left (adverse for this bot's direction), green extends right (favorable), with current values as a label. **During a drawdown halt or gains lock**, the bars (kline direction, funding skew) and the liq chart are sourced from the partner bot's sample state every 15 seconds so the display stays current without this bot running any scans.
 
 | Bar | What it shows |
 |---|---|
@@ -343,6 +347,7 @@ Developer-level detail with no operational consequence. Included for reference.
 | `pc_v1_log` | PseudoChaser activity log |
 | `__pc_plugins_v1` | PseudoChaser serialized plugin list |
 | `__ew_shared_v1` | Cross-tab shared data registry (bulkTickers, watchTickers, klines_1h, klines_1h_last, mcap, liqResults) |
+| `__ew_sample_state_v1` | Cross-bot sample state written by Permafrost/Ashfall after each structure cycle. Contains `state.winter` and `state.chaser` — each carrying waveScore, fundSkew, oiSkew, klineBar, and liqHistory. Read every 15 s by the partner bot to keep displays current during halts. |
 | `__pf_liq_batches` | Permafrost active liq batch snapshots (for reconnect on reload) |
 | `__ash_liq_batches` | Ashfall active liq batch snapshots |
 | `__permafrost_winter_v1` | Permafrost profile: events, samples, wave history |
