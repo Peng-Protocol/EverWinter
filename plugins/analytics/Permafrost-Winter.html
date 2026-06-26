@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.29.1';
+  const VERSION        = '1.29.2';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -79,6 +79,7 @@
   const MIN_HALT_MS    = 1 * 3600 * 1000;      // never thaw before 1h (only reachable under a strong bias)
   const EVENTS_CAP     = 200;
   const CLOSES_CAP     = 500;
+  const SAMPLE_STATE_KEY = '__ew_sample_state_v1'; // cross-bot sample sharing
 
   // ── Structure trajectory ("the wave") ──
   // A reading isn't just where the market is now — it's where it came from. We
@@ -583,7 +584,8 @@
         pfScorecardView: 'combined',   // 'combined' | 'own'
         pfScorecardSource: 'both',     // 'both' | 'hist' | 'traded'
         pfScorecardExpanded: null,     // key of currently expanded chip, or null
-        pfKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // last-cycle aggregate % change sums
+        pfKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // merged (own + partner) kline bar for display
+        _pfOwnKlineBar: null,                       // own-only kline bar before partner merge
         _pfKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
         _pfStructureList: null, _pfStructureAt: 0, // own 3h ticker cache independent of host
         pfStatus:  { skew: null, breadth: null, score: null, mass: 0, count: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
@@ -719,6 +721,20 @@
                   const _d = this._pfDescribe(r, score, mass, count);
                   this.log(`[PFR] ❄ Structure check (halted) — ${_d.desc} — ${_d.bias}`, 'info');
                 }).catch(() => {});
+              }
+            }
+            // Partner sample: keep wave chart and kline bar alive using Ashfall's latest data
+            if (this.cfg.permafrostEnabled) {
+              const _ps = this._pfReadPartnerSample();
+              this._pfMergeKlineBar();
+              if (_ps) {
+                const _lwTs = this.pfWave.length ? this.pfWave[this.pfWave.length - 1].ts : 0;
+                if (_ps.ts > _lwTs + 60_000) {
+                  this.pfWave.push({ ts: _ps.ts, lean: +(_ps.lean ?? 0).toFixed(4), vol: +(_ps.vol ?? 0).toFixed(4), volAbs: _ps.volAbs ?? 0, io: _ps.ioScore != null ? +_ps.ioScore.toFixed(4) : null, score: this._miwWaveScore != null ? +((this._miwWaveScore / 100).toFixed(4)) : null });
+                  const _cut = Date.now() - WAVE_TTL_MS;
+                  if (this.pfWave.length && this.pfWave[0].ts < _cut) this.pfWave = this.pfWave.filter(p => p.ts >= _cut);
+                  if (this.pfWave.length > WAVE_CAP) this.pfWave = this.pfWave.slice(-WAVE_CAP);
+                }
               }
             }
           }, 15000);
@@ -915,11 +931,15 @@
             }
             if (bearSum > 0 || bullSum > 0) {
               this.pfKlineBar = { bearSum, bullSum, max: this.cfg.miwKlineScanCap ?? 50 };
+              this._pfOwnKlineBar = { ...this.pfKlineBar };
+              this._pfMergeKlineBar();
               return;
             }
           }
           // MIW didn't fetch klines this cycle — own sample, cached per completed hourly candle
-          if (this._pfKlineBarAt === lastHourStart && (this.pfKlineBar.bearSum > 0 || this.pfKlineBar.bullSum > 0)) return;
+          if (this._pfKlineBarAt === lastHourStart && (this.pfKlineBar.bearSum > 0 || this.pfKlineBar.bullSum > 0)) {
+            this._pfMergeKlineBar(); return;
+          }
           try {
             const allTickers = this._lastAllTickers || [];
             const cap = this.cfg.miwKlineScanCap ?? 50;
@@ -951,7 +971,49 @@
             }));
             this._pfKlineBarAt = lastHourStart;
             this.pfKlineBar = { bearSum, bullSum, max: cap };
+            this._pfOwnKlineBar = { ...this.pfKlineBar };
+            this._pfMergeKlineBar();
           } catch(e) {}
+        },
+
+        _pfWriteSample(reading) {
+          try {
+            const raw = localStorage.getItem(SAMPLE_STATE_KEY);
+            const state = raw ? JSON.parse(raw) : {};
+            state.winter = {
+              ts: reading.ts,
+              klineBar: this._pfOwnKlineBar ?? this.pfKlineBar,
+              fundSkew: this._miwFundSkew ?? null,
+              oiSkew: this._miwOiSkew ?? null,
+              waveScore: this._miwWaveScore ?? null,
+              vol: reading.vol ?? 0,
+              volAbs: reading.volAbs ?? 0,
+              ioScore: reading.ioScore ?? null,
+              lean: +((reading.skew + reading.breadth) / 2).toFixed(4),
+            };
+            localStorage.setItem(SAMPLE_STATE_KEY, JSON.stringify(state));
+          } catch(e) {}
+        },
+
+        _pfReadPartnerSample() {
+          try {
+            const raw = localStorage.getItem(SAMPLE_STATE_KEY);
+            if (!raw) return null;
+            const s = JSON.parse(raw)?.chaser ?? null;
+            return (s && s.ts >= Date.now() - 7_200_000) ? s : null;
+          } catch(e) { return null; }
+        },
+
+        _pfMergeKlineBar() {
+          const own = this._pfOwnKlineBar ?? this.pfKlineBar;
+          const partner = this._pfReadPartnerSample();
+          const pb = partner?.klineBar;
+          if (!pb || (!pb.bearSum && !pb.bullSum)) return;
+          this.pfKlineBar = {
+            bearSum: own.bearSum + pb.bearSum,
+            bullSum: own.bullSum + pb.bullSum,
+            max: (own.max || 50) + (pb.max || 50),
+          };
         },
 
         _pfScoreRead() {
@@ -1305,6 +1367,7 @@
           const inherent = this._pfInherent(lean, slope, reading.ioScore ?? null);
           const eff = this._pfEffectiveScore(score, mass, inherent);
           this.pfStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, count, lean, slope, inherent, eff, ioScore: reading.ioScore ?? null, at: reading.ts };
+          this._pfWriteSample(reading);
         },
 
         _pfDownload(filename, data) {
