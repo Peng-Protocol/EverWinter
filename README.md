@@ -229,6 +229,7 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Block Threshold** (`permafrostSlotLossThreshold`/`ashfallSlotLossThreshold`) | Loss threshold (as a fraction of entry margin) used by the active blocking conditions. For Threshold Block, applied independently to own-side gross losses and partner-side gross wins. For Combined PnL Block, applied to the net total. Raising Min Notional raises the dollar threshold proportionally, which can naturally unblock slots without clearing the scorecard. |
 | **Cross Broadcast** (`permafrostCrossEnabled`/`ashfallCrossEnabled`) | Writes cascade/sacrifice closes and drawdown halt/gains-lock transitions to a shared log that the partner bot can read. Required for Mutual DDH Lift. |
 | **Mutual DDH Lift** (`permafrostMutualDdLiftEnabled`/`ashfallMutualDdLiftEnabled`) | When both bots are simultaneously in drawdown halt, lifts this bot's halt. Checked every 15 s. Requires Cross Broadcast to be on. |
+| **Gains Continuation** (`permafrostGainsContinuationEnabled`/`ashfallGainsContinuationEnabled`) | When the partner bot locks gains, restarts this bot's drawdown throttle timer from the full configured duration. Prevents new entries while the partner is in a market climate favorable to their direction but adverse to this bot. Checked every 15 s. Requires Cross Broadcast to be on. Default on. |
 | **Stale Slot Purge** (`pfStaleSlotDays`/`afStaleSlotDays`) | Slots with no new close in this many days are fully removed from the scorecard on the next trim. Keeps the scorecard clean when criteria combinations fall out of use. Default 7, configurable 1–90 days. |
 | **Collapsed Ranks** (`pfCollapsedRanks`/`afCollapsedRanks`) | Switches the scorecard chip row from per-slot to per-criterion view — tiers are stripped and PnL pools across every slot that contained each criterion. Also controls slot ordering in MIW/MIC: in Collapsed mode, slots are ranked by the sum of their constituent criteria scores rather than per-slot history, so entries are attempted through the highest-scoring combination first. Useful when Auto Slots generates too many distinct combinations for per-slot records to carry statistical weight. |
 | **Collapsed Sort** (`pfCollapsedSort`/`afCollapsedSort`) | When on, the MIW/MIC entry pool is sorted by a composite score rather than by slot index. The composite score starts with the ticker's best-matching slot score, then penalises tickers that also qualify for additional slots with negative collapsed scores (see Co-Qualifying Penalty below). Tickers that happen to match only high-scoring slots rise; those that match losing slots in addition to their best slot fall. |
@@ -242,6 +243,18 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Liquidation Surveillance** (`pfLiqEnabled`/`ashLiqEnabled`) | Opens WebSocket connections to track live liquidation flow across a rolling sample of volatile tickers. Required for `sliq`/`bliq` criteria in MIW/MIC. |
 | **Liq Batch Size** (`pfLiqBatchSize`/`ashLiqBatchSize`) | Tickers per liquidation batch (5–50). More tickers = broader market coverage per cycle. |
 | **Liq Threshold %** (`pfLiqThresholdPct`/`ashLiqThresholdPct`) | Minimum share of a cycle's total liquidation turnover one side must hold to qualify (10–90%). At 50%, one side must account for at least half. |
+
+### WAVE Tab — Score Metrics
+
+The WAVE tab overlays a **score line** on the structure wave chart and lets you configure which market signals contribute to it. The score summarises current conditions on a continuous scale: light gray = favorable, dark gray = adverse. The line is built from recent wave points and only populates forward from when metrics are configured — no retroactive backfill.
+
+**Score metric picker**: each available metric (`io`, `vol`, `oi`) appears as a chip. Click a chip to focus it — a config panel opens below showing:
+- A weight slider (1–5) controlling how much that metric contributes relative to others.
+- An **Add** button (when the metric is not yet active) or **Remove** button (when it is). Changes take effect on the next wave point.
+
+When Fade Away's OI Normalcy Signal is active, the OI metric's config panel shows "Mid/tol inherited from Fade Away OI config" and uses those settings — the separate OI sliders are hidden to avoid conflicting configuration.
+
+**Labels** (`io`, `vol`, `score`) appear at the bottom-right of the chart where they don't overlap wave data.
 
 ### Status Block
 
