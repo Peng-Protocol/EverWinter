@@ -109,6 +109,8 @@ What each side does with this value is opposite. For the long side, a participat
 
 **This technique is under evaluation.** The link between high participation and bearish follow-through is an empirical observation, not a validated rule. The threshold values are starting points derived from what a plausible trigger should look like, not from back-tested optimal parameters. Treat this as a filter-in-progress rather than a proven gate.
 
+The intended end state is broader than the current implementation: a reliable way to identify the current market regime — bullish, bearish, or transitional — and ideally to detect regime shifts before they are reflected in price. The participation signal partially achieves this. High aggregate volume and elevated open interest do appear ahead of bearish turns, but the relationship is inconsistent enough that it does not yet constitute a regime classifier on its own. Future development should focus on what additional signals, in what combination, would make regime identification robust enough to function as a genuine entry gate rather than a heuristic filter.
+
 ---
 
 ### Reactive Techniques
