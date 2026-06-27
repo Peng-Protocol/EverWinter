@@ -98,15 +98,7 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 
 #### Preemptive Lock *(tentative)*
 
-The observation behind this technique: when a large proportion of the market is trading above its typical hourly volume and open interest is concentrated at an elevated level relative to market cap, conditions tend to turn bearish. The reasoning is that high aggregate participation combined with heavy leverage usually precedes a flush — the fuel for further upside is consumed and the structural overhang increases short risk for longs.
-
-A single **participation value** summarises both signals. Volume contributes above a configurable threshold — below that threshold the market is considered insufficiently active to carry the signal. OI contributes from zero upward, capped to prevent any single outlier day from dominating. At 60% above-average volume and 4% aggregate OI the participation value reaches 50, which is the trigger threshold.
-
-What each side does with this value is opposite. For the long side, a participation reading above 50 means the bearish pressure is real — new long entries are locked until the signal clears. For the short side, a participation reading *below* 50 means the bearish pressure is absent — without the signal, new short entries are locked. The short side does not short into an unconfirmed environment; it waits for the market to show evidence of the condition it is designed to trade.
-
-**This technique is under evaluation.** The link between high participation and bearish follow-through is an empirical observation, not a validated rule. The threshold values are starting points derived from what a plausible trigger should look like, not from back-tested optimal parameters. Treat this as a filter-in-progress rather than a proven gate.
-
-The intended end state is broader than the current implementation: a reliable way to identify the current market regime — bullish, bearish, or transitional — and ideally to detect regime shifts before they are reflected in price. The participation signal partially achieves this. High aggregate volume and elevated open interest do appear ahead of bearish turns, but the relationship is inconsistent enough that it does not yet constitute a regime classifier on its own. Future development should focus on what additional signals, in what combination, would make regime identification robust enough to function as a genuine entry gate rather than a heuristic filter.
+When broad market volume is running above average and aggregate open interest is elevated relative to market cap, conditions tend to turn bearish. The short side waits for this signal before entering; the long side locks out when it appears. The goal — not yet fully achieved — is reliable regime identification: knowing whether the market is bullish, bearish, or transitional before price confirms it.
 
 ---
 
