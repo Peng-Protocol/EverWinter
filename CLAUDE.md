@@ -28,8 +28,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.31.6 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.31.6 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.30.9 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.30.9 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.31.0 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.31.0 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
@@ -58,6 +58,7 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 - **Log behavioral corrections.** Whenever the user gives a behavioral correction or long-term instruction — signalled by phrases like "why didn't you…", "why are you…", "you should always…", "you should never…", or any direct criticism of approach — add the lesson to this file before finishing the response.
 - **Tooltip length.** In-app tooltips (hint text, x-text descriptions, title attributes) must be at most 3 phrases. Aim for 1.
 - **Fade Away loss trigger = between-scan enabler, not a scan gate.** The loss threshold causes the combined fade check to also fire via the exit timer (between scans) when any position crosses it. The check always runs every scan cycle unconditionally. "Scan bypass" means it bypasses waiting for the next scan — it does NOT skip or gate the scan-time check.
+- **PF/AF tooltip and README framing**: These plugins do not reliably identify which specific market structures precede halt events. Market regime (bull/bear) is the dominant driver of the learned profile and is not fully captured in the tracked signals. Tooltips should be generalized ("learns from historical conditions and outcomes") and avoid implying structural causation. The README may elaborate on observed reactions to data.
 - **Never use `window.confirm()`, `window.alert()`, or `window.prompt()` in plugin or bot UI.** These are blocked when the app runs in an iframe, silently returning `false`/`undefined` and making buttons appear unresponsive with no feedback. Use inline Alpine confirmation UI instead: wrap the button in `<span x-data="{c:false}">`, show the action button when `!c`, and when clicked set `c=true` to reveal inline "Sure? Yes / No" buttons that execute the action or reset `c`.
 
 ## Pending Tasks

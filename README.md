@@ -194,7 +194,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 
 ## Permafrost / Ashfall Plugin
 
-Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins replace the fixed 12h drawdown/gains-lock timers with a learned market climate profile. They track market breadth, momentum, and funding sentiment, and learn which conditions precede losses vs. profits. Halts end when the climate improves rather than when a clock runs out.
+Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins replace the fixed 12h drawdown/gains-lock timers with an adaptive halt system that learns from historical market conditions and trade outcomes. They pair realized PnL from each close with a snapshot of market structure — breadth, momentum, and funding sentiment — building a recency-weighted profile over time. That profile drives a climate score that controls halt duration and signals downstream systems (the bots themselves) to adjust their entry and hold behavior accordingly. In practice, market regime (broadly bullish or bearish) is a significant driver of the learned profile, so the score reflects prevailing conditions rather than precise structural predictions.
 
 **During the first weeks of operation the plugin behaves almost identically to the stock timers.** It withholds climate governance until enough evidence has accumulated near the current market reading.
 

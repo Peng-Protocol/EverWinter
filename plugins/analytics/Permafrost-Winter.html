@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.30.9';
+  const VERSION        = '1.31.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -137,7 +137,7 @@
               <div class="tog-t" :class="cfg.permafrostEnabled?'on':''"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l">Permafrost Mode</div>
-                <div class="pfr-hint">Learns which market climates correlate with drawdowns vs gains locks, building a historical structure profile over time.</div>
+                <div class="pfr-hint">Learns from historical market conditions and outcomes to adapt halt timing and entry behavior.</div>
               </div>
             </label>
             <div class="pfr-tabs" style="margin-top:10px">
@@ -418,12 +418,10 @@
                   <button @click="cfg.permafrostWaveShowMain=!(cfg.permafrostWaveShowMain??true);persist()" :style="(cfg.permafrostWaveShowMain??true)?'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Structure</button>
                   <button @click="cfg.permafrostWaveShowVol=!(cfg.permafrostWaveShowVol??true);persist()" :style="(cfg.permafrostWaveShowVol??true)?'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Vol</button>
                   <button @click="cfg.permafrostWaveShowIo=!(cfg.permafrostWaveShowIo??true);persist()" :style="(cfg.permafrostWaveShowIo??true)?'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">IO</button>
-                  <button @click="cfg.pfShowScore=!(cfg.pfShowScore??true);persist()" :style="(cfg.pfShowScore??true)?'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Score</button>
                 </div>
                 <div class="pfr-hint" style="margin-top:4px">Structure lean path (bull ↑ / bear ↓), up to ~1 week of history. Direction matters — rising tape reads negative for shorts even if mildly bearish. History takes priority over the inherent wave when the profile is rich.</div>
                 <div class="pfr-hint" style="margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">
                   <span x-show="cfg.permafrostIoEnabled && pfStatus.ioScore != null">IO <span x-text="pfStatus.ioScore>=0?'+':''"></span><span x-text="(pfStatus.ioScore??0).toFixed(2)"></span> — <span x-text="(pfStatus.ioScore??0)>0.2?'crowd net long':(pfStatus.ioScore??0)<-0.2?'crowd net short':'crowd neutral'"></span></span>
-                  <span x-show="(()=>{ void tick; return _miwWaveScore != null; })()">Score <span x-text="(()=>{ void tick; const s=_miwWaveScore; if(s==null) return ''; return (s>=0?'+':'')+s.toFixed(1); })()" :style="(()=>{ void tick; return _miwWaveScore>0?'color:#6cd2aa':_miwWaveScore<0?'color:#f08080':''; })()"></span></span>
                 </div>
                 <div style="margin-top:10px">
                   <div x-show="cfg.pfShowStructure??true">
@@ -563,7 +561,6 @@
         pfScorecardExpanded: null,     // key of currently expanded chip, or null
         pfKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // merged (own + partner) kline bar for display
         _pfOwnKlineBar: null,                       // own-only kline bar before partner merge
-        _pfLastScorePushAt: 0,                      // epoch ms of last wave entry that carried a non-null score
         _pfKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
         _pfStructureList: null, _pfStructureAt: 0, // own 3h ticker cache independent of host
         pfStatus:  { skew: null, breadth: null, score: null, mass: 0, count: 0, lean: 0, slope: 0, inherent: 0, eff: null, ioScore: null, at: 0 },
@@ -590,7 +587,6 @@
           if (this.cfg.pfShowFunding              === undefined) this.cfg.pfShowFunding              = true;
           if (this.cfg.pfShowVol                  === undefined) this.cfg.pfShowVol                  = true;
           if (this.cfg.pfShowOi                   === undefined) this.cfg.pfShowOi                   = true;
-          if (this.cfg.pfScoreMetrics             === undefined) this.cfg.pfScoreMetrics             = { funding: 1, liq: 1, vol: 1 };
           if (this.cfg.permafrostCrossEnabled        === undefined) this.cfg.permafrostCrossEnabled        = true;
           if (this.cfg.permafrostMutualDdLiftEnabled          === undefined) this.cfg.permafrostMutualDdLiftEnabled          = false;
           if (this.cfg.permafrostGainsContinuationEnabled     === undefined) this.cfg.permafrostGainsContinuationEnabled     = true;
@@ -872,11 +868,7 @@
         // separate from pfCloses (which track realized PnL) so the wave
         // retains the full trajectory for as long as we have data, up to ~a week.
         _pfPushWave(reading) {
-          const _pwScore = this._miwWaveScore ?? this._pfReadPartnerSample()?.waveScore ?? null;
-          const _minGap = (this.cfg.scanMins ?? 3) * 60_000 * 0.8;
-          const _recordScore = _pwScore != null && (reading.ts - this._pfLastScorePushAt) >= _minGap;
-          if (_recordScore) this._pfLastScorePushAt = reading.ts;
-          this.pfWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4), vol: reading.vol ?? 0, volAbs: reading.volAbs ?? 0, io: reading.ioScore ?? null, score: _recordScore ? +((_pwScore / 100).toFixed(4)) : null });
+          this.pfWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4), vol: reading.vol ?? 0, volAbs: reading.volAbs ?? 0, io: reading.ioScore ?? null });
           const cut = Date.now() - WAVE_TTL_MS;
           if (this.pfWave.length && this.pfWave[0].ts < cut) this.pfWave = this.pfWave.filter(p => p.ts >= cut);
           if (this.pfWave.length > WAVE_CAP) this.pfWave = this.pfWave.slice(-WAVE_CAP);
@@ -989,7 +981,6 @@
               fundSkew: this._miwFundSkew ?? null,
               oiSkew: this._miwOiSkew ?? null,
               volSkew: this._miwVolSkew ?? null,
-              waveScore: this._miwWaveScore ?? null,
               vol: reading.vol ?? 0,
               volAbs: reading.volAbs ?? 0,
               ioScore: reading.ioScore ?? null,
@@ -1320,27 +1311,9 @@
             ioSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.io).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.io).toFixed(1)}" stroke="rgba(200,150,255,0.5)" stroke-width="1" stroke-dasharray="3 2"/>`;
           }
 
-          // Score line: plot each stamped entry directly by timestamp — no binning, so stored values
-          // never change. Points scroll left as the window advances but y values are immutable.
-          const scorePts = [];
-          for (const p of wave) {
-            if (p.score == null) continue;
-            const x = pad + ((p.ts - tMin) / WAVE_TTL_MS) * plotW;
-            if (x < pad || x > pad + plotW) continue;
-            scorePts.push({ x, s: p.score });
-          }
-          let scoreSvg = '';
-          for (let i = 1; i < scorePts.length; i++) {
-            const p1 = scorePts[i-1], p2 = scorePts[i];
-            const avg = (p1.s + p2.s) / 2;
-            const gv = Math.round(50 + (avg + 1) / 2 * 160);
-            scoreSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.s).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.s).toFixed(1)}" stroke="rgba(${gv},${gv},${gv},.8)" stroke-width="1.5"/>`;
-          }
-
           const showMain = this.cfg.permafrostWaveShowMain ?? true;
           const showVol = this.cfg.permafrostWaveShowVol ?? true;
           const showIo  = this.cfg.permafrostWaveShowIo  ?? true;
-          const showScore = this.cfg.pfShowScore ?? true;
           const cur = pts[pts.length - 1].lean;
           const col = cur > 0.05 ? 'var(--profit)' : cur < -0.05 ? 'var(--short)' : 'var(--ice)';
           const polyPts = pts.map(p => `${p.x.toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ');
@@ -1351,14 +1324,12 @@
             + `<line x1="0" y1="${mid.toFixed(1)}" x2="${W}" y2="${mid.toFixed(1)}" stroke="rgba(255,255,255,.18)" stroke-dasharray="3 3"/>`
             + (showVol ? volSvg : '')
             + (showIo  ? ioSvg  : '')
-            + (showScore ? scoreSvg : '')
             + (showMain ? `<polyline points="${polyPts}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>` : '')
             + (showMain ? `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.5" fill="${col}"/>` : '')
             + `<text x="2" y="${pad+7}" fill="rgba(0,229,160,.5)" font-size="8" font-family="monospace">bull</text>`
             + `<text x="2" y="${(H-pad-1).toFixed(1)}" fill="rgba(255,69,96,.5)" font-size="8" font-family="monospace">bear</text>`
             + (showVol ? `<text x="${pad}" y="${H + 9}" fill="rgba(255,185,50,.55)" font-size="8" font-family="monospace">vol</text>` : '')
             + (showIo && ioPts.length >= 2 ? `<text x="${W / 2}" y="${H + 9}" fill="rgba(200,150,255,.55)" font-size="8" font-family="monospace" text-anchor="middle">io</text>` : '')
-            + (showScore && scorePts.length >= 2 ? `<text x="${W - pad}" y="${H + 9}" fill="rgba(180,180,180,.55)" font-size="8" font-family="monospace" text-anchor="end">score</text>` : '')
             + `</svg>`;
         },
 
