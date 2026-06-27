@@ -10,7 +10,6 @@
    - [Reactive Techniques](#reactive-techniques)
 3. [Market Intelligence](#market-intelligence)
    - [Structure Learning](#structure-learning)
-   - [Structure Sampling](#structure-sampling)
    - [Slot Scorecard](#slot-scorecard)
    - [Cross-Side Coordination](#cross-side-coordination)
 4. [Psycho Mode](#psycho-mode)
@@ -94,9 +93,21 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 - **mS-Liq (Mixed Sell-Liquidation)** — Sell liquidations lead, but buy liquidations hold at least 30% of turnover — a contested cycle with a sell lean. Use this to capture the short-liq thesis when a clean one-sided signal is absent. The same depth gate applies.
 - **mB-Liq (Mixed Buy-Liquidation)** — Buy liquidations lead, but sell liquidations hold at least 30% — a contested cycle with a buy lean. Use this to capture the long-liq thesis under mixed but directionally leaning conditions.
 
-**Building slots**: A slot containing only "fund>1" behaves exactly like a fund-chasing filter. A slot containing "+24h" and "vm>10" behaves like a momentum filter. A slot with all three — "+24h", "vm>10", and "fund>1" — requires momentum, participation, and a funding premium to align before opening. Adding "lsa>25" to a bearish slot demands that the last hourly candle confirm the move with volume. The building-block design lets you dial the filter from permissive to strict without changing the underlying logic.
+**Building slots**: A slot containing only "fund>1" behaves like a fund-chasing filter. A slot containing "+24h" and "vm>10" behaves like a momentum filter. A slot with all three — "+24h", "vm>10", and "fund>1" — requires momentum, participation, and a funding premium to align before opening. Adding "lsa>25" to a bearish slot demands that the last hourly candle confirm the move with volume. The building-block design lets you dial the filter from permissive to strict without changing the underlying logic.
 
 **Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 base combinations. At size 3, 220. These are base-name counts — the scorecard tracks a much larger space in practice. Tiered criteria (Fund, V/M, spike, IO/T, IO/M) record the specific tier value at entry, so a single base combination like "Fund + +24h" can produce dozens of distinct scorecard entries depending on how far the funding rate was at each trade. The effective tracked variety grows with data and can far exceed the base count shown. Some criteria are inherently opposed and cannot coexist: +24h and -24h, and any two from the candle group (lsa, lba, rasl, rabl) — a candle can only close in one direction with one volume character simultaneously. Auto-generated slots containing any such pair will never see a position. Combined with auto-correction, this creates a self-pruning strategy: all valid combinations run, and the ones that consistently lose are disabled without manual intervention.
+
+---
+
+#### Preemptive Lock *(tentative)*
+
+The observation behind this technique: when a large proportion of the market is trading above its typical hourly volume and open interest is concentrated at an elevated level relative to market cap, conditions tend to turn bearish. The reasoning is that high aggregate participation combined with heavy leverage usually precedes a flush — the fuel for further upside is consumed and the structural overhang increases short risk for longs.
+
+A single **participation value** summarises both signals. Volume contributes above a configurable threshold — below that threshold the market is considered insufficiently active to carry the signal. OI contributes from zero upward, capped to prevent any single outlier day from dominating. At 60% above-average volume and 4% aggregate OI the participation value reaches 50, which is the trigger threshold.
+
+What each side does with this value is opposite. For the long side, a participation reading above 50 means the bearish pressure is real — new long entries are locked until the signal clears. For the short side, a participation reading *below* 50 means the bearish pressure is absent — without the signal, new short entries are locked. The short side does not short into an unconfirmed environment; it waits for the market to show evidence of the condition it is designed to trade.
+
+**This technique is under evaluation.** The link between high participation and bearish follow-through is an empirical observation, not a validated rule. The threshold values are starting points derived from what a plausible trigger should look like, not from back-tested optimal parameters. Treat this as a filter-in-progress rather than a proven gate.
 
 ---
 
@@ -215,41 +226,19 @@ A perfect AMa run returns roughly **709% on the original entry margin** at 6× l
 
 ---
 
-#### Group Exits
-
-The system exerts influence over positions and entries through two independent axes. The first is the adverse score from Fade Away — a live reading of market conditions that can close the oldest position and block new entries. The second is slot sorting — the scorecard-ranked ordering of the entry pool that ensures the strongest historically-performing conditions enter first. These axes are complementary but separate: sorting improves the quality of what enters without preventing entries, while Fade Away can block or close without altering the order of what remains eligible. When sorting alone is providing sufficient risk management, Fade Away can be used in a narrower role — computing the adverse score to gate entries without closing positions at all.
-
-**Fade Away** — Five signals feed a combined adverse score each scan: candle structure, liquidation flow, funding rate direction, volume character, and OI normalcy. The evaluation runs after fresh kline data is fetched each cycle, so signals reflect current conditions rather than the previous scan's data. Two outcomes can trigger independently when the combined score crosses the threshold: closing the oldest open position, and blocking new entries — each is a separate toggle. Candle structure contributes unconditionally — when the tape is broadly moving against the open position direction, that counts against it. Liquidation, funding, and volume signals are gated by scorecard history: they only contribute when past trades opened under the same entry conditions confirm the signal has historically led to losses. If the history is absent or ambiguous those signals stay silent. The volume signal reads whether the current kline sample leans toward above-average or below-average volume, and checks whether slots using those volume criteria have historically lost — if so, the skew contributes to the combined score. OI normalcy measures aggregate open interest as a proportion of market cap across tickers with recent data — both unusually high and unusually low readings are treated as adverse, with a configurable midpoint defining what is normal. The structure signal's weight is configurable relative to all other active signals as a group: raise it to let the directional tape reading dominate the combined score, lower it to trust the scorecard-gated signals more. A loss trigger can also fire the same evaluation between scans when any position is already in loss past a set amount, so a deteriorating position does not have to wait for the next scan cycle.
-
 ---
 
 ## Market Intelligence
 
-Market Intelligence is the strategy used by PseudoWinter and PseudoChaser. Rather than trading on a single signal or a fixed rule, it builds a living picture of the market — learning what conditions have preceded wins and losses, tracking what the broad tape is doing right now, and filtering entries against everything the system has observed so far.
+Market Intelligence is the approach used by PseudoWinter and PseudoChaser. Rather than trading on a single signal, it learns which entry conditions have historically preceded wins and losses and filters entries against that record. The tools described here vary in maturity — some are well-established, others are under active evaluation.
 
 ---
 
 ### Structure Learning
 
-Structure Learning is the observational counterpart to Psycho Mode's mechanical approach. Where Psycho Mode handles the position book mechanically — absorbing, escalating, exhuming — Structure Learning watches the broader market and asks what conditions surrounded past wins and losses.
+Structure Learning accumulates a profile of what market conditions have looked like during past wins, losses, and halts. Over many sessions, this profile replaces the fixed 12-hour halt timer with a climate-aware gate: conditions resembling past drawdown periods narrow the entry window; conditions resembling profitable periods widen it.
 
-Every significant event — a position closes at target, a drawdown halt triggers, a relief rally is detected — captures a snapshot of what the market looked like at that moment: trend balance, buying and selling pressure, velocity. Over many sessions these accumulate into a profile.
-
-Before each entry pass, current conditions are compared against the profile. Conditions resembling past drawdown events narrow the entry gate. Conditions resembling profitable periods widen it.
-
-A fresh installation has no history and places no weight on structure. After weeks of operation, the profile reflects the market as this system has actually experienced it — a learned intuition shaped by its own trading logic, not a generic market model.
-
----
-
-### Structure Sampling
-
-Structure Sampling runs three parallel observations each cycle, each answering a distinct question about current market conditions.
-
-**Candle direction** draws a random sample of tickers and tallies how many closed their last completed hourly candle red versus green. The result can be charted as a two-sided bar for quick comprehension. This is a snapshot, not a forecast — it tells you what a portion of the market did in the last hour, not what it will do next. Paired with the Fade Away exit, it forms a closed loop: when the bar skews heavily in one direction, positions exposed to that direction are at risk, and Fade Away uses that observation to act automatically.
-
-**Candle magnitude** goes further than red or green, sampling the actual percentage moves of those same candles. A market where everything moved ±0.2% is a different environment from one where tickers moved ±3–5%. This layer distinguishes low-conviction drift from high-conviction expansion — conditions where breakout and momentum entries carry more statistical weight. Entry criteria that reference abnormal volume relative to rolling averages draw on this magnitude reading to assess whether a spike is unusual relative to the current environment, not just large in absolute terms.
-
-**Liquidation flow** is a real-time layer running continuously alongside the candle samples. A rotating batch of volatile tickers is monitored for live liquidation activity, measuring which side — buyers or sellers — is being forced out and at what intensity. This is not a historical observation; it reflects what is happening in the market right now. Heavily one-sided liquidation pressure is an entry signal in its own right, and criteria that require it to qualify will only activate when the flow is sufficiently pronounced on the correct side.
+A fresh installation has no history and exerts no climate influence. After weeks of operation the profile reflects the market as this system has actually experienced it, shaped by its own trading logic rather than a generic model.
 
 ---
 

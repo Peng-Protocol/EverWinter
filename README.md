@@ -53,8 +53,6 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Min Notional** (`minNotional`) | Base margin per position in USDT. Actual order size = minNotional × leverage. |
 | **TP %** (`tpPct`) | Take-profit target. When EDa is active this is the buffered target — the debt-free close happens at a lower percentage. |
 | **SL %** (`slPct`) | Stop-loss. Position closes immediately when mark price hits this level. |
-| **RSI Filter** (`rsiEnabled`) | When on, a ticker must pass an RSI gate before entry. Blocks entries when momentum is already exhausted. |
-| **RSI Threshold** (`rsiThreshold`) | RSI value required to qualify. PseudoWinter requires RSI above threshold (room to fall); PseudoChaser requires below (room to rise). |
 | **Drawdown Throttle** (`drawdownThrottleEnabled`) | Halts new entries for 12 hours when rolling 6h realized PnL drops below a loss threshold. |
 | **Drawdown Factor** (`drawdownThrottleFactor`) | Loss threshold as a multiple of entry margin. At 0.5× with $1 margin, $0.50 of rolling losses triggers the halt. |
 | **Gains Lock** (`gainsLockEnabled`) | Halts new entries for 12 hours once rolling 6h profit hits a target. Banks a winning streak before it reverses. |
@@ -64,7 +62,6 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Ticker Cooldown** (`bulkTickerCooldownHours`) | How long the bot reuses a cached bulk ticker fetch before hitting the API again. Higher = fewer API calls per day. |
 | **Whiplash Audit** (`whiplashEnabled`) | When on, the position watcher fetches 1-minute klines near TP to confirm whether price spiked through TP between watcher cycles. |
 | **Whiplash Proximity** (`whiplashProximityPct`) | How close (%) to TP price triggers the kline audit. |
-| **Funding Drop Close** (`fundingDropEnabled`) | Closes a position when its funding rate flips adverse beyond a set amount. Cuts carry cost before it erodes PnL. |
 | **Runtime Limit** (`runtimeHours`) | Maximum position age. Forces a close at the deadline if TP hasn't been hit. |
 | **TP Reduce** (`tpReduceMins`) | Minutes before the runtime deadline when TP is tightened to improve close probability. |
 | **Symbol Banlist** (`banlistEnabled`) | When on, symbols on the ban list are excluded from all scans. Entries expire after 7 days. |
@@ -173,6 +170,9 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Sacrifice** (`miwSacrificeEnabled`/`micSacrificeEnabled`) | Closes MIW/MIC positions when their collective unrealized loss hits a threshold. Caps group drawdown. |
 | **Sacrifice %** (`miwSacrificePct`/`micSacrificePct`) | Collective uLoss trigger as a % of base margin (minNotional ÷ leverage). |
 | **Rolling Sacrifice** (`miwRollingSacrificeEnabled`/`micRollingSacrificeEnabled`) | When on, Sacrifice closes only the oldest MIW/MIC position at a time instead of all at once. |
+| **Preemptive Lock** (`miwPlkEnabled`/`micPlkEnabled`) | When on, a participation signal derived from volume and OI data can gate all new entries before any PnL damage occurs. While active, an amber **PLK** pill appears in the bot's topbar. MIW locks when participation is **below** threshold (no bearish pressure — Winter holds off); MIC locks when participation is **at or above** threshold (bearish pressure present — Chaser holds off). |
+| **PLK Vol Threshold** (`miwPlkVolThreshold`/`micPlkVolThreshold`) | The above-average volume share (%) at which volume starts contributing to participation. Default 60 — volume below this threshold contributes nothing. |
+| **PLK OI Cap** (`miwPlkOiCap`/`micPlkOiCap`) | Maximum OI/market cap ratio (%) counted toward participation. OI above this cap is treated as equal to the cap. Default 10. |
 | **Fade Away** (`miwFadeEnabled`/`micFadeEnabled`) | Master toggle. Runs every scan after klines are fetched, ensuring signals use the freshest available data before any entries open. If any MIW/MIC position is in loss ≥ Loss Trigger, also fires between scans. Evaluates enabled signals as a combined adverse score — when combined score ≥ Combined Threshold, triggers whichever outcomes are enabled below (close oldest and/or block entries). |
 | **Loss Trigger** (`miwFadeAwayLossPct`/`micFadeAwayLossPct`) | Loss threshold as a % of base margin (minNotional ÷ leverage). When any position crosses this, the combined fade check fires immediately outside the scan cycle. Default 25%. |
 | **Structure Signal** (`miwFadeStructureEnabled`/`micFadeStructureEnabled`) | Includes 1h kline momentum in the combined score. Adverse contribution = % of sampled candles moving against the position direction. |
@@ -219,8 +219,6 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Enabled** | Master toggle. When off, the bot uses the stock 12h halt timers. |
 | **Thaw/Settle Score** | Climate score the market must reach for an early halt lift. Higher = harder to thaw; bot stays halted longer in ambiguous conditions. |
 | **Hard Cap** (`permafrostCapHours`/`ashfallCapHours`) | Maximum halt duration in hours (12–48h). The bot always resumes by this deadline regardless of climate. |
-| **PLK** (Preemptive Lock) | When on, the plugin can engage a lock before any PnL damage if climate is sufficiently hostile during a routine scan. While active, an amber **PLK** pill appears in the bot's topbar. |
-| **PLK Trigger Score** (`permafrostPlkScore`/`ashfallPlkScore`) | How hostile the climate must be (−0.05 to −0.50) to engage a preemptive lock. More negative = harder to trigger. |
 | **IO Sentiment** | Includes funding rate sentiment (which side is paying) in the climate score. |
 | **Slot Scorecard** (`permafrostScorecardEnabled`/`ashfallScorecardEnabled`) | Records realized PnL per MIW/MIC criteria combination. Shows which slot types have been profitable or losing over time. |
 | **Sponge Quota** (`pfSpongeQuota`/`afSpongeQuota`) | How many recent closes per slot are used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation to recent performance; higher = more stable scores that smooth out short streaks. Default 30. |
@@ -268,7 +266,7 @@ Three directional bar charts below the climate reading show relative dominance a
 | **Volume Sample** | Below-average vs. above-average volume share of the current kline sample, weighted by deviation magnitude. Gray extends left (below average) and thematic color extends right (above average). Only appears when the Volume fade signal is enabled. |
 | **OI Normalcy** | Aggregate OI as a % of market cap across tickers with market cap data fresher than 1 hour, plotted on a 0–100% scale. A notch marks the configured midpoint. Bar is thematic color when the ratio sits outside the tolerance window, gray when within. Only appears when the OI Normalcy fade signal is enabled. |
 
-> **Observational note:** The structure wave and sampling bars (kline direction, funding skew, volume skew, OI normalcy) reflect broad market conditions but do not reliably predict per-bot outcome. A declining market can coincide with Chaser winning and Winter losing, or vice versa — entry criteria are selective enough that position outcomes regularly diverge from aggregate market direction. Treat these displays as ambient market context, not predictive signals. Fade Away's usefulness comes from its scorecard gating (signals only contribute when historical scorecard data confirms they've been meaningful for this bot) — not from the raw market readings alone.
+> **Observational note:** The sampling bars (kline direction, funding skew, volume skew, OI normalcy) are primarily **visual feedback**. They reflect broad market conditions but do not directly gate entries or trigger closes on their own — the only mechanisms that act on them are Fade Away (which requires scorecard gating before most signals contribute) and Preemptive Lock (which uses volume and OI readings to compute a participation value). Do not read the bars as predictive signals; a heavily red kline bar can coincide with Chaser winning and Winter losing, or vice versa. Treat them as ambient context while the scorecard provides the actual decision weight.
 
 ### Slot Scorecard
 
