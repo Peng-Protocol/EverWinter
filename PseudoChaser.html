@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.4.1 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.4.2 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -590,7 +590,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.4.1 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.4.2 · Long Only · No Real Orders</div>
     </div>
     <div class="pills">
       <!-- SIM state pill — always visible -->
@@ -997,8 +997,6 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <div class="ps"><div class="psl">Lev</div>   <div class="psv"      x-text="p.leverage+'×'"></div></div>
               <div class="ps"><div class="psl">Margin</div><div class="psv"      x-text="'$'+p.margin.toFixed(2)"></div></div>
               <div class="ps"><div class="psl">24h Chg</div><div class="psv" class="short" x-text="(()=>{const v=parseFloat(p.change24h);if(!Number.isFinite(v))return'—';const r=+v.toFixed(4);return (r>=0?'+':'')+r+'%';})()"></div></div>
-              <!-- RSI6/12/24 hidden — gating replaced with 24h change -->
-              <div class="ps" style="display:none"><div class="psl">RSI6/12/24</div><div class="psv" x-text="(p.rsi6?p.rsi6.toFixed(0):'—')+'/'+(p.rsi12?p.rsi12.toFixed(0):'—')+'/'+(p.rsi24?p.rsi24.toFixed(0):'—')"></div></div>
 
               <div class="ps" style="min-width:0;overflow:hidden">
                 <div class="psl">Current TP</div>
@@ -1499,18 +1497,6 @@ function showError(msg) {
 }
 
 
-function calcRSI(closes, period=14) {
-  if (closes.length < period+1) return null;
-  const ch = closes.slice(1).map((v,i)=>v-closes[i]);
-  let ag = ch.slice(0,period).filter(c=>c>0).reduce((a,b)=>a+b,0)/period;
-  let al = ch.slice(0,period).filter(c=>c<0).reduce((a,b)=>a+Math.abs(b),0)/period;
-  for (let i=period;i<ch.length;i++) {
-    ag=(ag*(period-1)+(ch[i]>0?ch[i]:0))/period;
-    al=(al*(period-1)+(ch[i]<0?Math.abs(ch[i]):0))/period;
-  }
-  return al===0?100:100-(100/(1+ag/al));
-}
-
 function fmtP(p) {
   if (p==null||isNaN(p)) return '—';
   p=parseFloat(p);
@@ -1636,7 +1622,7 @@ function pw() { return {
   creds: { key:'', secret:'' },
   cfg: {
     leverage:6, minNotional:6, addNotional:6,
-    rsi6Min:30, rsi12Min:30, rsi24Min:30, rsi6Max:10, maxPos:5, scanMins:10, topN:25, // unused — kept for compat
+    maxPos:5, scanMins:10, topN:25,
     bulkTickerCooldownEnabled: true, bulkTickerCooldownHours: 3,
     restPollEnabled: true, restPollBaseSec: 5,
     entryTpRoi: 18,    // TP ROI % — the single TP target (bufferedEV basis), parallel with the SL %
@@ -1703,7 +1689,7 @@ function pw() { return {
   _manualHalt: false,    // user-initiated halt — blocks scans identically to a drawdown halt
   _gainsWindow: [],      // { pnl, ts }[] — rolling 6h closed-trade PnL log for gains lock
   _gainsLockHaltUntil: 0, // epoch ms — new entries locked until this timestamp
-  _symData:       {}, // symbol → { rsi6, rsi12, rsi24, fundingRate, lastPrice, ts } — single source of truth for per-symbol live data; written by any fetch path, read by all watchlists/display
+  _symData:       {}, // symbol → { fundingRate, lastPrice, ts } — per-symbol live data; written by any fetch path, read by all watchlists/display
   cfgOpen: { general: false, laggard: false }, // accordion open state
   tSc: false, tH: false, tSz: false,
   _pluginMgrOpen: false,
@@ -1916,63 +1902,6 @@ function pw() { return {
     // LONG: positive funding rate = longs pay shorts (negative fee for us)
     const fundingFee       = -(fundingRate / 100) * notional * fundingIntervals;
     return { fundingFee, fundingRate, fundingIntervals };
-  },
-
-  // Fetch 15m closes for symbol, cached per completed 15m bar, then compute RSI(period).
-  // The closes array intentionally includes the forming bar's live close (last entry).
-  // Returns null if data is insufficient or the fetch fails.
-  async fetchRSI(symbol, period = 14) {
-    const INTERVAL  = '15';   // 15-minute klines for all RSI periods
-    const cacheKey  = `${symbol}_${INTERVAL}`;
-    const cached    = this._klineCache[cacheKey];
-    const BAR_15MS  = 15 * 60 * 1000;
-    const expectedLastTs = Math.floor(Date.now() / BAR_15MS) * BAR_15MS - BAR_15MS;
-    if (cached && cached.lastCompletedTs != null && cached.lastCompletedTs >= expectedLastTs) {
-      return calcRSI(cached.closes, period);
-    }
-    const KLINE_DEPTH = Math.max(period, 24) + 6; // RSI-24 needs 25+ closes; +6 for warm-up
-    // Incremental top-up: when the cache is only a few bars behind, fetch just the missing
-    // candles (a few hundred bytes) instead of re-pulling the whole window.
-    const gapBars = (cached && cached.lastCompletedTs != null && cached.timestamps?.length >= 2)
-      ? Math.round((expectedLastTs - cached.lastCompletedTs) / BAR_15MS) : Infinity;
-    const limit = (gapBars >= 1 && gapBars + 1 < KLINE_DEPTH) ? gapBars + 1 : KLINE_DEPTH;
-    try {
-      const url = `${this.base}/v5/market/kline?category=linear&symbol=${symbol}&interval=${INTERVAL}&limit=${limit}`;
-      const res = await fetch(url);
-      const js  = await res.json();
-      if (js.retCode !== 0) throw new Error(js.retMsg);
-      // Bybit kline list: newest-first; reverse to chronological — last entry = forming bar
-      const candles = (js.result?.list || []).slice().reverse();
-      let entry;
-      if (limit < KLINE_DEPTH && candles.length) {
-        // Drop the cached forming-bar snapshot — the fetched rows carry its final values —
-        // then append everything newer, preserving the [...completed, forming] array shape.
-        entry = cached;
-        if (entry.timestamps.length && entry.timestamps[entry.timestamps.length - 1] > entry.lastCompletedTs) {
-          entry.closes.pop(); entry.timestamps.pop();
-        }
-        for (const c of candles) {
-          const cts = parseInt(c[0]);
-          if (entry.timestamps.length && cts <= entry.timestamps[entry.timestamps.length - 1]) continue;
-          entry.closes.push(parseFloat(c[4]));
-          entry.timestamps.push(cts);
-        }
-        const excess = entry.closes.length - KLINE_DEPTH;
-        if (excess > 0) for (const k of ['closes', 'timestamps']) entry[k].splice(0, excess);
-        entry.lastCompletedTs = entry.timestamps.length >= 2 ? entry.timestamps[entry.timestamps.length - 2] : null;
-        entry.ts = Date.now();
-      } else {
-        const closes          = candles.map(c => parseFloat(c[4]));
-        const timestamps      = candles.map(c => parseInt(c[0]));
-        const lastCompletedTs = timestamps.length >= 2 ? timestamps[timestamps.length - 2] : null;
-        entry = { closes, timestamps, lastCompletedTs, ts: Date.now() };
-      }
-      this._klineCache[cacheKey] = entry;
-      return calcRSI(entry.closes, period);
-    } catch (e) {
-      this.log(`[RSI-01] ${symbol}: kline fetch failed — ${e.message}`, 'warn');
-      return null;
-    }
   },
 
   // Fetch 1-minute klines between fromMs and toMs (used by whiplash audit).
@@ -2783,7 +2712,7 @@ function pw() { return {
 
 
   async pseudoOpenLong(candidate) {
-    const { symbol, price: _candidatePrice, change=0, rsi6=null, rsi12=null, rsi24=null, fundingRate=null } = candidate;
+    const { symbol, price: _candidatePrice, change=0, fundingRate=null } = candidate;
     let price = _candidatePrice;
     // Hard cap at the open itself — every sim entry path flows through here, so no
     // caller (scan, strategy plugin, manual) can overshoot maxPos.
@@ -2882,9 +2811,6 @@ function pw() { return {
       slPrice,
       slSet,
       change24h:           +(Number(change) || 0).toFixed(4),
-      rsi6,
-      rsi12,
-      rsi24,
       fundingRate,
       _stageCount:         stages,
       _firstWindStageCount: stages,
