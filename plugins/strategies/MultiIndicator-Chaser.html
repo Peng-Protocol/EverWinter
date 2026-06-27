@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.31.4';
+  const VERSION       = '1.31.5';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
 
@@ -421,9 +421,22 @@
                   <div class="tog-t" :class="cfg.micPlkEnabled?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Preemptive Lock</div>
-                    <div class="mic-hint">Blocks new MIC entries when the structure wave score is below the median (bearish territory). Displays PLK pill in topbar. Lifts automatically when score returns above 0.</div>
+                    <div class="mic-hint">Locks Chaser entries when bearish participation reaches threshold (≥50 pts). Lifts when vol + OI signal drops below threshold.</div>
                   </div>
                 </label>
+                <div x-show="cfg.micPlkEnabled" style="margin-top:8px">
+                  <div class="g">
+                    <div class="lbl">Vol Threshold <b x-text="(cfg.micPlkVolThreshold??60)+'%'"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="_micVolSkew ? '(now '+_micVolSkew.abovePct.toFixed(1)+'% above avg)' : '(no data)'"></span></div>
+                    <input type="range" min="10" max="100" step="5" x-model.number="cfg.micPlkVolThreshold" @change="persist()">
+                    <div class="mic-hint">Vol contribution starts above this threshold. Each % above = 2.5 pts.</div>
+                  </div>
+                  <div class="g" style="margin-top:6px">
+                    <div class="lbl">OI Cap <b x-text="(cfg.micPlkOiCap??10)+'%'"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="_micOiSkew ? '(now '+_micOiSkew.ratio.toFixed(2)+'% OI/MC)' : '(no data)'"></span></div>
+                    <input type="range" min="0.5" max="20" step="0.5" x-model.number="cfg.micPlkOiCap" @change="persist()">
+                    <div class="mic-hint">OI/MC % is capped here before scoring. Each % = 6.25 pts.</div>
+                  </div>
+                  <div class="mic-hint" style="margin-top:5px" x-text="(()=>{ if(!_micVolSkew||!_micOiSkew) return 'Participation: awaiting data'; const v=Math.max(0,_micVolSkew.abovePct-(cfg.micPlkVolThreshold??60))*2.5; const o=Math.min(_micOiSkew.ratio,(cfg.micPlkOiCap??10))*6.25; return 'Participation: '+(v+o).toFixed(1)+' pts (vol '+v.toFixed(1)+' + OI '+o.toFixed(1)+')'; })()"></div>
+                </div>
                 <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06)">
                   <label class="tog" @click.prevent="if(!cfgLocked){cfg.micHistScoringEnabled=!cfg.micHistScoringEnabled;persist()}">
                     <div class="tog-t" :class="cfg.micHistScoringEnabled?'on':''"><div class="tog-k"></div></div>
@@ -605,6 +618,8 @@
           if (this.cfg.micHalvingEnabled   === undefined) this.cfg.micHalvingEnabled   = false;
           if (this.cfg.micHalvingHours     === undefined) this.cfg.micHalvingHours     = 3;
           if (this.cfg.micPlkEnabled           === undefined) this.cfg.micPlkEnabled           = false;
+          if (this.cfg.micPlkVolThreshold      === undefined) this.cfg.micPlkVolThreshold      = 60;
+          if (this.cfg.micPlkOiCap             === undefined) this.cfg.micPlkOiCap             = 10;
           if (this.cfg.micLiqResultMaxCycles   === undefined) this.cfg.micLiqResultMaxCycles   = 2;
           if (this.cfg.micRequireLiqData       === undefined) this.cfg.micRequireLiqData       = true;
           if (this.cfg.micRequireMcapData      === undefined) this.cfg.micRequireMcapData      = true;
@@ -854,19 +869,24 @@
         },
 
         _micCheckPlk() {
-          if (!this.cfg.micPlkEnabled || this._micWaveScore === null) {
+          if (!this.cfg.micPlkEnabled) {
             if (this._micPlkActive) { this._micPlkActive = false; this._micPlkLogged = false; this.log('[MIC] PLK lifted', 'info'); }
             return;
           }
-          const shouldLock = this._micWaveScore < 0;
+          if (!this._micVolSkew || !this._micOiSkew) return; // no data yet — hold current state
+          const volPts  = Math.max(0, this._micVolSkew.abovePct - (this.cfg.micPlkVolThreshold ?? 60)) * 2.5;
+          const oiPts   = Math.min(this._micOiSkew.ratio, this.cfg.micPlkOiCap ?? 10) * 6.25;
+          const participation = volPts + oiPts;
+          // Chaser: high participation = bearish regime = LOCK (block new long entries)
+          const shouldLock = participation >= 50;
           if (shouldLock && !this._micPlkActive) {
             this._micPlkActive = true;
             this._micPlkLogged = true;
-            this.log(`[MIC] PLK — score ${this._micWaveScore.toFixed(1)} below median — entries locked`, 'info');
+            this.log(`[MIC] PLK — participation ${participation.toFixed(1)} at/above threshold — entries locked`, 'info');
           } else if (!shouldLock && this._micPlkActive) {
             this._micPlkActive = false;
             this._micPlkLogged = false;
-            this.log(`[MIC] PLK lifted — score ${this._micWaveScore.toFixed(1)} above median`, 'info');
+            this.log(`[MIC] PLK lifted — participation ${participation.toFixed(1)} (vol ${this._micVolSkew.abovePct.toFixed(1)}% above / OI ${this._micOiSkew.ratio.toFixed(2)}%)`, 'info');
           }
         },
 
@@ -878,7 +898,7 @@
               label: 'PLK',
               labelStyle: 'color:rgba(255,150,80,.9)',
               border: 'border-color:rgba(255,150,80,.45);background:rgba(255,150,80,.10)',
-              title: 'Preemptive Lock active — entries blocked (score bearish)',
+              title: 'Preemptive Lock active — entries blocked (bearish participation above threshold)',
               action: null,
             }];
           }

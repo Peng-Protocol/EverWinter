@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.31.4';
+  const VERSION       = '1.31.5';
   const DEFAULT_SLOTS = [['fund>1','+24h','vm>10'],['fund<-1','-24h','vm<10']];
   const MIW_HIST_KEY  = '__miw_hist_batches';
 
@@ -421,9 +421,22 @@
                   <div class="tog-t" :class="cfg.miwPlkEnabled?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Preemptive Lock</div>
-                    <div class="miw-hint">Blocks new MIW entries when the structure wave score is above the median (bullish territory). Displays PLK pill in topbar. Lifts automatically when score returns below 0.</div>
+                    <div class="miw-hint">Locks Winter entries when bearish participation is low. Lifts when vol + OI signal reaches threshold (≥50 pts).</div>
                   </div>
                 </label>
+                <div x-show="cfg.miwPlkEnabled" style="margin-top:8px">
+                  <div class="g">
+                    <div class="lbl">Vol Threshold <b x-text="(cfg.miwPlkVolThreshold??60)+'%'"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="_miwVolSkew ? '(now '+_miwVolSkew.abovePct.toFixed(1)+'% above avg)' : '(no data)'"></span></div>
+                    <input type="range" min="10" max="100" step="5" x-model.number="cfg.miwPlkVolThreshold" @change="persist()">
+                    <div class="miw-hint">Vol contribution starts above this threshold. Each % above = 2.5 pts.</div>
+                  </div>
+                  <div class="g" style="margin-top:6px">
+                    <div class="lbl">OI Cap <b x-text="(cfg.miwPlkOiCap??10)+'%'"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="_miwOiSkew ? '(now '+_miwOiSkew.ratio.toFixed(2)+'% OI/MC)' : '(no data)'"></span></div>
+                    <input type="range" min="0.5" max="20" step="0.5" x-model.number="cfg.miwPlkOiCap" @change="persist()">
+                    <div class="miw-hint">OI/MC % is capped here before scoring. Each % = 6.25 pts.</div>
+                  </div>
+                  <div class="miw-hint" style="margin-top:5px" x-text="(()=>{ if(!_miwVolSkew||!_miwOiSkew) return 'Participation: awaiting data'; const v=Math.max(0,_miwVolSkew.abovePct-(cfg.miwPlkVolThreshold??60))*2.5; const o=Math.min(_miwOiSkew.ratio,(cfg.miwPlkOiCap??10))*6.25; return 'Participation: '+(v+o).toFixed(1)+' pts (vol '+v.toFixed(1)+' + OI '+o.toFixed(1)+')'; })()"></div>
+                </div>
                 <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06)">
                   <label class="tog" @click.prevent="if(!cfgLocked){cfg.miwHistScoringEnabled=!cfg.miwHistScoringEnabled;persist()}">
                     <div class="tog-t" :class="cfg.miwHistScoringEnabled?'on':''"><div class="tog-k"></div></div>
@@ -605,6 +618,8 @@
           if (this.cfg.miwHalvingEnabled   === undefined) this.cfg.miwHalvingEnabled   = false;
           if (this.cfg.miwHalvingHours     === undefined) this.cfg.miwHalvingHours     = 3;
           if (this.cfg.miwPlkEnabled           === undefined) this.cfg.miwPlkEnabled           = false;
+          if (this.cfg.miwPlkVolThreshold      === undefined) this.cfg.miwPlkVolThreshold      = 60;
+          if (this.cfg.miwPlkOiCap             === undefined) this.cfg.miwPlkOiCap             = 10;
           if (this.cfg.miwLiqResultMaxCycles   === undefined) this.cfg.miwLiqResultMaxCycles   = 2;
           if (this.cfg.miwRequireLiqData       === undefined) this.cfg.miwRequireLiqData       = true;
           if (this.cfg.miwRequireMcapData      === undefined) this.cfg.miwRequireMcapData      = true;
@@ -854,19 +869,24 @@
         },
 
         _miwCheckPlk() {
-          if (!this.cfg.miwPlkEnabled || this._miwWaveScore === null) {
+          if (!this.cfg.miwPlkEnabled) {
             if (this._miwPlkActive) { this._miwPlkActive = false; this._miwPlkLogged = false; this.log('[MIW] PLK lifted', 'info'); }
             return;
           }
-          const shouldLock = this._miwWaveScore > 0;
+          if (!this._miwVolSkew || !this._miwOiSkew) return; // no data yet — hold current state
+          const volPts  = Math.max(0, this._miwVolSkew.abovePct - (this.cfg.miwPlkVolThreshold ?? 60)) * 2.5;
+          const oiPts   = Math.min(this._miwOiSkew.ratio, this.cfg.miwPlkOiCap ?? 10) * 6.25;
+          const participation = volPts + oiPts;
+          // Winter: high participation = bearish regime = UNLOCK (lift lock); low = lock
+          const shouldLock = participation < 50;
           if (shouldLock && !this._miwPlkActive) {
             this._miwPlkActive = true;
             this._miwPlkLogged = true;
-            this.log(`[MIW] PLK — score ${this._miwWaveScore.toFixed(1)} above median — entries locked`, 'info');
+            this.log(`[MIW] PLK — participation ${participation.toFixed(1)} below threshold — entries locked`, 'info');
           } else if (!shouldLock && this._miwPlkActive) {
             this._miwPlkActive = false;
             this._miwPlkLogged = false;
-            this.log(`[MIW] PLK lifted — score ${this._miwWaveScore.toFixed(1)} below median`, 'info');
+            this.log(`[MIW] PLK lifted — participation ${participation.toFixed(1)} (vol ${this._miwVolSkew.abovePct.toFixed(1)}% above / OI ${this._miwOiSkew.ratio.toFixed(2)}%)`, 'info');
           }
         },
 
@@ -878,7 +898,7 @@
               label: 'PLK',
               labelStyle: 'color:rgba(255,150,80,.9)',
               border: 'border-color:rgba(255,150,80,.45);background:rgba(255,150,80,.10)',
-              title: 'Preemptive Lock active — entries blocked (score bullish)',
+              title: 'Preemptive Lock active — entries blocked (bearish participation below threshold)',
               action: null,
             }];
           }
