@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.30.2';
+  const VERSION       = '1.31.0';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
 
@@ -841,81 +841,14 @@
             this._micOiSkew = null;
           }
 
-          // Wave score: weighted average of enabled metrics in cfg.afScoreMetrics, range [-100, +100]
-          // Positive = favorable for Chaser; changes to metric config are forward-looking only
-          const _wMet = this.cfg.afScoreMetrics ?? { funding: 1, liq: 1, vol: 1 };
-          let _wNum = 0, _wDen = 0;
-          // Structure — bearish = good for Chaser; no scorecard gate
-          if (_wMet.structure != null) {
-            const _wHr = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
-            let _wBear = 0, _wBull = 0;
-            for (const e of Object.values(this._micKlineCache || {})) {
-              if (e.candleStart !== _wHr || !e.open) continue;
-              const _p = (e.close - e.open) / e.open * 100;
-              if (_p < 0) _wBear += -_p; else if (_p > 0) _wBull += _p;
-            }
-            const _wT = _wBear + _wBull;
-            if (_wT > 0) { _wNum += (_wBull - _wBear) / _wT * 100 * _wMet.structure; _wDen += _wMet.structure; }
-          }
-          // Funding — scorecard-gated sign
-          if (_wMet.funding != null && this._micFundSkew) {
-            const { domDir, domPct } = this._micFundSkew;
-            const _fb = this._micLiqScorecardBias(domDir);
-            if (_fb === 'bad') { _wNum += -domPct * _wMet.funding; _wDen += _wMet.funding; }
-            else if (_fb === 'good') { _wNum += +domPct * _wMet.funding; _wDen += _wMet.funding; }
-          }
-          // Liq — sliq adverse for Chaser (shorts squeezed = bullish = bad)
-          if (_wMet.liq != null) {
-            const _sl = this._sharedRead('liqResults');
-            const _lc = { ...((_sl?.data) || {}), ...(this._liqResults || {}) };
-            let _ls = 0, _lb = 0;
-            for (const r of Object.values(_lc)) { _ls += r.sLiqRaw || 0; _lb += r.bLiqRaw || 0; }
-            const _lt = _ls + _lb;
-            if (_lt > 0) {
-              const _liqB = this._micLiqScorecardBias('sliq');
-              if (_liqB === 'bad') { _wNum += (_lb - _ls) / _lt * 100 * _wMet.liq; _wDen += _wMet.liq; }
-              else if (_liqB === 'good') { _wNum += (_ls - _lb) / _lt * 100 * _wMet.liq; _wDen += _wMet.liq; }
-            }
-          }
-          // Vol — scorecard-gated sign
-          if (_wMet.vol != null && this._micVolSkew) {
-            const { aboveSum, belowSum } = this._micVolSkew;
-            const _vt = aboveSum + belowSum;
-            const _vd = Math.max(aboveSum, belowSum) / _vt * 100;
-            const _vb = aboveSum >= belowSum ? this._micVolScorecardBias(['lsa','lba']) : this._micVolScorecardBias(['rasl','rabl']);
-            if (_vb === 'bad') { _wNum += -_vd * _wMet.vol; _wDen += _wMet.vol; }
-            else if (_vb === 'good') { _wNum += +_vd * _wMet.vol; _wDen += _wMet.vol; }
-          }
-          // OI — extreme deviation from midpoint = adverse; when fade OI is active, share its config
-          if (_wMet.oi != null && this._micOiSkew) {
-            const _oiMid = this.cfg.afWaveOiMid ?? 2;
-            const _oiTol = this.cfg.afWaveOiTol ?? 1;
-            const _oiDev = Math.abs(this._micOiSkew.ratio - _oiMid) - _oiTol;
-            if (_oiDev > 0) { _wNum += -Math.min(100, _oiDev / _oiTol * 100) * _wMet.oi; _wDen += _wMet.oi; }
-          }
-          // Collapsed scorecard skew — combined ledger: own (positive: longs profitable=bullish)
-          // + partner MIW (negate: shorts profitable=bearish). Both sides express the same market direction.
-          if (_wMet.scorecard != null && this.micCollapsedSlotRanks) {
-            const _ownVals  = Object.values(this.micCollapsedSlotRanks);
-            const _partVals = Object.values(this._afReadPartnerSample()?.slotRanks ?? {}).map(v => -v);
-            const _allVals  = [..._ownVals, ..._partVals];
-            const _scNet = _allVals.reduce((a, b) => a + b, 0);
-            const _scAbs = _allVals.reduce((a, b) => a + Math.abs(b), 0);
-            if (_scAbs > 0) { _wNum += _scNet / _scAbs * 100 * _wMet.scorecard; _wDen += _wMet.scorecard; }
-          }
-          if (_wDen > 0) {
-            this._micWaveScore = _wNum / _wDen;
-          } else {
-            // Scorecard thin/absent — fall back to raw kline momentum (structure signal only)
-            const _fbHr = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
-            let _fbBear = 0, _fbBull = 0;
-            for (const e of Object.values(this._micKlineCache || {})) {
-              if (e.candleStart !== _fbHr || !e.open) continue;
-              const _p = (e.close - e.open) / e.open * 100;
-              if (_p < 0) _fbBear += -_p; else if (_p > 0) _fbBull += _p;
-            }
-            const _fbT = _fbBear + _fbBull;
-            this._micWaveScore = _fbT > 0 ? (_fbBull - _fbBear) / _fbT * 100 : null;
+          // Wave score: scorecard skew only — stable historical signal, range [-100, +100], positive = bullish.
+          // micCollapsedSlotRanks already incorporates both bots' unified trade ledger (AF effectivePnl convention:
+          // chaser pnl positive, winter pnl negated). Use as-is: positive = longs profitable = bullish.
+          {
+            const _scVals = Object.values(this.micCollapsedSlotRanks || {});
+            const _scNet  = _scVals.reduce((a, b) => a + b, 0);
+            const _scAbs  = _scVals.reduce((a, b) => a + Math.abs(b), 0);
+            this._micWaveScore = _scAbs > 0 ? _scNet / _scAbs * 100 : null;
           }
           this._micCheckPlk();
         },
