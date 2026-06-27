@@ -9,9 +9,6 @@
    - [Proactive Techniques](#proactive-techniques)
    - [Reactive Techniques](#reactive-techniques)
 3. [Market Intelligence](#market-intelligence)
-   - [Structure Learning](#structure-learning)
-   - [Slot Scorecard](#slot-scorecard)
-   - [Cross-Side Coordination](#cross-side-coordination)
 4. [Psycho Mode](#psycho-mode)
 5. [Sizing](#sizing)
 6. [Conclusion](#conclusion)
@@ -232,37 +229,13 @@ A perfect AMa run returns roughly **709% on the original entry margin** at 6× l
 
 ## Market Intelligence
 
-Market Intelligence is the approach used by PseudoWinter and PseudoChaser. Rather than trading on a single signal, it learns which entry conditions have historically preceded wins and losses and filters entries against that record. The tools described here vary in maturity — some are well-established, others are under active evaluation.
+The system learns from its own closed positions — and from simulated positions that were never actually opened — which entry conditions have been profitable and which have not. Slot combinations that consistently lose are blocked; combinations that win rise to the top of the entry queue.
 
----
+The important caveat is that in a strongly bullish regime almost every long indicator will show a positive record, and in a strongly bearish regime almost every short indicator will. The scorecard reflects the regime the system has been running in as much as it reflects genuine signal quality. This is expected behaviour, not a flaw — the regime itself is information. The scorecard's value is most apparent at the margins: identifying which specific combinations hold up when conditions are mixed, and pruning the ones that only look good because the tide was with them.
 
-### Structure Learning
+Both sides use the same record. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, so consistently losing combinations get blocked from both directions rather than just one.
 
-Structure Learning accumulates a profile of what market conditions have looked like during past wins, losses, and halts. Over many sessions, this profile replaces the fixed 12-hour halt timer with a climate-aware gate: conditions resembling past drawdown periods narrow the entry window; conditions resembling profitable periods widen it.
-
-A fresh installation has no history and exerts no climate influence. After weeks of operation the profile reflects the market as this system has actually experienced it, shaped by its own trading logic rather than a generic model.
-
----
-
-### Slot Scorecard
-
-The scorecard tracks realized PnL per entry combination. Every time a position opened through the slot-based strategy closes, the outcome is tied to the specific combination of criteria that triggered the entry.
-
-Combinations are displayed sorted by total PnL. When both sides run simultaneously, the scores account for direction: a win on the short side is a loss for the long side, so each side inverts the other's records in its own view.
-
-The scorecard can be switched from per-slot view to a collapsed view that shows one row per individual criterion rather than one row per combination. In this mode, win and loss counts appear much larger than expected — this is correct behaviour, not a data error. Because a criterion like "funding rate positive" may appear across many different slot combinations, every trade from every combination containing it contributes to the count. A criterion shared by several slots accumulates several times the records of a single-slot one.
-
-**Auto-correction**: when enabled, each slot combination carries a running score. Own wins add to it; own losses subtract; partner wins subtract further; partner losses add back. When a combination's score falls below the configured threshold, entries stop opening through it. When conditions shift and the partner starts losing on the same combination, the score recovers and the block lifts. Combinations that sink deep stay blocked; combinations near the threshold fluctuate with the market.
-
-When a position is opened via a liquidation signal, the intensity of that signal is recorded alongside the trade outcome. The scorecard bias check accounts for this intensity tag, so outcomes from heavy signals and light signals are tracked separately — the bias verdict is drawn from trades opened under comparable conditions, not from a flat average.
-
-**Composite scoring and co-qualifying penalty**: A ticker may satisfy more than one slot simultaneously. In collapsed mode with sorting enabled, the entry pool is ranked not just by the best slot score a ticker qualifies for, but by a composite score that accounts for every slot it qualifies for. Qualifying for additional slots that have historically lost subtracts from the composite — the ticker is penalised for being associated with losing conditions even if its primary qualifying slot is strong. Only losing co-qualifiers penalise; winning ones do not boost. The result is that genuinely clean signals — tickers that match only historically profitable criteria — rise above tickers that happen to match many slots at once, some of which carry a losing track record. This filters out coincidental entries that look valid by one criterion but are entangled with conditions that have consistently underperformed.
-
----
-
-### Cross-Side Coordination
-
-Both sides trade independently, but their drawdown throttles can interact. When one side enters drawdown and halts new entries, the other side continues running. If that other side subsequently hits its own drawdown threshold, it signals that the market is now moving against both directions simultaneously — a shift in character rather than a persistent directional move. At that point the original throttle can lift: the condition that justified the halt no longer holds.
+When one side enters drawdown and halts, the other continues. If the other side subsequently halts too, both directions have failed simultaneously — evidence of a regime shift rather than a directional mistake. The older halt lifts at that point; the condition that justified it no longer holds.
 
 ---
 
