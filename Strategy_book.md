@@ -96,12 +96,6 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 
 ---
 
-#### Preemptive Lock *(tentative)*
-
-When broad market volume is running above average and aggregate open interest is elevated relative to market cap, conditions tend to turn bearish. The short side waits for this signal before entering; the long side locks out when it appears. The goal — not yet fully achieved — is reliable regime identification: knowing whether the market is bullish, bearish, or transitional before price confirms it.
-
----
-
 ### Reactive Techniques
 
 Reactive techniques manage positions after entry. They fire in response to position behavior or evolving market conditions, not to conditions at the time of entry.
@@ -221,11 +215,11 @@ A perfect AMa run returns roughly **709% on the original entry margin** at 6× l
 
 ## Market Intelligence
 
-The system learns from its own closed positions — and from simulated positions that were never actually opened — which entry conditions have been profitable and which have not. Slot combinations that consistently lose are blocked; combinations that win rise to the top of the entry queue.
+The system learns from its own closed positions — and from simulated positions that were never actually opened — which entry conditions have been profitable and which have not. Combinations that win rise to the top of the entry queue; consistently losing combinations are deprioritized.
 
 The important caveat is that in a strongly bullish regime almost every long indicator will show a positive record, and in a strongly bearish regime almost every short indicator will. The scorecard reflects the regime the system has been running in as much as it reflects genuine signal quality. This is expected behaviour, not a flaw — the regime itself is information. The scorecard's value is most apparent at the margins: identifying which specific combinations hold up when conditions are mixed, and pruning the ones that only look good because the tide was with them.
 
-Both sides use the same record. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, so consistently losing combinations get blocked from both directions rather than just one.
+Both sides use the same record. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, so consistently losing combinations are deprioritized from both directions rather than just one.
 
 When one side enters drawdown and halts, the other continues. If the other side subsequently halts too, both directions have failed simultaneously — evidence of a regime shift rather than a directional mistake. The older halt lifts at that point; the condition that justified it no longer holds.
 
