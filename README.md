@@ -223,9 +223,11 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 
 ### WAVE Tab
 
-The WAVE tab holds display and analysis config controls: which sampling bars to show (Structure / Funding / Liq / Vol / OI toggles), the OI/MC midpoint and tolerance sliders, Slope Window, Collective IO toggle, and Liquidation Surveillance setup and config. The Danger Zone (Export / Import / Clear Profile / Clear Plugin State) is also accessed from this tab.
+The WAVE tab holds display and analysis config controls: which sampling bars and charts to show (Structure / Funding / Liq / Vol / OI toggles), Slope Window, Collective IO toggle, and Liquidation Surveillance setup and config. The Danger Zone (Export / Import / Clear Profile / Clear Plugin State) is also accessed from this tab.
 
-The **wave chart**, **sampling bar displays** (kline direction, funding skew, liq flow, volume, OI normalcy), **scorecard chip row**, and **liquidation results chart** all appear directly in the accordion body — no tab needs to be clicked to see them.
+The **wave chart**, **sampling bar displays** (kline direction, funding skew, liq flow, volume), **OI/MC history chart**, **scorecard chip row**, and **liquidation results chart** all appear directly in the accordion body — no tab needs to be clicked to see them.
+
+The wave chart has three overlay toggles: **Structure** (the market lean path), **IO** (funding sentiment line), and **Score** (a gray line derived from the slot scorecard). When Score is on, a percentage readout appears below the chart showing the net scorecard balance as a share of total recorded weight — green when positive, red when negative.
 
 **Score line during halt**: when the bot is in a drawdown halt or gains lock and its own wave score is unavailable, the score line falls back to the partner bot's most recently published wave score. This means the line stays live even when this bot is not running scans. When the scorecard is thin, the wave score falls back to raw kline momentum from the last completed hour candles across the sampled ticker set.
 
@@ -240,10 +242,10 @@ Three directional bar charts below the climate reading show relative dominance a
 | **1h Kline** | Bear vs. bull aggregate from the last completed 1h candle sample. |
 | **Funding Rate** | Neg vs. pos funding skew across the kline + liq ticker union. |
 | **Liquidation Flow** | B-Liq vs. S-Liq share of the last completed liq cycle. Only appears when Liquidation Surveillance is on and at least one cycle has closed. |
-| **Volume Sample** | Below-average vs. above-average volume share of the current kline sample, weighted by deviation magnitude. Gray extends left (below average) and thematic color extends right (above average). Only appears when the Volume fade signal is enabled. |
-| **OI Normalcy** | Aggregate OI as a % of market cap across tickers with market cap data fresher than 1 hour, plotted on a 0–100% scale. A notch marks the configured midpoint. Bar is thematic color when the ratio sits outside the tolerance window, gray when within. Only appears when the OI Normalcy fade signal is enabled. |
+| **Volume Sample** | Below-average vs. above-average volume share of the current kline sample, weighted by deviation magnitude. Gray extends left (below average) and thematic color extends right (above average). Only appears when the Volume fade signal is enabled. Below this bar, a **Volume History** line chart shows total market volume (USD billions) sampled at each bulk ticker fetch. Use the ← → buttons to scroll through history in weekly windows. |
+| **OI/MC History** | A line chart showing aggregate OI as a % of market cap over time, sampled from the bulk ticker feed every ~3h. Current ratio shown next to the label. Only appears when the OI fade signal is enabled. |
 
-> **Observational note:** The sampling bars (kline direction, funding skew, volume skew, OI normalcy) are primarily **visual feedback**. They reflect broad market conditions but do not directly gate entries or trigger closes on their own — the only mechanism that acts on them is the combined entry/close signal system (which requires scorecard gating before most signals contribute). Do not read the bars as predictive signals; a heavily red kline bar can coincide with Chaser winning and Winter losing, or vice versa. Treat them as ambient context while the scorecard provides the actual decision weight.
+> **Observational note:** The sampling bars and charts (kline direction, funding skew, volume skew, OI/MC history) are primarily **visual feedback**. They reflect broad market conditions but do not directly gate entries or trigger closes on their own — the only mechanism that acts on them is the combined entry/close signal system (which requires scorecard gating before most signals contribute). Do not read the bars as predictive signals; a heavily red kline bar can coincide with Chaser winning and Winter losing, or vice versa. Treat them as ambient context while the scorecard provides the actual decision weight.
 
 ### Slot Scorecard
 
