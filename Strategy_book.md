@@ -197,6 +197,16 @@ When combined unrealized loss crosses a threshold, one can either close all posi
 
 ---
 
+#### Substitution
+
+When every position slot is full and a fresh opportunity outscores your weakest holding by a meaningful margin, swap it in — close the weakest, open the new one. A full book shouldn't mean the door is closed to a genuinely better setup; it should mean the worst current holding has to defend its spot.
+
+The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
+
+By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
+
+---
+
 #### Cascade Triggers
 
 **Collective Profit Cascade (CPC)**: When total unrealized book PnL crosses 2.5× entry margin, the two most profitable positions close immediately. Banked gains pass into the laggard's deficit tally. 5-minute cooldown.

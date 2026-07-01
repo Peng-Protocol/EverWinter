@@ -34,7 +34,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.38.1';
+  const VERSION       = '1.39.0';
   const DEFAULT_SLOTS = [['fund<-1','+24h','vm>10'],['fund>1','-24h','vm<10']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
 
@@ -416,6 +416,33 @@
                   <input type="number" class="inp" min="0.1" max="24" step="0.1" x-model.number="cfg.micHalvingHours" @change="persist()" style="width:80px">
                   <div class="mic-hint" x-text="(()=>{ const pos=(positions||[]).filter(p=>p._mic); if(!pos.length) return 'No active MIC positions.'; const oldest=pos.reduce((m,p)=>Math.min(m,p.openedAt||Date.now()),Date.now()); const ageMs=Date.now()-oldest; const halvMs=(cfg.micHalvingHours??3)*3600000; const mul=Math.pow(0.5,ageMs/halvMs); const h=Math.floor(ageMs/3600000); const m=Math.floor((ageMs%3600000)/60000); return 'Oldest: '+h+'h '+String(m).padStart(2,'0')+'m old → ×'+mul.toFixed(3)+' on trigger'; })()"></div>
                 </div>
+
+                <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.micSubstitutionEnabled=!cfg.micSubstitutionEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.micSubstitutionEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Substitution</div>
+                    <div class="mic-hint">When no entry slot is free, closes the worst-ranked MIC position and opens a new candidate instead if it scores meaningfully higher. Requires Co-Qualifying Penalty (Ashfall) to be on — otherwise there is no score to compare.</div>
+                  </div>
+                </label>
+                <div x-show="cfg.micSubstitutionEnabled" style="margin-top:8px">
+                  <div class="g">
+                    <div class="lbl">Margin <b x-text="(cfg.micSubstitutionMarginPct??15)+'% of base margin'"></b></div>
+                    <input type="range" min="5" max="100" step="5" x-model.number="cfg.micSubstitutionMarginPct" @change="persist()">
+                    <div class="mic-hint">How much better (in scorecard $ terms, relative to base margin) the new candidate must score than the worst held position before a swap is made. Prevents thrashing on marginal differences.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl">Min Age <b x-text="(cfg.micSubstitutionMinAgeMins??30)+'m'"></b></div>
+                    <input type="range" min="5" max="240" step="5" x-model.number="cfg.micSubstitutionMinAgeMins" @change="persist()">
+                    <div class="mic-hint">A position must be held at least this long before it can be substituted out.</div>
+                  </div>
+                  <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.micSubstitutionProtectWinners=!cfg.micSubstitutionProtectWinners;persist()}">
+                    <div class="tog-t" :class="cfg.micSubstitutionProtectWinners?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Protect Winners</div>
+                      <div class="mic-hint">When on, positions currently in profit are never substituted out. Turn off if temporary winners in your markets tend to reverse quickly and shouldn't be protected just for being ahead right now.</div>
+                    </div>
+                  </label>
+                </div>
               </div><!-- end exit zone -->
 
               <!-- Historical Scoring Zone -->
@@ -544,6 +571,10 @@
           if (this.cfg.micMcapScanCap      === undefined) this.cfg.micMcapScanCap      = 50;
           if (this.cfg.micHalvingEnabled   === undefined) this.cfg.micHalvingEnabled   = false;
           if (this.cfg.micHalvingHours     === undefined) this.cfg.micHalvingHours     = 3;
+          if (this.cfg.micSubstitutionEnabled       === undefined) this.cfg.micSubstitutionEnabled       = false;
+          if (this.cfg.micSubstitutionMarginPct     === undefined) this.cfg.micSubstitutionMarginPct     = 15;
+          if (this.cfg.micSubstitutionMinAgeMins    === undefined) this.cfg.micSubstitutionMinAgeMins    = 30;
+          if (this.cfg.micSubstitutionProtectWinners === undefined) this.cfg.micSubstitutionProtectWinners = true;
           if (this.cfg.micLiqResultMaxCycles   === undefined) this.cfg.micLiqResultMaxCycles   = 2;
           if (this.cfg.micRequireLiqData       === undefined) this.cfg.micRequireLiqData       = true;
           if (this.cfg.micRequireMcapData      === undefined) this.cfg.micRequireMcapData      = true;
@@ -700,6 +731,36 @@
               } finally { this._logBatchEnd?.('[MIC] 🩸 Sacrifice roll-up'); }
             }
           }
+        },
+
+        // Only meaningful when Co-Qualifying Penalty is on (Ashfall) — otherwise compositeScore
+        // is always 0 for both sides and the margin check never clears, so this is a safe no-op.
+        async _micTrySubstitute(pool) {
+          if (!this.cfg.micSubstitutionEnabled || !pool?.length) return false;
+          const myPositions = (this.positions || []).filter(p => p._mic);
+          if (!myPositions.length) return false;
+          const now           = Date.now();
+          const minAgeMs       = (this.cfg.micSubstitutionMinAgeMins ?? 30) * 60000;
+          const protectWinners = this.cfg.micSubstitutionProtectWinners ?? true;
+          const baseMargin     = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const marginThreshold = baseMargin * ((this.cfg.micSubstitutionMarginPct ?? 15) / 100);
+
+          const eligible = myPositions.filter(p => {
+            if ((now - (p.openedAt || 0)) < minAgeMs) return false;
+            if (protectWinners && (p.upnl || 0) > 0) return false;
+            return true;
+          });
+          if (!eligible.length) return false;
+
+          eligible.sort((a, b) => (a._micCompositeScore ?? 0) - (b._micCompositeScore ?? 0));
+          const worst      = eligible[0];
+          const worstScore = worst._micCompositeScore ?? 0;
+          const best       = pool[0];
+          if (!best || (best.compositeScore - worstScore) < marginThreshold) return false;
+
+          this.log(`[MIC] 🔁 Substitution — closing ${worst.symbol} (score ${worstScore.toFixed(4)}) for ${best.t.symbol} (score ${best.compositeScore.toFixed(4)}), Δ${(best.compositeScore - worstScore).toFixed(4)} ≥ ${marginThreshold.toFixed(4)} margin`, 'info');
+          await this.pseudoClosePosition(worst, 'substitution');
+          return await this._micOpen(best.t, best.criteria, best.slotIdx, best.compositeScore);
         },
 
         async runScan() {
@@ -1117,7 +1178,10 @@
 
           if (_micHalted) return;
 
-          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) return;
+          if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) {
+            await this._micTrySubstitute(pool);
+            return;
+          }
 
           let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
           if (this.cfg.micShareCapEnabled ?? true) {
@@ -1125,7 +1189,9 @@
             const micCount = (this.positions || []).filter(p => p._mic).length;
             headroom = Math.min(headroom, capSlots - micCount);
             if (headroom < 1) {
-              this.log('[MIC] 💡 Share cap reached — no slots available', 'info');
+              if (!(await this._micTrySubstitute(pool))) {
+                this.log('[MIC] 💡 Share cap reached — no slots available', 'info');
+              }
               return;
             }
           }
@@ -1152,11 +1218,11 @@
           let opened = 0, attempted = 0, blocked = 0;
           this._logBatchBegin?.();
           try {
-            for (const { t, criteria, slotIdx } of pool) {
+            for (const { t, criteria, slotIdx, compositeScore } of pool) {
               if (opened >= picks) break;
               if ((this.positions?.length ?? 0) >= maxPos) break;
               attempted++;
-              if (await this._micOpen(t, criteria, slotIdx)) { opened++; slotOpened[slotIdx]++; }
+              if (await this._micOpen(t, criteria, slotIdx, compositeScore)) { opened++; slotOpened[slotIdx]++; }
               else { blocked++; }
             }
           } finally { this._logBatchEnd?.('[MIC] 💡 Entry roll-up'); }
@@ -1166,7 +1232,7 @@
           this.log(`[MIC] 💡 ${pool.length} qualified — ${opened} opened${_micBlockNote}${openedNote}`, 'info');
         },
 
-        async _micOpen(t, criteria, slotIdx) {
+        async _micOpen(t, criteria, slotIdx, compositeScore) {
           const sym   = t.symbol;
           let price = parseFloat(t.lastPrice || 0);
           if (!price) return false;
@@ -1197,6 +1263,7 @@
             const pos = this.positions[this.positions.length - 1];
             pos._mic = true;
             pos._micSlotIdx  = slotIdx ?? 0;
+            pos._micCompositeScore = compositeScore ?? 0;
             const _liqR = this._liqResults?.[sym];
             pos._micCriteria = (criteria || []).map(c => {
               if (/^sliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `sliq${d >= 0 ? '+' : ''}${d}`; }
