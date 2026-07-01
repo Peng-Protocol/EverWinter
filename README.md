@@ -283,7 +283,7 @@ When surveillance is on: the **Feed Watcher** panel shows active batches (batch 
 
 ### Danger Zone
 
-**Clear Plugin State** removes all profile data and halt state from localStorage and memory. Use before uninstalling the plugin to avoid orphaned data, or to guarantee a fully clean slate. Irreversible.
+**Export** downloads one combined `.json` file with everything the plugin tracks — structure wave (events/closes/wave trajectory), scorecard records, liquidation cycle history, and OC cycle history. **Import** restores all of it from a previously exported file in one step; any field missing from the file is left untouched. **Clear Plugin State** removes all profile data and halt state from localStorage and memory. Use before uninstalling the plugin to avoid orphaned data, or to guarantee a fully clean slate. Irreversible.
 
 ---
 

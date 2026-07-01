@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.38.0';
+  const VERSION        = '1.39.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -73,6 +73,17 @@
     if (c === '>10pct') return '🔊'; if (c === '<10pct') return '🔉';
     return c;
   };
+  // Collapses a single recorded (tiered) criterion down to its base+sign bucket, e.g.
+  // "fund+3" -> "fund+", "ocx+18" -> "ocx+". Used both for scorecard display aggregation
+  // and for scorecard storage retention — the sponge quota is meant to cap records per
+  // base-criterion combination, not per exact tier value (which is combinatorially large
+  // and would barely ever repeat, defeating the quota).
+  const collapseCrit = c => {
+    if (c === '+fund') return 'fund>';
+    if (c === '-fund') return 'fund<';
+    return c.replace(/\d+$/, '');
+  };
+  const collapseKey = criteria => [...criteria].map(collapseCrit).sort().join(',');
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old scars fade
   const MIN_MASS       = 6;                    // evidence mass (kernel-weighted closes) required to use history
@@ -294,31 +305,8 @@
               <button @click="dzOpen=!dzOpen" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border:1px solid rgba(255,69,96,.25);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px;display:flex;align-items:center;gap:4px"><span x-text="dzOpen?'▾':'▸'"></span>&nbsp;Danger Zone</button>
               <div x-show="dzOpen" x-transition.opacity style="margin-top:6px;padding:8px;background:rgba(255,69,96,.04);border:1px solid rgba(255,69,96,.18);border-radius:3px">
                 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-                    <span x-data="{eOpen:false}" style="display:inline-flex;align-items:center">
-                      <button @click="eOpen=true" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(96,210,255,.4);border-radius:2px;background:none;color:var(--ice);cursor:pointer;letter-spacing:.5px">Export</button>
-                      <template x-teleport="body">
-                      <div x-show="eOpen" @click.self="eOpen=false" style="position:fixed;inset:0;z-index:5100;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(5,8,16,.92);backdrop-filter:blur(6px)">
-                        <div style="background:#0d1117;border:1px solid rgba(96,210,255,.2);border-radius:6px;padding:20px;width:360px;max-width:90vw">
-                          <div style="font-family:var(--mono);font-size:11px;color:var(--ice);letter-spacing:.5px;margin-bottom:6px">↓ Export Permafrost Data</div>
-                          <div style="font-size:9px;color:var(--text-lo);margin-bottom:16px">Each file downloads independently and can be re-imported separately.</div>
-                          <div style="display:flex;flex-direction:column;gap:8px">
-                            <button @click="pfExportWave();eOpen=false" style="font-family:var(--mono);font-size:10px;padding:8px 10px;border:1px solid rgba(96,210,255,.35);border-radius:3px;background:rgba(96,210,255,.06);color:var(--ice);cursor:pointer;text-align:left">
-                              ❄ Structure Wave
-                              <span style="font-size:8.5px;color:var(--text-lo);display:block;margin-top:2px;letter-spacing:.3px">Closes on record + wave trajectory</span>
-                            </button>
-                            <button @click="pfExportScorecard();eOpen=false" style="font-family:var(--mono);font-size:10px;padding:8px 10px;border:1px solid rgba(255,255,255,.12);border-radius:3px;background:rgba(255,255,255,.03);color:var(--text-mid);cursor:pointer;text-align:left">
-                              📊 Scorecard
-                              <span style="font-size:8.5px;color:var(--text-lo);display:block;margin-top:2px;letter-spacing:.3px">Per-slot criteria PnL records (shared with Ashfall)</span>
-                            </button>
-                            <button @click="pfExportLiq();eOpen=false" style="font-family:var(--mono);font-size:10px;padding:8px 10px;border:1px solid rgba(255,255,255,.12);border-radius:3px;background:rgba(255,255,255,.03);color:var(--text-mid);cursor:pointer;text-align:left">
-                              🌊 Liq Samples
-                              <span style="font-size:8.5px;color:var(--text-lo);display:block;margin-top:2px;letter-spacing:.3px">Historical liquidation batch records</span>
-                            </button>
-                            <button @click="eOpen=false" style="font-family:var(--mono);font-size:9px;padding:7px 10px;border:1px solid rgba(255,255,255,.1);border-radius:3px;background:none;color:var(--text-lo);cursor:pointer;margin-top:2px">Cancel</button>
-                          </div>
-                        </div>
-                      </div>
-                      </template>
+                    <span style="display:inline-flex;align-items:center">
+                      <button @click="pfExportAll()" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(96,210,255,.4);border-radius:2px;background:none;color:var(--ice);cursor:pointer;letter-spacing:.5px">Export</button>
                     </span>
                     <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
                       <button x-show="!c" @click="c=true" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(96,210,255,.4);border-radius:2px;background:none;color:var(--ice);cursor:pointer;letter-spacing:.5px">Import</button>
@@ -1034,7 +1022,7 @@
             const bySlot = {};
             for (const r of records) {
               if (isLegacy(r)) continue;
-              const k = [...r.criteria].sort().join(',');
+              const k = collapseKey(r.criteria);
               if (!bySlot[k]) bySlot[k] = [];
               bySlot[k].push(r);
             }
@@ -1058,7 +1046,7 @@
             const quota = this.cfg.pfSpongeQuota ?? 30;
             const bySlot = {};
             for (const r of records) {
-              const k = [...r.criteria].sort().join(',');
+              const k = collapseKey(r.criteria);
               if (!bySlot[k]) bySlot[k] = [];
               bySlot[k].push(r);
             }
@@ -1097,12 +1085,7 @@
           }
           for (const s of Object.values(map)) s.totalPnl = s.ownPnl + s.partnerPnl;
           this.pfScoreboard = Object.values(map).sort((a, b) => b.totalPnl - a.totalPnl);
-          const collapse = c => {
-            if (c === '+fund') return 'fund>';
-            if (c === '-fund') return 'fund<';
-            if (/^(?:sliq|bliq)/.test(c)) return c.replace(/\d+$/, '');
-            return c.replace(/\d+$/, '');
-          };
+          const collapse = collapseCrit;
           const critCount = {}, collapsedRanks = {}, critStats = {};
           for (const r of [...records].sort((a, b) => b.ts - a.ts)) {
             if (r.hist && !includeHist) continue;
@@ -1369,20 +1352,21 @@
           a.click();
           URL.revokeObjectURL(a.href);
         },
-        pfExportWave() {
-          this._pfDownload(`permafrost-wave-${new Date().toISOString().slice(0, 10)}.json`, { exportedAt: Date.now(), events: this.pfEvents, closes: this.pfCloses, wave: this.pfWave });
-        },
-        pfExportScorecard() {
+        pfExportAll() {
           try {
-            const raw = localStorage.getItem(SCORE_KEY);
-            this._pfDownload(`permafrost-scorecard-${new Date().toISOString().slice(0, 10)}.json`, { exportedAt: Date.now(), scorecard: raw ? JSON.parse(raw) : [] });
-          } catch(e) { this.log('[PFR] Scorecard export failed', 'warn'); }
-        },
-        pfExportLiq() {
-          try {
-            const raw = localStorage.getItem(PFR_LIQ_HISTORY_KEY);
-            this._pfDownload(`permafrost-liq-${new Date().toISOString().slice(0, 10)}.json`, { exportedAt: Date.now(), liqHistory: raw ? JSON.parse(raw) : [] });
-          } catch(e) { this.log('[PFR] Liq export failed', 'warn'); }
+            const scorecardRaw = localStorage.getItem(SCORE_KEY);
+            const liqRaw       = localStorage.getItem(PFR_LIQ_HISTORY_KEY);
+            const ocRaw        = localStorage.getItem(PFR_OC_HIST_KEY);
+            this._pfDownload(`permafrost-profile-${new Date().toISOString().slice(0, 10)}.json`, {
+              exportedAt: Date.now(),
+              events: this.pfEvents,
+              closes: this.pfCloses,
+              wave: this.pfWave,
+              scorecard: scorecardRaw ? JSON.parse(scorecardRaw) : [],
+              liqHistory: liqRaw ? JSON.parse(liqRaw) : [],
+              ocHistory: ocRaw ? JSON.parse(ocRaw) : [],
+            });
+          } catch(e) { this.log('[PFR] Export failed', 'warn'); }
         },
 
         pfImport(e) {
@@ -1395,8 +1379,21 @@
               if (Array.isArray(d.events)) this.pfEvents = d.events.slice(-EVENTS_CAP);
               if (Array.isArray(d.closes)) this.pfCloses = d.closes.slice(-CLOSES_CAP);
               if (Array.isArray(d.wave))   this.pfWave   = d.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
+              if (Array.isArray(d.scorecard)) {
+                try { localStorage.setItem(SCORE_KEY, JSON.stringify(d.scorecard)); } catch(_) {}
+              }
+              if (Array.isArray(d.liqHistory)) {
+                this._liqCycleHistory = d.liqHistory;
+                try { localStorage.setItem(PFR_LIQ_HISTORY_KEY, JSON.stringify(d.liqHistory)); } catch(_) {}
+              }
+              if (Array.isArray(d.ocHistory)) {
+                this._pfOcCycleHistory = d.ocHistory;
+                try { localStorage.setItem(PFR_OC_HIST_KEY, JSON.stringify(d.ocHistory)); } catch(_) {}
+              }
               this.persist();
-              this.log(`[PFR] Profile imported — ${this.pfCloses.length} closes, ${this.pfWave.length} wave points`, 'info');
+              this._pfScoreTrim();
+              this._pfScoreBuild();
+              this.log(`[PFR] Profile imported — ${this.pfCloses.length} closes, ${this.pfWave.length} wave points, ${(d.scorecard||[]).length} scorecard records, ${(d.liqHistory||[]).length} liq cycles, ${(d.ocHistory||[]).length} OC cycles`, 'info');
             } catch(err) {
               this.log('[PFR] Import failed — file could not be parsed as a valid Permafrost profile', 'warn');
             }
