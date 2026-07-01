@@ -142,8 +142,12 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | `bliq` / `bliq>N` / `bliq<N` | Long liquidations dominated the latest liq cycle with ≥70% of total liq turnover (bearish flow). Same depth gate mechanism as sliq. |
 | `msliq` / `msliq>N` / `msliq<N` | Sell-liq majority but buy-liq ≥30% — a contested cycle with a sell lean. Passes when the cycle is mixed but not one-sided. Same depth gate as sliq. |
 | `mbliq` / `mbliq>N` / `mbliq<N` | Buy-liq majority but sell-liq ≥30% — a contested cycle with a buy lean. Same depth gate as bliq. |
+| `ocs>N` / `ocs<N` | Buy/sell fill skew from Order Count Surveillance, at N percentage points from parity (0–100 gate scale, 1% cadence). Requires Permafrost/Ashfall OC Surveillance. |
+| `ocx>N` / `ocx<N` | Total fill count for the ticker vs. the mean across all surveilled tickers in the same OC cycle, at N percent (1% cadence). Requires Permafrost/Ashfall OC Surveillance. |
 
 **Tier gate**: all tiered criteria (`fund`, `vm`, `lsa`, `lba`, `rasl`, `rabl`, `iot`, `iom`) compute an integer tier as `floor(value / step)` and compare it against N. Step sizes are configurable per criterion under **Tier Step Sizes** in the Entry Zone. The same tier is recorded on the position and used as the scorecard key — `lsa>25` and `lsa+37` are different tiers and scored separately.
+
+**OCS/OCX recording**: on entry, `ocs` records signed deviation from 50% parity (e.g. `ocs+12` = 62% buy-dominant, `ocs-8` = 42% buy / 58% sell) and `ocx` records signed deviation from the cross-ticker mean fill count (e.g. `ocx+40` = 40% more fills than the sample average, `ocx-15` = 15% fewer). Unlike every other criterion, Order Count Surveillance data exists for essentially every ticker at all times — there are always orders flowing — so `ocs`/`ocx` behave like `+24h`/`-24h` in that they are near-universally available rather than conditional on a data source being fresh or a pattern being present.
 
 **Depth gate** (sliq/bliq/msliq/mbliq): `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. `sDepth` is an integer score where 0 = average hourly liq volume for that ticker, positive = above, negative = below. Without a suffix the depth gate is skipped. msliq and mbliq use the same depth value as sliq and bliq respectively.
 
@@ -170,6 +174,8 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Sacrifice %** (`miwSacrificePct`/`micSacrificePct`) | Collective uLoss trigger as a % of base margin (minNotional ÷ leverage). |
 | **Rolling Sacrifice** (`miwRollingSacrificeEnabled`/`micRollingSacrificeEnabled`) | When on, Sacrifice closes only the oldest MIW/MIC position at a time instead of all at once. |
 | **Liq Result Max Age** (`miwLiqResultMaxCycles`/`micLiqResultMaxCycles`) | How many scan cycles a liq result stays valid for sliq/bliq/msliq/mbliq slot criteria. Results older than this are treated as absent. Default 2. |
+| **Fresh OC Only** (`miwRequireOcData`/`micRequireOcData`) | Blanket gate: excludes any ticker without a recent Order Count Surveillance result from entry consideration entirely, regardless of which slot it would match. Off by default. Requires Permafrost/Ashfall OC Surveillance. |
+| **OC Freshness** (`miwOcFreshMins`/`micOcFreshMins`) | Minutes since the last completed OC cycle before a ticker's OC result is treated as stale for Fresh OC Only. Default 120. Only visible when Fresh OC Only is on. |
 | **Auto Slots** (`miwAutoSlots`/`micAutoSlots`) | Replaces the manual slot list with every possible combination of the available criteria at the chosen size. |
 | **Auto Slot Size** (`miwAutoSlotSize`/`micAutoSlotSize`) | How many criteria per auto-generated combination (1–4). |
 | **Exclude from Auto** (`miwAutoSlotExclude`/`micAutoSlotExclude`) | Criteria omitted from auto-generated combinations and from scorecard scoring. |
@@ -192,6 +198,8 @@ All three sources share their results cross-tab. A ticker with no data from any 
 **Manual mode**: click a slot to select it, then toggle criteria on/off in the picker row below. ✕ deletes the slot; `+` adds a new empty one.
 
 **Auto mode**: the manual builder is replaced by a size picker and an exclusion chip row. The combo count shown reflects how many slots are active after exclusions. Note that many generated combinations are contradictory and will never match any ticker — a slot containing both `+24h` and `-24h` can never be satisfied simultaneously, nor can any two from the candle group (`lsa`, `lba`, `rasl`, `rabl`), since a candle can only close in one direction with one volume character at a time. At size 2 these pairs are common, so the effective slot count is lower than the number shown. Excluding one side of each pair removes the dead combinations. Additionally, `lsa`/`lba`/`rasl`/`rabl` almost never co-qualify with `vm` criteria in the same slot: `vm` criteria apply only to the top 30 tickers by turnover, while kline criteria apply to a random sample drawn from the full pool — the overlap between those two subsets is small in practice.
+
+`ocs` and `ocx` are the only criteria backed by data that is essentially always present — there are always fills on a liquid ticker — so unlike liquidation, kline, or market-cap-derived criteria, they don't depend on a spike, gap, or fresh fetch lining up. In practice this makes them behave like `+24h`/`-24h`: nearly every OC-surveilled ticker satisfies some `ocs`/`ocx` tier at any given scan, so they show up in a large share of generated auto-slots and matched positions once Order Count Surveillance is enabled.
 
 ---
 
@@ -220,6 +228,8 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Liquidation Surveillance** (`pfLiqEnabled`/`ashLiqEnabled`) | Opens WebSocket connections to track live liquidation flow across a rolling sample of volatile tickers. Required for `sliq`/`bliq` criteria in MIW/MIC. |
 | **Liq Batch Size** (`pfLiqBatchSize`/`ashLiqBatchSize`) | Tickers per liquidation batch (5–50). More tickers = broader market coverage per cycle. |
 | **Liq Threshold %** (`pfLiqThresholdPct`/`ashLiqThresholdPct`) | Minimum share of a cycle's total liquidation turnover one side must hold to qualify (10–90%). At 50%, one side must account for at least half. |
+| **Order Count Surveillance** (`pfOcEnabled`/`afOcEnabled`) | Polls recent trades for the liquidation-sampled ticker pool and accumulates buy/sell fill counts per 1h bucket. Required for `ocs`/`ocx` criteria in MIW/MIC. Fill IDs are deduplicated and persisted to localStorage so restarts don't double-count. |
+| **OC Base Interval** (`pfOcBaseIntervalSecs`/`afOcBaseIntervalSecs`) | Starting fetch interval per ticker in seconds. Self-throttle raises this for tickers returning mostly duplicate data and lowers it back when fresh activity resumes. |
 
 ### WAVE Tab
 
@@ -244,6 +254,7 @@ Three directional bar charts below the climate reading show relative dominance a
 | **Liquidation Flow** | B-Liq vs. S-Liq share of the last completed liq cycle. Only appears when Liquidation Surveillance is on and at least one cycle has closed. |
 | **Volume Sample** | Below-average vs. above-average volume share of the current kline sample, weighted by deviation magnitude. Gray extends left (below average) and thematic color extends right (above average). Only appears when the Volume fade signal is enabled. Below this bar, a **Volume History** line chart shows total market volume (USD billions) sampled at each bulk ticker fetch. Use the ← → buttons to scroll through history in weekly windows. |
 | **OI/MC History** | A line chart showing aggregate OI as a % of market cap over time, sampled from the bulk ticker feed every ~3h. Current ratio shown next to the label. Only appears when the OI fade signal is enabled. |
+| **Order Count Sample** | Per-ticker bar chart of buy vs. sell fill counts for the most recently closed OC cycle. Winter shows sells in thematic ice blue / buys in gray; Chaser shows buys in thematic orange / sells in gray. Only appears when Order Count Surveillance is on and at least one cycle has closed. |
 
 > **Observational note:** The sampling bars and charts (kline direction, funding skew, volume skew, OI/MC history) are primarily **visual feedback**. They reflect broad market conditions but do not directly gate entries or trigger closes on their own — the only mechanism that acts on them is the combined entry/close signal system (which requires scorecard gating before most signals contribute). Do not read the bars as predictive signals; a heavily red kline bar can coincide with Chaser winning and Winter losing, or vice versa. Treat them as ambient context while the scorecard provides the actual decision weight.
 
