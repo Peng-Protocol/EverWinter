@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.41.4';
+  const VERSION        = '1.41.5';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -476,7 +476,7 @@
                   </template>
                 </span>
               </div>
-              <div x-html="_pfScorecardHtml()" @click="const c=$event.target.closest('[data-slot]');if(c){pfScorecardExpanded=pfScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+              <div x-html="_pfScorecardHtml(open && cfg.permafrostScorecardEnabled)" @click="const c=$event.target.closest('[data-slot]');if(c){pfScorecardExpanded=pfScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px"></div>
               <div style="margin-top:5px;display:flex;justify-content:flex-end;gap:4px">
 <button @click="cfg.pfScorecardSource=cfg.pfScorecardSource==='both'?'hist':cfg.pfScorecardSource==='hist'?'traded':'both';pfScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(96,210,255,.3);background:rgba(96,210,255,.06);color:rgba(96,210,255,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.pfScorecardSource==='hist'?'Hist':cfg.pfScorecardSource==='traded'?'Traded':'Both'"></button>
                 <button @click="cfg.pfScorecardView=cfg.pfScorecardView==='combined'?'own':'combined';pfScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(96,210,255,.3);background:rgba(96,210,255,.06);color:rgba(96,210,255,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.pfScorecardView==='own'?'Own':'Combined'"></button>
@@ -667,7 +667,12 @@
           this.log(`[PFR] Permafrost (Winter) v${VERSION} loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfCloses.length} closes on record`, 'info');
           setInterval(() => {
             if (this.cfg.permafrostCrossEnabled) this._pfCheckCross().catch(() => {});
-            if (this.cfg.permafrostScorecardEnabled) this._pfScoreBuild();
+            // _pfScoreBuild() is NOT called here on a timer — its source data (scorecard
+            // records) only changes on a trade close, a config change affecting the
+            // computation, or an import, and it's called from each of those directly. A
+            // periodic rebuild here would just recompute the identical result between those
+            // events for no reason, on every tick's worth of ticks (up to a few thousand
+            // records, twice-sorted) whether or not the Score panel is even open.
             if (this.cfg.permafrostCrossEnabled) {
               const _halted  = this._isDrawdownHalted?.() ?? false;
               const _glocked = this._isGainsLocked?.()    ?? false;
@@ -1131,17 +1136,25 @@
             }
             const byteCapped = trimToByteCap([...trimmed].reverse()).reverse();
             localStorage.setItem(SCORE_KEY, JSON.stringify(byteCapped));
-          } catch(e) {}
+            return byteCapped;
+          } catch(e) { return null; }
         },
-        _pfScoreBuild() {
-          const records = this._pfScoreRead();
+        // `records`, when passed, skips the internal _pfScoreRead() — callers on the
+        // trade-close hot path already have the just-written result from _pfScoreWrite()
+        // in hand, so re-reading and re-parsing the same data straight back out of
+        // localStorage would be pure duplicate work.
+        _pfScoreBuild(records) {
+          records = records || this._pfScoreRead();
           const exclude = new Set(this.cfg.miwAutoSlotExclude || []);
           const quota = this.cfg.pfSpongeQuota ?? 30;
           const includeHist = this.cfg.pfHistScoringEnabled ?? true;
           const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
+          // Sorted once and reused by both passes below — they use the identical sort
+          // criteria (newest-first), so sorting twice was pure duplicate work.
+          const sortedRecords = [...records].sort((a, b) => b.ts - a.ts);
           const slotCount = {};
           const map = {};
-          for (const r of [...records].sort((a, b) => b.ts - a.ts)) {
+          for (const r of sortedRecords) {
             if (r.hist && !includeHist) continue;
             if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
             const key = [...r.criteria].sort().join(',');
@@ -1162,7 +1175,7 @@
           this.pfScoreboard = Object.values(map).sort((a, b) => b.totalPnl - a.totalPnl);
           const collapse = collapseCrit;
           const critCount = {}, collapsedRanks = {}, critStats = {};
-          for (const r of [...records].sort((a, b) => b.ts - a.ts)) {
+          for (const r of sortedRecords) {
             if (r.hist && !includeHist) continue;
             if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
             const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
@@ -1182,7 +1195,11 @@
           this.miwCollapsedSlotRanks = collapsedRanks;
           this.miwCollapsedCritStats = critStats;
         },
-        _pfScorecardHtml() {
+        // Pure display — unlike _pfScoreBuild() (which miwCollapsedCritStats/miwCollapsedSlotRanks
+        // come from and which real trading logic reads), this chip-rendering step has no
+        // consumer besides this panel, so it's safe to skip while the panel isn't visible.
+        _pfScorecardHtml(shown) {
+          if (!shown) return '';
           const stats = this.miwCollapsedCritStats || {};
           if (!Object.keys(stats).length) return '<span style="font-size:9px;color:var(--text-lo)">No MIW closes recorded yet.</span>';
           const own = (this.cfg.pfScorecardView || 'combined') === 'own';
@@ -1583,8 +1600,7 @@
             const _t = this.closedTrades?.[0];
             const _pnl = _t?.totalPnl ?? _t?.pnl;
             if (typeof _pnl === 'number') {
-              this._pfScoreWrite(pos._miwCriteria, _pnl);
-              this._pfScoreBuild();
+              this._pfScoreBuild(this._pfScoreWrite(pos._miwCriteria, _pnl));
             }
           }
         },

@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.41.4';
+  const VERSION        = '1.41.5';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
@@ -455,7 +455,7 @@
                   </template>
                 </span>
               </div>
-              <div x-html="_afScorecardHtml()" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+              <div x-html="_afScorecardHtml(open && cfg.ashfallScorecardEnabled)" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px"></div>
               <div style="margin-top:5px;display:flex;justify-content:flex-end;gap:4px">
 <button @click="cfg.afScorecardSource=cfg.afScorecardSource==='both'?'hist':cfg.afScorecardSource==='hist'?'traded':'both';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,150,80,.3);background:rgba(255,150,80,.06);color:rgba(255,150,80,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardSource==='hist'?'Hist':cfg.afScorecardSource==='traded'?'Traded':'Both'"></button>
                 <button @click="cfg.afScorecardView=cfg.afScorecardView==='combined'?'own':'combined';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,150,80,.3);background:rgba(255,150,80,.06);color:rgba(255,150,80,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardView==='own'?'Own':'Combined'"></button>
@@ -645,7 +645,12 @@
           this.log(`[ASH] Ashfall (Chaser) v${VERSION} loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afCloses.length} closes on record`, 'info');
           setInterval(() => {
             if (this.cfg.ashfallCrossEnabled) this._afCheckCross().catch(() => {});
-            if (this.cfg.ashfallScorecardEnabled) this._afScoreBuild();
+            // _afScoreBuild() is NOT called here on a timer — its source data (scorecard
+            // records) only changes on a trade close, a config change affecting the
+            // computation, or an import, and it's called from each of those directly. A
+            // periodic rebuild here would just recompute the identical result between those
+            // events for no reason, on every tick's worth of ticks (up to a few thousand
+            // records, twice-sorted) whether or not the Score panel is even open.
             if (this.cfg.ashfallCrossEnabled) {
               const _halted  = this._isDrawdownHalted?.() ?? false;
               const _glocked = this._isGainsLocked?.()    ?? false;
@@ -1085,17 +1090,25 @@
             }
             const byteCapped = trimToByteCap([...trimmed].reverse()).reverse();
             localStorage.setItem(SCORE_KEY, JSON.stringify(byteCapped));
-          } catch(e) {}
+            return byteCapped;
+          } catch(e) { return null; }
         },
-        _afScoreBuild() {
-          const records = this._afScoreRead();
+        // `records`, when passed, skips the internal _afScoreRead() — callers on the
+        // trade-close hot path already have the just-written result from _afScoreWrite()
+        // in hand, so re-reading and re-parsing the same data straight back out of
+        // localStorage would be pure duplicate work.
+        _afScoreBuild(records) {
+          records = records || this._afScoreRead();
           const exclude = new Set(this.cfg.micAutoSlotExclude || []);
           const quota = this.cfg.afSpongeQuota ?? 30;
           const includeHist = this.cfg.afHistScoringEnabled ?? true;
           const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
+          // Sorted once and reused by both passes below — they use the identical sort
+          // criteria (newest-first), so sorting twice was pure duplicate work.
+          const sortedRecords = [...records].sort((a, b) => b.ts - a.ts);
           const slotCount = {};
           const map = {};
-          for (const r of [...records].sort((a, b) => b.ts - a.ts)) {
+          for (const r of sortedRecords) {
             if (r.hist && !includeHist) continue;
             if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
             const key = [...r.criteria].sort().join(',');
@@ -1116,7 +1129,7 @@
           this.afScoreboard = Object.values(map).sort((a, b) => b.totalPnl - a.totalPnl);
           const collapse = collapseCrit;
           const critCount = {}, collapsedRanks = {}, critStats = {};
-          for (const r of [...records].sort((a, b) => b.ts - a.ts)) {
+          for (const r of sortedRecords) {
             if (r.hist && !includeHist) continue;
             if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
             const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
@@ -1136,7 +1149,11 @@
           this.micCollapsedSlotRanks = collapsedRanks;
           this.micCollapsedCritStats = critStats;
         },
-        _afScorecardHtml() {
+        // Pure display — unlike _afScoreBuild() (which micCollapsedCritStats/micCollapsedSlotRanks
+        // come from and which real trading logic reads), this chip-rendering step has no
+        // consumer besides this panel, so it's safe to skip while the panel isn't visible.
+        _afScorecardHtml(shown) {
+          if (!shown) return '';
           const stats = this.micCollapsedCritStats || {};
           if (!Object.keys(stats).length) return '<span style="font-size:9px;color:var(--text-lo)">No MIC closes recorded yet.</span>';
           const own = (this.cfg.afScorecardView || 'combined') === 'own';
@@ -1542,8 +1559,7 @@
             const _t = this.closedTrades?.[0];
             const _pnl = _t?.totalPnl ?? _t?.pnl;
             if (typeof _pnl === 'number') {
-              this._afScoreWrite(pos._micCriteria, _pnl);
-              this._afScoreBuild();
+              this._afScoreBuild(this._afScoreWrite(pos._micCriteria, _pnl));
             }
           }
         },
