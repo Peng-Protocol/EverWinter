@@ -85,6 +85,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 | **Positions** | Count of open positions. |
 | **Last Scan** | Timestamp of the most recent scan cycle. |
 | **Laggard** | The oldest open position — the EDa debt holder. Shows its current debt load when EDa is active. |
+| **Persistence** | "Active" is the live in-memory position count; "Stored" is what's confirmed saved to localStorage. These should always match. A mismatch (shown in red with a warning banner) means a save failed or was overwritten — the bot retries automatically every 5s. If it doesn't clear, check the activity log for `[PST]`/`[PERSIST]` entries, and close any duplicate tabs of the same bot — a second tab can overwrite the first tab's saves with its own stale position count. |
 
 ### Actions Dropdown
 
@@ -101,7 +102,7 @@ Timestamped entries for every significant bot event. Color coding:
 - **Yellow** — warnings (halts engaged, API retries)
 - **Red** — errors (API failures, plugin conflicts)
 
-Common prefixes: `[MHL]` manual halt · `[DWN]` drawdown throttle · `[GLK]` gains lock · `[PFR]`/`[ASH]` climate plugin events · `[MIW]`/`[MIC]` multi-indicator events.
+Common prefixes: `[MHL]` manual halt · `[DWN]` drawdown throttle · `[GLK]` gains lock · `[PST]` (PseudoWinter) / `[PERSIST]` (PseudoChaser) save failures or recovered positions · `[PFR]`/`[ASH]` climate plugin events · `[MIW]`/`[MIC]` multi-indicator events.
 
 The log is capped at 300 entries in memory and in localStorage. Oldest entries are dropped when the cap is exceeded.
 
