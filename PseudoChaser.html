@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.9.0 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.9.1 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -590,7 +590,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.9.0 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.9.1 · Long Only · No Real Orders</div>
     </div>
     <div class="pills">
       <!-- SIM state pill — always visible -->
@@ -1279,13 +1279,13 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             <span x-text="showStorageBreakdown?'▾':'▸'"></span> Storage usage
           </span>
           <span x-show="showStorageBreakdown" @click="_exportStorageBreakdown()" title="Download this breakdown as a text file" style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;text-decoration:underline;user-select:none">⤓ Export</span>
-          <div x-show="showStorageBreakdown" x-html="_storageBreakdown()" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
+          <div x-show="showStorageBreakdown" x-html="_storageBreakdown(showStorageBreakdown)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
         </div>
         <div style="margin-top:6px">
           <span @click="showPowerUsage=!showPowerUsage" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
             <span x-text="showPowerUsage?'▾':'▸'"></span> Power usage
           </span>
-          <div x-show="showPowerUsage" x-html="_powerUsageHtml()" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
+          <div x-show="showPowerUsage" x-html="_powerUsageHtml(showPowerUsage)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
         </div>
         <button class="btn btn-ghost" style="margin-top:8px;font-size:10px;padding:5px;letter-spacing:1px"
           @click="showDangerZone=!showDangerZone"
@@ -1549,6 +1549,56 @@ let _sharedChannel = null;
 try { _sharedChannel = new BroadcastChannel('ew_shared'); } catch(_) {}
 const BANLIST_TTL_MS = 7 * 24 * 3600 * 1000;
 
+// The shared registry accumulates several independent per-symbol caches (klines_1h,
+// klines_1h_last, watchTickers, mcap, cpSupply, dsMcap, liqResults, ...) inside one blob,
+// merged in by _sharedMerge with no eviction — every symbol either bot has ever touched
+// stays forever. Capped at one combined budget (matching how it shows as a single row in
+// the Storage usage breakdown) rather than per-type, trimming the globally-oldest entries
+// first regardless of which cache they're in. Each per-key entry carries its own `ts`
+// (set by whichever _sharedWrite/_sharedMerge call wrote it); a bucket whose `data` isn't
+// a per-key dict (e.g. bulkTickers, a plain array) is evicted as a whole unit instead,
+// aged by the bucket's own top-level `ts`.
+const SHARED_REGISTRY_BYTE_CAP = 200 * 1024;
+function _trimSharedRegistry(reg, maxBytes = SHARED_REGISTRY_BYTE_CAP) {
+  let json = JSON.stringify(reg);
+  let size = new Blob([json]).size;
+  if (size <= maxBytes) return reg;
+  const units = [];
+  for (const [type, bucket] of Object.entries(reg)) {
+    if (!bucket || typeof bucket !== 'object') continue;
+    const data = bucket.data;
+    const isEntryDict = data && typeof data === 'object' && !Array.isArray(data)
+      && Object.values(data).every(v => v && typeof v === 'object' && typeof v.ts === 'number');
+    if (isEntryDict) {
+      for (const key of Object.keys(data)) units.push({ type, key, ts: data[key].ts });
+    } else {
+      units.push({ type, key: null, ts: bucket.ts || 0 });
+    }
+  }
+  units.sort((a, b) => a.ts - b.ts); // oldest first
+  let idx = 0, guard = 0;
+  while (size > maxBytes && idx < units.length && guard < 25) {
+    const avg = size / Math.max(1, units.length - idx);
+    const excess = size - maxBytes;
+    const drop = Math.min(units.length - idx, Math.max(1, Math.ceil(excess / avg)));
+    for (let j = 0; j < drop; j++) {
+      const u = units[idx + j];
+      if (u.key === null) delete reg[u.type];
+      else if (reg[u.type]?.data) delete reg[u.type].data[u.key];
+    }
+    idx += drop;
+    json = JSON.stringify(reg);
+    size = new Blob([json]).size;
+    guard++;
+  }
+  // Clean up any buckets left with an empty data dict after eviction.
+  for (const type of Object.keys(reg)) {
+    const data = reg[type]?.data;
+    if (data && typeof data === 'object' && !Array.isArray(data) && !Object.keys(data).length) delete reg[type];
+  }
+  return reg;
+}
+
 const _closingIds = new Set();
 const AUDIT_MIN_GAP_MS = 60000;
 let _auditRunning = false;
@@ -1764,16 +1814,18 @@ function pw() { return {
     },
     _sharedWrite(type, data) {
       try {
-        const reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
+        let reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
         reg[type] = { data, ts: Date.now(), by: BOT_ID };
+        reg = _trimSharedRegistry(reg);
         localStorage.setItem(SHARED_KEY, JSON.stringify(reg));
         _sharedChannel?.postMessage({ type, ts: Date.now(), by: BOT_ID });
       } catch(_) {}
     },
     _sharedMerge(type, patch, extra) {
       try {
-        const reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
+        let reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
         reg[type] = { ...(reg[type] || {}), ...extra, data: { ...(reg[type]?.data || {}), ...patch }, ts: Date.now(), by: BOT_ID };
+        reg = _trimSharedRegistry(reg);
         localStorage.setItem(SHARED_KEY, JSON.stringify(reg));
         _sharedChannel?.postMessage({ type, ts: Date.now(), by: BOT_ID });
       } catch(_) {}
@@ -2188,7 +2240,15 @@ function pw() { return {
     }
     return { rows, grand };
   },
-  _storageBreakdown() {
+  // `shown` mirrors the pattern used for the analytics plugins' chart builders: without it,
+  // Alpine still evaluates this on every tick even while the dropdown is collapsed, and this
+  // one is expensive — it Blob-sizes every localStorage value (megabytes' worth, once storage
+  // grows) plus a JSON.parse/re-stringify of the two Permafrost/Ashfall blobs, every second,
+  // regardless of visibility. Alpine's own dependency tracking (which reactive property was
+  // read) doesn't help here since the cost comes from localStorage, not a tracked property —
+  // so unlike the chart fixes, this still needs the tick read, just gated on visibility.
+  _storageBreakdown(shown) {
+    if (!shown) return '';
     void this.tick;
     const fmt = b => b >= 1048576 ? (b/1048576).toFixed(2)+' MB' : b >= 1024 ? (b/1024).toFixed(1)+' KB' : b+' B';
     const { rows, grand } = this._storageRows();
@@ -2231,7 +2291,8 @@ function pw() { return {
   // points. Browsers don't expose real CPU%, so this self-timed wall-clock figure is the
   // closest practical proxy — high or rising values mean something reactive is doing more work
   // than it needs to, which is exactly the class of bug this panel exists to catch.
-  _powerUsageHtml() {
+  _powerUsageHtml(shown) {
+    if (!shown) return '';
     void this.tick;
     const samples = this._tickCostSamples;
     if (!samples.length) return `<div style="color:var(--text-lo)">gathering samples…</div>`;
