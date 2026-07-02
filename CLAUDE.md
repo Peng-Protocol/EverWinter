@@ -28,8 +28,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.41.0 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.40.0 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.41.1 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.41.1 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.41.2 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.41.2 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
