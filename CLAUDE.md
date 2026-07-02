@@ -28,8 +28,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.41.0 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.40.0 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.41.3 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.41.3 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.41.4 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.41.4 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
@@ -60,6 +60,8 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 - **Fade Away loss trigger = between-scan enabler, not a scan gate.** The loss threshold causes the combined fade check to also fire via the exit timer (between scans) when any position crosses it. The check always runs every scan cycle unconditionally. "Scan bypass" means it bypasses waiting for the next scan — it does NOT skip or gate the scan-time check.
 - **PF/AF tooltip and README framing**: These plugins do not reliably identify which specific market structures precede halt events. Market regime (bull/bear) is the dominant driver of the learned profile and is not fully captured in the tracked signals. Tooltips should be generalized ("learns from historical conditions and outcomes") and avoid implying structural causation. The README may elaborate on observed reactions to data.
 - **Never use `window.confirm()`, `window.alert()`, or `window.prompt()` in plugin or bot UI.** These are blocked when the app runs in an iframe, silently returning `false`/`undefined` and making buttons appear unresponsive with no feedback. Use inline Alpine confirmation UI instead: wrap the button in `<span x-data="{c:false}">`, show the action button when `!c`, and when clicked set `c=true` to reveal inline "Sure? Yes / No" buttons that execute the action or reset `c`.
+- **When fixing a performance issue, don't change functional/behavioral parameters as part of the fix without confirming they're not intentional.** Capping the liq surveillance's concurrent-batch count looked like an obvious perf win but was actually a deliberate design choice (broader simultaneous ticker coverage) — the real cost was the per-message localStorage write, not the batch count itself. When a "wasteful-looking" number (concurrency, retry count, batch size) could plausibly be intentional, ask before changing it rather than folding it into a performance fix.
+- **Alpine.js `x-html`/`x-text` reactivity: prefer removing artificial `tick`-style polling dependencies over throttling them.** A method that reads `void this.tick` recomputes every time that counter changes, regardless of whether the data it actually uses changed — even a throttled/slower counter is still polling. Alpine already tracks which reactive properties a method reads and re-runs it automatically when *those* properties mutate (array `.push()`, reassignment, etc.), so a chart/panel builder should have no tick dependency at all unless it has a genuine live/time-based element (e.g. a countdown) with no underlying data change to key off. Default to letting Alpine's own dependency tracking drive recomputation; only add a tick read when there's a concrete reason sub-second or sub-few-second freshness matters independent of data.
 
 ## Pending Tasks
 
