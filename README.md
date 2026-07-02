@@ -85,7 +85,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 | **Positions** | Count of open positions. |
 | **Last Scan** | Timestamp of the most recent scan cycle. |
 | **Laggard** | The oldest open position — the EDa debt holder. Shows its current debt load when EDa is active. |
-| **Persistence** | "Active" is the live in-memory position count; "Stored" is what's confirmed saved to localStorage. These should always match. A mismatch (shown in red with a warning banner) means a save failed or was overwritten — the bot retries automatically every 5s. If it doesn't clear, check the activity log for `[PST]`/`[PERSIST]` entries, and close any duplicate tabs of the same bot — a second tab can overwrite the first tab's saves with its own stale position count. |
+| **Persistence** | "Active" is the live in-memory position count; "Stored" is what's confirmed saved to localStorage. These should always match. A mismatch (shown in red with a warning banner) means a save failed or was overwritten — the bot retries automatically every 5s. If it doesn't clear, check the activity log for `[PST]`/`[PERSIST]` entries, and close any duplicate tabs of the same bot — a second tab can overwrite the first tab's saves with its own stale position count. The **Storage usage** dropdown below it breaks down total localStorage space by plugin/subcategory (this bot's own state, Permafrost/Ashfall, MultiIndicator, cross-bot shared data, market cap caches), useful for spotting which plugin is bloating storage. |
 
 ### Actions Dropdown
 
