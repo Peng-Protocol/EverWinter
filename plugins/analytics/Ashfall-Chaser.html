@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.40.1';
+  const VERSION        = '1.41.0';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
@@ -73,6 +73,32 @@
   const EVENTS_CAP     = 200;
   const CLOSES_CAP     = 500;
   const SAMPLE_STATE_KEY = '__ew_sample_state_v1'; // cross-bot sample sharing
+
+  // ── Per-data-type storage cap ──
+  // Each distinct data type (wave, liq history, OC history, scorecard, ...) is capped
+  // independently at TYPE_BYTE_CAP bytes, trimming its own oldest entries when it alone
+  // exceeds budget. Deliberately atomized rather than one blanket cap on the whole plugin
+  // blob, so an oversized data type can't force pruning of unrelated data that's still
+  // well within budget — e.g. a liq-history spike shouldn't cost wave history records.
+  const TYPE_BYTE_CAP = 200 * 1024;
+  function trimToByteCap(arr, maxBytes = TYPE_BYTE_CAP) {
+    // Assumes arr is ordered oldest-first (push-appended). Converges in a handful of
+    // iterations by estimating how many records to drop from the size overshoot, rather
+    // than shifting one at a time and re-stringifying the whole array each try.
+    if (!Array.isArray(arr) || arr.length < 2) return arr;
+    let out = arr;
+    let size = new Blob([JSON.stringify(out)]).size;
+    let guard = 0;
+    while (size > maxBytes && out.length > 1 && guard < 25) {
+      const avg = size / out.length;
+      const excess = size - maxBytes;
+      const drop = Math.min(out.length - 1, Math.max(1, Math.ceil(excess / avg)));
+      out = out.slice(drop);
+      size = new Blob([JSON.stringify(out)]).size;
+      guard++;
+    }
+    return out;
+  }
 
   // ── Structure trajectory ("the wave") ──
   // A reading isn't just where the market is now — it's where it came from. We
@@ -707,6 +733,13 @@
         persist() {
           _origPers.call(this);
           try {
+            // Each array is its own atomized data type — capped independently so an
+            // oversized one (e.g. volume history) can't crowd out another (e.g. wave).
+            this.afEvents     = trimToByteCap(this.afEvents);
+            this.afCloses     = trimToByteCap(this.afCloses);
+            this.afWave       = trimToByteCap(this.afWave);
+            this.afVolHistory = trimToByteCap(this.afVolHistory);
+            this.afOiHistory  = trimToByteCap(this.afOiHistory);
             localStorage.setItem(ASH_KEY, JSON.stringify({
               events: this.afEvents, closes: this.afCloses, wave: this.afWave,
               volHistory: this.afVolHistory,
@@ -942,6 +975,10 @@
           try {
             const raw = localStorage.getItem(SAMPLE_STATE_KEY);
             const state = raw ? JSON.parse(raw) : {};
+            // liqHistory duplicates data already fully persisted under its own key
+            // (ASH_LIQ_HISTORY_KEY) — it's shared here only so a halted partner can
+            // backfill cycles it missed. Cap it as its own atomized type rather than
+            // embedding the full (already independently-capped) history verbatim.
             state.chaser = {
               ts: reading.ts,
               klineBar: this._afOwnKlineBar ?? this.afKlineBar,
@@ -952,7 +989,7 @@
               volAbs: reading.volAbs ?? 0,
               ioScore: reading.ioScore ?? null,
               lean: +((reading.skew + reading.breadth) / 2).toFixed(4),
-              liqHistory: this._liqCycleHistory ?? [],
+              liqHistory: trimToByteCap(this._liqCycleHistory ?? []),
             };
             localStorage.setItem(SAMPLE_STATE_KEY, JSON.stringify(state));
           } catch(e) {}
@@ -1011,7 +1048,11 @@
             }
             const GLOBAL_CAP = 5000;
             const capped = trimmed.sort((a, b) => b.ts - a.ts).slice(0, GLOBAL_CAP);
-            localStorage.setItem(SCORE_KEY, JSON.stringify(capped));
+            // Per-slot quota + GLOBAL_CAP bound the record *count*, but with enough
+            // distinct auto-generated slot buckets the total byte size can still run
+            // large — apply the same atomized byte cap as a final safety net, oldest first.
+            const byteCapped = trimToByteCap([...capped].reverse()).reverse();
+            localStorage.setItem(SCORE_KEY, JSON.stringify(byteCapped));
           } catch(e) {}
         },
         _afScoreWrite(criteria, pnl, hist = false) {
@@ -1032,7 +1073,8 @@
               recs.sort((a, b) => b.ts - a.ts);
               trimmed.push(...recs.slice(0, quota));
             }
-            localStorage.setItem(SCORE_KEY, JSON.stringify(trimmed));
+            const byteCapped = trimToByteCap([...trimmed].reverse()).reverse();
+            localStorage.setItem(SCORE_KEY, JSON.stringify(byteCapped));
           } catch(e) {}
         },
         _afScoreBuild() {
@@ -1505,7 +1547,10 @@
         },
 
         _liqPersistHistory() {
-          try { localStorage.setItem(ASH_LIQ_HISTORY_KEY, JSON.stringify(this._liqCycleHistory)); } catch(_) {}
+          try {
+            this._liqCycleHistory = trimToByteCap(this._liqCycleHistory);
+            localStorage.setItem(ASH_LIQ_HISTORY_KEY, JSON.stringify(this._liqCycleHistory));
+          } catch(_) {}
         },
 
         _liqResumeBatch(snapshot) {
@@ -1826,7 +1871,10 @@
         },
 
         _ocPersistHistory() {
-          try { localStorage.setItem(ASH_OC_HIST_KEY, JSON.stringify(this._afOcCycleHistory)); } catch(_) {}
+          try {
+            this._afOcCycleHistory = trimToByteCap(this._afOcCycleHistory);
+            localStorage.setItem(ASH_OC_HIST_KEY, JSON.stringify(this._afOcCycleHistory));
+          } catch(_) {}
         },
 
         _afOcChartSvg() {

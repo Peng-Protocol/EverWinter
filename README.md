@@ -85,7 +85,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 | **Positions** | Count of open positions. |
 | **Last Scan** | Timestamp of the most recent scan cycle. |
 | **Laggard** | The oldest open position — the EDa debt holder. Shows its current debt load when EDa is active. |
-| **Persistence** | "Active" is the live in-memory position count; "Stored" is what's confirmed saved to localStorage. These should always match. A mismatch (shown in red with a warning banner) means a save failed or was overwritten — the bot retries automatically every 5s. If it doesn't clear, check the activity log for `[PST]`/`[PERSIST]` entries, and close any duplicate tabs of the same bot — a second tab can overwrite the first tab's saves with its own stale position count. The **Storage usage** dropdown below it breaks down total localStorage space by plugin/subcategory (this bot's own state, Permafrost/Ashfall, MultiIndicator, cross-bot shared data, market cap caches), useful for spotting which plugin is bloating storage. |
+| **Persistence** | "Active" is the live in-memory position count; "Stored" is what's confirmed saved to localStorage. These should always match. A mismatch (shown in red with a warning banner) means a save failed or was overwritten — the bot retries automatically every 5s. If it doesn't clear, check the activity log for `[PST]`/`[PERSIST]` entries, and close any duplicate tabs of the same bot — a second tab can overwrite the first tab's saves with its own stale position count. The **Storage usage** dropdown below it breaks localStorage down to one row per data type — e.g. Permafrost's structure wave, volume history, OI/MC history, liquidation samples, and OC samples are each their own row rather than one lumped "Permafrost" figure, so a bloated data type is visible on its own. Any row over 200KB is shown in red. |
 
 ### Actions Dropdown
 
@@ -196,6 +196,8 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 2. **CoinPaprika** (fallback) — used for any tickers CoinGecko did not return. Fetches circulating supply; market cap is computed as supply × current Bybit price. Coin list cached 24h in `__cpCoinList`.
 3. **DexScreener** (final fallback) — used for tickers both CoinGecko and CoinPaprika missed. Pulls mcap directly from DEX pair data.
 
+CoinGecko and CoinPaprika's full coin lists cover the entire market (tens of thousands of coins); only the subset matching Bybit's own linear-perp ticker universe is ever persisted to `__cgCoinList`/`__cpCoinList` — the rest is discarded before caching since it's never looked up.
+
 All three sources share their results cross-tab. A ticker with no data from any source cannot satisfy `vm` or `iom` criteria; enabling Fresh V/M Only forces stale-data tickers to be dropped rather than passed.
 
 ### Slots UI
@@ -291,6 +293,8 @@ When surveillance is on: the **Feed Watcher** panel shows active batches (batch 
 ### Danger Zone
 
 **Export** downloads one combined `.json` file with everything the plugin tracks — structure wave (events/closes/wave trajectory), scorecard records, liquidation cycle history, and OC cycle history. **Import** restores all of it from a previously exported file in one step; any field missing from the file is left untouched. **Clear Plugin State** removes all profile data and halt state from localStorage and memory. Use before uninstalling the plugin to avoid orphaned data, or to guarantee a fully clean slate. Irreversible.
+
+**Automatic storage pruning**: structure wave, volume history, OI/MC history, liquidation samples, OC samples, and the shared scorecard are each capped independently at 200KB. If one alone grows past that on a save, its own oldest records are dropped until it's back under budget — other data types aren't touched. This is deliberately per-data-type rather than one shared budget, so a spike in one (e.g. a burst of liquidation activity) can't force pruning of unrelated history (e.g. structure wave) that's still well within its own budget. The Stats menu's Storage usage dropdown shows each of these individually, so a bloated data type is easy to spot before it hits the cap.
 
 ---
 
