@@ -296,6 +296,8 @@ When surveillance is on: the **Feed Watcher** panel shows active batches (batch 
 
 **Automatic storage pruning**: structure wave, volume history, OI/MC history, liquidation samples, OC samples, and the shared scorecard are each capped independently at 200KB. If one alone grows past that on a save, its own oldest records are dropped until it's back under budget — other data types aren't touched. This is deliberately per-data-type rather than one shared budget, so a spike in one (e.g. a burst of liquidation activity) can't force pruning of unrelated history (e.g. structure wave) that's still well within its own budget. The Stats menu's Storage usage dropdown shows each of these individually, so a bloated data type is easy to spot before it hits the cap.
 
+The market cap cache (CoinGecko/CoinPaprika) and the cross-bot shared registry are also capped, at 200KB each — the market cap cache by trimming its entry count to fit, the shared registry by dropping its oldest per-symbol entries across all its internal caches (klines, market cap, watch tickers, liquidation results, ...) until back under budget, same as the history types above.
+
 ---
 
 ## Randomized Outcomes
