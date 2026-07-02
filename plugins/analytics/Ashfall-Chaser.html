@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.40.0';
+  const VERSION        = '1.40.1';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
@@ -1155,6 +1155,11 @@
             pts.push({ x: pad + i + 0.5, lean: bins[i].sum / bins[i].n });
           }
           if (pts.length < 2) return placeholder;
+          // A gap of missing bins this large means the bot was off/unable to sample for a
+          // real stretch of time, not continuous data — break the lines there instead of
+          // drawing a straight connector across the gap.
+          const BIN_MS = WAVE_TTL_MS / BINS;
+          const WAVE_GAP_MS = 3 * 3600 * 1000;
 
           // IO line: crowd funding-rate sentiment; only present in newer wave entries (guard p.io != null)
           const ioBins = new Array(BINS).fill(null).map(() => ({ iSum: 0, n: 0 }));
@@ -1171,6 +1176,7 @@
           let ioSvg = '';
           for (let i = 1; i < ioPts.length; i++) {
             const p1 = ioPts[i-1], p2 = ioPts[i];
+            if ((p2.x - p1.x) * BIN_MS > WAVE_GAP_MS) continue;
             ioSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.io).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.io).toFixed(1)}" stroke="rgba(200,150,255,0.5)" stroke-width="1" stroke-dasharray="3 2"/>`;
           }
 
@@ -1180,11 +1186,12 @@
             if (p.score == null) continue;
             const x = pad + ((p.ts - tMin) / WAVE_TTL_MS) * plotW;
             if (x < pad || x > pad + plotW) continue;
-            scorePts.push({ x, s: p.score });
+            scorePts.push({ x, s: p.score, ts: p.ts });
           }
           let scoreSvg = '';
           for (let i = 1; i < scorePts.length; i++) {
             const p1 = scorePts[i-1], p2 = scorePts[i];
+            if (p2.ts - p1.ts > WAVE_GAP_MS) continue;
             const avg = (p1.s + p2.s) / 2;
             const gv = Math.round(50 + (avg + 1) / 2 * 160);
             scoreSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.s).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.s).toFixed(1)}" stroke="rgba(${gv},${gv},${gv},.8)" stroke-width="1.5"/>`;
@@ -1195,7 +1202,14 @@
           const showScore = this.cfg.afShowScore         ?? true;
           const cur = pts[pts.length - 1].lean;
           const col = cur > 0.05 ? 'var(--profit)' : cur < -0.05 ? 'var(--short)' : '#ff9650';
-          const polyPts = pts.map(p => `${p.x.toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ');
+          const leanGroups = [[pts[0]]];
+          for (let i = 1; i < pts.length; i++) {
+            if ((pts[i].x - pts[i-1].x) * BIN_MS > WAVE_GAP_MS) leanGroups.push([]);
+            leanGroups[leanGroups.length-1].push(pts[i]);
+          }
+          const mainPolylines = leanGroups.map(g => g.length > 1
+            ? `<polyline points="${g.map(p => `${p.x.toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ')}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>`
+            : '').join('');
           const cx = pts[pts.length - 1].x, cy = y(cur);
           return `<svg width="100%" viewBox="0 0 ${W} ${H + labelH}" preserveAspectRatio="none" style="display:block">`
             + `<line x1="0" y1="${pad}" x2="${W}" y2="${pad}" stroke="rgba(0,229,160,.12)"/>`
@@ -1203,7 +1217,7 @@
             + `<line x1="0" y1="${mid.toFixed(1)}" x2="${W}" y2="${mid.toFixed(1)}" stroke="rgba(255,255,255,.18)" stroke-dasharray="3 3"/>`
             + (showIo    ? ioSvg   : '')
             + (showScore ? scoreSvg : '')
-            + (showMain ? `<polyline points="${polyPts}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>` : '')
+            + (showMain ? mainPolylines : '')
             + (showMain ? `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.5" fill="${col}"/>` : '')
             + `<text x="2" y="${pad+7}" fill="rgba(0,229,160,.5)" font-size="8" font-family="monospace">bull</text>`
             + `<text x="2" y="${(H-pad-1).toFixed(1)}" fill="rgba(255,69,96,.5)" font-size="8" font-family="monospace">bear</text>`
@@ -1227,17 +1241,26 @@
           const yMax = Math.max(maxR * 1.2, 1);
           const plotW = W - 2 * pad;
           const y = r => pad + (1 - r / yMax) * (H - 2 * pad);
-          const pts = visible.map(p => {
-            const x = pad + ((p.ts - tMin) / WAVE_TTL_MS) * plotW;
-            return `${x.toFixed(1)},${y(p.ratio).toFixed(1)}`;
-          }).join(' ');
+          // Split into separate polylines across a real sampling gap (OI samples every ~3h;
+          // a gap of 3x that means the bot was off/unable to sample, not continuous data)
+          // instead of drawing a straight line through the missing period.
+          const OI_GAP_MS = 9 * 3600 * 1000;
+          const oiGroups = [[visible[0]]];
+          for (let i = 1; i < visible.length; i++) {
+            if (visible[i].ts - visible[i-1].ts > OI_GAP_MS) oiGroups.push([]);
+            oiGroups[oiGroups.length-1].push(visible[i]);
+          }
+          const polylines = oiGroups.filter(g => g.length > 1).map(g => {
+            const pts = g.map(p => `${(pad + ((p.ts - tMin) / WAVE_TTL_MS) * plotW).toFixed(1)},${y(p.ratio).toFixed(1)}`).join(' ');
+            return `<polyline points="${pts}" fill="none" stroke="rgba(255,140,50,.7)" stroke-width="1.5" stroke-linejoin="round"/>`;
+          }).join('');
           const cur = visible[visible.length - 1];
           const cx = (pad + ((cur.ts - tMin) / WAVE_TTL_MS) * plotW).toFixed(1);
           const cy = y(cur.ratio).toFixed(1);
           const yMidLine = y(yMax * 0.5).toFixed(1);
           return `<svg width="100%" viewBox="0 0 ${W} ${H + labelH}" preserveAspectRatio="none" style="display:block">`
             + `<line x1="0" y1="${yMidLine}" x2="${W}" y2="${yMidLine}" stroke="rgba(255,255,255,.1)" stroke-dasharray="3 3"/>`
-            + `<polyline points="${pts}" fill="none" stroke="rgba(255,140,50,.7)" stroke-width="1.5" stroke-linejoin="round"/>`
+            + polylines
             + `<circle cx="${cx}" cy="${cy}" r="2.5" fill="rgba(255,140,50,.9)"/>`
             + `<text x="2" y="${pad+7}" fill="rgba(255,255,255,.3)" font-size="8" font-family="monospace">${yMax.toFixed(1)}%</text>`
             + `<text x="2" y="${H-1}" fill="rgba(255,255,255,.2)" font-size="8" font-family="monospace">0%</text>`
@@ -1300,8 +1323,11 @@
           let dayLabels='';
           for (let i=1;i<allHours.length;i++) { if (localDay(allHours[i])!==localDay(allHours[i-1])) { const gx=xMap.get(allHours[i]).toFixed(1); gridSvg+=`<line x1="${gx}" y1="${padT}" x2="${gx}" y2="${padT+plotH}" stroke="rgba(255,255,255,.08)"/>`; const d=new Date(allHours[i]); dayLabels+=`<text x="${gx}" y="${H+padB-2}" fill="rgba(255,255,255,.28)" font-size="7" font-family="monospace" text-anchor="middle">${dLabel(d)}</text>`; } }
           const my=yV(meanV).toFixed(1);
+          // Vol line — skip the connecting segment across a real data gap (missing hourly
+          // buckets) instead of drawing a straight line through hours with no samples.
+          const LINE_GAP_MS = 3 * 3600 * 1000;
           let volLine='';
-          for (let i=1;i<buckets.length;i++) { const x1=(xMap.get(buckets[i-1].ts)+BAR_W/2).toFixed(1),x2=(xMap.get(buckets[i].ts)+BAR_W/2).toFixed(1),y1=yV(buckets[i-1].v).toFixed(1),y2=yV(buckets[i].v).toFixed(1); volLine+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="rgba(255,150,80,.75)" stroke-width="1.5"/>`; }
+          for (let i=1;i<buckets.length;i++) { if (buckets[i].ts - buckets[i-1].ts > LINE_GAP_MS) continue; const x1=(xMap.get(buckets[i-1].ts)+BAR_W/2).toFixed(1),x2=(xMap.get(buckets[i].ts)+BAR_W/2).toFixed(1),y1=yV(buckets[i-1].v).toFixed(1),y2=yV(buckets[i].v).toFixed(1); volLine+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="rgba(255,150,80,.75)" stroke-width="1.5"/>`; }
           this._afVolLatestV = buckets[buckets.length - 1].v;
           this._afVolMeanV   = meanV;
           this._afVolOcLatestSec = null;
@@ -1310,8 +1336,8 @@
           if (ocPts.length > 1) {
             const maxOc=Math.max(...ocPts.map(p=>p.avgSec),1) * HEADROOM;
             const yOc=v=>padT+plotH-Math.min(1,v/maxOc)*plotH;
-            const ocMapped=ocPts.map(p=>({x:xMap.get(p.ts)+BAR_W/2,y:yOc(p.avgSec)}));
-            for (let i=1;i<ocMapped.length;i++) ocLine+=`<line x1="${ocMapped[i-1].x.toFixed(1)}" y1="${ocMapped[i-1].y.toFixed(1)}" x2="${ocMapped[i].x.toFixed(1)}" y2="${ocMapped[i].y.toFixed(1)}" stroke="rgba(200,160,80,.8)" stroke-width="1.2"/>`;
+            const ocMapped=ocPts.map(p=>({x:xMap.get(p.ts)+BAR_W/2,y:yOc(p.avgSec),ts:p.ts}));
+            for (let i=1;i<ocMapped.length;i++) { if (ocMapped[i].ts - ocMapped[i-1].ts > LINE_GAP_MS) continue; ocLine+=`<line x1="${ocMapped[i-1].x.toFixed(1)}" y1="${ocMapped[i-1].y.toFixed(1)}" x2="${ocMapped[i].x.toFixed(1)}" y2="${ocMapped[i].y.toFixed(1)}" stroke="rgba(200,160,80,.8)" stroke-width="1.2"/>`; }
             this._afVolOcLatestSec = ocPts[ocPts.length - 1].avgSec;
             // Right-side vertical axis for the OC line's own scale, mirroring the left volume axis.
             const _rax = 6;
