@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.39.5';
+  const VERSION        = '1.40.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -474,6 +474,7 @@
                   <div x-ref="ocChartWrap" x-effect="tick; $nextTick(()=>{ const el=$refs.ocChartWrap; if(!el) return; const vis=!!el.offsetParent; const n=(_pfOcCycleHistory||[]).length; if(!vis){el._ocLastLen=undefined;return;} if(el._ocLastLen!==n){el._ocLastLen=n;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_pfOcChartSvg()"></div></div>
                 </div>
                 <div style="border-top:1px solid rgba(255,255,255,.06);padding:3px 8px 4px">
+                  <div x-text="_pfOcSummaryText()" style="font-family:var(--mono);font-size:8.5px;color:var(--text-lo)"></div>
                   <div x-html="_pfOcInfoHtml()" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px"></div>
                 </div>
               </div>
@@ -531,6 +532,7 @@
         _pfOcCycleHistory: [], // rolling per-cycle snapshots: {id, ts, results:[{sym,bc,sc,avgMs,n}]}
         _pfOcCycleCounter: 0,
         pfOcResults: {},       // {[sym]:{bc,sc,avgMs,n}} from the most recent OC fetch batch
+        _ocFetchRunning: false, // guards against overlapping _ocFetchBatch calls
 
         async init() {
           await _origInit.call(this);
@@ -590,8 +592,24 @@
           try {
             const _ocHist = JSON.parse(localStorage.getItem(PFR_OC_HIST_KEY) || 'null');
             if (Array.isArray(_ocHist) && _ocHist.length) {
-              this._pfOcCycleHistory = _ocHist.filter(c => c && Array.isArray(c.results) && typeof c.ts === 'number' && !isNaN(c.ts)).slice(-40);
-              const _last = this._pfOcCycleHistory[this._pfOcCycleHistory.length - 1];
+              // Purge records from the pre-redesign OC system, which counted a single raw
+              // order number per ticker instead of the current buy/sell split — those
+              // entries lack bc/sc and just clutter the chart with meaningless zero-fill bars.
+              const _rawCount = _ocHist.reduce((n,c) => n + (Array.isArray(c?.results) ? c.results.length : 0), 0);
+              const _cleaned = _ocHist
+                .filter(c => c && Array.isArray(c.results) && typeof c.ts === 'number' && !isNaN(c.ts))
+                .map(c => ({ ...c, results: c.results.filter(r => r && typeof r.sym === 'string' && typeof r.bc === 'number' && typeof r.sc === 'number') }))
+                .filter(c => c.results.length > 0);
+              const _cleanCount = _cleaned.reduce((n,c) => n + c.results.length, 0);
+              this._pfOcCycleHistory = _cleaned.slice(-40);
+              if (_cleanCount < _rawCount) {
+                this.log(`[PFR] 🧹 Purged ${_rawCount - _cleanCount} legacy OC record(s) from stored history (pre-redesign raw-count schema).`, 'info');
+                this._ocPersistHistory();
+              }
+              // Latest cycle by timestamp, not array position — a slower concurrent fetch
+              // finishing after a newer one has already pushed would otherwise leave a stale
+              // batch sitting last in the array.
+              const _last = this._pfOcCycleHistory.reduce((a,c) => (!a || c.ts > a.ts) ? c : a, null);
               if (_last?.results) for (const r of _last.results) { if (r && typeof r.sym === 'string') this.pfOcResults[r.sym] = { bc: r.bc, sc: r.sc, avgMs: r.avgMs, n: r.n }; }
               this._pfOcCycleCounter = Math.max(this._pfOcCycleCounter, _last?.id || 0);
             }
@@ -1784,6 +1802,13 @@
 
         async _ocFetchBatch(symbols) {
           if (!this.cfg.pfOcEnabled || !symbols?.length) return;
+          // Guard against overlapping calls: if a slower fetch (e.g. from a re-triggered
+          // scan) finishes after a newer one already pushed, its stale ticker set would
+          // otherwise land in history too, mixing symbols that were never part of the
+          // latest scan's sample into the display.
+          if (this._ocFetchRunning) return;
+          this._ocFetchRunning = true;
+          try {
           const limit = this.cfg.pfOcOrderLimit ?? 100;
           const results = {};
           const CONC = 10;
@@ -1813,6 +1838,7 @@
           const withInterval = Object.values(results).filter(r => r.avgMs != null);
           const avgSec = withInterval.length ? (withInterval.reduce((s,r)=>s+r.avgMs,0)/withInterval.length/1000).toFixed(1) : '?';
           this.log(`[PFR] 📊 OC sample — ${Object.keys(results).length}t · avg ${avgSec}s/order`, 'info');
+          } finally { this._ocFetchRunning = false; }
         },
 
         _ocPersistHistory() {
@@ -1824,7 +1850,7 @@
           // Defensive: a stale/partial write (e.g. a crash mid-save) or leftover pre-redesign
           // entries in localStorage can leave a history array with malformed shapes. Filter to
           // well-formed entries only so one bad record can't corrupt the whole render.
-          const history = (this._pfOcCycleHistory || []).filter(c => c && Array.isArray(c.results) && typeof c.ts === 'number' && !isNaN(c.ts));
+          const history = (this._pfOcCycleHistory || []).filter(c => c && Array.isArray(c.results) && typeof c.ts === 'number' && !isNaN(c.ts)).sort((a,b)=>a.ts-b.ts);
           if (!history.length) return '';
           const cycleW = 28, dayGapW = 38, H = 80, padL = 28, padB = 16, padT = 6, padR = 4;
           const plotH = H - padT - padB;
@@ -1872,9 +1898,28 @@
           return `<svg width="${W}" height="${H+padB}" style="display:block">`+baseline+grids+bars+dayLabels+`</svg>`;
         },
 
+        // Picks the newest cycle by timestamp rather than array position — see the matching
+        // comment in init() on why array-position ("last pushed") can go stale if two OC
+        // fetches ever overlap.
+        _pfOcLatestCycle() {
+          const hist = this._pfOcCycleHistory || [];
+          return hist.reduce((a,c) => (!a || c.ts > a.ts) ? c : a, null);
+        },
+        _pfOcSummaryText() {
+          void this.tick;
+          const last = this._pfOcLatestCycle();
+          const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
+          if (!results.length) return '';
+          const bc = results.reduce((s,r)=>s+(r.bc||0),0);
+          const sc = results.reduce((s,r)=>s+(r.sc||0),0);
+          const total = bc + sc;
+          if (!total) return '';
+          const buyPct = (bc/total*100).toFixed(0), sellPct = (sc/total*100).toFixed(0);
+          return `${total} order${total===1?'':'s'} sampled · ${buyPct}% buy / ${sellPct}% sell · ${results.length} ticker${results.length===1?'':'s'}`;
+        },
         _pfOcInfoHtml() {
           void this.tick;
-          const last = (this._pfOcCycleHistory||[]).at(-1);
+          const last = this._pfOcLatestCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
           const mean = results.reduce((s,r)=>s+(r.bc||0)+(r.sc||0),0)/results.length;
