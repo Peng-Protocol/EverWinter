@@ -249,7 +249,7 @@ The wave chart has three overlay toggles: **Structure** (the market lean path), 
 
 **Score line during halt**: when the bot is in a drawdown halt or gains lock and its own wave score is unavailable, the score line falls back to the partner bot's most recently published wave score. This means the line stays live even when this bot is not running scans. When the scorecard is thin, the wave score falls back to raw kline momentum from the last completed hour candles across the sampled ticker set.
 
-**Gaps in chart history**: the wave chart's Structure/IO/Score lines, the OI/MC history chart, and the Volume History chart's volume and OC lines all break the line across a real data gap (the bot off, or unable to sample for several hours) instead of drawing a straight connector across the missing period. A resumed session starts a fresh line segment rather than dragging the old one forward to the latest point.
+**Gaps in chart history**: the wave chart's Structure/IO/Score lines, the OI/MC history chart, and the Volume History chart's volume and OC lines all break the line across a real data gap (the bot off, or unable to sample) instead of drawing a straight connector across the missing period. A resumed session starts a fresh line segment rather than dragging the old one forward to the latest point. Each chart's gap threshold matches its own actual sampling cadence exactly — Scan Interval for the wave lines, the OI/MC dedup window (2h) for that chart, and 1h (the bucket size) for the volume/OC lines — rather than a flat or padded value, so a break only ever means a real miss, not normal timing jitter.
 
 ### Status Block
 

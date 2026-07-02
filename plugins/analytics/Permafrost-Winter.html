@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.41.0';
+  const VERSION        = '1.41.1';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -129,6 +129,7 @@
   // wave only takes the helm when the learned profile is thin.
   const WAVE_TTL_MS    = 7 * 24 * 3600 * 1000; // wave retains as much structure history as we have, up to ~a week
   const WAVE_CAP       = 2000;              // hard cap on stored wave points
+  const OI_SAMPLE_MIN_GAP_MS = 2 * 3600_000; // OI/MC dedup guard — also the chart's own gap-break threshold, kept as one constant so the two can't drift apart
   const WAVE_MIN_PTS   = 3;                 // readings needed before a trajectory is meaningful
   const W_LEAN         = 0.6;               // inherent-score weight on the current structure level
   const W_SLOPE        = 0.4;               // inherent-score weight on the trajectory (where it's heading)
@@ -738,11 +739,11 @@
                   if (this.pfWave.length > WAVE_CAP) this.pfWave = this.pfWave.slice(-WAVE_CAP);
                 }
               }
-              // OI/MC history — deduplicate against last entry (MIW samples every ~3h)
+              // OI/MC history — deduplicate against last entry
               const _oi = this._miwOiSkew;
               if (_oi?.ratio != null) {
                 const _lastOi = this.pfOiHistory.length ? this.pfOiHistory[this.pfOiHistory.length - 1] : null;
-                if (!_lastOi || Date.now() - _lastOi.ts > 2 * 3600_000) {
+                if (!_lastOi || Date.now() - _lastOi.ts > OI_SAMPLE_MIN_GAP_MS) {
                   this.pfOiHistory.push({ ts: Date.now(), ratio: +_oi.ratio.toFixed(4) });
                   const _oiCut = Date.now() - WAVE_TTL_MS;
                   this.pfOiHistory = this.pfOiHistory.filter(p => p.ts >= _oiCut).slice(-500);
@@ -1246,9 +1247,10 @@
           if (pts.length < 2) return placeholder;
           // A gap of missing bins this large means the bot was off/unable to sample for a
           // real stretch of time, not continuous data — break the lines there instead of
-          // drawing a straight connector across the gap.
+          // drawing a straight connector across the gap. Threshold matches the actual wave
+          // sampling cadence (scan interval) rather than a flat/arbitrary value.
           const BIN_MS = WAVE_TTL_MS / BINS;
-          const WAVE_GAP_MS = 3 * 3600 * 1000;
+          const WAVE_GAP_MS = (this.cfg.scanMins ?? 15) * 60000;
 
           // IO line: crowd funding-rate sentiment; only present in newer wave entries (guard p.io != null)
           const ioBins = new Array(BINS).fill(null).map(() => ({ iSum: 0, n: 0 }));
@@ -1330,13 +1332,12 @@
           const yMax = Math.max(maxR * 1.2, 1);
           const plotW = W - 2 * pad;
           const y = r => pad + (1 - r / yMax) * (H - 2 * pad);
-          // Split into separate polylines across a real sampling gap (OI samples every ~3h;
-          // a gap of 3x that means the bot was off/unable to sample, not continuous data)
-          // instead of drawing a straight line through the missing period.
-          const OI_GAP_MS = 9 * 3600 * 1000;
+          // Split into separate polylines across a real sampling gap — anything wider than
+          // the actual OI sampling cadence itself (the same dedup guard the sampler uses)
+          // means the bot was off/unable to sample, not continuous data.
           const oiGroups = [[visible[0]]];
           for (let i = 1; i < visible.length; i++) {
-            if (visible[i].ts - visible[i-1].ts > OI_GAP_MS) oiGroups.push([]);
+            if (visible[i].ts - visible[i-1].ts > OI_SAMPLE_MIN_GAP_MS) oiGroups.push([]);
             oiGroups[oiGroups.length-1].push(visible[i]);
           }
           const polylines = oiGroups.filter(g => g.length > 1).map(g => {
@@ -1423,9 +1424,10 @@
           for (let i=1;i<allHours.length;i++) { if (localDay(allHours[i])!==localDay(allHours[i-1])) { const gx=xMap.get(allHours[i]).toFixed(1); gridSvg+=`<line x1="${gx}" y1="${padT}" x2="${gx}" y2="${padT+plotH}" stroke="rgba(255,255,255,.08)"/>`; const d=new Date(allHours[i]); dayLabels+=`<text x="${gx}" y="${H+padB-2}" fill="rgba(255,255,255,.28)" font-size="7" font-family="monospace" text-anchor="middle">${dLabel(d)}</text>`; } }
           // Mean line
           const my = yV(meanV).toFixed(1);
-          // Vol line — skip the connecting segment across a real data gap (missing hourly
-          // buckets) instead of drawing a straight line through hours with no samples.
-          const LINE_GAP_MS = 3 * 3600 * 1000;
+          // Vol line — skip the connecting segment across a real data gap (a missing hourly
+          // bucket) instead of drawing a straight line through hours with no samples.
+          // Threshold matches the bucket's own sampling cadence (1h) exactly.
+          const LINE_GAP_MS = 3600 * 1000;
           let volLine = '';
           for (let i=1;i<buckets.length;i++) { if (buckets[i].ts - buckets[i-1].ts > LINE_GAP_MS) continue; const x1=(xMap.get(buckets[i-1].ts)+BAR_W/2).toFixed(1),x2=(xMap.get(buckets[i].ts)+BAR_W/2).toFixed(1),y1=yV(buckets[i-1].v).toFixed(1),y2=yV(buckets[i].v).toFixed(1); volLine+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="rgba(96,210,255,.75)" stroke-width="1.5"/>`; }
           this._pfVolLatestV = buckets[buckets.length - 1].v;
