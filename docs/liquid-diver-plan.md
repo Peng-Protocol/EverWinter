@@ -82,18 +82,12 @@ Proposed shape:
    covered by the existing "already open" exclusion every strategy here uses, but worth stating
    explicitly since this checks on every message, not once per scan).
 
-**Real open question, methodological, not just a detail**: depth computed against turnover
-*accumulated so far* in an active cycle is not the same measurement as depth computed against a
-*completed* hour. Early in a batch's life, hitting a given depth requires the same absolute
-turnover in far less time — arguably a *stronger* signal (more intense, not just eventually
-large) — but it also means the type classification (sliq vs. msliq, e.g.) can look different at
-minute 5 than it would at the full hour, since the 70%/30% shares are computed on whatever's
-accumulated so far too. Does an early, fast, single-sided spike that hasn't had time to accumulate
-a "typical hour's" worth of activity read correctly under this formula, or does the reactive
-version need its own scaled/prorated baseline (e.g. `avg × elapsedFraction` instead of the full
-`avg`) so a threshold crossing 5 minutes into a batch is judged against a 5-minute expectation
-rather than a full-hour one? This changes how easy/hard it is to trigger early vs. late in a
-cycle and needs a real decision, not an assumption.
+**Resolved**: depth uses the raw full-hour `avgHourlyTurnover`, not prorated by elapsed time in
+the batch. Deliberately a higher bar early in a cycle — an early trigger has to earn it against
+the same denominator a full hour would use, rather than against a scaled-down expectation. Type
+classification (the 70%/30% shares) still naturally reflects whatever's accumulated so far, since
+those are ratios of the two sides against each other, not against the hourly baseline — no
+proration question applies there.
 
 ## Slot Blocking
 
@@ -112,20 +106,11 @@ working normally.
   `sliq` score = `ranks['sliq+'] + ranks['sliq-']` — mirroring the existing pattern already used
   for auto-slot ranking in `_micEffectiveSlots`'s `getRank`.
 
-**Real open question**: "blocked if the score is below a threshold" — below in which direction?
-Two readings are both plausible and need a decision, not an assumption:
-1. **Loss circuit breaker** (most consistent with Sacrifice's framing): block when score is a
-   *loss* exceeding the threshold magnitude — `score ≤ −(25% × baseMargin)`. A type that's been
-   flat or mildly profitable stays open; only a type that's actively losing gets shut off.
-2. **Profitability bar**: block unless score clears a positive bar — `score < +(25% × baseMargin)`
-   blocks, meaning a brand-new type with a $0 score (no trades yet) would start out *blocked*
-   until it proves itself, which would make Historical Scoring-style pre-seeding relevant here
-   too.
-
-Recommend #1 (loss circuit breaker) since it matches every other threshold-as-%-of-margin
-mechanism in this codebase (Cascade/Sacrifice both trigger on crossing into loss/profit territory
-from a neutral starting point, not requiring proof-of-profitability before participating), but
-this needs explicit confirmation since the two produce very different early behavior.
+**Resolved**: loss circuit breaker. Block a type only when its score is an active loss beyond the
+threshold magnitude — `score ≤ −(25% × baseMargin)`. A type that's flat, new (no trades yet), or
+mildly profitable stays open; only one that's demonstrably losing gets shut off. Matches how
+Cascade/Sacrifice already work (crossing into loss territory from neutral, not requiring
+proof-of-profitability up front).
 
 **Unblocking**: does a blocked type ever re-open automatically (e.g. once its score recovers
 above the threshold, checked continuously), or does it require a manual clear, similar to the
@@ -159,13 +144,39 @@ Blind-Entry's)?
 ## Position management — what ports over
 
 Same as Blind-Entry inherited from MultiIndicator: Cascade, Sacrifice (+ rolling variant),
-Halving multiplier, Share Cap — all scoped to Liquid-Diver's own position tag. Substitution is a
-genuine open question here (unlike Blind-Entry, where it clearly didn't apply): Liquid-Diver
-positions *do* have a real classification (their triggering type) even if not a MultiIndicator-
-style composite score — is there any version of Substitution worth considering (e.g. swap out a
-position from a currently-blocked type for a fresh entry from an active one), or is it out of
-scope for the same reason as Blind-Entry (no comparable score to justify a swap)? Leaning out of
-scope by default, but flagging since it's less clear-cut here than for Blind-Entry.
+Halving multiplier, Share Cap — all scoped to Liquid-Diver's own position tag.
+
+**Substitution — reintroduced, but wider than MultiIndicator's version.** Per the user:
+Liquid-Diver's Substitution isn't scoped to its own positions — it can replace *any* held
+position, including ones opened by a different strategy plugin entirely, not just other
+Liquid-Diver positions. This is a meaningfully bigger scope than MultiIndicator's Substitution
+(which only ever compares against its own `_mic`-tagged positions) and needs its own design, not
+a straight port:
+
+- **Ranking basis across heterogeneous positions.** MultiIndicator's Substitution compares
+  composite scores — both sides of the swap use the same scoring system, because both are its
+  own positions. Liquid-Diver reaching into another strategy's position has no shared score to
+  compare against (a MultiIndicator position has a composite score; a manual position has none at
+  all). The two universally-computable metrics on *any* position regardless of origin are
+  unrealized PnL (bump the most underwater position) and age (bump the oldest). Which should
+  decide "worst held position" here — most-underwater, oldest, or some combination?
+- **Blast radius.** This can close a position the user is actively watching under a completely
+  different strategy, triggered by a Liquid-Diver signal that strategy's owner never asked to be
+  measured against. Worth a real safeguard: does "Protect Winners" (never substitute out a
+  currently-profitable position, matching MultiIndicator's existing protection) apply here too,
+  or is that specifically what should be overridable given how time-sensitive a reactive
+  liquidation entry is?
+- **Trigger scope.** Does Liquid-Diver reach into other strategies' positions only once its own
+  Share Cap is exhausted *and* `maxPos` overall is full (genuinely no room anywhere), or does it
+  compete more aggressively — willing to bump another strategy's position even while Liquid-Diver
+  still has headroom left in its own Share Cap, if the live signal is strong enough? The former is
+  a last-resort behavior; the latter is closer to Liquid-Diver treating the whole book, not just
+  its own allocation, as its potential inventory.
+- **Margin bar.** MultiIndicator's Substitution requires the new candidate to beat the held
+  position's score by a configured margin before swapping, to avoid churn on marginal
+  differences. With no shared score to compare against here, what stands in for that margin gate
+  — is crossing the depth threshold itself sufficient justification, or does cross-strategy
+  substitution need a stricter bar than same-strategy substitution did?
 
 ## Config namespace and files (proposed, not final)
 
@@ -180,23 +191,36 @@ Illustrative config (not final — depends on resolving the open questions above
 |---|---|---|
 | `ldcEnabled` | `false` | master toggle |
 | `ldcDepthThreshold` | ? | minimum live depth to trigger entry — needs a default, unresolved |
-| `ldcSlotBlockEnabled` / `ldcSlotBlockPct` | `true` / `25` | Slot Blocking on/off and threshold |
+| `ldcSlotBlockEnabled` / `ldcSlotBlockPct` | `true` / `25` | Slot Blocking on/off and loss threshold |
 | `ldcCascadeEnabled` / `ldcCascadePct` | `true` / `25` | mirrors MIC |
 | `ldcSacrificeEnabled` / `ldcSacrificePct` / `ldcRollingSacrificeEnabled` | `true` / `25` / `true` | mirrors MIC |
 | `ldcHalvingEnabled` / `ldcHalvingHours` | `true` / `0.5` | mirrors MIC |
 | `ldcShareCapEnabled` / `ldcShareCapPct` | `true` / `100` | mirrors MIC |
+| `ldcSubstitutionEnabled` | `true`? | cross-strategy Substitution on/off — shape unresolved, see above |
 
 (Winter mirrors with `ldw` prefix.)
 
 ## Open questions, summarized
 
-1. Mid-cycle depth methodology: raw formula against the full-hour average, or prorated against
-   elapsed time in the batch so far?
-2. Slot Blocking direction: loss circuit breaker (score ≤ −threshold) or profitability bar
-   (score < +threshold, blocking brand-new types by default)?
-3. Does a blocked type auto-unblock when its score recovers, or require manual clear?
-4. Does Substitution have any place here, or is it out of scope like Blind-Entry?
-5. Manifest conflict: one-directional or does MultiIndicator also need updating to list
+**Resolved:**
+- Mid-cycle depth uses the raw full-hour average, not prorated — higher bar early in a cycle.
+- Slot Blocking is a loss circuit breaker: blocks only when a type's score is an active loss
+  beyond the threshold, not a profitability bar.
+- Substitution is back in scope, but cross-strategy (can replace any held position, not just
+  Liquid-Diver's own) — see the four sub-questions below.
+
+**Still open:**
+1. Cross-strategy Substitution ranking basis: most-underwater unrealized PnL, oldest by age, or a
+   combination — what decides "worst held position" when it might belong to a different strategy
+   with no comparable score?
+2. Does Protect Winners (never substitute out a currently-profitable position) apply to
+   cross-strategy substitution, or is that specifically meant to be overridable?
+3. Trigger scope: only reach into other strategies' positions as a last resort (own Share Cap *and*
+   `maxPos` both full), or more aggressively, even with headroom left in Liquid-Diver's own cap?
+4. What stands in for MultiIndicator's Substitution margin gate, with no shared score to compare
+   against — is clearing the depth threshold itself sufficient justification?
+5. Does a blocked type auto-unblock when its score recovers, or require manual clear?
+6. Manifest conflict: one-directional or does MultiIndicator also need updating to list
    Liquid-Diver?
-6. `ldcDepthThreshold` default — no natural anchor from an existing config value the way
+7. `ldcDepthThreshold` default — no natural anchor from an existing config value the way
    Blind-Entry's threshold had Psycho Mode's `psychoChangePct` to borrow from. Needs a number.
