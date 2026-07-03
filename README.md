@@ -18,6 +18,8 @@
 | `plugins/modes/EDa-Chaser.html` | EDa plugin for PseudoChaser |
 | `plugins/strategies/MultiIndicator-Winter.html` | Entry filter plugin for PseudoWinter |
 | `plugins/strategies/MultiIndicator-Chaser.html` | Entry filter plugin for PseudoChaser |
+| `plugins/strategies/BlindEntry-Winter.html` | Control-group entry plugin for PseudoWinter (no criteria, threshold only) |
+| `plugins/strategies/BlindEntry-Chaser.html` | Control-group entry plugin for PseudoChaser (no criteria, threshold only) |
 | `plugins/analytics/Permafrost-Winter.html` | Market climate plugin for PseudoWinter |
 | `plugins/analytics/Ashfall-Chaser.html` | Market climate plugin for PseudoChaser |
 
@@ -37,7 +39,9 @@ In addition to the shared data pool, the Permafrost and Ashfall plugins maintain
 
 To load a plugin, open the **Plugin Manager** panel, click **Load Plugin**, and select the `.html` file. **A page reload is required after loading or removing any plugin** — the plugin pipeline runs once at page boot, so changes don't take effect until the next load.
 
-Load order matters: live trading plugins (EverWinter, SunChaser) must load before strategy plugins (MultiIndicator, Permafrost/Ashfall). The Plugin Manager shows the current load order and warns about conflicts.
+Load order matters: live trading plugins (EverWinter, SunChaser) must load before strategy plugins (MultiIndicator, Blind-Entry, Permafrost/Ashfall). The Plugin Manager shows the current load order and warns about conflicts.
+
+MultiIndicator and Blind-Entry are alternatives, not companions — load one or the other per bot unless intentionally running both to compare (see the Blind-Entry Plugin section).
 
 ---
 
@@ -210,6 +214,33 @@ All three sources share their results cross-tab. A ticker with no data from any 
 
 ---
 
+## Blind-Entry Plugin (BEW / BEC)
+
+A control-group strategy: the only entry gate is 24h price change exceeding a threshold, in either direction — no funding rate, volume ratio, candle pattern, liquidation data, or order-flow data ever decides which ticker gets picked. Its purpose is to measure whether MultiIndicator's criteria-based entry gate actually adds expectancy over its exit machinery (Cascade, Sacrifice, Halving, Share Cap — all shared with MIW/MIC and behave identically) by running the same management tools with entry selection removed. Don't load alongside MultiIndicator on the same bot unless intentionally comparing both — they'll compete for the same position pool via their respective Share Caps.
+
+| Setting | What it does |
+|---|---|
+| **Enabled** (`bewEnabled`/`becEnabled`) | Master on/off. Off by default. |
+| **Change Threshold** (`bewChangePct`/`becChangePct`) | Minimum absolute 24h price change to qualify. Direction doesn't matter, only magnitude. Default 6%. |
+| **Candidates per Cycle** (`bewPerCycle`/`becPerCycle`) | Max new entries per scan, randomly sampled from all qualifying tickers — no ranking. Default 12. |
+| **Re-entry Cooldown** (`bewReentryCooldownHrs`/`becReentryCooldownHrs`) | Minimum hours after any close (by any strategy) before the same symbol can be re-entered. Default 1h. |
+| **Cascade** (`bewCascadeEnabled`/`becCascadeEnabled`) | Closes all Blind-Entry positions when their collective unrealized profit hits a threshold. |
+| **Cascade %** (`bewCascadePct`/`becCascadePct`) | Collective uPnL trigger as a % of base margin (minNotional ÷ leverage). Default 25%. |
+| **Sacrifice** (`bewSacrificeEnabled`/`becSacrificeEnabled`) | Closes Blind-Entry positions when their collective unrealized loss hits a threshold. |
+| **Sacrifice %** (`bewSacrificePct`/`becSacrificePct`) | Collective uLoss trigger as a % of base margin. Default 25%. |
+| **Rolling Sacrifice** (`bewRollingSacrificeEnabled`/`becRollingSacrificeEnabled`) | When on, Sacrifice closes only the oldest Blind-Entry position at a time instead of all at once. On by default. |
+| **Halving** (`bewHalvingEnabled`/`becHalvingEnabled`) | Shrinks the Cascade/Sacrifice trigger threshold the longer the oldest Blind-Entry position has been held — continuous exponential decay based on Halving Interval, same mechanism as MIW/MIC. |
+| **Halving Interval** (`bewHalvingHours`/`becHalvingHours`) | Hours per halving step. Default 0.5. |
+| **Share Cap** (`bewShareCapEnabled`/`becShareCapEnabled`) | Limits Blind-Entry to a percentage of `maxPos`, so it doesn't monopolize the book if another strategy plugin is also loaded. |
+| **Share Cap %** (`bewShareCapPct`/`becShareCapPct`) | The cap percentage. Default 100%. |
+| **OC Scan Cap** (`bewOcScanCap`/`becOcScanCap`) | Max symbols per cycle for the Order Count batch fetch used only for the `+ocs`/`-ocs` tag below — capped separately from Candidates per Cycle since the fetch runs before entries open. Default 20. |
+
+**Position tagging**: every opened position is tagged with three sign-only pairs — `+24h`/`-24h` (ticker direction), `+fund`/`-fund` (funding rate sign, any magnitude), `+ocs`/`-ocs` (buy/sell order-flow majority, no depth threshold). These are recorded, never filtered on — every candidate that clears the Change Threshold gets one of each pair regardless of which side it lands on. They exist purely so Permafrost/Ashfall's Slot Scorecard has something to bucket Blind-Entry's trades by. If Order Count data isn't available for a candidate when it opens (thin liquidity, fetch miss), the position still opens — `+ocs`/`-ocs` is simply omitted from that trade's tags rather than blocking entry. `+24h`/`-24h` share the same Scorecard bucket as MultiIndicator's `+24h`/`-24h` criterion — a shared "was the ticker up or down" signal across whichever strategy produced the trade, not separated per plugin. Requires Permafrost/Ashfall with Order Count Surveillance on for the `+ocs`/`-ocs` tag; the other two tags need no plugin dependency.
+
+Substitution does not apply to Blind-Entry — it has no score to rank a new candidate against a held position, so there's nothing to substitute on.
+
+---
+
 ## Permafrost / Ashfall Plugin
 
 Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins replace the fixed 12h drawdown/gains-lock timers with an adaptive halt system that learns from historical market conditions and trade outcomes. They pair realized PnL from each close with a snapshot of market structure — breadth, momentum, and funding sentiment — building a recency-weighted profile over time. That profile drives a climate score that controls halt duration and signals downstream systems (the bots themselves) to adjust their entry and hold behavior accordingly. In practice, market regime (broadly bullish or bearish) is a significant driver of the learned profile, so the score reflects prevailing conditions rather than precise structural predictions.
@@ -236,7 +267,7 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Liquidation Surveillance** (`pfLiqEnabled`/`ashLiqEnabled`) | Opens WebSocket connections to track live liquidation flow across a rolling sample of volatile tickers. Required for `sliq`/`bliq` criteria in MIW/MIC. |
 | **Liq Batch Size** (`pfLiqBatchSize`/`ashLiqBatchSize`) | Tickers per liquidation batch (5–50). More tickers = broader market coverage per cycle. |
 | **Liq Threshold %** (`pfLiqThresholdPct`/`ashLiqThresholdPct`) | Minimum share of a cycle's total liquidation turnover one side must hold to qualify (10–90%). At 50%, one side must account for at least half. |
-| **Order Count Surveillance** (`pfOcEnabled`/`afOcEnabled`) | Fetches a fixed number of recent trades for MIW's/MIC's own candidate ticker pool each scan cycle. Required for `ocs`/`ocx` criteria in MIW/MIC. Each fetch is a fresh, independent snapshot — no accumulation or deduplication across cycles. |
+| **Order Count Surveillance** (`pfOcEnabled`/`afOcEnabled`) | Fetches a fixed number of recent trades for whichever strategy plugin is driving the scan's candidate pool — MIW/MIC, or Blind-Entry (BEW/BEC) when MultiIndicator isn't loaded. Required for `ocs`/`ocx` criteria in MIW/MIC and for the `+ocs`/`-ocs` tag in Blind-Entry. Each fetch is a fresh, independent snapshot — no accumulation or deduplication across cycles. |
 | **OC Order Limit** (`pfOcOrderLimit`/`afOcOrderLimit`) | Recent trades fetched per ticker per scan cycle (10–500). Buy/sell skew and average order interval are both computed from this single sample. Default 100. |
 
 ### WAVE Tab
@@ -268,9 +299,13 @@ Three directional bar charts below the climate reading show relative dominance a
 
 > **Observational note:** The sampling bars and charts (kline direction, funding skew, volume skew, OI/MC history) are primarily **visual feedback**. They reflect broad market conditions but do not directly gate entries or trigger closes on their own — the only mechanism that acts on them is the combined entry/close signal system (which requires scorecard gating before most signals contribute). Do not read the bars as predictive signals; a heavily red kline bar can coincide with Chaser winning and Winter losing, or vice versa. Treat them as ambient context while the scorecard provides the actual decision weight.
 
+**Requires MultiIndicator**: the Funding Rate Sample, Volume Sample, and OI/MC History bars are computed by MIW/MIC's own sampling pass and disappear entirely if MultiIndicator isn't loaded — they are not shown empty, they don't render at all. Order Count Surveillance and the Slot Scorecard have no such requirement — either MIW/MIC or Blind-Entry can drive them.
+
 ### Slot Scorecard
 
 Chip row showing one chip per base criterion (e.g. `fund>`, `vm>`, `+24h`) with PnL pooled across all slots that contained it. Each close writes one record; the Sponge Quota controls how many recent records per criterion are factored in, so scores always reflect the most recent N closes and adapt quickly to shifts in market behavior. MIW/MIC uses the same per-criterion scores to order its entry queue — slots are ranked by the sum of their individual criteria scores. A slot with one losing criterion and one winning criterion ranks by their combined total.
+
+Blind-Entry (BEW/BEC) writes to the same scorecard using its three fixed pseudo-criteria (`+24h`/`-24h`, `+fund`/`-fund`, `+ocs`/`-ocs` — see the Blind-Entry Plugin section). The chip row shows whichever plugin's records exist — MIW/MIC's, Blind-Entry's, or both if trade history spans both — there's no separate panel or toggle for it.
 
 A live position close isn't the only thing that updates the scorecard. Each completed Historical Scoring batch writes its own records and refreshes the scorecard the same way, so scores can shift between trades whenever Historical Scoring is enabled — see the Hist Scoring panel below.
 

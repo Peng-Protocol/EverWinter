@@ -1,4 +1,4 @@
-# Blind-Entry — Design Plan (draft, not implemented)
+# Blind-Entry — Design Plan (implemented — see plugins/strategies/BlindEntry-Chaser.html / BlindEntry-Winter.html)
 
 ## Purpose
 
@@ -231,8 +231,13 @@ Proposed config keys (illustrative, not final):
 - A configurable way to disable/customize the three Scorecard pseudo-criteria — fixed set for
   v1, not user-adjustable.
 
-## Status: resolved, moving to implementation
+## Status: implemented
 
-All open questions settled: re-entry cooldown mirrors Psycho Mode's `reentryCooldownHrs` (default
-1h), `becPerCycle` defaults to 12 (Psycho Mode's value), config prefix is `bec`/`bew`, OC data is
-batch-fetched for the already-selected random sample with no gating on availability.
+All open questions settled and built: re-entry cooldown mirrors Psycho Mode's
+`reentryCooldownHrs` (default 1h), `becPerCycle`/`bewPerCycle` default to 12, config prefix is
+`bec`/`bew`, OC data is batch-fetched for the already-selected random sample with no gating on
+availability. Position tag properties ended up bot-scoped (`pos._bec`/`pos._becCriteria`,
+`pos._bew`/`pos._bewCriteria`) rather than the generic `pos._blindEntry`/`pos._beCriteria` named
+earlier in this doc, to match the existing `pos._mic`/`pos._miw` convention exactly. See
+`plugins/strategies/BlindEntry-Chaser.html` and `BlindEntry-Winter.html` for the implementation,
+and README.md's "Blind-Entry Plugin (BEW / BEC)" section for user-facing documentation.
