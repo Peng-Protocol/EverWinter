@@ -94,7 +94,19 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 
 **Building slots**: A slot containing only "fund>1" behaves like a fund-chasing filter. A slot containing "+24h" and "vm>10" behaves like a momentum filter. A slot with all three — "+24h", "vm>10", and "fund>1" — requires momentum, participation, and a funding premium to align before opening. Adding "lsa>25" to a bearish slot demands that the last hourly candle confirm the move with volume. The building-block design lets you dial the filter from permissive to strict without changing the underlying logic.
 
-**Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with twelve available criteria, it produces 66 base combinations. At size 3, 220. These are base-name counts — the scorecard tracks a much larger space in practice. Tiered criteria (Fund, V/M, spike, IO/T, IO/M) record the specific tier value at entry, so a single base combination like "Fund + +24h" can produce dozens of distinct scorecard entries depending on how far the funding rate was at each trade. The effective tracked variety grows with data and can far exceed the base count shown. Some criteria are inherently opposed and cannot coexist: +24h and -24h, and any two from the candle group (lsa, lba, rasl, rabl) — a candle can only close in one direction with one volume character simultaneously. Auto-generated slots containing any such pair will never see a position. Combined with auto-correction, this creates a self-pruning strategy: all valid combinations run, and the ones that consistently lose are disabled without manual intervention. Because Buy/Sell Skew and Order Count Deviation are backed by data that is essentially always present, expect them to appear in a large share of matched positions once order flow tracking is turned on — that is expected behavior, not over-triggering.
+**Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with sixteen available criteria, it produces 120 base combinations. At size 3, 560. These are base-name counts — the scorecard tracks a much larger space in practice. Tiered criteria (Fund, V/M, spike, IO/T, IO/M) record the specific tier value at entry, so a single base combination like "Fund + +24h" can produce dozens of distinct scorecard entries depending on how far the funding rate was at each trade. The effective tracked variety grows with data and can far exceed the base count shown. Some criteria are inherently opposed and cannot coexist: +24h and -24h, and any two from the candle group (lsa, lba, rasl, rabl) — a candle can only close in one direction with one volume character simultaneously. Auto-generated slots containing any such pair will never see a position. Combined with auto-correction, this creates a self-pruning strategy: all valid combinations run, and the ones that consistently lose are disabled without manual intervention. Because Buy/Sell Skew and Order Count Deviation are backed by data that is essentially always present, expect them to appear in a large share of matched positions once order flow tracking is turned on — that is expected behavior, not over-triggering.
+
+---
+
+#### Substitution
+
+When every position slot is full, a fresh candidate isn't turned away just because the book is at capacity. Its case is weighed against the weakest current holding using the same scoring the entry gate itself runs on. If the new case outscores the weakest holding by a meaningful margin, swap it in — close the weakest, open the new one. A full book means the worst current holding has to keep defending its spot, not that opportunity stops being evaluated.
+
+The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
+
+By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
+
+This is an entry-gate decision, not a reaction to a struggling position — it belongs beside Market Reading, not beside the exit machinery below.
 
 ---
 
@@ -194,16 +206,6 @@ When the final DCA stage fills and absorption has reduced position margin signif
 #### Rolling Window Sacrifice
 
 When combined unrealized loss crosses a threshold, one can either close all positions at once or only the oldest — one position per trigger. The former sweeps exposure clean; the latter reduces it gradually. Use the staged approach when you want to de-risk without abandoning the book entirely.
-
----
-
-#### Substitution
-
-When every position slot is full and a fresh opportunity outscores your weakest holding by a meaningful margin, swap it in — close the weakest, open the new one. A full book shouldn't mean the door is closed to a genuinely better setup; it should mean the worst current holding has to defend its spot.
-
-The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
-
-By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
 
 ---
 

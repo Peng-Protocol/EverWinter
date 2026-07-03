@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.7.0 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.9.4 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -590,7 +590,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.7.0 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.9.4 · Long Only · No Real Orders</div>
     </div>
     <div class="pills">
       <!-- SIM state pill — always visible -->
@@ -729,7 +729,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               </label>
               <div x-show="cfg.mktWatchEnabled" style="margin-top:8px">
                 <div class="g">
-                  <div class="lbl">List Size <b x-text="cfg.mktWatchSize??10"></b></div>
+                  <div class="lbl">List Size <b x-text="cfg.mktWatchSize??5"></b></div>
                   <input type="range" min="5" max="50" step="5" x-model.number="cfg.mktWatchSize" @change="persist()">
                 </div>
               </div>
@@ -1278,7 +1278,14 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
           <span @click="showStorageBreakdown=!showStorageBreakdown" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
             <span x-text="showStorageBreakdown?'▾':'▸'"></span> Storage usage
           </span>
-          <div x-show="showStorageBreakdown" x-html="_storageBreakdown()" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
+          <span x-show="showStorageBreakdown" @click="_exportStorageBreakdown()" title="Download this breakdown as a text file" style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;text-decoration:underline;user-select:none">⤓ Export</span>
+          <div x-show="showStorageBreakdown" x-html="_storageBreakdown(showStorageBreakdown)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
+        </div>
+        <div style="margin-top:6px">
+          <span @click="showPowerUsage=!showPowerUsage" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
+            <span x-text="showPowerUsage?'▾':'▸'"></span> Power usage
+          </span>
+          <div x-show="showPowerUsage" x-html="_powerUsageHtml(showPowerUsage)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
         </div>
         <button class="btn btn-ghost" style="margin-top:8px;font-size:10px;padding:5px;letter-spacing:1px"
           @click="showDangerZone=!showDangerZone"
@@ -1542,6 +1549,56 @@ let _sharedChannel = null;
 try { _sharedChannel = new BroadcastChannel('ew_shared'); } catch(_) {}
 const BANLIST_TTL_MS = 7 * 24 * 3600 * 1000;
 
+// The shared registry accumulates several independent per-symbol caches (klines_1h,
+// klines_1h_last, watchTickers, mcap, cpSupply, dsMcap, liqResults, ...) inside one blob,
+// merged in by _sharedMerge with no eviction — every symbol either bot has ever touched
+// stays forever. Capped at one combined budget (matching how it shows as a single row in
+// the Storage usage breakdown) rather than per-type, trimming the globally-oldest entries
+// first regardless of which cache they're in. Each per-key entry carries its own `ts`
+// (set by whichever _sharedWrite/_sharedMerge call wrote it); a bucket whose `data` isn't
+// a per-key dict (e.g. bulkTickers, a plain array) is evicted as a whole unit instead,
+// aged by the bucket's own top-level `ts`.
+const SHARED_REGISTRY_BYTE_CAP = 200 * 1024;
+function _trimSharedRegistry(reg, maxBytes = SHARED_REGISTRY_BYTE_CAP) {
+  let json = JSON.stringify(reg);
+  let size = new Blob([json]).size;
+  if (size <= maxBytes) return reg;
+  const units = [];
+  for (const [type, bucket] of Object.entries(reg)) {
+    if (!bucket || typeof bucket !== 'object') continue;
+    const data = bucket.data;
+    const isEntryDict = data && typeof data === 'object' && !Array.isArray(data)
+      && Object.values(data).every(v => v && typeof v === 'object' && typeof v.ts === 'number');
+    if (isEntryDict) {
+      for (const key of Object.keys(data)) units.push({ type, key, ts: data[key].ts });
+    } else {
+      units.push({ type, key: null, ts: bucket.ts || 0 });
+    }
+  }
+  units.sort((a, b) => a.ts - b.ts); // oldest first
+  let idx = 0, guard = 0;
+  while (size > maxBytes && idx < units.length && guard < 25) {
+    const avg = size / Math.max(1, units.length - idx);
+    const excess = size - maxBytes;
+    const drop = Math.min(units.length - idx, Math.max(1, Math.ceil(excess / avg)));
+    for (let j = 0; j < drop; j++) {
+      const u = units[idx + j];
+      if (u.key === null) delete reg[u.type];
+      else if (reg[u.type]?.data) delete reg[u.type].data[u.key];
+    }
+    idx += drop;
+    json = JSON.stringify(reg);
+    size = new Blob([json]).size;
+    guard++;
+  }
+  // Clean up any buckets left with an empty data dict after eviction.
+  for (const type of Object.keys(reg)) {
+    const data = reg[type]?.data;
+    if (data && typeof data === 'object' && !Array.isArray(data) && !Object.keys(data).length) delete reg[type];
+  }
+  return reg;
+}
+
 const _closingIds = new Set();
 const AUDIT_MIN_GAP_MS = 60000;
 let _auditRunning = false;
@@ -1695,6 +1752,11 @@ function pw() { return {
   _cycleRunning: false, // re-entry guard for runScheduledCycle
   _haltLoggedKind: null, // last halt kind logged — suppresses repeat log lines until kind changes
   _roleBadgeProviders: [], // plugins push (item)=>htmlString|null here to render their own position role badge (FIRE, etc.)
+  // Close-reason → badge label shown on closed-trade cards. Built-ins seeded below; plugins
+  // add their own via registerCloseReason() instead of the host hardcoding every reason.
+  // Convention: labels should be a short truncated form (e.g. 'substitution' → 'Sub'), not the
+  // raw reason string — that's what makes the badge scan-able at a glance in the trades list.
+  _closeReasonLabels: { tp: 'TP', sl: 'SL', force: 'FORCE', laggard: 'EDa' },
   _drawdownWindow: [],  // { pnl, ts }[] — rolling 6h closed-trade PnL log for drawdown throttle
   _drawdownHaltUntil: 0, // epoch ms — new scans blocked until this timestamp
   _manualHalt: false,    // user-initiated halt — blocks scans identically to a drawdown halt
@@ -1709,6 +1771,8 @@ function pw() { return {
   _pluginFileErr: '',
   showDangerZone: false,    // toggle for destructive action buttons in Persistence section
   showStorageBreakdown: false, // toggle for the localStorage usage-by-plugin readout
+  showPowerUsage: false,    // toggle for the main-thread tick-cost readout
+  _tickCostSamples: [],     // rolling window of ms spent per 1s tick (incl. reactive re-render), for Power usage
   showImportConfirm: false, // toggle for import data confirmation modal
   showExportMenu: false,    // toggle for export type selection popup
   _pendingImport: null,    // parsed JSON payload awaiting user confirmation
@@ -1755,16 +1819,18 @@ function pw() { return {
     },
     _sharedWrite(type, data) {
       try {
-        const reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
+        let reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
         reg[type] = { data, ts: Date.now(), by: BOT_ID };
+        reg = _trimSharedRegistry(reg);
         localStorage.setItem(SHARED_KEY, JSON.stringify(reg));
         _sharedChannel?.postMessage({ type, ts: Date.now(), by: BOT_ID });
       } catch(_) {}
     },
     _sharedMerge(type, patch, extra) {
       try {
-        const reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
+        let reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
         reg[type] = { ...(reg[type] || {}), ...extra, data: { ...(reg[type]?.data || {}), ...patch }, ts: Date.now(), by: BOT_ID };
+        reg = _trimSharedRegistry(reg);
         localStorage.setItem(SHARED_KEY, JSON.stringify(reg));
         _sharedChannel?.postMessage({ type, ts: Date.now(), by: BOT_ID });
       } catch(_) {}
@@ -1790,7 +1856,7 @@ function pw() { return {
           const j = Math.floor(Math.random() * (i + 1));
           [_mwFiltered[i], _mwFiltered[j]] = [_mwFiltered[j], _mwFiltered[i]];
         }
-        this._mktWatch = _mwFiltered.slice(0, this.cfg.mktWatchSize ?? 10).map(t => ({
+        this._mktWatch = _mwFiltered.slice(0, this.cfg.mktWatchSize ?? 5).map(t => ({
           symbol:       t.symbol,
           lastPrice:    parseFloat(t.lastPrice    || 0),
           fundingRate:  parseFloat(t.fundingRate  || 0),
@@ -1945,7 +2011,7 @@ function pw() { return {
       document.getElementById('pw-load-status').textContent = 'LOADING SAVED STATE...';
       this.loadSaved();
       if (this.cfg.mktWatchEnabled === undefined) this.cfg.mktWatchEnabled = true;
-      if (this.cfg.mktWatchSize    === undefined) this.cfg.mktWatchSize    = 10;
+      if (this.cfg.mktWatchSize    === undefined) this.cfg.mktWatchSize    = 5;
       if (this.cfg.mktWatchSort    === undefined) this.cfg.mktWatchSort    = 'highest';
       document.getElementById('pw-load-status').textContent = 'READY';
       setTimeout(() => showApp(), 400);
@@ -1953,6 +2019,7 @@ function pw() { return {
         ? ' ' + this.savedPositions.length + ' saved position(s) restored.'
         : ' Ready — uses public Bybit market data, no API key required.'), 'info');
       setInterval(()=>{
+        const _tickT0 = performance.now();
         this.tick++;
         this.pruneTpIngress();
         // Self-heal: if the in-memory position count has drifted from what was last
@@ -1960,6 +2027,14 @@ function pw() { return {
         if (this.tick % 5 === 0 && this.positions.length !== this.savedPositions.length) {
           this.persist();
         }
+        // Measured after $nextTick, not right after tick++, since Alpine flushes the
+        // reactive re-render (every x-html/x-text bound to `tick`, across the bot and any
+        // loaded plugins) asynchronously — that flush is the actual cost the Power usage
+        // panel is meant to surface, not the increment itself.
+        this.$nextTick(() => {
+          this._tickCostSamples.push(performance.now() - _tickT0);
+          if (this._tickCostSamples.length > 20) this._tickCostSamples.shift();
+        });
       }, 1000);
 
       // Start position watcher immediately — no API key needed
@@ -2106,10 +2181,9 @@ function pw() { return {
 
   // Reads every localStorage key under this origin and buckets it by which part of the
   // app owns it, so storage bloat (e.g. an unbounded plugin cache) can be spotted at a
-  // glance instead of guessing from the total quota alone.
-  _storageBreakdown() {
-    void this.tick;
-    const fmt = b => b >= 1048576 ? (b/1048576).toFixed(2)+' MB' : b >= 1024 ? (b/1024).toFixed(1)+' KB' : b+' B';
+  // glance instead of guessing from the total quota alone. Shared by the on-screen
+  // breakdown and the export-to-file button so both report the same numbers.
+  _storageRows() {
     const byteSize = v => { try { return new Blob([v]).size; } catch(e) { return (v||'').length; } };
     // Every localStorage key maps to exactly one atomized data-type row — deliberately
     // granular (liq samples separate from structure wave, separate from OC samples, etc.)
@@ -2169,6 +2243,20 @@ function pw() { return {
       }
       addRow(singleKeyMap[k] || 'Other', bytes);
     }
+    return { rows, grand };
+  },
+  // `shown` mirrors the pattern used for the analytics plugins' chart builders: without it,
+  // Alpine still evaluates this on every tick even while the dropdown is collapsed, and this
+  // one is expensive — it Blob-sizes every localStorage value (megabytes' worth, once storage
+  // grows) plus a JSON.parse/re-stringify of the two Permafrost/Ashfall blobs, every second,
+  // regardless of visibility. Alpine's own dependency tracking (which reactive property was
+  // read) doesn't help here since the cost comes from localStorage, not a tracked property —
+  // so unlike the chart fixes, this still needs the tick read, just gated on visibility.
+  _storageBreakdown(shown) {
+    if (!shown) return '';
+    void this.tick;
+    const fmt = b => b >= 1048576 ? (b/1048576).toFixed(2)+' MB' : b >= 1024 ? (b/1024).toFixed(1)+' KB' : b+' B';
+    const { rows, grand } = this._storageRows();
     const TYPE_WARN_BYTES = 200 * 1024;
     const rowsHtml = Object.entries(rows).sort((a,b) => b[1]-a[1]).map(([name,bytes]) => {
       const over = bytes > TYPE_WARN_BYTES;
@@ -2176,6 +2264,50 @@ function pw() { return {
       return `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:${over?'var(--short)':'var(--text-lo)'}">${name}</span><span style="color:${clr}">${fmt(bytes)}</span></div>`;
     }).join('');
     return rowsHtml + `<div style="display:flex;justify-content:space-between;gap:8px;margin-top:3px;padding-top:3px;border-top:1px solid rgba(255,255,255,.08)"><span>Total</span><span style="color:var(--ice)">${fmt(grand)}</span></div>`;
+  },
+  // Dumps the same numbers as _storageBreakdown() to a downloadable .txt file — the
+  // on-screen rows live inside an x-html block that's unreliable to click-drag select,
+  // so this is the actual "get this data out to paste elsewhere" path.
+  _exportStorageBreakdown() {
+    const fmt = b => b >= 1048576 ? (b/1048576).toFixed(2)+' MB' : b >= 1024 ? (b/1024).toFixed(1)+' KB' : b+' B';
+    const { rows, grand } = this._storageRows();
+    const sorted = Object.entries(rows).sort((a,b) => b[1]-a[1]);
+    const lines = [
+      `EverWinter storage usage — PseudoChaser — ${new Date().toISOString()}`,
+      '',
+      ...sorted.map(([name,bytes]) => `${fmt(bytes).padStart(10)}  (${bytes} B)  ${name}`),
+      '',
+      `${fmt(grand).padStart(10)}  (${grand} B)  Total`,
+    ];
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `pseudochaser-storage-${new Date().toISOString().replace(/[:.]/g,'-')}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+
+  // Main-thread cost of each 1s tick — the increment itself is free, what actually costs time
+  // is every x-html/x-text bound to `tick` (or a plugin's own slower tick) re-rendering, which
+  // for a chart-heavy analytics plugin can mean rebuilding SVG strings over hundreds of history
+  // points. Browsers don't expose real CPU%, so this self-timed wall-clock figure is the
+  // closest practical proxy — high or rising values mean something reactive is doing more work
+  // than it needs to, which is exactly the class of bug this panel exists to catch.
+  _powerUsageHtml(shown) {
+    if (!shown) return '';
+    void this.tick;
+    const samples = this._tickCostSamples;
+    if (!samples.length) return `<div style="color:var(--text-lo)">gathering samples…</div>`;
+    const avg = samples.reduce((a,b)=>a+b,0) / samples.length;
+    const max = Math.max(...samples);
+    const warn = avg > 50;
+    const clr = warn ? 'var(--short)' : 'var(--ice)';
+    return `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--text-lo)">Avg main-thread work / tick</span><span style="color:${clr}">${avg.toFixed(1)} ms</span></div>`
+      + `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--text-lo)">Peak (last ${samples.length} ticks)</span><span style="color:${max>50?'var(--short)':'var(--ice)'}">${max.toFixed(1)} ms</span></div>`
+      + `<div style="color:var(--text-lo);font-size:8.5px;margin-top:3px;line-height:1.5">Wall-clock time from each 1s tick to every reactive update it triggers finishing — mostly plugin chart/panel rebuilds. Rising values usually mean a plugin panel left open is redrawing more than it needs to.</div>`;
   },
 
   // PERSISTENCE
@@ -2778,7 +2910,7 @@ function pw() { return {
         const j = Math.floor(Math.random() * (i + 1));
         [pool[i], pool[j]] = [pool[j], pool[i]];
       }
-      this._mktWatch = pool.slice(0, this.cfg.mktWatchSize ?? 10).map(t => ({
+      this._mktWatch = pool.slice(0, this.cfg.mktWatchSize ?? 5).map(t => ({
         symbol:       t.symbol,
         lastPrice:    parseFloat(t.lastPrice    || 0),
         fundingRate:  parseFloat(t.fundingRate  || 0),
@@ -3462,6 +3594,15 @@ function pw() { return {
     if (typeof fn === 'function' && !this._roleBadgeProviders.includes(fn)) this._roleBadgeProviders.push(fn);
   },
 
+  // Plugins call this (typically in their init) to register the badge label for a
+  // pseudoClosePosition() reason string they introduce, e.g. registerCloseReason('substitution',
+  // 'Sub'). Label should be a short truncated form, not the raw reason string. Reasons with no
+  // registered label fall back to showing the raw reason string as-is (see reasonLabel below).
+  registerCloseReason(reason, label) {
+    if (!this._closeReasonLabels) this._closeReasonLabels = {};
+    if (reason && label) this._closeReasonLabels[reason] = label;
+  },
+
   // The single role badge for a position/closed-trade: a plugin renderer if one
   // claims it, else no badge (strategies are now entirely plugin-provided).
   _roleBadge(item) {
@@ -3633,7 +3774,7 @@ function pw() { return {
       const badgeStyle = isWin
         ? 'color:var(--profit);border-color:rgba(0,229,160,.3);background:var(--profit-dim)'
         : 'color:var(--short);border-color:rgba(255,69,96,.3);background:var(--short-glow)';
-      const reasonLabel = t.reason === 'tp' ? 'TP' : t.reason === 'sl' ? 'SL' : t.reason === 'force' ? 'FORCE' : t.reason === 'laggard' ? 'EDa' : 'CLOSE';
+      const reasonLabel = this._closeReasonLabels?.[t.reason] || t.reason || 'CLOSE';
       const funBadge  = '';
       const salfBadge = '';
       const typeBadge = this._roleBadge(t);
