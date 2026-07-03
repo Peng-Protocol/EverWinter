@@ -90,64 +90,88 @@ alongside it, not because concurrent MIC+BEC use is the actual plan.
 
 ## AF/PF restructuring around MultiIndicator's absence
 
-Checked against the live code rather than assumed. The dividing line is not as clean as
-"scorecard + score line vs. everything else":
+Checked against the live code rather than assumed — the Score line and the Scorecard panel are
+*not* the same mechanism, and they don't need the same treatment.
+
+**The Score line needs no changes at all.** `afCloses.push({ts, pnl, skew, breadth})` fires
+unconditionally in `pseudoClosePosition`, for any closed position regardless of which strategy
+closed it — it is not gated on `pos._mic`. The line itself is driven by `_afEffectiveScore`,
+which blends that kernel-weighted PnL-vs-conditions regression with the wave's own lean/FIO
+reading — no reference to `micCollapsedSlotRanks` anywhere in that chain. It already works for
+Blind-Entry's closes today, automatically. (The earlier draft of this plan assumed the Score line
+was built from MultiIndicator's scorecard — that was wrong; corrected here.)
 
 **Genuinely independent** (triggered from Ashfall/Permafrost's own `runScan`/interval, no
-MultiIndicator involvement): Structure/FIO wave, Volume History chart, Liquidation Surveillance.
-These keep working unchanged with MultiIndicator removed — no action needed.
+MultiIndicator involvement): Structure/FIO wave, Volume History chart, Liquidation Surveillance,
+and (per above) the Score line. These keep working unchanged with MultiIndicator removed — no
+action needed.
 
-**Currently coupled to MultiIndicator, contrary to how it might look at a glance:**
+**Currently coupled to MultiIndicator:**
 - **OC Surveillance** — the fetch function lives in Ashfall/Permafrost, but MultiIndicator
   decides which symbols to sample and makes the call, using its own scan's candidate pool.
 - **Funding Rate Sample / Volume Sample / OI-MC History bars** — populated by MultiIndicator's
   own sampling pass (`_micFundSkew`/`_micVolSkew`/`_micOiSkew`), not computed independently by
   AF/PF.
-- **Scorecard panel and Score line** — built entirely from `micCollapsedSlotRanks`.
 
-**Resolved**: none of these get duplicated into Blind-Entry or refactored to run standalone. When
-MultiIndicator isn't loaded, all four are simply hidden — the OC Surveillance panel, the three
-sampling bars, and the Scorecard panel disappear from the accordion entirely rather than showing
-empty/broken placeholders. This is a UI visibility question, not a data-collection one: nothing
-in Blind-Entry needs to reproduce what those panels do.
+**Resolved**: these three don't get duplicated into Blind-Entry or refactored to run standalone —
+they're simply hidden when MultiIndicator isn't loaded, rather than showing empty/broken
+placeholders. A single presence flag is enough: MultiIndicator's own `init()` sets
+`this._micLoaded = true` (mirrored `this._miwLoaded` for Winter), and the OC Surveillance panel
+plus the three sampling bars gate their `x-show` on that flag.
 
-**Presence detection**: a single boolean flag is enough — no need for the more general
-multi-source registry considered earlier, since the real scenario is exactly one of
-"MultiIndicator present" or "absent," not several strategy plugins simultaneously feeding the
-same panel. MultiIndicator's own `init()` sets `this._micLoaded = true` (mirrored `this._miwLoaded`
-for Winter); every AF/PF panel in the coupled list above gates its `x-show` on that flag instead
-of on `cfg.ashfallScorecardEnabled` alone. Simple, direct, no abstraction beyond what's needed.
+**The Scorecard panel is a separate case, not a "hide" case — see below.**
 
-## Score line v2 — a Blind-Entry PnL line takes the Score line's place
+## Scorecard — a minimal criteria set for Blind-Entry, not just a hide/show toggle
 
-The current Score line (`afShowScore`/`pfShowScore`) is built from MultiIndicator's
-`micCollapsedSlotRanks` — many collapsed criterion slots, each with its own running score, summed
-per candidate. Blind-Entry has no criteria to break down by, so its equivalent isn't a scorecard
-in the same sense — it's a single running tally: net/cumulative realized PnL across its own
-closed trades, one line, no per-slot breakdown.
+The Scorecard's write path is gated on `pos._mic && pos._micCriteria?.length` (Ashfall-Chaser.html
+around line 1569) — unlike the Score line, this genuinely needs criteria data to populate at all,
+and Blind-Entry has none by default.
 
-- When MultiIndicator is present (`_micLoaded`/`_miwLoaded`), the Score line and Scorecard panel
-  behave exactly as they do today — unchanged.
-- When it's absent and Blind-Entry is loaded instead, the Score line is driven by Blind-Entry's
-  own PnL tally rather than staying hidden along with the Scorecard panel — this is the one
-  MIC-coupled element that gets a real replacement instead of just disappearing, because the user
-  specifically wants this comparison visible on the wave chart.
-- **Minimum sample size**: per the user, this line isn't meaningful below 3 closed trades — show
-  a "gathering data" placeholder before that, the same pattern already used for the wave/volume
-  charts before they have enough points to plot.
-- The two are separate, independent stores (MultiIndicator's existing scorecard vs. a new, much
-  smaller Blind-Entry PnL history) — Blind-Entry's store doesn't need the collapsed-rank/tier
-  machinery at all, just a rolling list of closed-trade PnL values with timestamps.
+**Resolved approach**: Blind-Entry tags each position with a small, fixed set of sign-only,
+untiered pseudo-criteria at close time — not real filters, since entry stays purely the
+`|24h change| ≥ threshold` gate. These exist only to give the Scorecard something to bucket:
+
+- `+24h` / `-24h` — direction of the ticker's 24h change. Always exactly one applies.
+- `+fund` / `-fund` — sign of the funding rate at entry, any magnitude. Always one applies.
+- `+ocs` / `-ocs` — which side (buy/sell) had order-flow majority at entry, no depth threshold.
+  Always one applies.
+
+None of these gate entry — they're recorded, not filtered on. This is what makes them safe under
+"zero proactive contamination": every candidate that clears the 24h threshold gets one of each
+pair regardless of which side it lands on, so nothing about *which* candidates get picked changes.
+
+**Bucket collisions, checked against `collapseCrit`:**
+- `+fund`/`-fund` land in `fund>`/`fund<` — a bucket MIC's current tiered `fund+N`/`fund-N`
+  criteria never write to (MIC migrated off the bare form). No collision.
+- `+ocs`/`-ocs` (sign-prefixed) land in their own bucket, distinct from MIC's sign-*suffixed*
+  `ocs+`/`ocs-`. No collision, as long as the prefix convention is kept.
+- `+24h`/`-24h` **do** collide with MIC's live, currently-used `+24h`/`-24h` criterion — same
+  bucket, PnL pools together. **Confirmed intentional** — a shared "was the ticker up or down"
+  signal across whichever strategy produced the trade is the wanted behavior, not a bug to avoid.
+
+**Implementation shape**: extend the Scorecard write-gate to
+`(pos._mic && pos._micCriteria?.length) || (pos._blindEntry && pos._beCriteria?.length)`, feeding
+the same `_afScoreBuild`/chip-render machinery MultiIndicator already uses. No new panel, no new
+"gathering data" placeholder logic — the existing panel already handles the empty-history case
+today (shows the toggle, no chips, until records exist), so it needs nothing extra for a smaller
+criteria set. No presence flag needed here either: the panel just reflects whatever's actually in
+the data, MIC's chips or Blind-Entry's, same as it always has.
+
+**Position-type badges**: Blind-Entry gets its own emoji-per-criterion role badge, mirroring
+MultiIndicator's `CRIT_EMOJI` convention — reuse the existing `+24h`/`-24h` emoji (⬆️/⬇️) and
+funding emoji logic where the same criterion already has one, add a matching emoji for the OCS
+pair.
 
 ## Data tagging for comparison
 
 The entire point of this plugin is to be comparable against MultiIndicator's real numbers. Since
 both would share the same `positions`/`closedTrades` arrays on the same bot instance:
 
-- Every Blind-Entry position gets `pos._blindEntry = true`, mirroring `pos._mic`.
+- Every Blind-Entry position gets `pos._blindEntry = true` and `pos._beCriteria = [...]` (the
+  three sign-tags at entry), mirroring `pos._mic`/`pos._micCriteria`.
 - Register a role badge (`registerRoleBadge`) so positions/closed trades are visually
   distinguishable in the Trades menu, same mechanism MultiIndicator already uses for its 'Multi'
-  badge.
+  badge — see Position-type badges above.
 - Close reasons reuse the existing strings (`'cascade'`, `'sacrifice'`) rather than inventing
   new ones — they already have registered labels via `registerCloseReason()`
   (Ashfall/Permafrost-Winter session work), and reusing them keeps the Trades menu badges
@@ -187,9 +211,11 @@ Proposed config keys (illustrative, not final):
 - Any DCA-escalation exit style — Blind-Entry inherits whatever Binary/DCA mode the host bot is
   already configured with, same as MultiIndicator does today. It is not a Psycho-Mode port; it's
   a MultiIndicator-shaped strategy with the entry gate removed.
-- Duplicating OC Surveillance / sampling-bar logic into Blind-Entry, or refactoring those four to
-  run independent of any strategy plugin — resolved as "hide when MultiIndicator is absent"
+- Duplicating OC Surveillance / sampling-bar logic into Blind-Entry, or refactoring those three
+  to run independent of any strategy plugin — resolved as "hide when MultiIndicator is absent"
   instead (see above). Worth revisiting as a separate cleanup later, not part of this plan.
+- A configurable way to disable/customize the three Scorecard pseudo-criteria — fixed set for
+  v1, not user-adjustable.
 
 ## Open questions for the user before implementation starts
 
