@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.43.0';
+  const VERSION        = '1.44.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -553,6 +553,7 @@
         pfStatus:  { skew: null, breadth: null, score: null, mass: 0, count: 0, lean: 0, slope: 0, inherent: 0, eff: null, fioScore: null, at: 0 },
         pfCrossEvents: [],
         _liqBatches: [],
+        _liqMessageHooks: [], // plugins push (batch, sym) => void here to react to live liq turnover, e.g. Liquid-Diver
         _liqPersistPending: false, // debounce guard for _liqPersistBatches
         _liqResults: {},
         _liqResultsVersion: 0,
@@ -1612,6 +1613,7 @@
           // used to gate entry, that exist purely so the scorecard has something to bucket.
           const _scoreCriteria = (pos._miw && pos._miwCriteria?.length) ? pos._miwCriteria
             : (pos._bew && pos._bewCriteria?.length) ? pos._bewCriteria
+            : (pos._ldw && pos._ldwCriteria?.length) ? pos._ldwCriteria
             : null;
           if (this.cfg.permafrostScorecardEnabled && _scoreCriteria) {
             const _t = this.closedTrades?.[0];
@@ -1712,6 +1714,8 @@
                 if (!isFinite(turnover) || turnover <= 0) continue;
                 if (side === 'Sell')      batch.sLiqTurnover[sym] += turnover;
                 else if (side === 'Buy')  batch.bLiqTurnover[sym] += turnover;
+                else continue;
+                for (const fn of (this._liqMessageHooks || [])) { try { fn(batch, sym); } catch(_) {} }
               }
               this._liqPersistBatches();
             } catch(_) {}
@@ -1732,6 +1736,14 @@
           openWs();
           batch._endTimer = setTimeout(() => this._liqCloseBatch(batch), remaining);
           this.log(`[PFR] 💧 Liq cycle #${id} resumed — ${batch.symbols.length} tickers, ${Math.round(remaining / 60000)}m remaining`, 'info');
+        },
+
+        // Called for every incoming liq message, per touched symbol, with the batch object still
+        // live (sLiqTurnover/bLiqTurnover/avgHourlyTurnover already updated) — before the batch
+        // closes. Lets a reactive consumer (e.g. Liquid-Diver) compute a mid-cycle depth reading
+        // without waiting for _liqCloseBatch's once-per-hour snapshot.
+        registerLiqMessageHook(fn) {
+          if (typeof fn === 'function' && !this._liqMessageHooks.includes(fn)) this._liqMessageHooks.push(fn);
         },
 
         _liqLaunchBatch() {
@@ -1777,6 +1789,8 @@
                 if (!isFinite(turnover) || turnover <= 0) continue;
                 if (side === 'Sell')      batch.sLiqTurnover[sym] += turnover;
                 else if (side === 'Buy')  batch.bLiqTurnover[sym] += turnover;
+                else continue;
+                for (const fn of (this._liqMessageHooks || [])) { try { fn(batch, sym); } catch(_) {} }
               }
               this._liqPersistBatches();
             } catch(_) {}

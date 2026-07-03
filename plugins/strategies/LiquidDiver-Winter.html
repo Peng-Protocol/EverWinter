@@ -1,0 +1,400 @@
+<!--
+  Liquid-Diver Strategy Plugin for PseudoWinter
+  Specialized liquidation-only strategy. Unlike Multi-Indicator's sliq/bliq/msliq/mbliq gates
+  (which only ever read a finished, hour-old liquidation cycle at scan time), Liquid-Diver reacts
+  live — it hooks Permafrost's liquidation WebSocket feed directly and opens a position the instant
+  a ticker's liquidation depth crosses the configured threshold, mid-cycle, without waiting for the
+  next scan or the batch's hour-end close. Scanning still matters here only because it's what
+  creates new liquidation surveillance batches (Permafrost's own runScan -> _liqLaunchBatch) — it
+  is not the entry trigger. See docs/liquid-diver-plan.md for the full design rationale.
+
+  Cannot run alongside Multi-Indicator-Winter (enforced via manifest conflicts) — both plugins
+  would otherwise fight over interpreting the same liquidation cycles on two different timelines,
+  and Slot Blocking (below) needs sole ownership of the sliq/bliq/msliq/mbliq scorecard buckets to
+  mean anything. Requires Permafrost's Liq Surveillance (pfLiqEnabled) to be on; without it there
+  are no live batches to react to.
+
+  Depth uses its own finer, 1%-step formula (calcLiveDepth) — a deliberately different cadence
+  from Multi-Indicator's coarse 10%-step calcDepth, local to this plugin only.
+
+  Slot Blocking: a per-type (sliq/bliq/msliq/mbliq) loss circuit breaker. If a type's collapsed
+  scorecard score is a loss beyond the configured percentage of base margin, new entries of that
+  type are blocked — continuously re-checked, no manual clear needed — while the other three types
+  keep working. Reads the same shared scorecard Multi-Indicator writes to when it's the one loaded.
+
+  Position management ports directly from Multi-Indicator: Cascade, Sacrifice (+ rolling variant),
+  a halving multiplier, and a Share Cap. Substitution is reintroduced but wider than
+  Multi-Indicator's own version — it can replace ANY held position, including ones opened by a
+  different strategy plugin, ranked by most-underwater unrealized PnL, no Protect Winners, no
+  margin gate (clearing the depth threshold is justification enough) — deliberately aggressive,
+  since genuine liquidation events are rare.
+
+  Each opened position is tagged with the real liquidation criterion that triggered entry (e.g.
+  sliq+14) plus three sign-only, untiered pseudo-criteria — +24h/-24h, +fund/-fund, +ocs/-ocs —
+  the same cosmetic tags Blind-Entry uses. The cosmetic tags feed the Scorecard only and never
+  gate entry or Slot Blocking. OC data is fetched for the single triggering symbol before the
+  position opens; a candidate still enters even if that fetch comes back empty, just without the
+  +ocs/-ocs tag.
+
+  Load via Plugin Manager in PseudoWinter's config panel.
+  targetBot: pseudowinter
+-->
+<script>
+(function () {
+  'use strict';
+
+  const VERSION = '1.0.0';
+
+  const LIQ_TYPE_EMOJI = { sliq: '🥵', bliq: '🥶', msliq: '💦', mbliq: '🌨️' };
+  const CRIT_EMOJI = { '+24h': '⬆️', '-24h': '⬇️', '+fund': '💰', '-fund': '🤑', '+ocs': '📈', '-ocs': '📉' };
+
+  // 1%-step relative-deviation depth, local to Liquid-Diver — 10x finer than Multi-Indicator's
+  // calcDepth. Floor of -100 falls out naturally at raw=0; +250 caps the same relative range
+  // (250% above average) as calcDepth's ±25 does at its coarser cadence.
+  const calcLiveDepth = (raw, avg) => avg > 0 ? Math.max(-100, Math.min(250, Math.trunc((raw / avg - 1) * 100))) : -100;
+
+  window.__BotPlugin = {
+    id:        'liquiddiver-winter',
+    name:      'Liquid-Diver (Winter)',
+    version:   VERSION,
+    targetBot: 'pseudowinter',
+    after:     ['permafrost-winter'],
+    before:    [],
+    conflicts: ['multiindicator-winter'],
+    requires:  [],
+    touches:   ['init', 'runScan'],
+
+    css: `
+      .ldw-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+    `,
+
+    slots: {
+      'mode-label-extra': `<span x-show="cfg.ldwEnabled"> + Dive</span>`,
+      'strategy-accordions': `
+        <div x-data="{ open: false }">
+          <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span>◌ Liquid-Diver</span>
+              <span x-show="cfg.ldwEnabled" style="font-size:8px;padding:1px 5px;background:rgba(96,210,255,.15);border:1px solid rgba(96,210,255,.35);border-radius:2px;color:var(--ice);letter-spacing:1px">ON</span>
+              <span x-show="!cfg.ldwEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
+            </div>
+            <span class="cfg-acc-arrow" :class="open?'open':''">▶</span>
+          </button>
+          <div x-show="open" x-transition.opacity class="cfg-acc-body">
+            <label class="tog" @click.prevent="if(!cfgLocked){cfg.ldwEnabled=!cfg.ldwEnabled;persist()}">
+              <div class="tog-t" :class="cfg.ldwEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Liquid-Diver Mode</div>
+                <div class="ldw-hint">Opens immediately when a surveilled ticker's live liquidation depth crosses the threshold. Requires Permafrost's Liq Surveillance on. Cannot run with Multi-Indicator.</div>
+              </div>
+            </label>
+            <div x-show="cfg.ldwEnabled" style="margin-top:8px">
+              <div class="lbl">Depth Threshold <b x-text="'+'+(cfg.ldwDepthThreshold??0)"></b></div>
+              <input type="number" class="inp" min="0" step="1" x-model.number="cfg.ldwDepthThreshold" :disabled="cfgLocked" @change="persist()" style="width:80px">
+              <div class="ldw-hint">Minimum live depth (1% steps vs. average hourly trading turnover) to trigger entry. No ceiling — the 70%/30% liquidation-share requirement already filters noise.</div>
+
+              <div class="ldw-hint" style="margin-top:8px;padding:6px 8px;background:rgba(96,210,255,.04);border:1px solid rgba(96,210,255,.12);border-radius:3px">Every opened position is tagged with the triggering liquidation criterion (e.g. sliq+14) plus +24h/-24h, +fund/-fund, +ocs/-ocs for the Scorecard only.</div>
+
+              <div class="lbl" style="margin-top:10px">Slot Blocking</div>
+              <label class="tog" style="margin-top:4px" @click.prevent="if(!cfgLocked){cfg.ldwSlotBlockEnabled=!cfg.ldwSlotBlockEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldwSlotBlockEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Enabled</div>
+                  <div class="ldw-hint">Blocks new entries for a single liquidation type (sliq/bliq/msliq/mbliq) once its scorecard score is a loss beyond <span x-text="cfg.ldwSlotBlockPct??25"></span>% of base margin. Other types keep working. Auto-clears once the score recovers.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldwSlotBlockEnabled" style="margin-top:4px;margin-left:2px">
+                <input type="range" min="5" max="100" step="5" x-model.number="cfg.ldwSlotBlockPct" :disabled="cfgLocked" @change="persist()">
+              </div>
+
+              <div class="lbl" style="margin-top:10px">Management</div>
+              <label class="tog" style="margin-top:4px" @click.prevent="if(!cfgLocked){cfg.ldwCascadeEnabled=!cfg.ldwCascadeEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldwCascadeEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Cascade</div>
+                  <div class="ldw-hint">Closes the whole Liquid-Diver book at once when its collective unrealized PnL crosses +<span x-text="cfg.ldwCascadePct??25"></span>% of base margin.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldwCascadeEnabled" style="margin-top:4px;margin-left:2px">
+                <input type="range" min="5" max="100" step="5" x-model.number="cfg.ldwCascadePct" :disabled="cfgLocked" @change="persist()">
+              </div>
+
+              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ldwSacrificeEnabled=!cfg.ldwSacrificeEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldwSacrificeEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Sacrifice</div>
+                  <div class="ldw-hint">Mirror of Cascade: closes when collective unrealized PnL crosses -<span x-text="cfg.ldwSacrificePct??25"></span>% of base margin.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldwSacrificeEnabled" style="margin-top:4px;margin-left:2px">
+                <input type="range" min="5" max="100" step="5" x-model.number="cfg.ldwSacrificePct" :disabled="cfgLocked" @change="persist()">
+              </div>
+              <label class="tog" style="margin-top:6px;margin-left:12px" @click.prevent="if(!cfgLocked){cfg.ldwRollingSacrificeEnabled=!cfg.ldwRollingSacrificeEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldwRollingSacrificeEnabled?'on':''"><div class="tog-k"></div></div>
+                <span class="tog-l" style="font-size:9px">Rolling (close oldest only, not whole book)</span>
+              </label>
+
+              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ldwHalvingEnabled=!cfg.ldwHalvingEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldwHalvingEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Halving</div>
+                  <div class="ldw-hint">Cascade/Sacrifice thresholds shrink exponentially the longer the oldest Liquid-Diver position has been open — half-life <span x-text="cfg.ldwHalvingHours??0.5"></span>h.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldwHalvingEnabled" style="margin-top:4px;margin-left:2px">
+                <input type="range" min="0.25" max="6" step="0.25" x-model.number="cfg.ldwHalvingHours" :disabled="cfgLocked" @change="persist()">
+              </div>
+
+              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ldwShareCapEnabled=!cfg.ldwShareCapEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldwShareCapEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Share Cap</div>
+                  <div class="ldw-hint">Caps Liquid-Diver's own direct entries to at most <span x-text="cfg.ldwShareCapPct??100"></span>% of Max Positions. Past the cap, a live signal falls through to Substitution instead of opening directly.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldwShareCapEnabled" style="margin-top:4px;margin-left:2px">
+                <input type="range" min="5" max="100" step="5" x-model.number="cfg.ldwShareCapPct" :disabled="cfgLocked" @change="persist()">
+              </div>
+
+              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ldwSubstitutionEnabled=!cfg.ldwSubstitutionEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldwSubstitutionEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Substitution</div>
+                  <div class="ldw-hint">When there's no room (Share Cap or Max Positions), closes the most-underwater held position — any strategy's, not just Liquid-Diver's own — and opens the live signal in its place.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldwSubstitutionEnabled" style="margin-top:4px;margin-left:2px">
+                <div class="lbl">Min Age <b x-text="(cfg.ldwSubstitutionMinAgeMins??10)+'m'"></b></div>
+                <input type="range" min="5" max="240" step="5" x-model.number="cfg.ldwSubstitutionMinAgeMins" :disabled="cfgLocked" @change="persist()">
+                <div class="ldw-hint">A held position must be at least this old before Substitution can close it.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _origInit = def.init;
+      const _origScan = def.runScan;
+
+      return Object.assign({}, def, {
+
+        async init() {
+          await _origInit.call(this);
+          if (this.cfg.ldwEnabled                   === undefined) this.cfg.ldwEnabled                   = false;
+          if (this.cfg.ldwDepthThreshold             === undefined) this.cfg.ldwDepthThreshold             = 0;
+          if (this.cfg.ldwSlotBlockEnabled           === undefined) this.cfg.ldwSlotBlockEnabled           = true;
+          if (this.cfg.ldwSlotBlockPct               === undefined) this.cfg.ldwSlotBlockPct               = 25;
+          if (this.cfg.ldwCascadeEnabled             === undefined) this.cfg.ldwCascadeEnabled             = true;
+          if (this.cfg.ldwCascadePct                 === undefined) this.cfg.ldwCascadePct                 = 25;
+          if (this.cfg.ldwSacrificeEnabled           === undefined) this.cfg.ldwSacrificeEnabled           = true;
+          if (this.cfg.ldwSacrificePct               === undefined) this.cfg.ldwSacrificePct               = 25;
+          if (this.cfg.ldwRollingSacrificeEnabled    === undefined) this.cfg.ldwRollingSacrificeEnabled    = true;
+          if (this.cfg.ldwHalvingEnabled             === undefined) this.cfg.ldwHalvingEnabled             = true;
+          if (this.cfg.ldwHalvingHours               === undefined) this.cfg.ldwHalvingHours               = 0.5;
+          if (this.cfg.ldwShareCapEnabled            === undefined) this.cfg.ldwShareCapEnabled            = true;
+          if (this.cfg.ldwShareCapPct                === undefined) this.cfg.ldwShareCapPct                = 100;
+          if (this.cfg.ldwSubstitutionEnabled        === undefined) this.cfg.ldwSubstitutionEnabled        = true;
+          if (this.cfg.ldwSubstitutionMinAgeMins     === undefined) this.cfg.ldwSubstitutionMinAgeMins     = 10;
+
+          this._ldwOpening = new Set(); // symbols with an in-flight reactive open, guards double-fire
+
+          this.registerRoleBadge?.(item => {
+            if (!item || !item._ldw) return null;
+            const type = item._ldwLiqType;
+            const liqEmoji = (type && LIQ_TYPE_EMOJI[type]) || '💧';
+            const crits = item._ldwCriteria || [];
+            const emoji = liqEmoji + crits.slice(1).map(c => CRIT_EMOJI[c] || '').join('');
+            const title = crits.length ? 'Dive: ' + crits.join(' + ') : 'Liquid-Diver';
+            return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(96,210,255,.45);color:var(--ice);background:rgba(96,210,255,.10)" title="${title}">${emoji}</span>`;
+          });
+          this.registerCloseReason?.('substitution', 'Sub');
+
+          if (this.cfg.ldwEnabled && !this.cfg.pfLiqEnabled) {
+            this.log('[LDW] ⚠️ Liquid-Diver is on but Permafrost\'s Liq Surveillance (pfLiqEnabled) is off — there are no live batches to react to', 'warn');
+          }
+
+          this.registerLiqMessageHook?.((batch, sym) => { this._ldwOnLiqMessage(batch, sym); });
+
+          this.log(`[LDW] Liquid-Diver (Winter) v${VERSION} loaded — ${this.cfg.ldwEnabled ? 'enabled' : 'disabled'} | depth ≥ +${this.cfg.ldwDepthThreshold}`, 'info');
+        },
+
+        _ldwHalvingMultiplier() {
+          if (!this.cfg.ldwHalvingEnabled) return 1;
+          const pos = (this.positions || []).filter(p => p._ldw);
+          if (!pos.length) return 1;
+          const oldest = pos.reduce((m, p) => Math.min(m, p.openedAt || Date.now()), Date.now());
+          return Math.pow(0.5, (Date.now() - oldest) / ((this.cfg.ldwHalvingHours ?? 0.5) * 3600000));
+        },
+
+        async _ldwCheckCascade() {
+          if (!this.cfg.ldwCascadeEnabled) return;
+          const ldwPositions = (this.positions || []).filter(p => p._ldw);
+          if (!ldwPositions.length) return;
+          const totalUPnL  = ldwPositions.reduce((s, p) => s + (p.upnl || 0), 0);
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const halvMul    = this._ldwHalvingMultiplier();
+          const threshold  = baseMargin * ((this.cfg.ldwCascadePct ?? 25) / 100) * halvMul;
+          if (totalUPnL >= threshold) {
+            const halvNote = halvMul < 0.999 ? ` × halving ×${halvMul.toFixed(3)}` : '';
+            this.log(`[LDW] 🌊 Cascade triggered — collective uPnL +${totalUPnL.toFixed(4)} ≥ ${threshold.toFixed(4)} USDT (${this.cfg.ldwCascadePct ?? 25}%${halvNote} of ${baseMargin.toFixed(4)} base margin) — bailing ${ldwPositions.length} position(s)`, 'info');
+            this._logBatchBegin?.();
+            try {
+              for (const pos of ldwPositions) {
+                await this.pseudoClosePosition(pos, 'cascade');
+              }
+            } finally { this._logBatchEnd?.('[LDW] 🌊 Cascade roll-up'); }
+          }
+        },
+
+        async _ldwCheckSacrifice() {
+          if (!this.cfg.ldwSacrificeEnabled) return;
+          const ldwPositions = (this.positions || []).filter(p => p._ldw);
+          if (!ldwPositions.length) return;
+          const totalUPnL  = ldwPositions.reduce((s, p) => s + (p.upnl || 0), 0);
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const halvMul    = this._ldwHalvingMultiplier();
+          const threshold  = -(baseMargin * ((this.cfg.ldwSacrificePct ?? 25) / 100) * halvMul);
+          if (totalUPnL <= threshold) {
+            const halvNote = halvMul < 0.999 ? ` × halving ×${halvMul.toFixed(3)}` : '';
+            if (this.cfg.ldwRollingSacrificeEnabled) {
+              const oldest = ldwPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
+              this.log(`[LDW] 🩸 Rolling sacrifice — uPnL ${totalUPnL.toFixed(4)} ≤ ${threshold.toFixed(4)} USDT (${this.cfg.ldwSacrificePct ?? 25}%${halvNote} of ${baseMargin.toFixed(4)} base margin) — closing oldest: ${oldest.symbol}`, 'info');
+              await this.pseudoClosePosition(oldest, 'sacrifice');
+            } else {
+              this.log(`[LDW] 🩸 Sacrifice triggered — collective uPnL ${totalUPnL.toFixed(4)} ≤ ${threshold.toFixed(4)} USDT (${this.cfg.ldwSacrificePct ?? 25}%${halvNote} of ${baseMargin.toFixed(4)} base margin) — bailing ${ldwPositions.length} position(s)`, 'info');
+              this._logBatchBegin?.();
+              try {
+                for (const pos of ldwPositions) {
+                  await this.pseudoClosePosition(pos, 'sacrifice');
+                }
+              } finally { this._logBatchEnd?.('[LDW] 🩸 Sacrifice roll-up'); }
+            }
+          }
+        },
+
+        async runScan() {
+          await this._ldwCheckCascade();
+          await this._ldwCheckSacrifice();
+          await _origScan.call(this);
+        },
+
+        // Slot Blocking reads the same shared collapsed-rank table Multi-Indicator populates
+        // (built by Permafrost regardless of which strategy plugin wrote the underlying records).
+        _ldwTypeScore(type) {
+          const ranks = this.miwCollapsedSlotRanks || {};
+          return (ranks[type] ?? 0) + (ranks[type + '+'] ?? 0) + (ranks[type + '-'] ?? 0);
+        },
+
+        _ldwIsBlocked(type) {
+          if (!(this.cfg.ldwSlotBlockEnabled ?? true)) return false;
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const threshold  = baseMargin * ((this.cfg.ldwSlotBlockPct ?? 25) / 100);
+          return this._ldwTypeScore(type) <= -threshold;
+        },
+
+        // Called live, per touched symbol, for every incoming liquidation message — not scan-gated.
+        async _ldwOnLiqMessage(batch, sym) {
+          if (!this.cfg.ldwEnabled) return;
+          if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
+          if (this._isSymbolBanned?.(sym)) return;
+          if (this._ldwOpening.has(sym)) return;
+          if ((this.positions || []).some(p => p.symbol === sym)) return;
+
+          const sRaw  = batch.sLiqTurnover?.[sym] || 0;
+          const bRaw  = batch.bLiqTurnover?.[sym] || 0;
+          const total = sRaw + bRaw;
+          if (!total) return;
+          const sPct = sRaw / total, bPct = bRaw / total;
+
+          let type = null;
+          if (sPct >= 0.70) type = 'sliq';
+          else if (bPct >= 0.70) type = 'bliq';
+          else if (sPct > bPct && bPct >= 0.30) type = 'msliq';
+          else if (bPct > sPct && sPct >= 0.30) type = 'mbliq';
+          if (!type) return;
+
+          const isSell = type === 'sliq' || type === 'msliq';
+          const raw    = isSell ? sRaw : bRaw;
+          const avg    = batch.avgHourlyTurnover?.[sym] || 0;
+          const depth  = calcLiveDepth(raw, avg);
+          if (depth < (this.cfg.ldwDepthThreshold ?? 0)) return;
+          if (this._ldwIsBlocked(type)) return;
+
+          const t = (this._lastAllTickers || []).find(x => x.symbol === sym);
+          if (!t) return;
+
+          this._ldwOpening.add(sym);
+          try {
+            await this._ldwTryOpen(t, type, depth);
+          } finally {
+            this._ldwOpening.delete(sym);
+          }
+        },
+
+        async _ldwTryOpen(t, type, depth) {
+          let headroom = (this.cfg.maxPos ?? 5) - (this.positions?.length ?? 0);
+          if (this.cfg.ldwShareCapEnabled ?? true) {
+            const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.ldwShareCapPct ?? 100) / 100)));
+            const ldwCount = (this.positions || []).filter(p => p._ldw).length;
+            headroom = Math.min(headroom, capSlots - ldwCount);
+          }
+          if (headroom >= 1) return await this._ldwOpen(t, type, depth);
+          if (!(this.cfg.ldwSubstitutionEnabled ?? true)) return false;
+          return await this._ldwTrySubstitute(t, type, depth);
+        },
+
+        // Cross-strategy, on purpose: ranks EVERY held position (not just Liquid-Diver's own) by
+        // most-underwater unrealized PnL, no Protect Winners, no margin gate — clearing the depth
+        // threshold is justification enough. Aggressive, matching how rare a genuine liquidation
+        // event actually is.
+        async _ldwTrySubstitute(t, type, depth) {
+          const minAgeMs = (this.cfg.ldwSubstitutionMinAgeMins ?? 10) * 60000;
+          const now = Date.now();
+          const pool = (this.positions || []).filter(p => (now - (p.openedAt || 0)) >= minAgeMs);
+          if (!pool.length) return false;
+          const worst = pool.reduce((a, b) => (a.upnl ?? 0) <= (b.upnl ?? 0) ? a : b);
+          this.log(`[LDW] 🔁 Substitution — closing ${worst.symbol} (uPnL ${(worst.upnl ?? 0).toFixed(4)}) for ${t.symbol} (${type}${depth >= 0 ? '+' : ''}${depth} live signal)`, 'info');
+          await this.pseudoClosePosition(worst, 'substitution');
+          return await this._ldwOpen(t, type, depth);
+        },
+
+        async _ldwOpen(t, type, depth) {
+          const sym = t.symbol;
+          let price = parseFloat(t.lastPrice || 0);
+          if (!price) return false;
+          try {
+            const r  = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+            const d  = await r.json();
+            const lp = parseFloat(d?.result?.list?.[0]?.lastPrice);
+            if (lp > 0) price = lp;
+          } catch(e) {}
+          const change = parseFloat(t.price24hPcnt || 0) * 100;
+          const fr     = parseFloat(t.fundingRate  || 0) * 100;
+
+          if (this.cfg.pfOcEnabled) { await this._ocFetchBatch?.([sym]); }
+          const _ocR = this.pfOcResults?.[sym];
+
+          const lenBefore = (this.positions || []).length;
+          await this.pseudoOpenShort({ symbol: sym, price, change, fundingRate: fr });
+          if ((this.positions?.length ?? 0) <= lenBefore) return false;
+
+          const pos = this.positions[this.positions.length - 1];
+          pos._ldw = true;
+          pos._ldwLiqType = type;
+          pos._ldwDepth = depth;
+          const liqCrit = `${type}${depth >= 0 ? '+' : ''}${depth}`;
+          const crits = [ liqCrit, change >= 0 ? '+24h' : '-24h', fr >= 0 ? '+fund' : '-fund' ];
+          if (_ocR && (_ocR.bc + _ocR.sc) > 0) crits.push(_ocR.bc >= _ocR.sc ? '+ocs' : '-ocs');
+          pos._ldwCriteria = crits;
+          if (typeof this.persist === 'function') this.persist();
+          this.log(`[LDW] ⚡ Reactive entry — ${sym} on ${liqCrit}`, 'info');
+          return true;
+        },
+
+      });
+    },
+  };
+})();
+</script>
