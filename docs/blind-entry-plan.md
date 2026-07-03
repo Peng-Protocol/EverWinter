@@ -99,26 +99,65 @@ re-verifying it actually exists and does what the name implies.
   plugins stacking on the same host — Blind-Entry should follow the same wrap-and-call-through
   pattern MultiIndicator uses, not a new mechanism.
 
-## AF/PF integration and the Score line
+## AF/PF integration — what's actually independent of MultiIndicator
 
-The user wants Ashfall/Permafrost's data collection and charts (structure wave, volume history,
-liquidation surveillance, OC surveillance) to keep working normally — those are observational,
-not entry filters, so they're fine regardless of which strategy plugin is driving entries.
+Checked against the live code rather than assumed. The dividing line is not as clean as
+"scorecard + score line vs. everything else":
 
-The **Score line** (`afShowScore`/`pfShowScore`, the wave chart overlay derived from
-`micCollapsedSlotRanks`) is a different matter — it's built entirely from MultiIndicator's slot
-scorecard, which Blind-Entry positions can't and shouldn't feed (see "zero proactive
-contamination" above). When only Blind-Entry is running:
+**Genuinely independent** (triggered from Ashfall/Permafrost's own `runScan`/interval, no
+MultiIndicator involvement): Structure/FIO wave, Volume History chart, Liquidation Surveillance.
+These keep working unchanged regardless of which strategy plugin(s) are loaded.
 
-- The Score line will show nothing/flat, because there's no scorecard data behind it — this
-  already degrades gracefully today (score toggle checks `cfg.afShowScore` and reads
-  `micCollapsedSlotRanks`, which would simply be empty). No new guard needed for this to not look
-  broken; it will just show an empty line, matching the existing "gathering data" placeholder
-  states already used elsewhere in these charts.
-- Recommend leaving `afShowScore`/`pfShowScore` as a manual toggle the user turns off themselves
-  when running Blind-Entry-only, rather than adding auto-detection logic to flip it off — a new
-  "is MultiIndicator installed" check is one more thing to keep in sync and isn't worth it for a
-  cosmetic toggle the user already knows to flip.
+**Currently coupled to MultiIndicator, contrary to how it might look at a glance:**
+- **OC Surveillance** — the fetch function lives in Ashfall/Permafrost, but MultiIndicator
+  decides which symbols to sample and makes the call, using its own scan's candidate pool. With
+  only BEC/BEW loaded, OC data goes silent unless BEC/BEW also drives that call itself (using its
+  own candidate pool from the same `|24h change| ≥ threshold` filter it already computes for
+  entry — this is a reasonable ask since Blind-Entry already knows those symbols, just needs to
+  make the same call MultiIndicator does).
+- **Funding Rate Sample / Volume Sample / OI-MC History bars** — populated by MultiIndicator's
+  own sampling pass (`_micFundSkew`/`_micVolSkew`/`_micOiSkew`), not computed independently by
+  AF/PF. Same story: needs BEC/BEW to populate the same fields, or these three bars go blank
+  under Blind-Entry-only.
+
+This means "does BEC/BEW replace MultiIndicator cleanly" isn't just a scorecard/score-line
+question — OC Surveillance and the three sampling bars need the same treatment, or they silently
+stop working the moment MultiIndicator is removed from the stack. Worth deciding whether BEC/BEW
+takes over driving these (duplicating a small amount of MIC's sampling logic) or whether this is
+the moment to refactor those four things to compute directly off `_lastAllTickers` inside AF/PF
+itself, independent of any strategy plugin — which would actually be the more correct fix, since
+none of the four conceptually need a strategy plugin's involvement at all.
+
+## Score line v2 — a Blind-Entry PnL line, and a two-database Score tab
+
+The current Score line (`afShowScore`/`pfShowScore`) is built from MultiIndicator's
+`micCollapsedSlotRanks` — many collapsed criterion slots, each with its own running score, summed
+per candidate. Blind-Entry has no criteria to break down by, so its equivalent isn't a scorecard
+in the same sense — it's a single running tally: net/cumulative realized PnL across its own
+closed trades, one line, no per-slot breakdown. Structurally simpler, and it should be treated as
+a **separate, second data store**, not squeezed into the existing scorecard shape.
+
+- **Minimum sample size**: per the user, this line isn't meaningful below 3 closed trades — show
+  a "gathering data" placeholder before that, the same pattern already used for the wave/volume
+  charts before they have enough points to plot.
+- **Two independent databases**: MultiIndicator's scorecard (`micCollapsedSlotRanks` /
+  `__everwinter_scorecard_v1`) and a new, much smaller Blind-Entry PnL store persist side by
+  side, completely independently. Neither reads or depends on the other.
+- **Presence-driven UI**: when only one of MultiIndicator or Blind-Entry is loaded, the Score tab
+  shows only that one's toggles/scorecard/score-line — no dead controls for a system that isn't
+  installed.
+- **Precedence toggle when both are loaded**: a single toggle in the Score tab picks which
+  scorecard + score line is the one actually displayed/plotted, since showing both at once on the
+  same wave chart would be visual noise, not a meaningful overlay. This does *not* mean one
+  database stops recording — both keep tracking in the background regardless of which one is
+  currently displayed; the toggle only controls what's rendered.
+- **How presence gets detected**: rather than AF/PF special-casing "does `micCollapsedSlotRanks`
+  exist" vs "does the Blind-Entry store exist," the cleaner fit with this codebase's existing
+  conventions (`registerRoleBadge`, `registerCloseReason`) is a new registration hook — each
+  strategy plugin calls something like `this.registerScoreSource?.({ id, label, getScorecard,
+  getScoreAt })` in its own `init()`. AF/PF then just asks "what score sources are registered"
+  instead of hardcoding which plugins might exist. This scales cleanly if a third strategy plugin
+  shows up later needing the same treatment.
 
 ## Data tagging for comparison
 
@@ -168,9 +207,13 @@ Proposed config keys (illustrative, not final):
 - Any DCA-escalation exit style — Blind-Entry inherits whatever Binary/DCA mode the host bot is
   already configured with, same as MultiIndicator does today. It is not a Psycho-Mode port; it's
   a MultiIndicator-shaped strategy with the entry gate removed.
-- Auto-detecting whether MultiIndicator is installed to change behavior. Coexistence should come
-  from tag-scoping, not mode-switching.
-- The AF/PF Score-line auto-disable — manual toggle is enough (see above).
+- Position management (Cascade/Sacrifice/Share Cap) stays tag-scoped, not presence-detected —
+  MultiIndicator and Blind-Entry each manage only their own tagged positions regardless of what
+  else is loaded. Presence detection is only for the AF/PF Score tab UI (see above), not for how
+  positions get managed.
+- The `_micFundSkew`/`_micVolSkew`/`_micOiSkew`/OC Surveillance refactor (compute directly in
+  AF/PF instead of depending on MultiIndicator) — flagged as the more correct fix above, but it's
+  a separate piece of work from Blind-Entry itself and shouldn't block v1.
 
 ## Open questions for the user before implementation starts
 
@@ -183,3 +226,12 @@ Proposed config keys (illustrative, not final):
    accident on a shared install.
 4. Confirm config prefix (`bec`/`bew`) and file names before anything gets built, since renaming
    after the fact means another migration shim.
+5. Should BEC/BEW take over driving OC Surveillance and the three sampling bars when
+   MultiIndicator isn't loaded (duplicating a bit of MIC's sampling logic), or is this the right
+   moment to refactor those four to compute directly in AF/PF, independent of any strategy
+   plugin? The latter is more correct long-term but is a bigger, separate change.
+6. Confirm the `registerScoreSource`-style hook approach for presence detection in the Score tab,
+   or if a simpler direct check (does the Blind-Entry PnL store have data) is preferred instead.
+7. Precedence toggle UX: does switching it only change what's *displayed*, with both databases
+   always recording in the background (as assumed above), or should it also pause/resume which
+   one is actively tracked?
