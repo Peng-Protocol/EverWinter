@@ -37,22 +37,27 @@ worse version of MultiIndicator.
 
 ## Entry logic
 
-- Filter: `|price24hPcnt| ≥ beChangePct` (default 6, matches Psycho Mode's `psychoChangePct`
-  default).
-- Direction of the position is fixed by the host bot (Chaser → long via `pseudoOpenLong`,
-  Winter → short via `pseudoOpenShort`), same as MultiIndicator. The 24h move can be up or down
-  in either case — there is no "only chase confirmed momentum" logic, because adding that would
-  itself be a proactive filter.
-- Pool selection within a scan cycle: random shuffle (Fisher-Yates), same as Psycho Mode — no
-  ranking, because ranking requires a score, and a score is exactly what this plugin must not
-  have.
-- Respects `openSymbols`, symbol banlist, and re-entry cooldown the same way every other
-  strategy here does — those are account-hygiene guards, not signal.
+Resolved sequence, per cycle:
 
-**Open question**: does the threshold apply once per scan cycle only (skip a candidate that's
-already open elsewhere), or does it also need its own per-symbol cooldown after a close, the way
-Psycho Mode's `reentryCooldownHrs` works? Recommend mirroring Psycho Mode's cooldown for
-consistency, but this needs confirmation.
+1. Filter candidates: `|price24hPcnt| ≥ becChangePct` (default 6, matches Psycho Mode's
+   `psychoChangePct` default), excluding already-open symbols, banlist, and re-entry cooldown
+   (mirrors Psycho Mode's `reentryCooldownHrs`, default 1h).
+2. Random shuffle (Fisher-Yates) and take a bounded sample, up to `becPerCycle` (default 12,
+   matching Psycho Mode) or remaining slots, whichever is smaller. This is the entire selection
+   step — no ranking, no scoring, because a score is exactly what this plugin must not have.
+3. Batch-fetch OC data for *only that already-selected sample* (`_ocFetchBatch`), same pattern
+   MultiIndicator uses. This step never filters — it's pure data collection on a set that's
+   already locked in. If OC data comes back missing for a candidate (thin liquidity, fetch
+   failure), that candidate still enters; `+ocs`/`-ocs` is simply omitted from its `_beCriteria`
+   rather than blocking entry. Consequence: the `+ocs`/`-ocs` Scorecard chips may end up with a
+   smaller sample size than `+24h`/`-24h` and `+fund`/`-fund`, which have no fetch dependency
+   (both read straight off the ticker payload already in hand).
+4. Open each position (`pseudoOpenLong` for Chaser, `pseudoOpenShort` for Winter), tagging
+   `pos._blindEntry = true` and `pos._beCriteria = [...]` (see Scorecard section).
+
+Direction of the position is fixed by the host bot, same as MultiIndicator — the 24h move can be
+up or down in either case, there is no "only chase confirmed momentum" logic, since adding that
+would itself be a proactive filter.
 
 ## Position management — what ports over
 
@@ -109,15 +114,23 @@ action needed.
 **Currently coupled to MultiIndicator:**
 - **OC Surveillance** — the fetch function lives in Ashfall/Permafrost, but MultiIndicator
   decides which symbols to sample and makes the call, using its own scan's candidate pool.
+  **Correction**: Blind-Entry needs real OC data for its own `+ocs`/`-ocs` tagging (batch-fetched
+  for its randomly-selected candidate pool each cycle, no gating — see Entry logic), so it drives
+  `_ocFetchBatch()` itself rather than going without. Since it's already making that call, the OC
+  Surveillance panel does *not* need hiding after all — it shows real data regardless of which
+  strategy is driving it. This corrects the earlier version of this section.
 - **Funding Rate Sample / Volume Sample / OI-MC History bars** — populated by MultiIndicator's
   own sampling pass (`_micFundSkew`/`_micVolSkew`/`_micOiSkew`), not computed independently by
-  AF/PF.
+  AF/PF. Blind-Entry has no equivalent need (funding sign is read inline per-candidate from the
+  ticker payload, no aggregate bar needed), so these three still hide when MultiIndicator's
+  absent.
 
-**Resolved**: these three don't get duplicated into Blind-Entry or refactored to run standalone —
-they're simply hidden when MultiIndicator isn't loaded, rather than showing empty/broken
+**Resolved**: the three sampling bars don't get duplicated into Blind-Entry or refactored to run
+standalone — simply hidden when MultiIndicator isn't loaded, rather than showing empty/broken
 placeholders. A single presence flag is enough: MultiIndicator's own `init()` sets
-`this._micLoaded = true` (mirrored `this._miwLoaded` for Winter), and the OC Surveillance panel
-plus the three sampling bars gate their `x-show` on that flag.
+`this._micLoaded = true` (mirrored `this._miwLoaded` for Winter), and the three sampling bars gate
+their `x-show` on that flag. OC Surveillance is unaffected by this flag — it works off whoever is
+actually calling `_ocFetchBatch()`.
 
 **The Scorecard panel is a separate case, not a "hide" case — see below.**
 
@@ -173,9 +186,10 @@ both would share the same `positions`/`closedTrades` arrays on the same bot inst
   distinguishable in the Trades menu, same mechanism MultiIndicator already uses for its 'Multi'
   badge — see Position-type badges above.
 - Close reasons reuse the existing strings (`'cascade'`, `'sacrifice'`) rather than inventing
-  new ones — they already have registered labels via `registerCloseReason()`
-  (Ashfall/Permafrost-Winter session work), and reusing them keeps the Trades menu badges
-  consistent instead of doubling the label count.
+  new ones. Correction: neither currently has a registered label via `registerCloseReason()` —
+  only `'substitution'` → `'Sub'` was registered this session — so both fall through to the raw
+  fallback and display as literal "cascade"/"sacrifice" today. That's existing MultiIndicator
+  behavior, unaffected either way by reusing the same strings; not a Blind-Entry-specific gap.
 - **Stretch goal, not required for v1**: a simple "MIC vs Blind-Entry" split somewhere in the
   Stats menu, similar in spirit to the existing Combined/Own scorecard toggle, so the comparison
   doesn't require manually filtering exported trade data by hand. Worth doing once there's
@@ -217,11 +231,8 @@ Proposed config keys (illustrative, not final):
 - A configurable way to disable/customize the three Scorecard pseudo-criteria — fixed set for
   v1, not user-adjustable.
 
-## Open questions for the user before implementation starts
+## Status: resolved, moving to implementation
 
-1. Per-symbol re-entry cooldown after a close — mirror Psycho Mode's `reentryCooldownHrs`, or
-   rely only on "already open" exclusion within a cycle?
-2. Default `becPerCycle` (candidates opened per scan cycle) — Psycho Mode uses 12; confirm or
-   adjust.
-3. Confirm config prefix (`bec`/`bew`) and file names before anything gets built, since renaming
-   after the fact means another migration shim.
+All open questions settled: re-entry cooldown mirrors Psycho Mode's `reentryCooldownHrs` (default
+1h), `becPerCycle` defaults to 12 (Psycho Mode's value), config prefix is `bec`/`bew`, OC data is
+batch-fetched for the already-selected random sample with no gating on availability.
