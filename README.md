@@ -272,6 +272,8 @@ Three directional bar charts below the climate reading show relative dominance a
 
 Chip row showing one chip per base criterion (e.g. `fund>`, `vm>`, `+24h`) with PnL pooled across all slots that contained it. Each close writes one record; the Sponge Quota controls how many recent records per criterion are factored in, so scores always reflect the most recent N closes and adapt quickly to shifts in market behavior. MIW/MIC uses the same per-criterion scores to order its entry queue — slots are ranked by the sum of their individual criteria scores. A slot with one losing criterion and one winning criterion ranks by their combined total.
 
+A live position close isn't the only thing that updates the scorecard. Each completed Historical Scoring batch writes its own records and refreshes the scorecard the same way, so scores can shift between trades whenever Historical Scoring is enabled — see the Hist Scoring panel below.
+
 **Win/loss counts can appear high** — this is normal. A criterion shared across many slots accumulates records from all of them. The Sponge Quota caps contributions per criterion, not per slot, which is what makes the scorecard responsive.
 
 MIW/MIC builds a composite score for each candidate ticker before sorting the entry pool. The composite starts with the ticker's best-matching slot score. If **Co-Qualifying Penalty** is on, any additional slots the ticker qualifies for are inspected: those with negative criterion scores subtract from the composite. A ticker that satisfies one strong slot but also satisfies two consistently losing slots ranks lower than a ticker that only satisfies the strong slot. Slots with positive scores do not boost — only negative co-qualifying scores penalise.
