@@ -28,12 +28,12 @@ Each file carries its version in two or three places — update **all** that app
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.43.1 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.42.1 |
-| `plugins/strategies/BlindEntry-Winter.html` | v1.0.0 |
-| `plugins/strategies/BlindEntry-Chaser.html` | v1.0.0 |
-| `plugins/strategies/LiquidDiver-Winter.html` | v1.0.0 |
-| `plugins/strategies/LiquidDiver-Chaser.html` | v1.0.0 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.44.0 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.44.0 |
+| `plugins/strategies/BlindEntry-Winter.html` | v1.0.1 |
+| `plugins/strategies/BlindEntry-Chaser.html` | v1.0.1 |
+| `plugins/strategies/LiquidDiver-Winter.html` | v1.0.1 |
+| `plugins/strategies/LiquidDiver-Chaser.html` | v1.0.1 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.45.0 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.45.0 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
