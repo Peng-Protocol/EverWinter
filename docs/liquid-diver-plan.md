@@ -1,4 +1,4 @@
-# Liquid-Diver — Design Plan (draft, not implemented)
+# Liquid-Diver — Design Plan (resolved, implementation underway)
 
 ## Purpose
 
@@ -27,6 +27,22 @@ of normal trading volume was liquidated on that side — not a neutral reading.
 Today this is only ever computed once, at `_liqCloseBatch`, an hour after a batch starts. Nothing
 currently computes it mid-cycle off the live-accumulating `batch.sLiqTurnover`/`bLiqTurnover` —
 that's the new piece this plugin needs.
+
+**Resolved: Liquid-Diver uses its own finer-grained depth formula, 1% steps instead of 10%.** The
+10-percentage-point cadence above is specific to MIC/MIW's `calcDepth` and stays as-is there —
+not being revisited. Liquid-Diver's live entry gate needs more granularity than that coarse scale
+gives, so it uses:
+
+```
+calcLiveDepth(raw, avg) = clamp(trunc((raw/avg − 1) × 100), −100, +250)
+```
+
+Same shape, 10× finer resolution — each step is 1 percentage point of relative deviation from the
+average baseline instead of 10. The floor of −100 falls out naturally (raw=0 → −100, matching the
+old formula's raw=0 → −10 at 10× coarser steps) and the +250 cap preserves the same *relative*
+range as MIC's ±25 (both represent ±250% deviation from baseline), just expressed at the finer
+granularity. This is a separate function from `calcDepth`, local to Liquid-Diver — it does not
+change anything MIC/MIW reads.
 
 **Depth is not a 0–100% scale.** It's an unbounded ratio measured in discrete steps of 10
 percentage points of relative deviation from the average baseline, arbitrarily clamped at ±25 —
@@ -77,10 +93,9 @@ MultiIndicator's own hardcoded 70%/30% slot criteria are also independently open
 the same cycles. Enforce via the plugin manifest's `conflicts` field (already used by other
 plugins) — the Plugin Manager blocks loading both on the same bot.
 
-**Open question**: should the manifest conflict be one-directional (Liquid-Diver declares a
-conflict with MultiIndicator) or should MultiIndicator's own manifest also list Liquid-Diver as a
-conflict, so it's caught regardless of load order? Recommend both list each other, matching how
-`conflicts` arrays read elsewhere in the codebase.
+**Resolved**: bidirectional. Liquid-Diver's manifest lists MultiIndicator in `conflicts`, and
+MultiIndicator-Chaser/Winter's manifests are updated to list Liquid-Diver too, so the conflict is
+caught regardless of load order.
 
 ## Entry mechanism: reactive, not scan-gated
 
@@ -132,10 +147,9 @@ mildly profitable stays open; only one that's demonstrably losing gets shut off.
 Cascade/Sacrifice already work (crossing into loss territory from neutral, not requiring
 proof-of-profitability up front).
 
-**Unblocking**: does a blocked type ever re-open automatically (e.g. once its score recovers
-above the threshold, checked continuously), or does it require a manual clear, similar to the
-Scorecard's own CLEAR button? Recommend automatic — continuous, matching how Cascade/Sacrifice
-aren't one-shot triggers — but should be confirmed.
+**Resolved**: automatic unblocking. A type's block is re-checked continuously, not latched — once
+its score recovers above the threshold it starts accepting entries again, the same way
+Cascade/Sacrifice aren't one-shot triggers. No manual clear step.
 
 ## OC data and position tagging — mirrors Blind-Entry exactly
 
@@ -156,25 +170,14 @@ sign tags (which only feed the Scorecard/Score line the way Blind-Entry's do, sa
 bucket-sharing considerations apply — `+24h`/`-24h` already collide intentionally with
 MultiIndicator's own bucket, same reasoning as before).
 
-**Depth tiering — should the scorecard collapse depth away?** `collapseCrit` strips trailing
-digits to sign only (`sliq+14` → `sliq+`), so with `ldcDepthThreshold` resolved to "anything ≥ 0,
-no ceiling" (below), *every* Liquid-Diver entry of a given type shares the same sign — they'll all
-collapse into one bucket (`sliq+`, `bliq+`, etc.) regardless of whether the triggering depth was 0
-or 25. Slot Blocking itself doesn't need finer granularity — it sums `ranks[type+] + ranks[type-]`
-per type, not per tier, so nothing breaks functionally.
-
-What this does mean: under the current collapsing scheme, it's structurally impossible to ever
-notice a depth-tier-dependent pattern later, even by manually reviewing the scorecard — the data
-needed to distinguish "shallow trigger" from "deep trigger" outcomes never survives past the raw
-position tag. That's a measurement/data-preservation argument, not a claim that such a pattern
-exists — there's no basis here for predicting whether depth intensity actually correlates with
-better, worse, or qualitatively different outcomes; that's an empirical question the current setup
-simply can't answer either way once collapsed.
-
-If preserving that distinction is wanted, the lightest option is bucketing depth into a few tiers
-before collapsing (e.g. low/mid/high) rather than a full per-integer breakdown, so the scorecard
-gets one extra dimension without exploding the number of buckets. This is optional and orthogonal
-to the entry/Slot Blocking mechanism — it only affects what's recoverable for later review.
+**Resolved: no depth tiering.** `collapseCrit` strips trailing digits to sign only (`sliq+14` →
+`sliq+`), so every Liquid-Diver entry of a given type collapses into one scorecard bucket
+regardless of the triggering depth's magnitude. Per the user, tiered sorting isn't worth building
+— liquidation events are rare and rarely map cleanly onto one another, so a finer-grained scorecard
+split wouldn't have enough recurring data per tier to be meaningful. Depth still ends up in the
+position type tag itself (the raw value is never discarded, just collapsed for scorecard
+aggregation) — this only affects Scorecard/Slot Blocking scoring, not what's visible on the
+position.
 
 **Open question**: same shape as Blind-Entry's — if the single-symbol OC fetch fails or comes
 back empty, does the position still open (recommended: yes, `+ocs`/`-ocs` simply omitted, since
@@ -198,8 +201,11 @@ a straight port:
   own positions. Liquid-Diver reaching into another strategy's position has no shared score to
   compare against (a MultiIndicator position has a composite score; a manual position has none at
   all). The two universally-computable metrics on *any* position regardless of origin are
-  unrealized PnL (bump the most underwater position) and age (bump the oldest). Which should
-  decide "worst held position" here — most-underwater, oldest, or some combination?
+  unrealized PnL (bump the most underwater position) and age (bump the oldest).
+
+  **Resolved**: unrealized PnL, most-underwater first. It's the metric that's directly comparable
+  across any position regardless of origin or age, and it's the one that most directly answers
+  "which held position is worst to keep."
 - **Blast radius.** This can close a position the user is actively watching under a completely
   different strategy, triggered by a Liquid-Diver signal that strategy's owner never asked to be
   measured against.
@@ -215,9 +221,12 @@ a straight port:
   for `maxPos` to be genuinely full everywhere first.
 - **Margin bar.** MultiIndicator's Substitution requires the new candidate to beat the held
   position's score by a configured margin before swapping, to avoid churn on marginal
-  differences. With no shared score to compare against here, what stands in for that margin gate
-  — is crossing the depth threshold itself sufficient justification, or does cross-strategy
-  substitution need a stricter bar than same-strategy substitution did?
+  differences. With no shared score to compare against here, what stands in for that margin gate?
+
+  **Resolved**: crossing the depth threshold itself is sufficient — no additional margin bar.
+  Genuine liquidation events are rare enough (per the user) that gating an already-rare reactive
+  signal behind a second bar would mostly just suppress it further, and there's no comparable
+  score to size a margin against anyway.
 
 ## Config namespace and files (proposed, not final)
 
@@ -237,7 +246,7 @@ Illustrative config (not final — depends on resolving the open questions above
 | `ldcSacrificeEnabled` / `ldcSacrificePct` / `ldcRollingSacrificeEnabled` | `true` / `25` / `true` | mirrors MIC |
 | `ldcHalvingEnabled` / `ldcHalvingHours` | `true` / `0.5` | mirrors MIC |
 | `ldcShareCapEnabled` / `ldcShareCapPct` | `true` / `100` | mirrors MIC |
-| `ldcSubstitutionEnabled` | `true`? | cross-strategy Substitution on/off — shape unresolved, see above |
+| `ldcSubstitutionEnabled` | `true` | cross-strategy Substitution on/off |
 
 (Winter mirrors with `ldw` prefix.)
 
@@ -263,14 +272,14 @@ Illustrative config (not final — depends on resolving the open questions above
   option to decide on before implementation, since it can't be added retroactively to already-
   collapsed history.
 
-**Still open:**
-1. Cross-strategy Substitution ranking basis: most-underwater unrealized PnL, oldest by age, or a
-   combination — what decides "worst held position" when it might belong to a different strategy
-   with no comparable score?
-2. What stands in for MultiIndicator's Substitution margin gate, with no shared score to compare
-   against — is clearing the depth threshold itself sufficient justification?
-3. Does a blocked type auto-unblock when its score recovers, or require manual clear?
-4. Manifest conflict: one-directional or does MultiIndicator also need updating to list
-   Liquid-Diver?
-5. Should depth get low/mid/high tiering before scorecard collapsing (see above), or leave the
-   sign-only collapsing as-is and accept that intensity data is discarded?
+- Cross-strategy Substitution ranking basis: most-underwater unrealized PnL.
+- No margin gate for Substitution — clearing the depth threshold is sufficient justification.
+- Slot Blocking auto-unblocks continuously once a type's score recovers — no manual clear.
+- Manifest conflict is bidirectional — both Liquid-Diver and MultiIndicator-Chaser/Winter list
+  each other in `conflicts`.
+- No depth tiering — liquidation events are too rare to make tiered scoring meaningful; the raw
+  depth stays visible on the position type, only scorecard aggregation collapses it to sign.
+- Liquid-Diver's live depth gate uses its own 1%-step formula (`calcLiveDepth`), separate from
+  MIC/MIW's 10%-step `calcDepth` — see the Depth section above.
+
+**Still open:** none — proceeding to implementation.
