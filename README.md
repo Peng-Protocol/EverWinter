@@ -110,7 +110,7 @@ The log is capped at 300 entries in memory and in localStorage. Oldest entries a
 
 ## Trades Menu
 
-The trades panel shows a card for each closed trade, newest first. Each card carries a close-reason badge — **TP**, **SL**, **FORCE** (runtime limit), **BAIL** (drawdown throttle bail, Winter only), **EDa** (laggard debt-free close), or **sub** (closed to free a slot for a higher-ranked candidate via MIW/MIC Substitution).
+The trades panel shows a card for each closed trade, newest first. Each card carries a close-reason badge — **TP**, **SL**, **FORCE** (runtime limit), **BAIL** (drawdown throttle bail, Winter only), **EDa** (laggard debt-free close), or **Sub** (closed to free a slot for a higher-ranked candidate via MIW/MIC Substitution). Reasons introduced by other plugins show their own registered label, or the raw reason name if a plugin hasn't registered one.
 
 **Roll-up card**: when the closed trades list exceeds 50 entries, the oldest are compacted into a single roll-up card showing their net PnL, trade count, and the date range they cover. The roll-up is not a trade — it is a historical summary. In the PnL chart, the roll-up's net value acts as a baseline offset applied to every plotted point.
 
