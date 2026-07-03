@@ -28,6 +28,26 @@ Today this is only ever computed once, at `_liqCloseBatch`, an hour after a batc
 currently computes it mid-cycle off the live-accumulating `batch.sLiqTurnover`/`bLiqTurnover` —
 that's the new piece this plugin needs.
 
+**Depth is not a 0–100% scale.** It's an unbounded ratio measured in discrete steps of 10
+percentage points of relative deviation from the average baseline, arbitrarily clamped at ±25 —
+not "+25 = 100% liquidated." Verified boundaries:
+
+| raw vs. avg | depth |
+|---|---|
+| 1.00× (equal) | 0 |
+| 1.05× | 0 |
+| 1.10× | 1 |
+| 1.5× | 5 |
+| 2× | 10 |
+| 3.49× (249% above) | 24 |
+| 3.5× (250% above) | 25 (clamp reached) |
+| 10× (900% above) | 25 (still clamped — no further room above the cap) |
+| 0 (no liquidations) | −10 (practical floor; −25 is unreachable since turnover can't go negative) |
+
+So +0 covers roughly 0–9% above average (truncation, not a literal 1%), and +25 is reached at
+250% above average and stays there for anything beyond — the cap is arbitrary, not a "fully
+liquidated" ceiling. There's no natural point where the scale "completes."
+
 **Type classification** (ported as-is from MultiIndicator, hardcoded thresholds, not config):
 - `sliq`: sell-liq share of cycle turnover ≥ 70%
 - `bliq`: buy-liq share ≥ 70%
@@ -136,6 +156,26 @@ sign tags (which only feed the Scorecard/Score line the way Blind-Entry's do, sa
 bucket-sharing considerations apply — `+24h`/`-24h` already collide intentionally with
 MultiIndicator's own bucket, same reasoning as before).
 
+**Depth tiering — should the scorecard collapse depth away?** `collapseCrit` strips trailing
+digits to sign only (`sliq+14` → `sliq+`), so with `ldcDepthThreshold` resolved to "anything ≥ 0,
+no ceiling" (below), *every* Liquid-Diver entry of a given type shares the same sign — they'll all
+collapse into one bucket (`sliq+`, `bliq+`, etc.) regardless of whether the triggering depth was 0
+or 25. Slot Blocking itself doesn't need finer granularity — it sums `ranks[type+] + ranks[type-]`
+per type, not per tier, so nothing breaks functionally.
+
+What this does mean: under the current collapsing scheme, it's structurally impossible to ever
+notice a depth-tier-dependent pattern later, even by manually reviewing the scorecard — the data
+needed to distinguish "shallow trigger" from "deep trigger" outcomes never survives past the raw
+position tag. That's a measurement/data-preservation argument, not a claim that such a pattern
+exists — there's no basis here for predicting whether depth intensity actually correlates with
+better, worse, or qualitatively different outcomes; that's an empirical question the current setup
+simply can't answer either way once collapsed.
+
+If preserving that distinction is wanted, the lightest option is bucketing depth into a few tiers
+before collapsing (e.g. low/mid/high) rather than a full per-integer breakdown, so the scorecard
+gets one extra dimension without exploding the number of buckets. This is optional and orthogonal
+to the entry/Slot Blocking mechanism — it only affects what's recoverable for later review.
+
 **Open question**: same shape as Blind-Entry's — if the single-symbol OC fetch fails or comes
 back empty, does the position still open (recommended: yes, `+ocs`/`-ocs` simply omitted, since
 OC availability must not gate a genuinely time-sensitive reactive entry any more than it gates
@@ -162,16 +202,17 @@ a straight port:
   decide "worst held position" here — most-underwater, oldest, or some combination?
 - **Blast radius.** This can close a position the user is actively watching under a completely
   different strategy, triggered by a Liquid-Diver signal that strategy's owner never asked to be
-  measured against. Worth a real safeguard: does "Protect Winners" (never substitute out a
-  currently-profitable position, matching MultiIndicator's existing protection) apply here too,
-  or is that specifically what should be overridable given how time-sensitive a reactive
-  liquidation entry is?
-- **Trigger scope.** Does Liquid-Diver reach into other strategies' positions only once its own
-  Share Cap is exhausted *and* `maxPos` overall is full (genuinely no room anywhere), or does it
-  compete more aggressively — willing to bump another strategy's position even while Liquid-Diver
-  still has headroom left in its own Share Cap, if the live signal is strong enough? The former is
-  a last-resort behavior; the latter is closer to Liquid-Diver treating the whole book, not just
-  its own allocation, as its potential inventory.
+  measured against.
+
+  **Resolved: Protect Winners does not apply.** Per the user, genuine liquidation events are rare
+  enough that Substitution should behave aggressively when one fires, not defer to a currently-
+  profitable held position the way MultiIndicator's own Substitution does.
+- **Trigger scope.**
+
+  **Resolved: aggressive, not last-resort.** Liquid-Diver competes for the whole book, not just
+  its own Share Cap allocation — it can bump another strategy's position (or its own) even while
+  it still has headroom left in its own cap, if the live signal clears the bar. It does not wait
+  for `maxPos` to be genuinely full everywhere first.
 - **Margin bar.** MultiIndicator's Substitution requires the new candidate to beat the held
   position's score by a configured margin before swapping, to avoid churn on marginal
   differences. With no shared score to compare against here, what stands in for that margin gate
@@ -190,7 +231,7 @@ Illustrative config (not final — depends on resolving the open questions above
 | Key | Default | Purpose |
 |---|---|---|
 | `ldcEnabled` | `false` | master toggle |
-| `ldcDepthThreshold` | ? | minimum live depth to trigger entry — needs a default, unresolved |
+| `ldcDepthThreshold` | `0` | minimum live depth to trigger entry — resolved: ≥0, no ceiling config; the type-share requirement (70%/30%) already filters out noise |
 | `ldcSlotBlockEnabled` / `ldcSlotBlockPct` | `true` / `25` | Slot Blocking on/off and loss threshold |
 | `ldcCascadeEnabled` / `ldcCascadePct` | `true` / `25` | mirrors MIC |
 | `ldcSacrificeEnabled` / `ldcSacrificePct` / `ldcRollingSacrificeEnabled` | `true` / `25` / `true` | mirrors MIC |
@@ -207,20 +248,29 @@ Illustrative config (not final — depends on resolving the open questions above
 - Slot Blocking is a loss circuit breaker: blocks only when a type's score is an active loss
   beyond the threshold, not a profitability bar.
 - Substitution is back in scope, but cross-strategy (can replace any held position, not just
-  Liquid-Diver's own) — see the four sub-questions below.
+  Liquid-Diver's own).
+- Protect Winners does **not** apply to cross-strategy Substitution — deliberately aggressive,
+  since genuine liquidation events are rare.
+- Trigger scope is aggressive, not last-resort — Liquid-Diver can substitute into any position
+  (its own or another strategy's) even with headroom left in its own Share Cap.
+- `ldcDepthThreshold` default: `0`, no ceiling — the 70%/30% type-share requirement already
+  filters noise, so depth just needs to clear the average baseline.
+- Depth-tier collapsing: `collapseCrit`'s sign-only bucketing means all Liquid-Diver entries of a
+  type land in one scorecard bucket regardless of depth intensity. Functionally fine for Slot
+  Blocking (which sums both sign buckets per type), but it erases any chance of later noticing a
+  depth-tier-dependent pattern. Optional low/mid/high tiering before collapsing would preserve
+  that data — no claim here about whether such a pattern exists, purely a data-preservation
+  option to decide on before implementation, since it can't be added retroactively to already-
+  collapsed history.
 
 **Still open:**
 1. Cross-strategy Substitution ranking basis: most-underwater unrealized PnL, oldest by age, or a
    combination — what decides "worst held position" when it might belong to a different strategy
    with no comparable score?
-2. Does Protect Winners (never substitute out a currently-profitable position) apply to
-   cross-strategy substitution, or is that specifically meant to be overridable?
-3. Trigger scope: only reach into other strategies' positions as a last resort (own Share Cap *and*
-   `maxPos` both full), or more aggressively, even with headroom left in Liquid-Diver's own cap?
-4. What stands in for MultiIndicator's Substitution margin gate, with no shared score to compare
+2. What stands in for MultiIndicator's Substitution margin gate, with no shared score to compare
    against — is clearing the depth threshold itself sufficient justification?
-5. Does a blocked type auto-unblock when its score recovers, or require manual clear?
-6. Manifest conflict: one-directional or does MultiIndicator also need updating to list
+3. Does a blocked type auto-unblock when its score recovers, or require manual clear?
+4. Manifest conflict: one-directional or does MultiIndicator also need updating to list
    Liquid-Diver?
-7. `ldcDepthThreshold` default — no natural anchor from an existing config value the way
-   Blind-Entry's threshold had Psycho Mode's `psychoChangePct` to borrow from. Needs a number.
+5. Should depth get low/mid/high tiering before scorecard collapsing (see above), or leave the
+   sign-only collapsing as-is and accept that intensity data is discarded?
