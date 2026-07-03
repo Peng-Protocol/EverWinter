@@ -14,8 +14,10 @@
   mean anything. Requires Ashfall's Liq Surveillance (ashLiqEnabled) to be on; without it there are
   no live batches to react to.
 
-  Depth uses its own finer, 1%-step formula (calcLiveDepth) — a deliberately different cadence
-  from Multi-Indicator's coarse 10%-step calcDepth, local to this plugin only.
+  Depth uses the same formula as Ashfall's own calcDepth (liquidated $ as a % of the ticker's
+  OI snapshot at batch launch) so a live reading here means exactly what a closed-cycle reading
+  means everywhere else — calcLiveDepth is just that formula evaluated mid-cycle instead of
+  waiting for _liqCloseBatch.
 
   Slot Blocking: a per-type (sliq/bliq/msliq/mbliq) loss circuit breaker. If a type's collapsed
   scorecard score is a loss beyond the configured percentage of base margin, new entries of that
@@ -43,17 +45,16 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.1';
+  const VERSION = '1.0.2';
 
   const LIQ_TYPE_EMOJI = { sliq: '🥵', bliq: '🥶', msliq: '💦', mbliq: '🌨️' };
   // +24h/-24h/+fund/-fund/+ocs/-ocs reuse Ashfall's own scorecard emoji (afCritEmoji) for
   // visual consistency across the shared tag vocabulary.
   const CRIT_EMOJI = { '+24h': '⬆️', '-24h': '⬇️', '+fund': '💸', '-fund': '🤑', '+ocs': '🔭', '-ocs': '🔭' };
 
-  // 1%-step relative-deviation depth, local to Liquid-Diver — 10x finer than Multi-Indicator's
-  // calcDepth. Floor of -100 falls out naturally at raw=0; +250 caps the same relative range
-  // (250% above average) as calcDepth's ±25 does at its coarser cadence.
-  const calcLiveDepth = (raw, avg) => avg > 0 ? Math.max(-100, Math.min(250, Math.trunc((raw / avg - 1) * 100))) : -100;
+  // Same formula as Ashfall's calcDepth: liquidated $ as a % of the ticker's OI snapshot.
+  // Depth +1 means the liquidated side's turnover so far this cycle equals 1% of OI.
+  const calcLiveDepth = (raw, oi) => oi > 0 ? Math.trunc((raw / oi) * 100) : 0;
 
   window.__BotPlugin = {
     id:        'liquiddiver-chaser',
@@ -93,7 +94,7 @@
             <div x-show="cfg.ldcEnabled" style="margin-top:8px">
               <div class="lbl">Depth Threshold <b x-text="'+'+(cfg.ldcDepthThreshold??0)"></b></div>
               <input type="number" class="inp" min="0" step="1" x-model.number="cfg.ldcDepthThreshold" :disabled="cfgLocked" @change="persist()" style="width:80px">
-              <div class="ldc-hint">Minimum live depth (1% steps vs. average hourly trading turnover) to trigger entry. No ceiling — the 70%/30% liquidation-share requirement already filters noise.</div>
+              <div class="ldc-hint">Minimum live depth — liquidated $ as a % of open interest — to trigger entry. No ceiling — the 70%/30% liquidation-share requirement already filters noise.</div>
 
               <div class="ldc-hint" style="margin-top:8px;padding:6px 8px;background:rgba(100,220,150,.04);border:1px solid rgba(100,220,150,.12);border-radius:3px">Every opened position is tagged with the triggering liquidation criterion (e.g. sliq+14) plus +24h/-24h, +fund/-fund, +ocs/-ocs for the Scorecard only.</div>
 
@@ -319,8 +320,8 @@
 
           const isSell = type === 'sliq' || type === 'msliq';
           const raw    = isSell ? sRaw : bRaw;
-          const avg    = batch.avgHourlyTurnover?.[sym] || 0;
-          const depth  = calcLiveDepth(raw, avg);
+          const oi     = batch.oiSnapshot?.[sym] || 0;
+          const depth  = calcLiveDepth(raw, oi);
           if (depth < (this.cfg.ldcDepthThreshold ?? 0)) return;
           if (this._ldcIsBlocked(type)) return;
 

@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.46.0';
+  const VERSION        = '1.46.1';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -1735,7 +1735,7 @@
             try {
               const snapshots = (this._liqBatches || []).map(b => ({
                 id: b.id, startedAt: b.startedAt, endsAt: b.endsAt, symbols: b.symbols,
-                sLiqTurnover: { ...b.sLiqTurnover }, bLiqTurnover: { ...b.bLiqTurnover }, avgHourlyTurnover: { ...(b.avgHourlyTurnover || {}) }
+                sLiqTurnover: { ...b.sLiqTurnover }, bLiqTurnover: { ...b.bLiqTurnover }, oiSnapshot: { ...(b.oiSnapshot || {}) }
               }));
               localStorage.setItem(PFR_LIQ_KEY, JSON.stringify(snapshots));
             } catch(_) {}
@@ -1757,7 +1757,7 @@
             symbols: snapshot.symbols,
             sLiqTurnover: { ...snapshot.sLiqTurnover },
             bLiqTurnover: { ...snapshot.bLiqTurnover },
-            avgHourlyTurnover: { ...(snapshot.avgHourlyTurnover || {}) },
+            oiSnapshot: { ...(snapshot.oiSnapshot || {}) },
             ws: null, _endTimer: null
           };
           this._liqBatches.push(batch);
@@ -1800,7 +1800,7 @@
         },
 
         // Called for every incoming liq message, per touched symbol, with the batch object still
-        // live (sLiqTurnover/bLiqTurnover/avgHourlyTurnover already updated) — before the batch
+        // live (sLiqTurnover/bLiqTurnover/oiSnapshot already updated) — before the batch
         // closes. Lets a reactive consumer (e.g. Liquid-Diver) compute a mid-cycle depth reading
         // without waiting for _liqCloseBatch's once-per-hour snapshot.
         registerLiqMessageHook(fn) {
@@ -1826,14 +1826,17 @@
           this._liqCycleCounter = (this._liqCycleCounter % 25) + 1;
           const id        = this._liqCycleCounter;
           const startedAt = Date.now();
-          const avgHourlyTurnover = Object.fromEntries(symbols.map(s => {
+          // Depth measures liquidated $ as a % of open interest — snapshotted once at batch
+          // launch so a live reactive consumer (Liquid-Diver) sees a stable denominator for
+          // the whole hour rather than one that drifts as OI itself moves mid-cycle.
+          const oiSnapshot = Object.fromEntries(symbols.map(s => {
             const tk = allTickers.find(t => t.symbol === s);
-            return [s, tk ? parseFloat(tk.turnover24h || 0) / 24 : 0];
+            return [s, tk ? parseFloat(tk.openInterestValue || 0) : 0];
           }));
           const batch     = { id, startedAt, endsAt: startedAt + 3600000, symbols,
             sLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
             bLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
-            avgHourlyTurnover,
+            oiSnapshot,
             ws: null, _endTimer: null };
           this._liqBatches.push(batch);
           this._liqPersistBatches();
@@ -1880,17 +1883,19 @@
           if (batch._endTimer) { clearTimeout(batch._endTimer); batch._endTimer = null; }
           try { if (batch.ws && batch.ws.readyState !== WebSocket.CLOSED) batch.ws.close(); } catch(_) {}
           batch.ws = null;
-          const calcDepth  = (raw, avg) => avg > 0 ? Math.max(-25, Math.min(25, Math.trunc((raw / avg - 1) * 10))) : 0;
+          // Depth = liquidated $ as a % of open interest — depth +1 means the liquidated
+          // side's turnover this cycle equaled 1% of the ticker's OI snapshot at batch launch.
+          const calcDepth  = (raw, oi) => oi > 0 ? Math.trunc((raw / oi) * 100) : 0;
           const threshold  = this.cfg.pfLiqThresholdPct ?? 50;
           const results    = batch.symbols.map(sym => {
             const sLiqRaw  = batch.sLiqTurnover[sym] || 0;
             const bLiqRaw  = batch.bLiqTurnover[sym] || 0;
-            const avgHrly  = (batch.avgHourlyTurnover || {})[sym] || 0;
+            const oi       = (batch.oiSnapshot || {})[sym] || 0;
             const liqTotal = sLiqRaw + bLiqRaw;
             const sLiqPct  = liqTotal > 0 ? (sLiqRaw / liqTotal) * 100 : 0;
             const bLiqPct  = liqTotal > 0 ? (bLiqRaw / liqTotal) * 100 : 0;
-            const sDepth   = calcDepth(sLiqRaw, avgHrly);
-            const bDepth   = calcDepth(bLiqRaw, avgHrly);
+            const sDepth   = calcDepth(sLiqRaw, oi);
+            const bDepth   = calcDepth(bLiqRaw, oi);
             return { sym, sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, sDepth, bDepth, sPass: liqTotal > 0 && sLiqPct >= threshold, bPass: liqTotal > 0 && bLiqPct >= threshold };
           });
           const _now = Date.now();
