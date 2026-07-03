@@ -98,6 +98,18 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 
 ---
 
+#### Substitution
+
+When every position slot is full, a fresh candidate isn't turned away just because the book is at capacity. Its case is weighed against the weakest current holding using the same scoring the entry gate itself runs on. If the new case outscores the weakest holding by a meaningful margin, swap it in — close the weakest, open the new one. A full book means the worst current holding has to keep defending its spot, not that opportunity stops being evaluated.
+
+The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
+
+By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
+
+This is an entry-gate decision, not a reaction to a struggling position — it belongs beside Market Reading, not beside the exit machinery below.
+
+---
+
 ### Reactive Techniques
 
 Reactive techniques manage positions after entry. They fire in response to position behavior or evolving market conditions, not to conditions at the time of entry.
@@ -194,16 +206,6 @@ When the final DCA stage fills and absorption has reduced position margin signif
 #### Rolling Window Sacrifice
 
 When combined unrealized loss crosses a threshold, one can either close all positions at once or only the oldest — one position per trigger. The former sweeps exposure clean; the latter reduces it gradually. Use the staged approach when you want to de-risk without abandoning the book entirely.
-
----
-
-#### Substitution
-
-When every position slot is full and a fresh opportunity outscores your weakest holding by a meaningful margin, swap it in — close the weakest, open the new one. A full book shouldn't mean the door is closed to a genuinely better setup; it should mean the worst current holding has to defend its spot.
-
-The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
-
-By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
 
 ---
 
