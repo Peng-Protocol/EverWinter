@@ -32,8 +32,8 @@ Each file carries its version in two or three places — update **all** that app
 | `plugins/strategies/BlindEntry-Chaser.html` | v1.0.3 |
 | `plugins/strategies/LiquidDiver-Winter.html` | v1.1.0 |
 | `plugins/strategies/LiquidDiver-Chaser.html` | v1.1.0 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.47.0 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.47.0 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.47.1 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.47.1 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
