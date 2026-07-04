@@ -33,6 +33,14 @@
   Permafrost's registerLiqCloseHook, not the live per-message path sliq/bliq/msliq/mbliq use. The
   Liquidation Presence toggle (only-1 / only-0 / both) controls which of the two paths are active.
 
+  Re-entry Block: reads the same shared graylist the host writes on every close (any strategy,
+  keyed by symbol) and Multi-Indicator reads from — a symbol stays blocked for one bulk-ticker
+  cooldown window after its position closes. Ported from Multi-Indicator, but with a mode Multi-
+  Indicator doesn't have: block losers only, or block both winners and losers (default). Liquid-
+  Diver's own liquidation flow tends to be mono-directional per symbol, so a repeat winner is
+  more plausible than a repeat loser — but the default stays conservative (both) until that
+  actually proves out.
+
   Position management ports directly from Multi-Indicator: Cascade, Sacrifice (+ rolling variant),
   a halving multiplier, and a Share Cap. Substitution is reintroduced but wider than
   Multi-Indicator's own version — it can replace ANY held position, including ones opened by a
@@ -54,7 +62,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.1';
+  const VERSION = '1.2.0';
 
   const LIQ_TYPE_EMOJI = { sliq: '🥵', bliq: '🥶', msliq: '💦', mbliq: '🌨️', '0liq': '⚫' };
   // +24h/-24h/+fund/-fund/+ocs/-ocs reuse Permafrost's own scorecard emoji (pfCritEmoji) for
@@ -127,6 +135,20 @@
               <div class="ldw-hint">"1" reacts live to tickers WITH liquidation past the Depth Threshold. "0" opens on tickers with ZERO liquidation once their surveillance cycle closes — there's no live signal for "nothing happened". "Both" runs each independently.</div>
 
               <div class="ldw-hint" style="margin-top:8px;padding:6px 8px;background:rgba(96,210,255,.04);border:1px solid rgba(96,210,255,.12);border-radius:3px">Every opened position is tagged with the triggering liquidation criterion (e.g. sliq+14, or bare 0liq) plus +24h/-24h, +fund/-fund, +ocs/-ocs for the Scorecard. OCS is cosmetic-only — Slot Blocking below can't see it.</div>
+
+              <div class="lbl" style="margin-top:10px">Re-entry Block</div>
+              <label class="tog" style="margin-top:4px" @click.prevent="if(!cfgLocked){cfg.ldwReentryBlockEnabled=!cfg.ldwReentryBlockEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldwReentryBlockEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Enabled</div>
+                  <div class="ldw-hint">Blocks a symbol from re-triggering for one bulk-ticker cooldown window right after its position closes — same graylist Multi-Indicator uses.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldwReentryBlockEnabled" style="display:flex;gap:3px;flex-wrap:wrap;margin-top:4px;margin-left:2px">
+                <button class="ldw-tab" :class="(cfg.ldwReentryBlockMode??'both')==='losers'?'on':''" @click.prevent="if(!cfgLocked){cfg.ldwReentryBlockMode='losers';persist()}">Losers Only</button>
+                <button class="ldw-tab" :class="(cfg.ldwReentryBlockMode??'both')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.ldwReentryBlockMode='both';persist()}">Winners + Losers</button>
+              </div>
+              <div class="ldw-hint">"Losers Only" lets a symbol that just closed in profit re-trigger immediately — liquidation flow tends to be mono-directional, so a repeat winner is more likely than a repeat loser. "Winners + Losers" blocks either outcome until the cooldown clears.</div>
 
               <div class="lbl" style="margin-top:10px">Slot Blocking</div>
               <label class="tog" style="margin-top:4px" @click.prevent="if(!cfgLocked){cfg.ldwSlotBlockEnabled=!cfg.ldwSlotBlockEnabled;persist()}">
@@ -234,6 +256,8 @@
           if (this.cfg.ldwSubstitutionEnabled        === undefined) this.cfg.ldwSubstitutionEnabled        = true;
           if (this.cfg.ldwSubstitutionMinAgeMins     === undefined) this.cfg.ldwSubstitutionMinAgeMins     = 10;
           if (this.cfg.ldwLiqPresenceMode             === undefined) this.cfg.ldwLiqPresenceMode             = '1';
+          if (this.cfg.ldwReentryBlockEnabled          === undefined) this.cfg.ldwReentryBlockEnabled          = true;
+          if (this.cfg.ldwReentryBlockMode             === undefined) this.cfg.ldwReentryBlockMode             = 'both';
 
           this._ldwOpening = new Set(); // symbols with an in-flight reactive open, guards double-fire
 
@@ -336,6 +360,21 @@
           return this._ldwTypeScore(type) <= -threshold;
         },
 
+        // Reuses the same shared re-entry graylist the host writes on every close (any
+        // strategy) and Multi-Indicator itself reads from — a symbol stays graylisted for one
+        // bulk-ticker cooldown window (matching "until next bulk fetch"). "both" mode blocks
+        // regardless of win/loss, same as Multi-Indicator's unconditional check; "losers" mode
+        // only blocks a symbol that just closed at a loss, letting a repeat winner re-trigger.
+        _ldwIsReentryBlocked(sym) {
+          if (!(this.cfg.ldwReentryBlockEnabled ?? true)) return false;
+          const g = this._tickerGraylist?.[sym];
+          if (!g || !(g.ts > 0)) return false;
+          const ttl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3600000;
+          if (Date.now() - g.ts >= ttl) return false;
+          if ((this.cfg.ldwReentryBlockMode ?? 'both') === 'losers') return g.isWin === false;
+          return true;
+        },
+
         // Called live, per touched symbol, for every incoming liquidation message — not scan-gated.
         // Skipped entirely in only-0 mode, since that mode reacts to the ABSENCE of liquidation,
         // which this per-message path (only fires when a liquidation message actually arrives)
@@ -345,6 +384,7 @@
           if ((this.cfg.ldwLiqPresenceMode ?? '1') === '0') return;
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
           if (this._isSymbolBanned?.(sym)) return;
+          if (this._ldwIsReentryBlocked(sym)) return;
           if (this._ldwOpening.has(sym)) return;
           if ((this.positions || []).some(p => p.symbol === sym)) return;
 
@@ -394,6 +434,7 @@
             const sym = r.sym;
             if (((r.sLiqRaw || 0) + (r.bLiqRaw || 0)) !== 0) continue;
             if (this._isSymbolBanned?.(sym)) continue;
+            if (this._ldwIsReentryBlocked(sym)) continue;
             if (this._ldwOpening.has(sym)) continue;
             if ((this.positions || []).some(p => p.symbol === sym)) continue;
 

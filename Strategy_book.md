@@ -107,6 +107,14 @@ This lets a strategy trading several independent conditions at once retire the o
 
 ---
 
+#### Re-entry Cooldown
+
+A symbol that just closed doesn't immediately re-qualify for entry — it sits out for one refresh of the market snapshot before becoming eligible again. This prevents chasing the same ticker straight back into the same setup that just resolved, on information that's already gone stale.
+
+Some strategies split this further: cooldown only applies after a loss, letting a symbol that just closed in profit come right back if it re-qualifies. Whether that's the better default depends on how directional the underlying signal tends to be for a given ticker — one that tends to repeat in the same direction favors letting winners run back in; one that behaves more like a coin flip favors treating both outcomes the same and sitting out regardless.
+
+---
+
 #### Substitution
 
 When every position slot is full, a fresh candidate isn't turned away just because the book is at capacity. Its case is weighed against the weakest current holding using the same scoring the entry gate itself runs on. If the new case outscores the weakest holding by a meaningful margin, swap it in — close the weakest, open the new one. A full book means the worst current holding has to keep defending its spot, not that opportunity stops being evaluated.
