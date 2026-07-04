@@ -99,6 +99,14 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 
 ---
 
+#### Slot Blocking
+
+Some strategies track win/loss performance not just per ticker but per originating condition — the specific market situation that triggered entry. If entries opened on a given condition have lost more than an acceptable share of position size, new entries on that specific condition pause automatically, while every other condition keeps trading normally. The pause lifts on its own once that condition's record recovers — no manual review needed.
+
+This lets a strategy trading several independent conditions at once retire the ones quietly losing money in the current environment, without shutting down the whole strategy or waiting for someone to notice and intervene by hand.
+
+---
+
 #### Substitution
 
 When every position slot is full, a fresh candidate isn't turned away just because the book is at capacity. Its case is weighed against the weakest current holding using the same scoring the entry gate itself runs on. If the new case outscores the weakest holding by a meaningful margin, swap it in — close the weakest, open the new one. A full book means the worst current holding has to keep defending its spot, not that opportunity stops being evaluated.
@@ -106,6 +114,8 @@ When every position slot is full, a fresh candidate isn't turned away just becau
 The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
 
 By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
+
+Some strategies apply substitution more aggressively still: no exemption for a currently-winning position, and the pool considered isn't limited to that strategy's own holdings — any position in the book is fair game if it's genuinely the weakest link, regardless of which strategy opened it. This suits a strategy built around a rare, high-conviction signal, where clearing the bar to enter at all is treated as justification enough to bump a lesser holding.
 
 This is an entry-gate decision, not a reaction to a struggling position — it belongs beside Market Reading, not beside the exit machinery below.
 
@@ -223,6 +233,16 @@ When combined unrealized loss crosses a threshold, one can either close all posi
 Positions open with no TP; as price moves in the profitable direction, flat adds are placed at −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% from entry. At the seventh add, a TP is set at −22% from the original entry.
 
 A perfect AMa run returns roughly **709% on the original entry margin** at 6× leverage. If price reverses and a DCA level triggers, AMa cancels and a standard stage-based TP is set against the current weighted average.
+
+---
+
+#### Collective Cascade and Sacrifice
+
+Entry-gate strategies pair their criteria-based selection with a book-level safety net separate from the DCA and absorption machinery above. Rather than judging each position on its own, the whole group of positions opened by that strategy is judged together: when their combined unrealized profit crosses a set share of margin, the whole group closes at once, banking the gain before it can give it back. The mirror case closes the group — or, in a gentler form, just the single oldest position — once combined unrealized loss crosses its own threshold, capping how far a bad swing is allowed to run before it's cut off.
+
+A halving option lets both thresholds shrink the longer the oldest position in the group has sat open — an aging, undecided group becomes progressively easier to trigger rather than sitting indefinitely waiting for a large move that may never come.
+
+This check reacts to the group's live state continuously rather than only at fixed intervals, so a swing that crosses the threshold and reverses again shortly after is still caught.
 
 ---
 
