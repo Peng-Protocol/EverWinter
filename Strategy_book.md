@@ -85,16 +85,33 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 - **rabl>N** — The mirror: a green candle with volume at least N tiers below average. The market drifted up without conviction. Useful for entries where you expect a measured continuation rather than a sharp move.
 - **iot>N / iot<N** — OI relative to 24h turnover at tier N (1% step by default). High OI relative to turnover signals conviction or stickiness — the market is holding open positions rather than trading them away.
 - **iom>N / iom<N** — OI relative to market cap at tier N. High OI signals leverage concentration — a large share of the coin's float is leveraged open interest.
-- **S-Liq (Sell-Liquidation)** — Short positions accounted for at least 70% of liquidation turnover in the cycle — a decisively one-sided reading. Short liquidations are bullish; the market forced out the short side with conviction. Use this to confirm the long case has real pressure behind it. An optional depth gate can additionally require the flow to be above or below a set intensity relative to the ticker's typical hourly turnover.
+- **S-Liq (Sell-Liquidation)** — Short positions accounted for at least 70% of liquidation turnover in the cycle — a decisively one-sided reading. Short liquidations are bullish; the market forced out the short side with conviction. Use this to confirm the long case has real pressure behind it. An optional depth gate can additionally require the liquidated value to sit a set percentage above or below the average liquidation size seen across all recorded history — a read on whether this event is unusually large or unusually small compared to what's typical.
 - **B-Liq (Buy-Liquidation)** — Long positions accounted for at least 70% of liquidation turnover. Long liquidations are bearish; the market forced out the long side with conviction. Use this to confirm the short case. The same optional depth gate applies.
 - **mS-Liq (Mixed Sell-Liquidation)** — Sell liquidations lead, but buy liquidations hold at least 30% of turnover — a contested cycle with a sell lean. Use this to capture the short-liq thesis when a clean one-sided signal is absent. The same depth gate applies.
 - **mB-Liq (Mixed Buy-Liquidation)** — Buy liquidations lead, but sell liquidations hold at least 30% — a contested cycle with a buy lean. Use this to capture the long-liq thesis under mixed but directionally leaning conditions.
+- **0-Liq (No Liquidation)** — Nothing was liquidated on this ticker in the cycle at all, the mirror case to every liquidation reading above. If one-sided liquidation flow across the market is consistently bullish, the complete absence of liquidation is a distinct condition worth treating on its own terms rather than lumping in with a quiet mixed cycle.
 - **Buy/Sell Skew** — What share of a ticker's recent order flow was buys versus sells, measured directly from filled trades rather than inferred from price. A strong buy lean confirms genuine demand behind a move; a strong sell lean confirms genuine supply. Unlike most criteria here, order flow exists on every liquid ticker at every moment — there is no waiting for a spike or a fresh data fetch to line up. Treat it the way you'd treat the day's up/down direction: nearly always available, and worth including in almost any slot as a light confirming filter rather than reserving it for rare setups.
 - **Order Count Deviation** — How quickly orders are landing on a ticker, measured as the average time between fills. A short gap means the ticker is being traded rapidly right now; a long gap means it's quiet. Same always-on caveat as Buy/Sell Skew: this is one of the few signals with no downtime, so it shows up often and should be weighted as a routine confirming factor, not a special case.
 
 **Building slots**: A slot containing only "fund>1" behaves like a fund-chasing filter. A slot containing "+24h" and "vm>10" behaves like a momentum filter. A slot with all three — "+24h", "vm>10", and "fund>1" — requires momentum, participation, and a funding premium to align before opening. Adding "lsa>25" to a bearish slot demands that the last hourly candle confirm the move with volume. The building-block design lets you dial the filter from permissive to strict without changing the underlying logic.
 
 **Auto-slot builder**: Instead of building slots by hand, the system can generate every possible combination of criteria at a chosen size automatically. At size 2 with sixteen available criteria, it produces 120 base combinations. At size 3, 560. These are base-name counts — the scorecard tracks a much larger space in practice. Tiered criteria (Fund, V/M, spike, IO/T, IO/M) record the specific tier value at entry, so a single base combination like "Fund + +24h" can produce dozens of distinct scorecard entries depending on how far the funding rate was at each trade. The effective tracked variety grows with data and can far exceed the base count shown. Some criteria are inherently opposed and cannot coexist: +24h and -24h, and any two from the candle group (lsa, lba, rasl, rabl) — a candle can only close in one direction with one volume character simultaneously. Auto-generated slots containing any such pair will never see a position. Combined with auto-correction, this creates a self-pruning strategy: all valid combinations run, and the ones that consistently lose are disabled without manual intervention. Because Buy/Sell Skew and Order Count Deviation are backed by data that is essentially always present, expect them to appear in a large share of matched positions once order flow tracking is turned on — that is expected behavior, not over-triggering.
+
+---
+
+#### Slot Blocking
+
+Some strategies track win/loss performance not just per ticker but per originating condition — the specific market situation that triggered entry. If entries opened on a given condition have lost more than an acceptable share of position size, new entries on that specific condition pause automatically, while every other condition keeps trading normally. The pause lifts on its own once that condition's record recovers — no manual review needed.
+
+This lets a strategy trading several independent conditions at once retire the ones quietly losing money in the current environment, without shutting down the whole strategy or waiting for someone to notice and intervene by hand.
+
+---
+
+#### Re-entry Cooldown
+
+A symbol that just closed doesn't immediately re-qualify for entry — it sits out for one refresh of the market snapshot before becoming eligible again. This prevents chasing the same ticker straight back into the same setup that just resolved, on information that's already gone stale.
+
+Some strategies split this further: cooldown only applies after a loss, letting a symbol that just closed in profit come right back if it re-qualifies. Whether that's the better default depends on how directional the underlying signal tends to be for a given ticker — one that tends to repeat in the same direction favors letting winners run back in; one that behaves more like a coin flip favors treating both outcomes the same and sitting out regardless.
 
 ---
 
@@ -105,6 +122,8 @@ When every position slot is full, a fresh candidate isn't turned away just becau
 The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
 
 By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
+
+Some strategies apply substitution more aggressively still: no exemption for a currently-winning position, and the pool considered isn't limited to that strategy's own holdings — any position in the book is fair game if it's genuinely the weakest link, regardless of which strategy opened it. This suits a strategy built around a rare, high-conviction signal, where clearing the bar to enter at all is treated as justification enough to bump a lesser holding.
 
 This is an entry-gate decision, not a reaction to a struggling position — it belongs beside Market Reading, not beside the exit machinery below.
 
@@ -222,6 +241,16 @@ When combined unrealized loss crosses a threshold, one can either close all posi
 Positions open with no TP; as price moves in the profitable direction, flat adds are placed at −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% from entry. At the seventh add, a TP is set at −22% from the original entry.
 
 A perfect AMa run returns roughly **709% on the original entry margin** at 6× leverage. If price reverses and a DCA level triggers, AMa cancels and a standard stage-based TP is set against the current weighted average.
+
+---
+
+#### Collective Cascade and Sacrifice
+
+Entry-gate strategies pair their criteria-based selection with a book-level safety net separate from the DCA and absorption machinery above. Rather than judging each position on its own, the whole group of positions opened by that strategy is judged together: when their combined unrealized profit crosses a set share of margin, the whole group closes at once, banking the gain before it can give it back. The mirror case closes the group — or, in a gentler form, just the single oldest position — once combined unrealized loss crosses its own threshold, capping how far a bad swing is allowed to run before it's cut off.
+
+A halving option lets both thresholds shrink the longer the oldest position in the group has sat open — an aging, undecided group becomes progressively easier to trigger rather than sitting indefinitely waiting for a large move that may never come.
+
+This check reacts to the group's live state continuously rather than only at fixed intervals, so a swing that crosses the threshold and reverses again shortly after is still caught.
 
 ---
 

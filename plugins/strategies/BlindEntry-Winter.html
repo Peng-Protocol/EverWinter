@@ -27,12 +27,13 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.0.3';
 
-  // +24h/-24h reuse Multi-Indicator's own emoji for visual consistency where the same
-  // criterion already has one; +fund/-fund and +ocs/-ocs get their own since MIW's fund/ocs
-  // emoji are tied to its tiered, app-relative-direction versions, not these bare signs.
-  const CRIT_EMOJI = { '+24h': '⬆️', '-24h': '⬇️', '+fund': '💰', '-fund': '🤑', '+ocs': '📈', '-ocs': '📉' };
+  // +24h/-24h/+fund/-fund reuse Multi-Indicator-Winter's own emoji for visual consistency where
+  // the same criterion already has one — fund is app-relative (short book): +fund (longs paying)
+  // is good carry for shorts (🤑), -fund (shorts paying) is bad for shorts (💸), same as MIW.
+  // +ocs/-ocs reuse Permafrost's single ocs symbol (🔭) since MIC/MIW have no sign-specific one.
+  const CRIT_EMOJI = { '+24h': '⬆️', '-24h': '⬇️', '+fund': '🤑', '-fund': '💸', '+ocs': '🔭', '-ocs': '🔭' };
 
   window.__BotPlugin = {
     id:        'blindentry-winter',
@@ -55,7 +56,7 @@
         <div x-data="{ open: false }">
           <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
             <div style="display:flex;align-items:center;gap:7px">
-              <span>◌ Blind-Entry</span>
+              <span>❄ Blind-Entry</span>
               <span x-show="cfg.bewEnabled" style="font-size:8px;padding:1px 5px;background:rgba(96,210,255,.15);border:1px solid rgba(96,210,255,.35);border-radius:2px;color:var(--ice);letter-spacing:1px">ON</span>
               <span x-show="!cfg.bewEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
             </div>
@@ -238,7 +239,9 @@
 
         async _bewRunScan() {
           if (!this.cfg.bewEnabled) return;
-          if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
+          // Halt is checked below, right before opening — not here. Candidate sampling and
+          // the OC batch fetch must still run while halted so Permafrost's OC surveillance
+          // keeps getting fed; only the actual position entry is what a halt should block.
 
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) return;
@@ -277,20 +280,35 @@
             const j = Math.floor(Math.random() * (i + 1));
             [pool[i], pool[j]] = [pool[j], pool[i]];
           }
-          const take   = Math.min(this.cfg.bewPerCycle ?? 12, headroom);
+          // Sample size is NOT capped by headroom — OC surveillance is meant to observe the
+          // full candidate pool regardless of how many slots are actually free to open (a
+          // near-full book would otherwise starve the OC sample down to a handful of tickers).
+          // The open loop below is what enforces headroom/maxPos on actual entries.
+          const take   = this.cfg.bewPerCycle ?? 12;
           const sample = pool.slice(0, take);
           if (!sample.length) { this._bewLastActedAt = freshAt; return; }
 
           // OC data is batch-fetched for the already-selected sample only — pure data
-          // collection for the +ocs/-ocs tag, never a filter on who's in the sample.
+          // collection for the +ocs/-ocs tag, never a filter on who's in the sample. Runs
+          // regardless of drawdown/gains-lock halt — only opening positions is halted below.
           if (this.cfg.pfOcEnabled) {
             const ocCap = this.cfg.bewOcScanCap ?? 20;
             await this._ocFetchBatch?.(sample.slice(0, ocCap).map(t => t.symbol));
           }
 
+          if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) { this._bewLastActedAt = freshAt; return; }
+
           let opened = 0;
           for (const t of sample) {
             if ((this.positions?.length ?? 0) >= (this.cfg.maxPos ?? 5)) break;
+            // Share Cap used to be enforced for free by the sample itself never exceeding
+            // headroom — now that the sample is sized independently for OC breadth, it has
+            // to be re-checked here, per open, since bewCount changes as this loop runs.
+            if (this.cfg.bewShareCapEnabled ?? true) {
+              const capSlots = Math.max(1, Math.floor((this.cfg.maxPos ?? 5) * ((this.cfg.bewShareCapPct ?? 100) / 100)));
+              const bewCount = (this.positions || []).filter(p => p._bew).length;
+              if (bewCount >= capSlots) break;
+            }
             if (await this._bewOpen(t)) opened++;
           }
           this._bewLastActedAt = freshAt;

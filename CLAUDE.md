@@ -23,17 +23,17 @@ Each file carries its version in two or three places — update **all** that app
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.5 |
-| `PseudoWinter.html` | v1.13.4 |
-| `PseudoChaser.html` | v1.9.4 |
+| `PseudoWinter.html` | v1.13.6 |
+| `PseudoChaser.html` | v1.9.7 |
 | `PsychoWinter1.0.html` | v1.0 |
-| `plugins/strategies/MultiIndicator-Winter.html` | v1.43.1 |
-| `plugins/strategies/MultiIndicator-Chaser.html` | v1.42.1 |
-| `plugins/strategies/BlindEntry-Winter.html` | v1.0.0 |
-| `plugins/strategies/BlindEntry-Chaser.html` | v1.0.0 |
-| `plugins/strategies/LiquidDiver-Winter.html` | v1.0.0 |
-| `plugins/strategies/LiquidDiver-Chaser.html` | v1.0.0 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.44.0 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.44.0 |
+| `plugins/strategies/MultiIndicator-Winter.html` | v1.44.2 |
+| `plugins/strategies/MultiIndicator-Chaser.html` | v1.43.2 |
+| `plugins/strategies/BlindEntry-Winter.html` | v1.0.3 |
+| `plugins/strategies/BlindEntry-Chaser.html` | v1.0.3 |
+| `plugins/strategies/LiquidDiver-Winter.html` | v1.3.0 |
+| `plugins/strategies/LiquidDiver-Chaser.html` | v1.3.0 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.47.2 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.47.2 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
@@ -68,6 +68,7 @@ Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser
 - **Don't present speculative trading-signal/strategy designs with confident language.** Recombining known TA concepts (candle patterns, liquidation exhaustion, OI crowding, etc.) into a proposed entry filter is not validated insight — it's pattern-matching against textbook material, with zero basis for claiming it would work. If a signal combination reliably predicted price reversal vs. continuation, it would already be arbitraged by better-resourced players; the fact that it isn't commoditized is itself evidence against casual recombination working. State plainly "I have no data or way to validate this" rather than describing a proposal as "the most direct lever" or "a genuine tell." Reasoning about *mechanics already in the code* (does this DCA math compound risk the way it looks, does this filter select the population it claims to) is grounded and fine; predicting what markets will do next is not something to answer with confidence.
 - **When you hit a hard barrier (blocked network, missing capability, missing data), stop and report — don't pick a path and start executing it.** State the barrier plainly, then describe the plan you're considering, and wait for the user to confirm or redirect before doing any of the follow-up work (e.g. reading more code, building tooling) that plan implies. Reporting the blocker and then immediately continuing on your own chosen path is still not stopping — the user needs a chance to redirect before work starts, not just a heads-up while it's already underway.
 - **Alpine.js `x-html`/`x-text` reactivity: prefer removing artificial `tick`-style polling dependencies over throttling them.** A method that reads `void this.tick` recomputes every time that counter changes, regardless of whether the data it actually uses changed — even a throttled/slower counter is still polling. Alpine already tracks which reactive properties a method reads and re-runs it automatically when *those* properties mutate (array `.push()`, reassignment, etc.), so a chart/panel builder should have no tick dependency at all unless it has a genuine live/time-based element (e.g. a countdown) with no underlying data change to key off. Default to letting Alpine's own dependency tracking drive recomputation; only add a tick read when there's a concrete reason sub-second or sub-few-second freshness matters independent of data.
+- **Prefer asking clarifying questions directly in the response text over the AskUserQuestion tool.** The tool appears to cost more credits than a plain-text question. Pose the question, then stop and wait for the user's reply in the next turn — don't use the structured tool unless the user asks for options/a picker.
 
 ## Pending Tasks
 
