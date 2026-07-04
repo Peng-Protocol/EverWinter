@@ -254,7 +254,7 @@ A specialized, liquidation-only strategy. Unlike MultiIndicator's `sliq`/`bliq`/
 | Setting | What it does |
 |---|---|
 | **Enabled** (`ldwEnabled`/`ldcEnabled`) | Master on/off. Off by default. |
-| **Depth Threshold** (`ldwDepthThreshold`/`ldcDepthThreshold`) | Minimum live depth (% vs. historical average, see above) to trigger entry. Default 10 (at least 10% above the average liquidation size). No ceiling — the 70%/30% liquidation-share requirement already filters out noise. |
+| **Depth Threshold** (`ldwDepthThreshold`/`ldcDepthThreshold`) | Minimum live depth (% vs. historical average, see above) to trigger entry. Default 1 (at least 1% above the average liquidation size). No ceiling — the 70%/30% liquidation-share requirement already filters out noise. |
 | **Slot Blocking** (`ldwSlotBlockEnabled`/`ldcSlotBlockEnabled`) | A per-type loss circuit breaker. If one liquidation type's (sliq/bliq/msliq/mbliq) collapsed Scorecard score is a loss beyond the threshold below, new entries of *that type only* are blocked — the other three keep working. Continuously re-checked; a blocked type re-opens automatically once its score recovers, no manual clear needed. |
 | **Slot Blocking %** (`ldwSlotBlockPct`/`ldcSlotBlockPct`) | Loss magnitude as a % of base margin (minNotional ÷ leverage) that trips the block. Default 25%. |
 | **Cascade** (`ldwCascadeEnabled`/`ldcCascadeEnabled`) | Closes all Liquid-Diver positions when their collective unrealized profit hits a threshold. |
