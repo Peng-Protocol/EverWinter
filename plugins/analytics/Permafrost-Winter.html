@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.46.1';
+  const VERSION        = '1.46.2';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -588,6 +588,8 @@
         _liqAvgYPx: null,
         _liqYAxisHtml: '',
         _liqHighlightedCycleTs: null, // ts of a clicked cycle in the LIQUIDATION SAMPLE chart; null = follow latest
+        _liqAvgSTurnover: 0, // avg sell-liq $ across all recorded cycles — see _liqUpdateAvgTurnover
+        _liqAvgBTurnover: 0, // avg buy-liq $ across all recorded cycles
         _pfOcCycleHistory: [], // rolling per-cycle snapshots: {id, ts, results:[{sym,bc,sc,avgMs,n}]}
         _pfOcCycleCounter: 0,
         pfOcResults: {},       // {[sym]:{bc,sc,avgMs,n}} from the most recent OC fetch batch
@@ -667,6 +669,7 @@
               this._liqCycleCounter = Math.max(this._liqCycleCounter, last.id || 0);
             }
           } catch(_) {}
+          this._liqUpdateAvgTurnover();
           try {
             const _sharedLiq = this._sharedRead?.('liqResults');
             if (_sharedLiq && Object.keys(_sharedLiq).length) this._liqResults = { ...this._liqResults, ..._sharedLiq };
@@ -1615,6 +1618,7 @@
               if (Array.isArray(d.liqHistory)) {
                 this._liqCycleHistory = d.liqHistory.slice(-25);
                 try { localStorage.setItem(PFR_LIQ_HISTORY_KEY, JSON.stringify(this._liqCycleHistory)); } catch(_) {}
+                this._liqUpdateAvgTurnover();
               }
               if (Array.isArray(d.ocHistory)) {
                 this._pfOcCycleHistory = this._ocSanitizeHistory(d.ocHistory).cleaned;
@@ -1735,7 +1739,7 @@
             try {
               const snapshots = (this._liqBatches || []).map(b => ({
                 id: b.id, startedAt: b.startedAt, endsAt: b.endsAt, symbols: b.symbols,
-                sLiqTurnover: { ...b.sLiqTurnover }, bLiqTurnover: { ...b.bLiqTurnover }, oiSnapshot: { ...(b.oiSnapshot || {}) }
+                sLiqTurnover: { ...b.sLiqTurnover }, bLiqTurnover: { ...b.bLiqTurnover }
               }));
               localStorage.setItem(PFR_LIQ_KEY, JSON.stringify(snapshots));
             } catch(_) {}
@@ -1757,7 +1761,6 @@
             symbols: snapshot.symbols,
             sLiqTurnover: { ...snapshot.sLiqTurnover },
             bLiqTurnover: { ...snapshot.bLiqTurnover },
-            oiSnapshot: { ...(snapshot.oiSnapshot || {}) },
             ws: null, _endTimer: null
           };
           this._liqBatches.push(batch);
@@ -1800,9 +1803,9 @@
         },
 
         // Called for every incoming liq message, per touched symbol, with the batch object still
-        // live (sLiqTurnover/bLiqTurnover/oiSnapshot already updated) — before the batch
-        // closes. Lets a reactive consumer (e.g. Liquid-Diver) compute a mid-cycle depth reading
-        // without waiting for _liqCloseBatch's once-per-hour snapshot.
+        // live (sLiqTurnover/bLiqTurnover already updated) — before the batch closes. Lets a
+        // reactive consumer (e.g. Liquid-Diver) compute a mid-cycle depth reading without
+        // waiting for _liqCloseBatch's once-per-hour snapshot.
         registerLiqMessageHook(fn) {
           if (typeof fn === 'function' && !this._liqMessageHooks.includes(fn)) this._liqMessageHooks.push(fn);
         },
@@ -1826,17 +1829,9 @@
           this._liqCycleCounter = (this._liqCycleCounter % 25) + 1;
           const id        = this._liqCycleCounter;
           const startedAt = Date.now();
-          // Depth measures liquidated $ as a % of open interest — snapshotted once at batch
-          // launch so a live reactive consumer (Liquid-Diver) sees a stable denominator for
-          // the whole hour rather than one that drifts as OI itself moves mid-cycle.
-          const oiSnapshot = Object.fromEntries(symbols.map(s => {
-            const tk = allTickers.find(t => t.symbol === s);
-            return [s, tk ? parseFloat(tk.openInterestValue || 0) : 0];
-          }));
           const batch     = { id, startedAt, endsAt: startedAt + 3600000, symbols,
             sLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
             bLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
-            oiSnapshot,
             ws: null, _endTimer: null };
           this._liqBatches.push(batch);
           this._liqPersistBatches();
@@ -1883,19 +1878,22 @@
           if (batch._endTimer) { clearTimeout(batch._endTimer); batch._endTimer = null; }
           try { if (batch.ws && batch.ws.readyState !== WebSocket.CLOSED) batch.ws.close(); } catch(_) {}
           batch.ws = null;
-          // Depth = liquidated $ as a % of open interest — depth +1 means the liquidated
-          // side's turnover this cycle equaled 1% of the ticker's OI snapshot at batch launch.
-          const calcDepth  = (raw, oi) => oi > 0 ? Math.trunc((raw / oi) * 100) : 0;
+          // Depth = % this side's liquidated $ deviates from the average liquidation size
+          // recorded across all history so far (this._liqAvgSTurnover/_liqAvgBTurnover, see
+          // _liqUpdateAvgTurnover) — +1 means 1% above average, -1 means 1% below, floor of
+          // -100 at zero liquidation, no ceiling. Computed against the average as it stood
+          // BEFORE this cycle (updated after, at the bottom of this function) so a cycle is
+          // never judged against a baseline that already includes itself.
+          const calcDepth  = (raw, avg) => avg > 0 ? Math.trunc(((raw / avg) - 1) * 100) : 0;
           const threshold  = this.cfg.pfLiqThresholdPct ?? 50;
           const results    = batch.symbols.map(sym => {
             const sLiqRaw  = batch.sLiqTurnover[sym] || 0;
             const bLiqRaw  = batch.bLiqTurnover[sym] || 0;
-            const oi       = (batch.oiSnapshot || {})[sym] || 0;
             const liqTotal = sLiqRaw + bLiqRaw;
             const sLiqPct  = liqTotal > 0 ? (sLiqRaw / liqTotal) * 100 : 0;
             const bLiqPct  = liqTotal > 0 ? (bLiqRaw / liqTotal) * 100 : 0;
-            const sDepth   = calcDepth(sLiqRaw, oi);
-            const bDepth   = calcDepth(bLiqRaw, oi);
+            const sDepth   = calcDepth(sLiqRaw, this._liqAvgSTurnover || 0);
+            const bDepth   = calcDepth(bLiqRaw, this._liqAvgBTurnover || 0);
             return { sym, sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, sDepth, bDepth, sPass: liqTotal > 0 && sLiqPct >= threshold, bPass: liqTotal > 0 && bLiqPct >= threshold };
           });
           const _now = Date.now();
@@ -1912,6 +1910,7 @@
           this._liqCycleHistory.push(entry);
           if (this._liqCycleHistory.length > 25) this._liqCycleHistory = this._liqCycleHistory.slice(-25);
           this._liqPersistHistory();
+          this._liqUpdateAvgTurnover();
           this._liqLatestResults = results;
           const _totS = results.reduce((s, r) => s + r.sLiqRaw, 0);
           const _totB = results.reduce((s, r) => s + r.bLiqRaw, 0);
@@ -1919,6 +1918,20 @@
           const _fmt  = v => v >= 1e6 ? `$${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `$${(v/1e3).toFixed(0)}k` : `$${v.toFixed(0)}`;
           const _skew = _tot > 0 ? `B ${(_totB/_tot*100).toFixed(0)}% / S ${(_totS/_tot*100).toFixed(0)}%` : 'no turnover';
           this.log(`[PFR] 💧 Liq #${batch.id} — ${_fmt(_tot)} · ${_skew}`, 'info');
+        },
+
+        // Recomputes the global avg sell-liq / buy-liq $ used as the depth baseline — the same
+        // population as the chart's own dashed avg line, just split by side. Zero-turnover
+        // entries are excluded so the vast majority of ticker/cycle combos with no liquidation
+        // that side don't drag the average toward zero. Called once per cycle close (and once
+        // at init, after history loads from storage) — not on every incoming WS message, since
+        // that would recompute this over the whole rolling history on the live hot path.
+        _liqUpdateAvgTurnover() {
+          const history = this._liqCycleHistory || [];
+          const allS = history.flatMap(c => (c.results || []).map(r => r.sLiqRaw || 0)).filter(v => v > 0);
+          const allB = history.flatMap(c => (c.results || []).map(r => r.bLiqRaw || 0)).filter(v => v > 0);
+          this._liqAvgSTurnover = allS.length ? allS.reduce((a, b) => a + b, 0) / allS.length : 0;
+          this._liqAvgBTurnover = allB.length ? allB.reduce((a, b) => a + b, 0) / allB.length : 0;
         },
 
         _liqChartSvg(shown) {
