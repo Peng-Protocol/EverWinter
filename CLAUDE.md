@@ -30,8 +30,8 @@ Each file carries its version in two or three places — update **all** that app
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.43.2 |
 | `plugins/strategies/BlindEntry-Winter.html` | v1.0.3 |
 | `plugins/strategies/BlindEntry-Chaser.html` | v1.0.3 |
-| `plugins/strategies/LiquidDiver-Winter.html` | v1.2.0 |
-| `plugins/strategies/LiquidDiver-Chaser.html` | v1.2.0 |
+| `plugins/strategies/LiquidDiver-Winter.html` | v1.3.0 |
+| `plugins/strategies/LiquidDiver-Chaser.html` | v1.3.0 |
 | `plugins/analytics/Permafrost-Winter.html` | v1.47.2 |
 | `plugins/analytics/Ashfall-Chaser.html` | v1.47.2 |
 
