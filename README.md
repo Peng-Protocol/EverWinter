@@ -18,10 +18,6 @@
 | `plugins/modes/EDa-Chaser.html` | EDa plugin for PseudoChaser |
 | `plugins/strategies/MultiIndicator-Winter.html` | Entry filter plugin for PseudoWinter |
 | `plugins/strategies/MultiIndicator-Chaser.html` | Entry filter plugin for PseudoChaser |
-| `plugins/strategies/BlindEntry-Winter.html` | Control-group entry plugin for PseudoWinter (no criteria, threshold only) |
-| `plugins/strategies/BlindEntry-Chaser.html` | Control-group entry plugin for PseudoChaser (no criteria, threshold only) |
-| `plugins/strategies/LiquidDiver-Winter.html` | Reactive liquidation-only entry plugin for PseudoWinter |
-| `plugins/strategies/LiquidDiver-Chaser.html` | Reactive liquidation-only entry plugin for PseudoChaser |
 | `plugins/analytics/Permafrost-Winter.html` | Market climate plugin for PseudoWinter |
 | `plugins/analytics/Ashfall-Chaser.html` | Market climate plugin for PseudoChaser |
 
@@ -41,9 +37,7 @@ In addition to the shared data pool, the Permafrost and Ashfall plugins maintain
 
 To load a plugin, open the **Plugin Manager** panel, click **Load Plugin**, and select the `.html` file. **A page reload is required after loading or removing any plugin** — the plugin pipeline runs once at page boot, so changes don't take effect until the next load.
 
-Load order matters: live trading plugins (EverWinter, SunChaser) must load before strategy plugins (MultiIndicator, Blind-Entry, Liquid-Diver, Permafrost/Ashfall). The Plugin Manager shows the current load order and warns about conflicts.
-
-MultiIndicator and Blind-Entry are alternatives, not companions — load one or the other per bot unless intentionally running both to compare (see the Blind-Entry Plugin section). Liquid-Diver cannot load on the same bot as MultiIndicator at all — the Plugin Manager blocks it (see the Liquid-Diver Plugin section for why).
+Load order matters: live trading plugins (EverWinter, SunChaser) must load before strategy plugins (MultiIndicator, Permafrost/Ashfall). The Plugin Manager shows the current load order and warns about conflicts.
 
 ---
 
@@ -93,7 +87,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 | **Laggard** | The oldest open position — the EDa debt holder. Shows its current debt load when EDa is active. |
 | **Persistence** | "Active" is the live in-memory position count; "Stored" is what's confirmed saved to localStorage. These should always match. A mismatch (shown in red with a warning banner) means a save failed or was overwritten — the bot retries automatically every 5s. If it doesn't clear, check the activity log for `[PST]`/`[PERSIST]` entries, and close any duplicate tabs of the same bot — a second tab can overwrite the first tab's saves with its own stale position count. The **Storage usage** dropdown below it breaks localStorage down to one row per data type — e.g. Permafrost's structure wave, volume history, OI/MC history, liquidation samples, and OC samples are each their own row rather than one lumped "Permafrost" figure, so a bloated data type is visible on its own. Any row over 200KB is shown in red. An **Export** link appears next to it once expanded, downloading the same breakdown as a plain-text file — useful for sharing the numbers outside the app. Below that, a **Power usage** dropdown shows a rolling average and peak of how many milliseconds the app spends reacting each second — a rising figure usually means a plugin panel left open somewhere is doing more work than it needs to; closing analytics panels you're not actively watching brings it back down. |
 
-**Ticker Graylist**: when MultiIndicator or Liquid-Diver is enabled, the Stats menu shows a Ticker Graylist section listing symbols currently blocked from re-entry (see each plugin's Re-entry Block description). It's empty when nothing is blocked. Each listed symbol clears itself automatically once the bulk ticker cooldown window elapses — no manual action needed.
+**Ticker Graylist**: when MultiIndicator is enabled, the Stats menu shows a Ticker Graylist section listing symbols currently blocked from re-entry. It's empty when nothing is blocked. Each listed symbol clears itself automatically once the bulk ticker cooldown window elapses — no manual action needed.
 
 ### Actions Dropdown
 
@@ -160,7 +154,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 
 **OCS/OCX recording**: on entry, `ocs` records signed deviation-from-parity tiers (e.g. `ocs+12` = 62% buy-dominant, `ocs-8` = 42% buy / 58% sell, at the default 1% step) and `ocx` records the average-interval tier directly (e.g. `ocx+18` ≈ 1.8s between fills at the default 0.1s step). Unlike every other criterion, Order Count Surveillance data exists for essentially every ticker at all times — there are always orders flowing — so `ocs`/`ocx` behave like `+24h`/`-24h` in that they are near-universally available rather than conditional on a data source being fresh or a pattern being present.
 
-**Depth gate** (sliq/bliq/msliq/mbliq): `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. `sDepth`/`bDepth` are computed once per closed liq cycle as `trunc(((sideTurnover / historicalAvg) − 1) × 100)` — the liquidated side's turnover this cycle compared to the average liquidation size recorded across *all* history (every ticker, every closed cycle, zero-turnover entries excluded so it isn't diluted by the majority of ticker/cycle combos with no liquidation that side). `+10` means this cycle's liquidation was 10% above the historical average; `-10` means 10% below. There's no upper ceiling; the practical floor is `-100` (zero liquidation that side). Without a suffix the depth gate is skipped. msliq and mbliq use the same depth value as sliq and bliq respectively. Liquid-Diver (below) uses the exact same formula and scale for its own live entry gate — a live reading and a closed-cycle reading mean the same thing. The historical average is recomputed once per closed cycle (not per liquidation message), and a cycle is always judged against the average *as it stood before that cycle* so it never gets compared against a baseline that already includes itself.
+**Depth gate** (sliq/bliq/msliq/mbliq): `sliq>N` requires `sDepth ≥ N`; `sliq<N` requires `sDepth ≤ N`. `sDepth`/`bDepth` are computed once per closed liq cycle as `trunc(((sideTurnover / historicalAvg) − 1) × 100)` — the liquidated side's turnover this cycle compared to the average liquidation size recorded across *all* history (every ticker, every closed cycle, zero-turnover entries excluded so it isn't diluted by the majority of ticker/cycle combos with no liquidation that side). `+10` means this cycle's liquidation was 10% above the historical average; `-10` means 10% below. There's no upper ceiling; the practical floor is `-100` (zero liquidation that side). Without a suffix the depth gate is skipped. msliq and mbliq use the same depth value as sliq and bliq respectively. The historical average is recomputed once per closed cycle (not per liquidation message), and a cycle is always judged against the average *as it stood before that cycle* so it never gets compared against a baseline that already includes itself.
 
 ### Config
 
@@ -219,72 +213,6 @@ All three sources share their results cross-tab. A ticker with no data from any 
 
 ---
 
-## Blind-Entry Plugin (BEW / BEC)
-
-A control-group strategy: the only entry gate is 24h price change exceeding a threshold, in either direction — no funding rate, volume ratio, candle pattern, liquidation data, or order-flow data ever decides which ticker gets picked. Its purpose is to measure whether MultiIndicator's criteria-based entry gate actually adds expectancy over its exit machinery (Cascade, Sacrifice, Halving, Share Cap — all shared with MIW/MIC and behave identically) by running the same management tools with entry selection removed. Don't load alongside MultiIndicator on the same bot unless intentionally comparing both — they'll compete for the same position pool via their respective Share Caps.
-
-| Setting | What it does |
-|---|---|
-| **Enabled** (`bewEnabled`/`becEnabled`) | Master on/off. Off by default. |
-| **Change Threshold** (`bewChangePct`/`becChangePct`) | Minimum absolute 24h price change to qualify. Direction doesn't matter, only magnitude. Default 6%. |
-| **Candidates per Cycle** (`bewPerCycle`/`becPerCycle`) | Max new entries per scan, randomly sampled from all qualifying tickers — no ranking. Default 12. |
-| **Re-entry Cooldown** (`bewReentryCooldownHrs`/`becReentryCooldownHrs`) | Minimum hours after any close (by any strategy) before the same symbol can be re-entered. Default 1h. |
-| **Cascade** (`bewCascadeEnabled`/`becCascadeEnabled`) | Closes all Blind-Entry positions when their collective unrealized profit hits a threshold. Checked continuously by the position watcher (every 5s while the bot is running), not just once per scan. |
-| **Cascade %** (`bewCascadePct`/`becCascadePct`) | Collective uPnL trigger as a % of base margin (minNotional ÷ leverage). Default 25%. |
-| **Sacrifice** (`bewSacrificeEnabled`/`becSacrificeEnabled`) | Closes Blind-Entry positions when their collective unrealized loss hits a threshold. Same continuous position-watcher check as Cascade. |
-| **Sacrifice %** (`bewSacrificePct`/`becSacrificePct`) | Collective uLoss trigger as a % of base margin. Default 25%. |
-| **Rolling Sacrifice** (`bewRollingSacrificeEnabled`/`becRollingSacrificeEnabled`) | When on, Sacrifice closes only the oldest Blind-Entry position at a time instead of all at once. On by default. |
-| **Halving** (`bewHalvingEnabled`/`becHalvingEnabled`) | Shrinks the Cascade/Sacrifice trigger threshold the longer the oldest Blind-Entry position has been held — continuous exponential decay based on Halving Interval, same mechanism as MIW/MIC. |
-| **Halving Interval** (`bewHalvingHours`/`becHalvingHours`) | Hours per halving step. Default 0.5. |
-| **Share Cap** (`bewShareCapEnabled`/`becShareCapEnabled`) | Limits Blind-Entry to a percentage of `maxPos`, so it doesn't monopolize the book if another strategy plugin is also loaded. |
-| **Share Cap %** (`bewShareCapPct`/`becShareCapPct`) | The cap percentage. Default 100%. |
-| **OC Scan Cap** (`bewOcScanCap`/`becOcScanCap`) | Max symbols per cycle for the Order Count batch fetch used only for the `+ocs`/`-ocs` tag below — capped separately from Candidates per Cycle since the fetch runs before entries open. Default 20. |
-
-**Position tagging**: every opened position is tagged with three sign-only pairs — `+24h`/`-24h` (ticker direction), `+fund`/`-fund` (funding rate sign, any magnitude), `+ocs`/`-ocs` (buy/sell order-flow majority, no depth threshold). These are recorded, never filtered on — every candidate that clears the Change Threshold gets one of each pair regardless of which side it lands on. They exist purely so Permafrost/Ashfall's Slot Scorecard has something to bucket Blind-Entry's trades by. If Order Count data isn't available for a candidate when it opens (thin liquidity, fetch miss), the position still opens — `+ocs`/`-ocs` is simply omitted from that trade's tags rather than blocking entry. `+24h`/`-24h` share the same Scorecard bucket as MultiIndicator's `+24h`/`-24h` criterion — a shared "was the ticker up or down" signal across whichever strategy produced the trade, not separated per plugin. Requires Permafrost/Ashfall with Order Count Surveillance on for the `+ocs`/`-ocs` tag; the other two tags need no plugin dependency.
-
-Substitution does not apply to Blind-Entry — it has no score to rank a new candidate against a held position, so there's nothing to substitute on.
-
----
-
-## Liquid-Diver Plugin (LDW / LDC)
-
-A specialized, liquidation-only strategy. Unlike MultiIndicator's `sliq`/`bliq`/`msliq`/`mbliq` gates — which only ever read a finished, hour-old liquidation cycle at the next scan — Liquid-Diver reacts live: it watches Permafrost/Ashfall's liquidation feed directly and opens a position the instant a surveilled ticker's live liquidation depth crosses the threshold, mid-cycle, without waiting for the next scan or the batch's hour-end close. Scanning still matters here only because it's what creates new liquidation surveillance batches to watch — it is not what triggers entry.
-
-**Cannot load on the same bot as MultiIndicator** — the Plugin Manager blocks it both ways. Both plugins would otherwise be interpreting the same liquidation cycles on two different timelines (one scan-gated and stale, one live), and Slot Blocking below needs sole ownership of the sliq/bliq/msliq/mbliq scorecard buckets to mean anything. Requires Permafrost/Ashfall's Liq Surveillance toggle on — without it there are no live batches to react to, and Liquid-Diver logs a warning on load if it's off.
-
-**Depth — read this before setting the threshold.** Liquid-Diver's depth is a live reading of the same formula MultiIndicator's depth gate uses (see above): % this side's liquidated $ deviates from the average liquidation size recorded across all history. `+10` means this liquidation is running 10% above the historical average so far this cycle; negative values mean below average. No upper ceiling; practical floor is `-100` (zero liquidation). A live reading and a closed-cycle reading mean exactly the same thing here. There's no depth reading for 0-liq (see Liquidation Presence below) — a zero has no magnitude to measure.
-
-Config is split into two tabs: **Entry** (Depth Threshold, Liquidation Presence, Slot Blocking, Share Cap, Substitution) and **Exit** (Cascade, Sacrifice, Halving).
-
-| Setting | What it does |
-|---|---|
-| **Enabled** (`ldwEnabled`/`ldcEnabled`) | Master on/off. Off by default. |
-| **Depth Threshold** (`ldwDepthThreshold`/`ldcDepthThreshold`) | Minimum live depth (% vs. historical average, see above) to trigger entry on a ticker *with* liquidation. Default 1 (at least 1% above the average liquidation size). No ceiling — the 70%/30% liquidation-share requirement already filters out noise. |
-| **Liquidation Presence** (`ldwLiqPresenceMode`/`ldcLiqPresenceMode`) | Three-way toggle: **Only 1** reacts live to tickers *with* liquidation past the Depth Threshold (default, the original behavior). **Only 0** opens instead on tickers with *zero* liquidation once their surveillance cycle closes — there's no live signal for "nothing happened," so this path checks at cycle-close rather than reacting mid-cycle. **Both** runs each path independently. |
-| **Re-entry Block** (`ldwReentryBlockEnabled`/`ldcReentryBlockEnabled`) | Blocks a symbol from re-triggering for one bulk-ticker cooldown window right after its own position closes — the same graylist MultiIndicator reads from, so a close by either plugin blocks the symbol for both. On by default. Currently blocked symbols are listed in the Stats menu's Ticker Graylist section. |
-| **Re-entry Block Mode** (`ldwReentryBlockMode`/`ldcReentryBlockMode`) | **Losers Only** lets a symbol that just closed in profit re-trigger immediately, blocking only a symbol that closed at a loss. **Winners + Losers** (default) blocks either outcome until the cooldown clears — unlike MultiIndicator, which always blocks both with no mode choice. |
-| **Slot Blocking** (`ldwSlotBlockEnabled`/`ldcSlotBlockEnabled`) | A per-criterion loss circuit breaker covering the triggering liquidation type (sliq/bliq/msliq/mbliq/0liq) *and* the sign-tagged 24h/funding criteria attached to every entry. If any one of those collapsed Scorecard scores is a loss beyond the threshold below, new entries carrying that criterion are blocked — other criteria keep working. Continuously re-checked; a block clears automatically once its score recovers, no manual action needed. OCS is not covered — it's fetched only after a candidate already clears blocking, so it can't gate entry. |
-| **Slot Blocking %** (`ldwSlotBlockPct`/`ldcSlotBlockPct`) | Loss magnitude as a % of base margin (minNotional ÷ leverage) that trips the block. Default 25%. |
-| **Cascade** (`ldwCascadeEnabled`/`ldcCascadeEnabled`) | Closes all Liquid-Diver positions when their collective unrealized profit hits a threshold. Checked continuously by the position watcher (every 5s while the bot is running) — matching the same live cadence as Liquid-Diver's own entries, rather than waiting on the scan clock. |
-| **Cascade %** (`ldwCascadePct`/`ldcCascadePct`) | Collective uPnL trigger as a % of base margin. Default 25%. |
-| **Sacrifice** (`ldwSacrificeEnabled`/`ldcSacrificeEnabled`) | Closes Liquid-Diver positions when their collective unrealized loss hits a threshold. Same continuous position-watcher check as Cascade. |
-| **Sacrifice %** (`ldwSacrificePct`/`ldcSacrificePct`) | Collective uLoss trigger as a % of base margin. Default 25%. |
-| **Rolling Sacrifice** (`ldwRollingSacrificeEnabled`/`ldcRollingSacrificeEnabled`) | When on, Sacrifice closes only the oldest Liquid-Diver position at a time instead of all at once. On by default. |
-| **Halving** (`ldwHalvingEnabled`/`ldcHalvingEnabled`) | Shrinks the Cascade/Sacrifice trigger threshold the longer the oldest Liquid-Diver position has been held — same mechanism as MIW/MIC. |
-| **Halving Interval** (`ldwHalvingHours`/`ldcHalvingHours`) | Hours per halving step. Default 0.5. |
-| **Share Cap** (`ldwShareCapEnabled`/`ldcShareCapEnabled`) | Limits Liquid-Diver's own *direct* entries to a percentage of `maxPos`. Past the cap, a live signal falls through to Substitution instead of opening into a fresh slot. |
-| **Share Cap %** (`ldwShareCapPct`/`ldcShareCapPct`) | The cap percentage. Default 100%. |
-| **Substitution** (`ldwSubstitutionEnabled`/`ldcSubstitutionEnabled`) | When there's no room (Share Cap or Max Positions both full), closes the most-underwater *held* position — any strategy's, not only Liquid-Diver's own — and opens the live signal in its place. |
-| **Substitution Min Age** (`ldwSubstitutionMinAgeMins`/`ldcSubstitutionMinAgeMins`) | A held position must be at least this old before Substitution can close it. Default 10m. |
-
-Liquid-Diver's Substitution is deliberately wider and more aggressive than MultiIndicator's own version: it can close *any* held position regardless of which strategy opened it, ranked purely by most-underwater unrealized PnL — there's no "Protect Winners" exemption for a currently-profitable position, and no extra margin bar beyond clearing the depth threshold itself. This is intentional — genuine liquidation events are rare, so when one fires it's treated as worth acting on immediately rather than deferred behind a last-resort check.
-
-**Position tagging**: every opened position is tagged with the real liquidation criterion that triggered entry — the type (sliq/bliq/msliq/mbliq) plus its depth, e.g. `sliq+15` (15% above the historical average liquidation size), or bare `0liq` for a zero-liquidation entry — followed by the same three cosmetic, sign-only pairs Blind-Entry uses: `+24h`/`-24h`, `+fund`/`-fund`, `+ocs`/`-ocs`. Of these, `+24h`/`-24h` and `+fund`/`-fund` also feed Slot Blocking (see above); `+ocs`/`-ocs` remains Scorecard-only. OC data is fetched for the single triggering symbol just before the position opens; if that fetch comes back empty the position still opens, just without the `+ocs`/`-ocs` tag.
-
-**Order Interval chart note**: the ORDER INTERVAL SAMPLE chart in Permafrost/Ashfall, and the "+ OC interval" overlay line on the Volume History chart, both hide themselves when Liquid-Diver is the only strategy plugin loaded. Liquid-Diver's OC fetch is single-symbol per reactive entry, so its samples are almost always a single flat bar — showing either chart alongside a proper batch-sampled chart (from MultiIndicator or Blind-Entry) would just be noise. Load MultiIndicator or Blind-Entry alongside Liquid-Diver to see them again.
-
----
-
 ## Permafrost / Ashfall Plugin
 
 Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins replace the fixed 12h drawdown/gains-lock timers with an adaptive halt system that learns from historical market conditions and trade outcomes. They pair realized PnL from each close with a snapshot of market structure — breadth, momentum, and funding sentiment — building a recency-weighted profile over time. That profile drives a climate score that controls halt duration and signals downstream systems (the bots themselves) to adjust their entry and hold behavior accordingly. In practice, market regime (broadly bullish or bearish) is a significant driver of the learned profile, so the score reflects prevailing conditions rather than precise structural predictions.
@@ -311,7 +239,7 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 | **Liquidation Surveillance** (`pfLiqEnabled`/`ashLiqEnabled`) | Opens WebSocket connections to track live liquidation flow across a rolling sample of volatile tickers. Required for `sliq`/`bliq` criteria in MIW/MIC. |
 | **Liq Batch Size** (`pfLiqBatchSize`/`ashLiqBatchSize`) | Tickers per liquidation batch (5–50). More tickers = broader market coverage per cycle. |
 | **Liq Threshold %** (`pfLiqThresholdPct`/`ashLiqThresholdPct`) | Minimum share of a cycle's total liquidation turnover one side must hold to qualify (10–90%). At 50%, one side must account for at least half. |
-| **Order Count Surveillance** (`pfOcEnabled`/`afOcEnabled`) | Fetches a fixed number of recent trades for whichever strategy plugin is driving the scan's candidate pool — MIW/MIC, or Blind-Entry (BEW/BEC) when MultiIndicator isn't loaded. Required for `ocs`/`ocx` criteria in MIW/MIC and for the `+ocs`/`-ocs` tag in Blind-Entry. Each fetch is a fresh, independent snapshot — no accumulation or deduplication across cycles. |
+| **Order Count Surveillance** (`pfOcEnabled`/`afOcEnabled`) | Fetches a fixed number of recent trades for the tickers in MIW/MIC's scan candidate pool. Required for `ocs`/`ocx` criteria in MIW/MIC. Each fetch is a fresh, independent snapshot — no accumulation or deduplication across cycles. |
 | **OC Order Limit** (`pfOcOrderLimit`/`afOcOrderLimit`) | Recent trades fetched per ticker per scan cycle (10–500). Buy/sell skew and average order interval are both computed from this single sample. Default 100. |
 
 ### WAVE Tab
@@ -343,16 +271,13 @@ Three directional bar charts below the climate reading show relative dominance a
 
 > **Observational note:** The sampling bars and charts (kline direction, funding skew, volume skew, OI/MC history) are primarily **visual feedback**. They reflect broad market conditions but do not directly gate entries or trigger closes on their own — the only mechanism that acts on them is the combined entry/close signal system (which requires scorecard gating before most signals contribute). Do not read the bars as predictive signals; a heavily red kline bar can coincide with Chaser winning and Winter losing, or vice versa. Treat them as ambient context while the scorecard provides the actual decision weight.
 
-**Requires MultiIndicator**: the Funding Rate Sample, Volume Sample, and OI/MC History bars are computed by MIW/MIC's own sampling pass and disappear entirely if MultiIndicator isn't loaded — they are not shown empty, they don't render at all. Order Count Surveillance and the Slot Scorecard have no such requirement — either MIW/MIC or Blind-Entry can drive them.
+**Requires MultiIndicator**: the Funding Rate Sample, Volume Sample, OI/MC History bars, Order Count Surveillance, and the Slot Scorecard are all computed by MIW/MIC's own sampling pass and disappear entirely if MultiIndicator isn't loaded — they are not shown empty, they don't render at all.
 
 ### Slot Scorecard
 
-Two separate chip rows, split by which plugin's criteria they hold — a criterion like `+fund` (Blind-Entry/Liquid-Diver's bare sign tag) and a tiered `fund>5` (MIW/MIC's own criterion) collapse to the same display bucket, so keeping them apart keeps either chart meaningful:
+**Slot Scorecard (Chaser/Winter View)** — one chip per base MIW/MIC criterion (e.g. `fund>`, `vm>`, `+24h`) with PnL pooled across all slots that contained it. Only shown when MIW/MIC is both loaded and enabled.
 
-- **Slot Scorecard (Chaser/Winter View)** — one chip per base MIW/MIC criterion (e.g. `fund>`, `vm>`, `+24h`) with PnL pooled across all slots that contained it. Only shown when MIW/MIC is both loaded and enabled.
-- **Blind-Entry / Liquid-Diver Scorecard** — one chip per Blind-Entry/Liquid-Diver bare-sign or liquidation-type criterion (`+24h`/`-24h`, `+fund`/`-fund`, `+ocs`/`-ocs`, `sliq+`/`bliq+`/etc.). Only shown when Blind-Entry or Liquid-Diver is enabled.
-
-Both charts read from the same underlying record store — **CLEAR** on either one wipes both. Each close writes one record; the Sponge Quota controls how many recent records per criterion are factored in, so scores always reflect the most recent N closes and adapt quickly to shifts in market behavior. MIW/MIC uses its own chart's per-criterion scores to order its entry queue — slots are ranked by the sum of their individual criteria scores. A slot with one losing criterion and one winning criterion ranks by their combined total.
+**CLEAR** wipes the record store. Each close writes one record; the Sponge Quota controls how many recent records per criterion are factored in, so scores always reflect the most recent N closes and adapt quickly to shifts in market behavior. MIW/MIC uses its own chart's per-criterion scores to order its entry queue — slots are ranked by the sum of their individual criteria scores. A slot with one losing criterion and one winning criterion ranks by their combined total.
 
 A live position close isn't the only thing that updates the scorecard. Each completed Historical Scoring batch writes its own records and refreshes the scorecard the same way, so scores can shift between trades whenever Historical Scoring is enabled — see the Hist Scoring panel below.
 
@@ -360,13 +285,13 @@ A live position close isn't the only thing that updates the scorecard. Each comp
 
 MIW/MIC builds a composite score for each candidate ticker before sorting the entry pool. The composite starts with the ticker's best-matching slot score. If **Co-Qualifying Penalty** is on, any additional slots the ticker qualifies for are inspected: those with negative criterion scores subtract from the composite. A ticker that satisfies one strong slot but also satisfies two consistently losing slots ranks lower than a ticker that only satisfies the strong slot. Slots with positive scores do not boost — only negative co-qualifying scores penalise.
 
-The **Both / Hist / Traded** source filter (`pfScorecardSource`/`afScorecardSource`) cycles through which score records are included in the displayed chips, shared by both charts. **Both** (default) shows all records. **Hist** shows only records written by the MIW/MIC Historical Scoring feature. **Traded** shows only records from actual live closed trades. This is a display-only filter — it does not affect which records count toward collapsed scoring. Selection is persisted.
+The **Both / Hist / Traded** source filter (`pfScorecardSource`/`afScorecardSource`) cycles through which score records are included in the displayed chips. **Both** (default) shows all records. **Hist** shows only records written by the MIW/MIC Historical Scoring feature. **Traded** shows only records from actual live closed trades. This is a display-only filter — it does not affect which records count toward collapsed scoring. Selection is persisted.
 
-The **Combined / Own** toggle (`pfScorecardView`/`afScorecardView`) switches between: Combined (includes partner bot trades, PnL inverted) sorted by blended total; and Own (this bot's trades only). Selection is persisted, shared by both charts.
+The **Combined / Own** toggle (`pfScorecardView`/`afScorecardView`) switches between: Combined (includes partner bot trades, PnL inverted) sorted by blended total; and Own (this bot's trades only). Selection is persisted.
 
 **Clicking a chip** in Combined mode shows the raw partner win total; in Own mode it shows the raw own loss total. Clicking again or switching sort mode returns to the normal view.
 
-**CLEAR** wipes all records in the shared store — both charts go empty together.
+**CLEAR** wipes all records in the shared store.
 
 **Hist Scoring panel**: when Historical Scoring is enabled, the **Stats menu** also shows a Hist Scoring section with the current count of pending simulation targets, a countdown to the next expected batch (shows "next scan" once the window has elapsed), and a list of completed scoring batches (newest first). Each batch entry shows the batch number, wrote/total counts, win count (W), loss count (L), net simulated PnL, and the clock time the batch completed (same-day batches show HH:MM; older ones show month, day, and time).
 

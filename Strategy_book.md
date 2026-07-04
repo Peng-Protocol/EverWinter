@@ -111,8 +111,6 @@ This lets a strategy trading several independent conditions at once retire the o
 
 A symbol that just closed doesn't immediately re-qualify for entry — it sits out for one refresh of the market snapshot before becoming eligible again. This prevents chasing the same ticker straight back into the same setup that just resolved, on information that's already gone stale.
 
-Some strategies split this further: cooldown only applies after a loss, letting a symbol that just closed in profit come right back if it re-qualifies. Whether that's the better default depends on how directional the underlying signal tends to be for a given ticker — one that tends to repeat in the same direction favors letting winners run back in; one that behaves more like a coin flip favors treating both outcomes the same and sitting out regardless.
-
 ---
 
 #### Substitution
@@ -122,8 +120,6 @@ When every position slot is full, a fresh candidate isn't turned away just becau
 The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
 
 By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
-
-Some strategies apply substitution more aggressively still: no exemption for a currently-winning position, and the pool considered isn't limited to that strategy's own holdings — any position in the book is fair game if it's genuinely the weakest link, regardless of which strategy opened it. This suits a strategy built around a rare, high-conviction signal, where clearing the bar to enter at all is treated as justification enough to bump a lesser holding.
 
 This is an entry-gate decision, not a reaction to a struggling position — it belongs beside Market Reading, not beside the exit machinery below.
 
