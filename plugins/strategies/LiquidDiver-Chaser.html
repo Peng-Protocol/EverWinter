@@ -20,10 +20,18 @@
   so a live reading here means exactly what a closed-cycle reading means everywhere else —
   calcLiveDepth is just that formula evaluated mid-cycle instead of waiting for _liqCloseBatch.
 
-  Slot Blocking: a per-type (sliq/bliq/msliq/mbliq) loss circuit breaker. If a type's collapsed
-  scorecard score is a loss beyond the configured percentage of base margin, new entries of that
-  type are blocked — continuously re-checked, no manual clear needed — while the other three types
-  keep working. Reads the same shared scorecard Multi-Indicator writes to when it's the one loaded.
+  Slot Blocking: a per-criterion loss circuit breaker, covering the triggering liquidation type
+  (sliq/bliq/msliq/mbliq/0liq) AND the sign-tagged 24h/funding criteria attached to every entry.
+  If any one of those collapsed scorecard scores is a loss beyond the configured percentage of
+  base margin, new entries carrying that criterion are blocked — continuously re-checked, no
+  manual clear needed — while unaffected criteria keep working. Reads the same shared scorecard
+  Multi-Indicator writes to when it's the one loaded. OCS is cosmetic-only here (fetched only
+  after a candidate already clears blocking) and can't gate entry.
+
+  0-Liq: a symbol with truly zero liquidation never fires a live WS message, so it can only be
+  observed once its surveillance cycle closes — 0-liq entries are therefore detected via
+  Ashfall's registerLiqCloseHook, not the live per-message path sliq/bliq/msliq/mbliq use. The
+  Liquidation Presence toggle (only-1 / only-0 / both) controls which of the two paths are active.
 
   Position management ports directly from Multi-Indicator: Cascade, Sacrifice (+ rolling variant),
   a halving multiplier, and a Share Cap. Substitution is reintroduced but wider than
@@ -33,11 +41,11 @@
   since genuine liquidation events are rare.
 
   Each opened position is tagged with the real liquidation criterion that triggered entry (e.g.
-  sliq+14) plus three sign-only, untiered pseudo-criteria — +24h/-24h, +fund/-fund, +ocs/-ocs —
-  the same cosmetic tags Blind-Entry uses. The cosmetic tags feed the Scorecard only and never
-  gate entry or Slot Blocking. OC data is fetched for the single triggering symbol before the
-  position opens; a candidate still enters even if that fetch comes back empty, just without the
-  +ocs/-ocs tag.
+  sliq+14, or bare 0liq) plus three sign-only, untiered pseudo-criteria — +24h/-24h, +fund/-fund,
+  +ocs/-ocs — the same cosmetic tags Blind-Entry uses. Of these, +24h/-24h and +fund/-fund also
+  feed Slot Blocking (see above); +ocs/-ocs remains Scorecard-only. OC data is fetched for the
+  single triggering symbol before the position opens; a candidate still enters even if that fetch
+  comes back empty, just without the +ocs/-ocs tag.
 
   Load via Plugin Manager in PseudoChaser's config panel.
   targetBot: pseudochaser
@@ -46,9 +54,9 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.5';
+  const VERSION = '1.1.0';
 
-  const LIQ_TYPE_EMOJI = { sliq: '🥵', bliq: '🥶', msliq: '💦', mbliq: '🌨️' };
+  const LIQ_TYPE_EMOJI = { sliq: '🥵', bliq: '🥶', msliq: '💦', mbliq: '🌨️', '0liq': '⚫' };
   // +24h/-24h/+fund/-fund/+ocs/-ocs reuse Ashfall's own scorecard emoji (afCritEmoji) for
   // visual consistency across the shared tag vocabulary.
   const CRIT_EMOJI = { '+24h': '⬆️', '-24h': '⬇️', '+fund': '💸', '-fund': '🤑', '+ocs': '🔭', '-ocs': '🔭' };
@@ -70,12 +78,17 @@
 
     css: `
       .ldc-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+      .ldc-tabs { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:2px; }
+      .ldc-tab { font-family:var(--mono); font-size:9px; padding:3px 9px; border-radius:2px; border:1px solid; cursor:pointer; background:none; transition:border-color .12s,color .12s,background .12s; letter-spacing:.5px; }
+      .ldc-tab.on { border-color:rgba(255,150,80,.6); color:#ff9650; background:rgba(255,150,80,.08); }
+      .ldc-tab:not(.on) { border-color:rgba(255,255,255,.15); color:var(--text-lo); }
+      .ldc-zone { margin-top:8px; padding:8px; background:rgba(255,255,255,.02); border:1px solid rgba(255,255,255,.06); border-radius:3px; }
     `,
 
     slots: {
       'mode-label-extra': `<span x-show="cfg.ldcEnabled"> + Dive</span>`,
       'strategy-accordions': `
-        <div x-data="{ open: false }">
+        <div x-data="{ open: false, tE: false, tX: false }">
           <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
             <div style="display:flex;align-items:center;gap:7px">
               <span>♨ Liquid-Diver</span>
@@ -93,26 +106,67 @@
               </div>
             </label>
             <div x-show="cfg.ldcEnabled" style="margin-top:8px">
+              <div class="ldc-tabs">
+                <button class="ldc-tab" :class="tE?'on':''" @click="tE=!tE">ENTRY</button>
+                <button class="ldc-tab" :class="tX?'on':''" @click="tX=!tX">EXIT</button>
+              </div>
+
+              <!-- Entry Zone -->
+              <div class="ldc-zone" x-show="tE">
               <div class="lbl">Depth Threshold <b x-text="((cfg.ldcDepthThreshold??1)>=0?'+':'')+(cfg.ldcDepthThreshold??1)"></b></div>
               <input type="number" class="inp" min="-100" step="1" x-model.number="cfg.ldcDepthThreshold" :disabled="cfgLocked" @change="persist()" style="width:80px">
-              <div class="ldc-hint">Minimum live depth — % above (or below, if negative) the average liquidation size across all recorded history — to trigger entry. No ceiling.</div>
+              <div class="ldc-hint">Minimum live depth — % above (or below, if negative) the average liquidation size across all recorded history — to trigger entry on a ticker WITH liquidation. No ceiling.</div>
 
-              <div class="ldc-hint" style="margin-top:8px;padding:6px 8px;background:rgba(100,220,150,.04);border:1px solid rgba(100,220,150,.12);border-radius:3px">Every opened position is tagged with the triggering liquidation criterion (e.g. sliq+14) plus +24h/-24h, +fund/-fund, +ocs/-ocs for the Scorecard only.</div>
+              <div class="lbl" style="margin-top:10px">Liquidation Presence</div>
+              <div style="display:flex;gap:3px;flex-wrap:wrap;margin-top:4px">
+                <button class="ldc-tab" :class="(cfg.ldcLiqPresenceMode??'1')==='1'?'on':''" @click.prevent="if(!cfgLocked){cfg.ldcLiqPresenceMode='1';persist()}">Only 1</button>
+                <button class="ldc-tab" :class="(cfg.ldcLiqPresenceMode??'1')==='0'?'on':''" @click.prevent="if(!cfgLocked){cfg.ldcLiqPresenceMode='0';persist()}">Only 0</button>
+                <button class="ldc-tab" :class="(cfg.ldcLiqPresenceMode??'1')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.ldcLiqPresenceMode='both';persist()}">Both</button>
+              </div>
+              <div class="ldc-hint">"1" reacts live to tickers WITH liquidation past the Depth Threshold. "0" opens on tickers with ZERO liquidation once their surveillance cycle closes — there's no live signal for "nothing happened". "Both" runs each independently.</div>
+
+              <div class="ldc-hint" style="margin-top:8px;padding:6px 8px;background:rgba(100,220,150,.04);border:1px solid rgba(100,220,150,.12);border-radius:3px">Every opened position is tagged with the triggering liquidation criterion (e.g. sliq+14, or bare 0liq) plus +24h/-24h, +fund/-fund, +ocs/-ocs for the Scorecard. OCS is cosmetic-only — Slot Blocking below can't see it.</div>
 
               <div class="lbl" style="margin-top:10px">Slot Blocking</div>
               <label class="tog" style="margin-top:4px" @click.prevent="if(!cfgLocked){cfg.ldcSlotBlockEnabled=!cfg.ldcSlotBlockEnabled;persist()}">
                 <div class="tog-t" :class="cfg.ldcSlotBlockEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Enabled</div>
-                  <div class="ldc-hint">Blocks new entries for a single liquidation type (sliq/bliq/msliq/mbliq) once its scorecard score is a loss beyond <span x-text="cfg.ldcSlotBlockPct??25"></span>% of base margin. Other types keep working. Auto-clears once the score recovers.</div>
+                  <div class="ldc-hint">Blocks new entries whose triggering liquidation type (sliq/bliq/msliq/mbliq/0liq) OR attached 24h/funding sign is a loss beyond <span x-text="cfg.ldcSlotBlockPct??25"></span>% of base margin. Auto-clears once the score recovers.</div>
                 </div>
               </label>
               <div x-show="cfg.ldcSlotBlockEnabled" style="margin-top:4px;margin-left:2px">
                 <input type="range" min="5" max="100" step="5" x-model.number="cfg.ldcSlotBlockPct" :disabled="cfgLocked" @change="persist()">
               </div>
 
-              <div class="lbl" style="margin-top:10px">Management</div>
-              <label class="tog" style="margin-top:4px" @click.prevent="if(!cfgLocked){cfg.ldcCascadeEnabled=!cfg.ldcCascadeEnabled;persist()}">
+              <label class="tog" style="margin-top:10px" @click.prevent="if(!cfgLocked){cfg.ldcShareCapEnabled=!cfg.ldcShareCapEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldcShareCapEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Share Cap</div>
+                  <div class="ldc-hint">Caps Liquid-Diver's own direct entries to at most <span x-text="cfg.ldcShareCapPct??100"></span>% of Max Positions. Past the cap, a signal falls through to Substitution instead of opening directly.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldcShareCapEnabled" style="margin-top:4px;margin-left:2px">
+                <input type="range" min="5" max="100" step="5" x-model.number="cfg.ldcShareCapPct" :disabled="cfgLocked" @change="persist()">
+              </div>
+
+              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ldcSubstitutionEnabled=!cfg.ldcSubstitutionEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ldcSubstitutionEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Substitution</div>
+                  <div class="ldc-hint">When there's no room (Share Cap or Max Positions), closes the most-underwater held position — any strategy's, not just Liquid-Diver's own — and opens the signal in its place.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ldcSubstitutionEnabled" style="margin-top:4px;margin-left:2px">
+                <div class="lbl">Min Age <b x-text="(cfg.ldcSubstitutionMinAgeMins??10)+'m'"></b></div>
+                <input type="range" min="5" max="240" step="5" x-model.number="cfg.ldcSubstitutionMinAgeMins" :disabled="cfgLocked" @change="persist()">
+                <div class="ldc-hint">A held position must be at least this old before Substitution can close it.</div>
+              </div>
+              </div><!-- end entry zone -->
+
+              <!-- Exit Zone -->
+              <div class="ldc-zone" x-show="tX">
+              <label class="tog" @click.prevent="if(!cfgLocked){cfg.ldcCascadeEnabled=!cfg.ldcCascadeEnabled;persist()}">
                 <div class="tog-t" :class="cfg.ldcCascadeEnabled?'on':''"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Cascade</div>
@@ -148,30 +202,7 @@
               <div x-show="cfg.ldcHalvingEnabled" style="margin-top:4px;margin-left:2px">
                 <input type="range" min="0.25" max="6" step="0.25" x-model.number="cfg.ldcHalvingHours" :disabled="cfgLocked" @change="persist()">
               </div>
-
-              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ldcShareCapEnabled=!cfg.ldcShareCapEnabled;persist()}">
-                <div class="tog-t" :class="cfg.ldcShareCapEnabled?'on':''"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Share Cap</div>
-                  <div class="ldc-hint">Caps Liquid-Diver's own direct entries to at most <span x-text="cfg.ldcShareCapPct??100"></span>% of Max Positions. Past the cap, a live signal falls through to Substitution instead of opening directly.</div>
-                </div>
-              </label>
-              <div x-show="cfg.ldcShareCapEnabled" style="margin-top:4px;margin-left:2px">
-                <input type="range" min="5" max="100" step="5" x-model.number="cfg.ldcShareCapPct" :disabled="cfgLocked" @change="persist()">
-              </div>
-
-              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ldcSubstitutionEnabled=!cfg.ldcSubstitutionEnabled;persist()}">
-                <div class="tog-t" :class="cfg.ldcSubstitutionEnabled?'on':''"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Substitution</div>
-                  <div class="ldc-hint">When there's no room (Share Cap or Max Positions), closes the most-underwater held position — any strategy's, not just Liquid-Diver's own — and opens the live signal in its place.</div>
-                </div>
-              </label>
-              <div x-show="cfg.ldcSubstitutionEnabled" style="margin-top:4px;margin-left:2px">
-                <div class="lbl">Min Age <b x-text="(cfg.ldcSubstitutionMinAgeMins??10)+'m'"></b></div>
-                <input type="range" min="5" max="240" step="5" x-model.number="cfg.ldcSubstitutionMinAgeMins" :disabled="cfgLocked" @change="persist()">
-                <div class="ldc-hint">A held position must be at least this old before Substitution can close it.</div>
-              </div>
+              </div><!-- end exit zone -->
             </div>
           </div>
         </div>
@@ -201,6 +232,7 @@
           if (this.cfg.ldcShareCapPct                === undefined) this.cfg.ldcShareCapPct                = 100;
           if (this.cfg.ldcSubstitutionEnabled        === undefined) this.cfg.ldcSubstitutionEnabled        = true;
           if (this.cfg.ldcSubstitutionMinAgeMins     === undefined) this.cfg.ldcSubstitutionMinAgeMins     = 10;
+          if (this.cfg.ldcLiqPresenceMode             === undefined) this.cfg.ldcLiqPresenceMode             = '1';
 
           this._ldcOpening = new Set(); // symbols with an in-flight reactive open, guards double-fire
 
@@ -220,8 +252,9 @@
           }
 
           this.registerLiqMessageHook?.((batch, sym) => { this._ldcOnLiqMessage(batch, sym); });
+          this.registerLiqCloseHook?.((results, batch) => { this._ldcOnLiqCycleClose(results, batch); });
 
-          this.log(`[LDC] Liquid-Diver (Chaser) v${VERSION} loaded — ${this.cfg.ldcEnabled ? 'enabled' : 'disabled'} | depth ≥ ${this.cfg.ldcDepthThreshold >= 0 ? '+' : ''}${this.cfg.ldcDepthThreshold}`, 'info');
+          this.log(`[LDC] Liquid-Diver (Chaser) v${VERSION} loaded — ${this.cfg.ldcEnabled ? 'enabled' : 'disabled'} | depth ≥ ${this.cfg.ldcDepthThreshold >= 0 ? '+' : ''}${this.cfg.ldcDepthThreshold} | presence: ${this.cfg.ldcLiqPresenceMode ?? '1'}`, 'info');
         },
 
         _ldcHalvingMultiplier() {
@@ -299,8 +332,12 @@
         },
 
         // Called live, per touched symbol, for every incoming liquidation message — not scan-gated.
+        // Skipped entirely in only-0 mode, since that mode reacts to the ABSENCE of liquidation,
+        // which this per-message path (only fires when a liquidation message actually arrives)
+        // can never observe.
         async _ldcOnLiqMessage(batch, sym) {
           if (!this.cfg.ldcEnabled) return;
+          if ((this.cfg.ldcLiqPresenceMode ?? '1') === '0') return;
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
           if (this._isSymbolBanned?.(sym)) return;
           if (this._ldcOpening.has(sym)) return;
@@ -324,16 +361,50 @@
           const avg    = isSell ? (this._liqAvgSTurnover || 0) : (this._liqAvgBTurnover || 0);
           const depth  = calcLiveDepth(raw, avg);
           if (depth < (this.cfg.ldcDepthThreshold ?? 0)) return;
-          if (this._ldcIsBlocked(type)) return;
 
           const t = (this._lastAllTickers || []).find(x => x.symbol === sym);
           if (!t) return;
+
+          const change = parseFloat(t.price24hPcnt || 0) * 100;
+          const fr     = parseFloat(t.fundingRate  || 0) * 100;
+          if ([type, change >= 0 ? '+24h' : '-24h', fr >= 0 ? '+fund' : '-fund'].some(k => this._ldcIsBlocked(k))) return;
 
           this._ldcOpening.add(sym);
           try {
             await this._ldcTryOpen(t, type, depth);
           } finally {
             this._ldcOpening.delete(sym);
+          }
+        },
+
+        // Called once per closed liquidation cycle (Ashfall's registerLiqCloseHook) with that
+        // cycle's full per-symbol results. Only-1 mode never reacts here — 0-liq detection has no
+        // depth/magnitude, so it's gated purely on presence mode, not a threshold.
+        async _ldcOnLiqCycleClose(results, batch) {
+          if (!this.cfg.ldcEnabled) return;
+          if ((this.cfg.ldcLiqPresenceMode ?? '1') === '1') return;
+          if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
+
+          for (const r of (results || [])) {
+            const sym = r.sym;
+            if (((r.sLiqRaw || 0) + (r.bLiqRaw || 0)) !== 0) continue;
+            if (this._isSymbolBanned?.(sym)) continue;
+            if (this._ldcOpening.has(sym)) continue;
+            if ((this.positions || []).some(p => p.symbol === sym)) continue;
+
+            const t = (this._lastAllTickers || []).find(x => x.symbol === sym);
+            if (!t) continue;
+
+            const change = parseFloat(t.price24hPcnt || 0) * 100;
+            const fr     = parseFloat(t.fundingRate  || 0) * 100;
+            if (['0liq', change >= 0 ? '+24h' : '-24h', fr >= 0 ? '+fund' : '-fund'].some(k => this._ldcIsBlocked(k))) continue;
+
+            this._ldcOpening.add(sym);
+            try {
+              await this._ldcTryOpen(t, '0liq', 0);
+            } finally {
+              this._ldcOpening.delete(sym);
+            }
           }
         },
 
@@ -359,7 +430,8 @@
           const pool = (this.positions || []).filter(p => (now - (p.openedAt || 0)) >= minAgeMs);
           if (!pool.length) return false;
           const worst = pool.reduce((a, b) => (a.upnl ?? 0) <= (b.upnl ?? 0) ? a : b);
-          this.log(`[LDC] 🔁 Substitution — closing ${worst.symbol} (uPnL ${(worst.upnl ?? 0).toFixed(4)}) for ${t.symbol} (${type}${depth >= 0 ? '+' : ''}${depth} live signal)`, 'info');
+          const sigLabel = type === '0liq' ? '0liq' : `${type}${depth >= 0 ? '+' : ''}${depth}`;
+          this.log(`[LDC] 🔁 Substitution — closing ${worst.symbol} (uPnL ${(worst.upnl ?? 0).toFixed(4)}) for ${t.symbol} (${sigLabel} signal)`, 'info');
           await this.pseudoClosePosition(worst, 'substitution');
           return await this._ldcOpen(t, type, depth);
         },
@@ -388,7 +460,7 @@
           pos._ldc = true;
           pos._ldcLiqType = type;
           pos._ldcDepth = depth;
-          const liqCrit = `${type}${depth >= 0 ? '+' : ''}${depth}`;
+          const liqCrit = type === '0liq' ? '0liq' : `${type}${depth >= 0 ? '+' : ''}${depth}`;
           const crits = [ liqCrit, change >= 0 ? '+24h' : '-24h', fr >= 0 ? '+fund' : '-fund' ];
           if (_ocR && (_ocR.bc + _ocR.sc) > 0) crits.push(_ocR.bc >= _ocR.sc ? '+ocs' : '-ocs');
           pos._ldcCriteria = crits;

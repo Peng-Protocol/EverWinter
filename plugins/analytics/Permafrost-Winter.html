@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.46.3';
+  const VERSION        = '1.47.0';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -462,7 +462,7 @@
                     <div class="pfr-hint" style="margin-top:2px">Market volume (USD bn) in 1h buckets — scroll to browse. OC line (amber) shows avg seconds/order when surveillance is on.</div>
                   </div>
                   <!-- OC Chart — grouped with Volume History since they share the OC-interval overlay above -->
-                  <div x-show="cfg.pfOcEnabled && (_pfOcCycleHistory||[]).length>0" style="margin-top:10px">
+                  <div x-show="cfg.pfOcEnabled && (_pfOcCycleHistory||[]).length>0 && _ocChartViable()" style="margin-top:10px">
                     <div style="border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
                       <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">ORDER INTERVAL SAMPLE</div>
                       <div style="position:relative">
@@ -580,6 +580,7 @@
         pfCrossEvents: [],
         _liqBatches: [],
         _liqMessageHooks: [], // plugins push (batch, sym) => void here to react to live liq turnover, e.g. Liquid-Diver
+        _liqCloseHooks: [], // plugins push (results, batch) => void here to react to a closed cycle's final per-symbol snapshot, e.g. Liquid-Diver's 0-liq detection
         _liqPersistPending: false, // debounce guard for _liqPersistBatches
         _liqResults: {},
         _liqResultsVersion: 0,
@@ -1272,6 +1273,19 @@
         _miwPluginLoaded() {
           return (this._pluginList || []).some(p => p.id === 'multiindicator-winter');
         },
+        _bewPluginLoaded() {
+          return (this._pluginList || []).some(p => p.id === 'blindentry-winter');
+        },
+        _ldwPluginLoaded() {
+          return (this._pluginList || []).some(p => p.id === 'liquiddiver-winter');
+        },
+        // Liquid-Diver's OC fetch is single-symbol, triggered per reactive entry — its samples are
+        // almost always one bar of 0.0s and drown out a real batch-fetched sample. Only show the
+        // chart when a plugin doing proper batch OC sampling (MIW or Blind-Entry) is loaded; if
+        // Liquid-Diver is the only OC consumer, hide it rather than let its noise dominate.
+        _ocChartViable() {
+          return this._miwPluginLoaded() || this._bewPluginLoaded();
+        },
         // Pure display — unlike _pfScoreBuild() (which miwCollapsedCritStats/miwCollapsedSlotRanks
         // come from and which real trading logic reads), this chip-rendering step has no
         // consumer besides this panel, so it's safe to skip while the panel isn't visible.
@@ -1811,6 +1825,14 @@
           if (typeof fn === 'function' && !this._liqMessageHooks.includes(fn)) this._liqMessageHooks.push(fn);
         },
 
+        // Called once per closed liquidation cycle with that cycle's full per-symbol results array
+        // (batch.symbols, each already carrying sLiqRaw/bLiqRaw/sDepth/bDepth/sLiqPct/bLiqPct) — lets
+        // a consumer detect states a per-message hook can't, e.g. 0-liq (a symbol with zero turnover
+        // never fires a live message, so it can only be observed once the cycle closes).
+        registerLiqCloseHook(fn) {
+          if (typeof fn === 'function' && !this._liqCloseHooks.includes(fn)) this._liqCloseHooks.push(fn);
+        },
+
         _liqLaunchBatch() {
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) return;
@@ -1919,6 +1941,7 @@
           const _fmt  = v => v >= 1e6 ? `$${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `$${(v/1e3).toFixed(0)}k` : `$${v.toFixed(0)}`;
           const _skew = _tot > 0 ? `B ${(_totB/_tot*100).toFixed(0)}% / S ${(_totS/_tot*100).toFixed(0)}%` : 'no turnover';
           this.log(`[PFR] 💧 Liq #${batch.id} — ${_fmt(_tot)} · ${_skew}`, 'info');
+          for (const fn of (this._liqCloseHooks || [])) { try { fn(results, batch); } catch(_) {} }
         },
 
         // Recomputes the global avg sell-liq / buy-liq $ used as the depth baseline — the same
