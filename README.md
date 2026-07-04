@@ -63,7 +63,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Drawdown Factor** (`drawdownThrottleFactor`) | Loss threshold as a multiple of entry margin. At 0.5× with $1 margin, $0.50 of rolling losses triggers the halt. |
 | **Gains Lock** (`gainsLockEnabled`) | Halts new entries for 12 hours once rolling 6h profit hits a target. Banks a winning streak before it reverses. |
 | **Gains Factor** (`gainsLockFactor`) | Profit target as a multiple of entry margin. Same scale as Drawdown Factor. |
-| **Manual Halt** | Button (Halt tab) that blocks all new scans indefinitely until manually lifted. Independent of Drawdown Throttle and Gains Lock — overrides both and doesn't stack with either. |
+| **Manual Halt** | Button (Halt tab) that blocks all new position entry indefinitely until manually lifted. Independent of Drawdown Throttle and Gains Lock — overrides both and doesn't stack with either. |
 | **EDa / Laggard Check** (`laggardCheckEnabled`) | Enables the Effective Debt Adjusted system. Realized losses are passed forward to surviving positions, which take higher TP targets to recover the debt. **Requires the EDa-Winter / EDa-Chaser plugin** (`plugins/modes/`). |
 | **TP Buffer** (`laggardProfitOffset`) | Extra TP headroom reserved above the functional target (%). The debt-free close happens at `tpPct ÷ (1 + buffer/100)` — at 50% buffer with an 18% TP slider, trades close at 12% without debt. Requires the EDa plugin. |
 | **Ticker Cooldown** (`bulkTickerCooldownHours`) | How long the bot reuses a cached bulk ticker fetch before hitting the API again. Higher = fewer API calls per day. |
@@ -312,7 +312,7 @@ The **wave chart**, **sampling bar displays** (kline direction, funding skew, li
 
 The wave chart has three overlay toggles: **Structure** (the market lean path), **FIO** (funding sentiment line — named for its funding-rate derivation, distinct from the `iot`/`iom` Open Interest criteria), and **Score** (a gray line derived from the slot scorecard). When Score is on, a percentage readout appears below the chart showing the net scorecard balance as a share of total recorded weight — green when positive, red when negative.
 
-**Score line during halt**: when the bot is in a drawdown halt or gains lock and its own wave score is unavailable, the score line falls back to the partner bot's most recently published wave score. This means the line stays live even when this bot is not running scans. When the scorecard is thin, the wave score falls back to raw kline momentum from the last completed hour candles across the sampled ticker set.
+**Score line during halt**: a drawdown halt or gains lock only pauses new position entry — scans keep running in full, so structure sampling, liquidation/OC surveillance, and the scorecard all keep collecting data. If this bot's own wave score is still unavailable for some other reason, the score line falls back to the partner bot's most recently published wave score. When the scorecard is thin, the wave score falls back to raw kline momentum from the last completed hour candles across the sampled ticker set.
 
 **Gaps in chart history**: the wave chart's Structure/FIO/Score lines, the OI/MC history chart, and the Volume History chart's volume and OC lines all break the line across a real data gap (the bot off, or unable to sample) instead of drawing a straight connector across the missing period. A resumed session starts a fresh line segment rather than dragging the old one forward to the latest point. Each chart's gap threshold is padded above that chart's own actual sampling cadence — Scan Interval for the wave lines, the OI/MC dedup window (2h) for that chart, and the bucket size (1h) for the volume/OC lines — so ordinary scan-timing jitter is never mistaken for a real gap, while a genuine multi-cycle miss still breaks the line.
 
@@ -320,7 +320,7 @@ The wave chart has three overlay toggles: **Structure** (the market lean path), 
 
 Shows the current climate reading (magnitude, breadth, slope, FIO score, effective score, evidence mass), and active halt state (profile-governed or fallback timer). The **wave graph** plots recent market structure — direction label (rising/falling/steady) reflects the recent path of the market.
 
-Three directional bar charts below the climate reading show relative dominance at a glance. Red extends left (adverse for this bot's direction), green extends right (favorable), with current values as a label. **During a drawdown halt or gains lock**, the bars (kline direction, funding skew) and the liq chart are sourced from the partner bot's sample state every 15 seconds so the display stays current without this bot running any scans.
+Three directional bar charts below the climate reading show relative dominance at a glance. Red extends left (adverse for this bot's direction), green extends right (favorable), with current values as a label. A drawdown halt or gains lock only pauses new position entry — this bot's own scans, and with them these bars, keep updating normally. The bars (kline direction, funding skew) and the liq chart also read from the partner bot's sample state every 15 seconds as a backup, so the display stays populated even if this bot's own sampling is thin or the bot is off.
 
 | Bar | What it shows |
 |---|---|
