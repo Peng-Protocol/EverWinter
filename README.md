@@ -130,27 +130,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 
 ### Criteria
 
-| Criterion | Meaning |
-|---|---|
-| `fund>N` | Funding rate at or above tier N (longs paying shorts). `fund>1` at 0.25% step requires FR ≥ 0.25%. Carry income for the short side. |
-| `fund<-N` | Funding rate at or below tier −N (shorts paying longs). `fund<-1` requires FR ≤ −0.25%. Carry income for the long side. |
-| `+24h` | Ticker is up on the day. |
-| `-24h` | Ticker is down on the day. |
-| `vm>N` | 24h turnover/market cap ratio at or above tier N. `vm>10` at 1% step requires V/M ≥ 10% — a significant fraction of the coin's total value changed hands in a day. |
-| `vm<N` | V/M ratio below tier N — the coin moved but volume didn't follow. Fade case: momentum without conviction. |
-| `lsa>N` | Last completed 1h candle closed down with volume ≥ N% above the 24h hourly average. Sell-side pressure with participation. |
-| `lba>N` | Last completed 1h candle closed up with volume ≥ N% above average. Buy-side pressure with participation. |
-| `rasl>N` | Last completed 1h candle closed red with volume ≥ N% *below* average. Quiet, uncontested selling. |
-| `rabl>N` | Last completed 1h candle closed green with volume ≥ N% below average. Quiet, uncontested buying. |
-| `iot>N` / `iot<N` | OI vs Turnover ratio at tier N (1% step by default). High OI relative to turnover signals conviction or stickiness — the market is holding open positions rather than trading them away. |
-| `iom>N` / `iom<N` | OI vs Market Cap ratio at tier N (1% step by default). High OI relative to mcap signals leverage concentration — a large share of the coin's float is leveraged open interest. |
-| `sliq` / `sliq>N` / `sliq<N` | **Live-only.** Fires the instant a liquidation message shows short liquidations dominating (≥70% of turnover so far this cycle, bullish flow) and depth crosses the threshold — no waiting for the scan or the cycle's close. Optional depth suffix gates by intensity (manual slots only — see Depth gate below); without one, the general Live Depth Threshold applies. Requires Permafrost/Ashfall with liquidation surveillance on. |
-| `bliq` / `bliq>N` / `bliq<N` | **Live-only.** Mirror of sliq for long liquidations dominating (bearish flow). Same live trigger, same depth gate mechanism. |
-| `msliq` / `msliq>N` / `msliq<N` | **Live-only.** Sell-liq majority but buy-liq ≥30% — a contested cycle with a sell lean, evaluated live the same way as sliq. |
-| `mbliq` / `mbliq>N` / `mbliq<N` | **Live-only.** Buy-liq majority but sell-liq ≥30% — a contested cycle with a buy lean, evaluated live the same way as bliq. |
-| `0liq` | **Closed-cycle-only.** No liquidation at all on this ticker in the latest liq cycle — the mirror case to sliq/bliq/msliq/mbliq. There's no live signal for "nothing happened," so this is confirmed only once the surveillance cycle closes, same as before. No depth suffix (there's no magnitude to a zero). Requires Permafrost/Ashfall with liquidation surveillance on. |
-| `ocs>N` / `ocs<N` | Buy/sell fill skew from Order Count Surveillance, tiered at N buy-share percent (0–100 scale, 1% step by default). Computed directly from the sampled order batch — no minimum runway required. Requires Permafrost/Ashfall OC Surveillance. |
-| `ocx>N` / `ocx<N` | Average seconds between orders in the sampled batch, tiered at N (0.1s step by default, so N is in tenths of a second — e.g. N=30 ≈ 3s average gap). `ocx<N` requires a busier gap (lower tier); `ocx>N` requires a quieter one (higher tier). The slot builder shows the real-seconds equivalent alongside the tier value. Requires Permafrost/Ashfall OC Surveillance. |
+See Strategy_book.md's **Market Reading** section for what each criterion (`fund`, `vm`, `lsa`/`lba`/`rasl`/`rabl`, `iot`/`iom`, `sliq`/`bliq`/`msliq`/`mbliq`, `0liq`, Buy/Sell Skew, Order Count Deviation) means and when to use it. The mechanical notes below cover tiering, recording, and the depth gate — operational detail Strategy_book intentionally leaves out.
 
 **Tier gate**: all tiered criteria (`fund`, `vm`, `lsa`, `lba`, `rasl`, `rabl`, `iot`, `iom`, `ocs`, `ocx`) compute an integer tier as `floor(value / step)` and compare it against N. Current step sizes are shown as a read-only info line under **Tier Step Sizes** in the Entry Zone. The same tier is recorded on the position and used as the scorecard key — `lsa>25` and `lsa+37` are different tiers and scored separately.
 
@@ -190,6 +170,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 | **Direction Lock** (`miwDirLockEnabled`/`micDirLockEnabled`) | Off by default. When on, closing a live liq trade (sliq/bliq/msliq/mbliq) locks that exact type to that exact ticker for 6 hours: a win allows only that type to re-fire there, a loss excludes it. The **Invert** sub-toggle (`miwDirLockInvert`/`micDirLockInvert`) flips both — a win excludes the type instead, a loss locks it instead. Watch it working in the **Direction Lock** stats section below the Hist Scoring panel. |
 | **Liq Result Max Age** (`miwLiqResultMaxCycles`/`micLiqResultMaxCycles`) | How many scan cycles a closed liq cycle result stays valid for the 0-Liq slot criterion. Results older than this are treated as absent. Default 2. Live sliq/bliq/msliq/mbliq entries aren't affected — there's nothing to go stale on a message that just arrived. |
 | **OC Scan Cap** (`miwOcScanCap`/`micOcScanCap`) | Max candidate tickers sampled for Order Count Surveillance per scan cycle, only fetched when at least one active slot uses `ocs`/`ocx`. When the candidate pool exceeds this cap, a random subset is drawn — a ticker outside that subset just fails the `ocs`/`ocx` criterion specifically, it isn't dropped from the rest of the pool. Default 20. |
+| **V/M & IO/M Sanity Cap** (`miwSanityCheck`/`micSanityCheck`, `miwSanityCap`/`micSanityCap`) | On by default. Excludes a ticker from `vm`/`iom` criteria for the cycle if its 24h turnover or open interest exceeds the cap as a share of market cap — a guard against a wrong-coin or stale market cap fetch producing an absurd ratio. Default cap 50%. One shared toggle and cap for both criteria, since they've never needed different values in practice. |
 | **Auto Slots** (`miwAutoSlots`/`micAutoSlots`) | Replaces the manual slot list with every possible combination of the available criteria at the chosen size. Every combination anchors on a liquidation criterion (filtered by Liquidation Presence) — there's no way to auto-generate a slot without one. |
 | **Auto Slot Size** (`miwAutoSlotSize`/`micAutoSlotSize`) | How many criteria per auto-generated combination (1–4), counting the mandatory liq anchor. At size 1 every generated slot is bare liquidation with no secondary confirmation at all. |
 | **Exclude from Auto** (`miwAutoSlotExclude`/`micAutoSlotExclude`) | Criteria omitted from auto-generated combinations and from scorecard scoring. Excluding all liq types allowed under the current Liquidation Presence mode leaves nothing to anchor on, so Auto Slots generates zero slots. |
