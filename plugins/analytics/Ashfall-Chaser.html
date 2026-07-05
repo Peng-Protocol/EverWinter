@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.47.5';
+  const VERSION        = '1.48.0';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
@@ -842,6 +842,7 @@
             let gSum = 0, lSum = 0, gCount = 0, lCount = 0;
             let gTurnover = 0, lTurnover = 0;
             let frSum = 0, frCount = 0;
+            let oiSum = 0, mcapSum = 0, oiCount = 0;
             for (const t of list) {
               if (!t.symbol.endsWith('USDT') || t.symbol === 'BTCUSDT') continue;
               if (parseFloat(t.lastPrice || 0) < 0.001) continue;
@@ -851,6 +852,29 @@
               else if (ch < 0) { lSum += Math.abs(ch); lCount++; lTurnover += tvr; }
               const fr = parseFloat(t.fundingRate || 0);
               if (!isNaN(fr)) { frSum += fr * 100; frCount++; } // accumulate as %
+              // OI/MC — detached from MIC's scan loop (see below); market caps are kept
+              // fresh by _liqLaunchBatch's per-batch top-up, read here via MIC's existing
+              // sync cache getter so this doesn't need its own fetch pipeline.
+              const oi = parseFloat(t.openInterestValue || 0);
+              if (oi) {
+                const base_  = t.symbol.replace(/USDT$/i, '').toLowerCase();
+                const price_ = parseFloat(t.lastPrice || 0);
+                const mcap   = this._micGetFreshMcap?.(base_, price_);
+                if (mcap) { oiSum += oi; mcapSum += mcap; oiCount++; }
+              }
+            }
+            // OI/MC skew — sampled here (bulk ticker cadence) rather than gated behind MIC's
+            // scan loop, so it isn't starved when MIC's active slots don't happen to use
+            // vm/iom. Only sets _micOiSkew; the existing 15s harvester below (init()'s
+            // interval) already owns pushing it into pfOiHistory with its own dedup/trim —
+            // no need to duplicate that here.
+            if (oiCount >= 3 && mcapSum > 0) {
+              const ratio = oiSum / mcapSum * 100;
+              const mid   = this.cfg.afWaveOiMid ?? 2;
+              const tol   = this.cfg.afWaveOiTol ?? 1;
+              const excess = Math.max(0, Math.abs(ratio - mid) - tol);
+              const score  = Math.min(100, excess / tol * 100);
+              this._micOiSkew = { ratio, mid, tol, score, count: oiCount };
             }
             const sumT   = gSum + lSum, cntT = gCount + lCount;
             const totalTvr = gTurnover + lTurnover;
@@ -1812,6 +1836,7 @@
           shuffle(gainers); shuffle(losers);
           const half    = Math.floor((this.cfg.ashLiqBatchSize ?? 25) / 2);
           const symbols = [...gainers.slice(0, half), ...losers.slice(0, half)].map(t => t.symbol);
+          this._micPrefetchMcaps?.(symbols.map(s => s.replace(/USDT$/i, '').toLowerCase()))?.catch?.(() => {});
           this._liqCycleCounter = (this._liqCycleCounter % 25) + 1;
           const id        = this._liqCycleCounter;
           const startedAt = Date.now();
