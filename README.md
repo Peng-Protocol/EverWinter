@@ -212,7 +212,6 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. These plugins rep
 |---|---|
 | **Enabled** | Master toggle. When off, the bot uses the stock 12h halt timers. |
 | **Thaw/Settle Score** | Climate score the market must reach for an early halt lift. Higher = harder to thaw; bot stays halted longer in ambiguous conditions. |
-| **Hard Cap** (`permafrostCapHours`/`ashfallCapHours`) | Maximum halt duration in hours (12–48h). The bot always resumes by this deadline regardless of climate. |
 | **FIO Sentiment** (`permafrostFioEnabled`/`ashfallFioEnabled`) | Includes funding rate sentiment (which side is paying) in the climate score. Labeled FIO — funding-derived — to avoid confusion with the unrelated `iot`/`iom` (Open Interest) criteria. |
 | **Slot Scorecard** (`permafrostScorecardEnabled`/`ashfallScorecardEnabled`) | Records realized PnL per MIW/MIC criteria combination. Shows which slot types have been profitable or losing over time. |
 | **Sponge Quota** (`pfSpongeQuota`/`afSpongeQuota`) | How many recent closes per criterion are used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation to recent performance; higher = more stable scores that smooth out short streaks. Default 30. |
