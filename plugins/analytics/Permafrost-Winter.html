@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.47.3';
+  const VERSION        = '1.47.4';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
@@ -463,10 +463,10 @@
                     <div class="pfr-hint" style="margin-top:2px">Market volume (USD bn) in 1h buckets — scroll to browse. OC line (amber) shows avg seconds/order when surveillance is on.</div>
                   </div>
                   <!-- OC Chart — grouped with Volume History since they share the OC-interval overlay above -->
-                  <div x-show="cfg.pfOcEnabled && (_pfOcCycleHistory||[]).length>0 && _ocChartViable()" style="margin-top:10px">
+                  <div x-show="cfg.pfOcEnabled && (_pfOcCycleHistory||[]).length>0 && _ocChartViable()" style="margin-top:10px" @click.outside="_pfOcHighlightedCycleTs=null">
                     <div style="border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
                       <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">ORDER INTERVAL SAMPLE</div>
-                      <div style="position:relative">
+                      <div style="position:relative" @click="const g=$event.target.closest('[data-oc-cycle-ts]');if(g)_pfOcHighlightedCycleTs=Number(g.dataset.ocCycleTs)">
                         <div x-html="_pfOcYAxisHtml||''" style="position:absolute;left:0;top:0;pointer-events:none;z-index:2"></div>
                         <div x-ref="ocChartWrap" x-effect="tick; $nextTick(()=>{ const el=$refs.ocChartWrap; if(!el) return; const vis=!!el.offsetParent; const n=(_pfOcCycleHistory||[]).length; if(!vis){el._ocLastLen=undefined;return;} if(el._ocLastLen!==n){el._ocLastLen=n;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_pfOcChartSvg(open && cfg.pfOcEnabled)"></div></div>
                       </div>
@@ -609,6 +609,7 @@
         _pfVolOcLatestSec: null,
         _pfOcYAxisHtml: '',
         _pfOcAvgYPx: null,
+        _pfOcHighlightedCycleTs: null, // ts of a clicked cycle in the ORDER INTERVAL SAMPLE chart; null = follow latest
 
         async init() {
           await _origInit.call(this);
@@ -2198,11 +2199,19 @@
           if (avgRef>maxSec*0.05&&avgRef<maxSec*0.95) this._pfOcAvgYPx=4+yVal(avgRef); else this._pfOcAvgYPx=null;
           const grids=[0,0.25,0.5,0.75,1].map(f=>{const v=maxSec*f;const y=yVal(v).toFixed(1);return `<line x1="${padL}" y1="${y}" x2="${(W-padR).toFixed(1)}" y2="${y}" stroke="rgba(255,255,255,.05)" stroke-width="0.5"/>`;}).join('');
           const CLR='rgba(200,160,80,'; // amber — matches the OC-interval overlay line in Volume History
+          // Highlighted cycle falls back to the actual latest cycle when nothing is pinned —
+          // see the matching HIGHLIGHTED CYCLE section below, fed by _pfOcDisplayedResults().
+          const displayedTs = this._pfOcHighlightedCycleTs ?? history[history.length - 1].ts;
           let bars='';
           history.forEach((cycle,ci)=>{
             const cx=xPos[ci]; const results=cycle.results.filter(r=>r&&r.avgMs!=null&&r.avgMs/1000<=CHART_MAX_SEC); const n=results.length;
             const cycleMean=n?results.reduce((s,r)=>s+r.avgMs/1000,0)/n:0;
             const bw=Math.max(1,Math.min(4,cycleW*0.9/Math.max(1,n)));
+            // Hitbox — sits under the bars and spans the full cycle column (not just the bars
+            // themselves, since a cycle with no qualifying-speed tickers has no bars to click),
+            // doubling as the highlight backdrop for whichever cycle is currently displayed.
+            const isDisplayed = cycle.ts === displayedTs;
+            bars += `<rect class="pfoc-cycle-hit" data-oc-cycle-ts="${cycle.ts}" x="${cx.toFixed(1)}" y="${padT}" width="${cycleW.toFixed(1)}" height="${plotH.toFixed(1)}" fill="${isDisplayed ? 'rgba(200,160,80,.10)' : 'transparent'}" pointer-events="all" style="cursor:pointer"/>`;
             results.forEach((r,ri)=>{
               const x=cx+(ri/n)*cycleW*0.9;
               const v=r.avgMs/1000;
@@ -2239,9 +2248,33 @@
           const hist = this._pfOcCycleHistory || [];
           return hist.reduce((a,c) => (!a || c.ts > a.ts) ? c : a, null);
         },
+        // Resolves which cycle's results the chart's summary/chip list show — the pinned cycle
+        // if one was clicked and is still in history, else the actual latest (default). Mirrors
+        // _liqDisplayedResults(); a pinned cycle can age out of _pfOcCycleHistory (capped at 25)
+        // without an explicit reset, so this falls back rather than showing a stale/empty list.
+        _pfOcDisplayedCycle() {
+          const hist = this._pfOcCycleHistory || [];
+          const hi = this._pfOcHighlightedCycleTs;
+          if (hi != null) {
+            const hit = hist.find(c => c.ts === hi);
+            if (hit) return hit;
+          }
+          return this._pfOcLatestCycle();
+        },
+        _pfOcDisplayedCycleLabel() {
+          const last = this._pfOcLatestCycle();
+          const hi = this._pfOcHighlightedCycleTs;
+          if (hi == null || !last) return '';
+          if (hi === last.ts) return '';
+          const hist = this._pfOcCycleHistory || [];
+          const hit = hist.find(c => c.ts === hi);
+          if (!hit) return '';
+          const d = new Date(hit.ts);
+          return ' · ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        },
         _pfOcSummaryText(shown) {
           if (!shown) return '';
-          const last = this._pfOcLatestCycle();
+          const last = this._pfOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
           const bc = results.reduce((s,r)=>s+(r.bc||0),0);
@@ -2249,11 +2282,11 @@
           const total = bc + sc;
           if (!total) return '';
           const buyPct = (bc/total*100).toFixed(0), sellPct = (sc/total*100).toFixed(0);
-          return `${total} order${total===1?'':'s'} sampled · ${buyPct}% buy / ${sellPct}% sell · ${results.length} ticker${results.length===1?'':'s'}`;
+          return `${total} order${total===1?'':'s'} sampled · ${buyPct}% buy / ${sellPct}% sell · ${results.length} ticker${results.length===1?'':'s'}${this._pfOcDisplayedCycleLabel()}`;
         },
         _pfOcInfoHtml(shown) {
           if (!shown) return '';
-          const last = this._pfOcLatestCycle();
+          const last = this._pfOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
           const mean = results.reduce((s,r)=>s+(r.bc||0)+(r.sc||0),0)/results.length;
