@@ -282,7 +282,7 @@ The **Combined / Own** toggle (`pfScorecardView`/`afScorecardView`) switches bet
 
 **Hist Scoring panel**: when Historical Scoring is enabled, the **Stats menu** also shows a Hist Scoring section with the current count of pending simulation targets, a countdown to the next expected batch (shows "next scan" once the window has elapsed), and a list of completed scoring batches (newest first). Each batch entry shows the batch number, wrote/total counts, win count (W), loss count (L), net simulated PnL, and the clock time the batch completed (same-day batches show HH:MM; older ones show month, day, and time). On **Only 1**, this section only appears during Drawdown Halt or Gains Lock — see the Historical Scoring row above.
 
-**Direction Lock panel**: when Direction Lock is enabled, the **Stats menu** also shows a Direction Lock section listing every ticker currently locked or excluded — the ticker, the liq type (S-Liq/B-Liq/mS-Liq/mB-Liq), whether it's a LOCK (green) or EXCLUDE (red), and the clock time the 6-hour window expires. Empty when nothing is currently locked.
+**Ticker Locks panel**: when any of Self-Liq Graylist, React to Partner Live-Liq, React to Partner 0-Liq Win, or Direction Lock is enabled, the **Stats menu** shows a Ticker Locks section listing every ticker currently excluded or locked by any of those four — the ticker, the source (Self-Liq / Partner Live-Liq / Partner 0-Liq Win / the liq type for Direction Lock), whether it's a LOCK (green) or EXCLUDE (red), and the clock time the 6-hour window expires. A ticker can appear more than once if more than one mechanism currently applies to it. Empty when nothing is currently locked.
 
 ### Liquidation Feed
 
