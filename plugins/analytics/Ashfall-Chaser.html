@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.47.2';
+  const VERSION        = '1.51.0';
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
@@ -111,7 +111,6 @@
   // wave only takes the helm when the learned profile is thin.
   const WAVE_TTL_MS    = 7 * 24 * 3600 * 1000; // wave retains as much structure history as we have, up to ~a week
   const WAVE_CAP       = 2000;              // hard cap on stored wave points
-  const OI_SAMPLE_MIN_GAP_MS = 2 * 3600_000; // OI/MC dedup guard — also the chart's own gap-break threshold, kept as one constant so the two can't drift apart
   const WAVE_MIN_PTS   = 3;                 // readings needed before a trajectory is meaningful
   const W_LEAN         = 0.6;               // inherent-score weight on the current structure level
   const W_SLOPE        = 0.4;               // inherent-score weight on the trajectory (where it's heading)
@@ -188,7 +187,21 @@
                   <div class="tog-t" :class="cfg.ashfallGainsContinuationEnabled?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Gains Continuation</div>
-                    <div class="ash-hint">When Permafrost reaches its gains threshold and broadcasts a Gains Continuation signal, resets this bot's drawdown throttle to its full configured duration.</div>
+                    <div class="ash-hint">When Permafrost reaches its gains threshold and broadcasts a Gains Continuation signal, arms this bot's own drawdown halt for a full configured duration — same as if this bot's own drawdown throttle had just triggered, including bailing open positions if Drawdown Bail is on.</div>
+                  </div>
+                </label>
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.afCrossLiqGraylistEnabled=!cfg.afCrossLiqGraylistEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.afCrossLiqGraylistEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">React to Winter Live-Liq</div>
+                    <div class="ash-hint">When Permafrost logs a live liquidation, graylists that ticker from MIC's 0-Liq path for 6h. Only has an effect while this bot's Liquidation Presence isn't Only-1.</div>
+                  </div>
+                </label>
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.afCrossWinGraylistEnabled=!cfg.afCrossWinGraylistEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.afCrossWinGraylistEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">React to Winter 0-Liq Win</div>
+                    <div class="ash-hint">When Permafrost wins a 0-Liq trade, graylists that ticker from MIC's live liq entries for 6h. Only has an effect while this bot's Liquidation Presence isn't Only-0.</div>
                   </div>
                 </label>
               </div>
@@ -254,10 +267,6 @@
                   <label class="tog" @click.prevent="if(!cfgLocked){cfg.afShowVol=!(cfg.afShowVol??true);persist()}">
                     <div class="tog-t" :class="(cfg.afShowVol??true)?'on':''"><div class="tog-k"></div></div>
                     <span class="tog-l">Vol</span>
-                  </label>
-                  <label class="tog" @click.prevent="if(!cfgLocked){cfg.afShowOi=!(cfg.afShowOi??true);persist()}">
-                    <div class="tog-t" :class="(cfg.afShowOi??true)?'on':''"><div class="tog-k"></div></div>
-                    <span class="tog-l">OI</span>
                   </label>
                 </div>
               </div>
@@ -420,37 +429,17 @@
                     </div>
                     <div class="ash-hint" style="margin-top:2px">Kline sample — vol relative to 24h avg. Gray ← below avg · above avg → Ember.</div>
                   </div>
-                  <div x-show="_micLoaded && (cfg.afShowOi??true)" style="margin-top:8px">
-                    <div class="lbl">OI/MC History <b x-text="_micOiSkew ? _micOiSkew.ratio.toFixed(2)+'%' : '—'"></b></div>
-                    <div x-html="_afOiSvg(open && cfg.ashfallEnabled && (cfg.afShowOi??true))" style="margin-top:4px;border:1px solid rgba(255,140,50,.15);border-radius:3px;background:rgba(255,140,50,.03)"></div>
-                    <div class="ash-hint" style="margin-top:2px">Aggregate OI as % of market cap — bulk ticker sample every ~3h.</div>
-                  </div>
-                  <div style="margin-top:8px">
-                    <div class="lbl">Volume History <span x-show="cfg.afOcEnabled && (_afOcCycleHistory||[]).length>0 && _ocChartViable()" style="font-family:var(--mono);font-size:7px;color:rgba(200,160,80,.8);margin-left:4px">+ OC interval</span></div>
-                    <div style="margin-top:4px;border:1px solid rgba(255,150,80,.15);border-radius:3px;background:rgba(255,150,80,.03);overflow:hidden">
-                      <div style="position:relative">
-                        <div x-html="_afVolYAxisHtml||''" style="position:absolute;left:0;top:0;pointer-events:none;z-index:2"></div>
-                        <div x-show="_afVolOcYAxisHtml" x-html="_afVolOcYAxisHtml||''" style="position:absolute;right:0;top:0;pointer-events:none;z-index:2"></div>
-                        <div x-ref="volChartWrap" x-effect="tick; $nextTick(()=>{ const el=$refs.volChartWrap; if(!el) return; const vis=!!el.offsetParent; const n=(afVolHistory||[]).length; if(!vis){el._volLastLen=undefined;return;} if(el._volLastLen!==n){el._volLastLen=n;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_afVolSvg(open && cfg.ashfallEnabled)"></div></div>
-                      </div>
-                    </div>
-                    <div class="ash-hint" style="margin-top:2px;display:flex;flex-wrap:wrap;gap:6px">
-                      <span x-show="_afVolLatestV!=null">Latest: <b x-text="(_afVolLatestV||0)>=1?(_afVolLatestV||0).toFixed(1)+'B':(_afVolLatestV||0)>=0.001?((_afVolLatestV||0)*1000).toFixed(0)+'M':(_afVolLatestV||0).toFixed(3)+'B'"></b></span>
-                      <span x-show="_afVolMeanV!=null" style="color:rgba(255,150,80,.7)">Mean: <b x-text="(_afVolMeanV||0)>=1?(_afVolMeanV||0).toFixed(1)+'B':(_afVolMeanV||0)>=0.001?((_afVolMeanV||0)*1000).toFixed(0)+'M':(_afVolMeanV||0).toFixed(3)+'B'"></b></span>
-                      <span x-show="_afVolOcLatestSec!=null" style="color:rgba(200,160,80,.75)">OC latest: <b x-text="(_afVolOcLatestSec||0).toFixed(1)+'s/order'"></b></span>
-                    </div>
-                    <div class="ash-hint" style="margin-top:2px">Market volume (USD bn) in 1h buckets — scroll to browse. OC line (amber) shows avg seconds/order when surveillance is on.</div>
-                  </div>
-                  <!-- OC Chart — grouped with Volume History since they share the OC-interval overlay above -->
-                  <div x-show="cfg.afOcEnabled && (_afOcCycleHistory||[]).length>0 && _ocChartViable()" style="margin-top:10px">
+                  <!-- OC Chart -->
+                  <div x-show="cfg.afOcEnabled && (_afOcCycleHistory||[]).length>0 && _ocChartViable()" style="margin-top:10px" @click.outside="_afOcHighlightedCycleTs=null">
                     <div style="border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
                       <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">ORDER INTERVAL SAMPLE</div>
-                      <div style="position:relative">
+                      <div style="position:relative" @click="const g=$event.target.closest('[data-oc-cycle-ts]');if(g)_afOcHighlightedCycleTs=Number(g.dataset.ocCycleTs)">
                         <div x-html="_afOcYAxisHtml||''" style="position:absolute;left:0;top:0;pointer-events:none;z-index:2"></div>
                         <div x-ref="ocChartWrap" x-effect="tick; $nextTick(()=>{ const el=$refs.ocChartWrap; if(!el) return; const vis=!!el.offsetParent; const n=(_afOcCycleHistory||[]).length; if(!vis){el._ocLastLen=undefined;return;} if(el._ocLastLen!==n){el._ocLastLen=n;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_afOcChartSvg(open && cfg.afOcEnabled)"></div></div>
                       </div>
                       <div style="border-top:1px solid rgba(255,255,255,.06);padding:3px 8px 4px">
                         <div x-text="_afOcSummaryText(open && cfg.afOcEnabled)" style="font-family:var(--mono);font-size:8.5px;color:var(--text-lo)"></div>
+                        <div x-show="_afOcAvgIntervalSec(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;color:rgba(200,160,80,.85);margin-top:1px">Avg order interval: <b x-text="(_afOcAvgIntervalSec(open && cfg.afOcEnabled)||0).toFixed(1)+'s/order'"></b></div>
                         <div x-html="_afOcInfoHtml(open && cfg.afOcEnabled)" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px"></div>
                       </div>
                     </div>
@@ -478,7 +467,7 @@
                 <button @click="cfg.afScorecardView=cfg.afScorecardView==='combined'?'own':'combined';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,150,80,.3);background:rgba(255,150,80,.06);color:rgba(255,150,80,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardView==='own'?'Own':'Combined'"></button>
               </div>
             </div>
-            <div x-show="cfg.ashfallScorecardEnabled && (cfg.becEnabled || cfg.ldcEnabled)" style="margin-top:8px;padding:6px 8px;background:rgba(150,150,255,.03);border:1px solid rgba(150,150,255,.1);border-radius:3px">
+            <div x-show="cfg.ashfallScorecardEnabled && ((cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded()))" style="margin-top:8px;padding:6px 8px;background:rgba(150,150,255,.03);border:1px solid rgba(150,150,255,.1);border-radius:3px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
                 <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)">BLIND-ENTRY / LIQUID-DIVER SCORECARD</div>
                 <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
@@ -493,7 +482,7 @@
                 </span>
               </div>
               <div class="ash-hint">Same shared record store as the MIC/MIW scorecard above — CLEAR wipes both.</div>
-              <div x-html="_afScorecardHtml(open && cfg.ashfallScorecardEnabled && (cfg.becEnabled || cfg.ldcEnabled), 'blind')" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px"></div>
+              <div x-html="_afScorecardHtml(open && cfg.ashfallScorecardEnabled && ((cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded())), 'blind')" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px"></div>
               <div style="margin-top:5px;display:flex;justify-content:flex-end;gap:4px">
 <button @click="cfg.afScorecardSource=cfg.afScorecardSource==='both'?'hist':cfg.afScorecardSource==='hist'?'traded':'both';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(150,150,255,.3);background:rgba(150,150,255,.06);color:rgba(150,150,255,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardSource==='hist'?'Hist':cfg.afScorecardSource==='traded'?'Traded':'Both'"></button>
                 <button @click="cfg.afScorecardView=cfg.afScorecardView==='combined'?'own':'combined';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(150,150,255,.3);background:rgba(150,150,255,.06);color:rgba(150,150,255,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardView==='own'?'Own':'Combined'"></button>
@@ -544,8 +533,6 @@
         afEvents:     [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth } — kept for import compat, not scored
         afCloses:     [],   // { ts, pnl, skew, breadth } — per-close PnL paired with structure at close time
         afWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
-        afVolHistory: [],   // { ts, v } — volAbs (USD billions) sampled ~15min, retained up to retention days
-        afOiHistory:  [],   // { ts, ratio } — aggregate OI/MC % sampled every ~3h from bulk ticker fetch
         afScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
         afScorecardView: null,         // persisted in cfg; init below
         afScorecardSource: null,       // persisted in cfg; init below
@@ -574,18 +561,14 @@
         _ocFetchRunning: false, // guards against overlapping _ocFetchBatch calls
         _liqLatestResults: [],
         _liqCycleCounter: 0,
-        // Fixed Y-axis overlay HTML/positions for the volume and OC charts, set as a side
-        // effect of _afVolSvg()/_afOcChartSvg(). Must be pre-declared (not just assigned
-        // later inside those methods) — an x-html/x-text binding that reads a property before
-        // Alpine has ever seen it declared throws a ReferenceError during the initial bind,
-        // same as _liqYAxisHtml/_liqAvgYPx above.
-        _afVolYAxisHtml: '',
-        _afVolOcYAxisHtml: '',
-        _afVolLatestV: null,
-        _afVolMeanV: null,
-        _afVolOcLatestSec: null,
+        // Fixed Y-axis overlay HTML/positions for the OC chart, set as a side effect of
+        // _afOcChartSvg(). Must be pre-declared (not just assigned later inside that method) —
+        // an x-html/x-text binding that reads a property before Alpine has ever seen it
+        // declared throws a ReferenceError during the initial bind, same as
+        // _liqYAxisHtml/_liqAvgYPx above.
         _afOcYAxisHtml: '',
         _afOcAvgYPx: null,
+        _afOcHighlightedCycleTs: null, // ts of a clicked cycle in the ORDER INTERVAL SAMPLE chart; null = follow latest
 
         async init() {
           await _origInit.call(this);
@@ -605,9 +588,10 @@
           if (this.cfg.ashfallFioEnabled        === undefined) this.cfg.ashfallFioEnabled        = this.cfg.ashfallIoEnabled ?? true;
           if (this.cfg.ashfallWaveShowMain      === undefined) this.cfg.ashfallWaveShowMain      = true;
           if (this.cfg.ashfallWaveShowFio        === undefined) this.cfg.ashfallWaveShowFio        = this.cfg.ashfallWaveShowIo ?? true;
-          if (this.cfg.afVolRetentionDays       === undefined) this.cfg.afVolRetentionDays       = 30;
           if (this.cfg.afShowScore              === undefined) this.cfg.afShowScore              = true;
           if (this.cfg.ashfallCrossEnabled        === undefined) this.cfg.ashfallCrossEnabled        = true;
+          if (this.cfg.afCrossLiqGraylistEnabled  === undefined) this.cfg.afCrossLiqGraylistEnabled  = false;
+          if (this.cfg.afCrossWinGraylistEnabled  === undefined) this.cfg.afCrossWinGraylistEnabled  = true;
           if (this.cfg.ashfallMutualDdLiftEnabled          === undefined) this.cfg.ashfallMutualDdLiftEnabled          = true;
           if (this.cfg.ashfallGainsContinuationEnabled     === undefined) this.cfg.ashfallGainsContinuationEnabled     = true;
           if (this.cfg.ashfallScorecardEnabled           === undefined) this.cfg.ashfallScorecardEnabled           = true;
@@ -627,7 +611,6 @@
           if (this.cfg.afShowLiq       === undefined) this.cfg.afShowLiq       = true;
           if (this.cfg.afShowFunding   === undefined) this.cfg.afShowFunding   = false;
           if (this.cfg.afShowVol       === undefined) this.cfg.afShowVol       = true;
-          if (this.cfg.afShowOi        === undefined) this.cfg.afShowOi        = true;
           try {
             const saved = JSON.parse(localStorage.getItem(ASH_LIQ_KEY) || 'null');
             if (Array.isArray(saved) && this.cfg.ashLiqEnabled) {
@@ -680,8 +663,6 @@
               if (Array.isArray(s.events)) this.afEvents = s.events.slice(-EVENTS_CAP);
               if (Array.isArray(s.closes)) this.afCloses = s.closes.slice(-CLOSES_CAP);
               if (Array.isArray(s.wave))      this.afWave      = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
-              if (Array.isArray(s.volHistory)) this.afVolHistory = s.volHistory.filter(p => Date.now() - p.ts < (this.cfg.afVolRetentionDays ?? 30) * 86400000).slice(-5000);
-              if (Array.isArray(s.oiHistory)) this.afOiHistory = s.oiHistory.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-500);
               if (s.afKlineBar?.bearSum != null) this.afKlineBar = s.afKlineBar;
             }
           } catch(e) {}
@@ -729,6 +710,13 @@
                   this._drawdownHaltUntil = Date.now() + _gcMs;
                   this.persist();
                   this.log('[ASH] ♨ Gains Continuation — Permafrost locked gains; drawdown throttle restarted.', 'warn');
+                  // Same bail-or-not decision the base bot makes for its own drawdown throttle
+                  // trigger — Gains Continuation arms an identical halt, so it defers to the
+                  // same drawdownBailEnabled toggle rather than always or never bailing.
+                  if (this.cfg.drawdownBailEnabled !== false && this.positions.length > 0) {
+                    this.log(`[ASH] ⚡ Gains Continuation bail — closing ${this.positions.length} open position(s)`, 'warn');
+                    setTimeout(() => { this.bailAll().catch(() => {}); }, 0);
+                  }
                 }
               }
             }
@@ -753,7 +741,6 @@
                 // During own halt: adopt partner's sampling metrics so bars stay current
                 if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
                   if (_ps.fundSkew) this._micFundSkew = _ps.fundSkew;
-                  if (_ps.oiSkew)   this._micOiSkew   = _ps.oiSkew;
                   if (_ps.volSkew)  this._micVolSkew  = _ps.volSkew;
                 }
                 // Merge partner liq history — add entries not already in own history (by ts), sort, cap
@@ -774,16 +761,6 @@
                   if (this.afWave.length > WAVE_CAP) this.afWave = this.afWave.slice(-WAVE_CAP);
                 }
               }
-              // OI/MC history — deduplicate against last entry
-              const _oi = this._micOiSkew;
-              if (_oi?.ratio != null) {
-                const _lastOi = this.afOiHistory.length ? this.afOiHistory[this.afOiHistory.length - 1] : null;
-                if (!_lastOi || Date.now() - _lastOi.ts > OI_SAMPLE_MIN_GAP_MS) {
-                  this.afOiHistory.push({ ts: Date.now(), ratio: +_oi.ratio.toFixed(4) });
-                  const _oiCut = Date.now() - WAVE_TTL_MS;
-                  this.afOiHistory = this.afOiHistory.filter(p => p.ts >= _oiCut).slice(-500);
-                }
-              }
             }
           }, 15000);
         },
@@ -796,12 +773,8 @@
             this.afEvents     = trimToByteCap(this.afEvents);
             this.afCloses     = trimToByteCap(this.afCloses);
             this.afWave       = trimToByteCap(this.afWave);
-            this.afVolHistory = trimToByteCap(this.afVolHistory);
-            this.afOiHistory  = trimToByteCap(this.afOiHistory);
             localStorage.setItem(ASH_KEY, JSON.stringify({
               events: this.afEvents, closes: this.afCloses, wave: this.afWave,
-              volHistory: this.afVolHistory,
-              oiHistory: this.afOiHistory,
               afKlineBar: this.afKlineBar,
             }));
           } catch(e) {}
@@ -923,16 +896,6 @@
           const cut = Date.now() - WAVE_TTL_MS;
           if (this.afWave.length && this.afWave[0].ts < cut) this.afWave = this.afWave.filter(p => p.ts >= cut);
           if (this.afWave.length > WAVE_CAP) this.afWave = this.afWave.slice(-WAVE_CAP);
-          // Vol history: sample volAbs with 15-min dedup
-          const _volAbs = reading.volAbs ?? 0;
-          const _lastVol = this.afVolHistory.length ? this.afVolHistory[this.afVolHistory.length - 1] : null;
-          if (_volAbs > 0 && (!_lastVol || reading.ts - _lastVol.ts >= 15 * 60000)) {
-            this.afVolHistory.push({ ts: reading.ts, v: _volAbs });
-            const _retMs = (this.cfg.afVolRetentionDays ?? 30) * 86400000;
-            const _volCut = Date.now() - _retMs;
-            if (this.afVolHistory.length && this.afVolHistory[0].ts < _volCut) this.afVolHistory = this.afVolHistory.filter(p => p.ts >= _volCut);
-            if (this.afVolHistory.length > 5000) this.afVolHistory = this.afVolHistory.slice(-5000);
-          }
         },
 
         // Current lean plus its trajectory (slope = avg lean over last N hours − avg lean N–2N hours ago).
@@ -1041,7 +1004,6 @@
               ts: reading.ts,
               klineBar: this._afOwnKlineBar ?? this.afKlineBar,
               fundSkew: this._micFundSkew ?? null,
-              oiSkew: this._micOiSkew ?? null,
               volSkew: this._micVolSkew ?? null,
               vol: reading.vol ?? 0,
               volAbs: reading.volAbs ?? 0,
@@ -1276,10 +1238,12 @@
           } catch(e) { return []; }
         },
 
-        _afCrossWrite(kind) {
+        _afCrossWrite(kind, symbol) {
           try {
             const events = this._afCrossRead();
-            events.push({ ts: Date.now(), kind, source: 'chaser' });
+            const rec = { ts: Date.now(), kind, source: 'chaser' };
+            if (symbol) rec.symbol = symbol;
+            events.push(rec);
             localStorage.setItem(CROSS_KEY, JSON.stringify({ events }));
           } catch(e) {}
         },
@@ -1395,135 +1359,6 @@
             + (showFio && fioPts.length >= 2 ? `<text x="${W / 2}" y="${H + 9}" fill="rgba(200,150,255,.55)" font-size="8" font-family="monospace" text-anchor="middle">fio</text>` : '')
             + (showScore && scorePts.length >= 2 ? `<text x="${W - pad}" y="${H + 9}" fill="rgba(180,180,180,.55)" font-size="8" font-family="monospace" text-anchor="end">score</text>` : '')
             + `</svg>`;
-        },
-
-        _afOiSvg(shown) {
-          if (!shown) return '';
-          const hist = this.afOiHistory;
-          const W = 260, H = 52, labelH = 10, pad = 4;
-          const placeholder = `<svg width="100%" viewBox="0 0 ${W} ${H + labelH}" preserveAspectRatio="none" style="display:block"><text x="${W/2}" y="${H/2+3}" fill="rgba(255,255,255,.3)" font-size="9" font-family="monospace" text-anchor="middle">gathering OI history…</text></svg>`;
-          if (hist.length < 2) return placeholder;
-          const now = Date.now();
-          const tMin = now - WAVE_TTL_MS;
-          const visible = hist.filter(p => p.ts >= tMin);
-          if (visible.length < 2) return placeholder;
-          const ratios = visible.map(p => p.ratio);
-          const maxR = Math.max(...ratios);
-          const yMax = Math.max(maxR * 1.2, 1);
-          const plotW = W - 2 * pad;
-          const y = r => pad + (1 - r / yMax) * (H - 2 * pad);
-          // Split into separate polylines across a real sampling gap. OI_SAMPLE_MIN_GAP_MS is
-          // the sampler's dedup *floor* — real consecutive samples land at or just above it,
-          // never below — so using it bare as the "this is a gap" ceiling breaks the line at
-          // every single normal point. Give it headroom above the floor before calling it a gap.
-          const OI_GAP_MS = OI_SAMPLE_MIN_GAP_MS + 2 * (this.cfg.scanMins ?? 15) * 60000;
-          const oiGroups = [[visible[0]]];
-          for (let i = 1; i < visible.length; i++) {
-            if (visible[i].ts - visible[i-1].ts > OI_GAP_MS) oiGroups.push([]);
-            oiGroups[oiGroups.length-1].push(visible[i]);
-          }
-          const polylines = oiGroups.filter(g => g.length > 1).map(g => {
-            const pts = g.map(p => `${(pad + ((p.ts - tMin) / WAVE_TTL_MS) * plotW).toFixed(1)},${y(p.ratio).toFixed(1)}`).join(' ');
-            return `<polyline points="${pts}" fill="none" stroke="rgba(255,140,50,.7)" stroke-width="1.5" stroke-linejoin="round"/>`;
-          }).join('');
-          const cur = visible[visible.length - 1];
-          const cx = (pad + ((cur.ts - tMin) / WAVE_TTL_MS) * plotW).toFixed(1);
-          const cy = y(cur.ratio).toFixed(1);
-          const yMidLine = y(yMax * 0.5).toFixed(1);
-          return `<svg width="100%" viewBox="0 0 ${W} ${H + labelH}" preserveAspectRatio="none" style="display:block">`
-            + `<line x1="0" y1="${yMidLine}" x2="${W}" y2="${yMidLine}" stroke="rgba(255,255,255,.1)" stroke-dasharray="3 3"/>`
-            + polylines
-            + `<circle cx="${cx}" cy="${cy}" r="2.5" fill="rgba(255,140,50,.9)"/>`
-            + `<text x="2" y="${pad+7}" fill="rgba(255,255,255,.3)" font-size="8" font-family="monospace">${yMax.toFixed(1)}%</text>`
-            + `<text x="2" y="${H-1}" fill="rgba(255,255,255,.2)" font-size="8" font-family="monospace">0%</text>`
-            + `<text x="${W-pad}" y="${H+9}" fill="rgba(255,140,50,.6)" font-size="8" font-family="monospace" text-anchor="end">${cur.ratio.toFixed(2)}%</text>`
-            + `</svg>`;
-        },
-
-        _afVolSvg(shown) {
-          if (!shown) return '';
-          const hist = this.afVolHistory;
-          const bucketMap = {};
-          for (const p of hist) { const hk = Math.floor(p.ts/3600000)*3600000; if (!bucketMap[hk]) bucketMap[hk]={sum:0,n:0}; bucketMap[hk].sum+=p.v; bucketMap[hk].n++; }
-          const buckets = Object.entries(bucketMap).map(([k,v])=>({ts:+k,v:v.sum/v.n})).sort((a,b)=>a.ts-b.ts);
-          const BAR_W=10, GAP_W=30, H=64, padL=28, padB=16, padT=6, padR=4;
-          const plotH = H - padT - padB;
-          if (buckets.length < 2) return `<svg width="260" height="${H+padB}" style="display:block"><text x="130" y="${H/2}" fill="rgba(255,255,255,.3)" font-size="9" font-family="monospace" text-anchor="middle">gathering volume history…</text></svg>`;
-
-          // OC hourly points computed up front so the shared x-axis can include their hours too.
-          // Gated on _ocChartViable() same as the standalone OC chart — Liquid-Diver's single-
-          // symbol fetches otherwise dominate the hourly buckets with noisy 1-ticker samples,
-          // making this overlay line look like it keeps resetting instead of building up smoothly.
-          let ocPts = [];
-          if (this.cfg.afOcEnabled && this._afOcCycleHistory?.length > 1 && this._ocChartViable()) {
-            const ocBucketMap = {};
-            for (const c of this._afOcCycleHistory) {
-              const hk = Math.floor(c.ts / 3600000) * 3600000;
-              const withInterval = (c.results || []).filter(r => r && r.avgMs != null);
-              if (!withInterval.length) continue;
-              const avgMs = withInterval.reduce((s,r)=>s+r.avgMs,0) / withInterval.length;
-              if (!ocBucketMap[hk]) ocBucketMap[hk] = { sum: 0, n: 0 };
-              ocBucketMap[hk].sum += avgMs; ocBucketMap[hk].n++;
-            }
-            ocPts = Object.entries(ocBucketMap).map(([k,v]) => ({ ts: +k, avgSec: (v.sum/v.n)/1000 })).sort((a,b)=>a.ts-b.ts);
-          }
-
-          // Unified hour axis: union of volume + OC hours, positioned once. Each series then
-          // looks up its own x by hour timestamp instead of one series searching the other's
-          // bucket list — an hour with only OC data (or only volume data) still gets a correct,
-          // temporally-ordered position instead of being dropped or aliased onto the wrong slot.
-          const localDay = ts => { const d=new Date(ts); return isNaN(d.getTime()) ? 0 : d.getFullYear()*10000+d.getMonth()*100+d.getDate(); };
-          const allHours = [...new Set([...buckets.map(b=>b.ts), ...ocPts.map(p=>p.ts)])].sort((a,b)=>a-b);
-          const xMap = new Map();
-          let xCur = padL;
-          for (let i=0;i<allHours.length;i++) { if (i>0 && localDay(allHours[i])!==localDay(allHours[i-1])) xCur+=GAP_W; xMap.set(allHours[i], xCur); xCur+=BAR_W; }
-          const W = xCur + padR;
-
-          // Headroom above the actual max so a typical (non-spike) reading sits mid-chart
-          // rather than pinned to the ceiling of a domain that tops out exactly at the max.
-          const HEADROOM = 1.3;
-          const rawMaxV = Math.max(...buckets.map(b=>b.v),0.001);
-          const maxV = rawMaxV * HEADROOM;
-          const meanV = buckets.reduce((s,b)=>s+b.v,0)/buckets.length;
-          const yV = v => padT + plotH - Math.min(1,v/maxV)*plotH;
-          const fmtV = v => v>=1?v.toFixed(1)+'B':v>=0.001?(v*1000).toFixed(0)+'M':v.toFixed(3)+'B';
-          const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-          const dLabel = _d => isNaN(_d.getTime()) ? '?' : MONTHS[_d.getMonth()]+' '+_d.getDate();
-          const _ow=padL+6,_oh=H+8,_ax=padL+6;
-          let _yAxis=`<svg width="${_ow}" height="${_oh}" style="display:block"><line x1="${_ax}" y1="${4+padT}" x2="${_ax}" y2="${4+padT+plotH}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`;
-          for (const f of [0,0.5,1]) { const v=maxV*f; const y=(4+yV(v)).toFixed(1); _yAxis+=`<text x="${_ax-3}" y="${(parseFloat(y)+3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${fmtV(v)}</text>`; }
-          this._afVolYAxisHtml = _yAxis+'</svg>';
-          let gridSvg = [0,0.25,0.5,0.75,1].map(f => { const y=yV(maxV*f).toFixed(1); return `<line x1="${padL}" y1="${y}" x2="${(W-padR).toFixed(1)}" y2="${y}" stroke="rgba(255,255,255,.05)" stroke-width="0.5"/>`; }).join('');
-          gridSvg += `<line x1="${padL}" y1="${(padT+plotH).toFixed(1)}" x2="${(W-padR).toFixed(1)}" y2="${(padT+plotH).toFixed(1)}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`;
-          let dayLabels='';
-          for (let i=1;i<allHours.length;i++) { if (localDay(allHours[i])!==localDay(allHours[i-1])) { const gx=xMap.get(allHours[i]).toFixed(1); gridSvg+=`<line x1="${gx}" y1="${padT}" x2="${gx}" y2="${padT+plotH}" stroke="rgba(255,255,255,.08)"/>`; const d=new Date(allHours[i]); dayLabels+=`<text x="${gx}" y="${H+padB-2}" fill="rgba(255,255,255,.28)" font-size="7" font-family="monospace" text-anchor="middle">${dLabel(d)}</text>`; } }
-          const my=yV(meanV).toFixed(1);
-          // Vol line — skip the connecting segment across a real data gap (a missing hourly
-          // bucket) instead of drawing a straight line through hours with no samples.
-          // Threshold matches the bucket's own sampling cadence (1h) exactly.
-          const LINE_GAP_MS = 3600 * 1000;
-          let volLine='';
-          for (let i=1;i<buckets.length;i++) { if (buckets[i].ts - buckets[i-1].ts > LINE_GAP_MS) continue; const x1=(xMap.get(buckets[i-1].ts)+BAR_W/2).toFixed(1),x2=(xMap.get(buckets[i].ts)+BAR_W/2).toFixed(1),y1=yV(buckets[i-1].v).toFixed(1),y2=yV(buckets[i].v).toFixed(1); volLine+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="rgba(255,150,80,.75)" stroke-width="1.5"/>`; }
-          this._afVolLatestV = buckets[buckets.length - 1].v;
-          this._afVolMeanV   = meanV;
-          this._afVolOcLatestSec = null;
-          this._afVolOcYAxisHtml = '';
-          let ocLine='';
-          if (ocPts.length > 1) {
-            const maxOc=Math.max(...ocPts.map(p=>p.avgSec),1) * HEADROOM;
-            // Inverted vs. the volume axis on purpose: a lower interval means faster/busier
-            // order flow, so it plots higher on the chart rather than lower like a plain value scale would.
-            const yOc=v=>padT+Math.min(1,v/maxOc)*plotH;
-            const ocMapped=ocPts.map(p=>({x:xMap.get(p.ts)+BAR_W/2,y:yOc(p.avgSec),ts:p.ts}));
-            for (let i=1;i<ocMapped.length;i++) { if (ocMapped[i].ts - ocMapped[i-1].ts > LINE_GAP_MS) continue; ocLine+=`<line x1="${ocMapped[i-1].x.toFixed(1)}" y1="${ocMapped[i-1].y.toFixed(1)}" x2="${ocMapped[i].x.toFixed(1)}" y2="${ocMapped[i].y.toFixed(1)}" stroke="rgba(200,160,80,.8)" stroke-width="1.2"/>`; }
-            this._afVolOcLatestSec = ocPts[ocPts.length - 1].avgSec;
-            // Right-side vertical axis for the OC line's own scale, mirroring the left volume axis.
-            const _rax = 6;
-            let _rAxis = `<svg width="${_ow}" height="${_oh}" style="display:block"><line x1="${_rax}" y1="${4+padT}" x2="${_rax}" y2="${4+padT+plotH}" stroke="rgba(200,160,80,.3)" stroke-width="0.5"/>`;
-            for (const f of [0,0.5,1]) { const v=maxOc*f; const y=(4+yOc(v)).toFixed(1); _rAxis += `<text x="${_rax+3}" y="${(parseFloat(y)+3).toFixed(1)}" fill="rgba(200,160,80,.55)" font-size="7" font-family="monospace" text-anchor="start">${v.toFixed(0)}s</text>`; }
-            this._afVolOcYAxisHtml = _rAxis + '</svg>';
-          }
-          return `<svg width="${W}" height="${H+padB}" style="display:block">`+gridSvg+`<line x1="${padL}" y1="${my}" x2="${(W-padR).toFixed(1)}" y2="${my}" stroke="rgba(255,150,80,.15)" stroke-dasharray="3 3"/>`+volLine+ocLine+dayLabels+`</svg>`;
         },
 
         // ── Hostility score: kernel-weighted, recency-decayed, normalized by entry margin.
@@ -1662,6 +1497,19 @@
             const _pnl = _t?.totalPnl ?? _t?.pnl;
             if (typeof _pnl === 'number') {
               this._afScoreBuild(this._afScoreWrite(_scoreCriteria, _pnl));
+            }
+          }
+          // MIC-only feedback: direction-awareness lock (always, independent of the scorecard
+          // toggle) and the 0liq-win cross broadcast (Permafrost's Only-1/Both side graylists
+          // the ticker for 6h so it doesn't compete with a ticker Chaser just won calmly).
+          if (pos._mic && pos._micCriteria?.length) {
+            const _t2  = this.closedTrades?.[0];
+            const _pnl2 = _t2?.totalPnl ?? _t2?.pnl;
+            if (typeof _pnl2 === 'number') {
+              this._micOnPositionScored?.(pos.symbol, pos._micCriteria, _pnl2);
+              if (this.cfg.ashfallCrossEnabled && _pnl2 > 0 && pos._micCriteria.includes('0liq')) {
+                this._afCrossWrite('0liq-win', pos.symbol);
+              }
             }
           }
         },
@@ -2090,6 +1938,32 @@
           } finally { this._ocFetchRunning = false; }
         },
 
+        // Isolated single-symbol OC lookup for the live liquidation path (MIC's _micOnLiqMessage).
+        // Deliberately does NOT touch afOcResults or _afOcCycleHistory: afOcResults is a full
+        // replace on every _ocFetchBatch call, so a live single-symbol result written there would
+        // wipe out the current scan's multi-ticker snapshot other tickers' ocs/ocx checks still
+        // need; and pushing a 1-ticker entry into _afOcCycleHistory floods the Order Interval
+        // Sample chart / Volume History overlay's hourly buckets with noisy samples — the same
+        // problem Liquid-Diver's live OC fetch used to cause (see _ocChartViable()), just
+        // reintroduced from inside MIC instead of a separate plugin. Callers merge the return
+        // value into their own local map instead.
+        async _ocFetchSingle(sym) {
+          if (!this.cfg.afOcEnabled || !sym) return null;
+          try {
+            const limit = this.cfg.afOcOrderLimit ?? 100;
+            const res = await fetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
+            const js  = await res.json();
+            const trades = js?.result?.list || [];
+            if (trades.length < 2) return null;
+            let bc = 0, sc = 0;
+            for (const t of trades) { if (t.side === 'Buy') bc++; else sc++; }
+            const times = trades.map(t => parseInt(t.time, 10)).filter(n => !isNaN(n)).sort((a,b)=>a-b);
+            const span = times[times.length - 1] - times[0];
+            const avgMs = times.length > 1 && span > 0 ? span / (times.length - 1) : null;
+            return { bc, sc, avgMs, n: trades.length };
+          } catch(_) { return null; }
+        },
+
         // Shared by init() (loading from localStorage) and afImport() (loading from a file)
         // so a corrupt/legacy history can't slip in through one path just because the other
         // path was hardened first. Drops records from the pre-redesign OC system (which
@@ -2155,11 +2029,19 @@
           if (avgRef>maxSec*0.05&&avgRef<maxSec*0.95) this._afOcAvgYPx=4+yVal(avgRef); else this._afOcAvgYPx=null;
           const grids=[0,0.25,0.5,0.75,1].map(f=>{const v=maxSec*f;const y=yVal(v).toFixed(1);return `<line x1="${padL}" y1="${y}" x2="${(W-padR).toFixed(1)}" y2="${y}" stroke="rgba(255,255,255,.05)" stroke-width="0.5"/>`;}).join('');
           const CLR='rgba(200,160,80,'; // amber — matches the OC-interval overlay line in Volume History
+          // Highlighted cycle falls back to the actual latest cycle when nothing is pinned —
+          // see the matching HIGHLIGHTED CYCLE section below, fed by _afOcDisplayedResults().
+          const displayedTs = this._afOcHighlightedCycleTs ?? history[history.length - 1].ts;
           let bars='';
           history.forEach((cycle,ci)=>{
             const cx=xPos[ci]; const results=cycle.results.filter(r=>r&&r.avgMs!=null&&r.avgMs/1000<=CHART_MAX_SEC); const n=results.length;
             const cycleMean=n?results.reduce((s,r)=>s+r.avgMs/1000,0)/n:0;
             const bw=Math.max(1,Math.min(4,cycleW*0.9/Math.max(1,n)));
+            // Hitbox — sits under the bars and spans the full cycle column (not just the bars
+            // themselves, since a cycle with no qualifying-speed tickers has no bars to click),
+            // doubling as the highlight backdrop for whichever cycle is currently displayed.
+            const isDisplayed = cycle.ts === displayedTs;
+            bars += `<rect class="afoc-cycle-hit" data-oc-cycle-ts="${cycle.ts}" x="${cx.toFixed(1)}" y="${padT}" width="${cycleW.toFixed(1)}" height="${plotH.toFixed(1)}" fill="${isDisplayed ? 'rgba(200,160,80,.10)' : 'transparent'}" pointer-events="all" style="cursor:pointer"/>`;
             results.forEach((r,ri)=>{
               const x=cx+(ri/n)*cycleW*0.9;
               const v=r.avgMs/1000;
@@ -2196,9 +2078,33 @@
           const hist = this._afOcCycleHistory || [];
           return hist.reduce((a,c) => (!a || c.ts > a.ts) ? c : a, null);
         },
+        // Resolves which cycle's results the chart's summary/chip list show — the pinned cycle
+        // if one was clicked and is still in history, else the actual latest (default). Mirrors
+        // _liqDisplayedResults(); a pinned cycle can age out of _afOcCycleHistory (capped at 25)
+        // without an explicit reset, so this falls back rather than showing a stale/empty list.
+        _afOcDisplayedCycle() {
+          const hist = this._afOcCycleHistory || [];
+          const hi = this._afOcHighlightedCycleTs;
+          if (hi != null) {
+            const hit = hist.find(c => c.ts === hi);
+            if (hit) return hit;
+          }
+          return this._afOcLatestCycle();
+        },
+        _afOcDisplayedCycleLabel() {
+          const last = this._afOcLatestCycle();
+          const hi = this._afOcHighlightedCycleTs;
+          if (hi == null || !last) return '';
+          if (hi === last.ts) return '';
+          const hist = this._afOcCycleHistory || [];
+          const hit = hist.find(c => c.ts === hi);
+          if (!hit) return '';
+          const d = new Date(hit.ts);
+          return ' · ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        },
         _afOcSummaryText(shown) {
           if (!shown) return '';
-          const last = this._afOcLatestCycle();
+          const last = this._afOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
           const bc = results.reduce((s,r)=>s+(r.bc||0),0);
@@ -2206,11 +2112,21 @@
           const total = bc + sc;
           if (!total) return '';
           const buyPct = (bc/total*100).toFixed(0), sellPct = (sc/total*100).toFixed(0);
-          return `${total} order${total===1?'':'s'} sampled · ${buyPct}% buy / ${sellPct}% sell · ${results.length} ticker${results.length===1?'':'s'}`;
+          return `${total} order${total===1?'':'s'} sampled · ${buyPct}% buy / ${sellPct}% sell · ${results.length} ticker${results.length===1?'':'s'}${this._afOcDisplayedCycleLabel()}`;
+        },
+        // Mean seconds/order across every ticker in the displayed cycle — moved here from the
+        // old Volume History chart's OC overlay line, which got scrapped along with the rest
+        // of that chart. Simple average across the cycle's tickers, not an hourly bucket mean.
+        _afOcAvgIntervalSec(shown) {
+          if (!shown) return null;
+          const last = this._afOcDisplayedCycle();
+          const withInterval = (last?.results || []).filter(r => r && r.avgMs != null);
+          if (!withInterval.length) return null;
+          return withInterval.reduce((s,r) => s + r.avgMs, 0) / withInterval.length / 1000;
         },
         _afOcInfoHtml(shown) {
           if (!shown) return '';
-          const last = this._afOcLatestCycle();
+          const last = this._afOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
           const mean=results.reduce((s,r)=>s+(r.bc||0)+(r.sc||0),0)/results.length;
