@@ -49,7 +49,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.46.0';
+  const VERSION       = '1.46.1';
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence mode ('1' — live only). Switching to Only-0/Both won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
@@ -1589,15 +1589,15 @@
         // Annotation for a live-triggered slot's criteria — sliq/bliq/msliq/mbliq use the live
         // depth just computed from the message (never _liqResults, which is closed-cycle only).
         // Everything else mirrors _miwOpen's cache-based annotation.
-        _miwAnnotateLiveCrit(c, t, mcap, liveType, liveDepth) {
+        _miwAnnotateLiveCrit(c, t, mcap, liveType, liveDepth, ocResults) {
           if (LIQ_TYPES.some(ty => c.startsWith(ty))) return `${liveType}${liveDepth >= 0 ? '+' : ''}${liveDepth}`;
           if (/^iot/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const tv = parseFloat(t.turnover24h || 0); const step = this.cfg.miwIotStep ?? 1; return `iot+${tv > 0 ? Math.floor(oi / tv * 100 / step) : 0}`; }
           if (/^iom/.test(c)) { const oi = parseFloat(t.openInterestValue || 0); const mc = mcap || 0; const step = this.cfg.miwIomStep ?? 1; return `iom+${mc > 0 ? Math.floor(oi / mc * 100 / step) : 0}`; }
           if (/^fund/.test(c)) { const step = this.cfg.miwFundStep ?? 0.25; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_/step); return `fund${tier>=0?'+':''}${tier}`; }
           if (/^vm/.test(c)) { const mc = mcap || 0; const tv = parseFloat(t.turnover24h||0); const step = this.cfg.miwVmStep ?? 1; const tier = mc > 0 ? Math.floor(tv/mc*100/step) : 0; return `vm+${tier}`; }
           if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._miwGetKlineSync(t.symbol); const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.miwSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
-          if (/^ocs/.test(c)) { const _r = this.pfOcResults?.[t.symbol]; const tot = (_r?.bc||0)+(_r?.sc||0); const buyPct = tot ? (_r.bc||0)/tot*100 : 50; const step = this.cfg.miwOcsStep ?? 1; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
-          if (/^ocx/.test(c)) { const _r = this.pfOcResults?.[t.symbol]; const step = this.cfg.miwOcxStep ?? 1; const tier = _r?.avgMs!=null ? Math.floor((_r.avgMs/1000)/step) : 0; return `ocx+${tier}`; }
+          if (/^ocs/.test(c)) { const _r = ocResults?.[t.symbol]; const tot = (_r?.bc||0)+(_r?.sc||0); const buyPct = tot ? (_r.bc||0)/tot*100 : 50; const step = this.cfg.miwOcsStep ?? 1; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
+          if (/^ocx/.test(c)) { const _r = ocResults?.[t.symbol]; const step = this.cfg.miwOcxStep ?? 1; const tier = _r?.avgMs!=null ? Math.floor((_r.avgMs/1000)/step) : 0; return `ocx+${tier}`; }
           return c;
         },
 
@@ -1662,17 +1662,24 @@
                 if (mcap == null) { await this._miwPrefetchMcaps([base]); mcap = this._miwGetMcapSync(base, parseFloat(t.lastPrice || 0)); }
               }
               if (needsKline && !this._miwGetKlineSync(sym)) await this._miwPrefetchKlines([sym]);
-              if (needsOc && this.cfg.pfOcEnabled && !this.pfOcResults?.[sym]) await this._ocFetchBatch?.([sym]);
+              // Reuses this symbol's fresh scan-time OC data if it happens to already be in
+              // pfOcResults, but otherwise fetches via the isolated _ocFetchSingle — never
+              // _ocFetchBatch, which would replace the whole shared pfOcResults snapshot other
+              // tickers' checks still need this cycle, and would flood the OC chart's history
+              // with a noisy 1-ticker sample (see _ocFetchSingle's own comment).
+              let ocResult = this.pfOcResults?.[sym] ?? null;
+              if (needsOc && !ocResult && this.cfg.pfOcEnabled) ocResult = await this._ocFetchSingle?.(sym) ?? null;
+              const ocResultsMap = ocResult ? { [sym]: ocResult } : {};
 
               const ratio   = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
               const mcapMap = mcap != null ? { [sym]: mcap } : {};
-              if (!secondary.every(c => this._miwCheckCrit(c, fr, is24hUp, ratio, t, mcapMap, this.pfOcResults))) continue;
+              if (!secondary.every(c => this._miwCheckCrit(c, fr, is24hUp, ratio, t, mcapMap, ocResultsMap))) continue;
 
               // Matched — annotate and score against this same-type slot subset. Co-Qualifying
               // Penalty against slots anchored on a different liq type or 0liq is moot: only one
               // liq classification can be true for this ticker at this moment, so any such slot
               // would fail its own anchor check anyway.
-              const annotCrits = slot.map(c => this._miwAnnotateLiveCrit(c, t, mcap, type, depth));
+              const annotCrits = slot.map(c => this._miwAnnotateLiveCrit(c, t, mcap, type, depth, ocResultsMap));
               let compositeScore = 0;
               if (this.cfg.pfCoQualPenaltyEnabled) {
                 const bestScore = slot.reduce((s, c, j) => s + this._miwScaledRank(c, annotCrits[j]), 0);
@@ -1682,8 +1689,8 @@
                   const other = candidateSlots[k];
                   if (!this._miwCheckLiveLiqCrit(this._miwSlotLiqAnchor(other), type, depth)) continue;
                   const otherSecondary = other.filter(c => c !== this._miwSlotLiqAnchor(other));
-                  if (!otherSecondary.every(c => this._miwCheckCrit(c, fr, is24hUp, ratio, t, mcapMap, this.pfOcResults))) continue;
-                  const otherAnnot = other.map(c => this._miwAnnotateLiveCrit(c, t, mcap, type, depth));
+                  if (!otherSecondary.every(c => this._miwCheckCrit(c, fr, is24hUp, ratio, t, mcapMap, ocResultsMap))) continue;
+                  const otherAnnot = other.map(c => this._miwAnnotateLiveCrit(c, t, mcap, type, depth, ocResultsMap));
                   const sc = other.reduce((s, c, j) => s + this._miwScaledRank(c, otherAnnot[j]), 0);
                   if (sc < 0) penalty += sc;
                 }
