@@ -87,13 +87,13 @@ Every slot requires a liquidation reading as its base — nothing else opens a p
 - **rabl>N** — The mirror: a green candle with volume at least N tiers below average. The market drifted up without conviction. Useful for entries where you expect a measured continuation rather than a sharp move.
 - **iot>N / iot<N** — OI relative to 24h turnover at tier N (1% step by default). High OI relative to turnover signals conviction or stickiness — the market is holding open positions rather than trading them away.
 - **iom>N / iom<N** — OI relative to market cap at tier N. High OI signals leverage concentration — a large share of the coin's float is leveraged open interest.
-- **S-Liq (Sell-Liquidation)** — Short positions account for at least 70% of liquidation turnover so far — a decisively one-sided reading, acted on the instant it crosses that line rather than waiting for anything to close. Short liquidations are bullish; the market forced out the short side with conviction. Use this to confirm the long case has real pressure behind it. An optional depth gate can additionally require the liquidated value to sit a set percentage above or below the average liquidation size seen across all recorded history — a read on whether this event is unusually large or unusually small compared to what's typical.
-- **B-Liq (Buy-Liquidation)** — Long positions account for at least 70% of liquidation turnover, same immediate reaction as S-Liq. Long liquidations are bearish; the market forced out the long side with conviction. Use this to confirm the short case. The same optional depth gate applies.
-- **mS-Liq (Mixed Sell-Liquidation)** — Sell liquidations lead, but buy liquidations hold at least 30% of turnover — a contested reading with a sell lean, same immediate reaction. Use this to capture the short-liq thesis when a clean one-sided signal is absent. The same depth gate applies.
-- **mB-Liq (Mixed Buy-Liquidation)** — Buy liquidations lead, but sell liquidations hold at least 30% — a contested reading with a buy lean, same immediate reaction. Use this to capture the long-liq thesis under mixed but directionally leaning conditions.
+- **S-Liq (Sell-Liquidation)** — Short positions on this ticker account for at least 70% of its liquidation turnover so far — a decisively one-sided reading, acted on the instant it crosses that line rather than waiting for anything to close. Short liquidations are bullish; the market forced out the short side with conviction. Use this to confirm the long case has real pressure behind it. An optional depth gate can additionally require the liquidated value to sit a set percentage above or below the average liquidation size seen across all recorded history — a read on whether this event is unusually large or unusually small compared to what's typical.
+- **B-Liq (Buy-Liquidation)** — Long positions on this ticker account for at least 70% of its liquidation turnover, same immediate reaction as S-Liq. Long liquidations are bearish; the market forced out the long side with conviction. Use this to confirm the short case. The same optional depth gate applies.
+- **mS-Liq (Mixed Sell-Liquidation)** — On this ticker, sell liquidations lead, but buy liquidations still hold at least 30% of its turnover — a contested reading with a sell lean, same immediate reaction. Use this to capture the short-liq thesis when a clean one-sided signal is absent. The same depth gate applies.
+- **mB-Liq (Mixed Buy-Liquidation)** — On this ticker, buy liquidations lead, but sell liquidations still hold at least 30% — a contested reading with a buy lean, same immediate reaction. Use this to capture the long-liq thesis under mixed but directionally leaning conditions.
 - **0-Liq (No Liquidation)** — Nothing was liquidated on this ticker for the entire cycle — the mirror case to every liquidation reading above. Unlike the four above, there's no way to observe an absence in real time, so this one only resolves once the cycle finishes. If one-sided liquidation flow across the market is consistently bullish, the complete absence of liquidation is a distinct condition worth treating on its own terms rather than lumping in with a quiet mixed cycle.
 - **Buy/Sell Skew** — What share of a ticker's recent order flow was buys versus sells, measured directly from filled trades rather than inferred from price. A strong buy lean confirms genuine demand behind a move; a strong sell lean confirms genuine supply. Unlike most criteria here, order flow exists on every liquid ticker at every moment — there is no waiting for a spike or a fresh data fetch to line up. Treat it the way you'd treat the day's up/down direction: nearly always available, and worth including in almost any slot as a light confirming filter rather than reserving it for rare setups.
-- **Order Count Deviation** — How quickly orders are landing on a ticker, measured as the average time between fills. A short gap means the ticker is being traded rapidly right now; a long gap means it's quiet. Same always-on caveat as Buy/Sell Skew: this is one of the few signals with no downtime, so it shows up often and should be weighted as a routine confirming factor, not a special case. One exception: on a ticker whose live liquidation reading just triggered entry, an extremely short gap is expected on its own — a liquidation cascade is itself a burst of forced trades. There, a busy reading isn't independent confirmation of anything; it's a direct side effect of the same event that already opened the position, and shouldn't be weighted as though it adds new information.
+- **Order Count Deviation** — How quickly orders are landing on a ticker, measured as the average time between fills. A short gap means the ticker is being traded rapidly right now; a long gap means it's quiet. Gaps also tend to lengthen in a downtrend and shorten in an uptrend, consistent with other order-count-based readings — treat a slowing gap as mild bearish confirmation and a quickening one as mild bullish confirmation, not a standalone signal. Same always-on caveat as Buy/Sell Skew: this is one of the few signals with no downtime, so it shows up often and should be weighted as a routine confirming factor, not a special case. One exception: on a ticker whose live liquidation reading just triggered entry, an extremely short gap is expected on its own — a liquidation cascade is itself a burst of forced trades. There, a busy reading isn't independent confirmation of anything; it's a direct side effect of the same event that already opened the position, and shouldn't be weighted as though it adds new information.
 
 **Building slots**: A slot containing only "S-Liq" behaves like a bare liquidation filter — no confirmation, just the base signal. A slot containing "S-Liq" and "V/M>10" requires the liquidation to also come with unusually high participation. A slot with "S-Liq", "V/M>10", and "fund<-1" requires liquidation, participation, and a funding premium to all align before opening. Adding "R-ABL>25" to that same slot demands the last hourly candle confirm the move with volume too. Each addition narrows the filter from permissive to strict without changing the underlying logic — but the liquidation reading itself is never optional, it's the base every slot is built on.
 
@@ -119,15 +119,13 @@ This can apply to both outcomes alike, or to losses only — letting a symbol th
 
 #### Substitution
 
-When every position slot is full, a fresh candidate isn't turned away just because the book is at capacity. Its case is weighed against the weakest current holding using the same scoring the entry gate itself runs on. If the new case outscores the weakest holding by a meaningful margin, swap it in — close the weakest, open the new one. A full book means the worst current holding has to keep defending its spot, not that opportunity stops being evaluated.
+A full book doesn't turn away a strong new candidate. Its case is scored the same way entries are, and if it clearly beats the weakest current holding, the weakest closes and the new one opens.
 
-The swap only fires when the improvement clears a deliberate bar, not on any marginal edge — otherwise you're paying round-trip costs to chase noise. A newly opened position also gets a grace period before it can be swapped out, so it isn't punished for a slot ranking that hasn't had time to prove itself.
+The bar for swapping is deliberate, not marginal — a small edge doesn't justify the round trip. A newly opened position also gets a grace period before it can be swapped out.
 
-By default, a position that's currently winning is left alone regardless of rank — a live winner is worth more than a rank number says. That protection can be turned off if your markets tend to see winners reverse quickly; in that case the swap goes purely on rank, profitable or not.
+A currently-winning position is protected by default regardless of rank, and a confirmed liquidation-absence reading can't be bumped by a live liquidation-driven candidate. Both protections can be turned off, leaving the decision on rank alone.
 
-A confirmed liquidation-absence reading outranks a reactive liquidation reading for this purpose — a live, instant-reaction candidate can't bump a position that was confirmed clean over a full cycle, though the reverse is allowed. That protection can also be turned off, in which case rank alone decides regardless of which kind of reading opened either side.
-
-This is an entry-gate decision, not a reaction to a struggling position — it belongs beside Market Reading, not beside the exit machinery below.
+This is an entry-gate decision, not a reaction to a struggling position.
 
 ---
 
@@ -228,6 +226,8 @@ When the final DCA stage fills and absorption has reduced position margin signif
 
 When combined unrealized loss crosses a threshold, one can either close all positions at once or only the oldest — one position per trigger. The former sweeps exposure clean; the latter reduces it gradually. Use the staged approach when you want to de-risk without abandoning the book entirely.
 
+The README covers the specific sacrifice and cascade variations Winter-Chaser runs in more detail.
+
 ---
 
 #### Cascade Triggers
@@ -243,18 +243,6 @@ When combined unrealized loss crosses a threshold, one can either close all posi
 Positions open with no TP; as price moves in the profitable direction, flat adds are placed at −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% from entry. At the seventh add, a TP is set at −22% from the original entry.
 
 A perfect AMa run returns roughly **709% on the original entry margin** at 6× leverage. If price reverses and a DCA level triggers, AMa cancels and a standard stage-based TP is set against the current weighted average.
-
----
-
-#### Collective Cascade and Sacrifice
-
-Entry-gate strategies pair their criteria-based selection with a book-level safety net separate from the DCA and absorption machinery above. Rather than judging each position on its own, the whole group of positions opened by that strategy is judged together: when their combined unrealized profit crosses a set share of margin, the whole group closes at once, banking the gain before it can give it back. The mirror case closes the group — or, in a gentler form, just the single oldest position — once combined unrealized loss crosses its own threshold, capping how far a bad swing is allowed to run before it's cut off.
-
-A halving option lets both thresholds shrink the longer the oldest position in the group has sat open — an aging, undecided group becomes progressively easier to trigger rather than sitting indefinitely waiting for a large move that may never come.
-
-This check reacts to the group's live state continuously rather than only at fixed intervals, so a swing that crosses the threshold and reverses again shortly after is still caught.
-
----
 
 ---
 
