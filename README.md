@@ -92,7 +92,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 ### Actions Dropdown
 
 - **Export** — Downloads current bot state (config, positions, closed trades, ban list, EDa state) as a `.json` file. Plugins with their own data (Permafrost/Ashfall profile, scorecard) have separate Export buttons inside their own accordions — the Stats menu Export covers the base bot state only.
-- **Import** — Restores state from a previously exported `.json` file. Config fields merge field-by-field; positions replace wholesale. A 5s debounce prevents accidental double-imports.
+- **Import** — Restores state from a previously exported `.json` file. Config fields merge field-by-field; positions replace wholesale. A 5s debounce prevents accidental double-imports. Any config key that no longer belongs to a currently-loaded feature (the bot itself or an installed plugin) is dropped automatically on import and on every save — retired settings from an old config file don't linger indefinitely.
 - **Clear Closed Trades** — Wipes the closed trades list and resets session stats. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
 
