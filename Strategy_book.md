@@ -271,7 +271,7 @@ Psycho Mode is the reactive approach in its purest form — no market astrology,
 - 48-hour hard deadline as backstop
 
 **Techniques in use:**
-- *Aggressive Absorption* — threshold-triggered, halving cooldown
+- *Loss Absorption* — threshold-triggered, halving cooldown
 - *Laggard debt repository* — uncapped debt holder; non-laggard caps push overflow back to laggard
 - *Exhumation* — absorbed positions receive personalized EH TP; regular TP and laggard rules suspended
 - *DCA Delay* — prevents premature stage commitment on fast-moving tickers
