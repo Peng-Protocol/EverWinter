@@ -49,13 +49,16 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.47.0';
+  const VERSION       = '1.48.0';
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence mode ('1' — live only). Switching to Only-0/Both won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
   const DEFAULT_SLOTS = [['sliq','fund>1','rasl>25'],['bliq','vm<10','rabl>25'],['msliq','fund<-1','rasl>25'],['mbliq','fund>1','rabl>25'],['sliq','vm>10','rabl>25'],['bliq','fund<-1','rabl>25']];
   const MIW_HIST_KEY  = '__miw_hist_batches';
   const LIQ_TYPES     = ['sliq', 'bliq', 'msliq', 'mbliq'];
+  // Shared 6h window for the self-liq graylist, cross-bot graylist reactions, and the
+  // direction-awareness lock — matches Permafrost/Ashfall's own CROSS_TTL.
+  const GRAYLIST_TTL_6H = 6 * 3600 * 1000;
 
   // Same formula as Permafrost's calcDepth: % deviation of this side's liquidated $ from the
   // average liquidation size recorded across all history. Depth +1 means 1% above average.
@@ -346,6 +349,27 @@
                     <input type="number" class="inp" min="-100" step="1" x-model.number="cfg.miwLiveDepthThreshold" :disabled="cfgLocked" @change="persist()" style="width:80px">
                     <div class="miw-hint">General depth threshold (% vs. historical avg liquidation size) applied to every Auto-Slot live liq anchor. Manual slots set depth per-slot instead — see the criteria picker above.</div>
                   </div>
+                  <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwSelfLiqGraylistEnabled=!cfg.miwSelfLiqGraylistEnabled;persist()}">
+                    <div class="tog-t" :class="cfg.miwSelfLiqGraylistEnabled?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Self-Liq Graylist</div>
+                      <div class="miw-hint">Any liquidation this bot's own surveillance records for a ticker — qualifying or not — graylists that ticker from 0-Liq for 6h. Catches tickers whose latest closed cycle happened to read clean despite a real liquidation shortly before.</div>
+                    </div>
+                  </label>
+                  <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwDirLockEnabled=!cfg.miwDirLockEnabled;persist()}">
+                    <div class="tog-t" :class="cfg.miwDirLockEnabled?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Direction Lock</div>
+                      <div class="miw-hint">A closed live-liq trade locks its exact type (S-Liq/B-Liq/mS-Liq/mB-Liq) to that ticker for 6h: a win allows only that type, a loss excludes it. See the Direction Lock section below to watch it working.</div>
+                    </div>
+                  </label>
+                  <label class="tog" x-show="cfg.miwDirLockEnabled" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwDirLockInvert=!cfg.miwDirLockInvert;persist()}">
+                    <div class="tog-t" :class="cfg.miwDirLockInvert?'on':''"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Invert</div>
+                      <div class="miw-hint">Flips both triggers: a win excludes the type instead of locking it, a loss locks it instead of excluding it.</div>
+                    </div>
+                  </label>
                   <div class="g" style="margin-top:8px">
                     <div class="lbl" style="margin-bottom:4px">Re-entry Block Mode</div>
                     <div style="display:flex;gap:4px">
@@ -560,6 +584,22 @@
             </div>
           </div>
         </div>
+        <div class="sec" x-show="cfg.miwDirLockEnabled">
+          <div class="sec-ttl">Direction Lock</div>
+          <div>
+            <div x-show="!_miwDirLockRows().length" style="font-family:var(--mono);font-size:9px;color:var(--text-lo)">No active locks.</div>
+            <div x-show="_miwDirLockRows().length" style="display:flex;flex-direction:column;gap:4px">
+              <template x-for="row in _miwDirLockRows()" :key="row.sym">
+                <div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:8.5px">
+                  <span style="color:var(--ice)" x-text="row.sym.replace('USDT','')"></span>
+                  <span style="color:var(--text-lo)" x-text="row.label"></span>
+                  <span :style="'color:'+(row.mode==='lock'?'rgba(100,220,150,.85)':'rgba(255,80,80,.7)')" x-text="row.mode==='lock'?'LOCK':'EXCLUDE'"></span>
+                  <span style="margin-left:auto;color:var(--text-lo)" x-text="'until '+row.until"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
       `,
     },
 
@@ -582,11 +622,12 @@
         _miwHistBatchId: 0,
         _miwSequestrUsed: 0,
         _miwSlotGraylist: {},
+        _miwDirLock: {},
         _miwFreshMcapBases: null,
 
         persist() {
           _origPers.call(this);
-          try { localStorage.setItem(MIW_HIST_KEY, JSON.stringify({ batches: (this.miwHistBatches || []).slice(-25), fundSkew: this._miwFundSkew || null, graylist: this._miwSlotGraylist || {}, histPending: this._miwHistPending || {} })); } catch(e) {}
+          try { localStorage.setItem(MIW_HIST_KEY, JSON.stringify({ batches: (this.miwHistBatches || []).slice(-25), fundSkew: this._miwFundSkew || null, graylist: this._miwSlotGraylist || {}, dirLock: this._miwDirLock || {}, histPending: this._miwHistPending || {} })); } catch(e) {}
         },
 
         async init() {
@@ -595,7 +636,7 @@
           // MIW-specific UI (sampling bars) — set unconditionally on load, not on miwEnabled,
           // since the plugin being loaded is what matters for "is this data available at all."
           this._miwLoaded = true;
-          try { const _r = localStorage.getItem(MIW_HIST_KEY); if (_r) { const _p = JSON.parse(_r); if (Array.isArray(_p)) { this.miwHistBatches = _p.slice(-25); } else { this.miwHistBatches = (_p.batches || []).slice(-25); if (_p.fundSkew) this._miwFundSkew = _p.fundSkew; if (_p.graylist) this._miwSlotGraylist = _p.graylist; if (_p.histPending) this._miwHistPending = _p.histPending; } } } catch(e) {}
+          try { const _r = localStorage.getItem(MIW_HIST_KEY); if (_r) { const _p = JSON.parse(_r); if (Array.isArray(_p)) { this.miwHistBatches = _p.slice(-25); } else { this.miwHistBatches = (_p.batches || []).slice(-25); if (_p.fundSkew) this._miwFundSkew = _p.fundSkew; if (_p.graylist) this._miwSlotGraylist = _p.graylist; if (_p.dirLock) this._miwDirLock = _p.dirLock; if (_p.histPending) this._miwHistPending = _p.histPending; } } } catch(e) {}
           if (!this.miwCollapsedSlotRanks) this.miwCollapsedSlotRanks = {};
           if (!this.miwCollapsedCritStats) this.miwCollapsedCritStats = {};
           if (this.cfg.miwEnabled         === undefined) this.cfg.miwEnabled         = true;
@@ -645,6 +686,11 @@
           if (this.cfg.miwAutoSlotSize               === undefined) this.cfg.miwAutoSlotSize               = 3;
           if (this.cfg.miwAutoSlotExclude            === undefined) this.cfg.miwAutoSlotExclude            = [];
           if (!this._miwSlotGraylist) this._miwSlotGraylist = {};
+          if (!this._miwDirLock) this._miwDirLock = {};
+          if (this.cfg.miwSelfLiqGraylistEnabled === undefined) this.cfg.miwSelfLiqGraylistEnabled = false;
+          if (this.cfg.miwDirLockEnabled         === undefined) this.cfg.miwDirLockEnabled         = false;
+          if (this.cfg.miwDirLockInvert          === undefined) this.cfg.miwDirLockInvert          = false;
+          this.registerLiqCloseHook?.((results, batch) => { this._miwOnLiqClose(results, batch); });
           if (!this._miwOpening) this._miwOpening = new Set(); // symbols with an in-flight live-liq open, guards double-fire
           if (this.cfg.miwFundStep  === undefined) this.cfg.miwFundStep  = 0.25;
           if (this.cfg.miwVmStep    === undefined) this.cfg.miwVmStep    = 1;
@@ -928,12 +974,22 @@
           const needsOc    = slots.some(s => s.some(c => /^(ocs|ocx)/.test(c)));
 
           if (!this._miwSlotGraylist) this._miwSlotGraylist = {};
+          // 0-liq slots are only ever generated in '0'/'both' mode (see _miwGenerateCombos), so
+          // the self- and cross-liq graylists — both aimed at keeping 0liq honest — only need to
+          // apply when this bot's presence mode could actually produce a 0liq slot.
+          const _liqPresenceMode = this.cfg.miwLiqPresenceMode ?? '1';
+          const _0liqRelevant    = _liqPresenceMode !== '1';
+          const _crossLiqSyms = (_0liqRelevant && this.cfg.pfCrossLiqGraylistEnabled) ? new Set(
+            (this._pfCrossRead?.() || []).filter(e => e.kind === 'live-liq' && e.source === 'chaser' && e.symbol).map(e => e.symbol)
+          ) : null;
           let basePool = allTickers.filter(t =>
             t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
             && parseFloat(t.lastPrice || 0) >= 0.001
             && !activeSyms.has(t.symbol)
             && !(this._isSymbolBanned?.(t.symbol))
             && !this._miwIsReentryBlocked(t.symbol)
+            && !(_0liqRelevant && this.cfg.miwSelfLiqGraylistEnabled && this._miwIsSlotGraylisted(t.symbol))
+            && !(_crossLiqSyms && _crossLiqSyms.has(t.symbol))
           );
 
           // Order Count Surveillance: fetch a fresh sample for this cycle's candidate pool, only
@@ -1611,6 +1667,30 @@
           else if (bPct > sPct && sPct >= 0.30) type = 'mbliq';
           if (!type) return;
 
+          // Tell Ashfall this ticker just produced a live liq event, regardless of whether this
+          // bot has a slot to act on it — Ashfall's Only-0 side reacts by graylisting the ticker
+          // for 6h (see pfCrossLiqGraylistEnabled). Piggybacks on the existing Cross Broadcast
+          // toggle rather than adding a separate one for the sending direction.
+          if (this.cfg.permafrostCrossEnabled) this._pfCrossWrite?.('live-liq', sym);
+
+          // Direction-awareness lock — a prior win/loss on this exact liq type for this exact
+          // ticker can lock this bot into only that type, or exclude it, for 6h. See
+          // _miwOnPositionScored for how the lock gets written.
+          if (this.cfg.miwDirLockEnabled) {
+            const lock = this._miwDirLock?.[sym];
+            if (lock && (Date.now() - lock.ts) < GRAYLIST_TTL_6H) {
+              if (lock.mode === 'lock'    && type !== lock.type) return;
+              if (lock.mode === 'exclude' && type === lock.type) return;
+            }
+          }
+
+          // Ashfall winning a 0-Liq trade on this ticker graylists it from this bot's live
+          // entries for 6h (symmetric to the self/cross-liq graylists guarding 0-Liq).
+          if (this.cfg.pfCrossWinGraylistEnabled) {
+            const won0liq = (this._pfCrossRead?.() || []).some(e => e.kind === '0liq-win' && e.source === 'chaser' && e.symbol === sym);
+            if (won0liq) return;
+          }
+
           const candidateSlots = this._miwEffectiveSlots().filter(s => {
             const anchor = this._miwSlotLiqAnchor(s);
             return anchor && anchor.startsWith(type);
@@ -1806,6 +1886,60 @@
           if (Date.now() - g.ts >= ttl) return false;
           if ((this.cfg.miwReentryBlockMode ?? 'both') === 'losers') return g.isWin === false;
           return true;
+        },
+
+        // Registered via Permafrost's registerLiqCloseHook — fires once per closed liq batch with
+        // every surveilled symbol's final turnover, qualifying or not. A ticker with ANY recorded
+        // liquidation (even one that never crossed the qualifying % threshold) gets graylisted for
+        // 6h so a stale 0liq read (last-batch-only, see _miwCheckCrit's '0liq' branch) can't treat
+        // a ticker that liquidated a couple hours ago as newly "calm" just because its latest
+        // batch happened to close clean.
+        _miwOnLiqClose(results, batch) {
+          if (!this.cfg.miwSelfLiqGraylistEnabled) return;
+          if (!this._miwSlotGraylist) this._miwSlotGraylist = {};
+          const now = Date.now();
+          for (const r of (results || [])) {
+            if ((r.sLiqRaw || 0) + (r.bLiqRaw || 0) > 0) {
+              this._miwSlotGraylist[r.sym] = { ts: now, reason: 'self-liq' };
+            }
+          }
+        },
+
+        _miwIsSlotGraylisted(sym) {
+          const g = this._miwSlotGraylist?.[sym];
+          if (!g || !(g.ts > 0)) return false;
+          return (Date.now() - g.ts) < GRAYLIST_TTL_6H;
+        },
+
+        // Called from Permafrost's pseudoClosePosition with the closed position's symbol,
+        // criteria, and realized PnL. If the criteria include a live liq type (sliq/bliq/msliq/
+        // mbliq), locks or excludes that exact type for that exact ticker for 6h — default: a
+        // win locks this bot into repeating only that type, a loss excludes it. miwDirLockInvert
+        // flips both: a win excludes the type (don't repeat a move already spent), a loss locks
+        // into it (bet the losing read was actually right). Breakeven (pnl === 0) is a no-op.
+        _miwOnPositionScored(symbol, criteria, pnl) {
+          if (!this.cfg.miwDirLockEnabled) return;
+          if (typeof pnl !== 'number' || pnl === 0) return;
+          const m = (criteria || []).map(c => c.match(/^(m?sliq|m?bliq)(?:[+-]\d+)?$/)).find(Boolean);
+          if (!m) return;
+          const type   = m[1];
+          const isWin  = pnl > 0;
+          const invert = !!this.cfg.miwDirLockInvert;
+          const mode   = (isWin !== invert) ? 'lock' : 'exclude';
+          if (!this._miwDirLock) this._miwDirLock = {};
+          this._miwDirLock[symbol] = { type, mode, ts: Date.now(), isWin };
+        },
+
+        _miwDirLockRows() {
+          const now = Date.now();
+          const labelOf = { sliq: 'S-Liq', bliq: 'B-Liq', msliq: 'mS-Liq', mbliq: 'mB-Liq' };
+          return Object.entries(this._miwDirLock || {})
+            .filter(([, l]) => (now - l.ts) < GRAYLIST_TTL_6H)
+            .map(([sym, l]) => {
+              const exp = new Date(l.ts + GRAYLIST_TTL_6H);
+              return { sym, label: labelOf[l.type] || l.type, mode: l.mode, until: exp.getHours().toString().padStart(2,'0')+':'+exp.getMinutes().toString().padStart(2,'0') };
+            })
+            .sort((a, b) => a.sym.localeCompare(b.sym));
         },
 
         // Auto-generated combos always anchor on exactly one liq criterion (filtered by presence
