@@ -49,7 +49,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.52.0';
+  const VERSION       = '1.52.1';
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence mode ('1' — live only). Switching to Only-0/Both won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
@@ -1647,9 +1647,17 @@
         async _miwOnLiqMessage(batch, sym) {
           if (!this.cfg.miwEnabled) return;
           if ((this.cfg.miwLiqPresenceMode ?? '1') === '0') return;
-          if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
+          // A halt blocks the real entry below, but Historical Scoring still wants to see what
+          // this message would have matched — otherwise Only-1 (and Both's live-anchored slots)
+          // go completely dark for scoring purposes every time a halt is active, since the
+          // scan-time checker can never resolve a live liq anchor on its own (see _miwCheckCrit —
+          // sliq/bliq/msliq/mbliq have no branch there). Falls through to a hist-only simulation
+          // instead of returning, gated the same way _miwHistScoringActive() already gates the
+          // scan-time path.
+          const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
+          if (halted && !this._miwHistScoringActive()) return;
           if (this._isSymbolBanned?.(sym)) return;
-          if (this._miwIsReentryBlocked(sym)) return;
+          if (!halted && this._miwIsReentryBlocked(sym)) return;
           if (this._miwOpening.has(sym)) return;
           if ((this.positions || []).some(p => p.symbol === sym)) return;
 
@@ -1747,6 +1755,16 @@
               // liq classification can be true for this ticker at this moment, so any such slot
               // would fail its own anchor check anyway.
               const annotCrits = slot.map(c => this._miwAnnotateLiveCrit(c, t, mcap, type, depth, ocResultsMap));
+
+              // Halted: everything above (banlist, direction lock, cross-win graylist, criteria
+              // match) is exactly what a real entry would have checked, so this is a genuine
+              // match a real entry would have taken were the halt not active — log it as a hist
+              // target and stop, same as the real path does below.
+              if (halted) {
+                this._miwLogLiveHistMatch(sym, annotCrits);
+                return;
+              }
+
               let compositeScore = 0;
               if (this.cfg.pfCoQualPenaltyEnabled) {
                 const bestScore = slot.reduce((s, c, j) => s + this._miwScaledRank(c, annotCrits[j]), 0);
@@ -2029,18 +2047,36 @@
           });
         },
 
-        // In Only-1, the scan-time criteria checker has no branch for sliq/bliq/msliq/mbliq
-        // (they're live-only now — see _miwCheckCrit), so the candidate list this feature logs
-        // targets from can never contain a live-anchored slot match. During normal operation
-        // that's fine, real trades already write the scorecard for every live match that
-        // fires. The one time it's actually useful in Only-1 is during Drawdown Halt or Gains
-        // Lock, when real entries are blocked and this is the only thing still feeding the
-        // scorecard. Only-0 and Both aren't affected — their slots are 0-Liq-anchored, which
-        // this checker does still resolve, so logging stays active same as before.
+        // The scan-time criteria checker has no branch for sliq/bliq/msliq/mbliq (they're
+        // live-only — see _miwCheckCrit), so _miwLogHistMatches's pool (built from that checker)
+        // can never contain a live-anchored slot match — those are instead caught live, in
+        // _miwOnLiqMessage, which logs a hist target itself when a halt blocks the real entry
+        // (see _miwLogLiveHistMatch). During normal (non-halted) operation live matches don't
+        // need this at all — real trades already write the scorecard for every live match that
+        // fires. On Only-1, that halted-only case is the *only* time this feature has anything to
+        // log, since every one of its slots is live-anchored. Only-0 and Both aren't limited this
+        // way — their 0-Liq-anchored slots resolve fine at scan time, so logging stays active
+        // unconditionally for those, same as before.
         _miwHistScoringActive() {
           if (!this.cfg.miwHistScoringEnabled) return false;
           if ((this.cfg.miwLiqPresenceMode ?? '1') !== '1') return true;
           return !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
+        },
+
+        // Mirrors _miwLogHistMatches's dedupe-key shape exactly so both paths feed the same
+        // _miwHistPending/_miwProcessHistMatches pipeline without it needing to know which one
+        // a given entry came from.
+        _miwLogLiveHistMatch(sym, annotCrits) {
+          if (!this._miwHistScoringActive()) return;
+          if ((this.positions || []).some(p => p._miw && p.symbol === sym)) return;
+          const now = Date.now();
+          const toleranceMs = (this.cfg.miwHistToleranceMins ?? 20) * 60 * 1000;
+          const targetHourStart = Math.ceil((now + toleranceMs) / 3_600_000) * 3_600_000;
+          const annotKey = [...annotCrits].sort().join(',');
+          const dedupeKey = `${sym}:${annotKey}:${targetHourStart}`;
+          if (!this._miwHistPending[dedupeKey]) {
+            this._miwHistPending[dedupeKey] = { symbol: sym, annotCrits, targetHourStart };
+          }
         },
 
         _miwLogHistMatches(pool) {
