@@ -219,6 +219,8 @@ See Strategy_book.md's **Market Reading** section for what each criterion (`fund
 
 CoinGecko and CoinPaprika's full coin lists cover the entire market (tens of thousands of coins); only the subset matching Bybit's own linear-perp ticker universe is ever persisted to `__cgCoinList`/`__cpCoinList` — the rest is discarded before caching since it's never looked up.
 
+- **Price sanity check**: each cached market-cap entry also carries the price the source reported it against. A cached mcap is only trusted if that reported price is within 10% of Bybit's current price for the same ticker — otherwise it's treated as stale and the next source in the fallback chain is tried instead. This guards against a source having matched the wrong coin (e.g. a ticker symbol that collides between two different projects), which would otherwise silently pass through as a wildly wrong market cap.
+
 All three sources share their results cross-tab. A ticker with no data from any source cannot satisfy `vm` or `iom` criteria; enabling Fresh V/M Only forces stale-data tickers to be dropped rather than passed.
 
 ### Slots UI
