@@ -2,13 +2,18 @@
   Speeder — Multiplex Plugin for PseudoWinter
   Tentative strategy: shorts whichever ticker's order-flow is running most extreme relative to
   the rest of the market right now — fast or slow, whichever this bot is configured for (Speed
-  Mode toggle, default Slow). "Extreme" is not a fixed number of seconds — every scan, the whole
-  known sample of per-ticker order intervals (avg ms between recent trades) is split at the
-  median into a fast half and a slow half, and a ticker only qualifies if its own average is
-  past that half's own mean (a stricter cut than merely landing in that half). The split
-  recomputes every scan from Permafrost's full OC cycle history (deduplicated to each ticker's
-  latest reading), so the threshold continuously adapts to current market conditions instead of
-  drifting stale.
+  Mode: Fast / Slow / Auto, default Slow). "Extreme" is not a fixed number of seconds — every
+  scan, the whole known sample of per-ticker order intervals (avg ms between recent trades) is
+  split at the median into a fast half and a slow half, and a ticker only qualifies if its own
+  average is past that half's own mean (a stricter cut than merely landing in that half). The
+  split recomputes every scan from Permafrost's full OC cycle history (deduplicated to each
+  ticker's latest reading), so the threshold continuously adapts to current market conditions
+  instead of drifting stale.
+
+  Speed Mode: Auto switches between Fast and Slow by market regime, same mechanism as
+  Multi-Indicator's Auto Liquidation Presence — see _sdwEffectiveMode()/_sdwAutoHalted() and
+  their twins in MultiIndicator-Winter.html for the full logic (Permafrost's aggregate liq skew
+  and/or the partner bot's drawdown state, via Cross Broadcast).
 
   This is a "multiplex" plugin: it borrows Permafrost's existing Order Count Surveillance
   (_ocFetchBatch, _pfOcCycleHistory, _liqLastBatchSyms) by calling/reading it directly, the same
@@ -27,7 +32,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   // Below this many distinct tickers in the accumulated sample, a median half-split mean is too
   // noisy to trust as an adaptive threshold — wait for more data instead of firing on it.
   const MIN_SAMPLE = 10;
@@ -45,6 +50,9 @@
 
     css: `
       .sdw-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+      .sdw-tab { font-family:var(--mono); font-size:9px; padding:3px 9px; border-radius:2px; border:1px solid; cursor:pointer; background:none; transition:border-color .12s,color .12s,background .12s; letter-spacing:.5px; }
+      .sdw-tab.on { border-color:rgba(167,139,250,.6); color:#a78bfa; background:rgba(167,139,250,.08); }
+      .sdw-tab:not(.on) { border-color:rgba(255,255,255,.15); color:var(--text-lo); }
     `,
 
     slots: {
@@ -66,16 +74,33 @@
                 <div class="sdw-hint">Shorts one ticker per scan whose order interval is well past the current fast/slow-half average — tentative strategy, no long-term validation yet.</div>
               </div>
             </label>
-            <div x-show="cfg.sdwEnabled" style="display:flex;align-items:center;gap:6px;margin-top:8px">
-              <span class="lbl" style="margin:0">Speed Mode</span>
-              <button @click.prevent="if(!cfgLocked){cfg.sdwMode=(cfg.sdwMode==='fast'?'slow':'fast');persist()}"
-                style="font-family:var(--mono);font-size:9px;padding:2px 8px;border-radius:2px;border:1px solid rgba(167,139,250,.4);background:rgba(167,139,250,.08);color:#a78bfa;cursor:pointer"
-                x-text="(cfg.sdwMode??'slow')==='fast' ? 'Fast tickers' : 'Slow tickers'"></button>
-              <span class="sdw-hint" style="margin:0" x-text="(cfg.sdwMode??'slow')==='fast' ? '— shorts busiest order flow' : '— shorts quietest order flow'"></span>
+            <div x-show="cfg.sdwEnabled" style="margin-top:8px">
+              <div class="lbl" style="margin-bottom:4px">Speed Mode</div>
+              <div style="display:flex;gap:4px">
+                <button class="sdw-tab" :class="(cfg.sdwMode??'slow')==='fast'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwMode='fast';persist()}">Fast</button>
+                <button class="sdw-tab" :class="(cfg.sdwMode??'slow')==='slow'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwMode='slow';persist()}">Slow</button>
+                <button class="sdw-tab" :class="(cfg.sdwMode??'slow')==='auto'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwMode='auto';persist()}">Auto</button>
+              </div>
+              <div class="sdw-hint"><b>Fast</b> shorts the busiest order flow, <b>Slow</b> shorts the quietest. <b>Auto</b> switches between them by market regime — see below.</div>
+              <div x-show="(cfg.sdwMode??'slow')==='auto'" style="margin-top:8px;padding:6px 8px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.15);border-radius:3px">
+                <div class="lbl" style="margin-bottom:4px">Base (used when the regime isn't flipped)</div>
+                <div style="display:flex;gap:4px">
+                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow')==='fast'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='fast';persist()}">Fast</button>
+                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow')==='slow'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='slow';persist()}">Slow</button>
+                </div>
+                <div class="lbl" style="margin-top:8px;margin-bottom:4px">Trigger</div>
+                <div style="display:flex;gap:4px">
+                  <button class="sdw-tab" :class="(cfg.sdwAutoTrigger??'skew')==='skew'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoTrigger='skew';persist()}">Only-Skew</button>
+                  <button class="sdw-tab" :class="(cfg.sdwAutoTrigger??'skew')==='drawdown'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoTrigger='drawdown';persist()}">Only-Drawdown</button>
+                  <button class="sdw-tab" :class="(cfg.sdwAutoTrigger??'skew')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoTrigger='both';persist()}">Both</button>
+                </div>
+                <div class="sdw-hint"><b>Only-Skew</b> flips off Base when Permafrost's aggregate B-Liq/S-Liq turnover crosses its Presence Regime Threshold — B-Liq dominant flips to the opposite of Base, S-Liq dominant stays on Base. <b>Only-Drawdown</b> flips off Base only while the partner bot (Chaser) is in a drawdown halt, via Cross Broadcast. <b>Both</b> flips if either signal fires. When the skew is mixed (neither side dominant) and no drawdown signal applies, Permafrost's "When Regime Is Mixed" setting decides whether this stays on Base or halts new entries entirely. Same mechanism as Multi-Indicator's Auto Presence, applied here to speed instead of liquidation reactivity — not a separately validated read on its own.</div>
+                <div class="sdw-hint" style="margin-top:4px" x-text="(()=>{ const halted=_sdwAutoHalted(); if(halted) return 'Currently: entries halted (mixed regime)'; return 'Currently resolving to: '+_sdwEffectiveMode(); })()"></div>
+              </div>
             </div>
             <div x-show="cfg.sdwEnabled" style="margin-top:8px;padding:6px 8px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.15);border-radius:3px;font-family:var(--mono);font-size:8.5px;color:var(--text-lo)">
               <template x-if="_sdwSplit">
-                <span>Sample: <b x-text="_sdwSplit.n"></b> tickers · <b x-text="(cfg.sdwMode??'slow')==='fast'?'fast':'slow'"></b>-half mean <b x-text="(((cfg.sdwMode??'slow')==='fast'?_sdwSplit.fastMean:_sdwSplit.slowMean)/1000).toFixed(1)+'s'"></b></span>
+                <span>Sample: <b x-text="_sdwSplit.n"></b> tickers · <b x-text="_sdwEffectiveMode()"></b>-half mean <b x-text="((_sdwEffectiveMode()==='fast'?_sdwSplit.fastMean:_sdwSplit.slowMean)/1000).toFixed(1)+'s'"></b></span>
               </template>
               <template x-if="!_sdwSplit">
                 <span x-text="_sdwPrereqOk ? 'Accumulating sample — needs more OC history to build a stable split.' : '⚠ Permafrost not loaded — inactive.'"></span>
@@ -106,6 +131,8 @@
           }
           if (this.cfg.sdwEnabled           === undefined) this.cfg.sdwEnabled           = true;
           if (this.cfg.sdwMode              === undefined) this.cfg.sdwMode              = 'slow';
+          if (this.cfg.sdwAutoBase          === undefined) this.cfg.sdwAutoBase          = 'slow';
+          if (this.cfg.sdwAutoTrigger       === undefined) this.cfg.sdwAutoTrigger       = 'skew';
           if (this.cfg.sdwReentryBlockMode  === undefined) this.cfg.sdwReentryBlockMode  = 'both';
           this.registerRoleBadge?.(item => {
             if (!item || !item._spd) return null;
@@ -114,7 +141,9 @@
             const modeStr  = item._spdMode === 'fast' ? 'fast' : 'slow';
             return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(167,139,250,.45);color:#a78bfa;background:rgba(167,139,250,.10)" title="Speeder: order interval ${secs} vs ${modeStr}-half mean ${meanSecs} (n=${item._spdSampleN ?? '?'})">⚡ Speed</span>`;
           });
-          this.log(`[SDW] Speeder v${VERSION} loaded — ${this.cfg.sdwEnabled ? 'enabled' : 'disabled'} | mode: ${this.cfg.sdwMode}${this._sdwPrereqOk ? '' : ' (INACTIVE — missing Permafrost)'}`, 'info');
+          const _modeRaw = this.cfg.sdwMode ?? 'slow';
+          const _modeStr = _modeRaw === 'auto' ? `auto (base ${this.cfg.sdwAutoBase ?? 'slow'}, trigger ${this.cfg.sdwAutoTrigger ?? 'skew'}) → ${this._sdwEffectiveMode()}` : _modeRaw;
+          this.log(`[SDW] Speeder v${VERSION} loaded — ${this.cfg.sdwEnabled ? 'enabled' : 'disabled'} | mode: ${_modeStr}${this._sdwPrereqOk ? '' : ' (INACTIVE — missing Permafrost)'}`, 'info');
         },
 
         async runScan() {
@@ -146,6 +175,36 @@
           return split;
         },
 
+        // Resolves Speed Mode to an actual 'fast'/'slow' — every reader should call this, not
+        // cfg.sdwMode directly, so 'auto' resolves identically everywhere. Same mechanism as
+        // MultiIndicator's Auto Presence (see MultiIndicator-Winter.html's
+        // _miwEffectivePresenceMode): Base is the resting state, a decisive B-Liq-dominant
+        // regime or a partner drawdown flips to the opposite of Base per the Trigger setting, a
+        // decisive S-Liq-dominant regime (or a mixed one with Permafrost's Mixed Mode set to
+        // "Continue") stays on Base.
+        _sdwEffectiveMode() {
+          const raw = this.cfg.sdwMode ?? 'slow';
+          if (raw !== 'auto') return raw;
+          const base    = this.cfg.sdwAutoBase ?? 'slow';
+          const trigger = this.cfg.sdwAutoTrigger ?? 'skew';
+          const bySkew     = trigger !== 'drawdown' && !!this._pfIsBliqDominant?.();
+          const byDrawdown = trigger !== 'skew'     && !!this._pfPartnerHalted?.();
+          return (bySkew || byDrawdown) ? (base === 'fast' ? 'slow' : 'fast') : base;
+        },
+
+        // True only when Auto mode has nothing decisive to act on — see
+        // _miwAutoPresenceHalted's twin in MultiIndicator-Winter.html for the full reasoning.
+        _sdwAutoHalted() {
+          if ((this.cfg.sdwMode ?? 'slow') !== 'auto') return false;
+          if ((this.cfg.pfPresenceMixedMode ?? 'continue') !== 'halt') return false;
+          const trigger = this.cfg.sdwAutoTrigger ?? 'skew';
+          if (trigger === 'drawdown') return false;
+          const decisive = !!this._pfIsBliqDominant?.() || !!this._pfIsSliqDominant?.();
+          if (decisive) return false;
+          if (trigger === 'both' && this._pfPartnerHalted?.()) return false;
+          return true;
+        },
+
         _sdwIsReentryBlocked(sym) {
           const g = this._tickerGraylist?.[sym];
           if (!g || !(g.ts > 0)) return false;
@@ -157,7 +216,7 @@
 
         async _sdwRunScan() {
           if (!this.cfg.sdwEnabled || !this._sdwPrereqOk) return;
-          const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
+          const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.() || this._sdwAutoHalted());
           if (halted) return;
 
           const allTickers = this._lastAllTickers || [];
@@ -194,7 +253,7 @@
           const split = this._sdwComputeSplit();
           if (!split) return;
 
-          const mode = this.cfg.sdwMode === 'fast' ? 'fast' : 'slow';
+          const mode = this._sdwEffectiveMode();
           const poolSyms  = new Set(basePool.map(t => t.symbol));
           const tickerMap = new Map(basePool.map(t => [t.symbol, t]));
           const qualifiers = Object.entries(split.latestMap)
