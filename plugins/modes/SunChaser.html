@@ -21,7 +21,7 @@
   window.__BotPlugin = {
     id:        'sunchaser',
     name:      'SunChaser',
-    version:   '1.0.2',
+    version:   '1.0.4',
     targetBot: 'pseudochaser',
     after:     [],
     before:    [],
@@ -369,7 +369,7 @@
             this.log('[SC] No credentials set — set API key/secret in config panel.', 'warn');
             return;
           }
-          const { symbol, price, change=0, rsi6=null, rsi12=null, rsi24=null, fundingRate=null, _gainerStrat=false } = candidate;
+          const { symbol, price, change=0, rsi6=null, rsi12=null, rsi24=null, fundingRate=null } = candidate;
           if (this._symbolBanlist?.[symbol]) return;
           if (this._scOpposite?.[symbol]) {
             this.log(`[SC] ${symbol}: skipped — opposite (short) position open on exchange`, 'warn');
@@ -381,10 +381,26 @@
           const instr = await this.getInstrInfo(symbol);
           if (!instr) { this.log(`[SC] ${symbol}: instrument info unavailable`, 'warn'); return; }
 
+          if (instr.minPrice > 0 && price < instr.minPrice) {
+            this.log(`[SC] ${symbol}: price ${price} below exchange minPrice ${instr.minPrice} — BLACKLISTED`, 'warn');
+            this._banSymbol?.(symbol, `Price below exchange minPrice (${price} < ${instr.minPrice})`);
+            return;
+          }
+
           const lev      = this.cfg.leverage;
           const notional = this.cfg.minNotional;
           const qty      = this.snapQty(notional / price, instr);
-          if (!qty || qty <= 0) { this.log(`[SC] ${symbol}: qty ≤ 0`, 'warn'); return; }
+          if (!qty || qty <= 0) {
+            this.log(`[SC] ${symbol}: qty ≤ 0 — BLACKLISTED`, 'warn');
+            this._banSymbol?.(symbol, `Qty rounds to 0 at configured notional (price ${price})`);
+            return;
+          }
+          const entryNotional = qty * price;
+          if (instr.minOrderAmt > 0 && entryNotional < instr.minOrderAmt) {
+            this.log(`[SC] ${symbol}: notional below exchange min — BLACKLISTED`, 'warn');
+            this._banSymbol?.(symbol, `Notional ${entryNotional.toFixed(2)} below exchange minOrderAmt ${instr.minOrderAmt}`);
+            return;
+          }
 
           const binary = this._binaryMode ? this._binaryMode() : this.cfg.binaryModeEnabled;
           const tpPct  = binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
@@ -418,7 +434,6 @@
             _pseudo:             false,
             _long:               true,
             _binary:             binary,
-            _gainerStrat,
             tpPct,
             currentTpPrice:      tpPrice,
             slPrice,
@@ -440,13 +455,13 @@
           if (tpPrice > 0) await this._scSetTP(pos, tpPrice);
           if (slPrice > 0) await this._scSetSL(symbol, slPrice);
 
-          const g = (this.gainers || []).find(x => x.symbol === symbol);
-          if (g) g.status = 'active';
-
           this.log(`☀ [SC] LONG ${symbol} @ ${fillPrice} | TP:${tpPrice}${slPrice ? ' SL:'+slPrice : ''}`, 'info');
 
-          if (_gainerStrat) this.gainerStratLockInBump?.(symbol, rsi6, rsi12, rsi24);
-          else this.gainerLockInBump?.(symbol, rsi6, rsi12, rsi24);
+          // Callers (e.g. MIC's own tagging step) need a direct reference to the position
+          // they just opened rather than assuming it's the last array element — a
+          // concurrent open for a different symbol can land in between while this one
+          // was still waiting on the real exchange fill.
+          return pos;
         },
 
         async pseudoClosePosition(pos, reason = 'manual', fillPrice = null) {
@@ -486,25 +501,28 @@
                 const d = await this._scSafeJson(r);
                 if (d?.retCode !== 0) this.log(`[SC] close attempt ${pos.symbol}: ${d?.retMsg || 'no response'}`, 'warn');
                 await new Promise(res => setTimeout(res, 2000));
-                // For bail, verify the exchange position is actually gone; retry once with market order if not
-                if (reason === 'bail') {
-                  try {
+                // Verify the exchange position is actually gone; retry once with a market order
+                // if not. A GTC limit order (the non-bail path above) has no fill guarantee — on
+                // a fast-moving ticker it can sit unfilled, and without this check the position
+                // would still be removed locally below while the real exchange exposure remains
+                // open and untracked, since the periodic sync only reconciles symbols already in
+                // this.positions. Every close reason needs this, not just bail.
+                try {
+                  await this._scDelay();
+                  const vp = `category=linear&symbol=${pos.symbol}`;
+                  const vh = await _sign(this.creds.key, this.creds.secret, vp, this._tsOffset);
+                  const vr = await fetch(`${this.base}/v5/position/list?${vp}`, { headers: vh });
+                  const vd = await this._scSafeJson(vr);
+                  const still = (vd?.result?.list || []).find(x => x.symbol === pos.symbol && x.side === 'Buy' && parseFloat(x.size) > 0);
+                  if (still) {
+                    this.log(`[SC] close verify ${pos.symbol}: position still open — retrying market close`, 'warn');
                     await this._scDelay();
-                    const vp = `category=linear&symbol=${pos.symbol}`;
-                    const vh = await _sign(this.creds.key, this.creds.secret, vp, this._tsOffset);
-                    const vr = await fetch(`${this.base}/v5/position/list?${vp}`, { headers: vh });
-                    const vd = await this._scSafeJson(vr);
-                    const still = (vd?.result?.list || []).find(x => x.symbol === pos.symbol && x.side === 'Buy' && parseFloat(x.size) > 0);
-                    if (still) {
-                      this.log(`[SC] bail verify ${pos.symbol}: position still open — retrying market close`, 'warn');
-                      await this._scDelay();
-                      const rb = JSON.stringify({ category: 'linear', symbol: pos.symbol, side: 'Sell', orderType: 'Market', qty: String(parseFloat(still.size)), timeInForce: 'IOC', reduceOnly: true });
-                      const rh = await _sign(this.creds.key, this.creds.secret, rb, this._tsOffset);
-                      await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: rh, body: rb });
-                      await new Promise(res => setTimeout(res, 2000));
-                    }
-                  } catch(e) { this.log(`[SC] bail verify error ${pos.symbol}: ${e.message}`, 'warn'); }
-                }
+                    const rb = JSON.stringify({ category: 'linear', symbol: pos.symbol, side: 'Sell', orderType: 'Market', qty: String(parseFloat(still.size)), timeInForce: 'IOC', reduceOnly: true });
+                    const rh = await _sign(this.creds.key, this.creds.secret, rb, this._tsOffset);
+                    await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: rh, body: rb });
+                    await new Promise(res => setTimeout(res, 2000));
+                  }
+                } catch(e) { this.log(`[SC] close verify error ${pos.symbol}: ${e.message}`, 'warn'); }
                 try {
                   await this._scDelay();
                   const pp = `category=linear&symbol=${pos.symbol}&limit=1`;
