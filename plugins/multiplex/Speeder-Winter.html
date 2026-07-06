@@ -33,10 +33,6 @@
   'use strict';
 
   const VERSION = '1.3.0';
-  // Below this many distinct tickers in the accumulated sample, a median half-split mean is too
-  // noisy to trust as an adaptive threshold — wait for more data instead of firing on it.
-  const MIN_SAMPLE = 10;
-
   window.__BotPlugin = {
     id:        'speeder-winter',
     name:      'Speeder',
@@ -86,13 +82,18 @@
                 <button class="sdw-tab" :class="(cfg.sdwMode??'slow')==='auto'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwMode='auto';persist()}">Auto</button>
               </div>
               <div class="sdw-hint">Fast shorts busiest flow, Slow shorts quietest. Auto regime-switches — see README.</div>
+              <div style="margin-top:8px">
+                <div class="lbl">Min Split Tickers <b x-text="(cfg.sdwMinSplitTickers??6)"></b></div>
+                <input type="range" min="2" max="25" step="1" x-model.number="cfg.sdwMinSplitTickers" @change="persist()">
+                <div class="sdw-hint">Speeder needs at least this many unique OC-sampled tickers before it can divide the sample into fast/slow halves.</div>
+              </div>
               <div x-show="(cfg.sdwMode??'slow')==='auto'" style="margin-top:8px;padding:6px 8px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.15);border-radius:3px">
                 <div class="lbl" style="margin-bottom:4px">Base</div>
                 <div style="display:flex;gap:4px;flex-wrap:wrap">
-                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow-sliq')==='fast-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='fast-sliq';persist()}">Fast 🥵^</button>
-                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow-sliq')==='fast-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='fast-bliq';persist()}">Fast 🥶^</button>
-                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow-sliq')==='slow-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='slow-bliq';persist()}">Slow 🥶^</button>
-                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow-sliq')==='slow-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='slow-sliq';persist()}">Slow 🥵^</button>
+                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow-sliq')==='fast-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='fast-sliq';cfg.sdwAutoCurrentBase='fast-sliq';persist()}">Fast 🥵^</button>
+                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow-sliq')==='fast-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='fast-bliq';cfg.sdwAutoCurrentBase='fast-bliq';persist()}">Fast 🥶^</button>
+                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow-sliq')==='slow-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='slow-bliq';cfg.sdwAutoCurrentBase='slow-bliq';persist()}">Slow 🥶^</button>
+                  <button class="sdw-tab" :class="(cfg.sdwAutoBase??'slow-sliq')==='slow-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwAutoBase='slow-sliq';cfg.sdwAutoCurrentBase='slow-sliq';persist()}">Slow 🥵^</button>
                 </div>
                 <div class="sdw-hint">Which mode runs when the ^-marked regime is dominant — the other regime gets the other mode.</div>
                 <div class="lbl" style="margin-top:8px;margin-bottom:4px">Trigger</div>
@@ -110,7 +111,7 @@
                 <span>Sample: <b x-text="_sdwSplit.n"></b> tickers · <b x-text="_sdwEffectiveMode()"></b>-half mean <b x-text="((_sdwEffectiveMode()==='fast'?_sdwSplit.fastMean:_sdwSplit.slowMean)/1000).toFixed(1)+'s'"></b></span>
               </template>
               <template x-if="!_sdwSplit">
-                <span x-text="_sdwPrereqOk ? 'Accumulating sample — needs more OC history to build a stable split.' : '⚠ Permafrost not loaded — inactive.'"></span>
+                <span x-text="_sdwPrereqOk ? _sdwSplitStatusText() : '⚠ Permafrost not loaded — inactive.'"></span>
               </template>
             </div>
           </div>
@@ -139,7 +140,10 @@
           if (this.cfg.sdwEnabled           === undefined) this.cfg.sdwEnabled           = true;
           if (this.cfg.sdwMode              === undefined) this.cfg.sdwMode              = 'slow';
           if (this.cfg.sdwAutoBase          === undefined) this.cfg.sdwAutoBase          = 'slow-sliq';
+          if (this.cfg.sdwAutoCurrentBase   === undefined) this.cfg.sdwAutoCurrentBase   = this.cfg.sdwAutoBase;
+          if (this.cfg.sdwLastPartnerDrawdownTs === undefined) this.cfg.sdwLastPartnerDrawdownTs = 0;
           if (this.cfg.sdwAutoTrigger       === undefined) this.cfg.sdwAutoTrigger       = 'skew';
+          if (this.cfg.sdwMinSplitTickers   === undefined) this.cfg.sdwMinSplitTickers   = 6;
           if (this.cfg.sdwReentryBlockMode  === undefined) this.cfg.sdwReentryBlockMode  = 'both';
           this.registerRoleBadge?.(item => {
             if (!item || !item._spd) return null;
@@ -149,13 +153,22 @@
             return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(167,139,250,.45);color:#a78bfa;background:rgba(167,139,250,.10)" title="Speeder: order interval ${secs} vs ${modeStr}-half mean ${meanSecs} (n=${item._spdSampleN ?? '?'})">Speed</span>`;
           });
           const _modeRaw = this.cfg.sdwMode ?? 'slow';
-          const _modeStr = _modeRaw === 'auto' ? `auto (base ${this.cfg.sdwAutoBase ?? 'slow-sliq'}, trigger ${this.cfg.sdwAutoTrigger ?? 'skew'}) → ${this._sdwEffectiveMode()}` : _modeRaw;
+          const _modeStr = _modeRaw === 'auto' ? `auto (initial ${this.cfg.sdwAutoBase ?? 'slow-sliq'}, current ${this.cfg.sdwAutoCurrentBase || this.cfg.sdwAutoBase}, trigger ${this.cfg.sdwAutoTrigger ?? 'skew'}) → ${this._sdwEffectiveMode()}` : _modeRaw;
           this.log(`[SDW] Speeder v${VERSION} loaded — ${this.cfg.sdwEnabled ? 'enabled' : 'disabled'} | mode: ${_modeStr}${this._sdwPrereqOk ? '' : ' (INACTIVE — missing Permafrost)'}`, 'info');
         },
 
         async runScan() {
           await _origScan.call(this);
           await this._sdwRunScan();
+        },
+
+        _sdwSplitStatusText() {
+          const hist = this._pfOcCycleHistory || [];
+          const syms = new Set();
+          for (const cycle of hist) for (const r of (cycle.results || [])) if (r?.sym && r.avgMs != null) syms.add(r.sym);
+          const have = syms.size;
+          const need = Math.max(2, this.cfg.sdwMinSplitTickers ?? 6);
+          return `Accumulating sample — ${have}/${need} unique OC tickers available for fast/slow split.`;
         },
 
         // Deduplicates Permafrost's rolling OC cycle history down to each ticker's single latest
@@ -173,13 +186,52 @@
             }
           }
           const entries = Object.values(latest);
-          if (entries.length < MIN_SAMPLE) { this._sdwSplit = null; return null; }
+          const minSample = Math.max(2, this.cfg.sdwMinSplitTickers ?? 6);
+          if (entries.length < minSample) { this._sdwSplit = null; return null; }
           const sorted = [...entries].sort((a, b) => a.avgMs - b.avgMs);
           const mid  = Math.floor(sorted.length / 2);
           const mean = arr => arr.reduce((s, r) => s + r.avgMs, 0) / arr.length;
           const split = { latestMap: latest, fastMean: mean(sorted.slice(0, mid)), slowMean: mean(sorted.slice(mid)), n: sorted.length };
           this._sdwSplit = split;
           return split;
+        },
+
+        _sdwNormalizeAutoBase(base) {
+          const [mode, anchor] = String(base || this.cfg.sdwAutoBase || 'slow-sliq').split('-');
+          return `${mode === 'slow' ? 'slow' : 'fast'}-${anchor === 'bliq' ? 'bliq' : 'sliq'}`;
+        },
+
+        _sdwOppositeAutoBase(base) {
+          const [mode, anchor] = this._sdwNormalizeAutoBase(base).split('-');
+          return `${mode === 'fast' ? 'slow' : 'fast'}-${anchor}`;
+        },
+
+        _sdwApplyAutoBase(base, reason = 'update') {
+          if ((this.cfg.sdwMode ?? 'fast') !== 'auto') return false;
+          const next = this._sdwNormalizeAutoBase(base);
+          if (this.cfg.sdwAutoCurrentBase === next) return false;
+          this.cfg.sdwAutoCurrentBase = next;
+          if (typeof this.persist === 'function') this.persist();
+          this.log(`[SDW] Speeder current base → ${next} (${reason}).`, 'warn');
+          return true;
+        },
+
+        _sdwSwitchAutoBaseAfterDrawdown() {
+          return this._sdwApplyAutoBase(this._sdwOppositeAutoBase(this.cfg.sdwAutoCurrentBase || this.cfg.sdwAutoBase), 'own drawdown');
+        },
+
+        _sdwApplyPartnerDrawdownAutoBase(evt) {
+          if (!evt || evt.kind !== 'ddh-start') return false;
+          if ((this.cfg.sdwMode ?? 'fast') !== 'auto') return false;
+          if (this.cfg.sdwLastPartnerDrawdownTs >= evt.ts) return false;
+          const partnerBase = evt.speedCurrentBase || evt.speedBase;
+          if (!partnerBase && evt.speedMode !== 'fast' && evt.speedMode !== 'slow') return false;
+          const [, ownAnchor] = this._sdwNormalizeAutoBase(this.cfg.sdwAutoCurrentBase || this.cfg.sdwAutoBase).split('-');
+          const next = partnerBase ? this._sdwNormalizeAutoBase(partnerBase) : `${evt.speedMode}-${ownAnchor}`;
+          this.cfg.sdwLastPartnerDrawdownTs = evt.ts;
+          const changed = this._sdwApplyAutoBase(next, `partner drawdown @ ${new Date(evt.ts).toLocaleTimeString()}`);
+          if (!changed && typeof this.persist === 'function') this.persist();
+          return changed;
         },
 
         // Resolves Speed Mode to an actual 'fast'/'slow' — every reader should call this, not
@@ -194,7 +246,7 @@
         _sdwEffectiveMode() {
           const raw = this.cfg.sdwMode ?? 'slow';
           if (raw !== 'auto') return raw;
-          const [baseMode, baseAnchor] = (this.cfg.sdwAutoBase ?? 'slow-sliq').split('-');
+          const [baseMode, baseAnchor] = this._sdwNormalizeAutoBase(this.cfg.sdwAutoCurrentBase || this.cfg.sdwAutoBase || 'slow-sliq').split('-');
           const trigger = this.cfg.sdwAutoTrigger ?? 'skew';
           let flip = false;
           if (trigger !== 'drawdown') {
