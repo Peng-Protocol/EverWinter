@@ -248,17 +248,6 @@ A perfect AMa run returns roughly **709% on the original entry margin** at 6× l
 
 ## Market Intelligence
 
-The breakthrough is not another entry criterion; it is a recontextualization of market intelligence itself. The rolling liquidation sample should be treated as the market's governing state. Funding, momentum, volume, order flow, candle shape, and similar signals can still refine entries, but they are secondary in the face of a strong liquidation regime unless the scorecard proves otherwise.
-
-The market intelligence layer now has two liquidation-defined regimes:
-
-- **Broadly bullish liquidation regime** — liquidation samples across the retained window are broadly bullish. In this state, it has been more profitable to long any live liquidation event once that event crosses a significant threshold versus the average turnover in the bot's own liquidation samples. The inverse path is absence: a ticker that has not seen any liquidation event within the sample window is treated as a short candidate, because it failed to participate in the regime's forced-buying pressure.
-- **Broadly bearish liquidation regime** — liquidation samples across the retained window are broadly bearish. In this state, the meaning inverts: live liquidation events become bearish once their turnover is significant versus the retained-sample average, while the absence of liquidation on a ticker becomes bullish.
-
-"Significant" is deliberately tied to retained liquidation history rather than an absolute dollar amount. A small forced trade merely says liquidation occurred; a significant event says the liquidation is large enough relative to this market's recent liquidation baseline to matter. This is why the regime layer should compare live-liq turnover against the average turnover from the retained samples and why the 0-Liq path should be interpreted as the mirror of live liquidation presence, not as missing data.
-
-This regime model does not rewrite what S-Liq, B-Liq, mixed-liq, or 0-Liq mean as criteria. Those definitions still describe the ticker-level observation used by the entry system. Market intelligence sits above that layer and decides which broad path is favored: in a bullish liquidation regime, live liquidation presence belongs to the long side and liquidation absence belongs to the short side; in a bearish liquidation regime, live liquidation presence belongs to the short side and liquidation absence belongs to the long side.
-
 The system learns from its own closed positions — and from simulated positions that were never actually opened — which entry conditions have been profitable and which have not. Combinations that win rise to the top of the entry queue; consistently losing combinations are deprioritized.
 
 The important caveat is that in a strongly bullish regime almost every long indicator will show a positive record, and in a strongly bearish regime almost every short indicator will. The scorecard reflects the regime the system has been running in as much as it reflects genuine signal quality. This is expected behaviour, not a flaw — the regime itself is information. The scorecard's value is most apparent at the margins: identifying which specific combinations hold up when conditions are mixed, and pruning the ones that only look good because the tide was with them.
