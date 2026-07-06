@@ -89,10 +89,10 @@
               <div x-show="(cfg.sdcMode??'fast')==='auto'" style="margin-top:8px;padding:6px 8px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.15);border-radius:3px">
                 <div class="lbl" style="margin-bottom:4px">Base</div>
                 <div style="display:flex;gap:4px;flex-wrap:wrap">
-                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='fast-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='fast-sliq';persist()}">Fast 🥵^</button>
-                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='fast-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='fast-bliq';persist()}">Fast 🥶^</button>
-                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='slow-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='slow-bliq';persist()}">Slow 🥶^</button>
-                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='slow-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='slow-sliq';persist()}">Slow 🥵^</button>
+                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='fast-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='fast-sliq';cfg.sdcAutoCurrentBase='fast-sliq';persist()}">Fast 🥵^</button>
+                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='fast-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='fast-bliq';cfg.sdcAutoCurrentBase='fast-bliq';persist()}">Fast 🥶^</button>
+                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='slow-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='slow-bliq';cfg.sdcAutoCurrentBase='slow-bliq';persist()}">Slow 🥶^</button>
+                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='slow-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='slow-sliq';cfg.sdcAutoCurrentBase='slow-sliq';persist()}">Slow 🥵^</button>
                 </div>
                 <div class="sdc-hint">Which mode runs when the ^-marked regime is dominant — the other regime gets the other mode.</div>
                 <div class="lbl" style="margin-top:8px;margin-bottom:4px">Trigger</div>
@@ -139,6 +139,8 @@
           if (this.cfg.sdcEnabled           === undefined) this.cfg.sdcEnabled           = true;
           if (this.cfg.sdcMode              === undefined) this.cfg.sdcMode              = 'fast';
           if (this.cfg.sdcAutoBase          === undefined) this.cfg.sdcAutoBase          = 'fast-sliq';
+          if (this.cfg.sdcAutoCurrentBase   === undefined) this.cfg.sdcAutoCurrentBase   = this.cfg.sdcAutoBase;
+          if (this.cfg.sdcLastPartnerDrawdownTs === undefined) this.cfg.sdcLastPartnerDrawdownTs = 0;
           if (this.cfg.sdcAutoTrigger       === undefined) this.cfg.sdcAutoTrigger       = 'skew';
           if (this.cfg.sdcReentryBlockMode  === undefined) this.cfg.sdcReentryBlockMode  = 'both';
           this.registerRoleBadge?.(item => {
@@ -149,7 +151,7 @@
             return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(167,139,250,.45);color:#a78bfa;background:rgba(167,139,250,.10)" title="Speeder: order interval ${secs} vs ${modeStr}-half mean ${meanSecs} (n=${item._spdSampleN ?? '?'})">Speed</span>`;
           });
           const _modeRaw = this.cfg.sdcMode ?? 'fast';
-          const _modeStr = _modeRaw === 'auto' ? `auto (base ${this.cfg.sdcAutoBase ?? 'fast-sliq'}, trigger ${this.cfg.sdcAutoTrigger ?? 'skew'}) → ${this._sdcEffectiveMode()}` : _modeRaw;
+          const _modeStr = _modeRaw === 'auto' ? `auto (initial ${this.cfg.sdcAutoBase ?? 'fast-sliq'}, current ${this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase}, trigger ${this.cfg.sdcAutoTrigger ?? 'skew'}) → ${this._sdcEffectiveMode()}` : _modeRaw;
           this.log(`[SDC] Speeder v${VERSION} loaded — ${this.cfg.sdcEnabled ? 'enabled' : 'disabled'} | mode: ${_modeStr}${this._sdcPrereqOk ? '' : ' (INACTIVE — missing Ashfall)'}`, 'info');
         },
 
@@ -182,6 +184,44 @@
           return split;
         },
 
+        _sdcNormalizeAutoBase(base) {
+          const [mode, anchor] = String(base || this.cfg.sdcAutoBase || 'fast-sliq').split('-');
+          return `${mode === 'slow' ? 'slow' : 'fast'}-${anchor === 'bliq' ? 'bliq' : 'sliq'}`;
+        },
+
+        _sdcOppositeAutoBase(base) {
+          const [mode, anchor] = this._sdcNormalizeAutoBase(base).split('-');
+          return `${mode === 'fast' ? 'slow' : 'fast'}-${anchor}`;
+        },
+
+        _sdcApplyAutoBase(base, reason = 'update') {
+          if ((this.cfg.sdcMode ?? 'fast') !== 'auto') return false;
+          const next = this._sdcNormalizeAutoBase(base);
+          if (this.cfg.sdcAutoCurrentBase === next) return false;
+          this.cfg.sdcAutoCurrentBase = next;
+          if (typeof this.persist === 'function') this.persist();
+          this.log(`[SDC] Speeder current base → ${next} (${reason}).`, 'warn');
+          return true;
+        },
+
+        _sdcSwitchAutoBaseAfterDrawdown() {
+          return this._sdcApplyAutoBase(this._sdcOppositeAutoBase(this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase), 'own drawdown');
+        },
+
+        _sdcApplyPartnerDrawdownAutoBase(evt) {
+          if (!evt || evt.kind !== 'ddh-start') return false;
+          if ((this.cfg.sdcMode ?? 'fast') !== 'auto') return false;
+          if (this.cfg.sdcLastPartnerDrawdownTs >= evt.ts) return false;
+          const partnerBase = evt.speedCurrentBase || evt.speedBase;
+          if (!partnerBase && evt.speedMode !== 'fast' && evt.speedMode !== 'slow') return false;
+          const [, ownAnchor] = this._sdcNormalizeAutoBase(this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase).split('-');
+          const next = partnerBase ? this._sdcNormalizeAutoBase(partnerBase) : `${evt.speedMode}-${ownAnchor}`;
+          this.cfg.sdcLastPartnerDrawdownTs = evt.ts;
+          const changed = this._sdcApplyAutoBase(next, `partner drawdown @ ${new Date(evt.ts).toLocaleTimeString()}`);
+          if (!changed && typeof this.persist === 'function') this.persist();
+          return changed;
+        },
+
         // Resolves Speed Mode to an actual 'fast'/'slow' — every reader should call this, not
         // cfg.sdcMode directly, so 'auto' resolves identically everywhere. Same mechanism as
         // MultiIndicator's Auto Presence (see MultiIndicator-Chaser.html's
@@ -194,7 +234,7 @@
         _sdcEffectiveMode() {
           const raw = this.cfg.sdcMode ?? 'fast';
           if (raw !== 'auto') return raw;
-          const [baseMode, baseAnchor] = (this.cfg.sdcAutoBase ?? 'fast-sliq').split('-');
+          const [baseMode, baseAnchor] = this._sdcNormalizeAutoBase(this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase || 'fast-sliq').split('-');
           const trigger = this.cfg.sdcAutoTrigger ?? 'skew';
           let flip = false;
           if (trigger !== 'drawdown') {

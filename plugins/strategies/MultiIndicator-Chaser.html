@@ -357,10 +357,10 @@
                     <div x-show="(cfg.micLiqPresenceMode??'1')==='auto'" style="margin-top:8px;padding:6px 8px;background:rgba(255,150,80,.04);border:1px solid rgba(255,150,80,.12);border-radius:3px">
                       <div class="lbl" style="margin-bottom:4px">Base</div>
                       <div style="display:flex;gap:4px;flex-wrap:wrap">
-                        <button class="mic-tab" :class="(cfg.micPresenceBase??'1-sliq')==='1-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPresenceBase='1-sliq';persist()}">Only-1 🥵^</button>
-                        <button class="mic-tab" :class="(cfg.micPresenceBase??'1-sliq')==='1-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPresenceBase='1-bliq';persist()}">Only-1 🥶^</button>
-                        <button class="mic-tab" :class="(cfg.micPresenceBase??'1-sliq')==='0-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPresenceBase='0-bliq';persist()}">Only-0 🥶^</button>
-                        <button class="mic-tab" :class="(cfg.micPresenceBase??'1-sliq')==='0-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPresenceBase='0-sliq';persist()}">Only-0 🥵^</button>
+                        <button class="mic-tab" :class="(cfg.micPresenceBase??'1-sliq')==='1-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPresenceBase='1-sliq';cfg.micPresenceCurrentBase='1-sliq';persist()}">Only-1 🥵^</button>
+                        <button class="mic-tab" :class="(cfg.micPresenceBase??'1-sliq')==='1-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPresenceBase='1-bliq';cfg.micPresenceCurrentBase='1-bliq';persist()}">Only-1 🥶^</button>
+                        <button class="mic-tab" :class="(cfg.micPresenceBase??'1-sliq')==='0-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPresenceBase='0-bliq';cfg.micPresenceCurrentBase='0-bliq';persist()}">Only-0 🥶^</button>
+                        <button class="mic-tab" :class="(cfg.micPresenceBase??'1-sliq')==='0-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPresenceBase='0-sliq';cfg.micPresenceCurrentBase='0-sliq';persist()}">Only-0 🥵^</button>
                       </div>
                       <div class="mic-hint">Which mode runs when the ^-marked regime is dominant — the other regime gets the other mode.</div>
                       <div class="lbl" style="margin-top:8px;margin-bottom:4px">Trigger</div>
@@ -678,6 +678,8 @@
           if (this.cfg.micLiqResultMaxCycles   === undefined) this.cfg.micLiqResultMaxCycles   = 2;
           if (this.cfg.micLiqPresenceMode      === undefined) this.cfg.micLiqPresenceMode      = '1';
           if (this.cfg.micPresenceBase         === undefined) this.cfg.micPresenceBase         = '1-sliq';
+          if (this.cfg.micPresenceCurrentBase  === undefined) this.cfg.micPresenceCurrentBase  = this.cfg.micPresenceBase;
+          if (this.cfg.micLastPartnerDrawdownTs === undefined) this.cfg.micLastPartnerDrawdownTs = 0;
           if (this.cfg.micPresenceAutoTrigger  === undefined) this.cfg.micPresenceAutoTrigger  = 'skew';
           if (this.cfg.micLiveDepthThreshold   === undefined) this.cfg.micLiveDepthThreshold   = 1;
           if (this.cfg.micReentryBlockMode     === undefined) this.cfg.micReentryBlockMode     = 'losers';
@@ -759,7 +761,7 @@
           this.registerCloseReason?.('substitution', 'Sub');
           this.registerLiqMessageHook?.((batch, sym) => { this._micOnLiqMessage(batch, sym); });
           const _presenceRaw = this.cfg.micLiqPresenceMode ?? '1';
-          const _presenceStr = _presenceRaw === 'auto' ? `auto (base ${this.cfg.micPresenceBase ?? '1-sliq'}, trigger ${this.cfg.micPresenceAutoTrigger ?? 'skew'}) → ${this._micEffectivePresenceMode()}` : _presenceRaw;
+          const _presenceStr = _presenceRaw === 'auto' ? `auto (initial ${this.cfg.micPresenceBase ?? '1-sliq'}, current ${this.cfg.micPresenceCurrentBase || this.cfg.micPresenceBase}, trigger ${this.cfg.micPresenceAutoTrigger ?? 'skew'}) → ${this._micEffectivePresenceMode()}` : _presenceRaw;
           this.log(`[MIC] Multi-Indicator (Chaser) v${VERSION} loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle | presence: ${_presenceStr}`, 'info');
           this.renderTradeFeed?.();
         },
@@ -1917,6 +1919,44 @@
           return (slot || []).find(c => LIQ_TYPES.some(t => c.startsWith(t)) || c === '0liq') || null;
         },
 
+        _micNormalizePresenceBase(base) {
+          const [mode, anchor] = String(base || this.cfg.micPresenceBase || '1-sliq').split('-');
+          return `${mode === '0' ? '0' : '1'}-${anchor === 'bliq' ? 'bliq' : 'sliq'}`;
+        },
+
+        _micOppositePresenceBase(base) {
+          const [mode, anchor] = this._micNormalizePresenceBase(base).split('-');
+          return `${mode === '1' ? '0' : '1'}-${anchor}`;
+        },
+
+        _micApplyPresenceBase(base, reason = 'update') {
+          if ((this.cfg.micLiqPresenceMode ?? '1') !== 'auto') return false;
+          const next = this._micNormalizePresenceBase(base);
+          if (this.cfg.micPresenceCurrentBase === next) return false;
+          this.cfg.micPresenceCurrentBase = next;
+          if (typeof this.persist === 'function') this.persist();
+          this.log(`[MIC] Liquidation Presence current base → ${next} (${reason}).`, 'warn');
+          return true;
+        },
+
+        _micSwitchPresenceBaseAfterDrawdown() {
+          return this._micApplyPresenceBase(this._micOppositePresenceBase(this.cfg.micPresenceCurrentBase || this.cfg.micPresenceBase), 'own drawdown');
+        },
+
+        _micApplyPartnerDrawdownPresenceBase(evt) {
+          if (!evt || evt.kind !== 'ddh-start') return false;
+          if ((this.cfg.micLiqPresenceMode ?? '1') !== 'auto') return false;
+          if (this.cfg.micLastPartnerDrawdownTs >= evt.ts) return false;
+          const partnerBase = evt.currentBase || evt.base;
+          if (!partnerBase && evt.mode !== '0' && evt.mode !== '1') return false;
+          const [, ownAnchor] = this._micNormalizePresenceBase(this.cfg.micPresenceCurrentBase || this.cfg.micPresenceBase).split('-');
+          const next = partnerBase ? this._micNormalizePresenceBase(partnerBase) : `${evt.mode}-${ownAnchor}`;
+          this.cfg.micLastPartnerDrawdownTs = evt.ts;
+          const changed = this._micApplyPresenceBase(next, `partner drawdown @ ${new Date(evt.ts).toLocaleTimeString()}`);
+          if (!changed && typeof this.persist === 'function') this.persist();
+          return changed;
+        },
+
         // Resolves Liquidation Presence to an actual '1'/'0'/'both' — every other reader of the
         // mode should call this, not cfg.micLiqPresenceMode directly, so 'auto' resolves
         // identically everywhere. Base is stored as "{mode}-{anchor}" (e.g. '1-sliq' = "Only-1
@@ -1929,7 +1969,7 @@
         _micEffectivePresenceMode() {
           const raw = this.cfg.micLiqPresenceMode ?? '1';
           if (raw !== 'auto') return raw;
-          const [baseMode, baseAnchor] = (this.cfg.micPresenceBase ?? '1-sliq').split('-');
+          const [baseMode, baseAnchor] = this._micNormalizePresenceBase(this.cfg.micPresenceCurrentBase || this.cfg.micPresenceBase || '1-sliq').split('-');
           const trigger = this.cfg.micPresenceAutoTrigger ?? 'skew';
           let flip = false;
           if (trigger !== 'drawdown') {
