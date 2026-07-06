@@ -32,6 +32,8 @@ Each file carries its version in two or three places — update **all** that app
 | `plugins/analytics/Ashfall-Chaser.html` | v1.51.3 |
 | `plugins/modes/EverWinter.html` | v1.0.4 |
 | `plugins/modes/SunChaser.html` | v1.0.4 |
+| `plugins/multiplex/SpeedDive-Chaser.html` | v1.0.0 |
+| `plugins/multiplex/SpeedDodge-Winter.html` | v1.0.0 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
@@ -48,7 +50,7 @@ Each file carries its version in two or three places — update **all** that app
 
 ## Scope (REQUIRED)
 
-Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser.html** and their associated plugins (`plugins/analytics/`, `plugins/strategies/`). Do not touch other files unless explicitly directed.
+Unless stated otherwise, all work is on **PseudoWinter.html** and **PseudoChaser.html** and their associated plugins (`plugins/analytics/`, `plugins/strategies/`, `plugins/multiplex/`). Do not touch other files unless explicitly directed.
 
 ## Working Style (REQUIRED)
 
