@@ -61,9 +61,11 @@ Binary Mode suits the meta-structure approach: when the read is correct, positio
 
 ---
 
-#### Drawdown Throttling
+#### Drawdown Throttling & Gains Locking
 
-A session that consistently loses on both sides is either a choppy, undirected market or a wrong read on the day's character. In either case, opening more positions compounds the damage. When drawdown reaches the configured threshold, stop entering new positions and wait. The market will either clarify its direction — at which point recovery begins naturally — or it stays choppy, in which case standing down was the right call. The throttle can be lifted either after a fixed interval or if the opposing directional side suffers a similar drawdown, indicating a shift in market direction. Do not override it early.
+A session that consistently loses on both sides is either a choppy, undirected market or a wrong read on the day's character. In either case, opening more positions compounds the damage. To mitigate this, drawdown throttling works in tandem with a structural and psychological "gains locking" quota system.
+
+When drawdown reaches the configured threshold, or conversely, once a specific profit quota is achieved, new position entries are suspended for a designated period of time. For drawdown; this serves to prevent exposure to continuation of adverse conditions, stay down and wait out the storm. For gains locking; it serves to protect the trader against sudden - violent regime changes, while giving psychological and operational space to prepare for subsequent legs of operation. Crucially, data collection, market scanning, and historical scorecard tracking continue uninterrupted even while the system is sitting out on a drawdown throttle or a gains lock. The throttle can be lifted either after a fixed interval or if the opposing directional side suffers a similar drawdown, indicating a shift in market direction. Do not override it early.
 
 ---
 
@@ -250,11 +252,15 @@ A perfect AMa run returns roughly **709% on the original entry margin** at 6× l
 
 The system learns from its own closed positions — and from simulated positions that were never actually opened — which entry conditions have been profitable and which have not. Combinations that win rise to the top of the entry queue; consistently losing combinations are deprioritized.
 
-The important caveat is that in a strongly bullish regime almost every long indicator will show a positive record, and in a strongly bearish regime almost every short indicator will. The scorecard reflects the regime the system has been running in as much as it reflects genuine signal quality. This is expected behaviour, not a flaw — the regime itself is information. The scorecard's value is most apparent at the margins: identifying which specific combinations hold up when conditions are mixed, and pruning the ones that only look good because the tide was with them.
+The definitive directional and regime signal for the system is the presence or absence of liquidation events on a ticker, serving as the most potent gauge available.
+
+* **During a Bullish Regime**: When short positions are being liquidated above a configured threshold, the optimal execution is to immediately long liquidation events of any kind as soon as they begin to form, while simultaneously shorting tickers where no liquidation events of any kind have occurred.
+* **During a Deeply Bearish Regime**: When long positions are being liquidated above a configured threshold, the operational strategy completely inverts—you immediately short forming liquidation events of any kind, and long tickers showing a complete absence of liquidation events.
+* **The Scorecard Role**: The primary scorecard remains highly useful within this framework for the explicit acts of substitution and ordering entries, as secondary, lesser indicators frequently prove to be valuable supplemental filters to refine your execution queue.
 
 Both sides use the same record. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, so consistently losing combinations are deprioritized from both directions rather than just one.
 
-When one side enters drawdown and halts, the other continues. If the other side subsequently halts too, both directions have failed simultaneously — evidence of a regime shift rather than a directional mistake. The older halt lifts at that point; the condition that justified it no longer holds.
+When one side enters gains quota and halts, the other halts as well. This is more psychological than functional, one side winning the session is an indicator both sides should take a break and prepare for regime change. 
 
 ---
 

@@ -371,6 +371,26 @@ The practical effect is that no two instances share the same entry triggers, exi
 
 ---
 
+## Multiplex Plugins
+
+To maximize efficiency within single-file browser execution, the system architecture supports **Multiplex Plugins**. Unlike standard plugins that independently isolate their telemetry, a multiplex variant hooks directly into the flattened component created when all plugins are loaded, using the structural pipelines—core data arrays—API batched payloads, and state tracking structures without wrapping or reassigning parent methods. This cross-dependencies model dramatically reduces resource consumption and mitigates multi-plugin race conditions by treating the master surveillance/execution engine as a shared database/resource.
+
+### The Speeder Module (Tentative Multiplex)
+
+Located in `/plugins/multiplex/`, **Speeder** leverages existing functions in `MultiIndicator` and data provenience in `Ashfall/Permafrost`. This direct-read capability allows it to tap directly into the rolling Order Count (OC) Surveillance histories and entry criteria builder. 
+
+* **What it does**: Rather than assessing order flow via arbitrary millisecond barriers, Speeder dynamically splits the entire deduplicated pool of recent per-ticker trade intervals at the median during each scan.
+
+* **How it does what it does**: To filter out noise, Speeder does not qualify a ticker simply for landing in the fast or slow half; the ticker's specific trade interval must exceed that collective half’s independent *mean*—ensuring an extreme, mathematical divergence from the baseline market velocity.
+
+* **When it does what it does**: Adhering strictly to `MultiIndicator`'s precedent, Speeder uses an automatic selection method for determining entry criteria (fast or slow), employing a `base` configuration dependent on the liquidation regime. Speeder can enter fast/slow tickers in hot or cold regimes. 
+
+* **When it doesn't**: If the foundational surveillance plugins are completely absent from the flattened component, Speeder logs a clean failure warning and remains safely inactive.
+
+> **Note**: The Speeder strategy is tentative and lacks long-term historical validation; it remains isolated within the multiplex directory for demonstration purposes and architectural testing.
+
+---
+
 ## Trivia
 
 Developer-level detail with no operational consequence. Included for reference.
