@@ -298,17 +298,14 @@ The wave chart has three overlay toggles: **Structure** (the market lean path), 
 
 Shows the current climate reading (magnitude, breadth, slope, FIO score, effective score, evidence mass), and active halt state (profile-governed or fallback timer). The **wave graph** plots recent market structure — direction label (rising/falling/steady) reflects the recent path of the market.
 
-Three directional bar charts below the climate reading show relative dominance at a glance. Red extends left (adverse for this bot's direction), green extends right (favorable), with current values as a label. A drawdown halt or gains lock only pauses new position entry — this bot's own scans, and with them these bars, keep updating normally. The bars (kline direction, funding skew) and the liq chart also read from the partner bot's sample state every 15 seconds as a backup, so the display stays populated even if this bot's own sampling is thin or the bot is off.
+Two directional bar charts below the climate reading show relative dominance at a glance. Red extends left (adverse for this bot's direction), green extends right (favorable), with current values as a label. A drawdown halt or gains lock only pauses new position entry — this bot's own scans, and with them these bars, keep updating normally. Both bars also read from the partner bot's sample state every 15 seconds as a backup, so the display stays populated even if this bot's own sampling is thin or the bot is off.
 
 | Bar | What it shows |
 |---|---|
 | **1h Kline** | Bear vs. bull aggregate from the last completed 1h candle sample. |
 | **Funding Rate** | Neg vs. pos funding skew across the kline + liq ticker union. |
-| **Liquidation Flow** | B-Liq vs. S-Liq share of the last completed liq cycle. Only appears when Liquidation Surveillance is on and at least one cycle has closed. |
 | **Volume Sample** | Below-average vs. above-average volume share of the current kline sample, weighted by deviation magnitude. Gray extends left (below average) and thematic color extends right (above average). Only appears when the Volume fade signal is enabled. |
 | **Order Interval Sample** | Per-ticker bar chart of average seconds between orders (orderbook velocity), scrollable through history — a slower/quieter ticker draws a taller bar, busier/faster draws shorter. Only appears when Order Count Surveillance is on and at least one sample has been taken. See **Order Interval Sample detail** below. |
-
-> **Observational note:** The sampling bars and charts (kline direction, funding skew, volume skew) are primarily **visual feedback**. They reflect broad market conditions but do not directly gate entries or trigger closes on their own — the only mechanism that acts on them is the combined entry/close signal system (which requires scorecard gating before most signals contribute). Do not read the bars as predictive signals; a heavily red kline bar can coincide with Chaser winning and Winter losing, or vice versa. Treat them as ambient context while the scorecard provides the actual decision weight.
 
 **Order Interval Sample detail**:
 - An **Avg order interval** line below the chart shows the mean seconds/order across every ticker in the displayed cycle.
@@ -343,6 +340,8 @@ The **Combined / Own** toggle (`pfScorecardView`/`afScorecardView`) switches bet
 **Ticker Locks panel**: when any of Self-Liq Graylist, React to Partner Live-Liq, React to Partner 0-Liq Win, or Direction Lock is enabled, the **Stats menu** shows a Ticker Locks section — one line per currently-affected ticker, listing every reason that currently applies to it (Self-Liq / Partner Live-Liq / Partner 0-Liq Win / the liq type for Direction Lock), each tagged LOCK (green) or EXCLUDE (red), plus the clock time the last of those reasons expires. Only shows a reason if it's actually relevant to the bot's current resolved Liquidation Presence mode — Self-Liq/Partner Live-Liq only matter while the 0-Liq path is reachable, Partner 0-Liq Win/Direction Lock only matter while the live path is reachable, so a reason with no current effect doesn't clutter the panel. Empty when nothing is currently locked.
 
 ### Liquidation Feed
+
+The **Liquidation Flow** bar (B-Liq vs. S-Liq share of the full retained liq turnover window) sits directly above the Feed Watcher panel below. Toggled by the **Liq** sampling-bar switch; only appears when Liquidation Surveillance is on and there's turnover to show.
 
 When surveillance is on: the **Feed Watcher** panel shows active batches (batch ID, ticker count, running S-Liq / B-Liq USDT totals, dominant side, countdown). The **Liq Sample chart** shows up to the last 25 closed cycles as stacked bars (S-Liq green / B-Liq red, qualifying segments at full opacity). Each cycle's bar group is clickable — clicking one pins the **Highlighted Cycle** chip grid below to that cycle's per-ticker qualification, with a label showing that cycle's time when it isn't the actual latest one. Clicking anywhere outside the chart or the chip grid returns Highlighted Cycle to the actual latest cycle, which is also what it shows by default with nothing pinned. Below the chart, a summary line ("Highlighted B-Liq % / S-Liq %") totals turnover for whichever cycle is currently pinned (or the latest one, if none is), alongside a second line totalling every ticker's latest known reading regardless of cycle ("All").
 

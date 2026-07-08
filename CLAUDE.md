@@ -28,8 +28,8 @@ Each file carries its version in two or three places — update **all** that app
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.55.1 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.54.1 |
-| `plugins/analytics/Permafrost-Winter.html` | v1.52.4 |
-| `plugins/analytics/Ashfall-Chaser.html` | v1.52.4 |
+| `plugins/analytics/Permafrost-Winter.html` | v1.52.5 |
+| `plugins/analytics/Ashfall-Chaser.html` | v1.52.5 |
 | `plugins/modes/EverWinter.html` | v1.0.4 |
 | `plugins/modes/SunChaser.html` | v1.0.4 |
 | `plugins/multiplex/Speeder-Chaser.html` | v1.5.1 |
