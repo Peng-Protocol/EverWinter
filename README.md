@@ -271,17 +271,6 @@ They pair realized PnL from each close with a snapshot of market structure — b
 | **Order Count Surveillance** (`pfOcEnabled`/`afOcEnabled`) | Fetches a fixed number of recent trades for the tickers in MIW/MIC's scan candidate pool. Required for `ocs`/`ocx` criteria in MIW/MIC. Each fetch is a fresh, independent snapshot — no accumulation or deduplication across cycles. |
 | **OC Order Limit** (`pfOcOrderLimit`/`afOcOrderLimit`) | Recent trades fetched per ticker per scan cycle (10–500). Buy/sell skew and average order interval are both computed from this single sample. |
 
-
-### Speeder Multiplex
-
-Speeder is an optional multiplex strategy (`plugins/multiplex/Speeder-Winter.html` / `plugins/multiplex/Speeder-Chaser.html`) that borrows the bot's Order Count Surveillance sample and opens tickers from the selected speed half(s), up to one per side per scan.
-
-| Setting | What it does |
-|---|---|
-| **Speeder Mode** (`sdwMode`/`sdcMode`) | **Fast** targets the busy/low-interval half of the order-count sample. **Slow** targets the quiet/high-interval half. **Both** runs the fast and slow reads independently every scan — each can open its own ticker, gated separately by Slot Blocking below. |
-| **Min Split Tickers** (`sdwMinSplitTickers`/`sdcMinSplitTickers`) | Minimum number of unique OC-sampled tickers Speeder needs before it builds the fast/slow split. Default is 6. Lower it if the OC sample is usually small; raise it if you want a more stable median split before Speeder acts. |
-| **Slot Blocking** (`sdwSlotBlockEnabled`/`sdcSlotBlockEnabled`, `sdwSlotBlockPct`/`sdcSlotBlockPct`) | Speeder has no criteria of its own to score, so it reads Multi-Indicator/Permafrost's (or Ashfall's) shared scorecard as an external validity signal instead. If the live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond the configured % of base margin, the fast read pauses; if 0-Liq is, the slow read pauses. In Both mode this is what actually decides which side is currently active — no manual clear needed, a pause lifts once its score recovers. |
-
 ### WAVE Tab
 
 The WAVE tab holds display and analysis config controls: which sampling bars and charts to show (Structure / Funding / Liq / Vol toggles), Slope Window, Collective FIO toggle, and Liquidation Surveillance setup and config. The Danger Zone (Export / Import / Clear Profile / Clear Plugin State) is also accessed from this tab.
