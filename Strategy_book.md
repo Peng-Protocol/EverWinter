@@ -254,9 +254,9 @@ The system learns from its own closed positions — and from simulated positions
 
 The definitive directional and regime signal for the system is the presence or absence of liquidation events on a ticker, serving as the most potent gauge available.
 
-* **During a Bullish Regime**: When short positions are being liquidated above a configured threshold, the optimal execution is to immediately long liquidation events of any kind as soon as they begin to form, while simultaneously shorting tickers where no liquidation events of any kind have occurred.
-* **During a Deeply Bearish Regime**: When long positions are being liquidated above a configured threshold, the operational strategy completely inverts—you immediately short forming liquidation events of any kind, and long tickers showing a complete absence of liquidation events.
-* **The Scorecard Role**: The primary scorecard remains highly useful within this framework for the explicit acts of substitution and ordering entries, as secondary, lesser indicators frequently prove to be valuable supplemental filters to refine your execution queue.
+The system does not presuppose which way the market will move. It runs the liquidation-event read and the liquidation-absence read on both sides at once, rather than committing to one based on an assumed regime. The scorecard decides which read is actually working: a losing path pauses itself while the winning path keeps trading, no regime label required. This is Market Intelligence applied directly — no fixed assumptions, only continuous adjustment to what is actually working.
+
+The scorecard also remains highly useful for the explicit acts of substitution and ordering entries, as secondary, lesser indicators frequently prove to be valuable supplemental filters to refine your execution queue.
 
 Both sides use the same record. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, so consistently losing combinations are deprioritized from both directions rather than just one.
 
