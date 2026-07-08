@@ -2,18 +2,19 @@
   Speeder — Multiplex Plugin for PseudoChaser
   Tentative strategy: longs whichever ticker's order-flow is running most extreme relative to
   the rest of the market right now — fast or slow, whichever this bot is configured for (Speed
-  Mode: Fast / Slow / Auto, default Fast). "Extreme" is not a fixed number of seconds — every
-  scan, the whole known sample of per-ticker order intervals (avg ms between recent trades) is
-  split at the median into a fast half and a slow half, and a ticker only qualifies if its own
-  average is past that half's own mean (a stricter cut than merely landing in that half). The
-  split recomputes every scan from Ashfall's full OC cycle history (deduplicated to each
-  ticker's latest reading), so the threshold continuously adapts to current market conditions
-  instead of drifting stale.
+  Mode: Fast / Slow, default Fast). "Extreme" is not a fixed number of seconds — every scan, the
+  whole known sample of per-ticker order intervals (avg ms between recent trades) is split at
+  the median into a fast half and a slow half, and a ticker only qualifies if its own average is
+  past that half's own mean (a stricter cut than merely landing in that half). The split
+  recomputes every scan from Ashfall's full OC cycle history (deduplicated to each ticker's
+  latest reading), so the threshold continuously adapts to current market conditions instead of
+  drifting stale.
 
-  Speed Mode: Auto switches between Fast and Slow by market regime, same mechanism as
-  Multi-Indicator's Auto Liquidation Presence — see _sdcEffectiveMode()/_sdcAutoHalted() and
-  their twins in MultiIndicator-Chaser.html for the full logic (Ashfall's aggregate liq skew
-  and/or the partner bot's drawdown state, via Cross Broadcast).
+  Slot Blocking (sdcSlotBlockEnabled): Speeder has no criteria of its own to score, so it reads
+  Multi-Indicator/Ashfall's shared scorecard (micCollapsedSlotRanks) as an external validity
+  signal instead. If the live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond
+  sdcSlotBlockPct% of base margin, Fast entries pause; if 0-Liq is, Slow entries pause. No manual
+  clear needed — the block lifts once the score recovers. See _sdcIsModeBlocked().
 
   This is a "multiplex" plugin: it borrows Ashfall's existing Order Count Surveillance
   (_ocFetchBatch, _afOcCycleHistory, _liqLastBatchSyms) by calling/reading it directly, the same
@@ -32,7 +33,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.3.1';
+  const VERSION = '1.4.0';
   window.__BotPlugin = {
     id:        'speeder-chaser',
     name:      'Speeder',
@@ -79,31 +80,26 @@
               <div style="display:flex;gap:4px">
                 <button class="sdc-tab" :class="(cfg.sdcMode??'fast')==='fast'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcMode='fast';persist()}">Fast</button>
                 <button class="sdc-tab" :class="(cfg.sdcMode??'fast')==='slow'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcMode='slow';persist()}">Slow</button>
-                <button class="sdc-tab" :class="(cfg.sdcMode??'fast')==='auto'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcMode='auto';persist()}">Auto</button>
               </div>
-              <div class="sdc-hint">Fast longs busiest flow, Slow longs quietest. Auto regime-switches — see README.</div>
+              <div class="sdc-hint">Fast longs busiest flow, Slow longs quietest.</div>
               <div style="margin-top:8px">
                 <div class="lbl">Min Split Tickers <b x-text="(cfg.sdcMinSplitTickers??6)"></b></div>
                 <input type="range" min="2" max="25" step="1" x-model.number="cfg.sdcMinSplitTickers" @change="persist()">
                 <div class="sdc-hint">Speeder needs at least this many unique OC-sampled tickers before it can divide the sample into fast/slow halves.</div>
               </div>
-              <div x-show="(cfg.sdcMode??'fast')==='auto'" style="margin-top:8px;padding:6px 8px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.15);border-radius:3px">
-                <div class="lbl" style="margin-bottom:4px">Base</div>
-                <div style="display:flex;gap:4px;flex-wrap:wrap">
-                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='fast-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='fast-sliq';cfg.sdcAutoCurrentBase='fast-sliq';persist()}">Fast 🥵^</button>
-                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='fast-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='fast-bliq';cfg.sdcAutoCurrentBase='fast-bliq';persist()}">Fast 🥶^</button>
-                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='slow-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='slow-bliq';cfg.sdcAutoCurrentBase='slow-bliq';persist()}">Slow 🥶^</button>
-                  <button class="sdc-tab" :class="(cfg.sdcAutoBase??'fast-sliq')==='slow-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoBase='slow-sliq';cfg.sdcAutoCurrentBase='slow-sliq';persist()}">Slow 🥵^</button>
+              <div style="margin-top:8px">
+                <label class="tog" @click.prevent="if(!cfgLocked){cfg.sdcSlotBlockEnabled=!cfg.sdcSlotBlockEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.sdcSlotBlockEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Slot Blocking</div>
+                    <div class="sdc-hint">Pauses Fast when live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond <span x-text="-(cfg.sdcSlotBlockPct??25)"></span>% of base margin, or Slow when 0-Liq is. Reads Multi-Indicator/Ashfall's scorecard — auto-clears once the score recovers.</div>
+                  </div>
+                </label>
+                <div x-show="cfg.sdcSlotBlockEnabled" style="margin-top:4px;margin-left:2px">
+                  <input type="range" min="5" max="100" step="5" x-model.number="cfg.sdcSlotBlockPct" :disabled="cfgLocked" @change="persist()">
+                  <div class="sdc-hint">Threshold: <span x-text="-(cfg.sdcSlotBlockPct??25)"></span>% of base margin.</div>
+                  <div x-show="_sdcIsModeBlocked(_sdcEffectiveMode())" class="sdc-hint" style="color:rgba(255,120,120,.85)">⛔ Blocked — current mode's scorecard read is a loss beyond threshold.</div>
                 </div>
-                <div class="sdc-hint">Which mode runs when the ^-marked regime is dominant — the other regime gets the other mode.</div>
-                <div class="lbl" style="margin-top:8px;margin-bottom:4px">Trigger</div>
-                <div style="display:flex;gap:4px">
-                  <button class="sdc-tab" :class="(cfg.sdcAutoTrigger??'skew')==='skew'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoTrigger='skew';persist()}">Only-Skew</button>
-                  <button class="sdc-tab" :class="(cfg.sdcAutoTrigger??'skew')==='drawdown'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoTrigger='drawdown';persist()}">Only-Drawdown</button>
-                  <button class="sdc-tab" :class="(cfg.sdcAutoTrigger??'skew')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcAutoTrigger='both';persist()}">Both</button>
-                </div>
-                <div class="sdc-hint">See README for Trigger and Mixed Mode details.</div>
-                <div class="sdc-hint" style="margin-top:4px" x-text="(()=>{ const halted=_sdcAutoHalted(); if(halted) return 'Currently: entries halted (mixed regime)'; return 'Currently resolving to: '+_sdcEffectiveMode(); })()"></div>
               </div>
             </div>
             <div x-show="cfg.sdcEnabled" style="margin-top:8px;padding:6px 8px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.15);border-radius:3px;font-family:var(--mono);font-size:8.5px;color:var(--text-lo)">
@@ -139,10 +135,13 @@
           }
           if (this.cfg.sdcEnabled           === undefined) this.cfg.sdcEnabled           = true;
           if (this.cfg.sdcMode              === undefined) this.cfg.sdcMode              = 'fast';
-          if (this.cfg.sdcAutoBase          === undefined) this.cfg.sdcAutoBase          = 'fast-sliq';
-          if (this.cfg.sdcAutoCurrentBase   === undefined) this.cfg.sdcAutoCurrentBase   = this.cfg.sdcAutoBase;
-          if (this.cfg.sdcLastPartnerDrawdownTs === undefined) this.cfg.sdcLastPartnerDrawdownTs = 0;
-          if (this.cfg.sdcAutoTrigger       === undefined) this.cfg.sdcAutoTrigger       = 'skew';
+          if (this.cfg.sdcMode === 'auto') {
+            const preserved = (this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase || 'fast-sliq').split('-')[0];
+            this.cfg.sdcMode = preserved === 'slow' ? 'slow' : 'fast';
+            this.log(`[SDC] Auto Speed Mode removed — migrated to ${this.cfg.sdcMode === 'slow' ? 'Slow' : 'Fast'}.`, 'warn');
+          }
+          if (this.cfg.sdcSlotBlockEnabled  === undefined) this.cfg.sdcSlotBlockEnabled  = true;
+          if (this.cfg.sdcSlotBlockPct      === undefined) this.cfg.sdcSlotBlockPct      = 25;
           if (this.cfg.sdcMinSplitTickers   === undefined) this.cfg.sdcMinSplitTickers   = 6;
           if (this.cfg.sdcReentryBlockMode  === undefined) this.cfg.sdcReentryBlockMode  = 'both';
           this.registerRoleBadge?.(item => {
@@ -152,9 +151,7 @@
             const modeStr  = item._spdMode === 'slow' ? 'slow' : 'fast';
             return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(167,139,250,.45);color:#a78bfa;background:rgba(167,139,250,.10)" title="Speeder: order interval ${secs} vs ${modeStr}-half mean ${meanSecs} (n=${item._spdSampleN ?? '?'})">Speed</span>`;
           });
-          const _modeRaw = this.cfg.sdcMode ?? 'fast';
-          const _modeStr = _modeRaw === 'auto' ? `auto (initial ${this.cfg.sdcAutoBase ?? 'fast-sliq'}, current ${this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase}, trigger ${this.cfg.sdcAutoTrigger ?? 'skew'}) → ${this._sdcEffectiveMode()}` : _modeRaw;
-          this.log(`[SDC] Speeder v${VERSION} loaded — ${this.cfg.sdcEnabled ? 'enabled' : 'disabled'} | mode: ${_modeStr}${this._sdcPrereqOk ? '' : ' (INACTIVE — missing Ashfall)'}`, 'info');
+          this.log(`[SDC] Speeder v${VERSION} loaded — ${this.cfg.sdcEnabled ? 'enabled' : 'disabled'} | mode: ${this.cfg.sdcMode ?? 'fast'}${this._sdcPrereqOk ? '' : ' (INACTIVE — missing Ashfall)'}`, 'info');
         },
 
         async runScan() {
@@ -196,81 +193,26 @@
           return split;
         },
 
-        _sdcNormalizeAutoBase(base) {
-          const [mode, anchor] = String(base || this.cfg.sdcAutoBase || 'fast-sliq').split('-');
-          return `${mode === 'slow' ? 'slow' : 'fast'}-${anchor === 'bliq' ? 'bliq' : 'sliq'}`;
-        },
-
-        _sdcOppositeAutoBase(base) {
-          const [mode, anchor] = this._sdcNormalizeAutoBase(base).split('-');
-          return `${mode === 'fast' ? 'slow' : 'fast'}-${anchor}`;
-        },
-
-        _sdcApplyAutoBase(base, reason = 'update') {
-          if ((this.cfg.sdcMode ?? 'fast') !== 'auto') return false;
-          const next = this._sdcNormalizeAutoBase(base);
-          if (this.cfg.sdcAutoCurrentBase === next) return false;
-          this.cfg.sdcAutoCurrentBase = next;
-          if (typeof this.persist === 'function') this.persist();
-          this.log(`[SDC] Speeder current base → ${next} (${reason}).`, 'warn');
-          return true;
-        },
-
-        _sdcSwitchAutoBaseAfterDrawdown() {
-          return this._sdcApplyAutoBase(this._sdcOppositeAutoBase(this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase), 'own drawdown');
-        },
-
-        _sdcApplyPartnerDrawdownAutoBase(evt) {
-          if (!evt || evt.kind !== 'ddh-start') return false;
-          if ((this.cfg.sdcMode ?? 'fast') !== 'auto') return false;
-          if (this.cfg.sdcLastPartnerDrawdownTs >= evt.ts) return false;
-          const partnerBase = evt.speedCurrentBase || evt.speedBase;
-          if (!partnerBase && evt.speedMode !== 'fast' && evt.speedMode !== 'slow') return false;
-          const [, ownAnchor] = this._sdcNormalizeAutoBase(this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase).split('-');
-          const next = partnerBase ? this._sdcNormalizeAutoBase(partnerBase) : `${evt.speedMode}-${ownAnchor}`;
-          this.cfg.sdcLastPartnerDrawdownTs = evt.ts;
-          const changed = this._sdcApplyAutoBase(next, `partner drawdown @ ${new Date(evt.ts).toLocaleTimeString()}`);
-          if (!changed && typeof this.persist === 'function') this.persist();
-          return changed;
-        },
-
-        // Resolves Speed Mode to an actual 'fast'/'slow' — every reader should call this, not
-        // cfg.sdcMode directly, so 'auto' resolves identically everywhere. Same mechanism as
-        // MultiIndicator's Auto Presence (see MultiIndicator-Chaser.html's
-        // _micEffectivePresenceMode): Base is stored as "{mode}-{anchor}" (e.g. 'fast-sliq' =
-        // "Fast 🥵^") — the anchor names which regime (sliq/bliq dominant, per Ashfall's
-        // aggregate skew) uses the named mode; the opposite regime gets the opposite mode.
-        // Only-Drawdown (a partner halt) also flips, per the Trigger setting. A mixed regime
-        // with no drawdown flip resolves to Base's own named mode when Ashfall's Mixed Mode is
-        // "Continue".
+        // Every reader should call this, not cfg.sdcMode directly.
         _sdcEffectiveMode() {
-          const raw = this.cfg.sdcMode ?? 'fast';
-          if (raw !== 'auto') return raw;
-          const [baseMode, baseAnchor] = this._sdcNormalizeAutoBase(this.cfg.sdcAutoCurrentBase || this.cfg.sdcAutoBase || 'fast-sliq').split('-');
-          const trigger = this.cfg.sdcAutoTrigger ?? 'skew';
-          let flip = false;
-          if (trigger !== 'drawdown') {
-            const bliqDom = !!this._afIsBliqDominant?.();
-            const sliqDom = !!this._afIsSliqDominant?.();
-            if (baseAnchor === 'sliq' && bliqDom) flip = true;
-            else if (baseAnchor === 'bliq' && sliqDom) flip = true;
-          }
-          if (trigger !== 'skew' && this._afPartnerHalted?.()) flip = true;
-          return flip ? (baseMode === 'fast' ? 'slow' : 'fast') : baseMode;
+          return this.cfg.sdcMode ?? 'fast';
         },
 
-        // True only when Auto mode has nothing decisive to act on: the regime is mixed (neither
-        // side crosses Ashfall's dominance threshold), the trigger doesn't independently resolve
-        // it via a partner drawdown, and Ashfall's Mixed Mode is set to "Halt".
-        _sdcAutoHalted() {
-          if ((this.cfg.sdcMode ?? 'fast') !== 'auto') return false;
-          if ((this.cfg.ashPresenceMixedMode ?? 'continue') !== 'halt') return false;
-          const trigger = this.cfg.sdcAutoTrigger ?? 'skew';
-          if (trigger === 'drawdown') return false;
-          const decisive = !!this._afIsBliqDominant?.() || !!this._afIsSliqDominant?.();
-          if (decisive) return false;
-          if (trigger === 'both' && this._afPartnerHalted?.()) return false;
-          return true;
+        // Speeder has no criteria of its own to score, so it reads Multi-Indicator/Ashfall's
+        // shared scorecard (micCollapsedSlotRanks) as an external validity signal instead. Fast
+        // pauses when the live-liq criteria are collectively a loss beyond threshold; Slow pauses
+        // when 0-Liq is. No manual clear needed — the block lifts once the score recovers.
+        _sdcIsModeBlocked(mode) {
+          if (!this.cfg.sdcSlotBlockEnabled) return false;
+          const ranks = this.micCollapsedSlotRanks || {};
+          const score = c => (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const threshold  = baseMargin * ((this.cfg.sdcSlotBlockPct ?? 25) / 100);
+          if (mode === 'fast') {
+            const liveScore = ['sliq', 'bliq', 'msliq', 'mbliq'].reduce((s, t) => s + score(t), 0);
+            return liveScore <= -threshold;
+          }
+          return score('0liq') <= -threshold;
         },
 
         _sdcIsReentryBlocked(sym) {
@@ -284,8 +226,10 @@
 
         async _sdcRunScan() {
           if (!this.cfg.sdcEnabled || !this._sdcPrereqOk) return;
-          const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.() || this._sdcAutoHalted());
+          const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
           if (halted) return;
+          const mode = this._sdcEffectiveMode();
+          if (this._sdcIsModeBlocked(mode)) return;
 
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) return;
@@ -321,7 +265,6 @@
           const split = this._sdcComputeSplit();
           if (!split) return;
 
-          const mode = this._sdcEffectiveMode();
           const poolSyms  = new Set(basePool.map(t => t.symbol));
           const tickerMap = new Map(basePool.map(t => [t.symbol, t]));
           const qualifiers = Object.entries(split.latestMap)
