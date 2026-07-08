@@ -57,16 +57,13 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.55.0';
+  const VERSION       = '1.55.1';
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence mode ('1' — live only). Switching to Only-0/Both won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
   const DEFAULT_SLOTS = [['sliq','fund>1','rasl>25'],['bliq','vm<10','rabl>25'],['msliq','fund<-1','rasl>25'],['mbliq','fund>1','rabl>25'],['sliq','vm>10','rabl>25'],['bliq','fund<-1','rabl>25']];
   const MIW_HIST_KEY  = '__miw_hist_batches';
   const LIQ_TYPES     = ['sliq', 'bliq', 'msliq', 'mbliq'];
-  // Shared 6h window for the self-liq graylist, cross-bot graylist reactions, and the
-  // direction-awareness lock — matches Permafrost/Ashfall's own CROSS_TTL.
-  const GRAYLIST_TTL_6H = 6 * 3600 * 1000;
 
   // Same formula as Permafrost's calcDepth: % deviation of this side's liquidated $ from the
   // average liquidation size recorded across all history. Depth +1 means 1% above average.
@@ -533,14 +530,14 @@
                     <div class="tog-t" :class="cfg.miwSelfLiqGraylistEnabled?'on':''"><div class="tog-k"></div></div>
                     <div>
                       <div class="tog-l">Self-Liq Graylist</div>
-                      <div class="miw-hint">Any liquidation this bot's own surveillance records for a ticker — qualifying or not — graylists that ticker from 0-Liq for 6h. Catches tickers whose latest closed cycle happened to read clean despite a real liquidation shortly before.</div>
+                      <div class="miw-hint">Any liquidation this bot's own surveillance records for a ticker — qualifying or not — graylists that ticker from 0-Liq for the last 25 liq batches. Catches tickers whose latest closed cycle happened to read clean despite a real liquidation shortly before.</div>
                     </div>
                   </label>
                   <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwDirLockEnabled=!cfg.miwDirLockEnabled;persist()}">
                     <div class="tog-t" :class="cfg.miwDirLockEnabled?'on':''"><div class="tog-k"></div></div>
                     <div>
                       <div class="tog-l">Direction Lock</div>
-                      <div class="miw-hint">A closed live-liq trade locks its exact type (S-Liq/B-Liq/mS-Liq/mB-Liq) to that ticker for 6h: a win allows only that type, a loss excludes it. See the Ticker Locks section below to watch it working.</div>
+                      <div class="miw-hint">A closed live-liq trade locks its exact type (S-Liq/B-Liq/mS-Liq/mB-Liq) to that ticker for the last 25 liq batches: a win allows only that type, a loss excludes it. See the Ticker Locks section below to watch it working.</div>
                     </div>
                   </label>
                   <label class="tog" x-show="cfg.miwDirLockEnabled" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwDirLockInvert=!cfg.miwDirLockInvert;persist()}">
@@ -1721,11 +1718,11 @@
           if (this.cfg.permafrostCrossEnabled) this._pfCrossWrite?.('live-liq', sym);
 
           // Direction-awareness lock — a prior win/loss on this exact liq type for this exact
-          // ticker can lock this bot into only that type, or exclude it, for 6h. See
-          // _miwOnPositionScored for how the lock gets written.
+          // ticker can lock this bot into only that type, or exclude it. See _miwOnPositionScored
+          // for how the lock gets written, and _miwLockTtl for the window.
           if (this.cfg.miwDirLockEnabled) {
             const lock = this._miwDirLock?.[sym];
-            if (lock && (Date.now() - lock.ts) < GRAYLIST_TTL_6H) {
+            if (lock && (Date.now() - lock.ts) < this._miwLockTtl()) {
               if (lock.mode === 'lock'    && type !== lock.type) return;
               if (lock.mode === 'exclude' && type === lock.type) return;
             }
@@ -1992,9 +1989,9 @@
         // Registered via Permafrost's registerLiqCloseHook — fires once per closed liq batch with
         // every surveilled symbol's final turnover, qualifying or not. A ticker with ANY recorded
         // liquidation (even one that never crossed the qualifying % threshold) gets graylisted for
-        // 6h so a stale 0liq read (last-batch-only, see _miwCheckCrit's '0liq' branch) can't treat
-        // a ticker that liquidated a couple hours ago as newly "calm" just because its latest
-        // batch happened to close clean.
+        // the _miwLockTtl() window so a stale 0liq read (last-batch-only, see _miwCheckCrit's
+        // '0liq' branch) can't treat a ticker that liquidated a couple hours ago as newly "calm"
+        // just because its latest batch happened to close clean.
         _miwOnLiqClose(results, batch) {
           if (!this.cfg.miwSelfLiqGraylistEnabled) return;
           if (!this._miwSlotGraylist) this._miwSlotGraylist = {};
@@ -2006,18 +2003,30 @@
           }
         },
 
+        // Window for the self-liq graylist, cross-bot graylist reactions, and the direction-
+        // awareness lock — tracks Permafrost's own retained liquidation history (capped at 25
+        // batches) at this bot's own scan cadence, rather than a fixed duration, so a faster or
+        // slower scanMins doesn't drift the exclusion away from what "25 batches" actually covers.
+        // Cross-bot reactions (Partner Live-Liq / Partner 0-Liq Win) also can't outlive
+        // Permafrost/Ashfall's own CROSS_TTL (6h) regardless, since that's how long the
+        // underlying broadcast event itself survives in _pfCrossRead()/_afCrossRead().
+        _miwLockTtl() {
+          return (this.cfg.scanMins ?? 15) * 60000 * 25;
+        },
+
         _miwIsSlotGraylisted(sym) {
           const g = this._miwSlotGraylist?.[sym];
           if (!g || !(g.ts > 0)) return false;
-          return (Date.now() - g.ts) < GRAYLIST_TTL_6H;
+          return (Date.now() - g.ts) < this._miwLockTtl();
         },
 
         // Called from Permafrost's pseudoClosePosition with the closed position's symbol,
         // criteria, and realized PnL. If the criteria include a live liq type (sliq/bliq/msliq/
-        // mbliq), locks or excludes that exact type for that exact ticker for 6h — default: a
-        // win locks this bot into repeating only that type, a loss excludes it. miwDirLockInvert
-        // flips both: a win excludes the type (don't repeat a move already spent), a loss locks
-        // into it (bet the losing read was actually right). Breakeven (pnl === 0) is a no-op.
+        // mbliq), locks or excludes that exact type for that exact ticker for the _miwLockTtl()
+        // window — default: a win locks this bot into repeating only that type, a loss excludes
+        // it. miwDirLockInvert flips both: a win excludes the type (don't repeat a move already
+        // spent), a loss locks into it (bet the losing read was actually right). Breakeven
+        // (pnl === 0) is a no-op.
         _miwOnPositionScored(symbol, criteria, pnl) {
           if (!this.cfg.miwDirLockEnabled) return;
           if (typeof pnl !== 'number' || pnl === 0) return;
@@ -2037,37 +2046,45 @@
         // even though all four answer the same question — "why isn't this ticker eligible?" —
         // and a ticker can be caught by more than one at once. "Until" is the latest of the
         // ticker's active reasons, since the ticker stays constrained until all of them clear.
+        // Self-Liq/Partner-Live-Liq only affect anything while the 0-Liq path is reachable
+        // (mode !== '1'); Partner-0-Liq-Win/Direction-Lock only affect anything while the live
+        // path is reachable (mode !== '0') — a reason inert under the current mode is skipped
+        // entirely rather than shown as if it were still doing something.
         _miwCombinedLockRows() {
-          const now = Date.now();
+          const now  = Date.now();
+          const ttl  = this._miwLockTtl();
+          const mode = this._miwEffectivePresenceMode();
+          const zeroLiqRelevant = mode !== '1';
+          const liveLiqRelevant = mode !== '0';
           const bySym = {};
-          const add = (sym, text, mode, ts) => {
+          const add = (sym, text, mode_, ts) => {
             if (!bySym[sym]) bySym[sym] = { sym, reasons: [], maxTs: 0 };
-            bySym[sym].reasons.push({ text, mode });
+            bySym[sym].reasons.push({ text, mode: mode_ });
             if (ts > bySym[sym].maxTs) bySym[sym].maxTs = ts;
           };
-          if (this.cfg.miwSelfLiqGraylistEnabled) {
+          if (zeroLiqRelevant && this.cfg.miwSelfLiqGraylistEnabled) {
             for (const [sym, g] of Object.entries(this._miwSlotGraylist || {})) {
-              if ((now - g.ts) < GRAYLIST_TTL_6H) add(sym, 'Self-Liq', 'exclude', g.ts);
+              if ((now - g.ts) < ttl) add(sym, 'Self-Liq', 'exclude', g.ts);
             }
           }
-          if (this.cfg.pfCrossLiqGraylistEnabled) {
+          if (zeroLiqRelevant && this.cfg.pfCrossLiqGraylistEnabled) {
             for (const [sym, g] of Object.entries(this._miwCrossLiqGraylist || {})) {
-              if ((now - g.ts) < GRAYLIST_TTL_6H) add(sym, 'Partner Live-Liq', 'exclude', g.ts);
+              if ((now - g.ts) < ttl) add(sym, 'Partner Live-Liq', 'exclude', g.ts);
             }
           }
-          if (this.cfg.pfCrossWinGraylistEnabled) {
+          if (liveLiqRelevant && this.cfg.pfCrossWinGraylistEnabled) {
             for (const [sym, g] of Object.entries(this._miwCrossWinGraylist || {})) {
-              if ((now - g.ts) < GRAYLIST_TTL_6H) add(sym, 'Partner 0-Liq Win', 'exclude', g.ts);
+              if ((now - g.ts) < ttl) add(sym, 'Partner 0-Liq Win', 'exclude', g.ts);
             }
           }
-          if (this.cfg.miwDirLockEnabled) {
+          if (liveLiqRelevant && this.cfg.miwDirLockEnabled) {
             const labelOf = { sliq: 'S-Liq', bliq: 'B-Liq', msliq: 'mS-Liq', mbliq: 'mB-Liq' };
             for (const [sym, l] of Object.entries(this._miwDirLock || {})) {
-              if ((now - l.ts) < GRAYLIST_TTL_6H) add(sym, labelOf[l.type] || l.type, l.mode, l.ts);
+              if ((now - l.ts) < ttl) add(sym, labelOf[l.type] || l.type, l.mode, l.ts);
             }
           }
           return Object.values(bySym).map(r => {
-            const exp = new Date(r.maxTs + GRAYLIST_TTL_6H);
+            const exp = new Date(r.maxTs + ttl);
             return { sym: r.sym, reasons: r.reasons, until: exp.getHours().toString().padStart(2,'0')+':'+exp.getMinutes().toString().padStart(2,'0') };
           }).sort((a, b) => a.sym.localeCompare(b.sym));
         },
