@@ -2,19 +2,22 @@
   Speeder — Multiplex Plugin for PseudoWinter
   Tentative strategy: shorts whichever ticker's order-flow is running most extreme relative to
   the rest of the market right now — fast or slow, whichever this bot is configured for (Speed
-  Mode: Fast / Slow, default Slow). "Extreme" is not a fixed number of seconds — every scan, the
-  whole known sample of per-ticker order intervals (avg ms between recent trades) is split at
-  the median into a fast half and a slow half, and a ticker only qualifies if its own average is
-  past that half's own mean (a stricter cut than merely landing in that half). The split
-  recomputes every scan from Permafrost's full OC cycle history (deduplicated to each ticker's
-  latest reading), so the threshold continuously adapts to current market conditions instead of
-  drifting stale.
+  Mode: Fast / Slow / Both, default Slow). "Extreme" is not a fixed number of seconds — every
+  scan, the whole known sample of per-ticker order intervals (avg ms between recent trades) is
+  split at the median into a fast half and a slow half, and a ticker only qualifies if its own
+  average is past that half's own mean (a stricter cut than merely landing in that half). The
+  split recomputes every scan from Permafrost's full OC cycle history (deduplicated to each
+  ticker's latest reading), so the threshold continuously adapts to current market conditions
+  instead of drifting stale. Both runs the fast and slow reads independently each scan — each can
+  open its own ticker — rather than picking one side up front.
 
   Slot Blocking (sdwSlotBlockEnabled): Speeder has no criteria of its own to score, so it reads
   Multi-Indicator/Permafrost's shared scorecard (miwCollapsedSlotRanks) as an external validity
   signal instead. If the live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond
-  sdwSlotBlockPct% of base margin, Fast entries pause; if 0-Liq is, Slow entries pause. No manual
-  clear needed — the block lifts once the score recovers. See _sdwIsModeBlocked().
+  sdwSlotBlockPct% of base margin, the fast read pauses; if 0-Liq is, the slow read pauses. This
+  is what actually mediates Both mode in practice — both reads run, but only the one(s) whose
+  scorecard is currently healthy produce entries. No manual clear needed — the block lifts once
+  the score recovers. See _sdwIsModeBlocked()/_sdwActiveModes().
 
   This is a "multiplex" plugin: it borrows Permafrost's existing Order Count Surveillance
   (_ocFetchBatch, _pfOcCycleHistory, _liqLastBatchSyms) by calling/reading it directly, the same
@@ -23,8 +26,8 @@
   plugin logs a warning and stays inactive rather than erroring.
 
   PseudoWinter only ever opens shorts, so this variant only ever trades short — Speed Mode picks
-  which extreme (fast/slow) triggers that short, it does not change the side. See
-  Speeder-Chaser for the long counterpart (same fast/slow toggle, always longs).
+  which extreme(s) (fast/slow) trigger that short, it does not change the side. See
+  Speeder-Chaser for the long counterpart (same fast/slow/both toggle, always longs).
 
   Load via Plugin Manager in PseudoWinter's config panel.
   targetBot: pseudowinter
@@ -33,7 +36,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.4.0';
+  const VERSION = '1.5.0';
   window.__BotPlugin = {
     id:        'speeder-winter',
     name:      'Speeder',
@@ -80,8 +83,9 @@
               <div style="display:flex;gap:4px">
                 <button class="sdw-tab" :class="(cfg.sdwMode??'slow')==='fast'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwMode='fast';persist()}">Fast</button>
                 <button class="sdw-tab" :class="(cfg.sdwMode??'slow')==='slow'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwMode='slow';persist()}">Slow</button>
+                <button class="sdw-tab" :class="(cfg.sdwMode??'slow')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdwMode='both';persist()}">Both</button>
               </div>
-              <div class="sdw-hint">Fast shorts busiest flow, Slow shorts quietest.</div>
+              <div class="sdw-hint">Fast shorts busiest flow, Slow shorts quietest. Both runs each independently — up to one short per side per scan.</div>
               <div style="margin-top:8px">
                 <div class="lbl">Min Split Tickers <b x-text="(cfg.sdwMinSplitTickers??6)"></b></div>
                 <input type="range" min="2" max="25" step="1" x-model.number="cfg.sdwMinSplitTickers" @change="persist()">
@@ -92,23 +96,27 @@
                   <div class="tog-t" :class="cfg.sdwSlotBlockEnabled?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Slot Blocking</div>
-                    <div class="sdw-hint">Pauses Fast when live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond <span x-text="-(cfg.sdwSlotBlockPct??25)"></span>% of base margin, or Slow when 0-Liq is. Reads Multi-Indicator/Permafrost's scorecard — auto-clears once the score recovers.</div>
+                    <div class="sdw-hint">Pauses the fast read when live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond <span x-text="-(cfg.sdwSlotBlockPct??25)"></span>% of base margin, or the slow read when 0-Liq is. This is what mediates Both mode — reads Multi-Indicator/Permafrost's scorecard, auto-clears once it recovers.</div>
                   </div>
                 </label>
                 <div x-show="cfg.sdwSlotBlockEnabled" style="margin-top:4px;margin-left:2px">
                   <input type="range" min="5" max="100" step="5" x-model.number="cfg.sdwSlotBlockPct" :disabled="cfgLocked" @change="persist()">
                   <div class="sdw-hint">Threshold: <span x-text="-(cfg.sdwSlotBlockPct??25)"></span>% of base margin.</div>
-                  <div x-show="_sdwIsModeBlocked(_sdwEffectiveMode())" class="sdw-hint" style="color:rgba(255,120,120,.85)">⛔ Blocked — current mode's scorecard read is a loss beyond threshold.</div>
                 </div>
               </div>
             </div>
             <div x-show="cfg.sdwEnabled" style="margin-top:8px;padding:6px 8px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.15);border-radius:3px;font-family:var(--mono);font-size:8.5px;color:var(--text-lo)">
               <template x-if="_sdwSplit">
-                <span>Sample: <b x-text="_sdwSplit.n"></b> tickers · <b x-text="_sdwEffectiveMode()"></b>-half mean <b x-text="((_sdwEffectiveMode()==='fast'?_sdwSplit.fastMean:_sdwSplit.slowMean)/1000).toFixed(1)+'s'"></b></span>
+                <span>Sample: <b x-text="_sdwSplit.n"></b> tickers · fast-half mean <b x-text="(_sdwSplit.fastMean/1000).toFixed(1)+'s'"></b> · slow-half mean <b x-text="(_sdwSplit.slowMean/1000).toFixed(1)+'s'"></b></span>
               </template>
               <template x-if="!_sdwSplit">
                 <span x-text="_sdwPrereqOk ? _sdwSplitStatusText() : '⚠ Permafrost not loaded — inactive.'"></span>
               </template>
+              <div x-show="cfg.sdwSlotBlockEnabled">
+                <template x-for="m in _sdwActiveModes()" :key="m">
+                  <div x-show="_sdwIsModeBlocked(m)" style="color:rgba(255,120,120,.85);margin-top:2px" x-text="'⛔ '+(m==='fast'?'Fast':'Slow')+' blocked — scorecard read is a loss beyond threshold.'"></div>
+                </template>
+              </div>
             </div>
           </div>
         </div>
@@ -193,9 +201,11 @@
           return split;
         },
 
-        // Every reader should call this, not cfg.sdwMode directly.
-        _sdwEffectiveMode() {
-          return this.cfg.sdwMode ?? 'slow';
+        // Fast/Slow run just their own read; Both runs both independently, each gated by its own
+        // Slot Blocking check — every reader should call this, not cfg.sdwMode directly.
+        _sdwActiveModes() {
+          const m = this.cfg.sdwMode ?? 'slow';
+          return m === 'both' ? ['fast', 'slow'] : [m];
         },
 
         // Speeder has no criteria of its own to score, so it reads Multi-Indicator/Permafrost's
@@ -228,8 +238,6 @@
           if (!this.cfg.sdwEnabled || !this._sdwPrereqOk) return;
           const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
           if (halted) return;
-          const mode = this._sdwEffectiveMode();
-          if (this._sdwIsModeBlocked(mode)) return;
 
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) return;
@@ -267,14 +275,21 @@
 
           const poolSyms  = new Set(basePool.map(t => t.symbol));
           const tickerMap = new Map(basePool.map(t => [t.symbol, t]));
-          const qualifiers = Object.entries(split.latestMap)
-            .filter(([sym]) => poolSyms.has(sym))
-            .filter(([, r]) => mode === 'fast' ? r.avgMs < split.fastMean : r.avgMs > split.slowMean)
-            .sort((a, b) => mode === 'fast' ? a[1].avgMs - b[1].avgMs : b[1].avgMs - a[1].avgMs);
-          if (!qualifiers.length) return;
-
-          const [sym, r] = qualifiers[0];
-          await this._sdwOpen(tickerMap.get(sym), r.avgMs, split, mode);
+          // Both mode runs the fast and slow reads independently — each can open its own ticker
+          // this scan. takenSyms keeps the second pass from also picking whatever the first pass
+          // just opened, in the rare case a small sample lets one ticker qualify for both halves.
+          const takenSyms = new Set();
+          for (const mode of this._sdwActiveModes()) {
+            if (this._sdwIsModeBlocked(mode)) continue;
+            const qualifiers = Object.entries(split.latestMap)
+              .filter(([sym]) => poolSyms.has(sym) && !takenSyms.has(sym))
+              .filter(([, r]) => mode === 'fast' ? r.avgMs < split.fastMean : r.avgMs > split.slowMean)
+              .sort((a, b) => mode === 'fast' ? a[1].avgMs - b[1].avgMs : b[1].avgMs - a[1].avgMs);
+            if (!qualifiers.length) continue;
+            const [sym, r] = qualifiers[0];
+            takenSyms.add(sym);
+            await this._sdwOpen(tickerMap.get(sym), r.avgMs, split, mode);
+          }
         },
 
         async _sdwOpen(t, avgMs, split, mode) {

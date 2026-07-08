@@ -2,19 +2,22 @@
   Speeder — Multiplex Plugin for PseudoChaser
   Tentative strategy: longs whichever ticker's order-flow is running most extreme relative to
   the rest of the market right now — fast or slow, whichever this bot is configured for (Speed
-  Mode: Fast / Slow, default Fast). "Extreme" is not a fixed number of seconds — every scan, the
-  whole known sample of per-ticker order intervals (avg ms between recent trades) is split at
-  the median into a fast half and a slow half, and a ticker only qualifies if its own average is
-  past that half's own mean (a stricter cut than merely landing in that half). The split
-  recomputes every scan from Ashfall's full OC cycle history (deduplicated to each ticker's
-  latest reading), so the threshold continuously adapts to current market conditions instead of
-  drifting stale.
+  Mode: Fast / Slow / Both, default Fast). "Extreme" is not a fixed number of seconds — every
+  scan, the whole known sample of per-ticker order intervals (avg ms between recent trades) is
+  split at the median into a fast half and a slow half, and a ticker only qualifies if its own
+  average is past that half's own mean (a stricter cut than merely landing in that half). The
+  split recomputes every scan from Ashfall's full OC cycle history (deduplicated to each
+  ticker's latest reading), so the threshold continuously adapts to current market conditions
+  instead of drifting stale. Both runs the fast and slow reads independently each scan — each can
+  open its own ticker — rather than picking one side up front.
 
   Slot Blocking (sdcSlotBlockEnabled): Speeder has no criteria of its own to score, so it reads
   Multi-Indicator/Ashfall's shared scorecard (micCollapsedSlotRanks) as an external validity
   signal instead. If the live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond
-  sdcSlotBlockPct% of base margin, Fast entries pause; if 0-Liq is, Slow entries pause. No manual
-  clear needed — the block lifts once the score recovers. See _sdcIsModeBlocked().
+  sdcSlotBlockPct% of base margin, the fast read pauses; if 0-Liq is, the slow read pauses. This
+  is what actually mediates Both mode in practice — both reads run, but only the one(s) whose
+  scorecard is currently healthy produce entries. No manual clear needed — the block lifts once
+  the score recovers. See _sdcIsModeBlocked()/_sdcActiveModes().
 
   This is a "multiplex" plugin: it borrows Ashfall's existing Order Count Surveillance
   (_ocFetchBatch, _afOcCycleHistory, _liqLastBatchSyms) by calling/reading it directly, the same
@@ -23,8 +26,8 @@
   warning and stays inactive rather than erroring.
 
   PseudoChaser only ever opens longs, so this variant only ever trades long — Speed Mode picks
-  which extreme (fast/slow) triggers that long, it does not change the side. See
-  Speeder-Winter for the short counterpart (same fast/slow toggle, always shorts).
+  which extreme(s) (fast/slow) trigger that long, it does not change the side. See
+  Speeder-Winter for the short counterpart (same fast/slow/both toggle, always shorts).
 
   Load via Plugin Manager in PseudoChaser's config panel.
   targetBot: pseudochaser
@@ -33,7 +36,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.4.0';
+  const VERSION = '1.5.0';
   window.__BotPlugin = {
     id:        'speeder-chaser',
     name:      'Speeder',
@@ -80,8 +83,9 @@
               <div style="display:flex;gap:4px">
                 <button class="sdc-tab" :class="(cfg.sdcMode??'fast')==='fast'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcMode='fast';persist()}">Fast</button>
                 <button class="sdc-tab" :class="(cfg.sdcMode??'fast')==='slow'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcMode='slow';persist()}">Slow</button>
+                <button class="sdc-tab" :class="(cfg.sdcMode??'fast')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.sdcMode='both';persist()}">Both</button>
               </div>
-              <div class="sdc-hint">Fast longs busiest flow, Slow longs quietest.</div>
+              <div class="sdc-hint">Fast longs busiest flow, Slow longs quietest. Both runs each independently — up to one long per side per scan.</div>
               <div style="margin-top:8px">
                 <div class="lbl">Min Split Tickers <b x-text="(cfg.sdcMinSplitTickers??6)"></b></div>
                 <input type="range" min="2" max="25" step="1" x-model.number="cfg.sdcMinSplitTickers" @change="persist()">
@@ -92,23 +96,27 @@
                   <div class="tog-t" :class="cfg.sdcSlotBlockEnabled?'on':''"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Slot Blocking</div>
-                    <div class="sdc-hint">Pauses Fast when live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond <span x-text="-(cfg.sdcSlotBlockPct??25)"></span>% of base margin, or Slow when 0-Liq is. Reads Multi-Indicator/Ashfall's scorecard — auto-clears once the score recovers.</div>
+                    <div class="sdc-hint">Pauses the fast read when live-liq criteria (sliq/bliq/msliq/mbliq) are collectively a loss beyond <span x-text="-(cfg.sdcSlotBlockPct??25)"></span>% of base margin, or the slow read when 0-Liq is. This is what mediates Both mode — reads Multi-Indicator/Ashfall's scorecard, auto-clears once it recovers.</div>
                   </div>
                 </label>
                 <div x-show="cfg.sdcSlotBlockEnabled" style="margin-top:4px;margin-left:2px">
                   <input type="range" min="5" max="100" step="5" x-model.number="cfg.sdcSlotBlockPct" :disabled="cfgLocked" @change="persist()">
                   <div class="sdc-hint">Threshold: <span x-text="-(cfg.sdcSlotBlockPct??25)"></span>% of base margin.</div>
-                  <div x-show="_sdcIsModeBlocked(_sdcEffectiveMode())" class="sdc-hint" style="color:rgba(255,120,120,.85)">⛔ Blocked — current mode's scorecard read is a loss beyond threshold.</div>
                 </div>
               </div>
             </div>
             <div x-show="cfg.sdcEnabled" style="margin-top:8px;padding:6px 8px;background:rgba(167,139,250,.04);border:1px solid rgba(167,139,250,.15);border-radius:3px;font-family:var(--mono);font-size:8.5px;color:var(--text-lo)">
               <template x-if="_sdcSplit">
-                <span>Sample: <b x-text="_sdcSplit.n"></b> tickers · <b x-text="_sdcEffectiveMode()"></b>-half mean <b x-text="((_sdcEffectiveMode()==='fast'?_sdcSplit.fastMean:_sdcSplit.slowMean)/1000).toFixed(1)+'s'"></b></span>
+                <span>Sample: <b x-text="_sdcSplit.n"></b> tickers · fast-half mean <b x-text="(_sdcSplit.fastMean/1000).toFixed(1)+'s'"></b> · slow-half mean <b x-text="(_sdcSplit.slowMean/1000).toFixed(1)+'s'"></b></span>
               </template>
               <template x-if="!_sdcSplit">
                 <span x-text="_sdcPrereqOk ? _sdcSplitStatusText() : '⚠ Ashfall not loaded — inactive.'"></span>
               </template>
+              <div x-show="cfg.sdcSlotBlockEnabled">
+                <template x-for="m in _sdcActiveModes()" :key="m">
+                  <div x-show="_sdcIsModeBlocked(m)" style="color:rgba(255,120,120,.85);margin-top:2px" x-text="'⛔ '+(m==='fast'?'Fast':'Slow')+' blocked — scorecard read is a loss beyond threshold.'"></div>
+                </template>
+              </div>
             </div>
           </div>
         </div>
@@ -193,9 +201,11 @@
           return split;
         },
 
-        // Every reader should call this, not cfg.sdcMode directly.
-        _sdcEffectiveMode() {
-          return this.cfg.sdcMode ?? 'fast';
+        // Fast/Slow run just their own read; Both runs both independently, each gated by its own
+        // Slot Blocking check — every reader should call this, not cfg.sdcMode directly.
+        _sdcActiveModes() {
+          const m = this.cfg.sdcMode ?? 'fast';
+          return m === 'both' ? ['fast', 'slow'] : [m];
         },
 
         // Speeder has no criteria of its own to score, so it reads Multi-Indicator/Ashfall's
@@ -228,8 +238,6 @@
           if (!this.cfg.sdcEnabled || !this._sdcPrereqOk) return;
           const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
           if (halted) return;
-          const mode = this._sdcEffectiveMode();
-          if (this._sdcIsModeBlocked(mode)) return;
 
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) return;
@@ -267,14 +275,21 @@
 
           const poolSyms  = new Set(basePool.map(t => t.symbol));
           const tickerMap = new Map(basePool.map(t => [t.symbol, t]));
-          const qualifiers = Object.entries(split.latestMap)
-            .filter(([sym]) => poolSyms.has(sym))
-            .filter(([, r]) => mode === 'fast' ? r.avgMs < split.fastMean : r.avgMs > split.slowMean)
-            .sort((a, b) => mode === 'fast' ? a[1].avgMs - b[1].avgMs : b[1].avgMs - a[1].avgMs);
-          if (!qualifiers.length) return;
-
-          const [sym, r] = qualifiers[0];
-          await this._sdcOpen(tickerMap.get(sym), r.avgMs, split, mode);
+          // Both mode runs the fast and slow reads independently — each can open its own ticker
+          // this scan. takenSyms keeps the second pass from also picking whatever the first pass
+          // just opened, in the rare case a small sample lets one ticker qualify for both halves.
+          const takenSyms = new Set();
+          for (const mode of this._sdcActiveModes()) {
+            if (this._sdcIsModeBlocked(mode)) continue;
+            const qualifiers = Object.entries(split.latestMap)
+              .filter(([sym]) => poolSyms.has(sym) && !takenSyms.has(sym))
+              .filter(([, r]) => mode === 'fast' ? r.avgMs < split.fastMean : r.avgMs > split.slowMean)
+              .sort((a, b) => mode === 'fast' ? a[1].avgMs - b[1].avgMs : b[1].avgMs - a[1].avgMs);
+            if (!qualifiers.length) continue;
+            const [sym, r] = qualifiers[0];
+            takenSyms.add(sym);
+            await this._sdcOpen(tickerMap.get(sym), r.avgMs, split, mode);
+          }
         },
 
         async _sdcOpen(t, avgMs, split, mode) {

@@ -32,8 +32,8 @@ Each file carries its version in two or three places — update **all** that app
 | `plugins/analytics/Ashfall-Chaser.html` | v1.52.4 |
 | `plugins/modes/EverWinter.html` | v1.0.4 |
 | `plugins/modes/SunChaser.html` | v1.0.4 |
-| `plugins/multiplex/Speeder-Chaser.html` | v1.4.0 |
-| `plugins/multiplex/Speeder-Winter.html` | v1.4.0 |
+| `plugins/multiplex/Speeder-Chaser.html` | v1.5.0 |
+| `plugins/multiplex/Speeder-Winter.html` | v1.5.0 |
 
 > Always update the table above after bumping a version so this document stays accurate.
 
