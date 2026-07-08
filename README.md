@@ -79,7 +79,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 |---|---|
 | **Session PnL** | Cumulative realized PnL from all closed trades this session. |
 | **Win / Loss** | Count of profitable vs. losing closed trades. |
-| **Win Rate** | Wins ÷ total closed trades. |
+| **Win Skew** | Share of total PnL magnitude (all closed trades, cumulative) that came from wins — sum of winning PnL ÷ (sum of winning PnL + sum of losing PnL). Weighted by trade size, not just a count of wins vs. losses. |
 | **Avg PnL** | Mean realized PnL per closed trade. |
 | **Open uPnL** | Unrealized PnL across all currently open positions. |
 | **Positions** | Count of open positions. |

@@ -23,8 +23,8 @@ Each file carries its version in two or three places — update **all** that app
 | File | Version |
 |---|---|
 | `ChartWinter.html` | v1.5 |
-| `PseudoWinter.html` | v1.14.2 |
-| `PseudoChaser.html` | v1.10.3 |
+| `PseudoWinter.html` | v1.14.3 |
+| `PseudoChaser.html` | v1.10.4 |
 | `PsychoWinter1.0.html` | v1.0 |
 | `plugins/strategies/MultiIndicator-Winter.html` | v1.55.1 |
 | `plugins/strategies/MultiIndicator-Chaser.html` | v1.54.1 |
