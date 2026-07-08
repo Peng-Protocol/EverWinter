@@ -13,11 +13,17 @@
       surveillance cycle closes, so this stays on the regular scan cadence exactly as before,
       gated by Liq Result Max Age.
 
-  Liquidation Presence (miwLiqPresenceMode: '1' / '0' / 'both' / 'auto') controls which of the
-  two paths are active — 'both' runs live real-liq entries and closed-cycle 0-liq entries side
-  by side, each producing their own slots. 'auto' resolves to '1' or '0' every scan via
-  _miwEffectivePresenceMode() — see that method and _miwAutoPresenceHalted() for the regime
-  logic (Permafrost's aggregate liq skew and/or the partner bot's drawdown state).
+  Liquidation Presence (miwLiqPresenceMode: '1' / '0' / 'both') controls which of the two paths
+  are active — 'both' runs live real-liq entries and closed-cycle 0-liq entries side by side,
+  each producing their own slots.
+
+  Slot Blocking (miwSlotBlockEnabled) is a per-criterion loss circuit breaker: if a liq-anchor
+  type's collapsed scorecard score (own + partner + historical, see miwCollapsedSlotRanks) drops
+  beyond miwSlotBlockPct% of base margin in loss, new entries carrying that type are blocked —
+  continuously re-checked, no manual clear needed. Historical Scoring keeps logging matches
+  through a block (folded into the existing halted-but-still-scoring path) so the score has data
+  to recover with. miwSlotBlockTags extends the same check to the entry's own +24h/-24h and
+  fund+/fund- criteria. Standalone toggle, independent of Liquidation Presence mode.
 
   Secondary criteria (fund, +24h/-24h, vm, lsa/lba/rasl/rabl, iot, iom, ocs, ocx) combine with
   the liq anchor via the same AND-gate slot logic as before. On the live path, anything not
@@ -51,16 +57,13 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.54.1';
+  const VERSION       = '1.55.1';
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence mode ('1' — live only). Switching to Only-0/Both won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
   const DEFAULT_SLOTS = [['sliq','fund>1','rasl>25'],['bliq','vm<10','rabl>25'],['msliq','fund<-1','rasl>25'],['mbliq','fund>1','rabl>25'],['sliq','vm>10','rabl>25'],['bliq','fund<-1','rabl>25']];
   const MIW_HIST_KEY  = '__miw_hist_batches';
   const LIQ_TYPES     = ['sliq', 'bliq', 'msliq', 'mbliq'];
-  // Shared 6h window for the self-liq graylist, cross-bot graylist reactions, and the
-  // direction-awareness lock — matches Permafrost/Ashfall's own CROSS_TTL.
-  const GRAYLIST_TTL_6H = 6 * 3600 * 1000;
 
   // Same formula as Permafrost's calcDepth: % deviation of this side's liquidated $ from the
   // average liquidation size recorded across all history. Depth +1 means 1% above average.
@@ -352,26 +355,27 @@
                       <button class="miw-tab" :class="(cfg.miwLiqPresenceMode??'1')==='1'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwLiqPresenceMode='1';persist()}">Only 1</button>
                       <button class="miw-tab" :class="(cfg.miwLiqPresenceMode??'1')==='0'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwLiqPresenceMode='0';persist()}">Only 0</button>
                       <button class="miw-tab" :class="(cfg.miwLiqPresenceMode??'1')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwLiqPresenceMode='both';persist()}">Both</button>
-                      <button class="miw-tab" :class="(cfg.miwLiqPresenceMode??'1')==='auto'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwLiqPresenceMode='auto';persist()}">Auto</button>
                     </div>
-                    <div class="miw-hint">Liquidation is mandatory for every slot. See README for Only 1/Only 0/Both/Auto details.</div>
-                    <div x-show="(cfg.miwLiqPresenceMode??'1')==='auto'" style="margin-top:8px;padding:6px 8px;background:rgba(96,210,255,.04);border:1px solid rgba(96,210,255,.12);border-radius:3px">
-                      <div class="lbl" style="margin-bottom:4px">Base</div>
-                      <div style="display:flex;gap:4px;flex-wrap:wrap">
-                        <button class="miw-tab" :class="(cfg.miwPresenceBase??'0-sliq')==='1-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPresenceBase='1-sliq';cfg.miwPresenceCurrentBase='1-sliq';persist()}">Only-1 🥵^</button>
-                        <button class="miw-tab" :class="(cfg.miwPresenceBase??'0-sliq')==='1-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPresenceBase='1-bliq';cfg.miwPresenceCurrentBase='1-bliq';persist()}">Only-1 🥶^</button>
-                        <button class="miw-tab" :class="(cfg.miwPresenceBase??'0-sliq')==='0-bliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPresenceBase='0-bliq';cfg.miwPresenceCurrentBase='0-bliq';persist()}">Only-0 🥶^</button>
-                        <button class="miw-tab" :class="(cfg.miwPresenceBase??'0-sliq')==='0-sliq'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPresenceBase='0-sliq';cfg.miwPresenceCurrentBase='0-sliq';persist()}">Only-0 🥵^</button>
+                    <div class="miw-hint">Liquidation is mandatory for every slot. See README for Only 1/Only 0/Both details.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <label class="tog" @click.prevent="if(!cfgLocked){cfg.miwSlotBlockEnabled=!cfg.miwSlotBlockEnabled;persist()}">
+                      <div class="tog-t" :class="cfg.miwSlotBlockEnabled?'on':''"><div class="tog-k"></div></div>
+                      <div>
+                        <div class="tog-l">Slot Blocking</div>
+                        <div class="miw-hint">Blocks new entries whose triggering liquidation type (sliq/bliq/msliq/mbliq/0liq) is a loss beyond <span x-text="-(cfg.miwSlotBlockPct??25)"></span>% of base margin. Auto-clears once the score recovers.</div>
                       </div>
-                      <div class="miw-hint">Which mode runs when the ^-marked regime is dominant — the other regime gets the other mode.</div>
-                      <div class="lbl" style="margin-top:8px;margin-bottom:4px">Trigger</div>
-                      <div style="display:flex;gap:4px">
-                        <button class="miw-tab" :class="(cfg.miwPresenceAutoTrigger??'skew')==='skew'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPresenceAutoTrigger='skew';persist()}">Only-Skew</button>
-                        <button class="miw-tab" :class="(cfg.miwPresenceAutoTrigger??'skew')==='drawdown'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPresenceAutoTrigger='drawdown';persist()}">Only-Drawdown</button>
-                        <button class="miw-tab" :class="(cfg.miwPresenceAutoTrigger??'skew')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPresenceAutoTrigger='both';persist()}">Both</button>
-                      </div>
-                      <div class="miw-hint">See README for Trigger and Mixed Mode details.</div>
-                      <div class="miw-hint" style="margin-top:4px" x-text="(()=>{ const halted=_miwAutoPresenceHalted(); if(halted) return 'Currently: entries halted (mixed regime)'; const eff=_miwEffectivePresenceMode(); return 'Currently resolving to: '+(eff==='1'?'Only 1':eff==='0'?'Only 0':'Both'); })()"></div>
+                    </label>
+                    <div x-show="cfg.miwSlotBlockEnabled" style="margin-top:4px;margin-left:2px">
+                      <input type="range" min="5" max="100" step="5" x-model.number="cfg.miwSlotBlockPct" :disabled="cfgLocked" @change="persist()">
+                      <div class="miw-hint">Threshold: <span x-text="-(cfg.miwSlotBlockPct??25)"></span>% of base margin (<span x-text="'-$'+(((cfg.minNotional||6)/(cfg.leverage||6))*((cfg.miwSlotBlockPct??25)/100)).toFixed(2)"></span> at current settings).</div>
+                      <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.miwSlotBlockTags=!cfg.miwSlotBlockTags;persist()}">
+                        <div class="tog-t" :class="cfg.miwSlotBlockTags?'on':''"><div class="tog-k"></div></div>
+                        <div>
+                          <div class="tog-l">Include Sign Tags</div>
+                          <div class="miw-hint">Also blocks on a losing +24h/-24h or fund+/fund- score, not just the liq type.</div>
+                        </div>
+                      </label>
                     </div>
                   </div>
                   <div class="g" x-show="cfg.miwAutoSlots && (cfg.miwLiqPresenceMode??'1') !== '0'" style="margin-top:8px">
@@ -526,14 +530,14 @@
                     <div class="tog-t" :class="cfg.miwSelfLiqGraylistEnabled?'on':''"><div class="tog-k"></div></div>
                     <div>
                       <div class="tog-l">Self-Liq Graylist</div>
-                      <div class="miw-hint">Any liquidation this bot's own surveillance records for a ticker — qualifying or not — graylists that ticker from 0-Liq for 6h. Catches tickers whose latest closed cycle happened to read clean despite a real liquidation shortly before.</div>
+                      <div class="miw-hint">Any liquidation this bot's own surveillance records for a ticker — qualifying or not — graylists that ticker from 0-Liq for the last 25 liq batches. Catches tickers whose latest closed cycle happened to read clean despite a real liquidation shortly before.</div>
                     </div>
                   </label>
                   <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwDirLockEnabled=!cfg.miwDirLockEnabled;persist()}">
                     <div class="tog-t" :class="cfg.miwDirLockEnabled?'on':''"><div class="tog-k"></div></div>
                     <div>
                       <div class="tog-l">Direction Lock</div>
-                      <div class="miw-hint">A closed live-liq trade locks its exact type (S-Liq/B-Liq/mS-Liq/mB-Liq) to that ticker for 6h: a win allows only that type, a loss excludes it. See the Ticker Locks section below to watch it working.</div>
+                      <div class="miw-hint">A closed live-liq trade locks its exact type (S-Liq/B-Liq/mS-Liq/mB-Liq) to that ticker for the last 25 liq batches: a win allows only that type, a loss excludes it. See the Ticker Locks section below to watch it working.</div>
                     </div>
                   </label>
                   <label class="tog" x-show="cfg.miwDirLockEnabled" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.miwDirLockInvert=!cfg.miwDirLockInvert;persist()}">
@@ -678,10 +682,13 @@
           if (this.cfg.miwSubstitutionProtectWinners === undefined) this.cfg.miwSubstitutionProtectWinners = false;
           if (this.cfg.miwLiqResultMaxCycles   === undefined) this.cfg.miwLiqResultMaxCycles   = 2;
           if (this.cfg.miwLiqPresenceMode      === undefined) this.cfg.miwLiqPresenceMode      = '0';
-          if (this.cfg.miwPresenceBase         === undefined) this.cfg.miwPresenceBase         = '0-sliq';
-          if (this.cfg.miwPresenceCurrentBase  === undefined) this.cfg.miwPresenceCurrentBase  = this.cfg.miwPresenceBase;
-          if (this.cfg.miwLastPartnerDrawdownTs === undefined) this.cfg.miwLastPartnerDrawdownTs = 0;
-          if (this.cfg.miwPresenceAutoTrigger  === undefined) this.cfg.miwPresenceAutoTrigger  = 'skew';
+          if (this.cfg.miwLiqPresenceMode === 'auto') {
+            this.cfg.miwLiqPresenceMode = 'both';
+            this.log('[MIW] Auto Liquidation Presence removed — migrated to Both.', 'warn');
+          }
+          if (this.cfg.miwSlotBlockEnabled     === undefined) this.cfg.miwSlotBlockEnabled     = true;
+          if (this.cfg.miwSlotBlockPct         === undefined) this.cfg.miwSlotBlockPct         = 25;
+          if (this.cfg.miwSlotBlockTags        === undefined) this.cfg.miwSlotBlockTags        = false;
           if (this.cfg.miwLiveDepthThreshold   === undefined) this.cfg.miwLiveDepthThreshold   = 1;
           if (this.cfg.miwReentryBlockMode     === undefined) this.cfg.miwReentryBlockMode     = 'losers';
           if (this.cfg.miwSubstitutionProtectPathA === undefined) this.cfg.miwSubstitutionProtectPathA = true;
@@ -761,8 +768,7 @@
           });
           this.registerCloseReason?.('substitution', 'Sub');
           this.registerLiqMessageHook?.((batch, sym) => { this._miwOnLiqMessage(batch, sym); });
-          const _presenceRaw = this.cfg.miwLiqPresenceMode ?? '1';
-          const _presenceStr = _presenceRaw === 'auto' ? `auto (initial ${this.cfg.miwPresenceBase ?? '0-sliq'}, current ${this.cfg.miwPresenceCurrentBase || this.cfg.miwPresenceBase}, trigger ${this.cfg.miwPresenceAutoTrigger ?? 'skew'}) → ${this._miwEffectivePresenceMode()}` : _presenceRaw;
+          const _presenceStr = this.cfg.miwLiqPresenceMode ?? '1';
           this.log(`[MIW] Multi-Indicator (Winter) v${VERSION} loaded — ${this.cfg.miwEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.miwSlots||[]).length} slots | ${this.cfg.miwPicks}/cycle | presence: ${_presenceStr}`, 'info');
           this.renderTradeFeed?.();
         },
@@ -956,9 +962,9 @@
 
         async _miwRunScan() {
           if (!this.cfg.miwEnabled) return;
-          const _miwHalted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.() || this._miwAutoPresenceHalted());
+          const _miwHalted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
           if (_miwHalted) {
-            if (!this._miwHaltLogged) { this.log(`[MIW] 💡 Halted — ${this._isGainsLocked?.() ? 'gains lock' : this._isDrawdownHalted?.() ? 'drawdown halt' : 'Auto Presence mixed regime'} active; hist scoring continues`, 'info'); this._miwHaltLogged = true; }
+            if (!this._miwHaltLogged) { this.log(`[MIW] 💡 Halted — ${this._isGainsLocked?.() ? 'gains lock' : 'drawdown halt'} active; hist scoring continues`, 'info'); this._miwHaltLogged = true; }
           } else {
             this._miwHaltLogged = false;
           }
@@ -1168,7 +1174,9 @@
               : (a.slotIdx - b.slotIdx || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0))));
 
           this._miwLogHistMatches(pool);
-          const entryPool = pool;
+          // Slot Blocking runs after hist logging so a blocked type keeps generating the
+          // data it needs to recover (see _miwIsEntryBlocked) — it only stops the real open.
+          const entryPool = pool.filter(e => !this._miwIsEntryBlocked('0liq', e.annotCrits));
 
           if (_miwHalted) return;
 
@@ -1682,9 +1690,8 @@
           // scan-time checker can never resolve a live liq anchor on its own (see _miwCheckCrit —
           // sliq/bliq/msliq/mbliq have no branch there). Falls through to a hist-only simulation
           // instead of returning, gated the same way _miwHistScoringActive() already gates the
-          // scan-time path. Auto Presence's own halt (mixed regime, Mixed Mode set to Halt) is
-          // folded in here too — same "new entries pause, hist scoring keeps logging" treatment.
-          const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.() || this._miwAutoPresenceHalted());
+          // scan-time path.
+          const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
           if (halted && !this._miwHistScoringActive()) return;
           if (this._isSymbolBanned?.(sym)) return;
           if (!halted && this._miwIsReentryBlocked(sym)) return;
@@ -1711,11 +1718,11 @@
           if (this.cfg.permafrostCrossEnabled) this._pfCrossWrite?.('live-liq', sym);
 
           // Direction-awareness lock — a prior win/loss on this exact liq type for this exact
-          // ticker can lock this bot into only that type, or exclude it, for 6h. See
-          // _miwOnPositionScored for how the lock gets written.
+          // ticker can lock this bot into only that type, or exclude it. See _miwOnPositionScored
+          // for how the lock gets written, and _miwLockTtl for the window.
           if (this.cfg.miwDirLockEnabled) {
             const lock = this._miwDirLock?.[sym];
-            if (lock && (Date.now() - lock.ts) < GRAYLIST_TTL_6H) {
+            if (lock && (Date.now() - lock.ts) < this._miwLockTtl()) {
               if (lock.mode === 'lock'    && type !== lock.type) return;
               if (lock.mode === 'exclude' && type === lock.type) return;
             }
@@ -1786,11 +1793,12 @@
               // would fail its own anchor check anyway.
               const annotCrits = slot.map(c => this._miwAnnotateLiveCrit(c, t, mcap, type, depth, ocResultsMap));
 
-              // Halted: everything above (banlist, direction lock, cross-win graylist, criteria
-              // match) is exactly what a real entry would have checked, so this is a genuine
-              // match a real entry would have taken were the halt not active — log it as a hist
-              // target and stop, same as the real path does below.
-              if (halted) {
+              // Halted or Slot-Blocked: everything above (banlist, direction lock, cross-win
+              // graylist, criteria match) is exactly what a real entry would have checked, so
+              // this is a genuine match a real entry would have taken were it not blocked — log
+              // it as a hist target and stop, same as the real path does below. Slot Blocking
+              // still lets hist scoring log through it so the score has data to recover with.
+              if (halted || this._miwIsEntryBlocked(anchor, annotCrits)) {
                 this._miwLogLiveHistMatch(sym, annotCrits);
                 return;
               }
@@ -1920,84 +1928,41 @@
           return (slot || []).find(c => LIQ_TYPES.some(t => c.startsWith(t)) || c === '0liq') || null;
         },
 
-        _miwNormalizePresenceBase(base) {
-          const [mode, anchor] = String(base || this.cfg.miwPresenceBase || '0-sliq').split('-');
-          return `${mode === '0' ? '0' : '1'}-${anchor === 'bliq' ? 'bliq' : 'sliq'}`;
-        },
-
-        _miwOppositePresenceBase(base) {
-          const [mode, anchor] = this._miwNormalizePresenceBase(base).split('-');
-          return `${mode === '1' ? '0' : '1'}-${anchor}`;
-        },
-
-        _miwApplyPresenceBase(base, reason = 'update') {
-          if ((this.cfg.miwLiqPresenceMode ?? '1') !== 'auto') return false;
-          const next = this._miwNormalizePresenceBase(base);
-          if (this.cfg.miwPresenceCurrentBase === next) return false;
-          this.cfg.miwPresenceCurrentBase = next;
-          if (typeof this.persist === 'function') this.persist();
-          this.log(`[MIW] Liquidation Presence current base → ${next} (${reason}).`, 'warn');
-          return true;
-        },
-
-        _miwSwitchPresenceBaseAfterDrawdown() {
-          return this._miwApplyPresenceBase(this._miwOppositePresenceBase(this.cfg.miwPresenceCurrentBase || this.cfg.miwPresenceBase), 'own drawdown');
-        },
-
-        _miwApplyPartnerDrawdownPresenceBase(evt) {
-          if (!evt || evt.kind !== 'ddh-start') return false;
-          if ((this.cfg.miwLiqPresenceMode ?? '1') !== 'auto') return false;
-          if ((Date.now() - (evt.ts || 0)) >= GRAYLIST_TTL_6H) return false;
-          if (this.cfg.miwLastPartnerDrawdownTs >= evt.ts) return false;
-          const partnerBase = evt.currentBase || evt.base;
-          if (!partnerBase && evt.mode !== '0' && evt.mode !== '1') return false;
-          const [, ownAnchor] = this._miwNormalizePresenceBase(this.cfg.miwPresenceCurrentBase || this.cfg.miwPresenceBase).split('-');
-          const next = partnerBase ? this._miwNormalizePresenceBase(partnerBase) : `${evt.mode}-${ownAnchor}`;
-          this.cfg.miwLastPartnerDrawdownTs = evt.ts;
-          const changed = this._miwApplyPresenceBase(next, `partner drawdown @ ${new Date(evt.ts).toLocaleTimeString()}`);
-          if (!changed && typeof this.persist === 'function') this.persist();
-          return changed;
-        },
-
-        // Resolves Liquidation Presence to an actual '1'/'0'/'both' — every other reader of the
-        // mode should call this, not cfg.miwLiqPresenceMode directly, so 'auto' resolves
-        // identically everywhere. Base is stored as "{mode}-{anchor}" (e.g. '0-sliq' = "Only-0
-        // 🥵^") — the anchor names which regime (sliq/bliq dominant, per Permafrost's aggregate
-        // skew) uses the named mode; the opposite regime gets the opposite mode. Only-Drawdown
-        // (a partner halt, via Cross Broadcast) also flips to the opposite mode, per the Trigger
-        // setting. A mixed regime (neither side dominant) with no drawdown flip resolves to
-        // Base's own named mode when Permafrost's Mixed Mode is "Continue" — see
-        // _miwAutoPresenceHalted for the "Halt" case.
+        // Every other reader of the mode should call this, not cfg.miwLiqPresenceMode directly.
         _miwEffectivePresenceMode() {
-          const raw = this.cfg.miwLiqPresenceMode ?? '1';
-          if (raw !== 'auto') return raw;
-          const [baseMode, baseAnchor] = this._miwNormalizePresenceBase(this.cfg.miwPresenceCurrentBase || this.cfg.miwPresenceBase || '0-sliq').split('-');
-          const trigger = this.cfg.miwPresenceAutoTrigger ?? 'skew';
-          let flip = false;
-          if (trigger !== 'drawdown') {
-            const bliqDom = !!this._pfIsBliqDominant?.();
-            const sliqDom = !!this._pfIsSliqDominant?.();
-            if (baseAnchor === 'sliq' && bliqDom) flip = true;
-            else if (baseAnchor === 'bliq' && sliqDom) flip = true;
-          }
-          if (trigger !== 'skew' && this._pfPartnerHalted?.()) flip = true;
-          return flip ? (baseMode === '1' ? '0' : '1') : baseMode;
+          return this.cfg.miwLiqPresenceMode ?? '1';
         },
 
-        // True only when Auto mode has nothing decisive to act on: the regime is mixed (neither
-        // side crosses Permafrost's dominance threshold), the trigger doesn't independently
-        // resolve it via a partner drawdown, and Permafrost's Mixed Mode is set to "Halt". Meant
-        // to be folded into the same halted-check as drawdown/gains-lock (see _miwRunScan and
-        // _miwOnLiqMessage) — new entries pause, existing positions are untouched.
-        _miwAutoPresenceHalted() {
-          if ((this.cfg.miwLiqPresenceMode ?? '1') !== 'auto') return false;
-          if ((this.cfg.pfPresenceMixedMode ?? 'continue') !== 'halt') return false;
-          const trigger = this.cfg.miwPresenceAutoTrigger ?? 'skew';
-          if (trigger === 'drawdown') return false;
-          const decisive = !!this._pfIsBliqDominant?.() || !!this._pfIsSliqDominant?.();
-          if (decisive) return false;
-          if (trigger === 'both' && this._pfPartnerHalted?.()) return false;
-          return true;
+        // Shared collapsed-rank lookup (own + partner + historical PnL, see miwCollapsedSlotRanks)
+        // for a single criterion key. +24h/-24h are bare, already-signed keys; every other
+        // criterion's rank accumulates under a sign-suffixed key (e.g. 'sliq+', 'fund-'), so both
+        // variants are summed.
+        _miwCritScore(c) {
+          const ranks = this.miwCollapsedSlotRanks || {};
+          if (c === '+24h' || c === '-24h') return ranks[c] ?? 0;
+          return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
+        },
+
+        // Slot Blocking: true once a criterion's collapsed score is a loss beyond the configured
+        // % of base margin. Auto-clears the moment the score recovers — no manual reset needed.
+        _miwIsCritBlocked(c) {
+          if (!this.cfg.miwSlotBlockEnabled) return false;
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const threshold  = baseMargin * ((this.cfg.miwSlotBlockPct ?? 25) / 100);
+          return this._miwCritScore(c) <= -threshold;
+        },
+
+        // Always checks the triggering liq-anchor type. miwSlotBlockTags additionally checks the
+        // entry's own +24h/-24h and fund+/fund- tags (read off the already-annotated criteria, so
+        // fund's tier-encoded sign matches the collapsed rank key exactly).
+        _miwIsEntryBlocked(anchor, annotCrits) {
+          if (this._miwIsCritBlocked(anchor)) return true;
+          if (!this.cfg.miwSlotBlockTags) return false;
+          return (annotCrits || []).some(c => {
+            if (c === '+24h' || c === '-24h') return this._miwIsCritBlocked(c);
+            if (/^fund[+-]/.test(c)) return this._miwIsCritBlocked(c.replace(/\d+$/, ''));
+            return false;
+          });
         },
 
         // true if this liq anchor is allowed under the current Liquidation Presence mode.
@@ -2024,9 +1989,9 @@
         // Registered via Permafrost's registerLiqCloseHook — fires once per closed liq batch with
         // every surveilled symbol's final turnover, qualifying or not. A ticker with ANY recorded
         // liquidation (even one that never crossed the qualifying % threshold) gets graylisted for
-        // 6h so a stale 0liq read (last-batch-only, see _miwCheckCrit's '0liq' branch) can't treat
-        // a ticker that liquidated a couple hours ago as newly "calm" just because its latest
-        // batch happened to close clean.
+        // the _miwLockTtl() window so a stale 0liq read (last-batch-only, see _miwCheckCrit's
+        // '0liq' branch) can't treat a ticker that liquidated a couple hours ago as newly "calm"
+        // just because its latest batch happened to close clean.
         _miwOnLiqClose(results, batch) {
           if (!this.cfg.miwSelfLiqGraylistEnabled) return;
           if (!this._miwSlotGraylist) this._miwSlotGraylist = {};
@@ -2038,18 +2003,30 @@
           }
         },
 
+        // Window for the self-liq graylist, cross-bot graylist reactions, and the direction-
+        // awareness lock — tracks Permafrost's own retained liquidation history (capped at 25
+        // batches) at this bot's own scan cadence, rather than a fixed duration, so a faster or
+        // slower scanMins doesn't drift the exclusion away from what "25 batches" actually covers.
+        // Cross-bot reactions (Partner Live-Liq / Partner 0-Liq Win) also can't outlive
+        // Permafrost/Ashfall's own CROSS_TTL (6h) regardless, since that's how long the
+        // underlying broadcast event itself survives in _pfCrossRead()/_afCrossRead().
+        _miwLockTtl() {
+          return (this.cfg.scanMins ?? 15) * 60000 * 25;
+        },
+
         _miwIsSlotGraylisted(sym) {
           const g = this._miwSlotGraylist?.[sym];
           if (!g || !(g.ts > 0)) return false;
-          return (Date.now() - g.ts) < GRAYLIST_TTL_6H;
+          return (Date.now() - g.ts) < this._miwLockTtl();
         },
 
         // Called from Permafrost's pseudoClosePosition with the closed position's symbol,
         // criteria, and realized PnL. If the criteria include a live liq type (sliq/bliq/msliq/
-        // mbliq), locks or excludes that exact type for that exact ticker for 6h — default: a
-        // win locks this bot into repeating only that type, a loss excludes it. miwDirLockInvert
-        // flips both: a win excludes the type (don't repeat a move already spent), a loss locks
-        // into it (bet the losing read was actually right). Breakeven (pnl === 0) is a no-op.
+        // mbliq), locks or excludes that exact type for that exact ticker for the _miwLockTtl()
+        // window — default: a win locks this bot into repeating only that type, a loss excludes
+        // it. miwDirLockInvert flips both: a win excludes the type (don't repeat a move already
+        // spent), a loss locks into it (bet the losing read was actually right). Breakeven
+        // (pnl === 0) is a no-op.
         _miwOnPositionScored(symbol, criteria, pnl) {
           if (!this.cfg.miwDirLockEnabled) return;
           if (typeof pnl !== 'number' || pnl === 0) return;
@@ -2069,37 +2046,45 @@
         // even though all four answer the same question — "why isn't this ticker eligible?" —
         // and a ticker can be caught by more than one at once. "Until" is the latest of the
         // ticker's active reasons, since the ticker stays constrained until all of them clear.
+        // Self-Liq/Partner-Live-Liq only affect anything while the 0-Liq path is reachable
+        // (mode !== '1'); Partner-0-Liq-Win/Direction-Lock only affect anything while the live
+        // path is reachable (mode !== '0') — a reason inert under the current mode is skipped
+        // entirely rather than shown as if it were still doing something.
         _miwCombinedLockRows() {
-          const now = Date.now();
+          const now  = Date.now();
+          const ttl  = this._miwLockTtl();
+          const mode = this._miwEffectivePresenceMode();
+          const zeroLiqRelevant = mode !== '1';
+          const liveLiqRelevant = mode !== '0';
           const bySym = {};
-          const add = (sym, text, mode, ts) => {
+          const add = (sym, text, mode_, ts) => {
             if (!bySym[sym]) bySym[sym] = { sym, reasons: [], maxTs: 0 };
-            bySym[sym].reasons.push({ text, mode });
+            bySym[sym].reasons.push({ text, mode: mode_ });
             if (ts > bySym[sym].maxTs) bySym[sym].maxTs = ts;
           };
-          if (this.cfg.miwSelfLiqGraylistEnabled) {
+          if (zeroLiqRelevant && this.cfg.miwSelfLiqGraylistEnabled) {
             for (const [sym, g] of Object.entries(this._miwSlotGraylist || {})) {
-              if ((now - g.ts) < GRAYLIST_TTL_6H) add(sym, 'Self-Liq', 'exclude', g.ts);
+              if ((now - g.ts) < ttl) add(sym, 'Self-Liq', 'exclude', g.ts);
             }
           }
-          if (this.cfg.pfCrossLiqGraylistEnabled) {
+          if (zeroLiqRelevant && this.cfg.pfCrossLiqGraylistEnabled) {
             for (const [sym, g] of Object.entries(this._miwCrossLiqGraylist || {})) {
-              if ((now - g.ts) < GRAYLIST_TTL_6H) add(sym, 'Partner Live-Liq', 'exclude', g.ts);
+              if ((now - g.ts) < ttl) add(sym, 'Partner Live-Liq', 'exclude', g.ts);
             }
           }
-          if (this.cfg.pfCrossWinGraylistEnabled) {
+          if (liveLiqRelevant && this.cfg.pfCrossWinGraylistEnabled) {
             for (const [sym, g] of Object.entries(this._miwCrossWinGraylist || {})) {
-              if ((now - g.ts) < GRAYLIST_TTL_6H) add(sym, 'Partner 0-Liq Win', 'exclude', g.ts);
+              if ((now - g.ts) < ttl) add(sym, 'Partner 0-Liq Win', 'exclude', g.ts);
             }
           }
-          if (this.cfg.miwDirLockEnabled) {
+          if (liveLiqRelevant && this.cfg.miwDirLockEnabled) {
             const labelOf = { sliq: 'S-Liq', bliq: 'B-Liq', msliq: 'mS-Liq', mbliq: 'mB-Liq' };
             for (const [sym, l] of Object.entries(this._miwDirLock || {})) {
-              if ((now - l.ts) < GRAYLIST_TTL_6H) add(sym, labelOf[l.type] || l.type, l.mode, l.ts);
+              if ((now - l.ts) < ttl) add(sym, labelOf[l.type] || l.type, l.mode, l.ts);
             }
           }
           return Object.values(bySym).map(r => {
-            const exp = new Date(r.maxTs + GRAYLIST_TTL_6H);
+            const exp = new Date(r.maxTs + ttl);
             return { sym: r.sym, reasons: r.reasons, until: exp.getHours().toString().padStart(2,'0')+':'+exp.getMinutes().toString().padStart(2,'0') };
           }).sort((a, b) => a.sym.localeCompare(b.sym));
         },
@@ -2145,18 +2130,10 @@
             const anchor = this._miwSlotLiqAnchor(s);
             return !!anchor && this._miwAnchorAllowed(anchor);
           });
-          const ranks = this.miwCollapsedSlotRanks || {};
-          if (!Object.keys(ranks).length) return filtered;
-          // Collapsed rank keys are sign-suffixed (e.g. 'ocx+', 'fund-') per collapseCrit();
-          // bare criterion names never accumulate rank on their own, so every tiered
-          // criterion — not just sliq/bliq — needs both sign variants summed.
-          const getRank = c => {
-            if (c === '+24h' || c === '-24h') return ranks[c] ?? 0;
-            return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
-          };
+          if (!Object.keys(this.miwCollapsedSlotRanks || {}).length) return filtered;
           return filtered.slice().sort((a, b) => {
-            const sa = a.reduce((s, c) => s + getRank(c), 0);
-            const sb = b.reduce((s, c) => s + getRank(c), 0);
+            const sa = a.reduce((s, c) => s + this._miwCritScore(c), 0);
+            const sb = b.reduce((s, c) => s + this._miwCritScore(c), 0);
             return sb - sa;
           });
         },
@@ -2174,7 +2151,7 @@
         _miwHistScoringActive() {
           if (!this.cfg.miwHistScoringEnabled) return false;
           if (this._miwEffectivePresenceMode() !== '1') return true;
-          return !!(this._isDrawdownHalted?.() || this._isGainsLocked?.() || this._miwAutoPresenceHalted());
+          return !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
         },
 
         // Mirrors _miwLogHistMatches's dedupe-key shape exactly so both paths feed the same
