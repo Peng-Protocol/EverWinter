@@ -1,0 +1,2322 @@
+<!--
+  Ashfall Strategy Plugin for PseudoChaser
+  Builds a learned market-structure profile by recording the climate at every
+  drawdown-throttle and gains-lock event — drawdown events mark hostile climate,
+  gains-lock events mark favorable climate. Scan cycles add weaker PnL-labeled
+  samples between those anchors.
+
+  Structure trajectory ("the wave"): a reading is judged in the context of what
+  preceded it, not in isolation. The recent path of the structure lean is tracked
+  and plotted in the accordion, and its direction folds into an inherent bull⇄bear
+  oscillation prior — so a mildly-bullish tape that is turning down reads negative
+  (don't long into the start of a dump). Learned history stays primary; the
+  inherent wave only takes the helm when the profile is thin.
+
+  The profile is direction-agnostic: it only learns what realized PnL says
+  about this installation — the same logic powers Permafrost on PseudoWinter.
+
+  Load via Plugin Manager in PseudoChaser's config panel.
+  Load AFTER SunChaser if using live trading — see README Plugin Stack Order.
+  targetBot: pseudochaser
+-->
+<script>
+(function () {
+  'use strict';
+
+  const VERSION        = '1.53.0';
+  const ASH_KEY        = '__ashfall_chaser_v1';
+  const ASH_LIQ_KEY         = '__ash_liq_batches';
+  const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
+  const ASH_LIQ_SEQUESTER_KEY = '__ash_liq_sequester';
+  const ASH_OC_HIST_KEY     = '__ash_oc_history';
+  const CROSS_KEY      = '__everwinter_cross_v1';
+  const CROSS_TTL      = 6 * 3600 * 1000;
+  const SCORE_KEY      = '__everwinter_scorecard_v1';
+  const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
+  const afCritEmoji = c => {
+    if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '🤑' : '💸') + s; }
+    if (/^vm/.test(c))   return '🔊' + c.slice(2);
+    if (/^lsa/.test(c))  return '🟥' + c.slice(3);
+    if (/^lba/.test(c))  return '🟩' + c.slice(3);
+    if (/^rasl/.test(c)) return '🔴' + c.slice(4);
+    if (/^rabl/.test(c)) return '🟢' + c.slice(4);
+    if (/^msliq/.test(c)) return '💦' + c.slice(5);
+    if (/^mbliq/.test(c)) return '🌨️' + c.slice(5);
+    if (/^sliq/.test(c)) return '🥵' + c.slice(4);
+    if (/^bliq/.test(c)) return '🥶' + c.slice(4);
+    if (/^iot/.test(c))  return '🎲' + c.slice(3);
+    if (/^iom/.test(c))  return '🧲' + c.slice(3);
+    if (/^ocs/.test(c))  return '🔭' + c.slice(3);
+    if (/^ocx/.test(c))  return '📡' + c.slice(3);
+    if (c === '+24h') return '⬆️'; if (c === '-24h') return '⬇️';
+    if (c === '+fund') return '💸'; if (c === '-fund') return '🤑';
+    if (c === '+ocs') return '🔭+'; if (c === '-ocs') return '🔭-';
+    if (c === '0liq') return '⚫';
+    if (c === '>10pct') return '🔊'; if (c === '<10pct') return '🔉';
+    return c;
+  };
+  // Collapses a single recorded (tiered) criterion down to its base+sign bucket, e.g.
+  // "fund+3" -> "fund+", "ocx+18" -> "ocx+". Used both for scorecard display aggregation
+  // and for scorecard storage retention — the sponge quota is meant to cap records per
+  // base-criterion combination, not per exact tier value (which is combinatorially large
+  // and would barely ever repeat, defeating the quota). Bare '+fund'/'-fund' (Blind-Entry/
+  // Liquid-Diver's own tag, never produced by MIC which is always tiered) used to fold into
+  // 'fund>'/'fund<' here so they'd share MIC's bucket — now that the scorecard is split into
+  // separate MIC and Blind-Entry/Liquid-Diver charts that merge no longer serves a purpose,
+  // and it was making the collapsed key get read back through afCritEmoji's tiered-fund
+  // regex branch instead of its bare-tag branch, showing a stray >/< after the emoji.
+  const collapseCrit = c => c.replace(/\d+$/, '');
+  const collapseKey = criteria => [...criteria].map(collapseCrit).sort().join(',');
+  const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
+  const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old burns fade
+  const MIN_MASS       = 6;                    // effective evidence mass required to override the timer
+  const STRONG_MASS    = 12;                   // evidence mass for a *strong* historical bias (2× MIN_MASS)
+  const STRONG_SCORE   = 0.30;                 // |score| at/above which the bias counts as strong
+  const DEFAULT_HALT_MS = 12 * 3600 * 1000;    // stock 12h horizon — the floor unless strong history says otherwise
+  const MIN_HALT_MS    = 1 * 3600 * 1000;      // never resume before 1h (only reachable under a strong bias)
+  const EVENTS_CAP     = 200;
+  const CLOSES_CAP     = 500;
+  const SAMPLE_STATE_KEY = '__ew_sample_state_v1'; // cross-bot sample sharing
+
+  // ── Per-data-type storage cap ──
+  // Each distinct data type (wave, liq history, OC history, scorecard, ...) is capped
+  // independently at TYPE_BYTE_CAP bytes, trimming its own oldest entries when it alone
+  // exceeds budget. Deliberately atomized rather than one blanket cap on the whole plugin
+  // blob, so an oversized data type can't force pruning of unrelated data that's still
+  // well within budget — e.g. a liq-history spike shouldn't cost wave history records.
+  const TYPE_BYTE_CAP = 200 * 1024;
+  function trimToByteCap(arr, maxBytes = TYPE_BYTE_CAP) {
+    // Assumes arr is ordered oldest-first (push-appended). Converges in a handful of
+    // iterations by estimating how many records to drop from the size overshoot, rather
+    // than shifting one at a time and re-stringifying the whole array each try.
+    if (!Array.isArray(arr) || arr.length < 2) return arr;
+    let out = arr;
+    let size = new Blob([JSON.stringify(out)]).size;
+    let guard = 0;
+    while (size > maxBytes && out.length > 1 && guard < 25) {
+      const avg = size / out.length;
+      const excess = size - maxBytes;
+      const drop = Math.min(out.length - 1, Math.max(1, Math.ceil(excess / avg)));
+      out = out.slice(drop);
+      size = new Blob([JSON.stringify(out)]).size;
+      guard++;
+    }
+    return out;
+  }
+
+  // ── Structure trajectory ("the wave") ──
+  // A reading isn't just where the market is now — it's where it came from. We
+  // track the recent path of the structure lean and read its direction, then
+  // fold an *inherent* oscillation prior (markets swing strongly bullish ⇄
+  // strongly bearish) into the decision. History stays primary; the inherent
+  // wave only takes the helm when the learned profile is thin.
+  const WAVE_TTL_MS    = 7 * 24 * 3600 * 1000; // wave retains as much structure history as we have, up to ~a week
+  const WAVE_CAP       = 2000;              // hard cap on stored wave points
+  const WAVE_MIN_PTS   = 3;                 // readings needed before a trajectory is meaningful
+  const W_LEAN         = 0.6;               // inherent-score weight on the current structure level
+  const W_SLOPE        = 0.4;               // inherent-score weight on the trajectory (where it's heading)
+  const W_FIO          = 0.15;               // inherent-score weight on collective FIO (funding-derived) sentiment (direct)
+  const SLOPE_REF      = 0.3;               // lean change over the window that counts as full-scale
+  const DIR            = 1;                 // PseudoChaser longs → favourable structure is bullish/rising
+
+  window.__BotPlugin = {
+    id:        'ashfall-chaser',
+    name:      'Ashfall (Chaser)',
+    version:   VERSION,
+    targetBot: 'pseudochaser',
+    after:     ['sunchaser'],
+    before:    [],
+    conflicts: [],
+    requires:  [],
+    touches:   ['init', 'persist', 'runScan', 'pseudoClosePosition'],
+
+    css: `
+      .ash-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+      .ash-stat { font-family:var(--mono); font-size:9px; color:var(--text-mid); line-height:1.7; }
+      .ash-tabs { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:2px; }
+      .ash-tab { font-family:var(--mono); font-size:9px; padding:3px 9px; border-radius:2px; border:1px solid; cursor:pointer; background:none; transition:border-color .12s,color .12s,background .12s; letter-spacing:.5px; }
+      .ash-tab.on { border-color:rgba(255,150,80,.6); color:#ff9650; background:rgba(255,150,80,.08); }
+      .ash-tab:not(.on) { border-color:rgba(255,255,255,.15); color:var(--text-lo); }
+      .ash-zone { margin-top:8px; padding:8px; background:rgba(255,255,255,.02); border:1px solid rgba(255,255,255,.06); border-radius:3px; }
+      .ash-opt { padding:5px 7px; font-size:9px; font-family:var(--mono); border-radius:2px; border:1px solid; cursor:pointer; background:none; transition:border-color .12s,background .12s,color .12s; }
+    `,
+
+    slots: {
+      'mode-label-extra': `<span x-show="cfg.ashfallEnabled"> + Ashfall</span>`,
+      // Accordion header emoji follows the host-family convention: ♨ for Chaser plugins,
+      // ❄ for Winter plugins (set by Ashfall/Permafrost) — keep all plugin accordions matching.
+      'strategy-accordions': `
+        <div x-data="{ open: false, tC: false, tS: false, tW: false }">
+          <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span>♨ Ashfall</span>
+              <span x-show="cfg.ashfallEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,150,80,.15);border:1px solid rgba(255,150,80,.35);border-radius:2px;color:#ff9650;letter-spacing:1px">ON</span>
+              <span x-show="!cfg.ashfallEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
+            </div>
+            <span class="cfg-acc-arrow" :class="open?'open':''">▶</span>
+          </button>
+          <div x-show="open" x-transition.opacity class="cfg-acc-body">
+            <label class="tog" @click.prevent="if(!cfgLocked){cfg.ashfallEnabled=!cfg.ashfallEnabled;persist()}">
+              <div class="tog-t" :class="cfg.ashfallEnabled?'on':''"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Ashfall Mode</div>
+                <div class="ash-hint">Learns from historical market conditions and outcomes to adapt halt timing and entry behavior.</div>
+              </div>
+            </label>
+            <div class="ash-tabs" style="margin-top:10px">
+              <button class="ash-tab" :class="tC?'on':''" @click="tC=!tC">CROSS</button>
+              <button class="ash-tab" :class="tS?'on':''" @click="tS=!tS">SCORE</button>
+              <button class="ash-tab" :class="tW?'on':''" @click="tW=!tW">WAVE</button>
+            </div>
+            <div class="ash-zone" x-show="tC">
+              <label class="tog" @click.prevent="if(!cfgLocked){cfg.ashfallCrossEnabled=!cfg.ashfallCrossEnabled;persist()}">
+                <div class="tog-t" :class="cfg.ashfallCrossEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Cross Broadcast (Permafrost)</div>
+                  <div class="ash-hint">Broadcasts cascade/sacrifice on close and DDH/gains-lock transitions to Permafrost.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ashfallCrossEnabled" style="margin-top:6px">
+                <label class="tog" @click.prevent="if(!cfgLocked){cfg.ashfallMutualDdLiftEnabled=!cfg.ashfallMutualDdLiftEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.ashfallMutualDdLiftEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Mutual DDH Lift</div>
+                    <div class="ash-hint">When Permafrost is also in drawdown halt, lifts this bot's halt. Checked every 15 s.</div>
+                  </div>
+                </label>
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.ashfallGainsContinuationEnabled=!cfg.ashfallGainsContinuationEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.ashfallGainsContinuationEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Gains Continuation</div>
+                    <div class="ash-hint">When Permafrost reaches its gains threshold and broadcasts a Gains Continuation signal, arms this bot's own drawdown halt for a full configured duration — same as if this bot's own drawdown throttle had just triggered, including bailing open positions if Drawdown Bail is on.</div>
+                  </div>
+                </label>
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.afCrossLiqGraylistEnabled=!cfg.afCrossLiqGraylistEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.afCrossLiqGraylistEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">React to Winter Live-Liq</div>
+                    <div class="ash-hint">When Permafrost logs a live liquidation, graylists that ticker from MIC's 0-Liq path for 6h. Only has an effect while this bot's Liquidation Presence isn't Only-1.</div>
+                  </div>
+                </label>
+                <label class="tog" style="margin-top:6px" @click.prevent="if(!cfgLocked){cfg.afCrossWinGraylistEnabled=!cfg.afCrossWinGraylistEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.afCrossWinGraylistEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">React to Winter 0-Liq Win</div>
+                    <div class="ash-hint">When Permafrost wins a 0-Liq trade, graylists that ticker from MIC's live liq entries for 6h. Only has an effect while this bot's Liquidation Presence isn't Only-0.</div>
+                  </div>
+                </label>
+              </div>
+              <div x-show="cfg.ashfallCrossEnabled && afCrossEvents.length" class="ash-hint" style="margin-top:5px" x-text="afCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Winter — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
+            </div>
+            <div class="ash-zone" x-show="tS">
+              <label class="tog" @click.prevent="if(!cfgLocked){cfg.ashfallScorecardEnabled=!cfg.ashfallScorecardEnabled;_afScoreBuild();persist()}">
+                <div class="tog-t" :class="cfg.ashfallScorecardEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Slot Scorecard</div>
+                  <div class="ash-hint">Cumulative PnL per MIC slot combo across both bots. Partner closes are direction-inverted. Best → worst, left to right.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ashfallScorecardEnabled" style="margin-top:8px">
+                <div class="g">
+                  <div class="lbl">Sponge Quota <b x-text="cfg.afSpongeQuota??30"></b> closes/criterion</div>
+                  <input type="range" min="10" max="200" step="10" x-model.number="cfg.afSpongeQuota" @change="_afScoreBuild();persist()">
+                  <div class="ash-hint">Max recent closes per criterion used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation.</div>
+                </div>
+                <div class="g" style="margin-top:8px">
+                  <div class="lbl">Stale Purge <b x-text="cfg.afStaleSlotDays??7"></b> days</div>
+                  <input type="range" min="1" max="90" step="1" x-model.number="cfg.afStaleSlotDays" @change="_afScoreTrim();_afScoreBuild();persist()">
+                  <div class="ash-hint">Slots with no new closes in this many days are fully removed from the scorecard.</div>
+                </div>
+                <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.afHistScoringEnabled=!cfg.afHistScoringEnabled;_afScoreBuild();persist()}">
+                  <div class="tog-t" :class="cfg.afHistScoringEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Include Historical Scores</div>
+                    <div class="ash-hint">Includes MIC historical (simulated) closes in scorecard calculations. Disable to see real-trades-only profile.</div>
+                  </div>
+                </label>
+                <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.afCoQualPenaltyEnabled=!cfg.afCoQualPenaltyEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.afCoQualPenaltyEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Co-Qualifying Penalty</div>
+                    <div class="ash-hint">Tickers also matching slots with negative collapsed scores are ranked lower. Each additional bad co-qualifying slot deducts from the ticker's sort score.</div>
+                  </div>
+                </label>
+                <div class="g" x-show="cfg.afCoQualPenaltyEnabled" style="margin-top:8px">
+                  <div class="lbl">Depth Multiplier <b x-text="(cfg.afCoQualDepthPct??10)+'%'"></b> per tier</div>
+                  <input type="range" min="0" max="50" step="1" x-model.number="cfg.afCoQualDepthPct" @change="persist()">
+                  <div class="ash-hint">Scales a criterion's collapsed score by how deep the ticker qualifies at — a good score gets better with depth, a bad score gets worse. E.g. at 10%, a criterion scoring +$0.50 is applied as +$0.70 for a ticker qualifying 4 tiers deep.</div>
+                </div>
+              </div>
+            </div>
+            <div class="ash-zone" x-show="tW">
+              <div x-data="{sm:null}">
+              <div style="margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:6px">
+                <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);margin-bottom:4px">SAMPLING BARS</div>
+                <div style="display:flex;flex-wrap:wrap;gap:4px 16px">
+                  <label class="tog" @click.prevent="if(!cfgLocked){cfg.afShowStructure=!(cfg.afShowStructure??false);persist()}">
+                    <div class="tog-t" :class="(cfg.afShowStructure??false)?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">Structure</span>
+                  </label>
+                  <label class="tog" @click.prevent="if(!cfgLocked){cfg.afShowFunding=!(cfg.afShowFunding??false);persist()}">
+                    <div class="tog-t" :class="(cfg.afShowFunding??false)?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">Funding</span>
+                  </label>
+                  <label class="tog" @click.prevent="if(!cfgLocked){cfg.afShowLiq=!(cfg.afShowLiq??true);persist()}">
+                    <div class="tog-t" :class="(cfg.afShowLiq??true)?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">Liq</span>
+                  </label>
+                  <label class="tog" @click.prevent="if(!cfgLocked){cfg.afShowVol=!(cfg.afShowVol??true);persist()}">
+                    <div class="tog-t" :class="(cfg.afShowVol??true)?'on':''"><div class="tog-k"></div></div>
+                    <span class="tog-l">Vol</span>
+                  </label>
+                </div>
+              </div>
+              <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
+              <div class="g">
+                <div class="lbl">Slope Window <b x-text="(cfg.ashfallSlopeWindowHours??24)+'h'"></b></div>
+                <input type="range" min="1" max="24" step="1" x-model.number="cfg.ashfallSlopeWindowHours" @change="persist()">
+                <div class="ash-hint">Timeframe for the directional comparison — "turning bullish/bearish" means the avg lean over the last N hours has shifted vs the N hours before it. Default 6h; raise to 12h for a slower, less reactive signal.</div>
+              </div>
+              <div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <label class="tog" style="font-size:9px" @click="cfg.ashfallFioEnabled=!cfg.ashfallFioEnabled;persist()">
+                  <div class="tog-t" :class="cfg.ashfallFioEnabled?'on':''"><div class="tog-k"></div></div>
+                  <span class="tog-l">Collective FIO</span>
+                </label>
+                <span class="ash-hint" style="margin:0">Aggregates funding rates across all tickers (already in the ticker response — zero extra bandwidth) as a direct crowd-sentiment signal and blends it into the inherent score.</span>
+              </div>
+              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ashLiqEnabled=!cfg.ashLiqEnabled;if(!cfg.ashLiqEnabled)_liqCloseAll();persist()}">
+                <div class="tog-t" :class="cfg.ashLiqEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Liquidation Surveillance</div>
+                  <div class="ash-hint">Subscribes to Bybit live liq feed for a random sample of volatile tickers. Enables 🥵 S-Liq and 🥶 B-Liq criteria in MIC slots.</div>
+                </div>
+              </label>
+              <div x-show="cfg.ashLiqEnabled" style="margin-top:8px">
+                <div class="g">
+                  <div class="lbl">S/B Dominance Threshold <b x-text="(cfg.ashLiqThresholdPct??50)+'%'"></b></div>
+                  <input type="range" min="10" max="90" step="5" x-model.number="cfg.ashLiqThresholdPct" @change="persist()">
+                  <div class="ash-hint">Qualifies S-Liq or B-Liq when that side represents ≥ this share of the ticker's total liquidation turnover in the cycle.</div>
+                </div>
+                <div class="g" style="margin-top:6px">
+                  <div class="lbl">Batch Size <b x-text="(cfg.ashLiqBatchSize??25)"></b> tickers</div>
+                  <input type="range" min="5" max="50" step="5" x-model.number="cfg.ashLiqBatchSize" @change="persist()">
+                  <div class="ash-hint">Random draw per 1h window from ≥6% 24h move pool, disjoint across concurrent batches.</div>
+                </div>
+                <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.ashLiqSequesterEnabled=!cfg.ashLiqSequesterEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.ashLiqSequesterEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">0-Liq Sequester</div>
+                    <div class="ash-hint">Reprioritizes calm (0-Liq) tickers for resurveillance so their clean read doesn't go stale.</div>
+                  </div>
+                </label>
+                <div class="g" x-show="cfg.ashLiqSequesterEnabled" style="margin-top:6px">
+                  <div class="lbl">Sequester Draw Cap <b x-text="(cfg.ashLiqSequesterCap??12)"></b> tickers</div>
+                  <input type="range" min="1" max="25" step="1" x-model.number="cfg.ashLiqSequesterCap" @change="persist()">
+                  <div class="ash-hint">Max sequestered tickers pulled per batch; excess rotate in on later cycles.</div>
+                </div>
+                <div class="g" style="margin-top:6px">
+                  <div class="lbl">Presence Regime Threshold <b x-text="(cfg.ashPresenceSkewThreshold??70)+'%'"></b></div>
+                  <input type="range" min="50" max="95" step="5" x-model.number="cfg.ashPresenceSkewThreshold" @change="persist()">
+                  <div class="ash-hint">Feeds MIW/MIC's and Speeder's Auto mode — see README.</div>
+                </div>
+                <div class="g" style="margin-top:6px">
+                  <div class="lbl">Presence Regime Window <b x-text="(cfg.ashPresenceSkewWindow??0)===0?'full history':(cfg.ashPresenceSkewWindow)+' cycles'"></b></div>
+                  <input type="range" min="0" max="25" step="1" x-model.number="cfg.ashPresenceSkewWindow" @change="persist()">
+                  <div class="ash-hint">Recent liq cycles to aggregate for the regime read. 0 = full history.</div>
+                </div>
+                <div class="g" style="margin-top:6px">
+                  <div class="lbl" style="margin-bottom:4px">When Regime Is Mixed</div>
+                  <div style="display:flex;gap:4px">
+                    <button class="ash-tab" :class="(cfg.ashPresenceMixedMode??'continue')==='continue'?'on':''" @click.prevent="if(!cfgLocked){cfg.ashPresenceMixedMode='continue';persist()}">Continue</button>
+                    <button class="ash-tab" :class="(cfg.ashPresenceMixedMode??'continue')==='halt'?'on':''" @click.prevent="if(!cfgLocked){cfg.ashPresenceMixedMode='halt';persist()}">Halt</button>
+                  </div>
+                  <div class="ash-hint">Continue = stay on base. Halt = pause new entries — see README.</div>
+                </div>
+                <div class="ash-hint" x-text="(()=>{ void tick; const sk=_afRegimeSkew(); if(!sk) return 'Regime: no turnover recorded yet.'; const thr=cfg.ashPresenceSkewThreshold??70; const dom=sk.bPct>=thr?'B-Liq dominant':sk.sPct>=thr?'S-Liq dominant':'mixed'; return 'Regime: '+dom+' (B '+sk.bPct.toFixed(0)+'% / S '+sk.sPct.toFixed(0)+'%)'; })()"></div>
+              </div>
+              <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.afOcEnabled=!cfg.afOcEnabled;persist()}">
+                <div class="tog-t" :class="cfg.afOcEnabled?'on':''"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Order Count Surveillance</div>
+                  <div class="ash-hint">Fetches recent trades for MIC's candidate tickers each scan cycle. Enables 📊 OCS/OCX criteria in MIC slots.</div>
+                </div>
+              </label>
+              <div x-show="cfg.afOcEnabled" style="margin-top:8px">
+                <div class="g">
+                  <div class="lbl">Order Limit <b x-text="(cfg.afOcOrderLimit??100)"></b> orders/ticker</div>
+                  <input type="range" min="10" max="500" step="10" x-model.number="cfg.afOcOrderLimit" @change="persist()">
+                  <div class="ash-hint">Recent trades fetched per ticker per scan cycle. Buy/sell skew and average order interval are computed from this sample alone — no accumulation across cycles.</div>
+                </div>
+                <div class="ash-hint" style="margin-top:4px" x-text="(()=>{ const last=_afOcLatestCycle(); if(!last) return 'no sample yet'; const ago=Math.round((Date.now()-last.ts)/60000)+'m ago'; const n=(last.results||[]).length; return n+' ticker'+(n!==1?'s':'')+' sampled · last: '+ago; })()"></div>
+              </div>
+              </div>
+            </div>
+            <div x-data="{ dzOpen:false }" style="margin-top:8px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
+              <button @click="dzOpen=!dzOpen" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border:1px solid rgba(255,69,96,.25);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px;display:flex;align-items:center;gap:4px"><span x-text="dzOpen?'▾':'▸'"></span>&nbsp;Danger Zone</button>
+              <div x-show="dzOpen" x-transition.opacity style="margin-top:6px;padding:8px;background:rgba(255,69,96,.04);border:1px solid rgba(255,69,96,.18);border-radius:3px">
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+                    <span style="display:inline-flex;align-items:center">
+                      <button @click="afExportAll()" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,150,80,.4);border-radius:2px;background:none;color:#ff9650;cursor:pointer;letter-spacing:.5px">Export</button>
+                    </span>
+                    <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
+                      <button x-show="!c" @click="c=true" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,150,80,.4);border-radius:2px;background:none;color:#ff9650;cursor:pointer;letter-spacing:.5px">Import</button>
+                      <template x-if="c">
+                        <span style="display:inline-flex;gap:3px;align-items:center">
+                          <span style="font-family:var(--mono);font-size:8px;color:#ff9650">Replace profile?</span>
+                          <button @click="document.getElementById('ash-import-file').click(); c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,150,80,.5);border-radius:2px;background:rgba(255,150,80,.12);color:#ff9650;cursor:pointer;letter-spacing:.5px">Yes</button>
+                          <button @click="c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
+                        </span>
+                      </template>
+                    </span>
+                    <input type="file" id="ash-import-file" accept=".json" style="display:none" @change="afImport($event)">
+                    <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
+                      <button x-show="!c" @click="if(!cfgLocked)c=true" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.4);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Clear Profile</button>
+                      <template x-if="c">
+                        <span style="display:inline-flex;gap:3px;align-items:center">
+                          <span style="font-family:var(--mono);font-size:8px;color:var(--short)">Sure?</span>
+                          <button @click="afEvents=[];afCloses=[];afWave=[];persist();log('[ASH] Profile cleared.','warn'); c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:rgba(255,69,96,.12);color:var(--short);cursor:pointer;letter-spacing:.5px">Yes</button>
+                          <button @click="c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
+                        </span>
+                      </template>
+                    </span>
+                  </div>
+                <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
+                  <button x-show="!c" @click="if(!cfgLocked)c=true" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Clear Plugin State</button>
+                  <template x-if="c">
+                    <span style="display:inline-flex;gap:3px;align-items:center">
+                      <span style="font-family:var(--mono);font-size:8px;color:var(--short)">Sure?</span>
+                      <button @click="localStorage.removeItem('__ashfall_chaser_v1');afEvents=[];afCloses=[];afWave=[];persist();log('[ASH] Plugin state cleared from storage.','warn'); c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:rgba(255,69,96,.12);color:var(--short);cursor:pointer;letter-spacing:.5px">Yes</button>
+                      <button @click="c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
+                    </span>
+                  </template>
+                </span>
+                <div class="ash-hint" style="margin-top:4px">Wipes all Ashfall data from browser storage — events, samples, and wave history. Also clears the storage key so no orphaned data lingers if the plugin is removed. Export first if you want to preserve the profile.</div>
+              </div>
+            </div>
+          </div>
+            <div x-show="cfg.ashfallEnabled" style="margin-top:8px">
+              <div class="g" style="margin-top:10px">
+                <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=afStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
+                <div x-html="_afWaveSvg(open && cfg.ashfallEnabled)" style="margin-top:4px;border:1px solid rgba(255,150,80,.15);border-radius:3px;background:rgba(255,150,80,.03)"></div>
+                <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap">
+                  <button @click="cfg.ashfallWaveShowMain=!(cfg.ashfallWaveShowMain??true);persist()" :style="(cfg.ashfallWaveShowMain??true)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Structure</button>
+                  <button @click="cfg.ashfallWaveShowFio=!(cfg.ashfallWaveShowFio??true);persist()" :style="(cfg.ashfallWaveShowFio??true)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">FIO</button>
+                  <button @click="cfg.afShowScore=!(cfg.afShowScore??true);persist()" :style="(cfg.afShowScore??true)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Score</button>
+                </div>
+                <div class="ash-hint">Structure lean path (bull ↑ / bear ↓), up to ~1 week of history. Direction matters — falling tape reads negative for longs even if mildly bullish. History takes priority over the inherent wave when the profile is rich.</div>
+                <div class="ash-hint" style="margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">
+                  <span x-show="cfg.ashfallFioEnabled && afStatus.fioScore != null">FIO <span x-text="afStatus.fioScore>=0?'+':''"></span><span x-text="(afStatus.fioScore??0).toFixed(2)"></span> — <span x-text="(afStatus.fioScore??0)>0.2?'crowd net long':(afStatus.fioScore??0)<-0.2?'crowd net short':'crowd neutral'"></span></span>
+                  <span x-show="(()=>{ void tick; return _afScoreNet().abs>0; })()">Score <span x-text="(()=>{ void tick; const {net,abs}=_afScoreNet(); if(!abs) return ''; const p=net/abs*100; return (p>=0?'+':'')+p.toFixed(1)+'%'; })()" :style="(()=>{ void tick; const {net}=_afScoreNet(); return net>0?'color:#6cd2aa':net<0?'color:#f08080':''; })()"></span></span>
+                </div>
+                <div style="margin-top:10px">
+                  <div x-show="cfg.afShowStructure??false">
+                  <div class="lbl">Structure Sampling <b x-text="afKlineBar.bearSum > 0 || afKlineBar.bullSum > 0 ? '🔴 '+(afKlineBar.bearSum/(afKlineBar.bearSum+afKlineBar.bullSum)*100).toFixed(1)+'% · 🟢 '+(afKlineBar.bullSum/(afKlineBar.bearSum+afKlineBar.bullSum)*100).toFixed(1)+'%' : '—'"></b></div>
+                  <div style="display:flex;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
+                    <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,80,80,.04)">
+                      <div :style="'width:'+(afKlineBar.bearSum+afKlineBar.bullSum>0?Math.min(100,afKlineBar.bearSum/(afKlineBar.bearSum+afKlineBar.bullSum)*100):0)+'%;background:rgba(255,80,80,.55)'"></div>
+                    </div>
+                    <div style="width:1px;background:rgba(255,255,255,.18);flex-shrink:0"></div>
+                    <div style="flex:1;display:flex;justify-content:flex-start;background:rgba(100,220,150,.04)">
+                      <div :style="'width:'+(afKlineBar.bearSum+afKlineBar.bullSum>0?Math.min(100,afKlineBar.bullSum/(afKlineBar.bearSum+afKlineBar.bullSum)*100):0)+'%;background:rgba(100,220,150,.55)'"></div>
+                    </div>
+                  </div>
+                  <div class="ash-hint" style="margin-top:2px">1h candle aggregate % change — last kline sample. Red ← bears · bulls → Green.</div>
+                  </div>
+                  <div x-show="_micLoaded && (cfg.afShowFunding??false) && _micFundSkew" style="margin-top:8px">
+                    <div class="lbl">Funding Rate Sample <b x-text="_micFundSkew ? 'neg '+_micFundSkew.negPct.toFixed(1)+'% · pos '+_micFundSkew.posPct.toFixed(1)+'%' : '—'"></b></div>
+                    <div style="display:flex;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
+                      <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,80,80,.04)">
+                        <div :style="'width:'+(_micFundSkew?Math.min(100,_micFundSkew.negPct):0)+'%;background:rgba(255,80,80,.55)'"></div>
+                      </div>
+                      <div style="width:1px;background:rgba(255,255,255,.18);flex-shrink:0"></div>
+                      <div style="flex:1;display:flex;justify-content:flex-start;background:rgba(100,220,150,.04)">
+                        <div :style="'width:'+(_micFundSkew?Math.min(100,_micFundSkew.posPct):0)+'%;background:rgba(100,220,150,.55)'"></div>
+                      </div>
+                    </div>
+                    <div class="ash-hint" style="margin-top:2px">Funding skew — kline + liq sample union. Red ← neg · pos → Green.</div>
+                  </div>
+                  <div x-show="_micLoaded && (cfg.afShowVol??true) && _micVolSkew" style="margin-top:8px">
+                    <div class="lbl">Volume Sample <b x-text="_micVolSkew ? 'below '+_micVolSkew.belowPct.toFixed(1)+'% · above '+_micVolSkew.abovePct.toFixed(1)+'%' : '—'"></b></div>
+                    <div style="display:flex;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
+                      <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,255,255,.03)">
+                        <div :style="'width:'+(_micVolSkew?Math.min(100,_micVolSkew.belowPct):0)+'%;background:rgba(150,150,160,.55)'"></div>
+                      </div>
+                      <div style="width:1px;background:rgba(255,255,255,.18);flex-shrink:0"></div>
+                      <div style="flex:1;display:flex;justify-content:flex-start;background:rgba(255,140,50,.04)">
+                        <div :style="'width:'+(_micVolSkew?Math.min(100,_micVolSkew.abovePct):0)+'%;background:rgba(255,140,50,.55)'"></div>
+                      </div>
+                    </div>
+                    <div class="ash-hint" style="margin-top:2px">Kline sample — vol relative to 24h avg. Gray ← below avg · above avg → Ember.</div>
+                  </div>
+                  <!-- OC Chart -->
+                  <div x-show="cfg.afOcEnabled && (_afOcCycleHistory||[]).length>0 && _ocChartViable()" style="margin-top:10px" @click.outside="_afOcHighlightedCycleTs=null">
+                    <div style="border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
+                      <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">ORDER INTERVAL SAMPLE</div>
+                      <div style="position:relative" @click="const g=$event.target.closest('[data-oc-cycle-ts]');if(g)_afOcHighlightedCycleTs=Number(g.dataset.ocCycleTs)">
+                        <div x-html="_afOcYAxisHtml||''" style="position:absolute;left:0;top:0;pointer-events:none;z-index:2"></div>
+                        <div x-ref="ocChartWrap" x-effect="tick; $nextTick(()=>{ const el=$refs.ocChartWrap; if(!el) return; const vis=!!el.offsetParent; const n=(_afOcCycleHistory||[]).length; if(!vis){el._ocLastLen=undefined;return;} if(el._ocLastLen!==n){el._ocLastLen=n;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_afOcChartSvg(open && cfg.afOcEnabled)"></div></div>
+                      </div>
+                      <div style="border-top:1px solid rgba(255,255,255,.06);padding:3px 8px 4px">
+                        <div x-text="_afOcSummaryText(open && cfg.afOcEnabled)" style="font-family:var(--mono);font-size:8.5px;color:var(--text-lo)"></div>
+                        <div x-show="_afOcAvgIntervalSec(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;color:rgba(200,160,80,.85);margin-top:1px">Avg order interval: <b x-text="(_afOcAvgIntervalSec(open && cfg.afOcEnabled)||0).toFixed(1)+'s/order'"></b></div>
+                        <div x-html="_afOcInfoHtml(open && cfg.afOcEnabled)" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px"></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div x-show="cfg.ashfallScorecardEnabled && cfg.micEnabled && _micPluginLoaded()" style="margin-top:8px;padding:6px 8px;background:rgba(255,150,80,.03);border:1px solid rgba(255,150,80,.1);border-radius:3px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+                <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)">SLOT SCORECARD (CHASER VIEW)</div>
+                <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
+                  <button x-show="!c" @click="if(!cfgLocked)c=true" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.35);background:rgba(255,80,80,.08);color:rgba(255,80,80,.8);cursor:pointer;letter-spacing:.5px">CLEAR</button>
+                  <template x-if="c">
+                    <span style="display:inline-flex;gap:3px;align-items:center">
+                      <span style="font-family:var(--mono);font-size:7.5px;color:rgba(255,80,80,.8)">Sure?</span>
+                      <button @click="localStorage.removeItem('__everwinter_scorecard_v1'); _afScoreBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
+                      <button @click="c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
+                    </span>
+                  </template>
+                </span>
+              </div>
+              <div x-html="_afScorecardHtml(open && cfg.ashfallScorecardEnabled && cfg.micEnabled && _micPluginLoaded(), 'mic')" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+              <div style="margin-top:5px;display:flex;justify-content:flex-end;gap:4px">
+<button @click="cfg.afScorecardSource=cfg.afScorecardSource==='both'?'hist':cfg.afScorecardSource==='hist'?'traded':'both';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,150,80,.3);background:rgba(255,150,80,.06);color:rgba(255,150,80,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardSource==='hist'?'Hist':cfg.afScorecardSource==='traded'?'Traded':'Both'"></button>
+                <button @click="cfg.afScorecardView=cfg.afScorecardView==='combined'?'own':'combined';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,150,80,.3);background:rgba(255,150,80,.06);color:rgba(255,150,80,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardView==='own'?'Own':'Combined'"></button>
+              </div>
+            </div>
+            <div x-show="cfg.ashfallScorecardEnabled && ((cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded()))" style="margin-top:8px;padding:6px 8px;background:rgba(150,150,255,.03);border:1px solid rgba(150,150,255,.1);border-radius:3px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+                <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)">BLIND-ENTRY / LIQUID-DIVER SCORECARD</div>
+                <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
+                  <button x-show="!c" @click="if(!cfgLocked)c=true" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.35);background:rgba(255,80,80,.08);color:rgba(255,80,80,.8);cursor:pointer;letter-spacing:.5px">CLEAR</button>
+                  <template x-if="c">
+                    <span style="display:inline-flex;gap:3px;align-items:center">
+                      <span style="font-family:var(--mono);font-size:7.5px;color:rgba(255,80,80,.8)">Sure?</span>
+                      <button @click="localStorage.removeItem('__everwinter_scorecard_v1'); _afScoreBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
+                      <button @click="c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
+                    </span>
+                  </template>
+                </span>
+              </div>
+              <div class="ash-hint">Same shared record store as the MIC/MIW scorecard above — CLEAR wipes both.</div>
+              <div x-html="_afScorecardHtml(open && cfg.ashfallScorecardEnabled && ((cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded())), 'blind')" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px"></div>
+              <div style="margin-top:5px;display:flex;justify-content:flex-end;gap:4px">
+<button @click="cfg.afScorecardSource=cfg.afScorecardSource==='both'?'hist':cfg.afScorecardSource==='hist'?'traded':'both';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(150,150,255,.3);background:rgba(150,150,255,.06);color:rgba(150,150,255,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardSource==='hist'?'Hist':cfg.afScorecardSource==='traded'?'Traded':'Both'"></button>
+                <button @click="cfg.afScorecardView=cfg.afScorecardView==='combined'?'own':'combined';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(150,150,255,.3);background:rgba(150,150,255,.06);color:rgba(150,150,255,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardView==='own'?'Own':'Combined'"></button>
+              </div>
+            </div>
+            <!-- Liquidation Surveillance -->
+            <div x-show="(cfg.afShowLiq??true) && cfg.ashLiqEnabled && _liqAllSummary().total > 0" style="margin-top:10px">
+              <div class="lbl">Liquidation Flow <b x-text="(()=>{ const a=_liqAllSummary(); return a.total?'B-Liq '+a.bPct.toFixed(1)+'% · S-Liq '+a.sPct.toFixed(1)+'%':'—'; })()"></b></div>
+              <div style="display:flex;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
+                <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,80,80,.04)">
+                  <div :style="'width:'+(()=>{ const a=_liqAllSummary(); return a.total?Math.min(100,a.bPct).toFixed(1):0; })()+'%;background:rgba(255,80,80,.55)'"></div>
+                </div>
+                <div style="width:1px;background:rgba(255,255,255,.18);flex-shrink:0"></div>
+                <div style="flex:1;display:flex;justify-content:flex-start;background:rgba(100,220,150,.04)">
+                  <div :style="'width:'+(()=>{ const a=_liqAllSummary(); return a.total?Math.min(100,a.sPct).toFixed(1):0; })()+'%;background:rgba(100,220,150,.55)'"></div>
+                </div>
+              </div>
+              <div class="ash-hint" style="margin-top:2px">Full retained-window liq turnover. Red ← B-Liq (buyers liquidated) · S-Liq → Green.</div>
+            </div>
+            <div x-show="cfg.ashLiqEnabled" style="margin-top:10px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
+              <div class="ash-hint" x-text="(()=>{ const n=(_liqBatches||[]).length; const last=(_liqCycleHistory||[]).length?_liqCycleHistory[_liqCycleHistory.length-1]:null; const ago=last?Math.round((Date.now()-last.ts)/60000)+'m ago':'never'; return n+' feed'+(n!==1?'s':'')+' active · last closed: '+ago+' · '+(_liqCycleHistory||[]).length+' recorded'; })()"></div>
+                <div x-show="(_liqBatches||[]).length>0" style="margin-top:6px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
+                  <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">FEED WATCHER</div>
+                  <div x-html="_liqFeedWatcherHtml(open && cfg.ashLiqEnabled)" style="padding:2px 8px 4px"></div>
+                </div>
+                <div @click.outside="_liqHighlightedCycleTs=null">
+                <div x-show="(_liqCycleHistory||[]).length>0" style="margin-top:6px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
+                  <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">LIQUIDATION SAMPLE</div>
+                  <div style="position:relative" @click="const g=$event.target.closest('[data-liq-cycle-ts]');if(g)_liqHighlightedCycleTs=Number(g.dataset.liqCycleTs)">
+                    <div x-html="_liqYAxisHtml" style="position:absolute;left:0;top:0;pointer-events:none;z-index:2"></div>
+                    <div x-show="_liqAvgYPx !== null" :style="'position:absolute;left:0;right:0;top:'+(_liqAvgYPx||0)+'px;border-top:1px dashed rgba(255,255,255,.2);pointer-events:none;z-index:1'"><span style="position:absolute;left:36px;top:-8px;font-family:monospace;font-size:7px;color:rgba(255,255,255,.32);user-select:none">avg</span></div>
+                    <div x-ref="liqChartWrap" x-effect="tick; $nextTick(()=>{ const el=$refs.liqChartWrap; if(!el) return; const vis=!!el.offsetParent; const n=(_liqCycleHistory||[]).length; if(!vis){el._liqLastLen=undefined;return;} if(el._liqLastLen!==n){el._liqLastLen=n;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_liqChartSvg(open && cfg.ashLiqEnabled)"></div></div>
+                  </div>
+                  <div style="border-top:1px solid rgba(255,255,255,.06);padding:3px 8px 4px;display:flex;flex-direction:column;gap:2px">
+                    <div x-text="(()=>{ void tick; const a=_liqSummary(_liqDisplayedResults()||[]); const fmt=v=>v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v.toFixed(0); return a.total?'Highlighted  B-Liq '+a.bPct.toFixed(0)+'% ('+fmt(a.b)+') · S-Liq '+a.sPct.toFixed(0)+'% ('+fmt(a.s)+') · '+a.n+' samples':'Highlighted  —'; })()" style="font-family:var(--mono);font-size:8px;color:var(--text-lo)"></div>
+                    <div x-text="(()=>{ void tick; const a=_liqAllSummary(); const fmt=v=>v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':v.toFixed(0); return a.total?'All   B-Liq '+a.bPct.toFixed(0)+'% ('+fmt(a.b)+') · S-Liq '+a.sPct.toFixed(0)+'% ('+fmt(a.s)+') · '+a.n+' samples':'All   —'; })()" style="font-family:var(--mono);font-size:8px;color:var(--text-lo)"></div>
+                  </div>
+                </div>
+                <div x-show="(_liqDisplayedResults()||[]).length>0" style="margin-top:6px">
+                  <div style="font-family:var(--mono);font-size:8px;color:var(--text-lo);margin-bottom:4px;letter-spacing:1px">HIGHLIGHTED CYCLE<span x-show="_liqHighlightedCycleTs" style="color:rgba(255,150,80,.7)" x-text="_liqDisplayedCycleLabel()"></span></div>
+                  <div x-html="_liqInfoHtml(open && cfg.ashLiqEnabled)" style="display:flex;flex-wrap:wrap;gap:3px"></div>
+                </div>
+                </div>
+            </div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _origInit  = def.init;
+      const _origPers  = def.persist;
+      const _origScan  = def.runScan;
+      const _origClose = def.pseudoClosePosition;
+
+      let _afWasHalted               = false;
+      let _afWasGainsLocked          = false;
+      let _afLastGainsContinuationTs = 0;
+
+      return Object.assign({}, def, {
+
+        afEvents:     [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth } — kept for import compat, not scored
+        afCloses:     [],   // { ts, pnl, skew, breadth } — per-close PnL paired with structure at close time
+        afWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
+        afScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
+        afScorecardView: null,         // persisted in cfg; init below
+        afScorecardSource: null,       // persisted in cfg; init below
+        afScorecardExpanded: null,     // key of currently expanded chip, or null
+        afKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // merged (own + partner) kline bar for display
+        _afOwnKlineBar: null,                       // own-only kline bar before partner merge
+        _afKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
+        _afStructureList: null, _afStructureAt: 0, // own 3h ticker cache independent of host
+        afStatus:  { skew: null, breadth: null, score: null, mass: 0, count: 0, lean: 0, slope: 0, inherent: 0, eff: null, fioScore: null, at: 0 },
+        afCrossEvents: [],
+        _liqBatches: [],
+        _liqLastBatchSyms: [], // tickers picked for liq surveillance on the most recent scan only
+        _liqMessageHooks: [], // plugins push (batch, sym) => void here to react to live liq turnover, e.g. Liquid-Diver
+        _liqCloseHooks: [], // plugins push (results, batch) => void here to react to a closed cycle's final per-symbol snapshot, e.g. Liquid-Diver's 0-liq detection
+        _liqPersistPending: false, // debounce guard for _liqPersistBatches
+        _liqResults: {},
+        _liqResultsVersion: 0,
+        _liqCycleHistory: [],
+        // Symbols whose most recently closed batch read clean (zero combined liq turnover).
+        // Map of symbol -> { qualifiedAt }, refreshed every time a clean close reconfirms it,
+        // deleted the moment a close shows any liquidation. Drives sequestered priority picks
+        // in _liqLaunchBatch so a calm ticker keeps getting resurveilled instead of aging out
+        // of the >6%/-6% mover pool and going dark. See _liqCloseBatch / _liqLaunchBatch.
+        _liqSequester: {},
+        _liqAvgYPx: null,
+        _liqYAxisHtml: '',
+        _liqHighlightedCycleTs: null, // ts of a clicked cycle in the LIQUIDATION SAMPLE chart; null = follow latest
+        _liqAvgSTurnover: 0, // avg sell-liq $ across all recorded cycles — see _liqUpdateAvgTurnover
+        _liqAvgBTurnover: 0, // avg buy-liq $ across all recorded cycles
+        _afOcCycleHistory: [], // rolling per-cycle snapshots: {id, ts, results:[{sym,bc,sc,avgMs,n}]}
+        _afOcCycleCounter: 0,
+        afOcResults: {},       // {[sym]:{bc,sc,avgMs,n}} from the most recent OC fetch batch
+        _ocFetchRunning: false, // guards against overlapping _ocFetchBatch calls
+        _liqLatestResults: [],
+        _liqCycleCounter: 0,
+        // Fixed Y-axis overlay HTML/positions for the OC chart, set as a side effect of
+        // _afOcChartSvg(). Must be pre-declared (not just assigned later inside that method) —
+        // an x-html/x-text binding that reads a property before Alpine has ever seen it
+        // declared throws a ReferenceError during the initial bind, same as
+        // _liqYAxisHtml/_liqAvgYPx above.
+        _afOcYAxisHtml: '',
+        _afOcAvgYPx: null,
+        _afOcHighlightedCycleTs: null, // ts of a clicked cycle in the ORDER INTERVAL SAMPLE chart; null = follow latest
+
+        async init() {
+          await _origInit.call(this);
+          // Sync to the actual restored halt/gains-lock state instead of leaving these at their
+          // false initial value. Without this, reloading the tab mid-halt made the very next
+          // tick see a false→true "transition" that never really happened, rewriting the
+          // cross-event start timestamp to "now" — which silently made an already-old halt look
+          // freshly started, breaking the Mutual DDH Lift age comparison below (it picks the
+          // *older* halt to lift, so an inflated timestamp can flip which side loses the halt).
+          _afWasHalted      = this._isDrawdownHalted?.() ?? false;
+          _afWasGainsLocked = this._isGainsLocked?.()    ?? false;
+          if (this.cfg.ashfallEnabled          === undefined) this.cfg.ashfallEnabled          = true;
+          if (this.cfg.ashfallSlopeWindowHours === undefined) this.cfg.ashfallSlopeWindowHours = 24;
+          // Renamed from ashfallIoEnabled/ashfallWaveShowIo ('IO' read as Open Interest, confusable
+          // with the unrelated iot/iom criteria — this line is purely funding-rate-derived). Fall
+          // back to the old key so an existing user's toggle choice survives the rename.
+          if (this.cfg.ashfallFioEnabled        === undefined) this.cfg.ashfallFioEnabled        = this.cfg.ashfallIoEnabled ?? true;
+          if (this.cfg.ashfallWaveShowMain      === undefined) this.cfg.ashfallWaveShowMain      = true;
+          if (this.cfg.ashfallWaveShowFio        === undefined) this.cfg.ashfallWaveShowFio        = this.cfg.ashfallWaveShowIo ?? true;
+          if (this.cfg.afShowScore              === undefined) this.cfg.afShowScore              = true;
+          if (this.cfg.ashfallCrossEnabled        === undefined) this.cfg.ashfallCrossEnabled        = true;
+          if (this.cfg.afCrossLiqGraylistEnabled  === undefined) this.cfg.afCrossLiqGraylistEnabled  = false;
+          if (this.cfg.afCrossWinGraylistEnabled  === undefined) this.cfg.afCrossWinGraylistEnabled  = true;
+          if (this.cfg.ashfallMutualDdLiftEnabled          === undefined) this.cfg.ashfallMutualDdLiftEnabled          = true;
+          if (this.cfg.ashfallGainsContinuationEnabled     === undefined) this.cfg.ashfallGainsContinuationEnabled     = true;
+          if (this.cfg.ashfallScorecardEnabled           === undefined) this.cfg.ashfallScorecardEnabled           = true;
+          if (this.cfg.afCoQualPenaltyEnabled           === undefined) this.cfg.afCoQualPenaltyEnabled           = true;
+          if (this.cfg.afCoQualDepthPct                 === undefined) this.cfg.afCoQualDepthPct                 = 10;
+          if (this.cfg.afScorecardView                   === undefined) this.cfg.afScorecardView                   = 'combined';
+          if (this.cfg.afScorecardSource                 === undefined) this.cfg.afScorecardSource                 = 'both';
+          if (this.cfg.afSpongeQuota                     === undefined) this.cfg.afSpongeQuota                     = 30;
+          if (this.cfg.afStaleSlotDays                   === undefined) this.cfg.afStaleSlotDays                   = 7;
+          if (this.cfg.afHistScoringEnabled              === undefined) this.cfg.afHistScoringEnabled              = true;
+          if (this.cfg.ashLiqEnabled      === undefined) this.cfg.ashLiqEnabled      = true;
+          if (this.cfg.ashLiqBatchSize    === undefined) this.cfg.ashLiqBatchSize    = 25;
+          if (this.cfg.ashLiqThresholdPct === undefined) this.cfg.ashLiqThresholdPct = 50;
+          if (this.cfg.ashLiqSequesterEnabled === undefined) this.cfg.ashLiqSequesterEnabled = true;
+          if (this.cfg.ashLiqSequesterCap     === undefined) this.cfg.ashLiqSequesterCap     = 12;
+          if (this.cfg.ashPresenceSkewThreshold === undefined) this.cfg.ashPresenceSkewThreshold = 70;
+          if (this.cfg.ashPresenceSkewWindow    === undefined) this.cfg.ashPresenceSkewWindow    = 0;
+          if (this.cfg.ashPresenceMixedMode     === undefined) this.cfg.ashPresenceMixedMode     = 'continue';
+          if (this.cfg.afOcEnabled            === undefined) this.cfg.afOcEnabled            = true;
+          if (this.cfg.afOcOrderLimit         === undefined) this.cfg.afOcOrderLimit         = 100;
+          if (this.cfg.afShowStructure === undefined) this.cfg.afShowStructure = false;
+          if (this.cfg.afShowLiq       === undefined) this.cfg.afShowLiq       = true;
+          if (this.cfg.afShowFunding   === undefined) this.cfg.afShowFunding   = false;
+          if (this.cfg.afShowVol       === undefined) this.cfg.afShowVol       = true;
+          try {
+            const saved = JSON.parse(localStorage.getItem(ASH_LIQ_KEY) || 'null');
+            if (Array.isArray(saved) && this.cfg.ashLiqEnabled) {
+              const valid = saved.filter(s => s.endsAt > Date.now());
+              if (valid.length) {
+                this._liqCycleCounter = Math.max(this._liqCycleCounter, ...valid.map(s => s.id));
+                for (const s of valid) this._liqResumeBatch(s);
+              }
+            }
+          } catch(_) {}
+          try {
+            const hist = JSON.parse(localStorage.getItem(ASH_LIQ_HISTORY_KEY) || 'null');
+            if (Array.isArray(hist) && hist.length) {
+              this._liqCycleHistory = hist.slice(-25);
+              const last = hist[hist.length - 1];
+              this._liqLatestResults = last.results || [];
+              for (const r of last.results || [])
+                this._liqResults[r.sym] = { sLiqPct: r.sLiqPct, bLiqPct: r.bLiqPct, sLiqRaw: r.sLiqRaw, bLiqRaw: r.bLiqRaw, cycleId: last.id, ts: last.ts };
+              this._liqCycleCounter = Math.max(this._liqCycleCounter, last.id || 0);
+            }
+          } catch(_) {}
+          try {
+            const seq = JSON.parse(localStorage.getItem(ASH_LIQ_SEQUESTER_KEY) || 'null');
+            if (seq && typeof seq === 'object') this._liqSequester = seq;
+          } catch(_) {}
+          this._liqUpdateAvgTurnover();
+          try {
+            const _sharedLiq = this._sharedRead?.('liqResults');
+            if (_sharedLiq && Object.keys(_sharedLiq).length) this._liqResults = { ...this._liqResults, ..._sharedLiq };
+          } catch(_) {}
+          try {
+            const _ocHist = JSON.parse(localStorage.getItem(ASH_OC_HIST_KEY) || 'null');
+            if (Array.isArray(_ocHist) && _ocHist.length) {
+              const { cleaned: _cleaned, purged: _purged } = this._ocSanitizeHistory(_ocHist);
+              this._afOcCycleHistory = _cleaned;
+              if (_purged > 0) {
+                this.log(`[ASH] 🧹 Purged ${_purged} legacy OC record(s) from stored history (pre-redesign raw-count schema).`, 'info');
+                this._ocPersistHistory();
+              }
+              // Latest cycle by timestamp, not array position — a slower concurrent fetch
+              // finishing after a newer one has already pushed would otherwise leave a stale
+              // batch sitting last in the array.
+              const _last = this._afOcCycleHistory.reduce((a,c) => (!a || c.ts > a.ts) ? c : a, null);
+              if (_last?.results) for (const r of _last.results) { if (r && typeof r.sym === 'string') this.afOcResults[r.sym] = { bc: r.bc, sc: r.sc, avgMs: r.avgMs, n: r.n }; }
+              this._afOcCycleCounter = Math.max(this._afOcCycleCounter, _last?.id || 0);
+            }
+          } catch(_) {}
+          this._afScoreTrim();
+          this._afScoreBuild();
+          try {
+            const raw = localStorage.getItem(ASH_KEY);
+            if (raw) {
+              const s = JSON.parse(raw);
+              if (Array.isArray(s.events)) this.afEvents = s.events.slice(-EVENTS_CAP);
+              if (Array.isArray(s.closes)) this.afCloses = s.closes.slice(-CLOSES_CAP);
+              if (Array.isArray(s.wave))      this.afWave      = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
+              if (s.afKlineBar?.bearSum != null) this.afKlineBar = s.afKlineBar;
+              // Restore the last-acted-on Gains Continuation broadcast so a reload doesn't
+              // see the same still-recent glk-start as "new" and restart the throttle timer.
+              if (typeof s.lastGainsContinuationTs === 'number') _afLastGainsContinuationTs = s.lastGainsContinuationTs;
+            }
+          } catch(e) {}
+          this.log(`[ASH] Ashfall (Chaser) v${VERSION} loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afCloses.length} closes on record`, 'info');
+          setInterval(() => {
+            if (this.cfg.ashfallCrossEnabled) this._afCheckCross().catch(() => {});
+            // _afScoreBuild() is NOT called here on a timer — its source data (scorecard
+            // records) only changes on a trade close, a config change affecting the
+            // computation, or an import, and it's called from each of those directly. A
+            // periodic rebuild here would just recompute the identical result between those
+            // events for no reason, on every tick's worth of ticks (up to a few thousand
+            // records, twice-sorted) whether or not the Score panel is even open.
+            if (this.cfg.ashfallCrossEnabled) {
+              const _halted  = this._isDrawdownHalted?.() ?? false;
+              const _glocked = this._isGainsLocked?.()    ?? false;
+              if (_halted !== _afWasHalted) {
+                _afWasHalted = _halted;
+                this._afCrossWrite(_halted ? 'ddh-start' : 'ddh-end');
+              }
+              if (_glocked !== _afWasGainsLocked) {
+                _afWasGainsLocked = _glocked;
+                this._afCrossWrite(_glocked ? 'glk-start' : 'glk-end');
+              }
+              if (this.cfg.ashfallMutualDdLiftEnabled && _halted) {
+                const _allEvents   = this._afCrossRead();
+                const _fromPartner = _allEvents.filter(e => e.source === 'winter');
+                const _fromSelf    = _allEvents.filter(e => e.source === 'chaser');
+                const _partnerDdh  = _fromPartner.filter(e => e.kind === 'ddh-start' || e.kind === 'ddh-end').at(-1);
+                const _selfDdh     = _fromSelf.filter(e => e.kind === 'ddh-start').at(-1);
+                if (_partnerDdh?.kind === 'ddh-start' && _selfDdh) {
+                  if (_selfDdh.ts < _partnerDdh.ts) {
+                    this._drawdownHaltUntil = null;
+                    this._haltLoggedKind = null;
+                    this.persist();
+                    this.log('[ASH] ♨ Mutual DDH lift — own halt is older; cleared.', 'info');
+                  }
+                }
+              }
+              if (this.cfg.ashfallGainsContinuationEnabled && this.cfg.drawdownThrottleEnabled !== false) {
+                const _fromPartner = this._afCrossRead().filter(e => e.source === 'winter');
+                const _lastGlk = _fromPartner.filter(e => e.kind === 'glk-start').at(-1);
+                // Explicit recency gate at the point of use — a bot that was offline or just
+                // reloaded may discover a glk-start it's never personally seen, but if the
+                // broadcast itself is already this old, arming a fresh multi-hour halt on top
+                // of time that's already elapsed since Permafrost's gains-lock started is not
+                // the intended "continuation." CROSS_TTL already prunes anything older than
+                // this from _afCrossRead(), but checking it here too makes the recency
+                // requirement explicit rather than an incidental side effect of unrelated
+                // pruning logic.
+                if (_lastGlk && (Date.now() - _lastGlk.ts) < CROSS_TTL && _lastGlk.ts > _afLastGainsContinuationTs) {
+                  _afLastGainsContinuationTs = _lastGlk.ts;
+                  const _gcMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+                  this._drawdownHaltUntil = Date.now() + _gcMs;
+                  this.persist();
+                  this.log('[ASH] ♨ Gains Continuation — Permafrost locked gains; drawdown throttle restarted.', 'warn');
+                  // Same bail-or-not decision the base bot makes for its own drawdown throttle
+                  // trigger — Gains Continuation arms an identical halt, so it defers to the
+                  // same drawdownBailEnabled toggle rather than always or never bailing.
+                  if (this.cfg.drawdownBailEnabled !== false && this.positions.length > 0) {
+                    this.log(`[ASH] ⚡ Gains Continuation bail — closing ${this.positions.length} open position(s)`, 'warn');
+                    setTimeout(() => { this.bailAll().catch(() => {}); }, 0);
+                  }
+                }
+              }
+            }
+            if (this.cfg.ashfallEnabled && (this._isDrawdownHalted?.() ?? false)) {
+              const _cdMs = (this.cfg.bulkTickerCooldownHours ?? 3) * 3600 * 1000;
+              if ((Date.now() - (this._afStructureAt || 0)) >= _cdMs) {
+                this._afFetchStructure().then(r => {
+                  if (!r) return;
+                  this._afAddSample(r);
+                  if (!r._fresh) return;
+                  const { score, mass, count } = this.afStatus;
+                  const _d = this._afDescribe(r, score, mass, count);
+                  this.log(`[ASH] ♨ Structure check (halted) — ${_d.desc} — ${_d.bias}`, 'info');
+                }).catch(() => {});
+              }
+            }
+            // Partner sample: keep wave chart and sampling bars alive using Permafrost's latest data
+            if (this.cfg.ashfallEnabled) {
+              const _ps = this._afReadPartnerSample();
+              this._afMergeKlineBar();
+              if (_ps) {
+                // During own halt: adopt partner's sampling metrics so bars stay current
+                if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) {
+                  if (_ps.fundSkew) this._micFundSkew = _ps.fundSkew;
+                  if (_ps.volSkew)  this._micVolSkew  = _ps.volSkew;
+                }
+                // Merge partner liq history — add entries not already in own history (by ts), sort, cap
+                if (Array.isArray(_ps.liqHistory) && _ps.liqHistory.length) {
+                  const _ownTs = new Set((this._liqCycleHistory || []).map(e => e.ts));
+                  const _added = _ps.liqHistory.filter(e => e.ts && !_ownTs.has(e.ts));
+                  if (_added.length) {
+                    this._liqCycleHistory = [...(this._liqCycleHistory || []), ..._added]
+                      .sort((a, b) => a.ts - b.ts).slice(-25);
+                    this._liqPersistHistory();
+                  }
+                }
+                const _lwTs = this.afWave.length ? this.afWave[this.afWave.length - 1].ts : 0;
+                if (_ps.ts > _lwTs + 60_000) {
+                  this.afWave.push({ ts: _ps.ts, lean: +(_ps.lean ?? 0).toFixed(4), vol: +(_ps.vol ?? 0).toFixed(4), volAbs: _ps.volAbs ?? 0, fio: _ps.fioScore != null ? +_ps.fioScore.toFixed(4) : null, score: null });
+                  const _cut = Date.now() - WAVE_TTL_MS;
+                  if (this.afWave.length && this.afWave[0].ts < _cut) this.afWave = this.afWave.filter(p => p.ts >= _cut);
+                  if (this.afWave.length > WAVE_CAP) this.afWave = this.afWave.slice(-WAVE_CAP);
+                }
+              }
+            }
+          }, 15000);
+        },
+
+        persist() {
+          _origPers.call(this);
+          try {
+            // Each array is its own atomized data type — capped independently so an
+            // oversized one (e.g. volume history) can't crowd out another (e.g. wave).
+            this.afEvents     = trimToByteCap(this.afEvents);
+            this.afCloses     = trimToByteCap(this.afCloses);
+            this.afWave       = trimToByteCap(this.afWave);
+            localStorage.setItem(ASH_KEY, JSON.stringify({
+              events: this.afEvents, closes: this.afCloses, wave: this.afWave,
+              afKlineBar: this.afKlineBar,
+              lastGainsContinuationTs: _afLastGainsContinuationTs,
+            }));
+          } catch(e) {}
+        },
+
+        // ── Market structure reading — full ticker universe, not the curated pools ──
+        async _afFetchStructure() {
+          try {
+            // Reuse the host scan's bulk ticker response when fresh (slow-tick
+            // sampling during halts falls back to fetching — scans don't run then)
+            const cooldownMs = (this.cfg.bulkTickerCooldownHours ?? 3) * 3600 * 1000;
+            let list, _freshData = false;
+            if (this._afStructureList?.length && (Date.now() - (this._afStructureAt || 0)) < cooldownMs) {
+              list = this._afStructureList; // own cache within cooldown
+            } else if (this._lastAllTickers?.length && (Date.now() - (this._lastAllTickersAt || 0)) < 60000) {
+              list = this._lastAllTickers;  // host just fetched this tick — piggyback
+              this._afStructureList = list;
+              this._afStructureAt   = this._lastAllTickersAt;
+              _freshData = true;
+            } else {
+              const _shared = this._sharedRead?.('bulkTickers');
+              if (_shared?.data?.tickers?.length && (Date.now() - (_shared.ts || 0)) < cooldownMs) {
+                list = _shared.data.tickers; // partner fetched recently — adopt
+                this._afStructureList = list;
+                this._afStructureAt   = _shared.ts;
+                _freshData = true;
+              } else {
+                const r = await fetch(`${this.base}/v5/market/tickers?category=linear`);
+                const d = await r.json();
+                if (d.retCode !== 0) return null;
+                list = d.result?.list || [];
+                this._afStructureList = list;
+                this._afStructureAt   = Date.now();
+                _freshData = true;
+              }
+            }
+            let gSum = 0, lSum = 0, gCount = 0, lCount = 0;
+            let gTurnover = 0, lTurnover = 0;
+            let frSum = 0, frCount = 0;
+            for (const t of list) {
+              if (!t.symbol.endsWith('USDT') || t.symbol === 'BTCUSDT') continue;
+              if (parseFloat(t.lastPrice || 0) < 0.001) continue;
+              const ch  = parseFloat(t.price24hPcnt || 0) * 100;
+              const tvr = parseFloat(t.turnover24h  || 0);
+              if (ch > 0)      { gSum += ch; gCount++; gTurnover += tvr; }
+              else if (ch < 0) { lSum += Math.abs(ch); lCount++; lTurnover += tvr; }
+              const fr = parseFloat(t.fundingRate || 0);
+              if (!isNaN(fr)) { frSum += fr * 100; frCount++; } // accumulate as %
+            }
+            const sumT   = gSum + lSum, cntT = gCount + lCount;
+            const totalTvr = gTurnover + lTurnover;
+            const vol    = totalTvr > 0 ? +((gTurnover - lTurnover) / totalTvr).toFixed(4) : 0;
+            const volAbs = +(totalTvr / 1e9).toFixed(2); // USD billions
+
+            // Collective FIO from aggregate funding rate: positive funding = longs paying = crowd net long.
+            // Normalised against 0.05% reference (≈5× the typical 0.01%/8h baseline) → [-1, 1].
+            const fioScore = frCount > 0
+              ? +Math.max(-1, Math.min(1, (frSum / frCount) / 0.05)).toFixed(4)
+              : null;
+
+            return {
+              ts: Date.now(),
+              skew:    sumT > 0 ? (gSum - lSum) / sumT : 0,
+              breadth: cntT > 0 ? (gCount - lCount) / cntT : 0,
+              gCount, lCount,
+              gSum: +gSum.toFixed(1), lSum: +lSum.toFixed(1),
+              vol, volAbs, fioScore, _fresh: _freshData,
+            };
+          } catch(e) { return null; }
+        },
+
+        _afDescribe(reading, score, mass, count) {
+          const lean = (reading.skew + reading.breadth) / 2;
+          const hist = this.afCloses.map(x => Math.abs((x.skew + x.breadth) / 2)).sort((a, b) => a - b);
+          const q = p => hist[Math.min(hist.length - 1, Math.floor(p * hist.length))];
+          const [tFlat, tModerate, tStrong] = hist.length >= 30 ? [q(0.25), q(0.5), q(0.8)] : [0.08, 0.20, 0.40];
+          const mag    = Math.abs(lean);
+          const adverb = mag >= tStrong ? 'strongly ' : mag >= tModerate ? 'moderately ' : 'mildly ';
+          const struct = mag <= tFlat ? 'flat/mixed' : `${adverb}${lean > 0 ? 'bullish' : 'bearish'}`;
+          const slope  = this._afTrajectory().slope;
+          const trend  = slope > 0.05 ? ', rising' : slope < -0.05 ? ', falling' : '';
+          const desc   = `${struct}${trend}`;
+          const inherent = this._afInherent(lean, slope, reading.fioScore ?? null);
+          const eff    = this._afEffectiveScore(score, mass, inherent);
+          let bias;
+          if (score === null || mass < MIN_MASS) {
+            bias = 'thin history';
+          } else {
+            const entryMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+            const avgPnl = score * entryMargin;
+            const sign = avgPnl >= 0 ? '+' : '-';
+            bias = `avg ${sign}${Math.abs(avgPnl).toFixed(2)}/position (${count} similar close${count === 1 ? '' : 's'})`;
+          }
+          return { desc, bias, eff };
+        },
+
+        // ── The wave: recent path of the structure lean (oldest → newest) ──
+        // lean = (skew + breadth) / 2 ∈ [−1,1]: +1 strongly bullish, −1 strongly bearish.
+        _afWaveSeries() {
+          const cut = Date.now() - WAVE_TTL_MS;
+          return this.afWave.filter(p => p.ts >= cut);
+        },
+
+        // Append a structure-lean point to the wave and prune by age / cap. Kept
+        // separate from afCloses (which track realized PnL) so the wave
+        // retains the full trajectory for as long as we have data, up to ~a week.
+        _afScoreNet() {
+          const cs = this.micCollapsedCritStats || {};
+          const vals = Object.values(cs);
+          const net = vals.reduce((a,c)=>a+c.pnl,0);
+          const abs = vals.reduce((a,c)=>a+Math.abs(c.pnl),0);
+          return { net, abs };
+        },
+
+        _afPushWave(reading) {
+          const { net: _scNet, abs: _scAbs } = this._afScoreNet();
+          const _score  = _scAbs > 0 ? +((_scNet / _scAbs).toFixed(4)) : null;
+          this.afWave.push({ ts: reading.ts, lean: +(((reading.skew + reading.breadth) / 2)).toFixed(4), vol: reading.vol ?? 0, volAbs: reading.volAbs ?? 0, fio: reading.fioScore ?? null, score: _score });
+          const cut = Date.now() - WAVE_TTL_MS;
+          if (this.afWave.length && this.afWave[0].ts < cut) this.afWave = this.afWave.filter(p => p.ts >= cut);
+          if (this.afWave.length > WAVE_CAP) this.afWave = this.afWave.slice(-WAVE_CAP);
+        },
+
+        // Current lean plus its trajectory (slope = avg lean over last N hours − avg lean N–2N hours ago).
+        // Fixed time window (cfg.ashfallSlopeWindowHours, default 6h) so directional signals
+        // always reflect the same timeframe regardless of wave history depth.
+        // slope > 0 → drifting bullish; slope < 0 → drifting bearish.
+        _afTrajectory() {
+          const wave = this._afWaveSeries();
+          const n    = wave.length;
+          const lean = n ? wave[n - 1].lean : (((this.afStatus.skew ?? 0) + (this.afStatus.breadth ?? 0)) / 2);
+          if (n < WAVE_MIN_PTS) return { lean, slope: 0, n };
+          const winMs     = (this.cfg.ashfallSlopeWindowHours ?? 24) * 3600 * 1000;
+          const now       = Date.now();
+          const recentPts = wave.filter(p => p.ts >= now - winMs);
+          const olderPts  = wave.filter(p => p.ts >= now - 2 * winMs && p.ts < now - winMs);
+          if (!recentPts.length || !olderPts.length) return { lean, slope: 0, n };
+          const recent = recentPts.reduce((a, p) => a + p.lean, 0) / recentPts.length;
+          const older  = olderPts.reduce((a, p) => a + p.lean, 0) / olderPts.length;
+          return { lean, slope: recent - older, n };
+        },
+
+        // Inherent favourability for this bot's direction (DIR): a long bot likes
+        // bullish *and* rising structure. The slope term is what stops us longing
+        // into the start of a dump (mildly bullish but turning down).
+        _afInherent(lean, slope, fioScore) {
+          const slopeN = Math.max(-1, Math.min(1, (slope || 0) / SLOPE_REF));
+          const fioN   = fioScore != null ? Math.max(-1, Math.min(1, fioScore)) : 0;
+          return Math.max(-1, Math.min(1, DIR * (W_LEAN * (lean || 0) + W_SLOPE * slopeN + W_FIO * fioN)));
+        },
+
+        // Effective score: learned history is primary, the inherent wave is the
+        // fallback — blended by how much evidence the profile actually has.
+        _afEffectiveScore(score, mass, inherent) {
+          const massFrac = Math.max(0, Math.min(1, (mass || 0) / STRONG_MASS));
+          return score === null ? inherent : massFrac * score + (1 - massFrac) * inherent;
+        },
+
+        async _afUpdateKlineBar() {
+          const lastHourStart = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
+          // Piggyback on MIC's cache when it's populated for the right hour
+          const cache = this._micKlineCache;
+          if (cache && Object.keys(cache).length > 0) {
+            let bearSum = 0, bullSum = 0;
+            for (const e of Object.values(cache)) {
+              if (e.candleStart !== lastHourStart || !e.open) continue;
+              const pct = (e.close - e.open) / e.open * 100;
+              if (pct < 0) bearSum += -pct;
+              else if (pct > 0) bullSum += pct;
+            }
+            if (bearSum > 0 || bullSum > 0) {
+              this.afKlineBar = { bearSum, bullSum, max: this.cfg.micKlineScanCap ?? 20 };
+              this._afOwnKlineBar = { ...this.afKlineBar };
+              this._afMergeKlineBar();
+              return;
+            }
+          }
+          // MIC didn't fetch klines this cycle — own sample, cached per completed hourly candle
+          if (this._afKlineBarAt === lastHourStart && (this.afKlineBar.bearSum > 0 || this.afKlineBar.bullSum > 0)) {
+            this._afMergeKlineBar(); return;
+          }
+          try {
+            const allTickers = this._lastAllTickers || [];
+            const cap = this.cfg.micKlineScanCap ?? 20;
+            let syms = allTickers
+              .filter(t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT' && parseFloat(t.lastPrice || 0) >= 0.001)
+              .map(t => t.symbol);
+            if (!syms.length) return;
+            for (let i = syms.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [syms[i], syms[j]] = [syms[j], syms[i]];
+            }
+            syms = syms.slice(0, cap);
+            let bearSum = 0, bullSum = 0;
+            await Promise.all(syms.map(async sym => {
+              try {
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
+                const d = await r.json();
+                if (d.retCode !== 0) return;
+                const list = d?.result?.list;
+                if (!list || list.length < 2) return;
+                const candle = list[1];
+                if (parseInt(candle[0]) !== lastHourStart) return;
+                const open = parseFloat(candle[1]), close = parseFloat(candle[4]);
+                if (!open) return;
+                const pct = (close - open) / open * 100;
+                if (pct < 0) bearSum += -pct;
+                else if (pct > 0) bullSum += pct;
+              } catch(e) {}
+            }));
+            this._afKlineBarAt = lastHourStart;
+            this.afKlineBar = { bearSum, bullSum, max: cap };
+            this._afOwnKlineBar = { ...this.afKlineBar };
+            this._afMergeKlineBar();
+          } catch(e) {}
+        },
+
+        _afWriteSample(reading) {
+          try {
+            const raw = localStorage.getItem(SAMPLE_STATE_KEY);
+            const state = raw ? JSON.parse(raw) : {};
+            // liqHistory duplicates data already fully persisted under its own key
+            // (ASH_LIQ_HISTORY_KEY) — it's shared here only so a halted partner can
+            // backfill cycles it missed. Cap it as its own atomized type rather than
+            // embedding the full (already independently-capped) history verbatim.
+            state.chaser = {
+              ts: reading.ts,
+              klineBar: this._afOwnKlineBar ?? this.afKlineBar,
+              fundSkew: this._micFundSkew ?? null,
+              volSkew: this._micVolSkew ?? null,
+              vol: reading.vol ?? 0,
+              volAbs: reading.volAbs ?? 0,
+              fioScore: reading.fioScore ?? null,
+              lean: +((reading.skew + reading.breadth) / 2).toFixed(4),
+              liqHistory: trimToByteCap(this._liqCycleHistory ?? []),
+            };
+            localStorage.setItem(SAMPLE_STATE_KEY, JSON.stringify(state));
+          } catch(e) {}
+        },
+
+        _afReadPartnerSample() {
+          try {
+            const raw = localStorage.getItem(SAMPLE_STATE_KEY);
+            if (!raw) return null;
+            const s = JSON.parse(raw)?.winter ?? null;
+            return (s && s.ts >= Date.now() - 7_200_000) ? s : null;
+          } catch(e) { return null; }
+        },
+
+        _afMergeKlineBar() {
+          const own = this._afOwnKlineBar ?? this.afKlineBar;
+          const partner = this._afReadPartnerSample();
+          const pb = partner?.klineBar;
+          if (!pb || (!pb.bearSum && !pb.bullSum)) return;
+          this.afKlineBar = {
+            bearSum: own.bearSum + pb.bearSum,
+            bullSum: own.bullSum + pb.bullSum,
+            max: (own.max || 50) + (pb.max || 50),
+          };
+        },
+
+        _afScoreRead() {
+          try {
+            const raw = localStorage.getItem(SCORE_KEY);
+            if (!raw) return [];
+            const cut = Date.now() - SCORE_SAFETY_TTL;
+            return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
+          } catch(e) { return []; }
+        },
+        _afScoreTrim() {
+          try {
+            const records   = this._afScoreRead();
+            const quota     = this.cfg.afSpongeQuota   ?? 30;
+            const staleDays = this.cfg.afStaleSlotDays ?? 7;
+            const staleMs   = staleDays * 24 * 3600 * 1000;
+            const now       = Date.now();
+            // +fund/-fund are NOT legacy — Blind-Entry and Liquid-Diver actively write them as
+            // their primary criteria tags. Only the genuinely dead pre-tiered criteria purge here.
+            const LEGACY    = new Set(['>10pct','<10pct','lsa','lba','rasl','rabl']);
+            const isLegacy  = r => r.criteria.some(c => LEGACY.has(c));
+            const bySlot = {};
+            for (const r of records) {
+              if (isLegacy(r)) continue;
+              const k = collapseKey(r.criteria);
+              if (!bySlot[k]) bySlot[k] = [];
+              bySlot[k].push(r);
+            }
+            const trimmed = [];
+            for (const recs of Object.values(bySlot)) {
+              recs.sort((a, b) => b.ts - a.ts);
+              const kept = recs.slice(0, quota);
+              if (kept.length && now - kept[0].ts < staleMs) trimmed.push(...kept);
+            }
+            const GLOBAL_CAP = 5000;
+            const capped = trimmed.sort((a, b) => b.ts - a.ts).slice(0, GLOBAL_CAP);
+            // Per-slot quota + GLOBAL_CAP bound the record *count*, but with enough
+            // distinct auto-generated slot buckets the total byte size can still run
+            // large — apply the same atomized byte cap as a final safety net, oldest first.
+            const byteCapped = trimToByteCap([...capped].reverse()).reverse();
+            localStorage.setItem(SCORE_KEY, JSON.stringify(byteCapped));
+          } catch(e) {}
+        },
+        _afScoreWrite(criteria, pnl, hist = false) {
+          try {
+            const records = this._afScoreRead();
+            const rec = { ts: Date.now(), criteria, pnl, source: 'chaser' };
+            if (hist) rec.hist = true;
+            records.push(rec);
+            const quota = this.cfg.afSpongeQuota ?? 30;
+            const bySlot = {};
+            for (const r of records) {
+              const k = collapseKey(r.criteria);
+              if (!bySlot[k]) bySlot[k] = [];
+              bySlot[k].push(r);
+            }
+            const trimmed = [];
+            for (const recs of Object.values(bySlot)) {
+              recs.sort((a, b) => b.ts - a.ts);
+              trimmed.push(...recs.slice(0, quota));
+            }
+            const byteCapped = trimToByteCap([...trimmed].reverse()).reverse();
+            localStorage.setItem(SCORE_KEY, JSON.stringify(byteCapped));
+            return byteCapped;
+          } catch(e) { return null; }
+        },
+        // `records`, when passed, skips the internal _afScoreRead() — callers on the
+        // trade-close hot path already have the just-written result from _afScoreWrite()
+        // in hand, so re-reading and re-parsing the same data straight back out of
+        // localStorage would be pure duplicate work.
+        _afScoreBuild(records) {
+          records = records || this._afScoreRead();
+          const exclude = new Set(this.cfg.micAutoSlotExclude || []);
+          const quota = this.cfg.afSpongeQuota ?? 30;
+          const includeHist = this.cfg.afHistScoringEnabled ?? true;
+          const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
+          // Sorted once and reused by both passes below — they use the identical sort
+          // criteria (newest-first), so sorting twice was pure duplicate work.
+          const sortedRecords = [...records].sort((a, b) => b.ts - a.ts);
+          const slotCount = {};
+          const map = {};
+          for (const r of sortedRecords) {
+            if (r.hist && !includeHist) continue;
+            if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
+            const key = [...r.criteria].sort().join(',');
+            if ((slotCount[key] = (slotCount[key] ?? 0) + 1) > quota) continue;
+            if (!map[key]) map[key] = { criteria: r.criteria, ownPnl: 0, ownWins: 0, ownLosses: 0, ownLossSum: 0, partnerPnl: 0, partnerWins: 0, partnerLosses: 0, partnerWinSum: 0, hasHist: false, hasTrade: false };
+            if (r.hist) map[key].hasHist = true; else map[key].hasTrade = true;
+            const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
+            if (r.source === 'chaser') {
+              map[key].ownPnl += pnl;
+              if (pnl > 0) map[key].ownWins++; else { map[key].ownLosses++; map[key].ownLossSum += -pnl; }
+            } else {
+              const inv = -pnl;
+              map[key].partnerPnl += inv;
+              if (inv > 0) map[key].partnerWins++; else { map[key].partnerLosses++; map[key].partnerWinSum += pnl; }
+            }
+          }
+          for (const s of Object.values(map)) s.totalPnl = s.ownPnl + s.partnerPnl;
+          this.afScoreboard = Object.values(map).sort((a, b) => b.totalPnl - a.totalPnl);
+          const collapse = collapseCrit;
+          const critCount = {}, collapsedRanks = {}, critStats = {};
+          for (const r of sortedRecords) {
+            if (r.hist && !includeHist) continue;
+            if (exclude.size && r.criteria.some(c => exclude.has(critBase(c)))) continue;
+            const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
+            const effectivePnl = r.source === 'chaser' ? pnl : -pnl;
+            for (const c of r.criteria) {
+              const key = collapse(c);
+              if ((critCount[key] = (critCount[key] ?? 0) + 1) > quota) continue;
+              collapsedRanks[key] = (collapsedRanks[key] ?? 0) + effectivePnl;
+              if (!critStats[key]) critStats[key] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
+              const cs = critStats[key];
+              cs.pnl += effectivePnl;
+              if (effectivePnl > 0) cs.wins++; else cs.losses++;
+              if (r.source === 'chaser') { cs.ownPnl += pnl; if (pnl > 0) cs.ownWins++; else cs.ownLosses++; }
+              if (r.hist) cs.hasHist = true; else cs.hasTrade = true;
+            }
+          }
+          this.micCollapsedSlotRanks = collapsedRanks;
+          this.micCollapsedCritStats = critStats;
+          // Blind-Entry / Liquid-Diver bucket — a *separate* pass over the same records, not a
+          // filter of critStats above. Their bare-sign tags (+fund/-fund, +ocs/-ocs) collapse to
+          // the exact same keys MIC's own tiered criteria collapse to (e.g. '+fund' and 'fund>5'
+          // both become 'fund>'), so once folded into critStats they're no longer separable —
+          // this has to be built independently, straight from the raw records. MIC's own
+          // critStats/collapsedRanks above are left untouched since real trading logic
+          // (co-qualification ranking, _afScoreNet) reads them.
+          const isBlindRec = r => Array.isArray(r.criteria) && r.criteria.some(c => c === '+fund' || c === '-fund' || c === '+ocs' || c === '-ocs');
+          const blindCritCount = {}, blindCritStats = {};
+          for (const r of sortedRecords) {
+            if (!isBlindRec(r)) continue;
+            if (r.hist && !includeHist) continue;
+            const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
+            const effectivePnl = r.source === 'chaser' ? pnl : -pnl;
+            for (const c of r.criteria) {
+              const key = collapse(c);
+              if ((blindCritCount[key] = (blindCritCount[key] ?? 0) + 1) > quota) continue;
+              if (!blindCritStats[key]) blindCritStats[key] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
+              const cs = blindCritStats[key];
+              cs.pnl += effectivePnl;
+              if (effectivePnl > 0) cs.wins++; else cs.losses++;
+              if (r.source === 'chaser') { cs.ownPnl += pnl; if (pnl > 0) cs.ownWins++; else cs.ownLosses++; }
+              if (r.hist) cs.hasHist = true; else cs.hasTrade = true;
+            }
+          }
+          this.blindCollapsedCritStats = blindCritStats;
+        },
+        // cfg.micEnabled is a persisted toggle value — it survives MIC being removed via the
+        // Plugin Manager, so it alone can't tell us whether MIC is actually loaded right now.
+        // Cross-check against the live plugin list so the MIC scorecard section disappears the
+        // moment MIC is unloaded, not just when its own toggle happens to be off.
+        _micPluginLoaded() {
+          return (this._pluginList || []).some(p => p.id === 'multiindicator-chaser');
+        },
+        _becPluginLoaded() {
+          return (this._pluginList || []).some(p => p.id === 'blindentry-chaser');
+        },
+        _ldcPluginLoaded() {
+          return (this._pluginList || []).some(p => p.id === 'liquiddiver-chaser');
+        },
+        // Liquid-Diver's OC fetch is single-symbol, triggered per reactive entry — its samples are
+        // almost always one bar of 0.0s and drown out a real batch-fetched sample. Only show the
+        // chart when a plugin doing proper batch OC sampling (MIC or Blind-Entry) is loaded; if
+        // Liquid-Diver is the only OC consumer, hide it rather than let its noise dominate.
+        _ocChartViable() {
+          return this._micPluginLoaded() || this._becPluginLoaded();
+        },
+        // Pure display — unlike _afScoreBuild() (which micCollapsedCritStats/micCollapsedSlotRanks
+        // come from and which real trading logic reads), this chip-rendering step has no
+        // consumer besides this panel, so it's safe to skip while the panel isn't visible.
+        _afScorecardHtml(shown, bucket) {
+          if (!shown) return '';
+          const stats = (bucket === 'blind' ? this.blindCollapsedCritStats : this.micCollapsedCritStats) || {};
+          if (!Object.keys(stats).length) return `<span style="font-size:9px;color:var(--text-lo)">No ${bucket === 'blind' ? 'Blind-Entry/Liquid-Diver' : 'MIC'} closes recorded yet.</span>`;
+          const own = (this.cfg.afScorecardView || 'combined') === 'own';
+          const expanded = this.afScorecardExpanded;
+          const _chipHtml = (key, emoji, title, val, wins, losses, isExpanded, expandedInner) => {
+            const clr = val > 0 ? 'rgba(100,220,150,.9)' : val < 0 ? 'var(--short)' : 'var(--text-lo)';
+            const bg  = val > 0 ? 'rgba(100,220,150,.08)' : val < 0 ? 'rgba(255,80,80,.08)' : 'rgba(255,255,255,.04)';
+            const bdr = val > 0 ? 'rgba(100,220,150,.35)' : val < 0 ? 'rgba(255,80,80,.35)' : 'rgba(255,255,255,.12)';
+            const inner = isExpanded ? expandedInner : `<b>${(val >= 0 ? '+$' : '-$') + Math.abs(val).toFixed(2)}</b> <span style="opacity:.55;font-size:8px">${wins}W ${losses}L</span>`;
+            return `<span data-slot="${key}" title="${title}" style="cursor:pointer;font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${emoji || '?'} ${inner}</span>`;
+          };
+          const _srcFilter = cs => { const src = this.cfg.afScorecardSource || 'both'; if (src === 'hist') return cs.hasHist; if (src === 'traded') return cs.hasTrade; return true; };
+          const sorted = Object.entries(stats).filter(([,cs]) => _srcFilter(cs)).sort(([,a],[,b]) => own ? b.ownPnl-a.ownPnl : b.pnl-a.pnl);
+          return sorted.map(([key, cs]) => {
+            const val = own ? cs.ownPnl : cs.pnl;
+            const wins = own ? cs.ownWins : cs.wins;
+            const losses = own ? cs.ownLosses : cs.losses;
+            const expandedInner = `<span style="opacity:.55;font-size:8px">${wins}W ${losses}L of ${wins+losses} recorded</span>`;
+            return _chipHtml(key, afCritEmoji(key), key, val, wins, losses, expanded===key, expandedInner);
+          }).join('');
+        },
+
+        _afCrossRead() {
+          try {
+            const raw = localStorage.getItem(CROSS_KEY);
+            if (!raw) return [];
+            const cut = Date.now() - CROSS_TTL;
+            return (JSON.parse(raw).events || []).filter(e => e.ts >= cut);
+          } catch(e) { return []; }
+        },
+
+        _afCrossWrite(kind, symbol, extra) {
+          try {
+            const events = this._afCrossRead();
+            const rec = { ts: Date.now(), kind, source: 'chaser' };
+            if (symbol) rec.symbol = symbol;
+            if (extra) Object.assign(rec, extra);
+            events.push(rec);
+            localStorage.setItem(CROSS_KEY, JSON.stringify({ events }));
+          } catch(e) {}
+        },
+
+        async _afCheckCross() {
+          if (!this.cfg.ashfallCrossEnabled) return;
+          const fromWinter = this._afCrossRead().filter(e => e.source === 'winter');
+          this.afCrossEvents = fromWinter.slice(-10);
+        },
+
+        // Inline SVG wave plot — time-based 1-week window, bins data into pixel columns so
+        // the chart compacts automatically as history grows (no index stretching).
+        // `shown` comes from the caller's own x-show chain (accordion open + relevant cfg
+        // toggle) — Alpine still evaluates x-html bindings on hidden elements every reactive
+        // tick, so without this the rebuild below would run every time `afWave` changes even
+        // while the panel is collapsed. No artificial tick dependency here: Alpine already
+        // re-runs this whenever a property it actually reads (afWave, cfg.*) changes, so it
+        // naturally recomputes only when new data arrives — not on a timer.
+        _afWaveSvg(shown) {
+          if (!shown) return '';
+          const wave = this._afWaveSeries();
+          const W = 260, H = 64, labelH = 12, pad = 6;
+          const y = lean => pad + ((1 - lean) / 2) * (H - 2 * pad);
+          const mid = y(0);
+          const placeholder = `<svg width="100%" viewBox="0 0 ${W} ${H + labelH}" preserveAspectRatio="none" style="display:block"><line x1="0" y1="${mid}" x2="${W}" y2="${mid}" stroke="rgba(255,255,255,.15)" stroke-dasharray="3 3"/><text x="${W/2}" y="${H/2+3}" fill="rgba(255,255,255,.35)" font-size="9" font-family="monospace" text-anchor="middle">gathering structure history…</text></svg>`;
+          if (wave.length < 2) return placeholder;
+          const now = Date.now();
+          const tMin = now - WAVE_TTL_MS;
+          const plotW = W - 2 * pad;
+          const BINS = Math.floor(plotW);
+          const bins = new Array(BINS).fill(null).map(() => ({ sum: 0, n: 0 }));
+          for (const p of wave) {
+            const bi = Math.min(BINS - 1, Math.max(0, Math.floor(((p.ts - tMin) / WAVE_TTL_MS) * BINS)));
+            bins[bi].sum += p.lean; bins[bi].n++;
+          }
+          const pts = [];
+          for (let i = 0; i < BINS; i++) {
+            if (!bins[i].n) continue;
+            pts.push({ x: pad + i + 0.5, lean: bins[i].sum / bins[i].n });
+          }
+          if (pts.length < 2) return placeholder;
+          // A gap of missing bins this large means the bot was off/unable to sample for a
+          // real stretch of time, not continuous data — break the lines there instead of
+          // drawing a straight connector across the gap. Threshold must clear two floors:
+          // it can never be smaller than a single bin's own width (BIN_MS) or literally
+          // every adjacent pair of bins — i.e. every normal, gap-free render — would count
+          // as "missing" data, since consecutive bins are BIN_MS apart by construction. It
+          // also needs headroom above the scan cadence itself so ordinary scan-timing jitter
+          // doesn't get misread as a gap.
+          const BIN_MS = WAVE_TTL_MS / BINS;
+          const WAVE_GAP_MS = Math.max(BIN_MS * 2, 3 * (this.cfg.scanMins ?? 15) * 60000);
+
+          // FIO line: crowd funding-rate sentiment; only present in newer wave entries (guard p.fio != null)
+          const fioBins = new Array(BINS).fill(null).map(() => ({ iSum: 0, n: 0 }));
+          for (const p of wave) {
+            if (p.fio == null) continue;
+            const bi = Math.min(BINS - 1, Math.max(0, Math.floor(((p.ts - tMin) / WAVE_TTL_MS) * BINS)));
+            fioBins[bi].iSum += p.fio; fioBins[bi].n++;
+          }
+          const fioPts = [];
+          for (let i = 0; i < BINS; i++) {
+            if (!fioBins[i].n) continue;
+            fioPts.push({ x: pad + i + 0.5, fio: fioBins[i].iSum / fioBins[i].n });
+          }
+          let fioSvg = '';
+          for (let i = 1; i < fioPts.length; i++) {
+            const p1 = fioPts[i-1], p2 = fioPts[i];
+            if ((p2.x - p1.x) * BIN_MS > WAVE_GAP_MS) continue;
+            fioSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.fio).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.fio).toFixed(1)}" stroke="rgba(200,150,255,0.5)" stroke-width="1" stroke-dasharray="3 2"/>`;
+          }
+
+          // Score line: timestamp-direct (no binning) so stored values stay immutable as window scrolls
+          const scorePts = [];
+          for (const p of wave) {
+            if (p.score == null) continue;
+            const x = pad + ((p.ts - tMin) / WAVE_TTL_MS) * plotW;
+            if (x < pad || x > pad + plotW) continue;
+            scorePts.push({ x, s: p.score, ts: p.ts });
+          }
+          let scoreSvg = '';
+          for (let i = 1; i < scorePts.length; i++) {
+            const p1 = scorePts[i-1], p2 = scorePts[i];
+            if (p2.ts - p1.ts > WAVE_GAP_MS) continue;
+            const avg = (p1.s + p2.s) / 2;
+            const gv = Math.round(50 + (avg + 1) / 2 * 160);
+            scoreSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.s).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.s).toFixed(1)}" stroke="rgba(${gv},${gv},${gv},.8)" stroke-width="1.5"/>`;
+          }
+
+          const showMain  = this.cfg.ashfallWaveShowMain ?? true;
+          const showFio    = this.cfg.ashfallWaveShowFio   ?? true;
+          const showScore = this.cfg.afShowScore         ?? true;
+          const cur = pts[pts.length - 1].lean;
+          const col = cur > 0.05 ? 'var(--profit)' : cur < -0.05 ? 'var(--short)' : '#ff9650';
+          const leanGroups = [[pts[0]]];
+          for (let i = 1; i < pts.length; i++) {
+            if ((pts[i].x - pts[i-1].x) * BIN_MS > WAVE_GAP_MS) leanGroups.push([]);
+            leanGroups[leanGroups.length-1].push(pts[i]);
+          }
+          const mainPolylines = leanGroups.map(g => g.length > 1
+            ? `<polyline points="${g.map(p => `${p.x.toFixed(1)},${y(p.lean).toFixed(1)}`).join(' ')}" fill="none" stroke="${col}" stroke-width="1.5" stroke-linejoin="round"/>`
+            : '').join('');
+          const cx = pts[pts.length - 1].x, cy = y(cur);
+          return `<svg width="100%" viewBox="0 0 ${W} ${H + labelH}" preserveAspectRatio="none" style="display:block">`
+            + `<line x1="0" y1="${pad}" x2="${W}" y2="${pad}" stroke="rgba(0,229,160,.12)"/>`
+            + `<line x1="0" y1="${(H-pad).toFixed(1)}" x2="${W}" y2="${(H-pad).toFixed(1)}" stroke="rgba(255,69,96,.12)"/>`
+            + `<line x1="0" y1="${mid.toFixed(1)}" x2="${W}" y2="${mid.toFixed(1)}" stroke="rgba(255,255,255,.18)" stroke-dasharray="3 3"/>`
+            + (showFio    ? fioSvg   : '')
+            + (showScore ? scoreSvg : '')
+            + (showMain ? mainPolylines : '')
+            + (showMain ? `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.5" fill="${col}"/>` : '')
+            + `<text x="2" y="${pad+7}" fill="rgba(0,229,160,.5)" font-size="8" font-family="monospace">bull</text>`
+            + `<text x="2" y="${(H-pad-1).toFixed(1)}" fill="rgba(255,69,96,.5)" font-size="8" font-family="monospace">bear</text>`
+            + (showFio && fioPts.length >= 2 ? `<text x="${W / 2}" y="${H + 9}" fill="rgba(200,150,255,.55)" font-size="8" font-family="monospace" text-anchor="middle">fio</text>` : '')
+            + (showScore && scorePts.length >= 2 ? `<text x="${W - pad}" y="${H + 9}" fill="rgba(180,180,180,.55)" font-size="8" font-family="monospace" text-anchor="end">score</text>` : '')
+            + `</svg>`;
+        },
+
+        // ── Hostility score: kernel-weighted, recency-decayed, normalized by entry margin.
+        // score ∈ [−1,1]; mass = evidence weight; count = closes within kernel radius.
+        _afScore(reading) {
+          const entryMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const now = Date.now();
+          let num = 0, mass = 0, count = 0;
+          for (const c of this.afCloses) {
+            const ds = reading.skew - c.skew, db = reading.breadth - c.breadth;
+            const k  = Math.exp(-(ds * ds + db * db) / (2 * KERNEL_H * KERNEL_H));
+            const dec = Math.pow(0.5, (now - c.ts) / HALF_LIFE_MS);
+            const norm = Math.max(-1, Math.min(1, c.pnl / entryMargin));
+            num  += norm * k * dec;
+            mass += k * dec;
+            if (k > 0.1) count++;
+          }
+          return { score: mass > 0 ? num / mass : null, mass, count };
+        },
+
+        _afAddSample(reading) {
+          this._afPushWave(reading);
+          const { score, mass, count } = this._afScore(reading);
+          const { lean, slope } = this._afTrajectory();
+          const inherent = this._afInherent(lean, slope, reading.fioScore ?? null);
+          const eff = this._afEffectiveScore(score, mass, inherent);
+          this.afStatus = { skew: reading.skew, breadth: reading.breadth, score, mass, count, lean, slope, inherent, eff, fioScore: reading.fioScore ?? null, at: reading.ts };
+          this._afWriteSample(reading);
+        },
+
+        _afDownload(filename, data) {
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = filename;
+          a.click();
+          URL.revokeObjectURL(a.href);
+        },
+        afExportAll() {
+          try {
+            const scorecardRaw = localStorage.getItem(SCORE_KEY);
+            const liqRaw       = localStorage.getItem(ASH_LIQ_HISTORY_KEY);
+            const ocRaw        = localStorage.getItem(ASH_OC_HIST_KEY);
+            this._afDownload(`ashfall-profile-${new Date().toISOString().slice(0, 10)}.json`, {
+              exportedAt: Date.now(),
+              events: this.afEvents,
+              closes: this.afCloses,
+              wave: this.afWave,
+              scorecard: scorecardRaw ? JSON.parse(scorecardRaw) : [],
+              liqHistory: liqRaw ? JSON.parse(liqRaw) : [],
+              ocHistory: ocRaw ? JSON.parse(ocRaw) : [],
+            });
+          } catch(e) { this.log('[ASH] Export failed', 'warn'); }
+        },
+
+        afImport(e) {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            try {
+              const d = JSON.parse(ev.target.result);
+              if (Array.isArray(d.events)) this.afEvents = d.events.slice(-EVENTS_CAP);
+              if (Array.isArray(d.closes)) this.afCloses = d.closes.slice(-CLOSES_CAP);
+              if (Array.isArray(d.wave))   this.afWave   = d.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
+              if (Array.isArray(d.scorecard)) {
+                try { localStorage.setItem(SCORE_KEY, JSON.stringify(d.scorecard)); } catch(_) {}
+              }
+              if (Array.isArray(d.liqHistory)) {
+                this._liqCycleHistory = d.liqHistory.slice(-25);
+                try { localStorage.setItem(ASH_LIQ_HISTORY_KEY, JSON.stringify(this._liqCycleHistory)); } catch(_) {}
+                this._liqUpdateAvgTurnover();
+              }
+              if (Array.isArray(d.ocHistory)) {
+                this._afOcCycleHistory = this._ocSanitizeHistory(d.ocHistory).cleaned;
+                try { localStorage.setItem(ASH_OC_HIST_KEY, JSON.stringify(this._afOcCycleHistory)); } catch(_) {}
+              }
+              this.persist();
+              this._afScoreTrim();
+              this._afScoreBuild();
+              this.log(`[ASH] Profile imported — ${this.afCloses.length} closes, ${this.afWave.length} wave points, ${(d.scorecard||[]).length} scorecard records, ${(d.liqHistory||[]).length} liq cycles, ${(d.ocHistory||[]).length} OC cycles`, 'info');
+            } catch(err) {
+              this.log('[ASH] Import failed — file could not be parsed as a valid Ashfall profile', 'warn');
+            }
+            e.target.value = '';
+          };
+          reader.readAsText(file);
+        },
+
+        async runScan() {
+          await _origScan.call(this);
+          if (this.cfg.ashLiqEnabled) this._liqLaunchBatch();
+          if (!this.cfg.ashfallEnabled) return;
+          this._afCheckCross().catch(() => {});
+          // Deferred so MIC's _micRunScan (which fetches klines) finishes first —
+          // MIC wraps after AF, so _origScan returns before MIC's own kline fetch runs.
+          setTimeout(() => this._afUpdateKlineBar(), 0);
+          this._afFetchStructure().then(r => {
+            if (!r) return;
+            this._afAddSample(r);
+            if (!r._fresh) return;
+            const { score, mass, count } = this.afStatus;
+            const _d = this._afDescribe(r, score, mass, count);
+            this.log(`[ASH] ♨ Market structure: ${_d.desc} — ${_d.bias}`, 'info');
+            this.persist();
+          }).catch(() => {});
+        },
+
+        async pseudoClosePosition(pos, reason, fillPrice) {
+          const prevLen = this.closedTrades?.length ?? 0;
+          await _origClose.call(this, pos, reason, fillPrice);
+          if ((this.closedTrades?.length ?? 0) > prevLen) {
+            // totalPnl (incl. funding) is what the base feeds its halt windows
+            const t   = this.closedTrades[0];
+            const pnl = t?.totalPnl ?? t?.pnl;
+            if (typeof pnl === 'number' && this.afStatus.skew !== null && this.afStatus.skew !== undefined) {
+              const now = Date.now();
+              this.afCloses.push({ ts: now, pnl, skew: this.afStatus.skew, breadth: this.afStatus.breadth });
+              if (this.afCloses.length > CLOSES_CAP) this.afCloses = this.afCloses.slice(-CLOSES_CAP);
+            }
+          }
+          if (this.cfg.ashfallCrossEnabled) {
+            if (reason === 'cascade' || reason === 'sacrifice') this._afCrossWrite(reason);
+            if (reason === 'sl') this._afCrossWrite('sacrifice');
+            else if (reason === 'tp') this._afCrossWrite('cascade');
+          }
+          // Blind-Entry has no real filtering criteria (see docs/blind-entry-plan.md) — its
+          // _becCriteria are sign-only recording tags (+24h/-24h, +fund/-fund, +ocs/-ocs), never
+          // used to gate entry, that exist purely so the scorecard has something to bucket.
+          const _scoreCriteria = (pos._mic && pos._micCriteria?.length) ? pos._micCriteria
+            : (pos._bec && pos._becCriteria?.length) ? pos._becCriteria
+            : (pos._ldc && pos._ldcCriteria?.length) ? pos._ldcCriteria
+            : null;
+          if (this.cfg.ashfallScorecardEnabled && _scoreCriteria) {
+            const _t = this.closedTrades?.[0];
+            const _pnl = _t?.totalPnl ?? _t?.pnl;
+            if (typeof _pnl === 'number') {
+              this._afScoreBuild(this._afScoreWrite(_scoreCriteria, _pnl));
+            }
+          }
+          // MIC-only feedback: direction-awareness lock (always, independent of the scorecard
+          // toggle) and the 0liq-win cross broadcast (Permafrost's Only-1/Both side graylists
+          // the ticker for 6h so it doesn't compete with a ticker Chaser just won calmly).
+          if (pos._mic && pos._micCriteria?.length) {
+            const _t2  = this.closedTrades?.[0];
+            const _pnl2 = _t2?.totalPnl ?? _t2?.pnl;
+            if (typeof _pnl2 === 'number') {
+              this._micOnPositionScored?.(pos.symbol, pos._micCriteria, _pnl2);
+              if (this.cfg.ashfallCrossEnabled && _pnl2 > 0 && pos._micCriteria.includes('0liq')) {
+                this._afCrossWrite('0liq-win', pos.symbol);
+              }
+            }
+          }
+        },
+
+        // ── Liquidation surveillance ──
+
+        _liqCloseAll() {
+          for (const b of (this._liqBatches || [])) {
+            if (b._endTimer) clearTimeout(b._endTimer);
+            try { if (b.ws && b.ws.readyState !== WebSocket.CLOSED) b.ws.close(); } catch(_) {}
+          }
+          this._liqBatches = [];
+          try { localStorage.removeItem(ASH_LIQ_KEY); } catch(_) {}
+        },
+
+        // Called from the liq WS onmessage handler for every incoming fill — with an active
+        // feed that's potentially several messages/sec, writing synchronously on each one was
+        // a real main-thread cost for no benefit (only a reload mid-cycle needs the persisted
+        // snapshot, and losing the last ~2s of accumulation on a reload is harmless). Debounced
+        // to at most one write per 2s; batch objects are mutated in place so the callback still
+        // reads whatever the latest totals are when it fires, not a stale snapshot from when it was scheduled.
+        _liqPersistBatches() {
+          if (this._liqPersistPending) return;
+          this._liqPersistPending = true;
+          setTimeout(() => {
+            this._liqPersistPending = false;
+            try {
+              const snapshots = (this._liqBatches || []).map(b => ({
+                id: b.id, startedAt: b.startedAt, endsAt: b.endsAt, symbols: b.symbols,
+                sLiqTurnover: { ...b.sLiqTurnover }, bLiqTurnover: { ...b.bLiqTurnover }
+              }));
+              localStorage.setItem(ASH_LIQ_KEY, JSON.stringify(snapshots));
+            } catch(_) {}
+          }, 2000);
+        },
+
+        _liqPersistHistory() {
+          try {
+            this._liqCycleHistory = trimToByteCap(this._liqCycleHistory);
+            localStorage.setItem(ASH_LIQ_HISTORY_KEY, JSON.stringify(this._liqCycleHistory));
+          } catch(_) {}
+        },
+
+        _liqPersistSequester() {
+          try { localStorage.setItem(ASH_LIQ_SEQUESTER_KEY, JSON.stringify(this._liqSequester)); } catch(_) {}
+        },
+
+        _liqResumeBatch(snapshot) {
+          const remaining = snapshot.endsAt - Date.now();
+          if (remaining <= 0) return;
+          const batch = {
+            id: snapshot.id, startedAt: snapshot.startedAt, endsAt: snapshot.endsAt,
+            symbols: snapshot.symbols,
+            sLiqTurnover: { ...snapshot.sLiqTurnover },
+            bLiqTurnover: { ...snapshot.bLiqTurnover },
+            ws: null, _endTimer: null
+          };
+          this._liqBatches.push(batch);
+          const id = batch.id;
+          const handleMsg = (ev) => {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (!msg.data) return;
+              const events = Array.isArray(msg.data) ? msg.data : [msg.data];
+              for (const e of events) {
+                const sym  = e.symbol || e.s;
+                const side = e.side   || e.S;
+                if (!sym || !Object.prototype.hasOwnProperty.call(batch.sLiqTurnover, sym)) continue;
+                const turnover = parseFloat(e.size || e.v || 0) * parseFloat(e.price || e.p || 0);
+                if (!isFinite(turnover) || turnover <= 0) continue;
+                if (side === 'Sell')      batch.sLiqTurnover[sym] += turnover;
+                else if (side === 'Buy')  batch.bLiqTurnover[sym] += turnover;
+                else continue;
+                for (const fn of (this._liqMessageHooks || [])) { try { fn(batch, sym); } catch(_) {} }
+              }
+              this._liqPersistBatches();
+            } catch(_) {}
+          };
+          const openWs = () => {
+            try {
+              const ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+              batch.ws = ws;
+              ws.onopen    = () => ws.send(JSON.stringify({ op: 'subscribe', args: batch.symbols.map(s => `allLiquidation.${s}`) }));
+              ws.onmessage = handleMsg;
+              ws.onerror   = () => {};
+              ws.onclose   = () => {
+                if (Date.now() >= batch.endsAt || !this._liqBatches.some(b => b.id === id)) return;
+                setTimeout(openWs, 5000);
+              };
+            } catch(_) {}
+          };
+          openWs();
+          batch._endTimer = setTimeout(() => this._liqCloseBatch(batch), remaining);
+          this.log(`[ASH] 💧 Liq cycle #${id} resumed — ${batch.symbols.length} tickers, ${Math.round(remaining / 60000)}m remaining`, 'info');
+        },
+
+        _liqFeedWatcherHtml(shown) {
+          if (!shown) return '';
+          void this.tick; // kept on the fast tick — shows a live mm:ss countdown
+          const batches = this._liqBatches || [];
+          if (!batches.length) return '';
+          const fmt = v => v >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'K' : v.toFixed(0);
+          return batches.map(b => {
+            const rem  = Math.max(0, b.endsAt - Date.now());
+            const remM = Math.floor(rem / 60000);
+            const remS = Math.floor((rem % 60000) / 1000);
+            let totalS = 0, totalB = 0;
+            for (const s of b.symbols) { totalS += b.sLiqTurnover[s] || 0; totalB += b.bLiqTurnover[s] || 0; }
+            const dom  = totalS > totalB ? 'S' : totalB > totalS ? 'B' : '·';
+            const clr  = dom === 'S' ? 'rgba(100,220,150,.9)' : dom === 'B' ? 'rgba(255,80,80,.9)' : 'var(--text-lo)';
+            return `<div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">` +
+              `<span style="color:var(--text-lo);min-width:18px">#${b.id}</span>` +
+              `<span style="color:var(--text-lo)">${b.symbols.length}t</span>` +
+              `<span style="color:rgba(100,220,150,.8)">S:${fmt(totalS)}</span>` +
+              `<span style="color:rgba(255,80,80,.8)">B:${fmt(totalB)}</span>` +
+              `<span style="color:${clr};font-weight:bold">${dom}</span>` +
+              `<span style="margin-left:auto;color:var(--text-lo)">${remM}m${String(remS).padStart(2, '0')}s</span>` +
+              `</div>`;
+          }).join('');
+        },
+
+        // Called for every incoming liq message, per touched symbol, with the batch object still
+        // live (sLiqTurnover/bLiqTurnover already updated) — before the batch closes. Lets a
+        // reactive consumer (e.g. Liquid-Diver) compute a mid-cycle depth reading without
+        // waiting for _liqCloseBatch's once-per-hour snapshot.
+        registerLiqMessageHook(fn) {
+          if (typeof fn === 'function' && !this._liqMessageHooks.includes(fn)) this._liqMessageHooks.push(fn);
+        },
+
+        // Called once per closed liquidation cycle with that cycle's full per-symbol results array
+        // (batch.symbols, each already carrying sLiqRaw/bLiqRaw/sDepth/bDepth/sLiqPct/bLiqPct) — lets
+        // a consumer detect states a per-message hook can't, e.g. 0-liq (a symbol with zero turnover
+        // never fires a live message, so it can only be observed once the cycle closes).
+        registerLiqCloseHook(fn) {
+          if (typeof fn === 'function' && !this._liqCloseHooks.includes(fn)) this._liqCloseHooks.push(fn);
+        },
+
+        _liqLaunchBatch() {
+          const allTickers = this._lastAllTickers || [];
+          if (!allTickers.length) { this._liqLastBatchSyms = []; return; }
+          const activeSyms = new Set((this._liqBatches || []).flatMap(b => b.symbols));
+          const base = t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
+            && parseFloat(t.lastPrice || 0) >= 0.001 && !activeSyms.has(t.symbol);
+
+          // Sequester: symbols whose most recently closed batch read 0-liq get priority
+          // resurveillance ahead of the random mover pool, so a calm ticker doesn't age out of
+          // coverage the moment it stops moving >6%/<-6% and its 0-liq status goes stale. The
+          // cap is a per-batch rotation limit, not a hard membership cap — a larger sequestered
+          // pool just rotates through over successive cycles, most-recently-reconfirmed-clean
+          // symbols drawn first each time (see _liqCloseBatch for how membership is maintained).
+          const tickerBySym = new Map(allTickers.map(t => [t.symbol, t]));
+          let sequesterPicks = [];
+          if (this.cfg.ashLiqSequesterEnabled ?? true) {
+            if (!this._liqSequester) this._liqSequester = {};
+            const cap = this.cfg.ashLiqSequesterCap ?? 12;
+            sequesterPicks = Object.entries(this._liqSequester)
+              .filter(([sym]) => {
+                const t = tickerBySym.get(sym);
+                if (!t || !base(t)) { delete this._liqSequester[sym]; return false; }
+                return true;
+              })
+              .sort((a, b) => (b[1].qualifiedAt || 0) - (a[1].qualifiedAt || 0))
+              .slice(0, cap)
+              .map(([sym]) => sym);
+          }
+          for (const sym of sequesterPicks) activeSyms.add(sym);
+
+          const remaining = Math.max(0, (this.cfg.ashLiqBatchSize ?? 25) - sequesterPicks.length);
+          const gainers = allTickers.filter(t => base(t) && parseFloat(t.price24hPcnt || 0) >  0.06);
+          const losers  = allTickers.filter(t => base(t) && parseFloat(t.price24hPcnt || 0) < -0.06);
+          if (!sequesterPicks.length && !gainers.length && !losers.length) {
+            this.log('[ASH] 💧 Liq batch skipped — no eligible tickers (>6% or <-6% 24h move, not already surveilled)', 'info');
+            this._liqLastBatchSyms = [];
+            return;
+          }
+          const shuffle = arr => { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } };
+          shuffle(gainers); shuffle(losers);
+          const half    = Math.floor(remaining / 2);
+          const symbols = [...sequesterPicks, ...gainers.slice(0, half).map(t => t.symbol), ...losers.slice(0, half).map(t => t.symbol)];
+          if (sequesterPicks.length) this.log(`[ASH] 💧 Sequester — ${sequesterPicks.length} calm ticker${sequesterPicks.length !== 1 ? 's' : ''} prioritized for resurveillance`, 'info');
+          this._liqPersistSequester();
+          // Tickers this scan just picked for liq surveillance — read by MIC's OC sampling so it
+          // can guarantee coverage for exactly these tickers this cycle (not the accumulated set
+          // across every still-open, hour-long batch — see _micRunScan's OC ticker selection).
+          this._liqLastBatchSyms = symbols;
+          this._liqCycleCounter = (this._liqCycleCounter % 25) + 1;
+          const id        = this._liqCycleCounter;
+          const startedAt = Date.now();
+          const batch     = { id, startedAt, endsAt: startedAt + 3600000, symbols,
+            sLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
+            bLiqTurnover: Object.fromEntries(symbols.map(s => [s, 0])),
+            ws: null, _endTimer: null };
+          this._liqBatches.push(batch);
+          this._liqPersistBatches();
+          const handleMsg = (ev) => {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (!msg.data) return;
+              const events = Array.isArray(msg.data) ? msg.data : [msg.data];
+              for (const e of events) {
+                const sym  = e.symbol || e.s;
+                const side = e.side   || e.S;
+                if (!sym || !Object.prototype.hasOwnProperty.call(batch.sLiqTurnover, sym)) continue;
+                const turnover = parseFloat(e.size || e.v || 0) * parseFloat(e.price || e.p || 0);
+                if (!isFinite(turnover) || turnover <= 0) continue;
+                if (side === 'Sell')      batch.sLiqTurnover[sym] += turnover;
+                else if (side === 'Buy')  batch.bLiqTurnover[sym] += turnover;
+                else continue;
+                for (const fn of (this._liqMessageHooks || [])) { try { fn(batch, sym); } catch(_) {} }
+              }
+              this._liqPersistBatches();
+            } catch(_) {}
+          };
+          const openWs = () => {
+            try {
+              const ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+              batch.ws = ws;
+              ws.onopen    = () => ws.send(JSON.stringify({ op: 'subscribe', args: symbols.map(s => `allLiquidation.${s}`) }));
+              ws.onmessage = handleMsg;
+              ws.onerror   = () => {};
+              ws.onclose   = () => {
+                if (Date.now() >= batch.endsAt || !this._liqBatches.some(b => b.id === id)) return;
+                setTimeout(openWs, 5000);
+              };
+            } catch(_) {}
+          };
+          openWs();
+          batch._endTimer = setTimeout(() => this._liqCloseBatch(batch), 3600000);
+          this.log(`[ASH] 💧 Liq cycle #${id} started — ${symbols.length} tickers (${symbols.map(s => s.replace('USDT', '')).join(', ')})`, 'info');
+        },
+
+        _liqCloseBatch(batch) {
+          this._liqBatches = (this._liqBatches || []).filter(b => b.id !== batch.id);
+          this._liqPersistBatches();
+          if (batch._endTimer) { clearTimeout(batch._endTimer); batch._endTimer = null; }
+          try { if (batch.ws && batch.ws.readyState !== WebSocket.CLOSED) batch.ws.close(); } catch(_) {}
+          batch.ws = null;
+          // Depth = % this side's liquidated $ deviates from the average liquidation size
+          // recorded across all history so far (this._liqAvgSTurnover/_liqAvgBTurnover, see
+          // _liqUpdateAvgTurnover) — +1 means 1% above average, -1 means 1% below, floor of
+          // -100 at zero liquidation, no ceiling. Computed against the average as it stood
+          // BEFORE this cycle (updated after, at the bottom of this function) so a cycle is
+          // never judged against a baseline that already includes itself.
+          const calcDepth  = (raw, avg) => avg > 0 ? Math.trunc(((raw / avg) - 1) * 100) : 0;
+          const threshold  = this.cfg.ashLiqThresholdPct ?? 50;
+          const results    = batch.symbols.map(sym => {
+            const sLiqRaw  = batch.sLiqTurnover[sym] || 0;
+            const bLiqRaw  = batch.bLiqTurnover[sym] || 0;
+            const liqTotal = sLiqRaw + bLiqRaw;
+            const sLiqPct  = liqTotal > 0 ? (sLiqRaw / liqTotal) * 100 : 0;
+            const bLiqPct  = liqTotal > 0 ? (bLiqRaw / liqTotal) * 100 : 0;
+            const sDepth   = calcDepth(sLiqRaw, this._liqAvgSTurnover || 0);
+            const bDepth   = calcDepth(bLiqRaw, this._liqAvgBTurnover || 0);
+            return { sym, sLiqPct, bLiqPct, sLiqRaw, bLiqRaw, sDepth, bDepth, sPass: liqTotal > 0 && sLiqPct >= threshold, bPass: liqTotal > 0 && bLiqPct >= threshold };
+          });
+          const _now = Date.now();
+          const _liqPatch = {};
+          for (const r of results) {
+            const _entry = { sLiqPct: r.sLiqPct, bLiqPct: r.bLiqPct, sLiqRaw: r.sLiqRaw, bLiqRaw: r.bLiqRaw, sDepth: r.sDepth, bDepth: r.bDepth, cycleId: batch.id, ts: _now };
+            this._liqResults[r.sym] = _entry;
+            _liqPatch[r.sym] = _entry;
+          }
+          this._liqResultsVersion = (this._liqResultsVersion || 0) + 1;
+          const _prevSharedVer = this._sharedRead?.('liqResults')?.ver ?? 0;
+          this._sharedMerge?.('liqResults', _liqPatch, { ver: Math.max(this._liqResultsVersion, _prevSharedVer + 1) });
+          if (!this._liqSequester) this._liqSequester = {};
+          for (const r of results) {
+            if ((r.sLiqRaw || 0) + (r.bLiqRaw || 0) === 0) this._liqSequester[r.sym] = { qualifiedAt: _now };
+            else delete this._liqSequester[r.sym];
+          }
+          this._liqPersistSequester();
+          const entry = { id: batch.id, ts: _now, results };
+          this._liqCycleHistory.push(entry);
+          if (this._liqCycleHistory.length > 25) this._liqCycleHistory = this._liqCycleHistory.slice(-25);
+          this._liqPersistHistory();
+          this._liqUpdateAvgTurnover();
+          this._liqLatestResults = results;
+          const _totS = results.reduce((s, r) => s + r.sLiqRaw, 0);
+          const _totB = results.reduce((s, r) => s + r.bLiqRaw, 0);
+          const _tot  = _totS + _totB;
+          const _fmt  = v => v >= 1e6 ? `$${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `$${(v/1e3).toFixed(0)}k` : `$${v.toFixed(0)}`;
+          const _skew = _tot > 0 ? `S ${(_totS/_tot*100).toFixed(0)}% / B ${(_totB/_tot*100).toFixed(0)}%` : 'no turnover';
+          this.log(`[ASH] 💧 Liq #${batch.id} — ${_fmt(_tot)} · ${_skew}`, 'info');
+          for (const fn of (this._liqCloseHooks || [])) { try { fn(results, batch); } catch(_) {} }
+        },
+
+        // Recomputes the global avg sell-liq / buy-liq $ used as the depth baseline — the same
+        // population as the chart's own dashed avg line, just split by side. Zero-turnover
+        // entries are excluded so the vast majority of ticker/cycle combos with no liquidation
+        // that side don't drag the average toward zero. Called once per cycle close (and once
+        // at init, after history loads from storage) — not on every incoming WS message, since
+        // that would recompute this over the whole rolling history on the live hot path.
+        _liqUpdateAvgTurnover() {
+          const history = this._liqCycleHistory || [];
+          const allS = history.flatMap(c => (c.results || []).map(r => r.sLiqRaw || 0)).filter(v => v > 0);
+          const allB = history.flatMap(c => (c.results || []).map(r => r.bLiqRaw || 0)).filter(v => v > 0);
+          this._liqAvgSTurnover = allS.length ? allS.reduce((a, b) => a + b, 0) / allS.length : 0;
+          this._liqAvgBTurnover = allB.length ? allB.reduce((a, b) => a + b, 0) / allB.length : 0;
+        },
+
+        _liqChartSvg(shown) {
+          if (!shown) return '';
+          const history = this._liqCycleHistory || [];
+          if (!history.length) return '';
+          const cycleW = 28, dayGapW = 38, H = 80, padL = 28, padB = 16, padT = 6, padR = 4;
+          const plotH = H - padT - padB;
+          const DATE_CLR = 'rgba(255,150,80,.65)';
+          const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+          const dLabel = _d => isNaN(_d.getTime()) ? '?' : MONTHS[_d.getMonth()]+' '+_d.getDate();
+          const localDay = ts => { const d = new Date(ts); return isNaN(d.getTime()) ? 0 : d.getFullYear() * 1000 + d.getMonth() * 32 + d.getDate(); };
+          // Pre-compute x positions, reserving extra space at day boundaries
+          const xPos = [];
+          let xCur = padL;
+          for (let ci = 0; ci < history.length; ci++) {
+            if (ci > 0 && localDay(history[ci].ts) !== localDay(history[ci - 1].ts)) xCur += dayGapW;
+            xPos.push(xCur);
+            xCur += cycleW;
+          }
+          const W = xCur + padR;
+          let maxRaw = 0;
+          for (const cycle of history) for (const r of cycle.results) maxRaw = Math.max(maxRaw, (r.sLiqRaw || 0) + (r.bLiqRaw || 0));
+          if (maxRaw <= 0) maxRaw = 1;
+          const allTotals = history.flatMap(c => c.results.map(r => (r.sLiqRaw||0) + (r.bLiqRaw||0))).filter(v => v > 0);
+          const avgRef = allTotals.length ? allTotals.reduce((a, b) => a + b, 0) / allTotals.length : 0;
+          const fmt = v => v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(0) + 'K' : v.toFixed(0);
+          const yVal = v => padT + plotH - (v / maxRaw) * plotH;
+          // Fixed Y-axis overlay SVG (padL=28, wrapPad=6 → overlay width=34, height=H+8=88)
+          const _ow = padL + 6, _oh = H + 8, _ax = padL + 6;
+          let _yAxis = `<svg width="${_ow}" height="${_oh}" style="display:block"><line x1="${_ax}" y1="${4 + padT}" x2="${_ax}" y2="${4 + padT + plotH}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`;
+          for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+            const v = maxRaw * f;
+            const y = (4 + yVal(v)).toFixed(1);
+            _yAxis += `<text x="${_ax - 3}" y="${(parseFloat(y) + 3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${fmt(v)}</text>`;
+          }
+          this._liqYAxisHtml = _yAxis + '</svg>';
+          const grids = [0, 0.25, 0.5, 0.75, 1].map(f => {
+            const v = maxRaw * f;
+            const y = yVal(v).toFixed(1);
+            return `<line x1="${padL}" y1="${y}" x2="${(W - padR).toFixed(1)}" y2="${y}" stroke="rgba(255,255,255,.05)" stroke-width="0.5"/>`;
+          }).join('');
+          if (avgRef > maxRaw * 0.05 && avgRef < maxRaw * 0.95) {
+            this._liqAvgYPx = 4 + yVal(avgRef); // 4px = wrapper top padding
+          } else {
+            this._liqAvgYPx = null;
+          }
+          // Highlighted cycle falls back to the actual latest cycle when nothing is pinned —
+          // see the matching HIGHLIGHTED CYCLE section below, fed by _liqDisplayedResults().
+          const displayedTs = this._liqHighlightedCycleTs ?? history[history.length - 1].ts;
+          let bars = '';
+          history.forEach((cycle, ci) => {
+            const cx = xPos[ci];
+            const n  = cycle.results.length;
+            const bw = Math.max(1, Math.min(4, cycleW * 0.9 / n));
+            // Hitbox — sits under the bars and spans the full cycle column (not just the bars
+            // themselves, since a cycle with zero turnover has no bars to click), doubling as
+            // the highlight backdrop for whichever cycle HIGHLIGHTED CYCLE is currently showing.
+            const isDisplayed = cycle.ts === displayedTs;
+            bars += `<rect class="liq-cycle-hit" data-liq-cycle-ts="${cycle.ts}" x="${cx.toFixed(1)}" y="${padT}" width="${cycleW.toFixed(1)}" height="${plotH.toFixed(1)}" fill="${isDisplayed ? 'rgba(255,150,80,.10)' : 'transparent'}" pointer-events="all" style="cursor:pointer"/>`;
+            cycle.results.forEach((r, ri) => {
+              const x    = cx + (ri / n) * cycleW * 0.9;
+              const bRaw = r.bLiqRaw || 0;
+              const sRaw = r.sLiqRaw || 0;
+              if (bRaw + sRaw <= 0) return;
+              const bH = Math.max(1, (bRaw / maxRaw) * plotH);
+              const sH = Math.max(0, (sRaw / maxRaw) * plotH);
+              bars += `<rect x="${x.toFixed(1)}" y="${(padT + plotH - bH).toFixed(1)}" width="${bw.toFixed(1)}" height="${bH.toFixed(1)}" fill="rgba(255,80,80,${r.bPass ? 0.85 : 0.35})"/>`;
+              if (sH > 0) bars += `<rect x="${x.toFixed(1)}" y="${(padT + plotH - bH - sH).toFixed(1)}" width="${bw.toFixed(1)}" height="${sH.toFixed(1)}" fill="rgba(100,220,150,${r.sPass ? 0.85 : 0.35})"/>`;
+            });
+            if (ci > 0 && localDay(history[ci].ts) !== localDay(history[ci - 1].ts)) {
+              const gx = cx - dayGapW / 2;
+              const d  = new Date(history[ci].ts);
+              bars += `<line x1="${gx.toFixed(1)}" y1="${padT}" x2="${gx.toFixed(1)}" y2="${(padT + plotH).toFixed(1)}" stroke="${DATE_CLR}" stroke-width="0.5" stroke-dasharray="3 2"/>`;
+              bars += `<text x="${gx.toFixed(1)}" y="${H - 2}" fill="${DATE_CLR}" font-size="7" font-family="monospace" text-anchor="middle">${dLabel(d)}</text>`;
+            } else if (ci > 0) {
+              bars += `<line x1="${cx.toFixed(1)}" y1="${padT}" x2="${cx.toFixed(1)}" y2="${(padT + plotH).toFixed(1)}" stroke="rgba(255,255,255,.08)" stroke-width="0.5"/>`;
+            }
+            const d = new Date(cycle.ts);
+            const label = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+            bars += `<text x="${(cx + cycleW / 2).toFixed(1)}" y="${H - 2}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="middle">${label}</text>`;
+          });
+          return `<svg width="${W}" height="${H}" style="display:block">`
+            + `<line x1="${padL}" y1="${(padT + plotH).toFixed(1)}" x2="${W - padR}" y2="${(padT + plotH).toFixed(1)}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`
+            + grids + bars
+            + `</svg>`;
+        },
+
+        // ── Presence Regime — shared market-skew signal for Multi-Indicator's and Speeder's
+        // Auto mode. Deliberately not a persisted rolling stat of its own: recomputed on demand
+        // from _liqCycleHistory (already retained for the chart above), same window every
+        // consumer reads, so nothing can drift out of sync from a stale cache.
+        _afRegimeSkew() {
+          const hist = this._liqCycleHistory || [];
+          if (!hist.length) return null;
+          const win = this.cfg.ashPresenceSkewWindow || 0;
+          const slice = win > 0 ? hist.slice(-win) : hist;
+          let s = 0, b = 0;
+          for (const cycle of slice) {
+            for (const r of (cycle.results || [])) { s += r.sLiqRaw || 0; b += r.bLiqRaw || 0; }
+          }
+          const total = s + b;
+          if (!total) return null;
+          return { sPct: s / total * 100, bPct: b / total * 100, total };
+        },
+
+        _afIsBliqDominant() {
+          const skew = this._afRegimeSkew();
+          return !!skew && skew.bPct >= (this.cfg.ashPresenceSkewThreshold ?? 70);
+        },
+
+        _afIsSliqDominant() {
+          const skew = this._afRegimeSkew();
+          return !!skew && skew.sPct >= (this.cfg.ashPresenceSkewThreshold ?? 70);
+        },
+
+        // Standalone version of the boolean the Mutual DDH Lift check above computes inline —
+        // true iff the partner bot's most recently broadcast drawdown transition was a start
+        // with no matching end since. Requires Cross Broadcast.
+        _afPartnerHalted() {
+          if (!this.cfg.ashfallCrossEnabled) return false;
+          const last = this._afCrossRead().filter(e => e.source === 'winter' && (e.kind === 'ddh-start' || e.kind === 'ddh-end')).at(-1);
+          return last?.kind === 'ddh-start';
+        },
+
+        // Resolves which cycle's results HIGHLIGHTED CYCLE shows — the pinned cycle if one was
+        // clicked and is still in history, else the actual latest (default). A pinned cycle
+        // can age out of _liqCycleHistory (capped at 25) without an explicit reset, so this
+        // falls back rather than showing a stale/empty list.
+        _liqDisplayedResults() {
+          const history = this._liqCycleHistory || [];
+          const hi = this._liqHighlightedCycleTs;
+          if (hi != null) {
+            const hit = history.find(c => c.ts === hi);
+            if (hit) return hit.results || [];
+          }
+          return history.length ? (history[history.length - 1].results || []) : (this._liqLatestResults || []);
+        },
+        _liqSummary(results) {
+          const rows = Array.isArray(results) ? results : [];
+          let s = 0, b = 0, n = 0;
+          for (const r of rows) {
+            if (!r) continue;
+            s += r.sLiqRaw || 0;
+            b += r.bLiqRaw || 0;
+            n++;
+          }
+          const total = s + b;
+          return { s, b, total, n, sPct: total ? s / total * 100 : 0, bPct: total ? b / total * 100 : 0 };
+        },
+
+        _liqAllSummary() {
+          const history = this._liqCycleHistory || [];
+          const rows = history.flatMap(c => c.results || []);
+          if (rows.length) return this._liqSummary(rows);
+          return this._liqSummary(this._liqLatestResults || Object.values(this._liqResults || {}));
+        },
+
+        _liqDisplayedCycleLabel() {
+          const history = this._liqCycleHistory || [];
+          const hi = this._liqHighlightedCycleTs;
+          if (hi == null || !history.length) return '';
+          const latest = history[history.length - 1];
+          if (hi === latest.ts) return '';
+          const hit = history.find(c => c.ts === hi);
+          if (!hit) return '';
+          const d = new Date(hit.ts);
+          return ' · ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        },
+        // Classifies each ticker the same way MIC's live classifier actually does (sliq/bliq at
+        // >=70% dominance, msliq/mbliq for a 30-70% mixed majority — see _micOnLiqMessage in
+        // MultiIndicator-Chaser.html), not the separate, user-configurable ashLiqThresholdPct
+        // (that one only drives the chart bar opacity / historical "pass" tracking below — a
+        // ticker just past 50% there is not the same thing as a ticker MI would actually treat
+        // as decisively one-sided). Mixed reads get the same hue as their majority side, just
+        // visibly dimmer, so a 55/44 split no longer looks identical to a 95/5 one.
+        _liqInfoHtml(shown) {
+          if (!shown) return '';
+          const results = this._liqDisplayedResults();
+          return results.map(r => {
+            const sPct = r.sLiqPct || 0, bPct = r.bLiqPct || 0;
+            let type = null;
+            if (sPct >= 70) type = 'sliq';
+            else if (bPct >= 70) type = 'bliq';
+            else if (sPct > bPct && bPct >= 30) type = 'msliq';
+            else if (bPct > sPct && sPct >= 30) type = 'mbliq';
+            const isSell  = type === 'sliq' || type === 'msliq';
+            const isMixed = type === 'msliq' || type === 'mbliq';
+            const clr = type ? (isMixed ? `rgba(255,150,80,.9)` : isSell ? 'rgba(100,220,150,.9)' : 'rgba(255,80,80,.9)') : 'rgba(255,255,255,.3)';
+            const bg  = type ? (isMixed ? `rgba(255,150,80,.07)` : isSell ? 'rgba(100,220,150,.07)' : 'rgba(255,80,80,.07)') : 'rgba(255,255,255,.03)';
+            const bdr = type ? (isMixed ? `rgba(255,150,80,.4)` : isSell ? 'rgba(100,220,150,.4)' : 'rgba(255,80,80,.4)') : 'rgba(255,255,255,.1)';
+            const domDepth = isSell ? (r.sDepth ?? 0) : (r.bDepth ?? 0);
+            const dSign = domDepth >= 0 ? '+' : '';
+            const emoji = { sliq: '🥵', bliq: '🥶', msliq: '💦', mbliq: '🌨️' }[type] || '';
+            const label = { sliq: 'S', bliq: 'B', msliq: 'mS', mbliq: 'mB' }[type] || '';
+            const badge = type ? `${emoji}${label}${dSign}${domDepth}` : '';
+            return `<span title="${r.sym}: S-Liq ${r.sLiqPct.toFixed(1)}% (depth ${r.sDepth >= 0 ? '+' : ''}${r.sDepth ?? 0}) / B-Liq ${r.bLiqPct.toFixed(1)}% (depth ${r.bDepth >= 0 ? '+' : ''}${r.bDepth ?? 0})" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${badge}${r.sym.replace('USDT','')} <span style="opacity:.65">S${r.sLiqPct.toFixed(1)}% B${r.bLiqPct.toFixed(1)}%</span></span>`;
+          }).join('');
+        },
+
+        // ── Order Count Surveillance ─────────────────────────────────────────
+
+        async _ocFetchBatch(symbols) {
+          if (!this.cfg.afOcEnabled || !symbols?.length) return;
+          // Guard against overlapping calls: if a slower fetch (e.g. from a re-triggered
+          // scan) finishes after a newer one already pushed, its stale ticker set would
+          // otherwise land in history too, mixing symbols that were never part of the
+          // latest scan's sample into the display.
+          if (this._ocFetchRunning) return;
+          this._ocFetchRunning = true;
+          try {
+          const limit = this.cfg.afOcOrderLimit ?? 100;
+          const results = {};
+          const CONC = 10;
+          for (let i = 0; i < symbols.length; i += CONC) {
+            await Promise.all(symbols.slice(i, i + CONC).map(async sym => {
+              try {
+                const res = await fetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
+                const js  = await res.json();
+                const trades = js?.result?.list || [];
+                if (trades.length < 2) return;
+                let bc = 0, sc = 0;
+                for (const t of trades) { if (t.side === 'Buy') bc++; else sc++; }
+                const times = trades.map(t => parseInt(t.time, 10)).filter(n => !isNaN(n)).sort((a,b)=>a-b);
+                const span = times[times.length - 1] - times[0];
+                const avgMs = times.length > 1 && span > 0 ? span / (times.length - 1) : null;
+                results[sym] = { bc, sc, avgMs, n: trades.length };
+              } catch(_) {}
+            }));
+          }
+          if (!Object.keys(results).length) return;
+          this.afOcResults = results;
+          this._afOcCycleCounter = (this._afOcCycleCounter % 99) + 1;
+          const entry = { id: this._afOcCycleCounter, ts: Date.now(), results: Object.entries(results).map(([sym, r]) => ({ sym, ...r })) };
+          this._afOcCycleHistory.push(entry);
+          if (this._afOcCycleHistory.length > 25) this._afOcCycleHistory = this._afOcCycleHistory.slice(-25);
+          this._ocPersistHistory();
+          const withInterval = Object.values(results).filter(r => r.avgMs != null);
+          const avgSec = withInterval.length ? (withInterval.reduce((s,r)=>s+r.avgMs,0)/withInterval.length/1000).toFixed(1) : '?';
+          this.log(`[ASH] 📊 OC sample — ${Object.keys(results).length}t · avg ${avgSec}s/order`, 'info');
+          } finally { this._ocFetchRunning = false; }
+        },
+
+        // Isolated single-symbol OC lookup for the live liquidation path (MIC's _micOnLiqMessage).
+        // Deliberately does NOT touch afOcResults or _afOcCycleHistory: afOcResults is a full
+        // replace on every _ocFetchBatch call, so a live single-symbol result written there would
+        // wipe out the current scan's multi-ticker snapshot other tickers' ocs/ocx checks still
+        // need; and pushing a 1-ticker entry into _afOcCycleHistory floods the Order Interval
+        // Sample chart / Volume History overlay's hourly buckets with noisy samples — the same
+        // problem Liquid-Diver's live OC fetch used to cause (see _ocChartViable()), just
+        // reintroduced from inside MIC instead of a separate plugin. Callers merge the return
+        // value into their own local map instead.
+        async _ocFetchSingle(sym) {
+          if (!this.cfg.afOcEnabled || !sym) return null;
+          try {
+            const limit = this.cfg.afOcOrderLimit ?? 100;
+            const res = await fetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
+            const js  = await res.json();
+            const trades = js?.result?.list || [];
+            if (trades.length < 2) return null;
+            let bc = 0, sc = 0;
+            for (const t of trades) { if (t.side === 'Buy') bc++; else sc++; }
+            const times = trades.map(t => parseInt(t.time, 10)).filter(n => !isNaN(n)).sort((a,b)=>a-b);
+            const span = times[times.length - 1] - times[0];
+            const avgMs = times.length > 1 && span > 0 ? span / (times.length - 1) : null;
+            return { bc, sc, avgMs, n: trades.length };
+          } catch(_) { return null; }
+        },
+
+        // Shared by init() (loading from localStorage) and afImport() (loading from a file)
+        // so a corrupt/legacy history can't slip in through one path just because the other
+        // path was hardened first. Drops records from the pre-redesign OC system (which
+        // counted a single raw order number per ticker, before the current buy/sell split —
+        // those entries lack bc/sc and only ever rendered as meaningless zero-fill bars/chips),
+        // rejects malformed or NaN timestamps, and caps to the same 25-cycle window as the
+        // liquidation history.
+        _ocSanitizeHistory(raw) {
+          const rawCount = (raw || []).reduce((n,c) => n + (Array.isArray(c?.results) ? c.results.length : 0), 0);
+          const cleaned = (raw || [])
+            .filter(c => c && Array.isArray(c.results) && typeof c.ts === 'number' && !isNaN(c.ts))
+            .map(c => ({ ...c, results: c.results.filter(r => r && typeof r.sym === 'string' && typeof r.bc === 'number' && !isNaN(r.bc) && typeof r.sc === 'number' && !isNaN(r.sc)) }))
+            .filter(c => c.results.length > 0)
+            .slice(-25);
+          const cleanCount = cleaned.reduce((n,c) => n + c.results.length, 0);
+          return { cleaned, purged: rawCount - cleanCount };
+        },
+
+        _ocPersistHistory() {
+          try {
+            this._afOcCycleHistory = trimToByteCap(this._afOcCycleHistory);
+            localStorage.setItem(ASH_OC_HIST_KEY, JSON.stringify(this._afOcCycleHistory));
+          } catch(_) {}
+        },
+
+        _afOcChartSvg(shown) {
+          if (!shown) return '';
+          // Defensive: a stale/partial write (e.g. a crash mid-save) or leftover pre-redesign
+          // entries in localStorage can leave a history array with malformed shapes. Filter to
+          // well-formed entries only so one bad record can't corrupt the whole render.
+          const history = (this._afOcCycleHistory || []).filter(c => c && Array.isArray(c.results) && typeof c.ts === 'number' && !isNaN(c.ts)).sort((a,b)=>a.ts-b.ts);
+          if (!history.length) return '';
+          const cycleW=28, dayGapW=38, H=80, padL=28, padB=16, padT=6, padR=4;
+          const plotH = H - padT - padB;
+          const MONTHS=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+          const dLabel = _d => isNaN(_d.getTime()) ? '?' : MONTHS[_d.getMonth()]+' '+_d.getDate();
+          const localDay = ts => { const d=new Date(ts); return isNaN(d.getTime()) ? 0 : d.getFullYear()*1000+d.getMonth()*32+d.getDate(); };
+          const xPos=[]; let xCur=padL;
+          for (let ci=0;ci<history.length;ci++) { if (ci>0&&localDay(history[ci].ts)!==localDay(history[ci-1].ts)) xCur+=dayGapW; xPos.push(xCur); xCur+=cycleW; }
+          const W = xCur + padR;
+          // Bars plot orderbook velocity (avg seconds/order) per ticker per cycle — this used
+          // to be fill-count data, which belongs on the OCS side, not the OCX side this chart
+          // is meant to represent. Fill counts are still visible in the chip list below.
+          // A handful of very illiquid tickers (60s+ intervals) are still real data and still
+          // eligible for entry — but including them here stretches the axis so far that every
+          // normal-paced ticker collapses into a thin sliver near the top. Chart display only:
+          // this cap has no effect on OCX matching or the chip list below.
+          const CHART_MAX_SEC = 12;
+          let maxSec=0;
+          for (const c of history) for (const r of c.results) { if (!r || r.avgMs==null || r.avgMs/1000>CHART_MAX_SEC) continue; maxSec=Math.max(maxSec,r.avgMs/1000); }
+          if (maxSec<=0) maxSec=1;
+          maxSec *= 1.3;
+          const allSecs=history.flatMap(c=>c.results.filter(r=>r&&r.avgMs!=null&&r.avgMs/1000<=CHART_MAX_SEC).map(r=>r.avgMs/1000));
+          const avgRef=allSecs.length?allSecs.reduce((a,b)=>a+b,0)/allSecs.length:0;
+          // Plain value scale: 0s at the bottom, maxSec at the top — a higher/slower interval
+          // plots taller, same convention as every other bar chart in this panel.
+          const yVal=v=>padT+plotH-(v/maxSec)*plotH;
+          const fmt=v=>v>=100?v.toFixed(0)+'s':v.toFixed(1)+'s';
+          const _ow=padL+6,_oh=H+8,_ax=padL+6;
+          let _yAxis=`<svg width="${_ow}" height="${_oh}" style="display:block"><line x1="${_ax}" y1="${4+padT}" x2="${_ax}" y2="${4+padT+plotH}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`;
+          for (const f of [0,0.25,0.5,0.75,1]) { const v=maxSec*f; const y=(4+yVal(v)).toFixed(1); _yAxis+=`<text x="${_ax-3}" y="${(parseFloat(y)+3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${fmt(v)}</text>`; }
+          this._afOcYAxisHtml = _yAxis+'</svg>';
+          if (avgRef>maxSec*0.05&&avgRef<maxSec*0.95) this._afOcAvgYPx=4+yVal(avgRef); else this._afOcAvgYPx=null;
+          const grids=[0,0.25,0.5,0.75,1].map(f=>{const v=maxSec*f;const y=yVal(v).toFixed(1);return `<line x1="${padL}" y1="${y}" x2="${(W-padR).toFixed(1)}" y2="${y}" stroke="rgba(255,255,255,.05)" stroke-width="0.5"/>`;}).join('');
+          const CLR='rgba(200,160,80,'; // amber — matches the OC-interval overlay line in Volume History
+          // Highlighted cycle falls back to the actual latest cycle when nothing is pinned —
+          // see the matching HIGHLIGHTED CYCLE section below, fed by _afOcDisplayedResults().
+          const displayedTs = this._afOcHighlightedCycleTs ?? history[history.length - 1].ts;
+          let bars='';
+          history.forEach((cycle,ci)=>{
+            const cx=xPos[ci]; const results=cycle.results.filter(r=>r&&r.avgMs!=null&&r.avgMs/1000<=CHART_MAX_SEC); const n=results.length;
+            const cycleMean=n?results.reduce((s,r)=>s+r.avgMs/1000,0)/n:0;
+            const bw=Math.max(1,Math.min(4,cycleW*0.9/Math.max(1,n)));
+            // Hitbox — sits under the bars and spans the full cycle column (not just the bars
+            // themselves, since a cycle with no qualifying-speed tickers has no bars to click),
+            // doubling as the highlight backdrop for whichever cycle is currently displayed.
+            const isDisplayed = cycle.ts === displayedTs;
+            bars += `<rect class="afoc-cycle-hit" data-oc-cycle-ts="${cycle.ts}" x="${cx.toFixed(1)}" y="${padT}" width="${cycleW.toFixed(1)}" height="${plotH.toFixed(1)}" fill="${isDisplayed ? 'rgba(200,160,80,.10)' : 'transparent'}" pointer-events="all" style="cursor:pointer"/>`;
+            results.forEach((r,ri)=>{
+              const x=cx+(ri/n)*cycleW*0.9;
+              const v=r.avgMs/1000;
+              // Lower interval = busier/faster order flow — highlight busier-than-usual
+              // ticks the same way spikes were highlighted in the old count-based bars.
+              const busier=cycleMean>0&&v<=cycleMean;
+              const alpha=busier?.85:.35;
+              const h=Math.max(1,(padT+plotH)-yVal(v));
+              const y=(padT+plotH)-h;
+              bars+=`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${CLR}${alpha})"/>`;
+            });
+            if (ci>0 && localDay(history[ci].ts)!==localDay(history[ci-1].ts)) {
+              const gx=cx-dayGapW/2;
+              const d=new Date(history[ci].ts);
+              bars+=`<line x1="${gx.toFixed(1)}" y1="${padT}" x2="${gx.toFixed(1)}" y2="${(padT+plotH).toFixed(1)}" stroke="rgba(200,160,80,.4)" stroke-dasharray="2 2"/>`;
+              bars+=`<text x="${gx.toFixed(1)}" y="${H-2}" fill="rgba(200,160,80,.65)" font-size="7" font-family="monospace" text-anchor="middle">${dLabel(d)}</text>`;
+            } else if (ci>0) {
+              bars+=`<line x1="${cx.toFixed(1)}" y1="${padT}" x2="${cx.toFixed(1)}" y2="${(padT+plotH).toFixed(1)}" stroke="rgba(255,255,255,.08)" stroke-width="0.5"/>`;
+            }
+            const d=new Date(cycle.ts);
+            const label=`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+            bars+=`<text x="${(cx+cycleW/2).toFixed(1)}" y="${H-2}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="middle">${label}</text>`;
+          });
+          return `<svg width="${W}" height="${H}" style="display:block">`
+            + `<line x1="${padL}" y1="${(padT+plotH).toFixed(1)}" x2="${W-padR}" y2="${(padT+plotH).toFixed(1)}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`
+            + grids + bars
+            + `</svg>`;
+        },
+
+        // Picks the newest cycle by timestamp rather than array position — see the matching
+        // comment in init() on why array-position ("last pushed") can go stale if two OC
+        // fetches ever overlap.
+        _afOcLatestCycle() {
+          const hist = this._afOcCycleHistory || [];
+          return hist.reduce((a,c) => (!a || c.ts > a.ts) ? c : a, null);
+        },
+        // Resolves which cycle's results the chart's summary/chip list show — the pinned cycle
+        // if one was clicked and is still in history, else the actual latest (default). Mirrors
+        // _liqDisplayedResults(); a pinned cycle can age out of _afOcCycleHistory (capped at 25)
+        // without an explicit reset, so this falls back rather than showing a stale/empty list.
+        _afOcDisplayedCycle() {
+          const hist = this._afOcCycleHistory || [];
+          const hi = this._afOcHighlightedCycleTs;
+          if (hi != null) {
+            const hit = hist.find(c => c.ts === hi);
+            if (hit) return hit;
+          }
+          return this._afOcLatestCycle();
+        },
+        _afOcDisplayedCycleLabel() {
+          const last = this._afOcLatestCycle();
+          const hi = this._afOcHighlightedCycleTs;
+          if (hi == null || !last) return '';
+          if (hi === last.ts) return '';
+          const hist = this._afOcCycleHistory || [];
+          const hit = hist.find(c => c.ts === hi);
+          if (!hit) return '';
+          const d = new Date(hit.ts);
+          return ' · ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+        },
+        _afOcSummaryText(shown) {
+          if (!shown) return '';
+          const last = this._afOcDisplayedCycle();
+          const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
+          if (!results.length) return '';
+          const bc = results.reduce((s,r)=>s+(r.bc||0),0);
+          const sc = results.reduce((s,r)=>s+(r.sc||0),0);
+          const total = bc + sc;
+          if (!total) return '';
+          const buyPct = (bc/total*100).toFixed(0), sellPct = (sc/total*100).toFixed(0);
+          return `${total} order${total===1?'':'s'} sampled · ${buyPct}% buy / ${sellPct}% sell · ${results.length} ticker${results.length===1?'':'s'}${this._afOcDisplayedCycleLabel()}`;
+        },
+        // Mean seconds/order across every ticker in the displayed cycle — moved here from the
+        // old Volume History chart's OC overlay line, which got scrapped along with the rest
+        // of that chart. Simple average across the cycle's tickers, not an hourly bucket mean.
+        _afOcAvgIntervalSec(shown) {
+          if (!shown) return null;
+          const last = this._afOcDisplayedCycle();
+          const withInterval = (last?.results || []).filter(r => r && r.avgMs != null);
+          if (!withInterval.length) return null;
+          return withInterval.reduce((s,r) => s + r.avgMs, 0) / withInterval.length / 1000;
+        },
+        _afOcInfoHtml(shown) {
+          if (!shown) return '';
+          const last = this._afOcDisplayedCycle();
+          const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
+          if (!results.length) return '';
+          const mean=results.reduce((s,r)=>s+(r.bc||0)+(r.sc||0),0)/results.length;
+          return results.map(r=>{
+            const total=(r.bc||0)+(r.sc||0); if(!total) return '';
+            const aboveAvg=total>=mean;
+            const clr=aboveAvg?'rgba(255,150,80,.9)':'var(--text-lo)';
+            const bdr=aboveAvg?'rgba(255,150,80,.4)':'rgba(255,255,255,.1)';
+            const bg=aboveAvg?'rgba(255,150,80,.06)':'transparent';
+            const avgSec = r.avgMs!=null ? (r.avgMs/1000).toFixed(1)+'s/order' : 'n/a';
+            return `<span title="${r.sym}: ${r.bc||0} B-fills / ${r.sc||0} S-fills · ${avgSec}" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${r.sym.replace('USDT','')} <span style="opacity:.65">B${r.bc||0} S${r.sc||0}</span><span style="opacity:.4;font-size:7px"> ${avgSec}</span></span>`;
+          }).join('');
+        },
+
+      });
+    },
+  };
+})();
+</script>
