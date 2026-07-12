@@ -44,10 +44,11 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.52.5';
+  const VERSION        = '1.54.2';
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
   const PFR_LIQ_HISTORY_KEY = '__pf_liq_history';
+  const PFR_LIQ_SEQUESTER_KEY = '__pf_liq_sequester';
   const PFR_OC_HIST_KEY     = '__pf_oc_history';
   const CROSS_KEY      = '__everwinter_cross_v1';
   const CROSS_TTL      = 6 * 3600 * 1000;
@@ -68,6 +69,12 @@
     if (/^iom/.test(c))  return '🧲' + c.slice(3);
     if (/^ocs/.test(c))  return '🔭' + c.slice(3);
     if (/^ocx/.test(c))  return '📡' + c.slice(3);
+    if (/^pec([a-z]+)/.test(c)) {
+      const m = c.match(/^(pec[a-z]+)/);
+      const base = m[1];
+      const emoji = { pecob: '⬆️', pecos: '⬇️', pecalpha: '🔺', pecdelta: '🎺', pecmomup: '↗️', pecmomdn: '↘️' }[base] || '📊';
+      return emoji + c.slice(base.length);
+    }
     if (c === '+24h') return '⬆️'; if (c === '-24h') return '⬇️';
     if (c === '+fund') return '🤑'; if (c === '-fund') return '💸';
     if (c === '+ocs') return '🔭+'; if (c === '-ocs') return '🔭-';
@@ -321,6 +328,18 @@
                   <div class="lbl">Batch Size <b x-text="(cfg.pfLiqBatchSize??25)"></b> tickers</div>
                   <input type="range" min="5" max="50" step="5" x-model.number="cfg.pfLiqBatchSize" @change="persist()">
                   <div class="pfr-hint">Random draw per 1h window from ≥6% 24h move pool, disjoint across concurrent batches.</div>
+                </div>
+                <label class="tog" style="margin-top:8px" @click.prevent="if(!cfgLocked){cfg.pfLiqSequesterEnabled=!cfg.pfLiqSequesterEnabled;persist()}">
+                  <div class="tog-t" :class="cfg.pfLiqSequesterEnabled?'on':''"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">0-Liq Sequester</div>
+                    <div class="pfr-hint">Reprioritizes calm (0-Liq) tickers for resurveillance so their clean read doesn't go stale.</div>
+                  </div>
+                </label>
+                <div class="g" x-show="cfg.pfLiqSequesterEnabled" style="margin-top:6px">
+                  <div class="lbl">Sequester Draw Cap <b x-text="(cfg.pfLiqSequesterCap??12)"></b> tickers</div>
+                  <input type="range" min="1" max="25" step="1" x-model.number="cfg.pfLiqSequesterCap" @change="persist()">
+                  <div class="pfr-hint">Max sequestered tickers pulled per batch; excess rotate in on later cycles.</div>
                 </div>
                 <div class="g" style="margin-top:6px">
                   <div class="lbl">Presence Regime Threshold <b x-text="(cfg.pfPresenceSkewThreshold??70)+'%'"></b></div>
@@ -593,6 +612,12 @@
         _liqResults: {},
         _liqResultsVersion: 0,
         _liqCycleHistory: [],
+        // Symbols whose most recently closed batch read clean (zero combined liq turnover).
+        // Map of symbol -> { qualifiedAt }, refreshed every time a clean close reconfirms it,
+        // deleted the moment a close shows any liquidation. Drives sequestered priority picks
+        // in _liqLaunchBatch so a calm ticker keeps getting resurveilled instead of aging out
+        // of the >6%/-6% mover pool and going dark. See _liqCloseBatch / _liqLaunchBatch.
+        _liqSequester: {},
         _liqLatestResults: [],
         _liqCycleCounter: 0,
         _liqAvgYPx: null,
@@ -652,6 +677,8 @@
           if (this.cfg.pfLiqEnabled      === undefined) this.cfg.pfLiqEnabled      = true;
           if (this.cfg.pfLiqBatchSize    === undefined) this.cfg.pfLiqBatchSize    = 25;
           if (this.cfg.pfLiqThresholdPct === undefined) this.cfg.pfLiqThresholdPct = 50;
+          if (this.cfg.pfLiqSequesterEnabled === undefined) this.cfg.pfLiqSequesterEnabled = true;
+          if (this.cfg.pfLiqSequesterCap     === undefined) this.cfg.pfLiqSequesterCap     = 12;
           if (this.cfg.pfPresenceSkewThreshold === undefined) this.cfg.pfPresenceSkewThreshold = 70;
           if (this.cfg.pfPresenceSkewWindow    === undefined) this.cfg.pfPresenceSkewWindow    = 0;
           if (this.cfg.pfPresenceMixedMode     === undefined) this.cfg.pfPresenceMixedMode     = 'continue';
@@ -677,6 +704,10 @@
                 this._liqResults[r.sym] = { sLiqPct: r.sLiqPct, bLiqPct: r.bLiqPct, sLiqRaw: r.sLiqRaw, bLiqRaw: r.bLiqRaw, cycleId: last.id, ts: last.ts };
               this._liqCycleCounter = Math.max(this._liqCycleCounter, last.id || 0);
             }
+          } catch(_) {}
+          try {
+            const seq = JSON.parse(localStorage.getItem(PFR_LIQ_SEQUESTER_KEY) || 'null');
+            if (seq && typeof seq === 'object') this._liqSequester = seq;
           } catch(_) {}
           this._liqUpdateAvgTurnover();
           try {
@@ -1287,19 +1318,56 @@
         // Pure display — unlike _pfScoreBuild() (which miwCollapsedCritStats/miwCollapsedSlotRanks
         // come from and which real trading logic reads), this chip-rendering step has no
         // consumer besides this panel, so it's safe to skip while the panel isn't visible.
+        // Mirrors MIW's actual Slot Blocking decision (_miwIsCritBlocked/_miwIsEntryBlocked) so
+        // the scorecard can show, at a glance, which chips are currently contributing to a block.
+        // Only meaningful for the MIW/MIC bucket — Slot Blocking is an MIW/MIC mechanism, the
+        // Blind-Entry/Liquid-Diver bucket has no equivalent concept.
+        // Liq-anchor types (sliq/bliq/msliq/mbliq/0liq) are always eligible, matching
+        // _miwIsEntryBlocked's unconditional anchor check; their score is the sign-combined total
+        // (matching _miwCritScore, which sums the '+' and '-' buckets for a bare anchor name —
+        // blocking is per anchor TYPE, not per sign, so both a type's chips share one verdict).
+        // Past-1 is a path, not a criterion — it never appears as a collapsed key here, so there's
+        // nothing to match it against.
+        // Kline/PEC tags (lsa/lba/rasl/rabl/pec*) are only eligible when miwSlotBlockTags is on,
+        // and use their own exact collapsed key's score, not a combined one — matching
+        // _miwIsEntryBlocked's per-tag check. Everything else (fund/vm/iot/iom/ocs/ocx) is never
+        // eligible, since Slot Blocking deliberately excludes them as too generalized.
+        _pfIsCritBlocked(key) {
+          if (!this.cfg.miwSlotBlockEnabled) return false;
+          const ranks = this.miwCollapsedSlotRanks || {};
+          const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+          const threshold  = baseMargin * ((this.cfg.miwSlotBlockPct ?? 25) / 100);
+          const anchorM = key.match(/^(sliq|bliq|msliq|mbliq)[+-]/);
+          if (anchorM || key === '0liq') {
+            const base = anchorM ? anchorM[1] : '0liq'; // '0liq' is bare, never sign-tagged
+            const score = (ranks[base] ?? 0) + (ranks[base + '+'] ?? 0) + (ranks[base + '-'] ?? 0);
+            return score <= -threshold;
+          }
+          if (/^(lsa|lba|rasl|rabl|pec[a-z]+)[+-]/.test(key)) {
+            if (!this.cfg.miwSlotBlockTags) return false;
+            return (ranks[key] ?? 0) <= -threshold;
+          }
+          return false;
+        },
+
         _pfScorecardHtml(shown, bucket) {
           if (!shown) return '';
           const stats = (bucket === 'blind' ? this.blindCollapsedCritStats : this.miwCollapsedCritStats) || {};
           if (!Object.keys(stats).length) return `<span style="font-size:9px;color:var(--text-lo)">No ${bucket === 'blind' ? 'Blind-Entry/Liquid-Diver' : 'MIW'} closes recorded yet.</span>`;
           const own = (this.cfg.pfScorecardView || 'combined') === 'own';
           const expanded = this.pfScorecardExpanded;
-          const _chipHtml = (key, emoji, title, val, wins, losses, isExpanded, expandedInner) => {
+          const _chipHtml = (key, emoji, title, val, wins, losses, isExpanded, expandedInner, blocked) => {
             let clr, bg, bdr;
-            clr = val > 0 ? 'rgba(100,220,150,.9)' : val < 0 ? 'var(--short)' : 'var(--text-lo)';
-            bg  = val > 0 ? 'rgba(100,220,150,.08)' : val < 0 ? 'rgba(255,80,80,.08)' : 'rgba(255,255,255,.04)';
-            bdr = val > 0 ? 'rgba(100,220,150,.35)' : val < 0 ? 'rgba(255,80,80,.35)' : 'rgba(255,255,255,.12)';
+            if (blocked) {
+              clr = 'rgba(190,130,255,.95)'; bg = 'rgba(160,90,255,.14)'; bdr = 'rgba(190,130,255,.55)';
+            } else {
+              clr = val > 0 ? 'rgba(100,220,150,.9)' : val < 0 ? 'var(--short)' : 'var(--text-lo)';
+              bg  = val > 0 ? 'rgba(100,220,150,.08)' : val < 0 ? 'rgba(255,80,80,.08)' : 'rgba(255,255,255,.04)';
+              bdr = val > 0 ? 'rgba(100,220,150,.35)' : val < 0 ? 'rgba(255,80,80,.35)' : 'rgba(255,255,255,.12)';
+            }
             const inner = isExpanded ? expandedInner : `<b>${(val >= 0 ? '+$' : '-$') + Math.abs(val).toFixed(2)}</b> <span style="opacity:.55;font-size:8px">${wins}W ${losses}L</span>`;
-            return `<span data-slot="${key}" title="${title}" style="cursor:pointer;font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${emoji || '?'} ${inner}</span>`;
+            const titleFull = blocked ? title + ' (blocked)' : title;
+            return `<span data-slot="${key}" title="${titleFull}" style="cursor:pointer;font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${emoji || '?'} ${inner}</span>`;
           };
           const _srcFilter = cs => { const src = this.cfg.pfScorecardSource || 'both'; if (src === 'hist') return cs.hasHist; if (src === 'traded') return cs.hasTrade; return true; };
           const sorted = Object.entries(stats).filter(([,cs]) => _srcFilter(cs)).sort(([,a],[,b]) => own ? b.ownPnl-a.ownPnl : b.pnl-a.pnl);
@@ -1308,7 +1376,8 @@
             const wins = own ? cs.ownWins : cs.wins;
             const losses = own ? cs.ownLosses : cs.losses;
             const expandedInner = `<span style="opacity:.55;font-size:8px">${wins}W ${losses}L of ${wins+losses} recorded</span>`;
-            return _chipHtml(key, pfCritEmoji(key), key, val, wins, losses, expanded===key, expandedInner);
+            const blocked = bucket !== 'blind' && this._pfIsCritBlocked(key);
+            return _chipHtml(key, pfCritEmoji(key), key, val, wins, losses, expanded===key, expandedInner, blocked);
           }).join('');
         },
 
@@ -1644,6 +1713,10 @@
           } catch(_) {}
         },
 
+        _liqPersistSequester() {
+          try { localStorage.setItem(PFR_LIQ_SEQUESTER_KEY, JSON.stringify(this._liqSequester)); } catch(_) {}
+        },
+
         _liqResumeBatch(snapshot) {
           const remaining = snapshot.endsAt - Date.now();
           if (remaining <= 0) return;
@@ -1715,17 +1788,44 @@
           const activeSyms = new Set((this._liqBatches || []).flatMap(b => b.symbols));
           const base = t => t.symbol.endsWith('USDT') && t.symbol !== 'BTCUSDT'
             && parseFloat(t.lastPrice || 0) >= 0.001 && !activeSyms.has(t.symbol);
+
+          // Sequester: symbols whose most recently closed batch read 0-liq get priority
+          // resurveillance ahead of the random mover pool, so a calm ticker doesn't age out of
+          // coverage the moment it stops moving >6%/<-6% and its 0-liq status goes stale. The
+          // cap is a per-batch rotation limit, not a hard membership cap — a larger sequestered
+          // pool just rotates through over successive cycles, most-recently-reconfirmed-clean
+          // symbols drawn first each time (see _liqCloseBatch for how membership is maintained).
+          const tickerBySym = new Map(allTickers.map(t => [t.symbol, t]));
+          let sequesterPicks = [];
+          if (this.cfg.pfLiqSequesterEnabled ?? true) {
+            if (!this._liqSequester) this._liqSequester = {};
+            const cap = this.cfg.pfLiqSequesterCap ?? 12;
+            sequesterPicks = Object.entries(this._liqSequester)
+              .filter(([sym]) => {
+                const t = tickerBySym.get(sym);
+                if (!t || !base(t)) { delete this._liqSequester[sym]; return false; }
+                return true;
+              })
+              .sort((a, b) => (b[1].qualifiedAt || 0) - (a[1].qualifiedAt || 0))
+              .slice(0, cap)
+              .map(([sym]) => sym);
+          }
+          for (const sym of sequesterPicks) activeSyms.add(sym);
+
+          const remaining = Math.max(0, (this.cfg.pfLiqBatchSize ?? 25) - sequesterPicks.length);
           const gainers = allTickers.filter(t => base(t) && parseFloat(t.price24hPcnt || 0) >  0.06);
           const losers  = allTickers.filter(t => base(t) && parseFloat(t.price24hPcnt || 0) < -0.06);
-          if (!gainers.length && !losers.length) {
+          if (!sequesterPicks.length && !gainers.length && !losers.length) {
             this.log('[PFR] 💧 Liq batch skipped — no eligible tickers (>6% or <-6% 24h move, not already surveilled)', 'info');
             this._liqLastBatchSyms = [];
             return;
           }
           const shuffle = arr => { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } };
           shuffle(gainers); shuffle(losers);
-          const half    = Math.floor((this.cfg.pfLiqBatchSize ?? 25) / 2);
-          const symbols = [...gainers.slice(0, half), ...losers.slice(0, half)].map(t => t.symbol);
+          const half    = Math.floor(remaining / 2);
+          const symbols = [...sequesterPicks, ...gainers.slice(0, half).map(t => t.symbol), ...losers.slice(0, half).map(t => t.symbol)];
+          if (sequesterPicks.length) this.log(`[PFR] 💧 Sequester — ${sequesterPicks.length} calm ticker${sequesterPicks.length !== 1 ? 's' : ''} prioritized for resurveillance`, 'info');
+          this._liqPersistSequester();
           // Tickers this scan just picked for liq surveillance — read by MIW's OC sampling so it
           // can guarantee coverage for exactly these tickers this cycle (not the accumulated set
           // across every still-open, hour-long batch — see _miwRunScan's OC ticker selection).
@@ -1810,6 +1910,12 @@
           this._liqResultsVersion = (this._liqResultsVersion || 0) + 1;
           const _prevSharedVer = this._sharedRead?.('liqResults')?.ver ?? 0;
           this._sharedMerge?.('liqResults', _liqPatch, { ver: Math.max(this._liqResultsVersion, _prevSharedVer + 1) });
+          if (!this._liqSequester) this._liqSequester = {};
+          for (const r of results) {
+            if ((r.sLiqRaw || 0) + (r.bLiqRaw || 0) === 0) this._liqSequester[r.sym] = { qualifiedAt: _now };
+            else delete this._liqSequester[r.sym];
+          }
+          this._liqPersistSequester();
           const entry = { id: batch.id, ts: _now, results };
           this._liqCycleHistory.push(entry);
           if (this._liqCycleHistory.length > 25) this._liqCycleHistory = this._liqCycleHistory.slice(-25);

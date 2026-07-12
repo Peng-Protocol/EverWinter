@@ -1,31 +1,46 @@
 <!--
   Multi-Indicator Strategy Plugin for PseudoChaser
-  Slot-based entry filter built around liquidation as the primary, mandatory signal, with
-  fund rate, 24hr price direction, vol/mcap, candle, OI, and order-flow criteria layered on
-  as secondary confirmation. Every slot (manual or auto-generated) must anchor on exactly one
-  liquidation criterion:
-    sliq/bliq/msliq/mbliq — LIVE-only. Evaluated the instant a liquidation message crosses the
-      depth threshold mid-cycle (see _micOnLiqMessage, registered via Ashfall's
-      registerLiqMessageHook). These never resolve from a closed cycle — the data is too
-      temporal to be meaningful an hour later — so they no longer appear in the scan-time
-      criteria checker at all.
-    0liq   — CLOSED-CYCLE-only. A ticker can only be confirmed liquidation-free once its
-      surveillance cycle closes, so this stays on the regular scan cadence exactly as before,
-      gated by Liq Result Max Age.
+  Slot-based entry filter built around liquidation presence as the primary, mandatory signal,
+  with fund rate, PEC, vol/mcap, candle, OI, and order-flow criteria layered on as secondary
+  confirmation. Liquidation Presence (micLiqPresenceModes: any combination of '1' / '0' /
+  'past1') selects which of three paths a slot can run under:
+    '1'     (Live)   — every slot anchors on exactly one of sliq/bliq/msliq/mbliq, a real
+      criterion evaluated the instant a liquidation message crosses the depth threshold
+      mid-cycle (see _micOnLiqMessage, registered via Ashfall's registerLiqMessageHook).
+      These never resolve from a closed cycle — the data is too temporal to be meaningful an
+      hour later — so they no longer appear in the scan-time criteria checker at all.
+    '0'     (0-Liq)  — every slot anchors on the 0liq criterion, a real criterion confirmable
+      only once a ticker's surveillance cycle closes clean, checked against the full retained
+      window of Ashfall's closed liq cycles (_liqCycleHistory, up to micLiqLookbackCycles of
+      them) — a ticker only reads 0-Liq if every cycle it appeared in within that window came
+      back clean. See _micLiqZeroAcrossWindow.
+    'past1' (Past-1) — NOT a criterion. A Past-1 slot has no liquidation criterion in it at all;
+      it's built entirely from secondary criteria. What makes it a Past-1 slot is that it's only
+      ever matched against tickers with real recent liquidation activity that never qualified
+      for '1' (didn't cross the live threshold) or '0' (wasn't clean) — see
+      _micPast1FreshSymbols, sourced from the same closed-batch pool (_micPecPool, populated by
+      registerLiqCloseHook) that feeds PEC. The ticker-pool restriction *is* the anchor; there's
+      nothing to tag in the slot or the scorecard. A manually-built slot with no liquidation
+      criterion is only valid while 'past1' is an active mode — otherwise it's the same mistake
+      it always was (see the anchorless-slot warning at startup).
 
-  Liquidation Presence (micLiqPresenceMode: '1' / '0' / 'both') controls which of the two paths
-  are active — 'both' runs live real-liq entries and closed-cycle 0-liq entries side by side,
-  each producing their own slots.
+  This is why "every slot must have exactly one liquidation criterion" is no longer quite true:
+  '1'/'0' slots do; 'past1' slots deliberately don't. See _micSlotLiqAnchor (returns the
+  criterion or null) and _micGenerateCombos (the null case is what generates Past-1 combos).
 
   Slot Blocking (micSlotBlockEnabled) is a per-criterion loss circuit breaker: if a liq-anchor
   type's collapsed scorecard score (own + partner + historical, see micCollapsedSlotRanks) drops
   beyond micSlotBlockPct% of base margin in loss, new entries carrying that type are blocked —
-  continuously re-checked, no manual clear needed. Historical Scoring keeps logging matches
-  through a block (folded into the existing halted-but-still-scoring path) so the score has data
-  to recover with. micSlotBlockTags extends the same check to the entry's own +24h/-24h and
-  fund+/fund- criteria. Standalone toggle, independent of Liquidation Presence mode.
+  continuously re-checked, no manual clear needed. Only applies to '1'/'0' slots (sliq/bliq/
+  msliq/mbliq/0liq are real, blockable anchors) — Past-1 slots have no anchor to block on, so
+  they're only ever blockable via micSlotBlockTags below. Historical Scoring keeps logging
+  matches through a block (folded into the existing halted-but-still-scoring path) so the score
+  has data to recover with. micSlotBlockTags extends the same check to the entry's own PEC and
+  kline (LSA/LBA/R-ASL/R-ABL) tags only — fund and the other secondary criteria are too
+  generalized to include here, since blocking on them tends to block nearly every entry off one
+  bad stretch. Standalone toggle, independent of Liquidation Presence mode.
 
-  Secondary criteria (fund, +24h/-24h, vm, lsa/lba/rasl/rabl, iot, iom, ocs, ocx) combine with
+  Secondary criteria (fund, PEC 6h/12h/24h, vm, lsa/lba/rasl/rabl, iot, iom, ocs, ocx) combine with
   the liq anchor via the same AND-gate slot logic as before. On the live path, anything not
   fetched fresh this cycle (mcap, kline, OC) is fetched synchronously for just the triggering
   symbol before the slot match is judged — see _micOnLiqMessage.
@@ -57,9 +72,9 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.54.1';
+  const VERSION       = '1.59.2';
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
-  // Presence mode ('1' — live only). Switching to Only-0/Both won't retroactively populate
+  // Presence modes (default ['1'] — live only). Enabling 0/Past-1 won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
   const DEFAULT_SLOTS = [['sliq','fund<-1','lba>25'],['bliq','vm>10','lsa>25'],['msliq','fund>1','lba>25'],['mbliq','vm<10','lsa>25'],['sliq','fund>1','lsa>25'],['bliq','fund<-1','lsa>25'],['sliq','vm>10','lba>25'],['bliq','vm<10','lba>25']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
@@ -72,8 +87,27 @@
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
   // -fund = shorts paying = good carry for longs (🤑), bad for shorts (💸).
   // +fund = longs paying = bad for longs (💸), good for shorts (🤑).
-  const CRIT_EMOJI = { '+24h': '⬆️', '-24h': '⬇️', 'fund': '💰', 'vm': '🔊', 'sliq': '🥵', 'bliq': '🥶', 'msliq': '💦', 'mbliq': '🌨️', '0liq': '⚫', 'iot': '🎲', 'iom': '🧲', 'ocs': '🔭', 'ocx': '📡' };
-  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', '+24h': '+24h (up on day)', '-24h': '-24h (down on day)', 'vm': 'V/M (vol/mcap ratio)', 'lsa': 'LSA (1h sell spike)', 'lba': 'LBA (1h buy spike)', 'rasl': 'R-ASL (1h low-vol red)', 'rabl': 'R-ABL (1h low-vol green)', 'sliq': 'S-Liq (Sell-Liquidation: sell side ≥70% dominant)', 'bliq': 'B-Liq (Buy-Liquidation: buy side ≥70% dominant)', 'msliq': 'mS-Liq (Mixed Sell-Liq: sell majority, buy ≥30%)', 'mbliq': 'mB-Liq (Mixed Buy-Liq: buy majority, sell ≥30%)', '0liq': '0-Liq (no liquidation at all this cycle)', 'iot': 'IO/T (OI vs Turnover — conviction/stickiness)', 'iom': 'IO/M (OI vs MCap — leverage concentration)', 'ocs': 'OCS (buy/sell skew %)', 'ocx': 'OCX (avg seconds between orders)' };
+  const CRIT_EMOJI = { 'pecob': '⬆️', 'pecos': '⬇️', 'pecalpha': '🔺', 'pecdelta': '🎺', 'pecmomup': '↗️', 'pecmomdn': '↘️', 'fund': '💰', 'vm': '🔊', 'sliq': '🥵', 'bliq': '🥶', 'msliq': '💦', 'mbliq': '🌨️', '0liq': '⚫', 'iot': '🎲', 'iom': '🧲', 'ocs': '🔭', 'ocx': '📡' };
+  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', 'pecob': 'PEC Overbought (6h, 12h and 24h all above high threshold)', 'pecos': 'PEC Oversold (6h, 12h and 24h all below low threshold)', 'pecalpha': 'PEC Red Mountain (12h more bullish than both 6h and 24h)', 'pecdelta': 'PEC Green Delta (12h more bearish than both 6h and 24h)', 'pecmomup': 'PEC Bullish Momentum (6h > 12h > 24h — trended up all day)', 'pecmomdn': 'PEC Bearish Momentum (6h < 12h < 24h — trended down all day)', 'vm': 'V/M (vol/mcap ratio)', 'lsa': 'LSA (1h sell spike)', 'lba': 'LBA (1h buy spike)', 'rasl': 'R-ASL (1h low-vol red)', 'rabl': 'R-ABL (1h low-vol green)', 'sliq': 'S-Liq (Sell-Liquidation: sell side ≥70% dominant)', 'bliq': 'B-Liq (Buy-Liquidation: buy side ≥70% dominant)', 'msliq': 'mS-Liq (Mixed Sell-Liq: sell majority, buy ≥30%)', 'mbliq': 'mB-Liq (Mixed Buy-Liq: buy majority, sell ≥30%)', '0liq': '0-Liq (no liquidation at all this cycle)', 'iot': 'IO/T (OI vs Turnover — conviction/stickiness)', 'iom': 'IO/M (OI vs MCap — leverage concentration)', 'ocs': 'OCS (buy/sell skew %)', 'ocx': 'OCX (avg seconds between orders)' };
+  // PEC (Price Effect Coefficient): replaces the old raw +24h/-24h ticker-field boolean. For each
+  // of 6h/12h/24h, builds a composite candle from cached klines at cfg.micPecGranularity and scores
+  // (Close-Open)/(High-Low) onto a 0-100 scale (50=neutral). Six criteria, all derived from the
+  // resulting I_6h/I_12h/I_24h triple:
+  //   pecob    — Confluent Overbought: I_6h, I_12h, and I_24h all above micPecThresholdHigh.
+  //   pecos    — Confluent Oversold: I_6h, I_12h, and I_24h all below micPecThresholdLow.
+  //   pecalpha — Red Mountain: I_12h higher than both I_6h and I_24h (a peak on the middle timeframe).
+  //   pecdelta — Green Delta: I_12h lower than both I_6h and I_24h (a trough on the middle timeframe).
+  //   pecmomup — Bullish Momentum: I_6h > I_12h > I_24h, a pure upward tilt across the whole day.
+  //   pecmomdn — Bearish Momentum: I_6h < I_12h < I_24h, a pure downward tilt across the whole day.
+  // (The Bullish/Bearish Reversion pair that used to sit here was retired as redundant with
+  // Red Mountain/Green Delta.) pecalpha/pecdelta/pecmomup/pecmomdn only compare the three
+  // readings to each other, not to any threshold. Only pecob/pecos gate on
+  // High/Low. Every criterion is also tiered with a depth score (micPecDepthStep) reflecting how
+  // strongly it's expressed — a clean distance-past-threshold measure for pecob/pecos/momentum,
+  // a looser divergence-intensity proxy for Reversion/Mountain/Delta. Only ever
+  // computed for tickers whose liq surveillance batch just closed (see _micOnLiqClose /
+  // _micPecPool) and are still within micPecFreshCycles — the same
+  // universe every liq anchor already requires, so this adds no new fetch scope, just reuses it.
   // BOC/SOC (raw buy/sell fill counts requiring 24h surveillance runway) were considered but scrapped:
   // a 24h watch period only tells you counts at the end of the period, not a meaningful trend, and
   // hardware restarts every ~6h make a reliable 24h runway impractical on this device.
@@ -93,6 +127,7 @@
     if (/^iom/.test(c)) return '🧲' + c.slice(3);
     if (/^ocs/.test(c)) return '🔭' + c.slice(3);
     if (/^ocx/.test(c)) return '📡' + c.slice(3);
+    if (/^pec/.test(c)) { const m = c.match(/^(pec[a-z]+)/); return (CRIT_EMOJI[m ? m[1] : c] || '') + c.replace(/^pec[a-z]+/, ''); }
     return CRIT_EMOJI[c] || '';
   };
   const critLabel = c => {
@@ -127,6 +162,10 @@
     const oc = c.match(/^(ocs|ocx)([<>])(\d+)$/);
     if (oc) return oc[1].toUpperCase() + ' ' + oc[2] + oc[3];
     if (c === 'ocs') return 'OCS'; if (c === 'ocx') return 'OCX';
+    const PEC_LABEL = { pecob: 'PEC OB', pecos: 'PEC OS', pecalpha: 'PEC Red Mtn', pecdelta: 'PEC Grn Delta', pecmomup: 'PEC Bull-Mom', pecmomdn: 'PEC Bear-Mom' };
+    const pM = c.match(/^(pec[a-z]+)([+-]\d+)$/);
+    if (pM && PEC_LABEL[pM[1]]) return PEC_LABEL[pM[1]] + ' t' + pM[2];
+    if (PEC_LABEL[c]) return PEC_LABEL[c];
     return CRIT_DESC[c] || c;
   };
 
@@ -194,11 +233,11 @@
 
                   <!-- Auto slots controls -->
                   <div x-show="cfg.micAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(255,150,80,.04);border:1px solid rgba(255,150,80,.12);border-radius:3px">
-                    <div class="lbl">Criteria per Slot <b x-text="cfg.micAutoSlotSize??3"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.micAutoSlotSize??3;const excl=new Set(cfg.micAutoSlotExclude||[]);const mode=cfg.micLiqPresenceMode??'1';const anchors=['sliq','bliq','msliq','mbliq','0liq'].filter(c=>!excl.has(c)&&(mode==='both'?true:mode==='0'?c==='0liq':c!=='0liq')).length;const secTotal=['fund','+24h','-24h','vm','lsa','lba','rasl','rabl','iot','iom','ocs','ocx'].filter(c=>!excl.has(c)).length;const need=n-1;if(!anchors||(need>0&&secTotal<need))return 0;let r=1;for(let i=0;i<need;i++)r=r*(secTotal-i)/(i+1);return anchors*Math.round(r)})()+' base slots (tiers add more) — 1 liq anchor × secondary combos'"></span></div>
+                    <div class="lbl">Criteria per Slot <b x-text="cfg.micAutoSlotSize??3"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.micAutoSlotSize??3;const excl=new Set(cfg.micAutoSlotExclude||[]);const modes=cfg.micLiqPresenceModes||['1'];const anchors=['sliq','bliq','msliq','mbliq','0liq'].filter(c=>!excl.has(c)&&(c==='0liq'?modes.includes('0'):modes.includes('1'))).length;const secTotal=['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','vm','lsa','lba','rasl','rabl','iot','iom','ocs','ocx'].filter(c=>!excl.has(c)).length;const binom=k=>{if(k<0||secTotal<k)return 0;let r=1;for(let i=0;i<k;i++)r=r*(secTotal-i)/(i+1);return Math.round(r)};const anchored=anchors*binom(n-1);const past1=modes.includes('past1')?binom(n):0;return anchored+past1})()+' base slots (tiers add more) — anchored (1 liq anchor × secondary combos) + Past-1 (secondary-only combos, if active)'"></span></div>
                     <input type="range" min="1" max="5" step="1" x-model.number="cfg.micAutoSlotSize" @change="persist()">
                     <div class="lbl" style="margin-top:5px;margin-bottom:3px">Exclude from Auto</div>
                     <div style="display:flex;flex-wrap:wrap;gap:3px">
-                      <template x-for="c in ['fund','+24h','-24h','vm','lsa','lba','rasl','rabl','sliq','bliq','msliq','mbliq','0liq','iot','iom','ocs','ocx']" :key="c">
+                      <template x-for="c in ['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','vm','lsa','lba','rasl','rabl','sliq','bliq','msliq','mbliq','0liq','iot','iom','ocs','ocx']" :key="c">
                         <button @click.prevent="if(!cfgLocked){ const ex=(cfg.micAutoSlotExclude||[]).slice(); const i=ex.indexOf(c); if(i>=0) ex.splice(i,1); else ex.push(c); cfg.micAutoSlotExclude=ex; persist(); }"
                                 :style="'font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;cursor:pointer;border:1px solid;' + ((cfg.micAutoSlotExclude||[]).includes(c) ? 'border-color:rgba(255,80,80,.5);background:rgba(255,80,80,.15);color:rgba(255,80,80,.8)' : 'border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)')"
                                 x-text="c.replace('fund','Fund').replace('vm','V/M').replace('lsa','LSA').replace('lba','LBA').replace('rasl','R-ASL').replace('rabl','R-ABL').replace('sliq','S-Liq').replace('bliq','B-Liq').replace('0liq','0-Liq').replace('iot','IO/T').replace('iom','IO/M').replace('ocs','OCS').replace('ocx','OCX')">
@@ -218,7 +257,7 @@
                          @click.outside="liqFocus = null; ratioFocus = null; gateFocus = null; ocFocus = null"
                          style="display:flex;gap:3px;flex-wrap:wrap;align-items:center;margin-bottom:7px;padding:6px 7px;background:rgba(255,255,255,.04);border-radius:3px;border:1px solid rgba(255,255,255,.08)">
                       <span style="font-size:9px;color:var(--text-lo);margin-right:2px">Slot <span x-text="(cfg.micActiveSlot??0)+1"></span>:</span>
-                      <template x-for="c in ['fund','+24h','-24h','vm','lsa','lba','rasl','rabl','sliq','bliq','msliq','mbliq','0liq','iot','iom','ocs','ocx']" :key="c">
+                      <template x-for="c in ['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','vm','lsa','lba','rasl','rabl','sliq','bliq','msliq','mbliq','0liq','iot','iom','ocs','ocx']" :key="c">
                         <button class="mic-opt"
                           @click.prevent="if(!cfgLocked){
                             if(c==='sliq'||c==='bliq'||c==='msliq'||c==='mbliq'){
@@ -323,8 +362,8 @@
                         @click.prevent="_micAddSlot()"
                         style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(255,150,80,.06);border:1px dashed rgba(255,150,80,.3);border-radius:3px;color:#ff9650;cursor:pointer">+</button>
                     </div>
-                    <div class="mic-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. A slot without a liquidation criterion (S-Liq/B-Liq/mS-Liq/mB-Liq/0-Liq) never matches — liquidation is the mandatory anchor, everything else is secondary confirmation. S-Liq/B-Liq/mS-Liq/mB-Liq only ever trigger live, mid-cycle; 0-Liq only ever triggers once its surveillance cycle closes. Vol/mcap criteria compute market cap from CoinPaprika supply × Bybit price. LSA/LBA/R-ASL/R-ABL fetch the last completed 1h kline per ticker.</div>
-                    <div class="mic-hint" style="margin-top:5px;line-height:1.8">Badge key: 💸/🤑 Fund · ⬆️ +24h · ⬇️ -24h · 🔊 V/M · 🟥 LSA · 🟩 LBA · 🔴 R-ASL · 🟢 R-ABL · 🥵 S-Liq · 🥶 B-Liq · 💦 mS-Liq · 🌨️ mB-Liq · ⚫ 0-Liq · 🎲 IO/T · 🧲 IO/M · 🔭 OCS · 📡 OCX — click any tiered criterion to configure gate</div>
+                    <div class="mic-hint" style="margin-top:5px">Each slot is an AND-gate — a ticker must meet every criterion in the slot. Any matching slot qualifies the ticker for entry. A slot without a liquidation criterion (S-Liq/B-Liq/mS-Liq/mB-Liq/0-Liq) never matches — liquidation is the mandatory anchor, everything else is secondary confirmation. S-Liq/B-Liq/mS-Liq/mB-Liq only ever trigger live, mid-cycle; 0-Liq only ever triggers once its surveillance cycle closes. Vol/mcap criteria compute market cap from CoinPaprika supply × Bybit price. LSA/LBA/R-ASL/R-ABL fetch the last completed 1h kline per ticker. PEC only resolves for tickers whose liq surveillance batch just closed and are still fresh.</div>
+                    <div class="mic-hint" style="margin-top:5px;line-height:1.8">Badge key: 💸/🤑 Fund · ⬆️ PEC OB · ⬇️ PEC OS · 🔺 Red Mountain · 🎺 Green Delta · ↗️ Bull Momentum · ↘️ Bear Momentum · 🔊 V/M · 🟥 LSA · 🟩 LBA · 🔴 R-ASL · 🟢 R-ABL · 🥵 S-Liq · 🥶 B-Liq · 💦 mS-Liq · 🌨️ mB-Liq · ⚫ 0-Liq · 🎲 IO/T · 🧲 IO/M · 🔭 OCS · 📡 OCX — click any tiered criterion to configure gate</div>
                   </div><!-- end manual builder -->
                   <div class="g" style="margin-top:8px">
                     <div class="lbl">Kline Scan Cap <b x-text="(cfg.micKlineScanCap??20)"></b> tickers</div>
@@ -332,9 +371,48 @@
                     <div class="mic-hint">Random sample of tickers checked for kline criteria per cycle.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
+                    <div class="lbl">PEC Granularity</div>
+                    <div style="display:flex;gap:4px">
+                      <button class="mic-tab" :class="(cfg.micPecGranularity??'1h')==='15m'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPecGranularity='15m';persist()}">15m×96</button>
+                      <button class="mic-tab" :class="(cfg.micPecGranularity??'1h')==='1h'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPecGranularity='1h';persist()}">1h×24</button>
+                      <button class="mic-tab" :class="(cfg.micPecGranularity??'1h')==='3h'?'on':''" @click.prevent="if(!cfgLocked){cfg.micPecGranularity='3h';persist()}">3h×8</button>
+                    </div>
+                    <div class="mic-hint">Sub-candle size for the 6h/12h/24h composite windows. Finer = more precise, heavier fetch.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl">PEC Threshold High/Low <b x-text="(cfg.micPecThresholdHigh??70)+' / '+(cfg.micPecThresholdLow??30)"></b></div>
+                    <input type="range" min="50" max="95" step="1" x-model.number="cfg.micPecThresholdHigh" @change="persist()">
+                    <input type="range" min="5" max="50" step="1" x-model.number="cfg.micPecThresholdLow" @change="persist()">
+                    <div class="mic-hint">Only gates pecob/pecos. Reversion, Red Mountain/Green Delta, and Momentum pairs just compare the three timeframes to each other or to the 50 midpoint.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl">PEC Depth Step <b x-text="(cfg.micPecDepthStep??5)"></b></div>
+                    <input type="range" min="1" max="20" step="1" x-model.number="cfg.micPecDepthStep" @change="persist()">
+                    <div class="mic-hint">Index-point size of one depth tier, for the collapsed-rank score. Strongest for pecob/pecos/Momentum; noisier for Reversion/Mountain/Delta.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <label class="tog" @click.prevent="if(!cfgLocked){cfg.micPecWickDampen=!cfg.micPecWickDampen;persist()}">
+                      <div class="tog-t" :class="cfg.micPecWickDampen?'on':''"><div class="tog-k"></div></div>
+                      <div>
+                        <div class="tog-l">Wick Dampening</div>
+                        <div class="mic-hint">Uses the average sub-candle range instead of window high/low, so one liquidation wick can't dominate the reading.</div>
+                      </div>
+                    </label>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl">PEC Fresh Cycles <b x-text="(cfg.micPecFreshCycles??4)"></b></div>
+                    <input type="range" min="1" max="20" step="1" x-model.number="cfg.micPecFreshCycles" @change="persist()">
+                    <div class="mic-hint">How many scan cycles a closed liq batch's tickers stay eligible for PEC before going stale.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <div class="lbl">PEC Scan Cap <b x-text="(cfg.micPecScanCap??20)"></b> tickers</div>
+                    <input type="range" min="5" max="200" step="5" x-model.number="cfg.micPecScanCap" @change="persist()">
+                    <div class="mic-hint">Max freshly-surveilled tickers to fetch PEC candles for per cycle.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
                     <div class="lbl">V/M Scan Cap <b x-text="(cfg.micMcapScanCap??50)"></b> tickers</div>
                     <input type="range" min="10" max="200" step="10" x-model.number="cfg.micMcapScanCap" @change="persist()">
-                    <div class="mic-hint">Max tickers for supply fetch per cycle. Pre-screened by fund rate and 24h direction first.</div>
+                    <div class="mic-hint">Max tickers for supply fetch per cycle. Pre-screened by fund rate first.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <div style="display:flex;flex-wrap:wrap;gap:4px">
@@ -351,18 +429,18 @@
                   <div class="g" style="margin-top:8px">
                     <div class="lbl" style="margin-bottom:4px">Liquidation Presence</div>
                     <div style="display:flex;gap:4px">
-                      <button class="mic-tab" :class="(cfg.micLiqPresenceMode??'1')==='1'?'on':''" @click.prevent="if(!cfgLocked){cfg.micLiqPresenceMode='1';persist()}">Only 1</button>
-                      <button class="mic-tab" :class="(cfg.micLiqPresenceMode??'1')==='0'?'on':''" @click.prevent="if(!cfgLocked){cfg.micLiqPresenceMode='0';persist()}">Only 0</button>
-                      <button class="mic-tab" :class="(cfg.micLiqPresenceMode??'1')==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.micLiqPresenceMode='both';persist()}">Both</button>
+                      <button class="mic-tab" :class="(cfg.micLiqPresenceModes||['1']).includes('1')?'on':''" @click.prevent="_micToggleLiqMode('1')">Live</button>
+                      <button class="mic-tab" :class="(cfg.micLiqPresenceModes||['1']).includes('0')?'on':''" @click.prevent="_micToggleLiqMode('0')">0-Liq</button>
+                      <button class="mic-tab" :class="(cfg.micLiqPresenceModes||['1']).includes('past1')?'on':''" @click.prevent="_micToggleLiqMode('past1')">Past-1</button>
                     </div>
-                    <div class="mic-hint">Liquidation is mandatory for every slot. See README for Only 1/Only 0/Both details.</div>
+                    <div class="mic-hint">Liquidation is mandatory for every slot. Select any combination — each active mode runs its own anchor-matched slots side by side. See README for details.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <label class="tog" @click.prevent="if(!cfgLocked){cfg.micSlotBlockEnabled=!cfg.micSlotBlockEnabled;persist()}">
                       <div class="tog-t" :class="cfg.micSlotBlockEnabled?'on':''"><div class="tog-k"></div></div>
                       <div>
                         <div class="tog-l">Slot Blocking</div>
-                        <div class="mic-hint">Blocks new entries whose triggering liquidation type (sliq/bliq/msliq/mbliq/0liq) is a loss beyond <span x-text="-(cfg.micSlotBlockPct??25)"></span>% of base margin. Auto-clears once the score recovers.</div>
+                        <div class="mic-hint">Blocks new entries whose triggering liquidation type (sliq/bliq/msliq/mbliq/0liq) is a loss beyond <span x-text="-(cfg.micSlotBlockPct??25)"></span>% of base margin. Past-1 has no anchor to block on directly — only its Include Sign Tags criteria can block it. Auto-clears once the score recovers.</div>
                       </div>
                     </label>
                     <div x-show="cfg.micSlotBlockEnabled" style="margin-top:4px;margin-left:2px">
@@ -372,12 +450,12 @@
                         <div class="tog-t" :class="cfg.micSlotBlockTags?'on':''"><div class="tog-k"></div></div>
                         <div>
                           <div class="tog-l">Include Sign Tags</div>
-                          <div class="mic-hint">Also blocks on a losing +24h/-24h or fund+/fund- score, not just the liq type.</div>
+                          <div class="mic-hint">Also blocks on a losing PEC or kline (LSA/LBA/R-ASL/R-ABL) score, not just the liq type.</div>
                         </div>
                       </label>
                     </div>
                   </div>
-                  <div class="g" x-show="cfg.micAutoSlots && (cfg.micLiqPresenceMode??'1') !== '0'" style="margin-top:8px">
+                  <div class="g" x-show="cfg.micAutoSlots && (cfg.micLiqPresenceModes||['1']).includes('1')" style="margin-top:8px">
                     <div class="lbl">Live Depth Threshold <b x-text="((cfg.micLiveDepthThreshold??1)>=0?'+':'')+(cfg.micLiveDepthThreshold??1)"></b></div>
                     <input type="number" class="inp" min="-100" step="1" x-model.number="cfg.micLiveDepthThreshold" :disabled="cfgLocked" @change="persist()" style="width:80px">
                     <div class="mic-hint">General depth threshold (% vs. historical avg liquidation size) applied to every Auto-Slot live liq anchor. Manual slots set depth per-slot instead — see the criteria picker above.</div>
@@ -416,9 +494,9 @@
                   </div>
                 </div><!-- end entry slots section -->
                 <div class="g" style="margin-top:10px">
-                  <div class="lbl">Liq Result Max Age <b x-text="(cfg.micLiqResultMaxCycles??2)+' cycles'"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'('+((cfg.micLiqResultMaxCycles??2)*(cfg.scanMins??15))+' min)'"></span></div>
-                  <input type="range" min="1" max="10" step="1" x-model.number="cfg.micLiqResultMaxCycles" @change="persist()">
-                  <div class="mic-hint">0-Liq slot criteria reject cycle results older than this many scan cycles. Live sliq/bliq/msliq/mbliq entries aren't affected — they react to the message as it arrives, there's nothing to go stale.</div>
+                  <div class="lbl">0-Liq Lookback <b x-text="(cfg.micLiqLookbackCycles??25)+' cycles'"></b></div>
+                  <input type="range" min="1" max="25" step="1" x-model.number="cfg.micLiqLookbackCycles" @change="persist()">
+                  <div class="mic-hint">Requires zero liquidation in every retained cycle the ticker appeared in; doesn't affect live sliq/bliq/msliq/mbliq entries.</div>
                 </div>
               </div><!-- end entry zone -->
 
@@ -561,7 +639,7 @@
               if (!_tickerGraylist) return [];
               const ttl = (cfg.bulkTickerCooldownHours ?? 1) * 3_600_000;
               const now = Date.now();
-              return Object.keys(_tickerGraylist).filter(s => (_tickerGraylist[s]?.ts ?? 0) > 0 && now - _tickerGraylist[s].ts < ttl);
+              return Object.keys(_tickerGraylist).filter(s => (_tickerGraylist[s]?.ts ?? 0) > 0 && now - _tickerGraylist[s].ts < ttl && _micIsReentryBlocked(s));
             }
           }">
             <div x-show="syms.length === 0" style="font-family:var(--mono);font-size:10px;color:var(--text-lo);padding:2px 0">None — all tickers eligible.</div>
@@ -679,11 +757,16 @@
           if (this.cfg.micSubstitutionMarginPct     === undefined) this.cfg.micSubstitutionMarginPct     = 5;
           if (this.cfg.micSubstitutionMinAgeMins    === undefined) this.cfg.micSubstitutionMinAgeMins    = 10;
           if (this.cfg.micSubstitutionProtectWinners === undefined) this.cfg.micSubstitutionProtectWinners = false;
-          if (this.cfg.micLiqResultMaxCycles   === undefined) this.cfg.micLiqResultMaxCycles   = 2;
-          if (this.cfg.micLiqPresenceMode      === undefined) this.cfg.micLiqPresenceMode      = '1';
-          if (this.cfg.micLiqPresenceMode === 'auto') {
-            this.cfg.micLiqPresenceMode = 'both';
-            this.log('[MIC] Auto Liquidation Presence removed — migrated to Both.', 'warn');
+          if (this.cfg.micLiqLookbackCycles    === undefined) this.cfg.micLiqLookbackCycles    = 25;
+          if (!Array.isArray(this.cfg.micLiqPresenceModes)) {
+            let _old = this.cfg.micLiqPresenceMode;
+            if (_old === undefined) _old = '1';
+            if (_old === 'auto') {
+              _old = 'both';
+              this.log('[MIC] Auto Liquidation Presence removed — migrated to Both.', 'warn');
+            }
+            this.cfg.micLiqPresenceModes = _old === 'both' ? ['1','0'] : [_old];
+            delete this.cfg.micLiqPresenceMode;
           }
           if (this.cfg.micSlotBlockEnabled     === undefined) this.cfg.micSlotBlockEnabled     = true;
           if (this.cfg.micSlotBlockPct         === undefined) this.cfg.micSlotBlockPct         = 25;
@@ -755,8 +838,10 @@
           // Liquidation is now a mandatory anchor — a manual slot saved before this restructure
           // (or built without one) will never match. Flag it once on load rather than silently.
           if (!this.cfg.micAutoSlots) {
+            // Anchorless is only a mistake when 'past1' isn't active — with it active, an
+            // anchorless manual slot is a valid Past-1 slot (see header comment).
             const anchorless = (this.cfg.micSlots || []).filter(s => s.length && !this._micSlotLiqAnchor(s)).length;
-            if (anchorless) this.log(`[MIC] ⚠️ ${anchorless} manual slot(s) have no liquidation criterion and will never match — add S-Liq/B-Liq/mS-Liq/mB-Liq/0-Liq to each.`, 'warn');
+            if (anchorless && !this._micEffectivePresenceModes().includes('past1')) this.log(`[MIC] ⚠️ ${anchorless} manual slot(s) have no liquidation criterion and will never match — add S-Liq/B-Liq/mS-Liq/mB-Liq/0-Liq to each, or enable the Past-1 presence mode.`, 'warn');
           }
           this.registerRoleBadge?.(item => {
             if (!item || !item._mic) return null;
@@ -767,7 +852,7 @@
           });
           this.registerCloseReason?.('substitution', 'Sub');
           this.registerLiqMessageHook?.((batch, sym) => { this._micOnLiqMessage(batch, sym); });
-          const _presenceStr = this.cfg.micLiqPresenceMode ?? '1';
+          const _presenceStr = (this.cfg.micLiqPresenceModes || ['1']).join('+');
           this.log(`[MIC] Multi-Indicator (Chaser) v${VERSION} loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle | presence: ${_presenceStr}`, 'info');
           this.renderTradeFeed?.();
         },
@@ -994,13 +1079,13 @@
           const needsKline = slots.some(s => s.some(c => /^(lsa|lba|rasl|rabl)/.test(c)));
           const needsMcap  = slots.some(s => s.some(c => /^vm/.test(c) || /^iom/.test(c)));
           const needsOc    = slots.some(s => s.some(c => /^(ocs|ocx)/.test(c)));
+          const needsPec   = slots.some(s => s.some(c => /^pec/.test(c)));
 
           if (!this._micSlotGraylist) this._micSlotGraylist = {};
           // 0-liq slots are only ever generated in '0'/'both' mode (see _micGenerateCombos), so
           // the self- and cross-liq graylists — both aimed at keeping 0liq honest — only need to
           // apply when this bot's presence mode could actually produce a 0liq slot.
-          const _liqPresenceMode = this._micEffectivePresenceMode();
-          const _0liqRelevant    = _liqPresenceMode !== '1';
+          const _0liqRelevant    = this._micEffectivePresenceModes().includes('0');
           const _crossLiqSyms = (_0liqRelevant && this.cfg.afCrossLiqGraylistEnabled) ? new Set(
             (this._afCrossRead?.() || []).filter(e => e.kind === 'live-liq' && e.source === 'winter' && e.symbol).map(e => e.symbol)
           ) : null;
@@ -1051,20 +1136,19 @@
           const _afOcResults = this.afOcResults || {};
 
           // Resolve market caps for vol/mcap criteria if any slot requires them.
-          // Pre-screen to tickers that pass non-mcap fast criteria (fund, 24h) so the CG
-          // request stays small and bounded — large-pool fetches fail silently and leave stale data.
+          // Pre-screen to tickers that pass non-mcap fast criteria (fund only — PEC requires a
+          // kline fetch and isn't a synchronous ticker field like the old +24h/-24h was, so it
+          // can't gate this prescreen) so the CG request stays small and bounded.
           const mcapMap = {};
           if (needsMcap) {
             const mcapCap     = this.cfg.micMcapScanCap ?? 50;
             const fundStep_   = this.cfg.micFundStep ?? 0.25;
             const mcapSlots   = slots.filter(s => s.some(c => /^(vm|iom)/.test(c)));
-            const fastFilters = mcapSlots.map(s => s.filter(c => /^fund/.test(c) || c === '+24h' || c === '-24h'));
+            const fastFilters = mcapSlots.map(s => s.filter(c => /^fund/.test(c)));
             let mcapPool = basePool.filter(t => {
               const fr_      = parseFloat(t.fundingRate || 0) * 100;
-              const is24hUp_ = parseFloat(t.price24hPcnt || 0) > 0;
               return fastFilters.some(ff => !ff.length || ff.every(c => {
-                if (/^fund/.test(c)) { const tier_ = Math.floor(fr_ / fundStep_); const m_ = c.match(/^fund([<>])(-?\d+)$/); if (!m_) return true; return m_[1] === '>' ? tier_ >= parseInt(m_[2],10) : tier_ <= parseInt(m_[2],10); }
-                return c === '+24h' ? is24hUp_ : !is24hUp_;
+                const tier_ = Math.floor(fr_ / fundStep_); const m_ = c.match(/^fund([<>])(-?\d+)$/); if (!m_) return true; return m_[1] === '>' ? tier_ >= parseInt(m_[2],10) : tier_ <= parseInt(m_[2],10);
               }));
             });
             if (mcapPool.length > mcapCap) mcapPool = mcapPool.slice(0, mcapCap);
@@ -1109,10 +1193,16 @@
             await this._micPrefetchKlines(klineSyms);
           }
 
+          // PEC only ever fetches for tickers whose liq surveillance batch just closed (see
+          // _micOnLiqClose) and are still within micPecFreshCycles — never the general pool.
+          // A ticker outside that set simply fails every pec{tf}+/- check, same as any other
+          // criterion whose backing data isn't available this cycle.
+          if (needsPec) await this._micPrefetchPec(this._micPecFreshCandidates());
+
           // Always compute sampling data for AF visualizations (PLK evaluated inside)
           this._micComputeSamplingData();
 
-          const checkCrit = (c, fr, is24hUp, ratio, t) => this._micCheckCrit(c, fr, is24hUp, ratio, t, mcapMap, _afOcResults);
+          const checkCrit = (c, fr, pec, ratio, t) => this._micCheckCrit(c, fr, pec, ratio, t, mcapMap, _afOcResults);
 
           this._micLastActedAt = freshAt;
 
@@ -1136,18 +1226,40 @@
             if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._micKlineCache?.[t.symbol]; const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.micSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
             if (/^ocs/.test(c)) { const _r = this.afOcResults?.[t.symbol]; const tot = (_r?.bc||0)+(_r?.sc||0); const buyPct = tot ? (_r.bc||0)/tot*100 : 50; const step = this.cfg.micOcsStep ?? 1; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
             if (/^ocx/.test(c)) { const _r = this.afOcResults?.[t.symbol]; const step = this.cfg.micOcxStep ?? 1; const tier = _r?.avgMs!=null ? Math.floor((_r.avgMs/1000)/step) : 0; return `ocx+${tier}`; }
+            if (/^pec/.test(c)) {
+              const p = this._micGetPecSync(t.symbol);
+              if (!p || p['6h'] == null || p['12h'] == null || p['24h'] == null) return `${c}+0`;
+              const step = this.cfg.micPecDepthStep ?? 5;
+              const high = this.cfg.micPecThresholdHigh ?? 70;
+              const low  = this.cfg.micPecThresholdLow ?? 30;
+              let depth = 0;
+              if (c === 'pecob') depth = ((p['6h']-high)+(p['12h']-high)+(p['24h']-high))/3;
+              else if (c === 'pecos') depth = ((low-p['6h'])+(low-p['12h'])+(low-p['24h']))/3;
+              else if (c === 'pecalpha') depth = ((p['12h']-p['6h'])+(p['12h']-p['24h']))/2;
+              else if (c === 'pecdelta') depth = ((p['6h']-p['12h'])+(p['24h']-p['12h']))/2;
+              else if (c === 'pecmomup') depth = p['6h']-p['24h'];
+              else if (c === 'pecmomdn') depth = p['24h']-p['6h'];
+              else return c;
+              const tier = Math.max(0, Math.floor(depth/step));
+              return `${c}+${tier}`;
+            }
             return c;
           };
+          // Past-1 slots have no anchor criterion (see _micSlotLiqAnchor/_micGenerateCombos) — the
+          // ticker-pool restriction below IS their anchor. Computed once per scan, not per-ticker.
+          const _past1Pool = this._micEffectivePresenceModes().includes('past1') ? this._micPast1FreshSymbols() : null;
           const pool = basePool
             .map(t => {
               const fr       = parseFloat(t.fundingRate || 0) * 100;
-              const is24hUp  = parseFloat(t.price24hPcnt || 0) > 0;
+              const _isPast1Fresh = !!_past1Pool && _past1Pool.has(t.symbol);
+              const pec      = this._micGetPecSync(t.symbol);
               const mcap     = mcapMap[t.symbol];
               const ratio    = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
               const _hasFreshMcap = !this.cfg.micRequireMcapData || this._micFreshMcapBases?.has(t.symbol.replace(/USDT$/i,'').toLowerCase());
               const slotIdx  = slots.findIndex(s => {
                 if (!_hasFreshMcap && s.some(c => /^(vm|iom)/.test(c))) return false;
-                return s.every(c => checkCrit(c, fr, is24hUp, ratio, t));
+                if (!this._micSlotLiqAnchor(s) && !_isPast1Fresh) return false;
+                return s.every(c => checkCrit(c, fr, pec, ratio, t));
               });
               if (slotIdx === -1) return null;
               const _annotCrits = slots[slotIdx].map(c => _micAnnotateCrit(c, t));
@@ -1159,7 +1271,8 @@
                 for (let i = 0; i < slots.length; i++) {
                   if (i === slotIdx) continue;
                   if (!_hasFreshMcap && slots[i].some(c => /^(vm|iom)/.test(c))) continue;
-                  if (!slots[i].every(c => checkCrit(c, fr, is24hUp, ratio, t))) continue;
+                  if (!this._micSlotLiqAnchor(slots[i]) && !_isPast1Fresh) continue;
+                  if (!slots[i].every(c => checkCrit(c, fr, pec, ratio, t))) continue;
                   const otherAnnot = slots[i].map(c => _micAnnotateCrit(c, t));
                   const sc = slots[i].reduce((s, c, j) => s + _cqScaledRank(c, otherAnnot[j]), 0);
                   if (sc < 0) penalty += sc;
@@ -1176,7 +1289,10 @@
           this._micLogHistMatches(pool);
           // Slot Blocking runs after hist logging so a blocked type keeps generating the
           // data it needs to recover (see _micIsEntryBlocked) — it only stops the real open.
-          const entryPool = pool.filter(e => !this._micIsEntryBlocked('0liq', e.annotCrits));
+          // Each entry's own matched criteria decide its anchor; Past-1 entries have none
+          // (null), which _micIsEntryBlocked already treats as "not anchor-blockable" — only
+          // their Include Sign Tags criteria (if any) can still block them.
+          const entryPool = pool.filter(e => !this._micIsEntryBlocked(this._micSlotLiqAnchor(e.criteria), e.annotCrits));
 
           if (_micHalted) return;
 
@@ -1204,13 +1320,14 @@
             const fundStep = this.cfg.micFundStep ?? 0.25;
             const posFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 >= fundStep).length;
             const negFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 <= -fundStep).length;
-            const up24h    = basePool.filter(t => parseFloat(t.price24hPcnt || 0) > 0).length;
+            const pecHits   = needsPec ? Object.keys(this._micPecCache||{}).length : 0;
             const mcapHits  = Object.keys(mcapMap).length;
             const klineHits = needsKline ? Object.keys(this._micKlineCache||{}).length : 0;
             const mcapNote  = needsMcap  ? ` mcap:${mcapHits}/${basePool.length}`  : '';
             const klineNote = needsKline ? ` kline:${klineHits}/${basePool.length}` : '';
+            const pecNote   = needsPec   ? ` pec:${pecHits}fresh` : '';
             const liqNote   = ` 0liq:${Object.keys(_allLiqResults).length}surveilled`;
-            this.log(`[MIC] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund} +24h:${up24h}${mcapNote}${klineNote}${liqNote}`, 'info');
+            this.log(`[MIC] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund}${mcapNote}${klineNote}${pecNote}${liqNote}`, 'info');
             return;
           }
 
@@ -1257,6 +1374,23 @@
             if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._micGetKlineSync(t.symbol); const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.micSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
             if (/^ocs/.test(c)) { const _r = this.afOcResults?.[t.symbol]; const tot = (_r?.bc||0)+(_r?.sc||0); const buyPct = tot ? (_r.bc||0)/tot*100 : 50; const step = this.cfg.micOcsStep ?? 1; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
             if (/^ocx/.test(c)) { const _r = this.afOcResults?.[t.symbol]; const step = this.cfg.micOcxStep ?? 1; const tier = _r?.avgMs!=null ? Math.floor((_r.avgMs/1000)/step) : 0; return `ocx+${tier}`; }
+            if (/^pec/.test(c)) {
+              const p = this._micGetPecSync(t.symbol);
+              if (!p || p['6h'] == null || p['12h'] == null || p['24h'] == null) return `${c}+0`;
+              const step = this.cfg.micPecDepthStep ?? 5;
+              const high = this.cfg.micPecThresholdHigh ?? 70;
+              const low  = this.cfg.micPecThresholdLow ?? 30;
+              let depth = 0;
+              if (c === 'pecob') depth = ((p['6h']-high)+(p['12h']-high)+(p['24h']-high))/3;
+              else if (c === 'pecos') depth = ((low-p['6h'])+(low-p['12h'])+(low-p['24h']))/3;
+              else if (c === 'pecalpha') depth = ((p['12h']-p['6h'])+(p['12h']-p['24h']))/2;
+              else if (c === 'pecdelta') depth = ((p['6h']-p['12h'])+(p['24h']-p['12h']))/2;
+              else if (c === 'pecmomup') depth = p['6h']-p['24h'];
+              else if (c === 'pecmomdn') depth = p['24h']-p['6h'];
+              else return c;
+              const tier = Math.max(0, Math.floor(depth/step));
+              return `${c}+${tier}`;
+            }
             return c;
           });
           try {
@@ -1530,12 +1664,31 @@
           return null;
         },
 
+        // Checks the full retained window of Ashfall's closed liq cycles (_liqCycleHistory,
+        // capped at 25 there) rather than just the symbol's most recently closed batch. A ticker
+        // only reads 0-Liq if it appeared at least once within the last micLiqLookbackCycles
+        // retained cycles and every appearance came back with zero combined turnover. Returns
+        // null (not false) when the symbol never appeared in the window at all — "no data" is
+        // deliberately distinct from "confirmed clean" everywhere this is used.
+        _micLiqZeroAcrossWindow(sym) {
+          const n = this.cfg.micLiqLookbackCycles ?? 25;
+          const cycles = (this._liqCycleHistory || []).slice(-n);
+          let seen = false;
+          for (const cycle of cycles) {
+            const r = (cycle.results || []).find(x => x.sym === sym);
+            if (!r) continue;
+            seen = true;
+            if ((r.sLiqRaw || 0) + (r.bLiqRaw || 0) > 0) return false;
+          }
+          return seen ? true : null;
+        },
+
         // Non-liquidation criteria only — sliq/bliq/msliq/mbliq are live-only now (see
         // _micOnLiqMessage) and never resolve from a closed cycle, so they have no branch here.
         // 0liq stays here since a zero reading can only ever be confirmed at cycle close.
         // Shared between the scan-time entry pool and the live liq-message handler, so mcapMap
         // and ocResults are threaded through as parameters rather than closed over.
-        _micCheckCrit(c, fr, is24hUp, ratio, t, mcapMap, ocResults) {
+        _micCheckCrit(c, fr, pec, ratio, t, mcapMap, ocResults) {
           if (/^fund/.test(c)) {
             const step = this.cfg.micFundStep ?? 0.25;
             const tier = Math.floor(fr / step);
@@ -1543,8 +1696,18 @@
             if (!m) return true;
             return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
           }
-          if (c === '+24h') return is24hUp;
-          if (c === '-24h') return !is24hUp;
+          if (/^pec/.test(c)) {
+            if (!pec || pec['6h'] == null || pec['12h'] == null || pec['24h'] == null) return false;
+            const high = this.cfg.micPecThresholdHigh ?? 70;
+            const low  = this.cfg.micPecThresholdLow ?? 30;
+            if (c === 'pecob')   return pec['6h'] > high && pec['12h'] > high && pec['24h'] > high;
+            if (c === 'pecos')   return pec['6h'] < low  && pec['12h'] < low  && pec['24h'] < low;
+            if (c === 'pecalpha') return pec['12h'] > pec['6h'] && pec['12h'] > pec['24h'];
+            if (c === 'pecdelta') return pec['12h'] < pec['6h'] && pec['12h'] < pec['24h'];
+            if (c === 'pecmomup') return pec['6h'] > pec['12h'] && pec['12h'] > pec['24h'];
+            if (c === 'pecmomdn') return pec['6h'] < pec['12h'] && pec['12h'] < pec['24h'];
+            return true;
+          }
           if (/^vm/.test(c)) {
             if (ratio === null) return false;
             const step = this.cfg.micVmStep ?? 1;
@@ -1570,10 +1733,7 @@
             return (base === 'lsa' || base === 'rasl') ? kline.close < kline.open : kline.close > kline.open;
           }
           if (c === '0liq') {
-            const r = this._liqResults?.[t.symbol];
-            if (!r) return false;
-            if (Date.now() - (r.ts || 0) > (this.cfg.micLiqResultMaxCycles ?? 2) * (this.cfg.scanMins ?? 15) * 60000) return false;
-            return ((r.sLiqRaw || 0) + (r.bLiqRaw || 0)) === 0;
+            return this._micLiqZeroAcrossWindow(t.symbol) === true;
           }
           if (/^iot/.test(c)) {
             const oi = parseFloat(t.openInterestValue || 0);
@@ -1674,18 +1834,35 @@
           if (/^(lsa|lba|rasl|rabl)/.test(c)) { const base = c.match(/^(lsa|lba|rasl|rabl)/)[1]; const kl = this._micGetKlineSync(t.symbol); const avg = parseFloat(t.volume24h||0)/24; const step = this.cfg.micSpikeStep ?? 1; let tier = 0; if (kl && avg > 0) { const mult = kl.volume/avg; const isAbove = base==='lsa'||base==='lba'; tier = Math.max(0, Math.floor((isAbove?mult-1:1-mult)*100/step)); } return `${base}+${tier}`; }
           if (/^ocs/.test(c)) { const _r = ocResults?.[t.symbol]; const tot = (_r?.bc||0)+(_r?.sc||0); const buyPct = tot ? (_r.bc||0)/tot*100 : 50; const step = this.cfg.micOcsStep ?? 1; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
           if (/^ocx/.test(c)) { const _r = ocResults?.[t.symbol]; const step = this.cfg.micOcxStep ?? 1; const tier = _r?.avgMs!=null ? Math.floor((_r.avgMs/1000)/step) : 0; return `ocx+${tier}`; }
+          if (/^pec/.test(c)) {
+            const p = this._micGetPecSync(t.symbol);
+            if (!p || p['6h'] == null || p['12h'] == null || p['24h'] == null) return `${c}+0`;
+            const step = this.cfg.micPecDepthStep ?? 5;
+            const high = this.cfg.micPecThresholdHigh ?? 70;
+            const low  = this.cfg.micPecThresholdLow ?? 30;
+            let depth = 0;
+            if (c === 'pecob') depth = ((p['6h']-high)+(p['12h']-high)+(p['24h']-high))/3;
+            else if (c === 'pecos') depth = ((low-p['6h'])+(low-p['12h'])+(low-p['24h']))/3;
+            else if (c === 'pecalpha') depth = ((p['12h']-p['6h'])+(p['12h']-p['24h']))/2;
+            else if (c === 'pecdelta') depth = ((p['6h']-p['12h'])+(p['24h']-p['12h']))/2;
+            else if (c === 'pecmomup') depth = p['6h']-p['24h'];
+            else if (c === 'pecmomdn') depth = p['24h']-p['6h'];
+            else return c;
+            const tier = Math.max(0, Math.floor(depth/step));
+            return `${c}+${tier}`;
+          }
           return c;
         },
 
         // Live liq-message hook — registered via Ashfall's registerLiqMessageHook. Not
         // scan-gated: fires the instant a message crosses this ticker's slot(s) depth threshold.
-        // Only sliq/bliq/msliq/mbliq route through here — 0liq is closed-cycle-only and stays on
-        // the regular runScan/checkCrit path. Skipped entirely in Only-0 mode.
+        // Only sliq/bliq/msliq/mbliq route through here — 0liq/past1 are closed-cycle-only and
+        // stay on the regular runScan/checkCrit path. Skipped entirely when 'live' isn't an active mode.
         async _micOnLiqMessage(batch, sym) {
           if (!this.cfg.micEnabled) return;
-          if (this._micEffectivePresenceMode() === '0') return;
+          if (!this._micEffectivePresenceModes().includes('1')) return;
           // A halt blocks the real entry below, but Historical Scoring still wants to see what
-          // this message would have matched — otherwise Only-1 (and Both's live-anchored slots)
+          // this message would have matched — otherwise live-only setups (and any live-anchored slots)
           // go completely dark for scoring purposes every time a halt is active, since the
           // scan-time checker can never resolve a live liq anchor on its own (see _micCheckCrit —
           // sliq/bliq/msliq/mbliq have no branch there). Falls through to a hist-only simulation
@@ -1704,11 +1881,7 @@
           if (!total) return;
           const sPct = sRaw / total, bPct = bRaw / total;
 
-          let type = null;
-          if (sPct >= 0.70) type = 'sliq';
-          else if (bPct >= 0.70) type = 'bliq';
-          else if (sPct > bPct && bPct >= 0.30) type = 'msliq';
-          else if (bPct > sPct && sPct >= 0.30) type = 'mbliq';
+          const type = this._micClassifyLiqDominance(sPct, bPct);
           if (!type) return;
 
           // Tell Permafrost this ticker just produced a live liq event, regardless of whether
@@ -1753,7 +1926,7 @@
           const t = (this._lastAllTickers || []).find(x => x.symbol === sym);
           if (!t) return;
           const fr      = parseFloat(t.fundingRate || 0) * 100;
-          const is24hUp = parseFloat(t.price24hPcnt || 0) > 0;
+          const pec     = this._micGetPecSync(sym);
 
           this._micOpening.add(sym);
           try {
@@ -1785,7 +1958,7 @@
 
               const ratio   = mcap ? parseFloat(t.turnover24h || 0) / mcap : null;
               const mcapMap = mcap != null ? { [sym]: mcap } : {};
-              if (!secondary.every(c => this._micCheckCrit(c, fr, is24hUp, ratio, t, mcapMap, ocResultsMap))) continue;
+              if (!secondary.every(c => this._micCheckCrit(c, fr, pec, ratio, t, mcapMap, ocResultsMap))) continue;
 
               // Matched — annotate and score against this same-type slot subset. Co-Qualifying
               // Penalty against slots anchored on a different liq type or 0liq is moot: only one
@@ -1812,7 +1985,7 @@
                   const other = candidateSlots[k];
                   if (!this._micCheckLiveLiqCrit(this._micSlotLiqAnchor(other), type, depth)) continue;
                   const otherSecondary = other.filter(c => c !== this._micSlotLiqAnchor(other));
-                  if (!otherSecondary.every(c => this._micCheckCrit(c, fr, is24hUp, ratio, t, mcapMap, ocResultsMap))) continue;
+                  if (!otherSecondary.every(c => this._micCheckCrit(c, fr, pec, ratio, t, mcapMap, ocResultsMap))) continue;
                   const otherAnnot = other.map(c => this._micAnnotateLiveCrit(c, t, mcap, type, depth, ocResultsMap));
                   const sc = other.reduce((s, c, j) => s + this._micScaledRank(c, otherAnnot[j]), 0);
                   if (sc < 0) penalty += sc;
@@ -1921,25 +2094,43 @@
           return null;
         },
 
-        // The liq criterion a slot is anchored on, or null if the slot has none (never matches —
-        // liquidation is mandatory). sliq/bliq/msliq/mbliq are the live-only anchors; 0liq is the
-        // closed-cycle-only anchor. A slot is expected to carry at most one of these.
+        // The liq criterion a slot is anchored on, or null if the slot has none. sliq/bliq/
+        // msliq/mbliq are the live-only anchors; 0liq is the closed-cycle-only anchor. null no
+        // longer means "invalid" outright — it also describes a valid Past-1 slot, IF 'past1' is
+        // an active presence mode (see _micEffectiveSlots, which is where that distinction gets
+        // made; this function only reports what's literally in the slot).
         _micSlotLiqAnchor(slot) {
           return (slot || []).find(c => LIQ_TYPES.some(t => c.startsWith(t)) || c === '0liq') || null;
         },
 
-        // Every other reader of the mode should call this, not cfg.micLiqPresenceMode directly.
-        _micEffectivePresenceMode() {
-          return this.cfg.micLiqPresenceMode ?? '1';
+        // Every other reader of the mode should call this, not cfg.micLiqPresenceModes directly.
+        // Always non-empty — falls back to ['1'] the same way the old single-mode getter did.
+        _micEffectivePresenceModes() {
+          const m = this.cfg.micLiqPresenceModes;
+          return Array.isArray(m) && m.length ? m : ['1'];
+        },
+
+        // Multi-select toggle for the Liquidation Presence buttons. Refuses to drop the last
+        // active mode — a slot with no reachable anchor type would never match anything.
+        _micToggleLiqMode(v) {
+          if (this.cfgLocked) return;
+          const cur = new Set(this._micEffectivePresenceModes());
+          if (cur.has(v)) {
+            if (cur.size <= 1) return;
+            cur.delete(v);
+          } else {
+            cur.add(v);
+          }
+          this.cfg.micLiqPresenceModes = ['1','0','past1'].filter(m => cur.has(m));
+          this.persist();
         },
 
         // Shared collapsed-rank lookup (own + partner + historical PnL, see micCollapsedSlotRanks)
-        // for a single criterion key. +24h/-24h are bare, already-signed keys; every other
-        // criterion's rank accumulates under a sign-suffixed key (e.g. 'sliq+', 'fund-'), so both
-        // variants are summed.
+        // for a single criterion key. Every criterion's rank accumulates under a sign-suffixed key
+        // (e.g. 'sliq+', 'fund-', 'pecob+'), so both variants are summed — PEC is tiered like
+        // fund/vm/iot (always non-negative, '+' only) rather than a bare unsigned key like 0liq.
         _micCritScore(c) {
           const ranks = this.micCollapsedSlotRanks || {};
-          if (c === '+24h' || c === '-24h') return ranks[c] ?? 0;
           return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
         },
 
@@ -1953,24 +2144,27 @@
         },
 
         // Always checks the triggering liq-anchor type. micSlotBlockTags additionally checks the
-        // entry's own +24h/-24h and fund+/fund- tags (read off the already-annotated criteria, so
-        // fund's tier-encoded sign matches the collapsed rank key exactly).
+        // entry's own PEC and kline (LSA/LBA/R-ASL/R-ABL) tags only — fund and the other secondary
+        // criteria are deliberately excluded here: they're too generalized (most entries share the
+        // same fund tier or vm/iot/iom band regardless of outcome), so including them would end up
+        // blocking nearly everything off one bad stretch unrelated to the actual signal.
         _micIsEntryBlocked(anchor, annotCrits) {
           if (this._micIsCritBlocked(anchor)) return true;
           if (!this.cfg.micSlotBlockTags) return false;
           return (annotCrits || []).some(c => {
-            if (c === '+24h' || c === '-24h') return this._micIsCritBlocked(c);
-            if (/^fund[+-]/.test(c)) return this._micIsCritBlocked(c.replace(/\d+$/, ''));
+            if (/^(lsa|lba|rasl|rabl|pec[a-z]+)[+-]/.test(c)) return this._micIsCritBlocked(c.replace(/\d+$/, ''));
             return false;
           });
         },
 
-        // true if this liq anchor is allowed under the current Liquidation Presence mode.
+        // true if this liq anchor is allowed under the current Liquidation Presence modes.
+        // Only ever called with a real criterion (0liq or a live type) — Past-1 has no anchor
+        // criterion, so it's never passed in here; see _micEffectiveSlots/_micGenerateCombos for
+        // where the 'past1' mode is actually consulted.
         _micAnchorAllowed(anchorCrit) {
-          const mode = this._micEffectivePresenceMode();
-          if (mode === 'both') return true;
-          const isLive = LIQ_TYPES.some(t => anchorCrit.startsWith(t));
-          return mode === '1' ? isLive : !isLive;
+          const modes = this._micEffectivePresenceModes();
+          if (anchorCrit === '0liq') return modes.includes('0');
+          return modes.includes('1'); // sliq/bliq/msliq/mbliq
         },
 
         // Reads the same shared graylist the host writes on every close (any strategy, keyed by
@@ -1982,17 +2176,37 @@
           if (!g || !(g.ts > 0)) return false;
           const ttl = (this.cfg.bulkTickerCooldownHours ?? 1) * 3600000;
           if (Date.now() - g.ts >= ttl) return false;
-          if ((this.cfg.micReentryBlockMode ?? 'both') === 'losers') return g.isWin === false;
+          if ((this.cfg.micReentryBlockMode ?? 'losers') === 'losers') return g.isWin === false;
           return true;
         },
 
         // Registered via Ashfall's registerLiqCloseHook — fires once per closed liq batch with
         // every surveilled symbol's final turnover, qualifying or not. A ticker with ANY recorded
         // liquidation (even one that never crossed the qualifying % threshold) gets graylisted for
-        // the _micLockTtl() window so a stale 0liq read (last-batch-only, see _micCheckCrit's
-        // '0liq' branch) can't treat a ticker that liquidated a couple hours ago as newly "calm"
-        // just because its latest batch happened to close clean.
+        // the _micLockTtl() window as a belt-and-suspenders backstop — redundant now that
+        // _micCheckCrit's '0liq' branch itself scans the full retained window
+        // (_micLiqZeroAcrossWindow), but left in place rather than reworked right now.
         _micOnLiqClose(results, batch) {
+          // Closed-batch pool: every symbol whose surveillance batch just closed lands here for
+          // micPecFreshCycles cycles, carrying its dominance stats alongside the timestamp. This
+          // is the shared foundation for two consumers: PEC (see _micPecFreshCandidates, which
+          // only needs the timestamp) and the past1 liq anchor (see _micPast1FreshSymbols, which
+          // needs sLiqPct/bLiqPct/sLiqRaw/bLiqRaw/sDepth/bDepth to tell "had some liquidation
+          // but never crossed the live threshold" apart from "genuinely clean"). Tracked
+          // unconditionally — this is the only source of tickers for either consumer, unlike the
+          // graylist below which is opt-in via micSelfLiqGraylistEnabled.
+          if (!this._micPecPool) this._micPecPool = {};
+          const _now = Date.now();
+          for (const r of (results || [])) {
+            if (!r?.sym) continue;
+            this._micPecPool[r.sym] = {
+              ts: _now,
+              sLiqPct: r.sLiqPct ?? 0, bLiqPct: r.bLiqPct ?? 0,
+              sLiqRaw: r.sLiqRaw ?? 0, bLiqRaw: r.bLiqRaw ?? 0,
+              sDepth:  r.sDepth  ?? 0, bDepth:  r.bDepth  ?? 0,
+            };
+          }
+
           if (!this.cfg.micSelfLiqGraylistEnabled) return;
           if (!this._micSlotGraylist) this._micSlotGraylist = {};
           const now = Date.now();
@@ -2001,6 +2215,50 @@
               this._micSlotGraylist[r.sym] = { ts: now, reason: 'self-liq' };
             }
           }
+        },
+
+        // Retrospective classification of a closed batch's dominance against the same 70%/30%
+        // thresholds _micOnLiqMessage checks live (sFrac/bFrac as 0-1 fractions). Shared so the
+        // two never drift apart. Returns the live criterion it would have fired, or null.
+        _micClassifyLiqDominance(sFrac, bFrac) {
+          if (sFrac >= 0.70) return 'sliq';
+          if (bFrac >= 0.70) return 'bliq';
+          if (sFrac > bFrac && bFrac >= 0.30) return 'msliq';
+          if (bFrac > sFrac && sFrac >= 0.30) return 'mbliq';
+          return null;
+        },
+
+        // past1 candidate set: fresh closed-batch entries (same TTL as PEC, uncapped — this is
+        // pure lookup, no fetch) that had real liquidation (sLiqRaw+bLiqRaw > 0, so not 0-Liq's
+        // territory) but would never have fired live. Live firing takes two gates (see
+        // _micOnLiqMessage/_micCheckLiveLiqCrit): dominance classification (this side must be
+        // ≥70%, or ≥30% for mixed) assigns a type, then that type's depth — % this side's
+        // turnover deviates from the average, same calcDepth Ashfall already computed into
+        // sDepth/bDepth — must clear micLiveDepthThreshold (default 1, i.e. "≥1% above average").
+        // A ticker lands in past1 if it fails either gate: no type at all (too balanced to
+        // classify), or classified but depth never reached the threshold — the genuine
+        // liquidation-happened-but-too-small-or-too-balanced middle ground, checked against the
+        // global threshold (a manual per-slot depth override on a live anchor has no bearing on
+        // this pool). Consumed by the scan loop as the match gate for anchorless (Past-1) slots
+        // — past1 is a path, not a criterion, so this is never called from checkCrit.
+        _micPast1FreshSymbols() {
+          const pool = this._micPecPool || {};
+          const ttl  = (this.cfg.micPecFreshCycles ?? 4) * (this.cfg.scanMins ?? 15) * 60000;
+          const threshold = this.cfg.micLiveDepthThreshold ?? 1;
+          const now  = Date.now();
+          const out  = new Set();
+          for (const [sym, e] of Object.entries(pool)) {
+            if ((now - e.ts) >= ttl) continue;
+            if ((e.sLiqRaw || 0) + (e.bLiqRaw || 0) <= 0) continue;
+            const type = this._micClassifyLiqDominance((e.sLiqPct || 0) / 100, (e.bLiqPct || 0) / 100);
+            if (type) {
+              const isSell = type === 'sliq' || type === 'msliq';
+              const relevantDepth = isSell ? (e.sDepth ?? 0) : (e.bDepth ?? 0);
+              if (relevantDepth >= threshold) continue; // would have fired live — not past1
+            }
+            out.add(sym);
+          }
+          return out;
         },
 
         // Window for the self-liq graylist, cross-bot graylist reactions, and the direction-
@@ -2047,15 +2305,15 @@
         // and a ticker can be caught by more than one at once. "Until" is the latest of the
         // ticker's active reasons, since the ticker stays constrained until all of them clear.
         // Self-Liq/Partner-Live-Liq only affect anything while the 0-Liq path is reachable
-        // (mode !== '1'); Partner-0-Liq-Win/Direction-Lock only affect anything while the live
-        // path is reachable (mode !== '0') — a reason inert under the current mode is skipped
+        // ('0' active); Partner-0-Liq-Win/Direction-Lock only affect anything while the live
+        // path is reachable ('1' active) — a reason inert under the current modes is skipped
         // entirely rather than shown as if it were still doing something.
         _micCombinedLockRows() {
           const now  = Date.now();
           const ttl  = this._micLockTtl();
-          const mode = this._micEffectivePresenceMode();
-          const zeroLiqRelevant = mode !== '1';
-          const liveLiqRelevant = mode !== '0';
+          const modes = this._micEffectivePresenceModes();
+          const zeroLiqRelevant = modes.includes('0');
+          const liveLiqRelevant = modes.includes('1');
           const bySym = {};
           const add = (sym, text, mode_, ts) => {
             if (!bySym[sym]) bySym[sym] = { sym, reasons: [], maxTs: 0 };
@@ -2095,26 +2353,33 @@
         // mandatory": there is no way to auto-generate a slot without one.
         _micGenerateCombos(size) {
           const exclude = new Set(this.cfg.micAutoSlotExclude || []);
-          const mode = this._micEffectivePresenceMode();
-          const anchors = ['sliq','bliq','msliq','mbliq','0liq'].filter(c => !exclude.has(c) && (
-            mode === 'both' ? true : mode === '0' ? c === '0liq' : c !== '0liq'
-          ));
-          const secondary = ['fund','+24h','-24h','vm','lsa','lba','rasl','rabl','iot','iom','ocs','ocx'].filter(c => !exclude.has(c));
-          const need = Math.max(0, size - 1);
-          const secCombos = [];
-          const pick = (start, current) => {
-            if (current.length === need) { secCombos.push([...current]); return; }
-            for (let i = start; i < secondary.length; i++) {
-              current.push(secondary[i]);
-              pick(i + 1, current);
-              current.pop();
-            }
+          const anchors = ['sliq','bliq','msliq','mbliq','0liq'].filter(c => !exclude.has(c) && this._micAnchorAllowed(c));
+          const secondary = ['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','vm','lsa','lba','rasl','rabl','iot','iom','ocs','ocx'].filter(c => !exclude.has(c));
+          const combosOfSize = need => {
+            const combos = [];
+            const pick = (start, current) => {
+              if (current.length === need) { combos.push([...current]); return; }
+              for (let i = start; i < secondary.length; i++) {
+                current.push(secondary[i]);
+                pick(i + 1, current);
+                current.pop();
+              }
+            };
+            pick(0, []);
+            return combos;
           };
-          pick(0, []);
           const result = [];
+          const need = Math.max(0, size - 1);
+          const secCombos = combosOfSize(need);
           for (const anchor of anchors) {
             if (need === 0) { result.push([anchor]); continue; }
             for (const combo of secCombos) result.push([anchor, ...combo]);
+          }
+          // Past-1: no anchor criterion at all — the ticker-pool restriction (_micPast1FreshSymbols,
+          // enforced where these slots are matched) IS the anchor. Uses the full slot size in
+          // secondary criteria since there's no anchor slot to reserve room for.
+          if (this._micEffectivePresenceModes().includes('past1')) {
+            for (const combo of combosOfSize(size)) result.push([...combo]);
           }
           return result;
         },
@@ -2123,12 +2388,16 @@
           const raw = this.cfg.micAutoSlots
             ? this._micGenerateCombos(this.cfg.micAutoSlotSize ?? 3)
             : (this.cfg.micSlots || []).filter(s => s.length > 0);
-          // Liquidation is mandatory — drop any slot with no liq anchor, or whose anchor isn't
-          // allowed under the current Liquidation Presence mode (e.g. a saved manual slot built
-          // before this restructure, or a 0liq slot while mode is 'Only 1').
+          // Liquidation presence is mandatory, but that no longer means every slot needs an
+          // anchor criterion: an anchorless slot is valid exactly when 'past1' is an active
+          // mode (it's a Past-1 slot — see header comment), and an anchored slot is valid when
+          // its specific anchor's mode ('0' or '1') is active. Drops anything else — a saved
+          // manual slot built before this restructure, an anchorless slot while 'past1' isn't
+          // active, or a 0liq/live slot while its mode isn't active.
+          const modes = this._micEffectivePresenceModes();
           const filtered = raw.filter(s => {
             const anchor = this._micSlotLiqAnchor(s);
-            return !!anchor && this._micAnchorAllowed(anchor);
+            return anchor ? this._micAnchorAllowed(anchor) : modes.includes('past1');
           });
           if (!Object.keys(this.micCollapsedSlotRanks || {}).length) return filtered;
           return filtered.slice().sort((a, b) => {
@@ -2144,13 +2413,14 @@
         // _micOnLiqMessage, which logs a hist target itself when a halt blocks the real entry
         // (see _micLogLiveHistMatch). During normal (non-halted) operation live matches don't
         // need this at all — real trades already write the scorecard for every live match that
-        // fires. On Only-1, that halted-only case is the *only* time this feature has anything to
-        // log, since every one of its slots is live-anchored. Only-0 and Both aren't limited this
-        // way — their 0-Liq-anchored slots resolve fine at scan time, so logging stays active
-        // unconditionally for those, same as before.
+        // fires. With only 'live' active, that halted-only case is the *only* time this feature
+        // has anything to log, since every slot is live-anchored. '0' and 'past1' aren't limited
+        // this way — their anchored slots resolve fine at scan time, so logging stays active
+        // unconditionally whenever either is an active mode, same as before.
         _micHistScoringActive() {
           if (!this.cfg.micHistScoringEnabled) return false;
-          if (this._micEffectivePresenceMode() !== '1') return true;
+          const modes = this._micEffectivePresenceModes();
+          if (modes.includes('0') || modes.includes('past1')) return true;
           return !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
         },
 
@@ -2346,6 +2616,122 @@
 
         _micGetKlineSync(symbol) {
           return this._micKlineCache?.[symbol] || null;
+        },
+
+        // PEC candidate pool: tickers whose liq surveillance batch closed within the last
+        // micPecFreshCycles scan cycles, capped at micPecScanCap. Draws from the same
+        // _micPecPool that past1 uses (see _micOnLiqClose / _micPast1FreshSymbols) — this is
+        // just PEC's own capped, timestamp-sorted view of it, since fetching costs bandwidth
+        // and past1's lookup doesn't.
+        _micPecFreshCandidates() {
+          const pool = this._micPecPool || {};
+          const ttl  = (this.cfg.micPecFreshCycles ?? 4) * (this.cfg.scanMins ?? 15) * 60000;
+          const cap  = this.cfg.micPecScanCap ?? 20;
+          const now  = Date.now();
+          return Object.entries(pool)
+            .filter(([, e]) => (now - e.ts) < ttl)
+            .sort((a, b) => b[1].ts - a[1].ts)
+            .slice(0, cap)
+            .map(([sym]) => sym);
+        },
+
+        _micPecIntervalMinutes() {
+          const g = this.cfg.micPecGranularity ?? '1h';
+          return g === '15m' ? 15 : g === '3h' ? 180 : 60;
+        },
+
+        _micPecCandleCount() {
+          return Math.round(1440 / this._micPecIntervalMinutes());
+        },
+
+        // Price Effect Coefficient for one window: (Close-Open)/(range), mapped to 0-100
+        // (50=neutral). Close is always the latest completed candle — only Open/range change
+        // per window, so all three timeframes read off the same current price (see PEC.md).
+        // Wick-dampened range uses the average sub-candle range instead of window high/low; since
+        // that can be smaller than the actual |close-open| displacement, P is clamped to ±1.
+        _micCalcPecWindow(candles, windowCount, dampen) {
+          if (!candles.length) return null;
+          const subset = candles.slice(-windowCount);
+          if (!subset.length) return null;
+          const open  = subset[0].open;
+          const close = candles[candles.length - 1].close;
+          let range;
+          if (dampen) {
+            range = subset.reduce((s, c) => s + (c.high - c.low), 0) / subset.length;
+          } else {
+            range = Math.max(...subset.map(c => c.high)) - Math.min(...subset.map(c => c.low));
+          }
+          if (!(range > 0)) return 50;
+          let p = (close - open) / range;
+          if (p > 1) p = 1; else if (p < -1) p = -1;
+          return p * 50 + 50;
+        },
+
+        // Fetches enough completed candles at micPecGranularity to cover 24h, then derives the
+        // 6h/12h/24h composite index for each symbol. Seeds from the shared cache first (same
+        // pattern as _micPrefetchKlines) so MIW doesn't refetch what MIC already pulled this bar.
+        async _micPrefetchPec(symbols) {
+          if (!symbols || !symbols.length) return;
+          const gran         = this.cfg.micPecGranularity ?? '1h';
+          const bybitInterval= gran === '15m' ? '15' : gran === '3h' ? '180' : '60';
+          const intervalMin  = this._micPecIntervalMinutes();
+          const total        = this._micPecCandleCount();
+          const barMs        = intervalMin * 60 * 1000;
+          const now          = Date.now();
+          const lastBarStart = Math.floor(now / barMs) * barMs - barMs;
+          const scanMs       = (this.cfg.scanMins || 15) * 60 * 1000;
+          const dampen       = !!this.cfg.micPecWickDampen;
+          const sharedKey    = `pec_${gran}_last`;
+          const shared       = this._sharedRead(sharedKey);
+          const seedCache    = {};
+          if (shared?.data) {
+            for (const sym of symbols) {
+              const e = shared.data[sym];
+              if (e && e.candleStart >= lastBarStart && e.ts && (now - e.ts) < scanMs) seedCache[sym] = e;
+            }
+          }
+          if (!this._micPecCache) this._micPecCache = {};
+          Object.assign(this._micPecCache, seedCache);
+          const toFetch = symbols.filter(sym => !seedCache[sym]);
+          const CONC = 10;
+          for (let i = 0; i < toFetch.length; i += CONC) {
+            await Promise.all(toFetch.slice(i, i + CONC).map(async sym => {
+              try {
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=${bybitInterval}&limit=${total + 1}`);
+                if (!r.ok) return;
+                const d = await r.json();
+                const list = d?.result?.list;
+                if (!list || list.length < 2) return;
+                // list[0] is the current, still-forming candle — drop it. Rest are completed,
+                // newest-first from Bybit; reverse to chronological (oldest -> newest).
+                const completed = list.slice(1).map(c => ({
+                  candleStart: parseInt(c[0]),
+                  open:  parseFloat(c[1]),
+                  high:  parseFloat(c[2]),
+                  low:   parseFloat(c[3]),
+                  close: parseFloat(c[4]),
+                })).reverse();
+                if (!completed.length) return;
+                const per6h  = Math.max(1, Math.round(360  / intervalMin));
+                const per12h = Math.max(1, Math.round(720  / intervalMin));
+                const per24h = Math.max(1, Math.round(1440 / intervalMin));
+                this._micPecCache[sym] = {
+                  '6h':  this._micCalcPecWindow(completed, per6h,  dampen),
+                  '12h': this._micCalcPecWindow(completed, per12h, dampen),
+                  '24h': this._micCalcPecWindow(completed, per24h, dampen),
+                  candleStart: completed[completed.length - 1].candleStart,
+                  ts: now,
+                };
+              } catch (e) {}
+            }));
+          }
+          const patch = {};
+          for (const sym of toFetch) { if (this._micPecCache[sym]) patch[sym] = this._micPecCache[sym]; }
+          if (Object.keys(patch).length) this._sharedMerge(sharedKey, patch);
+        },
+
+        _micGetPecSync(symbol) {
+          return this._micPecCache?.[symbol] || null;
         },
 
       });
