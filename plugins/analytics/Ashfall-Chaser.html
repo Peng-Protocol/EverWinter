@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.55.2';
+  const VERSION        = '1.57.0';
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -38,6 +38,17 @@
   const CROSS_TTL      = 6 * 3600 * 1000;
   const SCORE_KEY      = '__everwinter_scorecard_v1';
   const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
+  // Full-universe PEC/VSG candle log for Pre-Screening — same same-origin-localStorage
+  // sharing convention as SCORE_KEY/CROSS_KEY (Ashfall and Permafrost both read/write this,
+  // so whichever fetches first each cycle saves the other one the trip), but deliberately
+  // its own key rather than the generic _sharedWrite registry: that registry is capped at
+  // SHARED_REGISTRY_BYTE_CAP (200KB, in PseudoChaser.html/PseudoWinter.html) sized for small
+  // recent-snapshot caches (bulkTickers, pec_1h_last, liqResults) — a real per-symbol candle
+  // history for the whole exchange is an order of magnitude bigger and would evict those on
+  // arrival. Keyed by granularity bucket ('15m'/'1h'/'3h') so this stays correct even if
+  // micPecGranularity and miwPecGranularity are set differently on the two installs.
+  const KLINE_LOG_KEY      = '__everwinter_kline_log_v1';
+  const KLINE_LOG_BYTE_CAP = 1.5 * 1024 * 1024;
   const afCritEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '🤑' : '💸') + s; }
     if (/^vm/.test(c))   return '🔊' + c.slice(2);
@@ -308,7 +319,7 @@
                 <div class="tog-t" :class="cfg.ashLiqEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashLiqEnabled=!cfg.ashLiqEnabled;if(!cfg.ashLiqEnabled)_liqCloseAll();persist()}"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Liquidation Surveillance</div>
-                  <div class="ash-hint">Subscribes to Bybit live liq feed for a random sample of volatile tickers. Enables 🥵 S-Liq and 🥶 B-Liq criteria in MIC slots.</div>
+                  <div class="ash-hint">Subscribes to Bybit live liq feed for a sample of volatile tickers. Enables 🥵 S-Liq and 🥶 B-Liq criteria in MIC slots.</div>
                 </div>
               </label>
               <div x-show="cfg.ashLiqEnabled" style="margin-top:8px">
@@ -320,7 +331,7 @@
                 <div class="g" style="margin-top:6px">
                   <div class="lbl">Batch Size <b x-text="(cfg.ashLiqBatchSize??25)"></b> tickers</div>
                   <input type="range" min="5" max="50" step="5" x-model.number="cfg.ashLiqBatchSize" @change="persist()">
-                  <div class="ash-hint">Random draw per 1h window from ≥6% 24h move pool, disjoint across concurrent batches.</div>
+                  <div class="ash-hint" x-text="'Per 1h window from ≥6% 24h move pool, disjoint across concurrent batches — '+(cfg.ashLiqPrescreenEnabled?'scored fill when Pre-Screening is on.':'random draw.')"></div>
                 </div>
                 <label class="tog" style="margin-top:8px">
                   <div class="tog-t" :class="cfg.ashLiqSequesterEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashLiqSequesterEnabled=!cfg.ashLiqSequesterEnabled;persist()}"><div class="tog-k"></div></div>
@@ -333,6 +344,30 @@
                   <div class="lbl">Sequester Draw Cap <b x-text="(cfg.ashLiqSequesterCap??12)"></b> tickers</div>
                   <input type="range" min="1" max="25" step="1" x-model.number="cfg.ashLiqSequesterCap" @change="persist()">
                   <div class="ash-hint">Max sequestered tickers pulled per batch; excess rotate in on later cycles.</div>
+                </div>
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.ashLiqPrescreenEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashLiqPrescreenEnabled=!cfg.ashLiqPrescreenEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Prospect Pre-Screening</div>
+                    <div class="ash-hint">Ranks the mover pool by MIC's own fund/V-A/IO-A scorecard instead of drawing at random.</div>
+                  </div>
+                </label>
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.ashPecPrescreenEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashPecPrescreenEnabled=!cfg.ashPecPrescreenEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">PEC/VSG Universe Weighing</div>
+                    <div class="ash-hint">Prefetches PEC/VSG for every USDT ticker on the bulk-ticker cadence, weighed into Pre-Screening ahead of liq surveillance.</div>
+                  </div>
+                </label>
+                <div class="g" x-show="cfg.ashPecPrescreenEnabled" style="margin-top:6px">
+                  <div class="lbl">Universe Fetch Batch Size <b x-text="(cfg.ashPecBatchSize??25)"></b> tickers</div>
+                  <input type="range" min="5" max="100" step="5" x-model.number="cfg.ashPecBatchSize" @change="persist()">
+                  <div class="ash-hint">Concurrent klines per batch across the full ticker universe.</div>
+                </div>
+                <div class="g" x-show="cfg.ashPecPrescreenEnabled" style="margin-top:6px">
+                  <div class="lbl">Universe Fetch Batch Delay <b x-text="(cfg.ashPecBatchDelayMs??2000)"></b> ms</div>
+                  <input type="range" min="0" max="10000" step="250" x-model.number="cfg.ashPecBatchDelayMs" @change="persist()">
+                  <div class="ash-hint">Pause between batches — spreads a full-universe fetch out instead of firing it all at once.</div>
                 </div>
                 <div class="g" style="margin-top:6px">
                   <div class="lbl">Presence Regime Threshold <b x-text="(cfg.ashPresenceSkewThreshold??70)+'%'"></b></div>
@@ -676,6 +711,10 @@
           if (this.cfg.ashLiqThresholdPct === undefined) this.cfg.ashLiqThresholdPct = 50;
           if (this.cfg.ashLiqSequesterEnabled === undefined) this.cfg.ashLiqSequesterEnabled = true;
           if (this.cfg.ashLiqSequesterCap     === undefined) this.cfg.ashLiqSequesterCap     = 12;
+          if (this.cfg.ashLiqPrescreenEnabled === undefined) this.cfg.ashLiqPrescreenEnabled = false;
+          if (this.cfg.ashPecPrescreenEnabled === undefined) this.cfg.ashPecPrescreenEnabled = false;
+          if (this.cfg.ashPecBatchSize        === undefined) this.cfg.ashPecBatchSize        = 25;
+          if (this.cfg.ashPecBatchDelayMs     === undefined) this.cfg.ashPecBatchDelayMs     = 2000;
           if (this.cfg.ashPresenceSkewThreshold === undefined) this.cfg.ashPresenceSkewThreshold = 70;
           if (this.cfg.ashPresenceSkewWindow    === undefined) this.cfg.ashPresenceSkewWindow    = 0;
           if (this.cfg.ashPresenceMixedMode     === undefined) this.cfg.ashPresenceMixedMode     = 'continue';
@@ -1582,6 +1621,7 @@
         async runScan() {
           await _origScan.call(this);
           if (this.cfg.ashLiqEnabled) this._liqLaunchBatch();
+          if (this.cfg.ashPecPrescreenEnabled) this._afPecUniverseFetch().catch(() => {});
           if (!this.cfg.ashfallEnabled) return;
           this._afCheckCross().catch(() => {});
           // Deferred so MIC's _micRunScan (which fetches klines) finishes first —
@@ -1778,13 +1818,270 @@
           if (typeof fn === 'function' && !this._liqCloseHooks.includes(fn)) this._liqCloseHooks.push(fn);
         },
 
+        // Ranks a bulk-ticker candidate by MIC's own collapsed critStats (this.micCollapsedCritStats,
+        // built in _afScoreBuild) restricted to the criteria actually readable at prescreen time —
+        // fund, V/A, IO/A always (straight off the ticker payload); PEC/VSG too once the universe
+        // prefetch (ashPecPrescreenEnabled, see _afPecUniverseFetch) has populated
+        // _afPecUniverseCache. ocs/ocx still need a live OC sample and are left out regardless. Tier
+        // math mirrors MIC's _micCheckCrit exactly (same steps, same window averages, same shape-
+        // match quartet) so a criterion means the same thing whether MIC tags it after the fact or
+        // this scores it ahead of time. Missing scorecard history for a key resolves to 0, not a
+        // penalty — deprioritizes, excludes nothing.
+        _liqPrescreenScore(t) {
+          const stats  = this.micCollapsedCritStats || {};
+          const pnlOf  = key => stats[key]?.pnl || 0;
+          let score = 0;
+
+          const fundStep = this.cfg.micFundStep ?? 0.25;
+          const fundTier = Math.floor((parseFloat(t.fundingRate || 0) * 100) / fundStep);
+          score += pnlOf(fundTier >= 0 ? 'fund+' : 'fund-');
+
+          const volW = this._afVolIoWindowAvg?.('vol');
+          if (volW) {
+            const vaStep = this.cfg.micVaStep ?? 1;
+            const vaTier = Math.floor(((parseFloat(t.turnover24h || 0) - volW) / volW * 100) / vaStep);
+            score += pnlOf(vaTier >= 0 ? 'va+' : 'va-');
+          }
+
+          const oiW = this._afVolIoWindowAvg?.('oi');
+          if (oiW) {
+            const ioaStep = this.cfg.micIoaStep ?? 1;
+            const ioaTier = Math.floor(((parseFloat(t.openInterestValue || 0) - oiW) / oiW * 100) / ioaStep);
+            score += pnlOf(ioaTier >= 0 ? 'ioa+' : 'ioa-');
+          }
+
+          if (this.cfg.ashPecPrescreenEnabled) {
+            const uni = this._afPecUniverseCache?.[t.symbol];
+            const p = uni?.pec, v = uni?.vsg;
+            if (p && p['6h'] != null && p['12h'] != null && p['24h'] != null) {
+              const pecHigh = this.cfg.micPecThresholdHigh ?? 70;
+              const pecLow  = this.cfg.micPecThresholdLow  ?? 30;
+              if (p['6h'] > pecHigh && p['12h'] > pecHigh && p['24h'] > pecHigh) score += pnlOf('pecob');
+              if (p['6h'] < pecLow  && p['12h'] < pecLow  && p['24h'] < pecLow)  score += pnlOf('pecos');
+              if (this._afPecShapeMatch(p, 'pecalpha')) score += pnlOf('pecalpha');
+              if (this._afPecShapeMatch(p, 'pecdelta')) score += pnlOf('pecdelta');
+              if (this._afPecShapeMatch(p, 'pecmomup')) score += pnlOf('pecmomup');
+              if (this._afPecShapeMatch(p, 'pecmomdn')) score += pnlOf('pecmomdn');
+            }
+            if (v && v['6h'] != null && v['12h'] != null && v['24h'] != null) {
+              const vsgHigh = this.cfg.micVsgThresholdHigh ?? 70;
+              const vsgLow  = this.cfg.micVsgThresholdLow  ?? 30;
+              if (v['6h'] > vsgHigh && v['12h'] > vsgHigh && v['24h'] > vsgHigh) score += pnlOf('vsgot');
+              if (v['6h'] < vsgLow  && v['12h'] < vsgLow  && v['24h'] < vsgLow)  score += pnlOf('vsgut');
+              if (this._afVsgShapeMatch(v, 'vsgalpha')) score += pnlOf('vsgalpha');
+              if (this._afVsgShapeMatch(v, 'vsgdelta')) score += pnlOf('vsgdelta');
+              if (this._afVsgShapeMatch(v, 'vsgmomup')) score += pnlOf('vsgmomup');
+              if (this._afVsgShapeMatch(v, 'vsgmomdn')) score += pnlOf('vsgmomdn');
+            }
+          }
+
+          return score;
+        },
+
+        // Same mutually-exclusive shape-quartet logic as MIC's _micPecShapeMatch/_micVsgShapeMatch
+        // (see MultiIndicator-Chaser.html) — duplicated rather than called through, deliberately:
+        // Ashfall's prescreen score has to work whether or not MIC is even loaded, and these are
+        // pure functions of the composite index object with no MIC-only state behind them, so
+        // duplication costs nothing in correctness (same formula, same thresholds off the same
+        // shared cfg) while keeping Pre-Screening independent of MIC's presence.
+        _afPecShapeMatch(pec, want) {
+          const a = pec['6h'], b = pec['12h'], c = pec['24h'];
+          if (b > a && b > c) return want === 'pecalpha';
+          if (b < a && b < c) return want === 'pecdelta';
+          if (a > b && b > c) return want === 'pecmomup';
+          if (a < b && b < c) return want === 'pecmomdn';
+          const scores = {
+            pecalpha: Math.min(b - a, b - c),
+            pecdelta: Math.min(a - b, c - b),
+            pecmomup: Math.min(a - b, b - c),
+            pecmomdn: Math.min(b - a, c - b),
+          };
+          const best = Object.entries(scores).reduce((p, n) => n[1] > p[1] ? n : p);
+          return want === best[0];
+        },
+        _afVsgShapeMatch(vsg, want) {
+          const a = vsg['6h'], b = vsg['12h'], c = vsg['24h'];
+          if (b > a && b > c) return want === 'vsgalpha';
+          if (b < a && b < c) return want === 'vsgdelta';
+          if (a > b && b > c) return want === 'vsgmomup';
+          if (a < b && b < c) return want === 'vsgmomdn';
+          const scores = {
+            vsgalpha: Math.min(b - a, b - c),
+            vsgdelta: Math.min(a - b, c - b),
+            vsgmomup: Math.min(a - b, b - c),
+            vsgmomdn: Math.min(b - a, c - b),
+          };
+          const best = Object.entries(scores).reduce((p, n) => n[1] > p[1] ? n : p);
+          return want === best[0];
+        },
+        // Price Effect Coefficient for one window — duplicated from MIC's _micCalcPecWindow (same
+        // formula, same wick-dampening option) so Ashfall's universe log can derive PEC without a
+        // dependency on MIC being loaded. See MultiIndicator-Chaser.html for the full derivation.
+        _afCalcPecWindow(candles, windowCount, dampen) {
+          if (!candles.length) return null;
+          const subset = candles.slice(-windowCount);
+          if (!subset.length) return null;
+          const open  = subset[0].open;
+          const close = candles[candles.length - 1].close;
+          let range;
+          if (dampen) {
+            range = subset.reduce((s, c) => s + (c.high - c.low), 0) / subset.length;
+          } else {
+            range = Math.max(...subset.map(c => c.high)) - Math.min(...subset.map(c => c.low));
+          }
+          if (!(range > 0)) return 50;
+          let p = (close - open) / range;
+          if (p > 1) p = 1; else if (p < -1) p = -1;
+          return p * 50 + 50;
+        },
+        // Volume Shape Graph for one window — duplicated from MIC's _micCalcVsgWindow, same reason
+        // as _afCalcPecWindow above.
+        _afCalcVsgWindow(candles, windowCount) {
+          if (!candles.length) return null;
+          const subset = candles.slice(-windowCount);
+          if (!subset.length) return null;
+          const vOpen = subset[0].volume;
+          const v     = candles[candles.length - 1].volume;
+          const vHigh = Math.max(...subset.map(c => c.volume));
+          const vLow  = Math.min(...subset.map(c => c.volume));
+          if (!(vHigh > vLow)) return 50;
+          let vp = (v - vOpen) / (vHigh - vLow);
+          if (vp > 1) vp = 1; else if (vp < -1) vp = -1;
+          return vp * 50 + 50;
+        },
+
+        // Persistent, byte-capped candle log (KLINE_LOG_KEY) shared cross-bot the same way
+        // SCORE_KEY/CROSS_KEY are — read fresh every call rather than cached on `this`, since
+        // Permafrost may have written a newer version of the same bucket since this bot last read
+        // it. Keyed by granularity so a differently-configured partner never corrupts this bot's
+        // bars.
+        _afKlineLogRead(gran) {
+          try {
+            const all = JSON.parse(localStorage.getItem(KLINE_LOG_KEY) || '{}');
+            return all[gran] || {};
+          } catch (_) { return {}; }
+        },
+        // Evicts whole symbols, oldest lastSeenAt first, until back under KLINE_LOG_BYTE_CAP —
+        // eviction is per-symbol rather than per-oldest-candle because a symbol that's stopped
+        // appearing in bulk tickers (delisted, or dropped below the price floor) is exactly the
+        // data this log has no further use for, not merely its least-recently-touched entry.
+        _afKlineLogWrite(gran, bucket) {
+          try {
+            const all = JSON.parse(localStorage.getItem(KLINE_LOG_KEY) || '{}');
+            all[gran] = bucket;
+            let json = JSON.stringify(all);
+            let guard = 0;
+            while (new Blob([json]).size > KLINE_LOG_BYTE_CAP && guard < 50) {
+              const syms = Object.keys(bucket).sort((a, b) => (bucket[a].lastSeenAt || 0) - (bucket[b].lastSeenAt || 0));
+              if (!syms.length) break;
+              delete bucket[syms[0]];
+              all[gran] = bucket;
+              json = JSON.stringify(all);
+              guard++;
+            }
+            localStorage.setItem(KLINE_LOG_KEY, json);
+          } catch (_) {}
+        },
+
+        // Full-universe PEC/VSG prefetch for Pre-Screening — piggybacks on the bulk-ticker
+        // refresh event (runs once per _lastAllTickersAt change, not on its own clock) rather
+        // than MIC's liq-batch-close trigger, so PEC/VSG are weighed before liq surveillance has
+        // surveilled anything at all. Covers every USDT ticker, not just movers or previously-
+        // surveilled symbols. MIC/MIW's own narrow _micPrefetchPec/_pfPrefetchPec is untouched and
+        // keeps acting as a gap-filler for whatever a given cycle here missed (new listings, a
+        // failed request). Batched with a configurable size/delay (ashPecBatchSize/
+        // ashPecBatchDelayMs) since this is a much bigger single burst than any existing kline
+        // fetch in this codebase — see the persistent log below for why repeat cycles are cheap
+        // (delta-fetch only the bars since each symbol's last stored candle, not the full 24h
+        // window every time).
+        async _afPecUniverseFetch() {
+          if (!this.cfg.ashPecPrescreenEnabled) return;
+          const freshAt = this._lastAllTickersAt || 0;
+          if (!freshAt || freshAt === this._afPecUniverseFetchedAt) return;
+          const allTickers = this._lastAllTickers || [];
+          if (!allTickers.length) return;
+
+          const gran         = this.cfg.micPecGranularity ?? '1h';
+          const bybitInterval = gran === '15m' ? '15' : gran === '3h' ? '180' : '60';
+          const intervalMin  = gran === '15m' ? 15 : gran === '3h' ? 180 : 60;
+          const total        = Math.round(1440 / intervalMin);
+          const barMs        = intervalMin * 60 * 1000;
+          const now          = Date.now();
+          const lastBarStart = Math.floor(now / barMs) * barMs - barMs;
+          const dampen       = !!this.cfg.micPecWickDampen;
+
+          const bucket  = this._afKlineLogRead(gran);
+          const symbols = allTickers.filter(t => t?.symbol?.endsWith('USDT')).map(t => t.symbol);
+          const batchSize = Math.max(1, this.cfg.ashPecBatchSize ?? 25);
+          const delayMs   = Math.max(0, this.cfg.ashPecBatchDelayMs ?? 2000);
+
+          for (let i = 0; i < symbols.length; i += batchSize) {
+            const slice = symbols.slice(i, i + batchSize);
+            await Promise.all(slice.map(async sym => {
+              try {
+                const entry = bucket[sym];
+                const have  = entry?.candles || [];
+                const newestHave = have.length ? have[have.length - 1].candleStart : 0;
+                if (newestHave >= lastBarStart) { if (entry) entry.lastSeenAt = now; return; }
+                const barsNeeded = have.length ? Math.round((lastBarStart - newestHave) / barMs) + 1 : total;
+                const limit = Math.min(barsNeeded + 1, 200); // +1 — Bybit's first row is the still-forming candle
+                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=${bybitInterval}&limit=${limit}`);
+                if (!r.ok) return;
+                const d = await r.json();
+                const list = d?.result?.list;
+                if (!list || list.length < 2) return;
+                const fetched = list.slice(1).map(c => ({
+                  candleStart: parseInt(c[0]), open: parseFloat(c[1]), high: parseFloat(c[2]),
+                  low: parseFloat(c[3]), close: parseFloat(c[4]), volume: parseFloat(c[5]),
+                })).reverse();
+                const merged = [...have.filter(c => !fetched.some(f => f.candleStart === c.candleStart)), ...fetched]
+                  .sort((a, b) => a.candleStart - b.candleStart)
+                  .slice(-total);
+                bucket[sym] = { candles: merged, lastSeenAt: now };
+              } catch (e) {}
+            }));
+            if (i + batchSize < symbols.length && delayMs) await new Promise(res => setTimeout(res, delayMs));
+          }
+
+          this._afKlineLogWrite(gran, bucket);
+          this._afPecUniverseFetchedAt = freshAt;
+
+          const cache  = {};
+          const per6h  = Math.max(1, Math.round(360  / intervalMin));
+          const per12h = Math.max(1, Math.round(720  / intervalMin));
+          const per24h = Math.max(1, Math.round(1440 / intervalMin));
+          for (const sym of symbols) {
+            const candles = bucket[sym]?.candles;
+            if (!candles || !candles.length) continue;
+            cache[sym] = {
+              pec: {
+                '6h':  this._afCalcPecWindow(candles, per6h,  dampen),
+                '12h': this._afCalcPecWindow(candles, per12h, dampen),
+                '24h': this._afCalcPecWindow(candles, per24h, dampen),
+              },
+              vsg: {
+                '6h':  this._afCalcVsgWindow(candles, per6h),
+                '12h': this._afCalcVsgWindow(candles, per12h),
+                '24h': this._afCalcVsgWindow(candles, per24h),
+              },
+            };
+          }
+          this._afPecUniverseCache = cache;
+          this.log(`[ASH] 🕯️ PEC/VSG universe prefetch — ${Object.keys(cache).length}/${symbols.length} tickers ready`, 'info');
+        },
+
         _liqLaunchBatch() {
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) { this._liqLastBatchSyms = []; return; }
           const activeSyms = new Set((this._liqBatches || []).flatMap(b => b.symbols));
           const _megacapExclude = this.cfg.megacapExclude || DEFAULT_MEGACAP_EXCLUDE;
+          // Inherits MIC's reentry-block verdict as-is (same graylist, same micReentryBlockMode
+          // winners+losers/losers-only split) — a ticker MIC would throw out of basePool anyway
+          // shouldn't burn a WS slot here first. No-op via optional chaining when MIC isn't loaded;
+          // this file invents no separate blocking policy of its own.
           const base = t => t.symbol.endsWith('USDT') && !_megacapExclude.includes(t.symbol)
-            && parseFloat(t.lastPrice || 0) >= 0.001 && !activeSyms.has(t.symbol);
+            && parseFloat(t.lastPrice || 0) >= 0.001 && !activeSyms.has(t.symbol)
+            && !this._micIsReentryBlocked?.(t.symbol);
 
           // Sequester: symbols whose most recently closed batch read 0-liq get priority
           // resurveillance ahead of the random mover pool, so a calm ticker doesn't age out of
@@ -1818,7 +2115,15 @@
             return;
           }
           const shuffle = arr => { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } };
-          shuffle(gainers); shuffle(losers);
+          if (this.cfg.ashLiqPrescreenEnabled) {
+            // Deprioritize, don't exclude — a ticker with no scorecard history or a losing one
+            // still sorts to the back of its half, not out of it, so it still fills a slot when
+            // nothing better is available this cycle.
+            const byScore = (a, b) => this._liqPrescreenScore(b) - this._liqPrescreenScore(a);
+            gainers.sort(byScore); losers.sort(byScore);
+          } else {
+            shuffle(gainers); shuffle(losers);
+          }
           const half    = Math.floor(remaining / 2);
           const symbols = [...sequesterPicks, ...gainers.slice(0, half).map(t => t.symbol), ...losers.slice(0, half).map(t => t.symbol)];
           if (sequesterPicks.length) this.log(`[ASH] 💧 Sequester — ${sequesterPicks.length} calm ticker${sequesterPicks.length !== 1 ? 's' : ''} prioritized for resurveillance`, 'info');

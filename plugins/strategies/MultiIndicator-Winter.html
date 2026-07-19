@@ -15,14 +15,17 @@
       them) — a ticker only reads 0-Liq if every cycle it appeared in within that window came
       back clean. See _miwLiqZeroAcrossWindow.
     'past1' (Past-1) — NOT a criterion. A Past-1 slot has no liquidation criterion in it at all;
-      it's built entirely from secondary criteria. What makes it a Past-1 slot is that it's only
-      ever matched against tickers with real recent liquidation activity that never qualified
-      for '1' (didn't cross the live threshold) or '0' (wasn't clean) — see
-      _miwPast1FreshSymbols, sourced from the same closed-batch pool (_miwPecPool, populated by
-      registerLiqCloseHook) that feeds PEC. The ticker-pool restriction *is* the anchor; there's
-      nothing to tag in the slot or the scorecard. A manually-built slot with no liquidation
-      criterion is only valid while 'past1' is an active mode — otherwise it's the same mistake
-      it always was (see the anchorless-slot warning at startup).
+      it's built entirely from secondary criteria. Every closed cycle sorts each ticker into
+      exactly one of three buckets, independent of sell/buy dominance: liq+ (some side's raw
+      turnover cleared its own historical average, i.e. would have fired live), 0-liq (no
+      liquidation at all this cycle, across the full retained window), or liq- (real liquidation
+      happened, but neither side's turnover cleared its average — too weak to have fired live).
+      Past-1 slots match liq- tickers. See _miwPast1FreshSymbols, sourced from the same
+      closed-batch pool (_miwPecPool, populated by registerLiqCloseHook) that feeds PEC. The
+      ticker-pool restriction *is* the anchor; there's nothing to tag in the slot or the
+      scorecard. A manually-built slot with no liquidation criterion is only valid while 'past1'
+      is an active mode — otherwise it's the same mistake it always was (see the anchorless-slot
+      warning at startup).
 
   This is why "every slot must have exactly one liquidation criterion" is no longer quite true:
   '1'/'0' slots do; 'past1' slots deliberately don't. See _miwSlotLiqAnchor (returns the
@@ -73,7 +76,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.64.0';
+  const VERSION       = '1.66.0';
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence modes (default ['1'] — live only). Enabling 0/Past-1 won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
@@ -1176,9 +1179,18 @@
           // 0-liq slots are only ever generated when '0' is an active mode (see
           // _miwAutoQualify), so the self- and cross-liq graylists — both aimed at keeping
           // 0liq honest — only need to apply when this bot's presence modes could actually
-          // produce a 0liq slot.
+          // produce a 0liq slot. But both are belt-and-suspenders backstops, not the actual
+          // guarantor of 0liq's correctness — _miwCheckCrit's '0liq' branch independently scans
+          // the full retained window (_miwLiqZeroAcrossWindow) and would never read a recently-
+          // liquidated ticker as clean regardless of these graylists. Past-1's entire population
+          // IS "recently liquidated" tickers (_miwPast1FreshSymbols draws from the same pool),
+          // so leaving these graylists active while Past-1 is also a mode silently deletes every
+          // Past-1 candidate from basePool for the length of the graylist lock (25 scan cycles —
+          // far longer than Past-1's own freshness TTL) before Past-1 ever gets to see them. Stand
+          // both graylists down whenever Past-1 is active; 0liq stays correct either way.
           const _0liqRelevant    = this._miwEffectivePresenceModes().includes('0');
-          const _crossLiqSyms = (_0liqRelevant && this.cfg.pfCrossLiqGraylistEnabled) ? new Set(
+          const _past1Relevant   = this._miwEffectivePresenceModes().includes('past1');
+          const _crossLiqSyms = (_0liqRelevant && !_past1Relevant && this.cfg.pfCrossLiqGraylistEnabled) ? new Set(
             (this._pfCrossRead?.() || []).filter(e => e.kind === 'live-liq' && e.source === 'chaser' && e.symbol).map(e => e.symbol)
           ) : null;
           // Mirror the derived exclusion set into persisted, timestamped per-symbol state —
@@ -1205,7 +1217,7 @@
             if (activeSyms.has(t.symbol)) { scanSkip.excluded.active++; continue; }
             if (this._isSymbolBanned?.(t.symbol)) { scanSkip.excluded.banned++; continue; }
             if (this._miwIsReentryBlocked(t.symbol)) { scanSkip.excluded.reentry++; continue; }
-            if (_0liqRelevant && this.cfg.miwSelfLiqGraylistEnabled && this._miwIsSlotGraylisted(t.symbol)) { scanSkip.excluded.selfLiq++; continue; }
+            if (_0liqRelevant && !_past1Relevant && this.cfg.miwSelfLiqGraylistEnabled && this._miwIsSlotGraylisted(t.symbol)) { scanSkip.excluded.selfLiq++; continue; }
             if (_crossLiqSyms && _crossLiqSyms.has(t.symbol)) { scanSkip.excluded.crossLiq++; continue; }
             basePool.push(t);
           };
@@ -1312,8 +1324,12 @@
                 // Only 0-Liq and Past-1 ever resolve at scan time — sliq/bliq/msliq/mbliq are
                 // live-only (checkCrit has no branch for them). Mutually exclusive by
                 // definition (0-Liq needs zero liquidation in-window, Past-1 needs some), so
-                // there's no ambiguity in trying one then the other.
-                if (this._miwAnchorAllowed('0liq')) {
+                // there's no ambiguity in trying one then the other. _miwAnchorAllowed only
+                // confirms '0' is an active mode — it says nothing about THIS ticker, so
+                // critOk('0liq') (the real _miwLiqZeroAcrossWindow check) has to run here too,
+                // or every ticker clearing the secondary-criteria floor gets falsely tagged
+                // 0liq regardless of its actual liquidation history.
+                if (this._miwAnchorAllowed('0liq') && critOk('0liq')) {
                   const m = this._miwAutoQualify('0liq', critOk, c => _miwAnnotateCrit(c, t));
                   if (m) matched = { ...m, slotIdx: -1 };
                 }
@@ -1497,6 +1513,16 @@
           if (this.cfg.miwForceGeneralCriteria && this.cfg.miwAutoSlots && this.cfg.pfCoQualPenaltyEnabled) {
             compositeScore = criteria.reduce((s, c, i) => s + this._miwScaledRank(c, annotCrits[i]), 0);
           }
+          // Top-up (above) can append criteria — most commonly fund — that were never part of
+          // the match _miwIsEntryBlocked already cleared for entryPool. Re-check against the
+          // now-possibly-expanded annotCrits before actually opening; entryPool's own check stays
+          // as the first, cheaper pass, this is the one that has to hold once the real criteria
+          // list is final.
+          if (this.cfg.miwForceGeneralCriteria && this.cfg.miwAutoSlots
+              && this._miwIsEntryBlocked(this._miwSlotLiqAnchor(criteria), annotCrits)) {
+            this._miwLogLiveHistMatch(sym, annotCrits);
+            return false;
+          }
           try {
             const r  = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
             const d  = await r.json();
@@ -1633,7 +1659,16 @@
             const step = this.cfg.miwFundStep ?? 0.25;
             const tier = Math.floor(fr / step);
             const m = c.match(/^fund([<>])(-?\d+)$/);
-            if (!m) return true;
+            // Bare 'fund' (Auto mode's un-thresholded form) used to return true unconditionally
+            // here, regardless of tier — unlike va/ioa's bare form, which at least requires
+            // windowAvg data to exist first. That made 'fund' a permanent automatic pass in Auto
+            // mode: every ticker always "matched" it, so _miwTopUpGeneralCriteria/
+            // _miwAutoQualify tagged virtually every entry with fund+/fund- whether or not
+            // funding had anything to do with the match, diluting the scorecard with noise and
+            // making a freshly-topped-up fund tag the most common way a blocked sign slipped
+            // through (see _miwOpen's post-top-up recheck). Requiring tier !== 0 means the rate
+            // has to actually clear one full miwFundStep off zero to count as a real signal.
+            if (!m) return tier !== 0;
             return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
           }
           if (/^pec/.test(c)) {
@@ -2188,18 +2223,18 @@
         },
 
         // past1 candidate set: fresh closed-batch entries (same TTL as PEC, uncapped — this is
-        // pure lookup, no fetch) that had real liquidation (sLiqRaw+bLiqRaw > 0, so not 0-Liq's
-        // territory) but would never have fired live. Live firing takes two gates (see
-        // _miwOnLiqMessage/_miwCheckLiveLiqCrit): dominance classification (this side must be
-        // ≥70%, or ≥30% for mixed) assigns a type, then that type's depth — % this side's
-        // turnover deviates from the average, same calcDepth Permafrost already computed into
-        // sDepth/bDepth — must clear miwLiveDepthThreshold (default 1, i.e. "≥1% above average").
-        // A ticker lands in past1 if it fails either gate: no type at all (too balanced to
-        // classify), or classified but depth never reached the threshold — the genuine
-        // liquidation-happened-but-too-small-or-too-balanced middle ground, checked against the
-        // global threshold (a manual per-slot depth override on a live anchor has no bearing on
-        // this pool). Consumed by the scan loop as the match gate for anchorless (Past-1) slots
-        // — past1 is a path, not a criterion, so this is never called from checkCrit.
+        // pure lookup, no fetch) that are liq- — real liquidation happened (sLiqRaw+bLiqRaw > 0,
+        // so not 0-Liq's territory) but neither side's raw turnover cleared its own historical
+        // average (sDepth/bDepth, the same calcDepth Permafrost already computed against
+        // _liqAvgSTurnover/_liqAvgBTurnover) beyond miwLiveDepthThreshold (default 1, i.e. "≥1%
+        // above average"). This is independent of sell/buy dominance — the 70/30 split
+        // (_miwClassifyLiqDominance) only labels sliq/bliq/msliq/mbliq for the live path and has
+        // no bearing on the liq+/liq-/0-liq classification here. A ticker is liq- (past1) as long
+        // as the stronger of its two sides never cleared the threshold; if either side did, it's
+        // liq+ and would have fired live already, so it's excluded. Checked against the global
+        // threshold (a manual per-slot depth override on a live anchor has no bearing on this
+        // pool). Consumed by the scan loop as the match gate for anchorless (Past-1) slots — past1
+        // is a path, not a criterion, so this is never called from checkCrit.
         _miwPast1FreshSymbols() {
           const pool = this._miwPecPool || {};
           const ttl  = (this.cfg.miwPecFreshCycles ?? 4) * (this.cfg.scanMins ?? 15) * 60000;
@@ -2208,14 +2243,10 @@
           const out  = new Set();
           for (const [sym, e] of Object.entries(pool)) {
             if ((now - e.ts) >= ttl) continue;
-            if ((e.sLiqRaw || 0) + (e.bLiqRaw || 0) <= 0) continue;
-            const type = this._miwClassifyLiqDominance((e.sLiqPct || 0) / 100, (e.bLiqPct || 0) / 100);
-            if (type) {
-              const isSell = type === 'sliq' || type === 'msliq';
-              const relevantDepth = isSell ? (e.sDepth ?? 0) : (e.bDepth ?? 0);
-              if (relevantDepth >= threshold) continue; // would have fired live — not past1
-            }
-            out.add(sym);
+            if ((e.sLiqRaw || 0) + (e.bLiqRaw || 0) <= 0) continue; // no liquidation at all — 0-Liq's territory
+            const maxDepth = Math.max(e.sDepth ?? 0, e.bDepth ?? 0);
+            if (maxDepth >= threshold) continue; // liq+ — a side cleared its average, would have fired live
+            out.add(sym); // liq- — real liquidation, but neither side cleared its average
           }
           return out;
         },
@@ -2666,6 +2697,25 @@
             for (const sym of symbols) {
               const e = shared.data[sym];
               if (e && e.candleStart >= lastBarStart && e.ts && (now - e.ts) < scanMs) seedCache[sym] = e;
+            }
+          }
+          // Permafrost's full-universe PEC/VSG prefetch (Pre-Screening's "PEC/VSG Universe
+          // Weighing") runs in this same page instance and already covers every USDT ticker on
+          // the current bulk-ticker window — seed straight from it before touching the network,
+          // so this narrow path only ever fetches what that pass missed (a symbol outside the
+          // USDT set, a request that failed this cycle, or Universe Weighing being off).
+          // Gated on _pfPecUniverseFetchedAt matching the current bulk window rather than a
+          // scanMs recency check: the candle itself is only ever as fresh as the last completed
+          // bar either way, so what actually matters is whether this reading is from the current
+          // window or a stale prior one, not how many minutes ago it was fetched.
+          const uniCache = this._pfPecUniverseCache;
+          if (uniCache && this._pfPecUniverseFetchedAt === this._lastAllTickersAt) {
+            for (const sym of symbols) {
+              if (seedCache[sym]) continue;
+              const u = uniCache[sym];
+              if (u?.pec?.['6h'] != null) {
+                seedCache[sym] = { '6h': u.pec['6h'], '12h': u.pec['12h'], '24h': u.pec['24h'], vsg: u.vsg, candleStart: lastBarStart, ts: now };
+              }
             }
           }
           if (!this._miwPecCache) this._miwPecCache = {};
