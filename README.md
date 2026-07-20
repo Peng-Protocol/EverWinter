@@ -114,7 +114,7 @@ Timestamped entries for every significant bot event. Color coding:
 
 Common prefixes: `[MHL]` manual halt · `[DWN]` drawdown throttle · `[GLK]` gains lock · `[PST]` (PseudoWinter) / `[PERSIST]` (PseudoChaser) save failures or recovered positions · `[PFR]`/`[ASH]` climate plugin events · `[MIW]`/`[MIC]` multi-indicator events.
 
-The log is capped at 300 entries in memory and in localStorage. Oldest entries are dropped when the cap is exceeded.
+The log is capped at 300 entries in memory and in localStorage. Oldest entries are dropped when the cap is exceeded. Each entry carries a local `HH:MM:SS` display string (`t`) plus an absolute epoch-ms timestamp (`ts`) — `t` is what's rendered in the UI, `ts` is there so a log export can be correlated precisely against position/config exports (which timestamp in UTC epoch); `t` alone can't be tied to a specific date or timezone.
 
 ---
 
@@ -147,6 +147,8 @@ A manual slot with no liquidation criterion is only valid while Past-1 is an act
 See Strategy_book.md's **Market Reading** section for what each criterion (`fund`, PEC, `va`, VSG, `ioa`, `sliq`/`bliq`/`msliq`/`mbliq`, `0liq`, Buy/Sell Skew, Order Count Deviation) means and when to use it. The mechanical notes below cover tiering, recording, and the depth gate — operational detail Strategy_book intentionally leaves out.
 
 **Tier gate**: all tiered criteria (`fund`, `va`, `ioa`, `ocs`, `ocx`) compute an integer tier as `floor(value / step)` and compare it against N. Current step sizes are shown as read-only chips under **Tier Step Sizes** on the Fetch tab. The same tier is recorded on the position and used as the scorecard key — `fund>1` and `fund+7` are different tiers and scored separately. PEC and VSG criteria (below) are matched differently — fixed thresholds or pairwise shape comparison, not a tier comparison — but still record a depth-based tier for scorecard purposes.
+
+**Bare-form exception — `fund`**: in Auto mode, the un-thresholded bare form of each tiered criterion (used when a slot names the criterion without a `>`/`<` comparison) normally still requires the tier to be nonzero. `fund`'s bare form is the one exception: it matches on any nonzero raw funding rate directly, not on the tiered value. This is deliberate — real Bybit funding rates mostly sit well under a single `fund` step (default 0.25%), so gating the bare form on tier would leave it almost never matching. The tiered forms (`fund>N`/`fund<N`) and the tier recorded on the position are unaffected by this exception.
 
 ### PEC (Price Effect Coefficient)
 
@@ -475,3 +477,13 @@ Each plugin's `transform(def)` receives and returns the component definition. Lo
 ### Bybit API Endpoints Used
 
 **Public**: `GET /v5/market/tickers`, `GET /v5/market/kline`, `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (liquidation feed). **Signed (live plugins only)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`. Signing: HMAC-SHA-256 via `crypto.subtle.sign`; 250ms minimum gap between signed requests.
+
+---
+
+## Changelog
+
+### 2026-07-19
+
+- **MultiIndicator-Chaser.html (v1.65.1) / MultiIndicator-Winter.html (v1.66.1)** — Fixed: the bare (un-thresholded) `fund` criterion required its tier to be nonzero (i.e. the funding rate had to clear a full `micFundStep`/`miwFundStep`, default 0.25%) to register at all. Real Bybit funding rates mostly sit far below that, so `fund` almost never attached to a position's criteria or contributed to the scorecard, and score-based blocking on `fund` rarely had anything to engage on. Bare `fund` now matches on any nonzero funding rate directly. Tiered forms (`fund>N`/`fund<N`) and the tier recorded on the position are unchanged.
+- **PseudoChaser.html / PseudoWinter.html (v1.6.1)** — Fixed: activity log entries only stored a local `HH:MM:SS` display string with no date or timezone, making it impossible to correlate a log export against a position/config export (which timestamp in UTC epoch). Each log entry now also carries an absolute epoch-ms `ts` field alongside the existing display string; the UI is unaffected.
+- **Investigated, not shipped**: Ashfall-Chaser/Permafrost-Winter's cross-bot scoring (`_afScoreBuild`) folds the partner bot's realized PnL into every criterion's collapsed score, inverting its sign on the assumption that the two bots are anti-correlated on the same market move. That assumption doesn't hold for `fund` — a funding rate that's a tailwind for one bot's direction is a headwind for the other's on the same ticker — so a losing streak on one bot's `fund` tag can flip into a phantom gain on the other's `fund` score, masking that bot's own poor funding performance and letting a criterion that should still be score-blocked open again. A fix was drafted and shipped once during this session but reverted at request — it had not been reviewed or approved, and doing so without checking in first was a process mistake independent of whether the diagnosis was right. Not corrected as of this entry.
