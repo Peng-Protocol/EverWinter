@@ -1,1754 +1,89 @@
 <!--
-Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+  PseudoChaser — as of v2.0.0, this is no longer a standalone page. It's a plugin (target
+  bot: pseudowinter) that registers itself as an independent Alpine store ('chaser'), rather
+  than merging into PseudoWinter's own component state the way Permafrost/Ashfall do. That's
+  a deliberate architecture difference: Permafrost/Ashfall's footprint (a scorecard, a liq
+  surveillance panel) is small enough to safely flat-merge via Object.assign. This store's
+  footprint is nearly all of what used to be a full standalone app — position lifecycle,
+  DCA, monitoring, closing, its own persistence — and PseudoChaser was itself a structural
+  clone of PseudoWinter (same function names throughout), so flat-merging it would mean
+  hundreds of colliding names, many with long-vs-short direction logic buried inside
+  identically-named functions. A separate store sidesteps that entirely: this file's ~2700
+  lines of ported business logic are UNCHANGED from the old standalone PseudoChaser.html
+  internally (this.positions, this.cfg.X, this.pseudoOpenLong(), etc. all still just work,
+  since `this` now refers to this store instead of a component). The only things genuinely
+  reworked for this port:
+    1. A short list of top-level globals that collided by name with PseudoWinter's own
+       declarations — renamed with a ch prefix (see the block below).
+    2. A longer list of globals that ALSO collided but were deliberately NOT renamed —
+       instead simply not redeclared here, so they resolve to PseudoWinter's own already-
+       loaded copies. This is what makes market data (ticker/kline fetches), the WS
+       connection, and the shared-registry cache genuinely shared instead of duplicated,
+       with zero new code: this store's existing _sharedRead('bulkTickers') check (ported
+       unchanged) now resolves against PseudoWinter's own SHARED_KEY automatically.
+    3. Its own sub-plugin loader (for Ashfall/MIC, both still declare targetBot: 'pseudochaser')
+       is real as of v2.3.0 — it reuses PseudoWinter's own window.__pluginSystem.load/sort and
+       the same re-execute-src-then-transform loop from PseudoWinter's tail IIFE, just applied
+       to this store's object before Alpine.store() registration instead of to a window.pw
+       function. See the alpine:init listener below. What's NOT built yet is a Plugin Manager
+       UI panel inside the Chaser accordion for browsing/adding/removing them (this._pluginList,
+       _pluginInit() — see the comment at that call site) — loading and UI are separate here,
+       and only loading exists so far.
+    4. Its own scan-scheduling loop (scheduleScan/_chCdTimer) is UNCHANGED and still runs on
+       its own cfg.scanMins cadence — it doesn't need to be driven by PseudoWinter's scan
+       cycle, because the shared-cache check above already prevents duplicate fetches
+       regardless of which instance's timer fires first each cycle.
+  Config (this.cfg) needed NO rename at all, unlike the globals above — it's a property on
+  this store's own object, completely isolated from PseudoWinter's own this.cfg by virtue of
+  being a different `this`. That's what was decided: chaser keeps its own full config
+  namespace (position sizing, DCA, runtime, leverage, etc.), separate from Winter's.
 -->
-   
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.11.1 — Pseudo Mainnet Sim</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-<style>
-/* ─── RESET ─── */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; overflow: hidden; }
-
-/* ─── TOKENS ─── */
-:root {
-  --bg-void:    #100805;
-  --bg-deep:    #140c08;
-  --bg-panel:   #18100b;
-  --bg-raised:  #20150f;
-  --bg-hover:   #2a1a14;
-  --border:     #302018;
-  --border-hi:  #483324;
-  --ice:        #fac87e;
-  --ice-glow:   rgba(250,200,126,0.13);
-  --ice-faint:  rgba(250,200,126,0.05);
-  --glacier:    #6b4a2a;
-  --short:      #ff4560;
-  --short-dim:  rgba(255,69,96,0.12);
-  --short-glow: rgba(255,69,96,0.07);
-  --profit:     #00e5a0;
-  --profit-dim: rgba(0,229,160,0.10);
-  --warn:       #f0c060;
-  --warn-dim:   rgba(240,192,96,0.12);
-  --text-hi:    #f8eedd;
-  --text-mid:   #c8aa8a;
-  --text-lo:    #80654a;
-  --mono:       'Share Tech Mono', monospace;
-  --ui:         'Overpass', sans-serif;
-}
-
-/* ─── BODY BASE ─── */
-body {
-  background: var(--bg-void);
-  color: var(--text-hi);
-  font-family: var(--ui);
-  font-size: 13px;
-  /* Atmospheric bg on body::before — safe stacking context */
-  position: relative;
-}
-body::before {
-  content: '';
-  position: fixed; inset: 0;
-  z-index: 0; /* sits behind everything */
-  pointer-events: none;
-  background:
-    radial-gradient(ellipse 55% 35% at 12% 18%, rgba(107,74,42,0.22) 0%, transparent 60%),
-    radial-gradient(ellipse 35% 55% at 88% 82%, rgba(250,200,126,0.07) 0%, transparent 55%),
-    repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,0.04) 3px, rgba(0,0,0,0.04) 4px);
-}
-
-/* ─── LOADING SCREEN ─── */
-#pw-loading {
-  position: fixed; inset: 0;
-  z-index: 10000; /* topmost layer */
-  display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 14px;
-  background: var(--bg-void);
-  font-family: 'Share Tech Mono', monospace;
-}
-#pw-loading .pw-logo {
-  font-size: 22px; letter-spacing: 4px;
-  color: #fac87e;
-  text-shadow: 0 0 24px rgba(250,200,126,.5);
-}
-#pw-loading .pw-status {
-  font-size: 11px; letter-spacing: 2px; color: #3d2a18;
-}
-#pw-loading .pw-bar {
-  width: 180px; height: 2px; background: #302018; border-radius: 1px; overflow: hidden;
-}
-#pw-loading .pw-bar-fill {
-  height: 100%; width: 0; background: #fac87e;
-  box-shadow: 0 0 8px #fac87e;
-  animation: barload 1.2s ease forwards;
-}
-@keyframes barload { to { width: 100%; } }
-
-/* ─── ERROR BANNER ─── */
-#pw-error {
-  display: none; /* shown via JS if init fails */
-  position: fixed; inset: 0;
-  z-index: 9999;
-  align-items: center; justify-content: center;
-  background: rgba(5,8,16,.95);
-  font-family: 'Share Tech Mono', monospace;
-}
-#pw-error .pw-err-box {
-  border: 1px solid rgba(255,69,96,.4);
-  background: rgba(255,69,96,.07);
-  border-radius: 4px; padding: 28px 32px; max-width: 420px; text-align: center;
-}
-#pw-error .pw-err-title { font-size: 14px; color: #ff4560; letter-spacing: 2px; margin-bottom: 10px; }
-#pw-error .pw-err-msg   { font-size: 11px; color: #6a8aaa; line-height: 1.6; margin-bottom: 14px; }
-#pw-error .pw-err-btn   {
-  font-family: 'Share Tech Mono', monospace; font-size: 11px; letter-spacing: 1.5px;
-  padding: 7px 18px; border: 1px solid rgba(255,69,96,.5); border-radius: 2px;
-  background: none; color: #ff4560; cursor: pointer;
-}
-
-/* ─── APP SHELL ─── */
-#pw-app {
-  position: relative;
-  z-index: 1; /* above body::before bg, below loading/error */
-  height: 100vh;
-  display: flex; flex-direction: column;
-  visibility: hidden; /* NOT display:none — keeps layout intact for Alpine */
-}
-
-/* ─── TOPBAR ─── */
-.topbar {
-  position: relative; z-index: 100;
-  height: 50px; flex-shrink: 0;
-  background: rgba(8,13,20,0.98);
-  border-bottom: 1px solid var(--border);
-  padding: 0 18px;
-  display: flex; align-items: center; justify-content: space-between;
-}
-.logo-mark { font-family: var(--ui); font-size: 18px; font-weight: 700; letter-spacing: 3px; color: var(--ice); text-shadow: 0 0 22px rgba(250,200,126,.5); }
-.logo-sub  { font-family: var(--mono); font-size: 9px; color: var(--text-lo); letter-spacing: 2px; margin-top: 1px; }
-.pills { display: flex; align-items: center; gap: 8px; }
-.pill { display: flex; align-items: center; gap: 5px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 2px; background: var(--bg-raised); font-family: var(--mono); font-size: 10px; }
-.pip { width: 6px; height: 6px; border-radius: 50%; background: var(--text-lo); flex-shrink: 0; }
-.pip.on   { background: var(--profit); box-shadow: 0 0 6px var(--profit); animation: blink 2s infinite; }
-.pip.run  { background: var(--ice);    box-shadow: 0 0 6px var(--ice);    animation: blink .9s infinite; }
-.pip.warn { background: var(--warn);   box-shadow: 0 0 6px var(--warn); }
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
-
-/* ─── TOPBAR OVERLAY-MENU BUTTONS (PC only — shown via min-width media query below) ─── */
-.topbar-menu-btns { display: none; align-items: center; gap: 6px; }
-.tbtn {
-  font-size: 15px; line-height: 1; padding: 6px 10px; border-radius: 2px;
-  border: 1px solid var(--border); background: var(--bg-raised); color: var(--text-mid);
-  cursor: pointer; transition: all .15s;
-}
-.tbtn:hover  { background: var(--bg-hover); color: var(--text-hi); }
-.tbtn.active { color: var(--ice); border-color: var(--glacier); box-shadow: 0 0 8px var(--ice-glow); }
-
-/* ─── LAYOUT — desktop 4-col ─── */
-.layout {
-  position: relative; z-index: 1;
-  flex: 1; display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  overflow: hidden;
-}
-.col { border-right: 1px solid var(--border); overflow-y: auto; overflow-x: hidden; background: var(--bg-panel); min-width: 0; }
-.col:last-child { border-right: none; border-left: 1px solid var(--border); }
-.col-mid   { background: var(--bg-deep);  overflow-y: auto; overflow-x: hidden; display: block; min-width: 0; }
-.col-stats { background: var(--bg-panel); overflow-y: auto; overflow-x: hidden; display: block; min-width: 0; border-right: 1px solid var(--border); }
-.col-pnl   { border-left: 1px solid var(--border); overflow-y: auto; overflow-x: hidden; background: var(--bg-panel); display: flex; flex-direction: column; min-width: 0; }
-
-/* ─── MOBILE NAV TABS ─── */
-.mob-tabs {
-  display: none;
-  flex-shrink: 0;
-  background: var(--bg-panel);
-  border-bottom: 1px solid var(--border);
-  position: relative; z-index: 10;
-}
-.mob-tab {
-  flex: 1; padding: 10px 0; text-align: center;
-  font-family: var(--mono); font-size: 10px; letter-spacing: 1.5px;
-  color: var(--text-lo); background: none; border: none;
-  border-bottom: 2px solid transparent; cursor: pointer;
-  text-transform: uppercase; transition: all .15s;
-}
-.mob-tab.active { color: var(--ice); border-bottom-color: var(--ice); }
-
-/* ─── PC OVERLAY MENUS — market is always the 100%-width base; config/stats/trades float on top ─── */
-@media (min-width: 769px) {
-  .topbar-menu-btns { display: flex; }
-
-  .layout { grid-template-columns: 1fr; }
-
-  .col, .col-stats, .col-pnl {
-    position: absolute;
-    top: 0; bottom: 0;
-    width: 33.334%;
-    z-index: 50;
-    display: none;
-    box-shadow: 0 0 32px rgba(0,0,0,.55);
-  }
-  .col.ov-open, .col-stats.ov-open { display: block; }
-  .col-pnl.ov-open                 { display: flex; flex-direction: column; }
-  .col.ov-left,  .col-stats.ov-left,  .col-pnl.ov-left  { left: 0;  border-right: 1px solid var(--border); border-left: none; }
-  .col.ov-right, .col-stats.ov-right, .col-pnl.ov-right { right: 0; border-left: 1px solid var(--border); border-right: none; }
-
-  .ov-backdrop {
-    display: none;
-    position: absolute; inset: 0;
-    background: rgba(2,5,10,.62);
-    z-index: 40;
-  }
-  .ov-backdrop.show { display: block; }
-
-  /* Market content stays centered at 2/3 width instead of stretching edge-to-edge now that col-mid is 100% wide */
-  .market-inner { max-width: 66.6667%; margin: 0 auto; }
-}
-
-/* ─── RESPONSIVE — single column on mobile ─── */
-@media (max-width: 768px) {
-  html, body { overflow: hidden; }
-
-  #pw-app { height: 100dvh; }   /* use dvh for mobile browser chrome */
-
-  .topbar {
-    padding: 0 12px; height: 46px;
-  }
-  .logo-mark { font-size: 15px; letter-spacing: 2px; }
-  .logo-sub  { display: none; }
-  .pills { gap: 5px; }
-  .pill  { padding: 2px 7px; font-size: 9px; }
-
-  .mob-tabs { display: flex; }
-
-  .layout {
-    grid-template-columns: 1fr;
-    grid-template-rows: 1fr;
-    overflow: hidden;
-  }
-
-  .col, .col-mid, .col-stats, .col-pnl {
-    grid-column: 1; grid-row: 1;
-    display: none;
-    overflow-y: auto;
-    height: 100%;
-  }
-  .col.mob-active, .col-mid.mob-active, .col-stats.mob-active { display: block; }
-  .col-pnl.mob-active { display: flex; flex-direction: column; }
-
-  /* Stat grids: 2-col max on mobile */
-  .sg4 { grid-template-columns: 1fr 1fr; }
-
-  /* Position card grid: 2-col on mobile */
-  .pos-grid { grid-template-columns: repeat(2, 1fr); }
-
-  /* Gainer table mobile: 4-col layout */
-  .gt-head, .gr { grid-template-columns: 32% 22% 16% 30%; }
-
-  /* Config col: constrain only sliders and number inputs to 2/3 width,
-     leaving the right 1/3 as passive scroll space. Everything else full width. */
-  .col input[type=range],
-  .col input[type=number].inp { width: 67% !important; }
-  .col .crit-pick { width: 67%; }
-}
-
-/* ─── SECTIONS ─── */
-.sec { padding: 13px; border-bottom: 1px solid var(--border); }
-.sec-ttl { font-family: var(--mono); font-size: 9px; letter-spacing: 2.5px; text-transform: uppercase; color: var(--text-lo); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
-.sec-ttl em { font-style: normal; color: var(--ice); font-size: 10px; }
-
-/* ─── FORM ─── */
-.lbl { font-size: 11px; color: var(--text-mid); margin-bottom: 4px; display: flex; justify-content: space-between; }
-.lbl b { font-weight: 400; font-family: var(--mono); color: var(--ice); }
-.inp { width: 100%; padding: 7px 9px; background: var(--bg-void); border: 1px solid var(--border); border-radius: 2px; color: var(--text-hi); font-family: var(--mono); font-size: 12px; outline: none; transition: border-color .15s; }
-.inp:focus { border-color: var(--glacier); }
-.inp:disabled { opacity: .35; cursor: not-allowed; }
-select.inp { cursor: pointer; }
-select.inp option { background: var(--bg-raised); }
-.g  { margin-top: 8px; }
-.gs { margin-top: 5px; }
-input[type=range] { -webkit-appearance: none; width: 100%; height: 3px; background: var(--border); border-radius: 2px; outline: none; cursor: pointer; margin: 5px 0 2px; }
-input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%; background: var(--ice); box-shadow: 0 0 7px var(--ice); cursor: pointer; }
-input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
-
-/* ─── CONFIG ACCORDION ─── */
-.cfg-acc-hd {
-  width: 100%; display: flex; align-items: center; justify-content: space-between;
-  padding: 11px 13px; background: var(--bg-raised); border: none;
-  border-bottom: 1px solid var(--border);
-  font-family: var(--mono); font-size: 10px; letter-spacing: 1.5px;
-  text-transform: uppercase; color: var(--text-mid); cursor: pointer;
-  transition: background .15s, color .15s; text-align: left;
-}
-.cfg-acc-hd:hover { background: var(--bg-hover); color: var(--text-hi); }
-.cfg-acc-hd.open  { background: var(--bg-hover); color: var(--ice); border-bottom-color: var(--glacier); }
-.cfg-acc-arrow { font-size: 8px; color: var(--text-lo); transition: transform .2s; flex-shrink: 0; margin-left: 8px; }
-.cfg-acc-arrow.open { transform: rotate(90deg); color: var(--ice); }
-.cfg-acc-body { padding: 13px; border-bottom: 1px solid var(--border); }
-.pw-tabs { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:2px; }
-.pw-tab { font-family:var(--mono); font-size:9px; padding:3px 9px; border-radius:2px; border:1px solid; cursor:pointer; background:none; transition:border-color .12s,color .12s,background .12s; letter-spacing:.5px; }
-.pw-tab.on { border-color:rgba(255,150,80,.6); color:#ff9650; background:rgba(255,150,80,.08); }
-.pw-tab:not(.on) { border-color:rgba(255,150,80,.2); color:var(--text-lo); }
-.pw-zone { margin-top:8px; padding:8px; background:rgba(255,255,255,.02); border:1px solid rgba(255,255,255,.06); border-radius:3px; }
-
-/* ─── CONFIG LOCK ─── */
-.cfg-locked input[type=range]:not(:disabled),
-.cfg-locked input[type=number]:not(:disabled),
-.cfg-locked select:not(:disabled) {
-  pointer-events: none;
-  opacity: .4;
-}
-.cfg-locked input[type=range]:not(:disabled)::-webkit-slider-thumb {
-  background: var(--text-lo);
-  box-shadow: none;
-}
-
-/* ─── TOGGLE ─── */
-.tog { display: flex; align-items: center; gap: 7px; user-select: none; }
-.tog-t { width: 30px; height: 17px; background: var(--border); border-radius: 9px; position: relative; transition: background .2s; flex-shrink: 0; cursor: pointer; }
-.tog-t.on { background: var(--glacier); }
-.tog-k { position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--text-lo); transition: all .2s; }
-.tog-t.on .tog-k { left: 15px; background: var(--ice); box-shadow: 0 0 5px var(--ice); }
-.tog-l { font-size: 11px; color: var(--text-mid); }
-
-/* ─── BUTTONS ─── */
-.btn { display: block; width: 100%; padding: 8px; font-family: var(--mono); font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; text-align: center; border-radius: 2px; border: 1px solid; cursor: pointer; transition: all .15s; }
-.btn-ice   { color: var(--ice);      border-color: var(--ice);   background: var(--ice-faint); }
-.btn-ice:hover:not(:disabled)   { background: var(--ice-glow); box-shadow: 0 0 14px var(--ice-glow); }
-.btn-red   { color: var(--short);    border-color: var(--short); background: var(--short-glow); }
-.btn-red:hover:not(:disabled)   { background: var(--short-dim); }
-.btn-ghost { color: var(--text-mid); border-color: var(--border); background: var(--bg-raised); }
-.btn-ghost:hover:not(:disabled) { background: var(--bg-hover); }
-.btn:disabled { opacity: .35; cursor: not-allowed; }
-
-/* ─── ALERTS ─── */
-.alert { padding: 8px 10px; border-radius: 2px; border: 1px solid; font-size: 11px; line-height: 1.5; }
-.a-warn { color: var(--warn);  border-color: rgba(240,192,96,.25); background: var(--warn-dim); }
-.a-err  { color: var(--short); border-color: rgba(255,69,96,.25);  background: var(--short-glow); }
-
-/* ─── STAT GRIDS ─── */
-.sg2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-.sg3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
-.sg4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px; }
-.stat { background: var(--bg-raised); border: 1px solid var(--border); border-radius: 3px; padding: 7px 9px; min-width: 0; overflow: hidden; }
-.sl { font-size: 9px; letter-spacing: 1px; color: var(--text-lo); text-transform: uppercase; margin-bottom: 3px; }
-/* Market top-bar stats: allow long labels like "Unrealized PnL" to wrap */
-.sv { font-family: var(--mono); font-size: 13px; color: var(--text-hi); }
-.sv.ice    { color: var(--ice); }
-.sv.short  { color: var(--short); }
-.sv.profit { color: var(--profit); }
-.sv.warn   { color: var(--warn); }
-.sv.sm     { font-size: 12px; }
-
-/* ─── MODAL PORTAL ─── */
-#pw-modal-portal {
-  position: fixed; inset: 0;
-  z-index: 5000;
-  display: flex; align-items: center; justify-content: center;
-  padding: 16px;
-  background: rgba(5,8,16,.92);
-  backdrop-filter: blur(6px);
-}
-.modal-box {
-  background: var(--bg-panel); border: 1px solid var(--border-hi);
-  border-radius: 4px; width: 380px; max-width: 100%; padding: 22px;
-  box-shadow: 0 30px 80px rgba(0,0,0,.8);
-}
-.modal-title { font-family: var(--ui); font-size: 18px; font-weight: 700; letter-spacing: 2px; color: var(--ice); text-shadow: 0 0 16px rgba(126,232,250,.4); margin-bottom: 4px; }
-.modal-sub   { font-size: 11px; color: var(--text-mid); margin-bottom: 14px; line-height: 1.5; }
-
-/* ─── POSITION CARD ─── */
-.pos-card { border: 1px solid var(--border); border-left: 3px solid var(--profit); border-radius: 3px; margin-bottom: 7px; background: var(--bg-raised); overflow: hidden; }
-.pos-head { padding: 6px 10px; background: rgba(255,69,96,.05); border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-.pos-sym { font-family: var(--mono); font-size: 13px; font-weight: 600; }
-.side-badge { font-family: var(--mono); font-size: 9px; letter-spacing: 1px; padding: 2px 6px; border-radius: 2px; color: var(--profit); border: 1px solid rgba(0,229,160,.35); background: var(--profit-dim); }
-.order-type-badge { display:inline-block; width:58px; max-width:58px; min-width:58px; vertical-align:middle; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
-.order-type-badge > * { display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:middle; }
-.order-type-badge.expanded { width:auto; max-width:none; min-width:0; overflow:visible; text-overflow:clip; white-space:normal; }
-.order-type-badge.expanded > * { max-width:none; overflow:visible; text-overflow:clip; white-space:normal; }
-.phase-b { font-family: var(--mono); font-size: 9px; letter-spacing: 1px; padding: 2px 6px; border-radius: 2px; border: 1px solid; margin-left: 5px; }
-.phase-b.normal { color: var(--ice);   border-color: rgba(126,232,250,.3); }
-.phase-b.force  { color: var(--short); border-color: rgba(255,69,96,.3);   background: var(--short-glow); }
-.phase-b.art-reduce { color: #ffaa00; border-color: rgba(255,160,0,.4); background: rgba(255,160,0,.08); }
-.phase-b.normal.laggard-active  { color: #ffaa00; border-color: rgba(255,160,0,.45); background: rgba(255,160,0,.09); }
-.pos-pnl { font-family: var(--mono); font-size: 13px; }
-.pos-pnl.p { color: var(--profit); } .pos-pnl.l { color: var(--short); }
-.pos-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); padding: 7px 10px; gap: 5px; }
-.ps  { display: flex; flex-direction: column; gap: 2px; }
-.psl { font-size: 9px; color: var(--text-lo); text-transform: uppercase; letter-spacing: .7px; }
-.psv { font-family: var(--mono); font-size: 11px; color: var(--text-mid); }
-.psv.ice { color: var(--ice); }
-.pos-orders { padding: 5px 10px 7px; border-top: 1px solid var(--border); display: flex; gap: 5px; flex-wrap: wrap; }
-.oc { font-family: var(--mono); font-size: 9px; padding: 2px 7px; border-radius: 2px; border: 1px solid; display: flex; gap: 5px; align-items: center; }
-.oc.cond    { color: var(--warn);   border-color: rgba(240,192,96,.3);  background: var(--warn-dim); }
-.oc.entry   { color: var(--ice);    border-color: rgba(126,232,250,.25); background: var(--ice-faint); }
-.oc.tp      { color: var(--profit); border-color: rgba(0,229,160,.25);  background: var(--profit-dim); }
-.oc.triggered { color: var(--warn); border-color: rgba(240,192,96,.6); background: rgba(240,192,96,.22); font-weight:600; }
-.oc.pending { color: var(--text-lo); border-color: var(--border); background: var(--bg-raised); }
-.oc.done    { color: var(--text-lo); border-color: var(--border); }
-.pos-timer { padding: 3px 10px 6px; font-family: var(--mono); font-size: 9px; color: var(--text-lo); display: flex; gap: 12px; }
-.pos-timer .hi { color: var(--warn); }
-
-/* ─── GAINER TABLE ─── */
-.gt-head { display: grid; grid-template-columns: 28% 20% 18% 34%; padding: 5px 10px; gap: 0; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 9px; letter-spacing: 1px; color: var(--text-lo); position: sticky; top: 0; background: var(--bg-panel); z-index: 2; }
-.gt-head span { padding: 0 4px; }
-.gr { display: grid; grid-template-columns: 28% 20% 18% 34%; padding: 6px 10px; gap: 0; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 11px; align-items: start; transition: background .1s; }
-.gr > * { padding: 0 4px; word-break: break-word; white-space: normal; overflow: visible; }
-.gr:hover { background: var(--bg-raised); }
-.g-sym { color: var(--text-hi); font-weight: 600; word-break: break-all; }
-.g-chg { color: var(--short); }
-.g-rsi { }
-.g-rsi.hot  { color: var(--short); }
-.g-rsi.warm { color: var(--warn); }
-.g-rsi.cool { color: var(--text-mid); }
-.g-fr       { font-size: 10px; color: var(--text-lo); }
-.g-fr-warn  { color: var(--warn); }
-.g-fr-neg   { color: var(--short); }
-.g-fr-pos   { color: var(--profit); }
-.g-st { font-size: 9px; letter-spacing: .5px; word-break: break-word; line-height: 1.3; }
-.g-st.ready   { color: var(--profit); }
-.g-st.watch   { color: var(--warn); }
-.g-st.active  { color: var(--ice); }
-.g-st.maxed      { color: #3d5a78; }
-.g-st.skip       { color: #3d5a78; }
-.g-st.invalid    { color: #3d5a78; }
-.g-st.notlive    { color: #3d5a78; }
-.g-st.proxmax    { color: #3d5a78; }
-.g-st.maxlev     { color: var(--warn); }
-.g-st.overlonged { color: var(--warn); }
-.g-st.overshorted { color: var(--warn); }
-.g-st.overextended { color: var(--ice); }
-.g-st.closed     { color: var(--profit); opacity: .5; }
-.g-st.lowbal     { color: var(--short); }
-.g-st.lowbalcond { color: var(--short); }
-/* Mirrors .gt-head / .gr exactly — percentage columns so header and body share the same track widths */
-.ft-head { display: grid; grid-template-columns: 28% 16% 22% 17% 17%; padding: 5px 10px; gap: 0; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 9px; letter-spacing: 1px; color: var(--text-lo); }
-.ft-head span { padding: 0 4px; }
-.ft-head.ft-6 { grid-template-columns: 24% 14% 20% 14% 13% 15%; }
-.ftr { display: grid; grid-template-columns: 28% 16% 22% 17% 17%; padding: 6px 10px; gap: 0; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 11px; align-items: start; transition: background .1s; }
-.ftr.ft-6 { grid-template-columns: 24% 14% 20% 14% 13% 15%; }
-.ftr > * { padding: 0 4px; word-break: break-word; white-space: normal; overflow: visible; }
-.ftr:hover { background: var(--bg-raised); }
-.g-st.ft-ready       { color: var(--profit); }
-.g-st.ft-waiting     { color: var(--ice); }
-.g-st.ft-open        { color: var(--ice); }
-.g-st.ft-maxed       { color: var(--warn); }
-.g-st.ft-lowrsi      { color: var(--text-lo); }
-.g-st.ft-highrsi     { color: var(--short); }
-.g-st.ft-overshorted { color: var(--warn); }
-
-.g-st.fade-ready     { color: var(--profit); }
-.g-st.fade-watch     { color: var(--warn); }
-.g-st.fade-lowrsi    { color: var(--text-lo); }
-.g-st.fade-highrsi   { color: var(--short); }
-.g-st.fade-lowvol    { color: var(--text-lo); opacity: .75; }
-.g-chg-fade          { color: var(--profit); }
-
-/* ─── LOG ─── */
-.log-box { background: var(--bg-void); border: 1px solid var(--border); border-radius: 2px; height: 195px; overflow-y: auto; padding: 6px 8px; font-family: var(--mono); font-size: 10.5px; }
-.ll { display: flex; gap: 7px; padding: 2px 0; border-bottom: 1px solid rgba(24,32,48,.4); animation: fu .2s ease; }
-@keyframes fu { from{opacity:0;transform:translateY(-3px)} to{opacity:1;transform:none} }
-.lt { color: var(--text-lo); flex-shrink: 0; }
-.lm         { white-space: pre-wrap; word-break: break-word; }
-.lm.info    { color: var(--text-mid); }
-.lm.success { color: var(--profit); }
-.lm.error   { color: var(--short); }
-.lm.warn    { color: var(--warn); }
-.lm.trade   { color: var(--ice); }
-.lm.scan    { color: #b8d4e0; }
-
-/* ─── SCAN BAR ─── */
-.scan-bar  { height: 2px; background: var(--border); border-radius: 1px; overflow: hidden; }
-.scan-fill { height: 100%; background: var(--ice); box-shadow: 0 0 8px var(--ice); transition: width 1s linear; }
-
-/* ─── EMPTY STATE ─── */
-.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--text-lo); font-family: var(--mono); font-size: 10px; letter-spacing: 2px; text-transform: uppercase; padding: 40px 0; }
-.snowflake { font-size: 34px; opacity: .12; animation: spin 25s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
-
-/* ─── SCROLLBAR ─── */
-::-webkit-scrollbar { width: 12px; height: 12px; }
-::-webkit-scrollbar-track { background: var(--bg-void); }
-::-webkit-scrollbar-thumb { background: var(--ice); border-radius: 6px; border: 2px solid var(--bg-void); }
-::-webkit-scrollbar-thumb:hover { background: var(--text-hi); }
-* { scrollbar-width: auto; scrollbar-color: var(--ice) var(--bg-void); }
-
-/* ─── TOOLTIP / HINT TEXT — bolder and brighter ─── */
-.cfg-acc-body [style*="font-size:9.5px"],
-.cfg-acc-body [style*="font-size:9px"],
-.sec [style*="font-size:9.5px"],
-.sec [style*="font-size:9px"] {
-  color: #7a9ab8 !important;
-  font-weight: 600 !important;
-}
-.cfg-acc-body [style*="font-size:9.5px"] [style*="color:var(--warn)"],
-.cfg-acc-body [style*="font-size:9.5px"] [style*="color:var(--short)"],
-.cfg-acc-body [style*="font-size:9.5px"] [style*="color:var(--profit)"],
-.cfg-acc-body [style*="font-size:9.5px"] [style*="color:var(--ice)"],
-.cfg-acc-body [style*="font-size:9px"]   [style*="color:var(--warn)"],
-.cfg-acc-body [style*="font-size:9px"]   [style*="color:var(--short)"],
-.cfg-acc-body [style*="font-size:9px"]   [style*="color:var(--profit)"],
-.cfg-acc-body [style*="font-size:9px"]   [style*="color:var(--ice)"] {
-  font-weight: 700 !important;
-}
-
-.mt-sep { margin-top:10px;padding-top:10px;border-top:1px solid var(--border) }
-.hint { font-size:9.5px;color:var(--text-lo);margin-top:2px;line-height:1.5 } /* hint text: one sentence max */
-.val-hi { font-size:12px;color:var(--text-hi);font-weight:600 }
-.mt-8 { margin-top:8px }
-.fs-9 { font-size:9px }
-</style>
-</head>
-<body>
-
-<!-- ══════════════════════════════════════════════════════════
-     LAYER 1 (z:10000): LOADING SCREEN
-     Pure HTML/CSS — zero JS/Alpine dependency.
-     Removed by showApp() once Alpine confirms successful init.
-══════════════════════════════════════════════════════════ -->
-<div id="pw-loading">
-  <div class="pw-logo">🔆 PSEUDOCHASER</div>
-  <div class="pw-bar"><div class="pw-bar-fill"></div></div>
-  <div class="pw-status" id="pw-load-status">INITIALISING...</div>
-</div>
-
-<!-- ══════════════════════════════════════════════════════════
-     LAYER 2 (z:9999): ERROR SCREEN
-     display:none by default. Shown if Alpine init throws.
-══════════════════════════════════════════════════════════ -->
-<div id="pw-error">
-  <div class="pw-err-box">
-    <div class="pw-err-title">⚠ INITIALISATION FAILED</div>
-    <div class="pw-err-msg" id="pw-err-msg">An unexpected error occurred while loading PseudoChaser. This is usually caused by a network issue loading Alpine.js or Bootstrap from the CDN. Check your internet connection and reload the page.</div>
-    <button class="pw-err-btn" onclick="location.reload()">↺ RELOAD</button>
-  </div>
-</div>
-
-<!-- ══════════════════════════════════════════════════════════
-     LAYER 3a (z:5001): IMPORT CONFIRM MODAL
-     Controlled by vanilla JS via Alpine x-effect bridge.
-     display:flex centres content; Alpine never touches display.
-══════════════════════════════════════════════════════════ -->
-<div id="pw-import-portal" style="display:none;position:fixed;inset:0;z-index:5001;align-items:center;justify-content:center;padding:16px;background:rgba(5,8,16,.92);backdrop-filter:blur(6px)">
-  <div class="modal-box" style="width:400px">
-    <div class="modal-title" style="color:var(--ice)">↑ Import Data</div>
-    <div class="modal-sub" style="margin-bottom:18px">
-      The importer auto-detects the file type (configs / positions &amp; trades / activity log). Matching data will be <span style="color:var(--short);font-weight:600">overwritten</span>. This cannot be undone.
-      <div id="pw-import-meta" style="margin-top:10px;padding:8px 10px;background:var(--bg-raised);border:1px solid var(--border);border-radius:3px;font-family:var(--mono);font-size:9.5px;color:var(--text-mid);line-height:1.8">
-        <div>Type: <span id="pw-import-type" style="color:var(--ice)">—</span></div>
-        <div>Exported: <span id="pw-import-exported" style="color:var(--ice)">—</span></div>
-        <div>Version: <span id="pw-import-version" style="color:var(--ice)">—</span></div>
-        <div>Trades: <span id="pw-import-trades" style="color:var(--ice)">—</span></div>
-        <div>Positions: <span id="pw-import-positions" style="color:var(--ice)">—</span></div>
-      </div>
-    </div>
-    <div style="display:flex;gap:8px">
-      <button class="btn btn-ghost" style="flex:1;font-size:10px;padding:7px" id="pw-import-cancel">
-        Cancel
-      </button>
-      <button class="btn btn-red" style="flex:1;font-size:10px;padding:7px" id="pw-import-confirm">
-        ⚠ Overwrite &amp; Import
-      </button>
-    </div>
-  </div>
-</div>
-
-<!-- LAYER 3: KEY ENTRY MODAL REMOVED — PseudoChaser uses public Bybit endpoints only -->
-
-<!-- ══════════════════════════════════════════════════════════
-     LAYER 3b (z:5002): EXPORT MENU MODAL
-══════════════════════════════════════════════════════════ -->
-<div id="pw-export-portal" style="display:none;position:fixed;inset:0;z-index:5002;align-items:center;justify-content:center;padding:16px;background:rgba(5,8,16,.92);backdrop-filter:blur(6px)">
-  <div class="modal-box" style="width:400px">
-    <div class="modal-title" style="color:var(--ice)">↓ Export Data</div>
-    <div class="modal-sub" style="margin-bottom:18px">
-      Choose what to export. Each file can be re-imported individually — the importer auto-detects the type.
-    </div>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="btn btn-ice" style="font-size:10px;padding:7px" id="pw-export-configs">
-        ⚙ Configs
-        <span style="font-size:9px;color:var(--ice);opacity:.7;display:block;letter-spacing:.5px;margin-top:1px">Strategy settings &amp; all config params</span>
-      </button>
-      <button class="btn btn-ghost" style="font-size:10px;padding:7px" id="pw-export-positions">
-        📊 Positions &amp; Trades
-        <span style="font-size:9px;color:var(--text-lo);display:block;letter-spacing:.5px;margin-top:1px">Active positions, session stats, closed trade history, FT roster, rodeo state</span>
-      </button>
-      <button class="btn btn-ghost" style="font-size:10px;padding:7px" id="pw-export-log">
-        📋 Activity Log
-        <span style="font-size:9px;color:var(--text-lo);display:block;letter-spacing:.5px;margin-top:1px">Current activity log entries (up to 300)</span>
-      </button>
-      <button class="btn btn-ghost" style="font-size:10px;padding:7px;margin-top:4px" id="pw-export-cancel">
-        Cancel
-      </button>
-    </div>
-  </div>
-</div>
-
-<!-- ══════════════════════════════════════════════════════════
-     LAYER 4 (z:1): APP — visibility:hidden until showApp()
-══════════════════════════════════════════════════════════ -->
-<div id="pw-app" x-data="pw()">
-
-  <!-- ── IMPORT CONFIRM MODAL (bridge span — wired to vanilla JS portal below) ── -->
-  <span x-effect="
-    const portal  = document.getElementById('pw-import-portal');
-    if (!portal) return;
-    if (showImportConfirm) {
-      const imp = _pendingImport;
-      const detectedType = imp?.exportType || (imp?.cfg && !imp?.closedTrades && !imp?.logs ? 'configs' : imp?.logs && !imp?.cfg && !imp?.closedTrades ? 'log' : 'positions');
-      document.getElementById('pw-import-type').textContent      = detectedType === 'configs' ? 'Configs' : detectedType === 'log' ? 'Activity Log' : 'Positions & Trades';
-      document.getElementById('pw-import-exported').textContent  = imp?.exportedAt ? new Date(imp.exportedAt).toLocaleString() : '—';
-      document.getElementById('pw-import-version').textContent   = imp?.version || '—';
-      document.getElementById('pw-import-trades').textContent    = Array.isArray(imp?.closedTrades) ? imp.closedTrades.length : (Array.isArray(imp?.logs) ? imp.logs.length + ' entries' : '—');
-      document.getElementById('pw-import-positions').textContent = Array.isArray(imp?.positions)    ? imp.positions.length    : '—';
-      portal.style.display = 'flex';
-    } else {
-      portal.style.display = 'none';
-    }
-  "></span>
-
-  <!-- ── EXPORT MENU MODAL (bridge span) ── -->
-  <span x-effect="
-    const ep = document.getElementById('pw-export-portal');
-    if (!ep) return;
-    ep.style.display = showExportMenu ? 'flex' : 'none';
-  "></span>
-
-
-  <!-- ── TOPBAR ── -->
-  <div class="topbar">
-    <div>
-      <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.11.1 · Long Only · No Real Orders</div>
-    </div>
-    <!-- ── PC-ONLY OVERLAY-MENU BUTTONS (hidden on mobile; mobile keeps its own tab bar below) ── -->
-    <div class="topbar-menu-btns">
-      <button class="tbtn" :class="(overlayLeft==='config'||overlayRight==='config')?'active':''" @click="toggleOverlay('config')" title="Config">⚙</button>
-      <button class="tbtn" :class="(overlayLeft==='stats'||overlayRight==='stats')?'active':''"  @click="toggleOverlay('stats')"  title="Stats">📈</button>
-      <button class="tbtn" :class="(overlayLeft==='trades'||overlayRight==='trades')?'active':''" @click="toggleOverlay('trades')" title="Trades">📋</button>
-    </div>
-    <div class="pills">
-      <!-- SIM state pill — always visible -->
-      <div class="pill" style="border-color:rgba(180,100,255,0.5);background:rgba(180,100,255,0.07)">
-        <div class="pip" :class="bot.running?'run':''" style="background:#b464ff;box-shadow:0 0 6px #b464ff"></div>
-        <span style="color:#b464ff;letter-spacing:1.5px" x-text="bot.running?(botLabel.toUpperCase()+' RUNNING'):(botLabel.toUpperCase()+' IDLE')"></span>
-      </div>
-      <!-- Saved positions pill — only when idle with saved state -->
-      <div class="pill" x-show="savedPositions.length>0&&!bot.running" style="border-color:rgba(0,229,160,.3)">
-        <div class="pip" style="background:var(--profit)"></div>
-        <span style="color:var(--profit)" x-text="savedPositions.length+' SAVED'"></span>
-      </div>
-      <!-- Unified status pill — OK when all clear, cycles through problems when not -->
-      <div class="pill"
-           :style="statusPill().border + (statusPill().action ? ';cursor:pointer' : '')"
-           :title="statusPill().title"
-           @click="statusPill().action && statusPill().action()">
-        <div class="pip" :class="statusPill().pip" :style="statusPill().pipStyle"></div>
-        <span :style="statusPill().labelStyle" x-text="statusPill().label"></span>
-      </div>
-    </div>
-  </div>
-
-  <!-- ── MOBILE TAB BAR (hidden on desktop via CSS) ── -->
-  <div class="mob-tabs">
-    <button class="mob-tab" :class="mobTab==='config'?'active':''" @click="mobTab='config'">⚙ Config</button>
-    <button class="mob-tab" :class="mobTab==='market'?'active':''" @click="mobTab='market'">📊 Market</button>
-    <button class="mob-tab" :class="mobTab==='stats'?'active':''"  @click="mobTab='stats'">📈 Stats</button>
-    <button class="mob-tab" :class="mobTab==='trades'?'active':''" @click="mobTab='trades'">📋 Trades</button>
-  </div>
-
-  <!-- ── LAYOUT ── -->
-  <div class="layout">
-    <!-- ── PC-ONLY dim backdrop shown behind whichever overlay menu(s) are open ── -->
-    <div class="ov-backdrop" :class="(overlayLeft||overlayRight)?'show':''"></div>
-
-    <!-- LEFT: Config -->
-    <div class="col" :class="(mobTab==='config'?'mob-active':'') + (cfgLocked?' cfg-locked':'') + ' ' + overlaySlotClass('config')">
-
-      <!-- ── Sim Control (always visible) ── -->
-      <div class="sec">
-        <div class="sec-ttl">Simulation Control</div>
-        <button class="btn btn-ice" x-show="!bot.running" @click="startBot()" style="margin-bottom:6px">▶ Start <span x-text="botLabel"></span></button>
-        <button class="btn btn-red" x-show="bot.running" @click="stopBot()">■ Stop <span x-text="botLabel"></span></button>
-        <button class="btn btn-ghost" style="margin-top:6px;font-size:10px;padding:5px;letter-spacing:1px"
-          @click="cfgLocked=!cfgLocked"
-          :disabled="bot.running"
-          :style="bot.running?'':'(cfgLocked?\'\':\' color:var(--warn);border-color:rgba(240,192,96,.4)\')'"
-          x-effect="if(bot.running) cfgLocked=true">
-          <span x-text="cfgLocked?'🔒 Config Locked':'🔓 Config Unlocked'"></span>
-        </button>
-
-      </div>
-
-      <!-- ══════════════════════════════════════════════
-           ACCORDION SECTIONS — each has a header button
-           that toggles its body open/closed.
-           State: cfgOpen.* (booleans, not persisted)
-           ══════════════════════════════════════════════ -->
-
-      <!-- ── General Settings ── -->
-      <div class="sec" style="padding:0">
-        <button class="cfg-acc-hd" @click="cfgOpen.general=!cfgOpen.general"
-          :class="cfgOpen.general?'open':''">
-          <span>⚙ General Settings</span>
-          <span class="cfg-acc-arrow" :class="cfgOpen.general?'open':''">▶</span>
-        </button>
-        <div x-show="cfgOpen.general" x-transition.opacity class="cfg-acc-body">
-
-          <!-- Direction toggle (greyed out / inert) -->
-          <div class="g">
-            <div style="opacity:0.38;pointer-events:none;cursor:not-allowed">
-              <label class="tog" style="cursor:not-allowed">
-                <div class="tog-t"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l" class="val-hi">Direction</div>
-                  <div style="font-size:9px;color:var(--text-lo);line-height:1.4;margin-top:1px">Long / Short — toggle reserved for future use.</div>
-                </div>
-              </label>
-            </div>
-          </div>
-
-          <!-- Direction indicator -->
-          <div class="sg2 gs" style="margin-top:10px">
-            <div class="stat"><div class="sl">Direction</div><div class="sv profit sm">LONG ONLY</div></div>
-          </div>
-
-          <!-- Tab buttons -->
-          <div class="pw-tabs" style="margin-top:10px">
-            <button class="pw-tab" :class="tSc?'on':''" @click="tSc=!tSc">SCAN</button>
-            <button class="pw-tab" :class="tH?'on':''" @click="tH=!tH">HALT</button>
-            <button class="pw-tab" :class="tSz?'on':''" @click="tSz=!tSz">SIZE</button>
-          </div>
-
-          <!-- SCAN zone -->
-          <div x-show="tSc" class="pw-zone">
-            <!-- Whiplash check config -->
-            <div class="g">
-              <div class="lbl">Whiplash Proximity <b x-text="(cfg.whiplashProximityPct??20)+'% remaining'"></b></div>
-              <input type="range" min="5" max="50" step="5" x-model.number="cfg.whiplashProximityPct" @change="persist()">
-            </div>
-            <div class="sg2 gs" style="margin-top:6px">
-              <div class="stat"><div class="sl">Whiplash Lookback</div><div class="sv ice sm">6 min</div></div>
-            </div>
-            <div style="font-size:9px;color:var(--text-lo);margin-top:4px;line-height:1.5">
-              Arms a 5min audit when price is within the proximity % of TP. Checks a 6min kline window for TP touch.
-            </div>
-
-            <!-- Scan Every slider -->
-            <div class="g">
-              <div class="lbl">Scan Every <b x-text="cfg.scanMins+'min'"></b></div>
-              <input type="range" min="5" max="60" step="5" x-model.number="cfg.scanMins" :disabled="bot.running" @change="persist()">
-            </div>
-
-            <!-- Bulk ticker cooldown -->
-            <div class="g" style="margin-top:6px">
-              <label class="tog">
-                <div class="tog-t" :class="cfg.bulkTickerCooldownEnabled?'on':''" @click="cfg.bulkTickerCooldownEnabled=!cfg.bulkTickerCooldownEnabled;persist()"><div class="tog-k"></div></div>
-                <span class="tog-l">Bulk Ticker Cooldown</span>
-              </label>
-              <div style="font-size:9px;color:var(--text-lo);margin-top:2px;line-height:1.5" x-text="'Caches the full ticker list for '+(cfg.bulkTickerCooldownHours??1)+'h, reducing bulk fetches from '+(Math.round(1440/(cfg.scanMins??15)))+'/day to '+(Math.round(24/(cfg.bulkTickerCooldownHours??1)))+'/day.'"></div>
-              <div x-show="cfg.bulkTickerCooldownEnabled" style="margin-top:6px">
-                <div class="lbl">Cooldown <b x-text="(cfg.bulkTickerCooldownHours??1)+'h'"></b></div>
-                <input type="range" min="1" max="12" step="1" x-model.number="cfg.bulkTickerCooldownHours" @change="persist()">
-                <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);margin-top:3px" x-text="(()=>{ void tick; const rem=Math.max(0,((cfg.bulkTickerCooldownHours??1)*3600000)-(Date.now()-(_lastAllTickersAt||0))); if(!_lastAllTickersAt||rem<=0) return 'ready — will fetch on next scan'; const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); return 'next refresh in '+h+'h '+String(m).padStart(2,'0')+'m'; })()"></div>
-              </div>
-            </div>
-
-            <!-- Market Watch -->
-            <div class="g" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
-              <div class="lbl" style="margin-bottom:6px;letter-spacing:1px">Market Watch</div>
-              <label class="tog">
-                <div class="tog-t" :class="cfg.mktWatchEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.mktWatchEnabled=!cfg.mktWatchEnabled;persist()}"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Market Watch Table</div>
-                  <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Tracks a random subset of tickers between bulk fetches.</div>
-                </div>
-              </label>
-              <div x-show="cfg.mktWatchEnabled" style="margin-top:8px">
-                <div class="g">
-                  <div class="lbl">List Size <b x-text="cfg.mktWatchSize??5"></b></div>
-                  <input type="range" min="5" max="50" step="5" x-model.number="cfg.mktWatchSize" @change="persist()">
-                </div>
-              </div>
-            </div>
-            <!-- REST Price Polling -->
-            <div class="g" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
-              <div class="lbl" style="margin-bottom:6px;letter-spacing:1px">Position Price Feed</div>
-              <label class="tog">
-                <div class="tog-t" :class="cfg.restPollEnabled?'on':''" @click.prevent="cfg.restPollEnabled=!cfg.restPollEnabled;persist()"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">REST Polling</div>
-                  <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Fetch position prices via REST instead of WebSocket. Use if WS prices appear incorrect.</div>
-                </div>
-              </label>
-              <div x-show="cfg.restPollEnabled" style="margin-top:8px">
-                <div class="lbl">Base Interval <b x-text="(cfg.restPollBaseSec??5)+'s'"></b></div>
-                <input type="range" min="5" max="30" step="5" x-model.number="cfg.restPollBaseSec" @change="persist()">
-                <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Doubles per symbol when price moves &lt;0.1% between ticks, up to 60s max.</div>
-              </div>
-            </div>
-          </div><!-- /SCAN zone -->
-
-          <!-- HALT zone -->
-          <div x-show="tH" class="pw-zone">
-            <!-- Drawdown Throttle -->
-            <div class="g">
-              <label class="tog">
-                <div class="tog-t" :class="cfg.drawdownThrottleEnabled?'on':''" @click="cfg.drawdownThrottleEnabled=!cfg.drawdownThrottleEnabled;persist()"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Drawdown Throttle</div>
-                  <div style="font-size:9px;color:var(--text-lo);line-height:1.4;margin-top:1px">Halt all new position entry for <span x-text="(cfg.drawdownHaltHours??6)+'h'"></span> if 6h rolling PnL drops below the loss limit.</div>
-                </div>
-              </label>
-            </div>
-            <div x-show="cfg.drawdownThrottleEnabled" style="margin-top:8px">
-              <div class="lbl">
-                Loss Limit <b x-text="cfg.drawdownFactor+'× margin'"></b>
-                <span style="font-size:9px;color:var(--text-lo);margin-left:6px" x-text="'(−$'+(cfg.minNotional/cfg.leverage*cfg.drawdownFactor).toFixed(2)+')'"></span>
-              </div>
-              <input type="range" min="0.1" max="3" step="0.1" x-model.number="cfg.drawdownFactor" @change="persist()">
-              <div style="font-size:9px;color:var(--text-lo);margin-top:2px;line-height:1.5">
-                Throttle fires when 6h PnL ≤ −(<span x-text="cfg.drawdownFactor"></span> × $<span x-text="(cfg.minNotional/cfg.leverage).toFixed(2)"></span> entry margin).
-              </div>
-              <div style="margin-top:8px">
-                <div class="lbl">Halt Duration <b x-text="(cfg.drawdownHaltHours??6)+'h'"></b></div>
-                <input type="range" min="1" max="24" step="1" x-model.number="cfg.drawdownHaltHours" @change="persist()">
-              </div>
-              <label class="tog" style="margin-top:8px">
-                <div class="tog-t" :class="(cfg.drawdownBailEnabled!==false)?'on':''" @click="cfg.drawdownBailEnabled=!(cfg.drawdownBailEnabled!==false);persist()"><div class="tog-k"></div></div>
-                <span class="tog-l">Bail on Trigger</span>
-              </label>
-              <div style="font-size:9px;color:var(--text-lo);margin-top:2px;line-height:1.5">
-                When the throttle fires, immediately close all open positions at mark price — positions held into a drawdown tend to underperform.
-              </div>
-            </div>
-
-            <!-- Gains Lock -->
-            <div class="g" style="margin-top:10px">
-              <label class="tog">
-                <div class="tog-t" :class="cfg.gainsLockEnabled?'on':''" @click="cfg.gainsLockEnabled=!cfg.gainsLockEnabled;if(!cfg.gainsLockEnabled){_gainsLockHaltUntil=0;_gainsWindow=[];}persist()"><div class="tog-k"></div></div>
-                <div>
-                  <div class="tog-l">Gains Lock</div>
-                  <div style="font-size:9px;color:var(--text-lo);line-height:1.4;margin-top:1px">Halt all new position entry for <span x-text="(cfg.gainsLockHours??6)+'h'"></span> if 6h rolling PnL exceeds the profit threshold.</div>
-                </div>
-              </label>
-            </div>
-            <div x-show="cfg.gainsLockEnabled" style="margin-top:8px">
-              <div class="lbl">
-                Profit Threshold <b x-text="(cfg.gainsLockFactor??1.0)+'× margin'"></b>
-                <span style="font-size:9px;color:var(--text-lo);margin-left:6px" x-text="'(+$'+(cfg.minNotional/cfg.leverage*(cfg.gainsLockFactor??1.0)).toFixed(2)+')'"></span>
-              </div>
-              <input type="range" min="0.1" max="5" step="0.1" x-model.number="cfg.gainsLockFactor" @change="persist()">
-              <div style="font-size:9px;color:var(--text-lo);margin-top:2px;line-height:1.5">
-                Lock fires when 6h PnL ≥ +(<span x-text="cfg.gainsLockFactor??1.0"></span> × $<span x-text="(cfg.minNotional/cfg.leverage).toFixed(2)"></span> entry margin).
-              </div>
-              <div style="margin-top:8px">
-                <div class="lbl">Lock Duration <b x-text="(cfg.gainsLockHours??6)+'h'"></b></div>
-                <input type="range" min="1" max="24" step="1" x-model.number="cfg.gainsLockHours" @change="persist()">
-              </div>
-            </div>
-
-            <!-- Halt status banner — covers DDH halt and manual halt (always visible while the HALT tab is open) -->
-            <div x-show="_manualHalt || (cfg.drawdownThrottleEnabled && _drawdownHaltUntil > Date.now() + tick*0)"
-                 style="margin-top:10px;padding:7px 10px;background:rgba(255,80,80,.08);border:1px solid rgba(255,80,80,.3);border-radius:4px;font-size:10px;color:var(--short);line-height:1.55">
-              <div x-show="_manualHalt && !(_drawdownHaltUntil > Date.now())" style="color:rgba(255,160,0,.9)"><b>🛑 MANUAL HALT ACTIVE</b></div>
-              <div x-show="_drawdownHaltUntil > Date.now()">
-                <b>⛔ ENTRY HALTED</b> — drawdown limit hit.<br>
-                <span style="color:var(--text-lo)">Lifts in
-                  <b style="color:var(--short)" x-text="(()=>{ void tick; const rem=Math.max(0,_drawdownHaltUntil-Date.now()); const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); return h+'h '+m+'m'; })()"></b>
-                </span>
-              </div>
-              <span style="color:var(--text-lo)">&nbsp;·&nbsp; <a href="#" style="color:var(--text-lo);text-decoration:underline"
-                @click.prevent="_drawdownHaltUntil=0;_drawdownWindow=[];_manualHalt=false;persist();log('Halt cleared manually.','warn')">clear manually</a>
-              </span>
-            </div>
-            <!-- Manual halt — always available to activate; overrides Drawdown Throttle / Gains Lock, doesn't stack -->
-            <div x-show="!_manualHalt"
-                 style="margin-top:10px;padding:7px 10px;border:1px solid rgba(255,160,0,.25);border-radius:4px">
-              <div style="font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:rgba(255,160,0,.75);margin-bottom:5px">MANUAL HALT</div>
-              <button @click="if(!cfgLocked){activateManualHalt()}" :disabled="cfgLocked" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,160,0,.5);border-radius:2px;background:none;color:rgba(255,160,0,.9);cursor:pointer;letter-spacing:.5px">Activate Manual Halt</button>
-              <div style="font-size:9px;color:var(--text-lo);margin-top:4px;line-height:1.5">Immediately blocks all new position entry. Overrides Drawdown Throttle and Gains Lock — cancel via the halt banner above.</div>
-            </div>
-            <!-- Gains lock active banner (always visible while the HALT tab is open) -->
-            <div x-show="cfg.gainsLockEnabled && _gainsLockHaltUntil > Date.now() + tick*0"
-                 style="margin-top:10px;padding:7px 10px;background:rgba(0,229,160,.06);border:1px solid rgba(0,229,160,.3);border-radius:4px;font-size:10px;color:var(--profit);line-height:1.55">
-              <b>🔒 GAINS LOCKED</b> — profit threshold hit.<br>
-              <span style="color:var(--text-lo)">Lifts in
-                <b style="color:var(--profit)" x-text="(()=>{ void tick; const rem=Math.max(0,_gainsLockHaltUntil-Date.now()); const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); return h+'h '+m+'m'; })()"></b>
-                &nbsp;·&nbsp; <a href="#" style="color:var(--text-lo);text-decoration:underline"
-                  @click.prevent="_gainsLockHaltUntil=0;_gainsWindow=[];persist();log('Gains lock cleared manually.','success')">clear manually</a>
-              </span>
-            </div>
-          </div><!-- /HALT zone -->
-
-          <!-- SIZE zone -->
-          <div x-show="tSz" class="pw-zone">
-            <!-- Leverage slider -->
-            <div class="g" style="margin-bottom:10px">
-              <div class="lbl">
-                Leverage <b x-text="cfg.leverage+'×'"></b>
-                <span style="font-size:9px;color:var(--text-mid);font-weight:700;margin-left:6px">ⓘ Affects all strategies</span>
-              </div>
-              <input type="range" min="6" max="20" x-model.number="cfg.leverage" :disabled="bot.running" @change="persist()">
-            </div>
-            <div class="g">
-              <div class="lbl">Notional per entry &amp; DCA add <b x-text="'$'+cfg.minNotional"></b></div>
-              <input type="number" class="inp" min="6" max="666" step="6"
-                x-model.number="cfg.minNotional"
-                :disabled="bot.running"
-                @change="cfg.minNotional=Math.min(666,Math.max(6,cfg.minNotional||6));cfg.addNotional=cfg.minNotional;persist()"
-                style="width:100%;max-width:160px;pointer-events:auto"
-                @wheel.prevent>
-              <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">Margin = $<span x-text="(cfg.minNotional/cfg.leverage).toFixed(2)"></span> per entry/add at <span x-text="cfg.leverage"></span>× &nbsp;·&nbsp; Max $666
-              </div>
-            </div>
-            <div class="g"><div class="lbl">Max Concurrent Positions <b x-text="cfg.maxPos"></b></div>
-              <input type="range" min="1" max="50" x-model.number="cfg.maxPos" :disabled="bot.running" @change="persist()">
-            </div>
-            <div class="g">
-              <div class="lbl">Force Close Runtime <b x-text="(h=>(h<1?Math.round(h*60)+'m':h%1===0?h+'h':Math.floor(h)+'h '+Math.round((h%1)*60)+'m'))(cfg.runtimeHours??12)"></b></div>
-              <input type="number" class="inp" min="0.1" max="48" step="0.1" x-model.number="cfg.runtimeHours" :disabled="bot.running" @change="persist()" style="width:80px">
-              <div style="font-size:9.5px;color:var(--text-lo);margin-top:2px">
-                Positions force-close at this age.
-              </div>
-            </div>
-            <div x-show="cfg.binaryModeEnabled" style="margin-top:10px">
-              <div class="g">
-                <div class="lbl">Take Profit <b x-text="cfg.binaryTpPct+'%'"></b></div>
-                <input type="range" min="1" max="99" step="1" x-model.number="cfg.binaryTpPct" :disabled="bot.running" @change="persist()">
-                <div class="hint">Closes at this % gain (leverage-adjusted); with held debt (EDa), target rises to cover the loss.</div>
-              </div>
-              <div class="g" style="margin-top:8px">
-                <div class="lbl">Stop Loss <b x-text="cfg.binarySlPct+'%'"></b></div>
-                <input type="range" min="1" max="99" step="1" x-model.number="cfg.binarySlPct" :disabled="bot.running" @change="persist()">
-                <div class="hint">SL fires at this % loss (leverage-adjusted). At 18%: SL = entry × (1 − 18% / lev).</div>
-              </div>
-            </div>
-            <div data-plugin-slot="config-eda"></div>
-          </div><!-- /SIZE zone -->
-          <!-- Mode config — binary by default; DCA mode unlocked via plugin -->
-          <div class="g" class="mt-sep" style="margin-top:14px">
-            <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text-lo);margin-bottom:8px">MODE</div>
-            <div data-plugin-slot="mode-config"></div>
-          </div>
-
-          <!-- Active Mode indicator -->
-          <div class="g" class="mt-sep">
-            <div style="font-family:var(--mono);font-size:10px;color:var(--ice)">
-              Mode:<span data-plugin-slot="mode-label-extra"></span>
-            </div>
-          </div>
-
-        </div>
-      </div>
-
-      <div data-plugin-slot="strategy-accordions"></div>
-
-      <!-- ── Empty-state — shown when all accordions are closed ── -->
-      <div x-show="!cfgOpen.general"
-           style="padding:40px 20px;text-align:center;pointer-events:none;user-select:none">
-        <div style="font-size:32px;margin-bottom:12px;opacity:0.18" x-text="themeEmoji"></div>
-        <div style="font-family:var(--mono);font-size:10px;letter-spacing:2.5px;color:var(--text-lo);text-transform:uppercase;opacity:0.45">Choose your destiny</div>
-      </div>
-
-      <div data-plugin-slot="config-bottom"></div>
-
-      <!-- ── Plugin Manager link ── -->
-      <div style="padding:10px 16px 6px;text-align:center">
-        <button @click="_pluginMgrOpen=true" style="background:none;border:none;font-family:var(--mono);font-size:9px;color:var(--text-lo);letter-spacing:1.5px;cursor:pointer;opacity:0.5;text-transform:uppercase;transition:opacity 0.2s" @mouseenter="$el.style.opacity='1'" @mouseleave="$el.style.opacity='0.5'">
-          ⊕ Plugin Manager <span x-show="_pluginList.length>0" style="color:var(--ice)" x-text="'('+_pluginList.length+')'"></span>
-        </button>
-      </div>
-
-    </div>
-
-    <!-- CENTER -->
-    <div class="col-mid" :class="mobTab==='market'?'mob-active':''">
-      <div class="market-inner">
-      <!-- Account bar -->
-      <div style="padding:9px 13px;border-bottom:1px solid var(--border);background:var(--bg-panel);position:sticky;top:0;z-index:3">
-        <div class="sg4">
-          <div class="stat"><div class="sl">Balance</div>
-            <div class="sv ice sm" x-text="acct.balance!=null?'$'+acct.balance.toFixed(2):'∞'"></div>
-          </div>
-          <div class="stat"><div class="sl">Allocated</div>
-            <div class="sv warn sm" x-text="'$'+(positions.reduce((s,p)=>s+p.margin,0)).toFixed(2)"></div>
-          </div>
-          <div class="stat sl-wrap"><div class="sl">Unrealized PnL</div>
-            <div class="sv sm" :class="acct.upnl>=0?'profit':'short'"
-                 x-text="acct.upnl!=null?(acct.upnl>=0?'+':'')+acct.upnl.toFixed(2):'—'"></div>
-          </div>
-          <div class="stat"><div class="sl">Positions</div>
-            <div class="sv sm" :class="positions.length>=cfg.maxPos?'warn':''">
-              <span x-text="positions.length"></span>/<span x-text="cfg.maxPos"></span>
-              <span style="font-size:9px;color:var(--text-lo)" x-text="'('+positions.length+' slots)'"></span>
-            </div>
-          </div>
-        </div>
-<div data-plugin-slot="account-bar-extra"></div>
-      </div>
-
-      <!-- Scan + Refresh bar -->
-      <div style="padding:7px 13px;border-bottom:1px solid var(--border);background:var(--bg-panel);position:sticky;top:56px;z-index:3">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;gap:8px">
-          <span style="font-family:var(--mono);font-size:9px;color:var(--text-lo);letter-spacing:1.5px;flex-shrink:0">
-            NEXT SCAN <span style="color:var(--ice)" x-text="bot.running ? (()=>{ void tick; const rem = Math.max(0, cfg.scanMins*60*1000 - (Date.now()-bot.lastScanAt)); return Math.round(rem/1000)+'s'; })() : '—'"></span>
-          </span>
-          <span style="font-family:var(--mono);font-size:9px;color:var(--text-lo);flex:1;text-align:center" x-text="bot.lastScan?'Last scan: '+bot.lastScan:''"></span>
-          <div style="display:flex;gap:5px;flex-shrink:0">
-            <button @click="refreshMarket()" :disabled="ui.refreshing"
-              style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 10px;border:1px solid var(--border);border-radius:2px;background:var(--bg-raised);color:var(--profit);cursor:pointer;transition:background .1s"
-              x-text="ui.refreshing?'REFRESHING...':'⟳ REFRESH'"></button>
-            <button @click="runScheduledCycle()" :disabled="ui.scanning"
-              style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 10px;border:1px solid var(--border);border-radius:2px;background:var(--bg-raised);color:var(--text-mid);cursor:pointer;transition:background .1s"
-              x-text="ui.scanning?'SCANNING...':'↻ SCAN NOW'"></button>
-          </div>
-        </div>
-        <div class="scan-bar"><div class="scan-fill" :style="'width:'+(bot.running ? (()=>{ void tick; const total=cfg.scanMins*60*1000; const rem=Math.max(0,total-(Date.now()-bot.lastScanAt)); return Math.max(0,Math.min(100,(rem/total)*100)); })() : 100)+'%'"></div></div>
-      </div>
-
-      <!-- Open positions -->
-      <div style="padding:11px 13px;border-bottom:1px solid var(--border)" x-show="positions.length>0">
-        <div class="sec-ttl" style="margin-bottom:9px">Open Positions <em x-text="positions.length+' active'"></em></div>
-        <template x-for="p in positions" :key="p.id">
-          <div class="pos-card">
-            <div class="pos-head">
-              <div style="display:flex;align-items:center;gap:7px;min-width:0">
-                <span class="pos-sym" x-text="p.symbol.replace('USDT','')"></span>
-                <span class="side-badge">▲ LONG</span>
-                <span data-plugin-slot="pos-card-badges" style="display:contents"></span>
-                <span style="display:contents" x-html="_roleBadge(p)"></span>
-                <span class="phase-b"
-                  :class="p.pendingClose?'force':p.phase"
-                  x-text="p.pendingClose?'RETRY CLOSE':(p.phase==='normal'?'Active':'CLOSING')"></span>
-                <span x-show="false" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;border:1px solid rgba(160,100,255,.45);color:#c084fc;background:rgba(160,100,255,.12);letter-spacing:1px">FT</span>
-
-                <span x-show="false" style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(0,180,180,.45);color:#2dd4bf;background:rgba(0,180,180,.10)">🎣 SalF</span>
-              </div>
-              <div class="pos-pnl" :class="(()=>{const v=Number.isFinite(p.upnl)?p.upnl:0;return v>=0?'p':'l';})()"
-                   x-text="(()=>{const v=Number.isFinite(p.upnl)?p.upnl:0;return (v>=0?'+':'')+v.toFixed(2)+' USDT';})()"></div>
-            </div>
-            <div class="pos-grid">
-              <div class="ps"><div class="psl">Entry</div> <div class="psv ice"  x-text="fmtP(p.originalEntryPrice ?? p.entryPrice)"></div></div>
-              <div class="ps"><div class="psl">Mark</div>  <div class="psv"      x-text="fmtP(p.markPrice)"></div></div>
-              <div class="ps" style="display:none"><div class="psl">Size</div>  <div class="psv" x-text="p.totalSize"></div></div>
-              <div class="ps"><div class="psl">Lev</div>   <div class="psv"      x-text="p.leverage+'×'"></div></div>
-              <div class="ps"><div class="psl">Margin</div><div class="psv"      x-text="'$'+p.margin.toFixed(2)"></div></div>
-              <div class="ps"><div class="psl">24h Chg</div><div class="psv" class="short" x-text="(()=>{const v=parseFloat(p.change24h);if(!Number.isFinite(v))return'—';const r=+v.toFixed(4);return (r>=0?'+':'')+r+'%';})()"></div></div>
-
-              <div class="ps" style="min-width:0;overflow:hidden">
-                <div class="psl">Current TP</div>
-                <div class="psv" style="color:var(--profit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" x-text="(()=>{const tp=p.currentTpPrice;if(!(tp>0))return '—';const roi=(tp-p.entryPrice)/p.entryPrice*p.leverage*100;return roi.toFixed(1)+'%  '+fmtP(tp);})()"></div>
-              </div>
-              <!-- Funding Rate + Round countdown -->
-              <div class="ps" x-show="p.fundingRate!=null">
-                <div class="psl">Funding Rate</div>
-                <div class="psv" :class="p.fundingRate>0?'profit':(p.fundingRate<0?'short':'')" x-text="p.fundingRate!=null?(p.fundingRate>=0?'+':'')+p.fundingRate.toFixed(4)+'%':'—'"></div>
-              </div>
-              <div class="ps" x-show="p.fundingRate!=null">
-                <div class="psl" x-text="'Round (8h)'"></div>
-                <div class="psv" style="color:var(--text-lo);font-family:var(--mono);font-size:10px" x-text="(()=>{
-                  void tick;
-                  const now=Date.now();
-                  const iv=8*3600000;
-                  const next=Math.ceil((now+1)/iv)*iv;
-                  const ms=next-now;
-                  const h=Math.floor(ms/3600000);
-                  const m=Math.floor((ms%3600000)/60000);
-                  const s=Math.floor((ms%60000)/1000);
-                  return (h>0?h+'h ':'')+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s';
-                })()"></div>
-              </div>
-              <!-- Accrued Funding -->
-              <div class="ps" x-show="p.fundingRate!=null && tick>=0 && (()=>{const iv=8*3600000;return Math.max(0,Math.floor(Date.now()/iv)-Math.ceil(p.openedAt/iv)+1)})()>0">
-                <div class="psl">Accrued Funding (8h)</div>
-                <div class="psv" :class="(()=>{const iv=8*3600000;const n=Math.max(0,Math.floor(Date.now()/iv)-Math.ceil(p.openedAt/iv)+1);const f=-(p.fundingRate/100)*((p.markPrice||p.entryPrice)*p.totalSize)*n;return f>=0?'profit':'short'})()">
-                  <span x-text="(()=>{
-                    const iv=8*3600000;
-                    const n=Math.max(0,Math.floor(Date.now()/iv)-Math.ceil(p.openedAt/iv)+1);
-                    const f=-(p.fundingRate/100)*((p.markPrice||p.entryPrice)*p.totalSize)*n;
-                    return (f>=0?'+':'')+f.toFixed(3)+' USDT ('+n+'×~)';
-                  })()"></span>
-                </div>
-              </div>
-              <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="(p._binary ? '−'+(p._slPctOverride ?? cfg.binarySlPct ?? 18)+'%' : '−105%')+'  '+fmtP(p.slPrice)"></div></div>
-            </div>
-            <!-- ── PRICE LADDER BAR ── -->
-            <div x-data="{
-              get orders()    { return p.orders || []; },
-              get allConds()  { return this.orders.filter(o => o.type === 'cond'); },
-              get condOrders() {
-                const ep = p.entryPrice;
-                return this.allConds.filter(o => !(o.filled && o.price >= ep)); // LONG: discard filled adds above entry
-              },
-              get totalSegs() { return this.condOrders.length + 2; },
-              get sw()        { return 100 / this.totalSegs; },
-              get cursorPct() {
-                // LONG layout (left→right): [...adds(lower)..., Entry, TP(higher)]
-                // cursor moves right as price rises
-                const mk = p.markPrice, ep = p.entryPrice, tp = p.currentTpPrice;
-                const cos  = this.condOrders;
-                const adds = cos.map(o => o.price).sort((a,b) => a - b); // ascending (lowest first = leftmost)
-                const allFired = this.allConds.length > 0 && this.allConds.every(o => o.filled);
-                const farLeft = ((allFired || this.allConds.length === 0) && p.slSet && p.slPrice) ? p.slPrice : null;
-                // prices array left→right: [sl-if-any, ...adds-ascending, ep, tp]
-                const prices = [...(farLeft ? [farLeft] : []), ...adds, ep, tp];
-                const n = this.totalSegs;
-                const sw = this.sw;
-                if (!mk || !ep) return sw;
-                for (let i = 0; i < n; i++) {
-                  const lo = prices[i], hi = prices[i+1];
-                  if (!lo || !hi) continue;
-                  const segStart = i * sw;
-                  if (i === 0) {
-                    if (mk < lo)  return 0;
-                    if (mk <= hi) return segStart + (mk - lo) / (hi - lo) * sw;
-                  } else {
-                    if (mk >= lo && mk <= hi) return segStart + (mk - lo) / (hi - lo) * sw;
-                    if (mk > hi && i === n-1) return 100;
-                  }
-                }
-                return mk < (prices[0]||0) ? 0 : 100;
-              },
-              fillPct(si) {
-                const sw = this.sw;
-                const segStart = si * sw, segEnd = (si + 1) * sw;
-                const c = this.cursorPct;
-                if (c <= segStart) return 0;
-                if (c >= segEnd)   return 1;
-                return (c - segStart) / sw;
-              },
-              segTriggered(si) {
-                // LONG: adds are leftmost (si 0..n-3), entry=n-2, TP=n-1
-                const cos = this.condOrders;
-                const addCount = cos.length;
-                if (si >= addCount) return false;
-                // add segments: sort adds by price ascending so si=0 is lowest price
-                const sortedAdds = [...cos].sort((a,b) => a.price - b.price);
-                return sortedAdds[si] ? !!sortedAdds[si].filled : false;
-              },
-              segLabel(si) {
-                const n = this.totalSegs;
-                if (si === n - 1) return 'TP';
-                if (si === n - 2) return 'ENTRY';
-                // Add segments: leftmost = lowest price = farthest from entry
-                const cos = [...this.condOrders].sort((a,b) => a.price - b.price);
-                const co  = cos[si];
-                return co ? co.label.replace('Add','A') : '';
-              },
-              segPrice(si) {
-                const n = this.totalSegs;
-                if (si === n - 1) return p._edaTpPrice > 0 ? p._edaTpPrice : p.currentTpPrice;
-                if (si === n - 2) return p.entryPrice;
-                const cos = [...this.condOrders].sort((a,b) => a.price - b.price);
-                const co  = cos[si];
-                return co ? co.price : null;
-              }
-            }" style="padding:6px 10px 8px;isolation:isolate">
-
-              <!-- Bar — taller to fit inline labels -->
-              <div style="position:relative;height:34px;border-radius:3px;overflow:visible;display:flex">
-                <template x-for="si in Array.from({length:totalSegs},(_,i)=>i)" :key="si">
-                  <div :style="
-                    'position:relative;flex:1;height:100%;overflow:hidden;' +
-                    'background:' + (si===totalSegs-1 ? 'rgba(0,229,160,0.05)' : si===totalSegs-2 ? 'rgba(250,200,126,0.05)' : segTriggered(si) ? 'rgba(240,192,96,0.10)' : 'rgba(240,192,96,0.04)') + ';' +
-                    'border-top:'    + (si===totalSegs-2 ? '1px' : segTriggered(si) ? '2px' : '1px') + ' solid ' + (si===totalSegs-1 ? 'rgba(0,229,160,0.35)' : si===totalSegs-2 ? 'rgba(250,200,126,0.45)' : segTriggered(si) ? 'rgba(240,192,96,0.85)' : 'rgba(240,192,96,0.22)') + ';' +
-                    'border-bottom:' + (si===totalSegs-2 ? '1px' : segTriggered(si) ? '2px' : '1px') + ' solid ' + (si===totalSegs-1 ? 'rgba(0,229,160,0.35)' : si===totalSegs-2 ? 'rgba(250,200,126,0.45)' : segTriggered(si) ? 'rgba(240,192,96,0.85)' : 'rgba(240,192,96,0.22)') + ';' +
-                    (si===0 ? 'border-left:1px solid ' + (segTriggered(0) ? 'rgba(240,192,96,0.85)' : 'rgba(240,192,96,0.22)') + ';border-radius:3px 0 0 3px;' : '') +
-                    (si===totalSegs-1 ? 'border-right:1px solid rgba(0,229,160,0.35);border-radius:0 3px 3px 0;' : '') +
-                    (segTriggered(si) ? 'box-shadow:0 0 6px rgba(240,192,96,0.35),inset 0 0 8px rgba(240,192,96,0.08);' : '')
-                  ">
-                    <!-- Fill -->
-                    <div :style="
-                      'position:absolute;top:0;left:0;bottom:0;' +
-                      'width:' + (fillPct(si)*100) + '%;' +
-                      'transition:width 0.45s ease;' +
-                      'background:' + (
-                        si === totalSegs-1 ? 'rgba(0,229,160,0.45)' :
-                        si === totalSegs-2 ? 'rgba(250,200,126,0.28)' :
-                        segTriggered(si) ? 'rgba(240,192,96,0.50)' : 'rgba(240,192,96,0.28)'
-                      )
-                    "></div>
-                    <!-- Inline label -->
-                    <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;pointer-events:none;z-index:4">
-                      <span style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.5px;line-height:1;color:#f8eedd;text-shadow:0 1px 3px rgba(0,0,0,0.8)"
-                            x-text="segLabel(si)+(si<totalSegs-2&&segTriggered(si)?' ⚡':'')"></span>
-                      <span style="font-family:var(--mono);font-size:7px;line-height:1;color:rgba(248,238,221,0.70);text-shadow:0 1px 3px rgba(0,0,0,0.8)"
-                            x-text="fmtP(segPrice(si))"></span>
-                    </div>
-                    <!-- Divider tick -->
-                    <div x-show="si > 0" style="position:absolute;left:0;top:-3px;bottom:-3px;width:1px;z-index:5"
-                      :style="'background:' + (si===totalSegs-2 ? 'rgba(250,200,126,0.60)' : 'rgba(250,200,126,0.18)')"></div>
-                    <!-- Entry divider — taller & brighter -->
-                    <div x-show="si === totalSegs-2" style="position:absolute;left:-1px;top:-5px;bottom:-5px;width:2px;background:rgba(250,200,126,0.70);box-shadow:0 0 4px rgba(250,200,126,0.4);z-index:6"></div>
-                  </div>
-                </template>
-              </div>
-
-            </div>
-            <div class="pos-timer">
-              <span>Open: <span x-text="fmtAge(p.openedAt, tick)"></span></span>
-              <span x-show="p.phase==='normal'">Force close in: <span class="hi" x-text="cdTo(p.openedAt+(cfg.runtimeHours*3600000), tick)"></span></span>
-              <span x-show="p.openedAt" style="color:var(--text-lo)" x-text="p.openedAt?(()=>{const d=new Date(p.openedAt);return d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});})():''"></span>
-            </div>
-          </div>
-        </template>
-      </div>
-
-        <!-- Market Watch table -->
-        <div x-show="cfg.mktWatchEnabled && _mktWatch.length > 0" style="padding:11px 13px;border-bottom:1px solid var(--border)"
-          x-data="{
-            mwSort: '+24h',
-            get sorted() {
-              const a = [...(_mktWatch||[])];
-              if (this.mwSort==='+24h') a.sort((x,y)=>y.price24hPcnt-x.price24hPcnt);
-              else if (this.mwSort==='-24h') a.sort((x,y)=>x.price24hPcnt-y.price24hPcnt);
-              else if (this.mwSort==='+fr') a.sort((x,y)=>y.fundingRate-x.fundingRate);
-              else if (this.mwSort==='-fr') a.sort((x,y)=>x.fundingRate-y.fundingRate);
-              else if (this.mwSort==='+vol') a.sort((x,y)=>y.turnover24h-x.turnover24h);
-              else if (this.mwSort==='-vol') a.sort((x,y)=>x.turnover24h-y.turnover24h);
-              return a;
-            }
-          }">
-          <div class="sec-ttl" style="margin-bottom:8px;display:flex;align-items:center;gap:6px">
-            <span>Market Watch</span>
-            <em x-text="'top '+_mktWatch.length+' random'" style="flex:1"></em>
-            <button @click.prevent="mwSort=(mwSort==='+24h'?'-24h':'+24h')"
-              :style="(mwSort==='+24h'||mwSort==='-24h')?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'"
-              style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px"
-              x-text="mwSort==='+24h'?'+24h':(mwSort==='-24h'?'-24h':'24h')"></button>
-            <button @click.prevent="mwSort=(mwSort==='+fr'?'-fr':'+fr')"
-              :style="(mwSort==='+fr'||mwSort==='-fr')?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'"
-              style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px"
-              x-text="mwSort==='+fr'?'+FR':(mwSort==='-fr'?'-FR':'FR')"></button>
-            <button @click.prevent="mwSort=(mwSort==='+vol'?'-vol':'+vol')"
-              :style="(mwSort==='+vol'||mwSort==='-vol')?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'"
-              style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px"
-              x-text="mwSort==='+vol'?'+Vol':(mwSort==='-vol'?'-Vol':'Vol')"></button>
-          </div>
-          <table style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:9px">
-            <thead>
-              <tr style="color:var(--text-lo);border-bottom:1px solid var(--border)">
-                <th style="text-align:left;padding:3px 4px;font-weight:normal">Symbol</th>
-                <th style="text-align:right;padding:3px 4px;font-weight:normal">Price</th>
-                <th style="text-align:right;padding:3px 4px;font-weight:normal">24h Δ</th>
-                <th style="text-align:right;padding:3px 4px;font-weight:normal">Funding</th>
-                <th style="text-align:right;padding:3px 4px;font-weight:normal">Vol(M)</th>
-              </tr>
-            </thead>
-            <tbody>
-              <template x-for="w in sorted" :key="w.symbol">
-                <tr style="border-bottom:1px solid rgba(255,255,255,.04)">
-                  <td style="padding:3px 4px;color:var(--text-hi)" x-text="w.symbol.replace('USDT','')"></td>
-                  <td style="padding:3px 4px;text-align:right;color:var(--text-mid)" x-text="fmtP(w.lastPrice)"></td>
-                  <td style="padding:3px 4px;text-align:right" :class="w.price24hPcnt<0?'short':'profit'" x-text="(w.price24hPcnt>=0?'+':'')+(w.price24hPcnt*100).toFixed(2)+'%'"></td>
-                  <td style="padding:3px 4px;text-align:right" :class="w.fundingRate>0?'profit':(w.fundingRate<0?'short':'')" x-text="(w.fundingRate>=0?'+':'')+(w.fundingRate*100).toFixed(4)+'%'"></td>
-                  <td style="padding:3px 4px;text-align:right;color:var(--text-lo)" x-text="(w.turnover24h/1e6).toFixed(1)+'M'"></td>
-                </tr>
-              </template>
-            </tbody>
-          </table>
-        </div>
-
-      <div style="height:40px;display:flex;align-items:center;justify-content:center">
-        <span style="font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:var(--text-lo);opacity:.45">PENG PROTOCOL 2026</span>
-      </div>
-      </div><!-- /market-inner -->
-    </div><!-- /col-mid -->
-    <div class="col-stats" :class="(mobTab==='stats'?'mob-active':'') + ' ' + overlaySlotClass('stats')">
-
-      <!-- Session Stats -->
-      <div class="sec">
-        <div class="sec-ttl">Session Stats</div>
-        <div class="sg3" style="margin-bottom:6px">
-          <div class="stat"><div class="sl">Trades</div><div class="sv ice sm" x-text="sess.trades"></div></div>
-          <div class="stat"><div class="sl">Wins</div><div class="sv sm profit" x-text="sess.wins"></div></div>
-          <div class="stat"><div class="sl">Losses</div><div class="sv sm short" x-text="sess.losses"></div></div>
-        </div>
-        <div class="sg3">
-          <div class="stat"><div class="sl">Win Skew</div>
-            <div class="sv sm" :class="(()=>{ const s=_sessionPnlStats(); return s.denom>0 ? (s.skew>=50?'profit':'short') : ''; })()"
-                 x-text="(()=>{ const s=_sessionPnlStats(); return s.denom>0?s.skew.toFixed(1)+'%':'—'; })()"></div>
-          </div>
-          <div class="stat"><div class="sl">Session PnL</div>
-            <div class="sv sm" :class="(()=>{ const ru=closedTrades.find(t=>t.reason==='period-rollup'); const cards=closedTrades.filter(t=>t.reason!=='period-rollup'); const v=(cards.length||ru?.rollup?.netPnl!=null)?cards.reduce((s,t)=>s+(t.totalPnl??t.pnl??0),0)+(ru?.rollup?.netPnl??0):0; return v>=0?'profit':'short'; })()"
-                 x-text="(()=>{ const ru=closedTrades.find(t=>t.reason==='period-rollup'); const cards=closedTrades.filter(t=>t.reason!=='period-rollup'); const v=(cards.length||ru?.rollup?.netPnl!=null)?cards.reduce((s,t)=>s+(t.totalPnl??t.pnl??0),0)+(ru?.rollup?.netPnl??0):0; return (v>=0?'+':'')+v.toFixed(2)+' USDT'; })()"></div>
-          </div>
-          <div class="stat"><div class="sl">Force Closes</div><div class="sv sm warn" x-text="sess.forceClose"></div></div>
-        </div>
-      </div>
-
-      <!-- Trade History -->
-      <div class="sec">
-        <div class="sec-ttl">Trade History <em id="pw-stats-count">—</em></div>
-        <div style="font-family:var(--mono);font-size:10px;line-height:1.9">
-          <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text-lo);font-size:9px;letter-spacing:1px">LAST CLOSE</span>
-            <span id="pw-stats-last" style="color:var(--text-mid)">—</span>
-          </div>
-          <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text-lo);font-size:9px;letter-spacing:1px">BEST WIN</span>
-            <span id="pw-stats-best" style="color:var(--profit)">—</span>
-          </div>
-          <div style="display:flex;justify-content:space-between">
-            <span style="color:var(--text-lo);font-size:9px;letter-spacing:1px">WORST LOSS</span>
-            <span id="pw-stats-worst" style="color:var(--short)">—</span>
-          </div>
-        </div>
-      </div>
-
-      <div data-plugin-slot="stats-eda"></div>
-
-
-
-
-
-      <div class="sec">
-        <div class="sec-ttl">Persistence</div>
-        <div style="font-size:10px;color:var(--text-mid);font-family:var(--mono);line-height:1.7">
-          <div>Active: <span style="color:var(--ice)" x-text="positions.length+' position(s)'"></span></div>
-          <div>Stored: <span :style="positions.length!==savedPositions.length?'color:var(--short)':'color:var(--ice)'" x-text="savedPositions.length+' in localStorage'"></span></div>
-          <div style="color:var(--text-lo);font-size:9.5px;margin-top:3px">Saves on every change. Timers resume from original open time on reload.</div>
-        </div>
-        <div x-show="positions.length!==savedPositions.length||_persistFailed" style="margin-top:6px;padding:6px 8px;background:rgba(255,80,80,.08);border:1px solid rgba(255,80,80,.35);border-radius:3px;font-size:9.5px;color:var(--short);line-height:1.5">
-          ⚠ Active/Stored count mismatch — retrying save automatically every 5s. Check the activity log for <b>[PERSIST]</b> entries. If this persists, another tab of this bot may be open and overwriting saves — close duplicate tabs.
-        </div>
-        <div style="margin-top:6px">
-          <span @click="showStorageBreakdown=!showStorageBreakdown" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
-            <span x-text="showStorageBreakdown?'▾':'▸'"></span> Storage usage
-          </span>
-          <span x-show="showStorageBreakdown" @click="_exportStorageBreakdown()" title="Download this breakdown as a text file" style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;text-decoration:underline;user-select:none">⤓ Export</span>
-          <div x-show="showStorageBreakdown" x-html="_storageBreakdown(showStorageBreakdown)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
-        </div>
-        <div style="margin-top:6px">
-          <span @click="showPowerUsage=!showPowerUsage" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
-            <span x-text="showPowerUsage?'▾':'▸'"></span> Power usage
-          </span>
-          <div x-show="showPowerUsage" x-html="_powerUsageHtml(showPowerUsage)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
-        </div>
-        <button class="btn btn-ghost" style="margin-top:8px;font-size:10px;padding:5px;letter-spacing:1px"
-          @click="showDangerZone=!showDangerZone"
-          :style="showDangerZone?'color:var(--warn);border-color:rgba(240,192,96,.4)':''">
-          <span x-text="showDangerZone?'▲ Hide Actions':'⚠ Show Actions'"></span>
-        </button>
-        <div x-show="showDangerZone" style="margin-top:6px;display:flex;flex-direction:column;gap:5px">
-          <button class="btn btn-red" style="font-size:10px;padding:5px"
-            x-show="savedPositions.length>0||positions.length>0"
-            @click="if(confirm('Clear all saved state? This cannot be undone.')) { clearSaved(); showDangerZone=false; }">
-            Clear Saved State
-          </button>
-          <button class="btn btn-red" style="font-size:10px;padding:5px"
-            @click="if(confirm('Reset all session stats? This cannot be undone.')) { clearStats(); showDangerZone=false; }">
-            ↺ Reset Stats
-          </button>
-          <button class="btn btn-red" style="font-size:10px;padding:5px"
-            x-show="positions.length>0"
-            @click="if(confirm('Bail all positions now? This closes every active position immediately at current mark price, for profit or loss.')) { bailAll(); showDangerZone=false; }">
-            Bail All Positions
-          </button>
-          <button class="btn btn-ghost" style="font-size:10px;padding:5px"
-            @click="showExportMenu=true">
-            ↓ Export Data
-          </button>
-          <button class="btn btn-ghost" style="font-size:10px;padding:5px;color:var(--ice);border-color:rgba(126,232,250,.35)"
-            @click="$refs.importFileInput.click()">
-            ↑ Import Data (JSON)
-          </button>
-
-          <input type="file" accept=".json,application/json" x-ref="importFileInput"
-            style="display:none"
-            @change="
-              const file = $event.target.files[0];
-              $event.target.value = '';
-              if (!file) return;
-              const reader = new FileReader();
-              reader.onload = e => {
-                try {
-                  const parsed = JSON.parse(e.target.result);
-                  if (!parsed || typeof parsed !== 'object') throw new Error('Invalid JSON structure');
-                  _pendingImport = parsed;
-                  showImportConfirm = true;
-                } catch(err) {
-                  log('Import failed: ' + err.message, 'error');
-                }
-              };
-              reader.readAsText(file);
-            ">
-        </div>
-      </div>
-
-      <div class="sec" style="flex:1">
-        <div class="sec-ttl">
-          Activity Log
-          <button @click="logs=[]" style="background:none;border:none;cursor:pointer;color:var(--text-lo);font-family:var(--mono);font-size:9px">CLEAR</button>
-        </div>
-        <div class="log-box">
-          <template x-for="(l,i) in logs" :key="i">
-            <div class="ll">
-              <span class="lt" x-text="l.t"></span>
-              <span class="lm" :class="l.type" x-text="l.m"></span>
-            </div>
-          </template>
-          <div x-show="logs.length===0" style="color:var(--text-lo);padding:4px 0;font-size:10px">No activity yet.</div>
-        </div>
-      </div>
-      <div style="height:40px;display:flex;align-items:center;justify-content:center">
-        <span style="font-family:var(--mono);font-size:9px;letter-spacing:1.5px;color:var(--text-lo);opacity:.45">PENG PROTOCOL 2026</span>
-      </div>
-    </div><!-- /col-stats -->
-
-
-    <!-- TRADES: Dedicated PnL feed column -->
-    <div class="col-pnl" :class="(mobTab==='trades'?'mob-active':'') + ' ' + overlaySlotClass('trades')">
-
-      <!-- Sticky header -->
-      <div style="position:sticky;top:0;z-index:3;background:var(--bg-panel);border-bottom:1px solid var(--border);padding:10px 13px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;">
-        <div>
-          <div class="sec-ttl" style="margin-bottom:2px">
-            Trade History
-            <em id="pw-trade-count">0 closed</em>
-          </div>
-          <div id="pw-trade-meta" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);display:none"></div>
-        </div>
-        <button id="pw-trade-clear"
-                class="btn btn-ghost"
-                style="width:auto;font-size:9px;padding:3px 10px;letter-spacing:1px;display:none"
-                @click="if(confirm('Clear trade history and session stats? This cannot be undone.'))clearStats()">CLEAR</button>
-      </div>
-
-      <!-- PnL Chart Drawer -->
-      <div x-data="{open:false}" x-show="closedTrades.filter(t=>t.reason!=='period-rollup').length>=2" style="border-bottom:1px solid var(--border);flex-shrink:0">
-        <div @click="open=!open" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:4px 13px;user-select:none">
-          <span style="font-family:var(--mono);font-size:8px;letter-spacing:1px;color:var(--text-lo)">PNL CHART</span>
-          <span style="font-size:8px;color:var(--text-lo)" x-text="open?'▲':'▼'"></span>
-        </div>
-        <div x-show="open" style="padding:0 11px 8px">
-          <div x-html="_pnlChartSvg()"></div>
-        </div>
-      </div>
-
-      <!-- Empty state -->
-      <div id="pw-trade-empty" class="empty-state" style="flex:1">
-        <div class="snowflake" x-text="themeEmoji"></div>
-        <span>No closed trades yet</span>
-      </div>
-
-      <!-- PnL card feed — rendered by renderTradeFeed(), not Alpine x-for.
-           Vanilla JS innerHTML avoids Alpine 3 DOM reconciliation bugs that caused
-           new cards to silently fail to insert and old cards to go invisible. -->
-      <div id="pw-trade-feed" style="padding:10px 11px;display:flex;flex-direction:column;gap:7px;"></div>
-
-    </div>
-
-  </div>
-
-<!-- ─── PLUGIN MANAGER MODAL ─── -->
-<span x-effect="const m=document.getElementById('pw-plugin-mgr');if(m)m.style.display=_pluginMgrOpen?'flex':'none'" style="display:none"></span>
-<div id="pw-plugin-mgr"
-     style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.7);align-items:center;justify-content:center"
-     @click.self="_pluginMgrOpen=false"
-     @keydown.escape.window="_pluginMgrOpen=false">
-  <div style="background:var(--bg-panel);border:1px solid var(--border-hi);border-radius:10px;width:min(480px,96vw);max-height:80vh;overflow-y:auto;padding:20px;position:relative">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-      <span style="font-family:var(--mono);font-size:11px;letter-spacing:2px;color:var(--ice);text-transform:uppercase">Plugin Manager</span>
-      <button @click="_pluginMgrOpen=false" style="background:none;border:none;color:var(--text-lo);font-size:16px;cursor:pointer;line-height:1">✕</button>
-    </div>
-
-    <div x-show="_pluginConflicts.length>0" style="background:rgba(255,69,96,0.10);border:1px solid rgba(255,69,96,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px">
-      <div style="font-size:10px;color:#ff4560;font-family:var(--mono);margin-bottom:4px">CONFLICTS / WARNINGS</div>
-      <template x-for="w in _pluginConflicts" :key="w">
-        <div style="font-size:10px;color:var(--text-mid);margin-top:2px" x-text="w"></div>
-      </template>
-    </div>
-
-    <div x-show="_pluginNotices.length>0" style="background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.28);border-radius:6px;padding:8px 10px;margin-bottom:12px">
-      <div style="font-size:10px;color:var(--profit);font-family:var(--mono);margin-bottom:4px">PLUGIN LOAD NOTES</div>
-      <template x-for="n in _pluginNotices" :key="n">
-        <div style="font-size:10px;color:var(--profit);margin-top:2px" x-text="n"></div>
-      </template>
-    </div>
-
-    <div x-show="_pluginList.length===0" style="text-align:center;padding:24px 0;color:var(--text-lo);font-size:11px;font-family:var(--mono)">No plugins loaded</div>
-
-    <template x-for="p in _pluginList" :key="p.id">
-      <div style="background:var(--bg-raised);border:1px solid var(--border);border-radius:7px;padding:10px 12px;margin-bottom:8px">
-        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
-          <div>
-            <div style="font-size:12px;color:var(--text-hi);font-weight:600" x-text="p.name"></div>
-            <div style="font-size:10px;color:var(--text-lo);font-family:var(--mono);margin-top:2px">
-              <span x-text="'v'+p.version"></span>
-              <span x-show="p.targetBot" style="margin-left:6px;color:var(--ice);opacity:0.7" x-text="'['+p.targetBot+']'"></span>
-            </div>
-            <div x-show="p.touches&&p.touches.length>0" style="font-size:9px;color:var(--text-lo);margin-top:4px">
-              Touches: <span style="color:var(--warn);font-family:var(--mono)" x-text="(p.touches||[]).join(', ')"></span>
-            </div>
-            <div x-show="p.suppresses&&p.suppresses.length>0" style="font-size:9px;color:var(--text-lo);margin-top:4px">
-              Suppresses: <span style="color:#ff4560;font-family:var(--mono)" x-text="(p.suppresses||[]).join(', ')"></span>
-            </div>
-          </div>
-          <button @click="_pluginRemove(p.id)" style="background:rgba(255,69,96,0.12);border:1px solid rgba(255,69,96,0.25);color:#ff4560;font-size:10px;padding:3px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0">Remove</button>
-        </div>
-      </div>
-    </template>
-
-    <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:14px">
-      <div style="font-size:10px;color:var(--text-lo);margin-bottom:8px">Load a plugin (.js or .html file exporting <span style="font-family:var(--mono);color:var(--ice)">window.__BotPlugin</span>). Changes take effect after reload.</div>
-      <label style="display:inline-block;background:var(--bg-raised);border:1px solid var(--border-hi);border-radius:5px;padding:6px 12px;font-size:11px;color:var(--ice);cursor:pointer;font-family:var(--mono)">
-        ⊕ Load Plugin File
-        <input type="file" accept=".js,.html" style="display:none" @change="_pluginLoad($event)">
-      </label>
-      <div x-show="_pluginFileErr" style="margin-top:8px;font-size:10px;color:#ff4560;font-family:var(--mono)" x-text="_pluginFileErr"></div>
-    </div>
-
-    <div x-show="_pluginConflicts.length===0&&_pluginList.length>0" style="margin-top:10px;font-size:9px;color:var(--text-lo);font-family:var(--mono);text-align:center">
-      Active load order: <span x-text="_pluginList.map(p=>p.name).join(' → ')"></span>
-    </div>
-  </div>
-</div>
-
-</div>
-
-<!-- ══════════════════════════════════════════════════════════
-     SCRIPTS
-     Order matters:
-       1. Helper functions (sync, no Alpine dependency)
-       2. Alpine component definition (ew function)
-       3. Alpine CDN — must come LAST so it finds pw() already defined
-══════════════════════════════════════════════════════════ -->
 <script>
-function showApp() {
-  document.getElementById('pw-app').style.visibility = 'visible';
-  const l = document.getElementById('pw-loading');
-  if (l) l.style.display = 'none';
-  const btnCancel  = document.getElementById('pw-import-cancel');
-  const btnConfirm = document.getElementById('pw-import-confirm');
-  function getAlpine() {
-    const app = document.getElementById('pw-app');
-    return app ? Alpine.$data(app) : null;
+(function () {
+
+  // ── Globals genuinely missing from the host page — kept as-is, no rename needed since
+  //    PseudoWinter doesn't declare these under any name. ──
+  function fmtAge(ts, _tick) {
+    if (!ts) return '';
+    const s = Math.floor((Date.now() - ts) / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return (h > 0 ? h + 'h ' : '') + m + 'm ' + String(sec).padStart(2,'0') + 's';
   }
-  if (btnCancel) btnCancel.addEventListener('click', () => {
-    const a = getAlpine(); if (!a) return;
-    a.showImportConfirm = false; a._pendingImport = null;
-  });
-  if (btnConfirm) btnConfirm.addEventListener('click', () => {
-    const a = getAlpine(); if (!a) return;
-    if (!a._pendingImport) return; // guard: payload already consumed (duplicate event)
-    a.importData(); a.showImportConfirm = false; a.showDangerZone = false;
-  });
-
-  // Export menu buttons
-  const btnExportCancel   = document.getElementById('pw-export-cancel');
-  const btnExportConfigs  = document.getElementById('pw-export-configs');
-  const btnExportPositions = document.getElementById('pw-export-positions');
-  const btnExportLog      = document.getElementById('pw-export-log');
-  if (btnExportCancel)    btnExportCancel.addEventListener('click',    () => { const a = getAlpine(); if (a) a.showExportMenu = false; });
-  if (btnExportConfigs)   btnExportConfigs.addEventListener('click',   () => { const a = getAlpine(); if (!a) return; a.exportData('configs');   a.showExportMenu = false; });
-  if (btnExportPositions) btnExportPositions.addEventListener('click', () => { const a = getAlpine(); if (!a) return; a.exportData('positions'); a.showExportMenu = false; });
-  if (btnExportLog)       btnExportLog.addEventListener('click',       () => { const a = getAlpine(); if (!a) return; a.exportData('log');       a.showExportMenu = false; });
-
-}
-function showError(msg) {
-  const el = document.getElementById('pw-error');
-  if (el) { el.style.display = 'flex'; }
-  if (msg) {
-    const m = document.getElementById('pw-err-msg');
-    if (m) m.textContent = msg;
+  // Countdown-to helper: returns 'Xh Ym Zs' until targetMs, or '—' if past/invalid.
+  function cdTo(targetMs, _tick) {
+    if (!targetMs || !Number.isFinite(targetMs)) return '—';
+    const rem = targetMs - Date.now();
+    if (rem <= 0) return 'now';
+    const h = Math.floor(rem / 3600000);
+    const m = Math.floor((rem % 3600000) / 60000);
+    const s = Math.floor((rem % 60000) / 1000);
+    return (h > 0 ? h + 'h ' : '') + String(m).padStart(2,'0') + 'm ' + String(s).padStart(2,'0') + 's';
   }
-  const l = document.getElementById('pw-loading');
-  if (l) l.style.display = 'none';
-}
 
+  // ── Globals that WOULD collide with PseudoWinter's own identically-named declarations —
+  //    renamed with a ch prefix. This is the complete list; everything else this store needs
+  //    (SHARED_KEY, BOT_ID, _sharedChannel, BANLIST_TTL_MS, SHARED_REGISTRY_BYTE_CAP,
+  //    _trimSharedRegistry, WS_URL, WS_FRESH_MS, _wsConn and friends, _wsSend, _wsResync,
+  //    _wsEnsureOpen, wsWatchSymbols, wsTicker, fmtP, showApp, showError) is deliberately NOT
+  //    redeclared here — those bare identifiers fall through to PseudoWinter's own already-
+  //    loaded globals of the same name. That's not a workaround, it's the actual mechanism
+  //    that makes market data, the WS connection, and the shared-registry cache genuinely
+  //    shared rather than duplicated: this store's _sharedRead('bulkTickers') call (below,
+  //    ported unchanged from PseudoChaser) resolves against PseudoWinter's own SHARED_KEY,
+  //    so whichever instance's scan cycle fires first each cycle does the real fetch and the
+  //    other reads the cache — the exact mechanism the decoupling pass (v1.61→1.62) built for
+  //    the old cross-page Permafrost/Ashfall pairing, now doing the same job intra-page. ──
+  const CH_LS_KEY = 'pc_v1';
+  const _chClosingIds = new Set();
+  let _chAuditRunning = false;
+  let _chCdTimer          = null;
+  let _chWatchTimer       = null;
+  let _chRefreshTimer     = null;
+  let _chAudioTimer       = null;
 
-function fmtP(p) {
-  if (p==null||isNaN(p)) return '—';
-  p=parseFloat(p);
-  if (p>=1000) return p.toFixed(2);
-  if (p>=1)    return p.toFixed(4);
-  return p.toFixed(6);
-}
-
-// Age-since helper: returns 'Xh YYm ZZs' elapsed since ts.
-function fmtAge(ts, _tick) {
-  if (!ts) return '';
-  const s = Math.floor((Date.now() - ts) / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return (h > 0 ? h + 'h ' : '') + m + 'm ' + String(sec).padStart(2,'0') + 's';
-}
-
-// Countdown-to helper: returns 'Xh Ym Zs' until targetMs, or '—' if past/invalid.
-function cdTo(targetMs, _tick) {
-  if (!targetMs || !Number.isFinite(targetMs)) return '—';
-  const rem = targetMs - Date.now();
-  if (rem <= 0) return 'now';
-  const h = Math.floor(rem / 3600000);
-  const m = Math.floor((rem % 3600000) / 60000);
-  const s = Math.floor((rem % 60000) / 1000);
-  return (h > 0 ? h + 'h ' : '') + String(m).padStart(2,'0') + 'm ' + String(s).padStart(2,'0') + 's';
-}
-
-const LS_KEY = 'pc_v1';
-const BOT_ID = 'chaser';
-const SHARED_KEY = '__ew_shared_v1';
-let _sharedChannel = null;
-try { _sharedChannel = new BroadcastChannel('ew_shared'); } catch(_) {}
-const BANLIST_TTL_MS = 7 * 24 * 3600 * 1000;
-
-// The shared registry accumulates several independent per-symbol caches (klines_1h,
-// klines_1h_last, watchTickers, mcap, cpSupply, dsMcap, liqResults, ...) inside one blob,
-// merged in by _sharedMerge with no eviction — every symbol either bot has ever touched
-// stays forever. Capped at one combined budget (matching how it shows as a single row in
-// the Storage usage breakdown) rather than per-type, trimming the globally-oldest entries
-// first regardless of which cache they're in. Each per-key entry carries its own `ts`
-// (set by whichever _sharedWrite/_sharedMerge call wrote it); a bucket whose `data` isn't
-// a per-key dict (e.g. bulkTickers, a plain array) is evicted as a whole unit instead,
-// aged by the bucket's own top-level `ts`.
-const SHARED_REGISTRY_BYTE_CAP = 200 * 1024;
-function _trimSharedRegistry(reg, maxBytes = SHARED_REGISTRY_BYTE_CAP) {
-  let json = JSON.stringify(reg);
-  let size = new Blob([json]).size;
-  if (size <= maxBytes) return reg;
-  const units = [];
-  for (const [type, bucket] of Object.entries(reg)) {
-    if (!bucket || typeof bucket !== 'object') continue;
-    const data = bucket.data;
-    const isEntryDict = data && typeof data === 'object' && !Array.isArray(data)
-      && Object.values(data).every(v => v && typeof v === 'object' && typeof v.ts === 'number');
-    if (isEntryDict) {
-      for (const key of Object.keys(data)) units.push({ type, key, ts: data[key].ts });
-    } else {
-      units.push({ type, key: null, ts: bucket.ts || 0 });
-    }
-  }
-  units.sort((a, b) => a.ts - b.ts); // oldest first
-  let idx = 0, guard = 0;
-  while (size > maxBytes && idx < units.length && guard < 25) {
-    const avg = size / Math.max(1, units.length - idx);
-    const excess = size - maxBytes;
-    const drop = Math.min(units.length - idx, Math.max(1, Math.ceil(excess / avg)));
-    for (let j = 0; j < drop; j++) {
-      const u = units[idx + j];
-      if (u.key === null) delete reg[u.type];
-      else if (reg[u.type]?.data) delete reg[u.type].data[u.key];
-    }
-    idx += drop;
-    json = JSON.stringify(reg);
-    size = new Blob([json]).size;
-    guard++;
-  }
-  // Clean up any buckets left with an empty data dict after eviction.
-  for (const type of Object.keys(reg)) {
-    const data = reg[type]?.data;
-    if (data && typeof data === 'object' && !Array.isArray(data) && !Object.keys(data).length) delete reg[type];
-  }
-  return reg;
-}
-
-const _closingIds = new Set();
-const AUDIT_MIN_GAP_MS = 60000;
-let _auditRunning = false;
-let _auditPromise = null;
-
-// Timers stored outside Alpine to prevent proxy mutation
-let _cdTimer          = null;
-let _watchTimer       = null;
-let _refreshTimer     = null;
-let _audioTimer       = null;
-
-// ── Bybit public WebSocket ticker feed (stored outside Alpine to prevent proxy mutation) ──
-// Replaces the recurring full-ticker REST poll (~300 KB per call, every 15s) with delta
-// pushes (~100 bytes each) for only the symbols the watch loops care about.
-const WS_URL      = 'wss://stream.bybit.com/v5/public/linear';
-const WS_FRESH_MS = 15000; // ticker older than this is considered stale → REST fallback
-let _wsConn           = null;
-let _wsPingTimer      = null;
-let _wsReconnectTimer = null;
-let _wsWantTopics     = new Set(); // topics the watch loops want subscribed
-let _wsSubTopics      = new Set(); // topics subscribed on the live connection
-const _wsTickers      = {};        // symbol → merged ticker fields + ts (deltas merged over snapshot)
-
-function _wsSend(obj) {
-  try { if (_wsConn && _wsConn.readyState === WebSocket.OPEN) _wsConn.send(JSON.stringify(obj)); } catch {}
-}
-
-function _wsResync() {
-  if (!_wsConn || _wsConn.readyState !== WebSocket.OPEN) return;
-  const sub   = [..._wsWantTopics].filter(t => !_wsSubTopics.has(t));
-  const unsub = [..._wsSubTopics].filter(t => !_wsWantTopics.has(t));
-  for (let i = 0; i < sub.length;   i += 10) _wsSend({ op: 'subscribe',   args: sub.slice(i, i + 10) });
-  for (let i = 0; i < unsub.length; i += 10) _wsSend({ op: 'unsubscribe', args: unsub.slice(i, i + 10) });
-  for (const t of sub)   _wsSubTopics.add(t);
-  for (const t of unsub) { _wsSubTopics.delete(t); delete _wsTickers[t.slice('tickers.'.length)]; }
-}
-
-function _wsEnsureOpen() {
-  if (!_wsWantTopics.size) return;
-  if (_wsConn && (_wsConn.readyState === WebSocket.CONNECTING || _wsConn.readyState === WebSocket.OPEN)) return;
-  if (_wsReconnectTimer) return; // reconnect backoff pending
-  let conn;
-  try { conn = new WebSocket(WS_URL); } catch { return; }
-  _wsConn = conn;
-  conn.onopen = () => {
-    _wsSubTopics = new Set();
-    _wsResync();
-    clearInterval(_wsPingTimer);
-    _wsPingTimer = setInterval(() => _wsSend({ op: 'ping' }), 20000); // Bybit requires a ping at least every 20s
-  };
-  conn.onmessage = (ev) => {
-    let m; try { m = JSON.parse(ev.data); } catch { return; }
-    if (!m.topic || !m.topic.startsWith('tickers.') || !m.data) return;
-    const sym = m.data.symbol || m.topic.slice('tickers.'.length);
-    _wsTickers[sym] = { ...(_wsTickers[sym] || {}), ...m.data, ts: Date.now() };
-  };
-  conn.onclose = () => {
-    clearInterval(_wsPingTimer); _wsPingTimer = null;
-    if (_wsConn === conn) _wsConn = null;
-    _wsSubTopics = new Set();
-    if (_wsWantTopics.size && !_wsReconnectTimer) {
-      _wsReconnectTimer = setTimeout(() => { _wsReconnectTimer = null; _wsEnsureOpen(); }, 5000);
-    }
-  };
-  conn.onerror = () => { try { conn.close(); } catch {} };
-}
-
-// Align the WS subscription set with the symbols the watch loops currently track.
-function wsWatchSymbols(symbols) {
-  _wsWantTopics = new Set((symbols || []).filter(Boolean).map(s => `tickers.${s}`));
-  if (!_wsWantTopics.size) {
-    if (_wsConn) { try { _wsConn.close(); } catch {} } // nothing watched — drop the stream entirely
-    return;
-  }
-  _wsEnsureOpen();
-  _wsResync();
-}
-
-// Fresh merged ticker from the WS feed, or null if absent/stale (caller falls back to REST).
-function wsTicker(symbol, maxAgeMs = WS_FRESH_MS) {
-  const t = _wsTickers[symbol];
-  return (t && t.lastPrice != null && (Date.now() - t.ts) <= maxAgeMs) ? t : null;
-}
-
-function pw() { return {
+function chFactory() { return {
   showSetup: false,
   creds: { key:'', secret:'' },
   cfg: {
@@ -1849,6 +184,7 @@ function pw() { return {
   _lastImportAt: null,      // timestamp of last successful import — used to suppress phantom abort log within 5s
   cfgLocked: true,         // config column inputs locked by default
   bot: { running:false, startTime:null, lastScan:'', lastScanAt:0, scanCd:0, scanPct:100 },
+  _tradingSuspended: false, // set by _chSetOperationalMode — see pseudoOpenLong's comment
   audioState: 'off', // 'off' | 'running' | 'suspended'
   themeEmoji: '🔆',
   appName: 'PSEUDOCHASER',
@@ -2076,6 +412,11 @@ function pw() { return {
   init() {
     if (this._initDone) return;
     this._initDone = true;
+    // Populates this store's OWN Plugin Manager list (filtered to pseudochaser-targeted
+    // entries — see _pluginInit above). Separate from actually loading sub-plugins: that
+    // already happens in this file's alpine:init listener, before this init() runs, via the
+    // sub-plugin loader that applies Ashfall/MIC's transform() to this object. This call is
+    // just for the management UI (browse/add/remove) inside the Chaser accordion.
     this._pluginInit();
     try {
       document.getElementById('pw-load-status').textContent = 'LOADING SAVED STATE...';
@@ -2084,6 +425,21 @@ function pw() { return {
       if (this.cfg.mktWatchEnabled === undefined) this.cfg.mktWatchEnabled = true;
       if (this.cfg.mktWatchSize    === undefined) this.cfg.mktWatchSize    = 5;
       if (this.cfg.mktWatchSort    === undefined) this.cfg.mktWatchSort    = 'highest';
+      // Default 'winter' matches pre-merger behavior for anyone upgrading — Winter ran, Chaser
+      // didn't exist. Applied below via _chApplyOperationalMode, not just left as a display
+      // default — without this, _tradingSuspended would silently reset to false on both sides
+      // every reload regardless of what was last selected, until the user re-clicked the
+      // control.
+      if (this.cfg.chOperationalMode === undefined) this.cfg.chOperationalMode = 'winter';
+      this._tradingSuspended = !(this.cfg.chOperationalMode === 'chaser' || this.cfg.chOperationalMode === 'both');
+      // Winter's half of the apply is deferred: this init() runs synchronously inside the
+      // alpine:init listener, before Alpine has mounted PW's own #pw-app component — calling
+      // Alpine.$data() on it here would hit an unmounted element. setTimeout(...,0) runs after
+      // Alpine's own synchronous initial-mount pass completes.
+      setTimeout(() => {
+        const pw = window.Alpine?.$data?.(document.getElementById('pw-app'));
+        if (pw) pw._tradingSuspended = !(this.cfg.chOperationalMode === 'winter' || this.cfg.chOperationalMode === 'both');
+      }, 0);
       document.getElementById('pw-load-status').textContent = 'READY';
       setTimeout(() => showApp(), 400);
       this.log(`[INI] ${this.themeEmoji} PseudoChaser initialised.` + (this.savedPositions.length
@@ -2102,15 +458,20 @@ function pw() { return {
         // reactive re-render (every x-html/x-text bound to `tick`, across the bot and any
         // loaded plugins) asynchronously — that flush is the actual cost the Power usage
         // panel is meant to surface, not the increment itself.
-        this.$nextTick(() => {
+        // Falls back to calling immediately if $nextTick isn't bound — this store's init()
+        // runs from a plain alpine:init listener, not from directive evaluation, so whether
+        // Alpine's magics attach to store methods invoked that way is unverified; this way
+        // a missing $nextTick loses only the timing precision, not the whole tick loop.
+        const _chTickDone = () => {
           this._tickCostSamples.push(performance.now() - _tickT0);
           if (this._tickCostSamples.length > 20) this._tickCostSamples.shift();
-        });
+        };
+        if (this.$nextTick) this.$nextTick(_chTickDone); else _chTickDone();
       }, 1000);
 
       // Start position watcher immediately — no API key needed
-      if (!_watchTimer) {
-        _watchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
+      if (!_chWatchTimer) {
+        _chWatchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
       }
       document.addEventListener('visibilitychange', async () => {
         if (document.visibilityState !== 'visible') return;
@@ -2266,7 +627,7 @@ function pw() { return {
     // so a single bloated data type is visible on its own instead of hiding inside a
     // whole-plugin lump sum, matching the per-type 200KB cap plugins enforce on write.
     const singleKeyMap = {
-      [LS_KEY]:                    'This Bot (PseudoChaser): core state',
+      [CH_LS_KEY]:                    'This Bot (PseudoChaser): core state',
       'pc_v1_log':                 'This Bot (PseudoChaser): activity log',
       '__pc_plugins_v1':           'This Bot (PseudoChaser): plugin config',
       'pw_v1':                     'PseudoWinter (partner): core state',
@@ -2275,13 +636,15 @@ function pw() { return {
       '__pf_liq_batches':          'Permafrost: liq batches (in-progress)',
       '__pf_liq_history':          'Permafrost: liquidation samples',
       '__pf_oc_history':           'Permafrost: OC samples',
+      '__pfr_scorecard_v1':        'Permafrost: scorecard',
+      '__pfr_kline_log_v1':        'Permafrost: kline log',
       '__ash_liq_batches':         'Ashfall: liq batches (in-progress)',
       '__ash_liq_history':         'Ashfall: liquidation samples',
       '__ash_oc_history':          'Ashfall: OC samples',
-      '__everwinter_scorecard_v1': 'Cross-Bot: scorecard',
-      '__everwinter_cross_v1':     'Cross-Bot: broadcast log',
-      '__ew_sample_state_v1':      'Cross-Bot: sample state (incl. shared liq backfill)',
-      '__ew_shared_v1':            'Cross-Bot: shared registry',
+      '__ash_scorecard_v1':        'Ashfall: scorecard',
+      '__ash_kline_log_v1':        'Ashfall: kline log',
+      '__ew_shared_v1_chaser':     'This Bot (PseudoChaser): shared registry',
+      '__ew_shared_v1_winter':     'PseudoWinter (partner): shared registry',
       '__cgCoinList':              'Market Cap Cache: CoinGecko',
       '__cpCoinList':              'Market Cap Cache: CoinPaprika',
       '__miw_hist_batches':        'MultiIndicator (Winter): hist batches',
@@ -2429,7 +792,7 @@ function pw() { return {
     // or wrote it — likely a duplicate tab of this bot. Merge in any positions it holds
     // that we don't have rather than blindly overwriting them into oblivion.
     try {
-      const onDisk = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
+      const onDisk = JSON.parse(localStorage.getItem(CH_LS_KEY) || 'null');
       if (onDisk && typeof onDisk.gen === 'number' && this._persistGen != null && onDisk.gen > this._persistGen) {
         const knownIds = new Set(this.positions.map(p => p.id));
         const missing  = (onDisk.positions || []).filter(p => p && !knownIds.has(p.id));
@@ -2442,12 +805,12 @@ function pw() { return {
     } catch(e) {}
     const payload = this._fullPersistPayload();
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify(payload));
+      localStorage.setItem(CH_LS_KEY, JSON.stringify(payload));
     } catch(e) {
       this.log(`[PERSIST] ⚠ localStorage write failed: ${e.message}. Retrying with trade history/watchlists dropped so open positions aren't lost.`, 'warn');
       try {
         const fallback = { ...payload, closedTrades: [], symbolBanlist: {}, drawdownWindow: [], gainsWindow: [] };
-        localStorage.setItem(LS_KEY, JSON.stringify(fallback));
+        localStorage.setItem(CH_LS_KEY, JSON.stringify(fallback));
       } catch(e2) {
         this.log(`[PERSIST] ✗ Fallback save also failed (${e2.message}) — ${this.positions.length} open position(s) are NOT saved and may be lost on reload.`, 'error');
         this._persistFailed = true;
@@ -2456,7 +819,7 @@ function pw() { return {
     }
     // Verify the write actually landed with the position count we intended.
     try {
-      const check = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
+      const check = JSON.parse(localStorage.getItem(CH_LS_KEY) || 'null');
       if (!check || (check.positions || []).length !== this.positions.length) {
         this.log(`[PERSIST] ⚠ Save verification mismatch — ${this.positions.length} position(s) in memory but ${(check?.positions || []).length} confirmed on disk.`, 'error');
         this._persistFailed = true;
@@ -2564,7 +927,7 @@ function pw() { return {
           }
         }
       } catch(e) {}
-      const raw = localStorage.getItem(LS_KEY);
+      const raw = localStorage.getItem(CH_LS_KEY);
       if (!raw) return;
       const s = JSON.parse(raw);
       this._persistGen = typeof s.gen === 'number' ? s.gen : 0;
@@ -2651,7 +1014,8 @@ function pw() { return {
         });
       }
     } catch(e) {}
-    this.$nextTick(() => { this.renderTradeFeed(); });
+    if (this.$nextTick) this.$nextTick(() => { this.renderTradeFeed(); });
+    else this.renderTradeFeed();
   },
 
   calcPhase(posOrOpenedAt, saved, allPositions = []) {
@@ -2680,7 +1044,7 @@ function pw() { return {
   },
 
   clearSaved() {
-    localStorage.removeItem(LS_KEY);
+    localStorage.removeItem(CH_LS_KEY);
     localStorage.removeItem('pc_v1_log');
     this.logs = [];
     this.savedPositions = [];
@@ -2881,22 +1245,58 @@ function pw() { return {
 
     try { await this.runScheduledCycle(); } catch(e) { this.log('[SES] Initial cycle error: ' + e.message, 'warn'); }
     this.scheduleScan();
-    if (_watchTimer) { clearInterval(_watchTimer); _watchTimer = null; }
-    _watchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
+    if (_chWatchTimer) { clearInterval(_chWatchTimer); _chWatchTimer = null; }
+    _chWatchTimer = setInterval(() => this.pseudoWatchPositions(), 5000);
     this.persist();
   },
 
   async stopBot() {
     this.bot.running = false;
-    clearInterval(_cdTimer);
-    clearInterval(_watchTimer); _watchTimer = null;
-    clearInterval(_refreshTimer);
+    clearInterval(_chCdTimer);
+    clearInterval(_chWatchTimer); _chWatchTimer = null;
+    clearInterval(_chRefreshTimer);
     this.stopKeepalive();
     this.bot.scanCd = 0; this.bot.scanPct = 100;
     this.bot.startTime = null;
     this._symData      = {}; // clear live symbol data — will be repopulated on next scan
     this._stopAllIftPollers();
     this.log(`[SES] ${this.themeEmoji} Sim stopped.`, 'warn');
+    this.persist();
+  },
+
+  // Applies a mode's _tradingSuspended flags on both sides without bailing anything — used at
+  // init() to restore the persisted mode after a reload. Bailing on every page load would
+  // force-close positions that were sitting there peacefully before the reload; that's only
+  // correct at the moment of an actual user-initiated transition (see _chSetOperationalMode).
+  _chApplyOperationalMode(mode) {
+    const pw = window.Alpine?.$data?.(document.getElementById('pw-app'));
+    if (pw) pw._tradingSuspended = !(mode === 'winter' || mode === 'both');
+    this._tradingSuspended = !(mode === 'chaser' || mode === 'both');
+  },
+
+  // Tri-state control from the Chaser accordion — 'winter' | 'chaser' | 'both' — persisted so
+  // it survives reload. Does NOT call startBot()/stopBot() — those also gate scanning,
+  // keepalive, and the watch loop, and market-data fetching must keep running on both sides
+  // regardless of this setting (still useful for shared data, scorecard, monitoring even for
+  // the side that's not opening new positions). This only sets _tradingSuspended, checked at
+  // the top of each side's own pseudoOpenShort()/pseudoOpenLong() — narrower than the earlier
+  // startBot/stopBot version, which was the wrong tool even before it had the "stuck" bug
+  // (mutating bot.running with no side effects at all): it would have stopped scanning too,
+  // which was never the intent.
+  // When a side transitions from active to suspended, its current open positions are bailed
+  // immediately (force-closed at mark price) rather than left open and monitored — the user's
+  // explicit call: switching a side off should clear its book, not let it ride unsupervised.
+  _chSetOperationalMode(mode) {
+    const pw = window.Alpine?.$data?.(document.getElementById('pw-app'));
+    const wantWinter = mode === 'winter' || mode === 'both';
+    const wantChaser = mode === 'chaser' || mode === 'both';
+    const prevMode = this.cfg.chOperationalMode;
+    const prevWantWinter = prevMode === 'winter' || prevMode === 'both';
+    const prevWantChaser = prevMode === 'chaser' || prevMode === 'both';
+    this._chApplyOperationalMode(mode);
+    if (pw && prevWantWinter && !wantWinter && pw.positions.length) pw.bailAll();
+    if (prevWantChaser && !wantChaser && this.positions.length) this.bailAll();
+    this.cfg.chOperationalMode = mode;
     this.persist();
   },
 
@@ -2913,7 +1313,7 @@ function pw() { return {
       gain.connect(this._audioCtx.destination);
       this._oscillator.start();
       this.audioState = this._audioCtx.state; // 'running' immediately after user gesture
-      _audioTimer = setInterval(() => {
+      _chAudioTimer = setInterval(() => {
         if (!this._audioCtx) return;
         this.audioState = this._audioCtx.state;
       }, 3000);
@@ -2926,8 +1326,8 @@ function pw() { return {
 
   stopKeepalive() {
     try {
-      clearInterval(_audioTimer);
-      _audioTimer = null;
+      clearInterval(_chAudioTimer);
+      _chAudioTimer = null;
       if (this._oscillator) { this._oscillator.stop(); this._oscillator = null; }
       if (this._audioCtx)   { this._audioCtx.close();  this._audioCtx   = null; }
       this.audioState = 'off';
@@ -2948,8 +1348,8 @@ function pw() { return {
   },
 
   scheduleScan() {
-    clearInterval(_cdTimer);
-    _cdTimer = setInterval(async () => {
+    clearInterval(_chCdTimer);
+    _chCdTimer = setInterval(async () => {
       if (!this.bot.running) return;
       const total   = this.cfg.scanMins * 60 * 1000;
       const elapsed = Date.now() - this.bot.lastScanAt;
@@ -3096,12 +1496,22 @@ function pw() { return {
   async pseudoOpenLong(candidate) {
     const { symbol, price: _candidatePrice, change=0, fundingRate=null } = candidate;
     let price = _candidatePrice;
+    // Set by this store's own _chSetOperationalMode — see that method's comment. Not tied to
+    // bot.running/startBot/stopBot, which also gate scanning/keepalive/the watch loop; scanning
+    // must keep running regardless so market data, scorecard, and monitoring stay live.
+    if (this._tradingSuspended) return;
     // Hard cap at the open itself — every sim entry path flows through here, so no
     // caller (scan, strategy plugin, manual) can overshoot maxPos.
     if (this.positions.length >= this.cfg.maxPos) {
       this.log(`[PC-OPEN-00] ${symbol}: max positions reached (${this.positions.length}/${this.cfg.maxPos}) — skipping`, 'warn');
       return;
     }
+    // No collision guard here, deliberately — matches PseudoWinter's own pseudoOpenShort(),
+    // which has none either. The check lives exclusively in MIC's _micIsEntryBlocked (see
+    // MultiIndicator-Chaser.html), called upstream during candidate selection, before a
+    // symbol is ever proposed to this function — same architecture as MIW's own
+    // _miwChaserHasPosition check on Winter's side. As of v2.5.0, MIC has a working host (see
+    // this file's sub-plugin loader), so that's no longer a dormant, unreachable check.
     const now       = Date.now();
     const instr     = await this.getInstrInfo(symbol);
     if (!instr) {
@@ -3309,7 +1719,7 @@ function pw() { return {
   },
 
   async pseudoWatchPositions() {
-    if (_auditRunning) return; // gap-fill audit is in progress — defer until it completes
+    if (_chAuditRunning) return; // gap-fill audit is in progress — defer until it completes
     if (this._watchRunning) return; // prevent concurrent execution
     this._watchRunning = true;
     try {
@@ -3508,7 +1918,7 @@ function pw() { return {
     for (const pos of [...this.positions]) {
       if (!pos._pseudo) continue;
       if (!this.positions.find(x => x.id === pos.id)) continue;
-      if (_closingIds.has(pos.id)) continue; // gap-audit is mid-flight for this position — skip
+      if (_chClosingIds.has(pos.id)) continue; // gap-audit is mid-flight for this position — skip
       await new Promise(r => setTimeout(r, 1000)); // 1s delay per position
 
       const mark = pos.markPrice || pos.entryPrice;
@@ -3669,16 +2079,16 @@ function pw() { return {
             const livePos = this.positions.find(p => p.id === posId);
             if (!livePos) return;
             livePos._whiplashScheduled = false;
-            if (_closingIds.has(posId)) return;
+            if (_chClosingIds.has(posId)) return;
             // Re-read the live TP — currentTpPrice is always the truth
             const _liveEffTp = livePos.currentTpPrice;
             if (_liveEffTp !== _snapTp) return;
-            _closingIds.add(posId);
+            _chClosingIds.add(posId);
             try {
               const auditFrom = Date.now() - 6 * 60 * 1000;
               const auditTo   = Date.now();
               const candles   = await this.pseudoFetchKlines(livePos.symbol, auditFrom, auditTo);
-              if (!candles.length) { _closingIds.delete(posId); return; }
+              if (!candles.length) { _chClosingIds.delete(posId); return; }
               let whiplashHit = false;
               for (const c of candles) {
                 if (_snapTp > 0 && c.h >= _snapTp) { // LONG: TP hit when candle high reaches TP
@@ -3687,15 +2097,15 @@ function pw() { return {
               }
               if (whiplashHit) {
                 this.log(`[WPL] ${this.themeEmoji} ${livePos.symbol}: whiplash audit — ${_snapIsEda ? 'EDa ' : ''}TP confirmed in klines — closing`, 'warn');
-                _closingIds.delete(posId);
+                _chClosingIds.delete(posId);
                 await this.pseudoClosePosition(livePos, 'tp', _snapTp);
               } else {
                 this.log(`[WPL] ${this.themeEmoji} ${livePos.symbol}: whiplash audit — TP not hit in klines — still open`, 'info');
-                _closingIds.delete(posId);
+                _chClosingIds.delete(posId);
               }
             } catch(e) {
               this.log(`[E05] ${this.themeEmoji} ${livePos.symbol}: whiplash audit error — ${e.message}`, 'warn');
-              _closingIds.delete(posId);
+              _chClosingIds.delete(posId);
             }
           }, 5 * 60 * 1000);
         }
@@ -3825,10 +2235,10 @@ function pw() { return {
   },
 
   renderTradeFeed() {
-    const el = document.getElementById('pw-trade-feed');
+    const el = document.getElementById('ch-trade-feed');
     if (!el) return;
-    const hdrCount = document.getElementById('pw-trade-count');
-    const hdrMeta  = document.getElementById('pw-trade-meta');
+    const hdrCount = document.getElementById('ch-trade-count');
+    const hdrMeta  = document.getElementById('ch-trade-meta');
     const _ru       = this.closedTrades.find(t => t.reason === 'period-rollup');
     const _individ  = this.closedTrades.filter(t => t.reason !== 'period-rollup');
     const _allShown = _individ;
@@ -3848,12 +2258,12 @@ function pw() { return {
       }
     }
     // Sync stats panel summary (col-stats)
-    const statsCount = document.getElementById('pw-stats-count');
-    const statsWl    = document.getElementById('pw-stats-wl');
-    const statsNet   = document.getElementById('pw-stats-net');
-    const statsLast  = document.getElementById('pw-stats-last');
-    const statsBest  = document.getElementById('pw-stats-best');
-    const statsWorst = document.getElementById('pw-stats-worst');
+    const statsCount = document.getElementById('ch-stats-count');
+    const statsWl    = document.getElementById('ch-stats-wl');
+    const statsNet   = document.getElementById('ch-stats-net');
+    const statsLast  = document.getElementById('ch-stats-last');
+    const statsBest  = document.getElementById('ch-stats-best');
+    const statsWorst = document.getElementById('ch-stats-worst');
     if (statsCount) statsCount.textContent = _totalCt > 0 ? _totalCt : '—';
     if (_totalCt > 0) {
       const _sw = _individ.filter(t => t.isWin).length + (_ru?.rollup?.wins || 0);
@@ -3890,9 +2300,9 @@ function pw() { return {
       if (statsBest)  { statsBest.textContent = '—'; }
       if (statsWorst) { statsWorst.textContent = '—'; }
     }
-    const hdrClear = document.getElementById('pw-trade-clear');
+    const hdrClear = document.getElementById('ch-trade-clear');
     if (hdrClear) hdrClear.style.display = (_totalCt > 0) ? '' : 'none';
-    const emptyEl = document.getElementById('pw-trade-empty');
+    const emptyEl = document.getElementById('ch-trade-empty');
     if (emptyEl) emptyEl.style.display = (_totalCt === 0) ? 'flex' : 'none';
 
     if (_totalCt === 0) { el.innerHTML = ''; return; }
@@ -4291,15 +2701,15 @@ function pw() { return {
 
 
   async pseudoClosePosition(pos, reason='manual', fillPrice=null) {
-    if (_closingIds.has(pos.id)) return; // module-level guard — survives object reference replacement
-    _closingIds.add(pos.id);
+    if (_chClosingIds.has(pos.id)) return; // module-level guard — survives object reference replacement
+    _chClosingIds.add(pos.id);
     if (false) {
-      _closingIds.delete(pos.id);
+      _chClosingIds.delete(pos.id);
       if (typeof this.ftClosePosition === 'function') return this.ftClosePosition(pos, reason, fillPrice);
       this.log(`[PC-FT-02] ${pos.symbol}: FT close requested but ftClosePosition is unavailable`, 'error');
       return;
     } // delegate FT to correct closer
-    if (!this.positions.find(x => x.id === pos.id)) { _closingIds.delete(pos.id); return; } // already removed
+    if (!this.positions.find(x => x.id === pos.id)) { _chClosingIds.delete(pos.id); return; } // already removed
     const exitPrice  = fillPrice || pos.markPrice || pos.entryPrice;
     const pnl        = (exitPrice - pos.entryPrice) / pos.entryPrice * pos.leverage * pos.margin;
     const pnlPct     = (exitPrice - pos.entryPrice) / pos.entryPrice * pos.leverage * 100;
@@ -4330,7 +2740,7 @@ function pw() { return {
       this.acct.upnl = this.positions.reduce((sum, p) => sum + (Number.isFinite(p.upnl) ? p.upnl : 0), 0);
       this.persist();
       this.renderTradeFeed();
-      _closingIds.delete(pos.id);
+      _chClosingIds.delete(pos.id);
       return;
     }
     this.closedTrades.unshift({
@@ -4375,13 +2785,18 @@ function pw() { return {
     this._tickerGraylist[pos.symbol] = { ts: Date.now(), isWin };
     this.persist();
     this.renderTradeFeed();
-    _closingIds.delete(pos.id);
+    _chClosingIds.delete(pos.id);
     if (this.bot.running) setTimeout(() => this.runScheduledCycle(), 500);
   },
 
+  // Filtered to entries THIS instance can actually apply — mirrors the fix on PseudoWinter's
+  // own _pluginInit (see that file). window.__pluginSystem.load() returns everything in the
+  // single shared storage key regardless of target; without this filter, Permafrost/MIW would
+  // show up here too, unmanageable ghosts, exactly the bug this whole rewrite is fixing.
   _pluginInit() {
     if (!window.__pluginSystem) return;
-    this._pluginList = window.__pluginSystem.load();
+    this._pluginList = window.__pluginSystem.load()
+      .filter(p => p.targetBot && p.targetBot.toLowerCase() === 'pseudochaser');
     this._pluginConflicts = window.__pluginSystem.checkConflicts(this._pluginList);
   },
   _pluginVersionNotice(entry, previous) {
@@ -4401,9 +2816,15 @@ function pw() { return {
     return `Updated "${name}" v${prev} → v${next} (${delta})`;
   },
 
+  // Critical: removes from the FULL shared list, then re-derives this store's filtered display
+  // list from the result — never calls save() with the filtered list itself. Saving a filtered
+  // view directly would silently overwrite the single shared storage key with only this
+  // instance's entries, erasing Permafrost/MIW in the process. This is the one thing that
+  // absolutely cannot be gotten wrong here.
   _pluginRemove(id) {
-    this._pluginList = this._pluginList.filter(p => p.id !== id);
-    window.__pluginSystem.save(this._pluginList);
+    const full = window.__pluginSystem.load().filter(p => p.id !== id);
+    window.__pluginSystem.save(full);
+    this._pluginList = full.filter(p => p.targetBot && p.targetBot.toLowerCase() === 'pseudochaser');
     this._pluginConflicts = window.__pluginSystem.checkConflicts(this._pluginList);
   },
   _pluginLoad(event) {
@@ -4422,10 +2843,14 @@ function pw() { return {
         }
         new Function(_pluginCode)();
         const plug = window.__BotPlugin;
+        delete window.__BotPlugin;
         if (!plug || !plug.id) throw new Error('No valid __BotPlugin export found');
-        const botId = window.__pluginSystem.BOT;
-        if (plug.targetBot && plug.targetBot.toLowerCase() !== botId) {
-          throw new Error(`Plugin targets "${plug.targetBot}" — this bot is "${botId}"`);
+        // window.__pluginSystem.BOT is PseudoWinter's own constant ('pseudowinter'), not this
+        // store's — using it here would have this loader reject the very plugins it exists
+        // for (Ashfall/MIC, targeting 'pseudochaser') and accept the ones that belong on
+        // PseudoWinter's own loader instead. Checked directly against 'pseudochaser' instead.
+        if (!plug.targetBot || plug.targetBot.toLowerCase() !== 'pseudochaser') {
+          throw new Error(`"${plug.name || plug.id}" doesn't target the Chaser instance — load it from PseudoWinter's own Plugin Manager instead.`);
         }
         const entry = {
           id: plug.id,
@@ -4438,15 +2863,20 @@ function pw() { return {
           requires: plug.requires || [],
           touches: plug.touches || [],
           suppresses: plug.suppresses || [],
+          providesTab: plug.providesTab || null,
           css: plug.css || '',
           slots: plug.slots || {},
           src: _pluginCode,
         };
-        const existing = this._pluginList.findIndex(p => p.id === entry.id);
-        const previous = existing >= 0 ? this._pluginList[existing] : null;
-        if (existing >= 0) this._pluginList.splice(existing, 1, entry);
-        else this._pluginList.push(entry);
-        window.__pluginSystem.save(this._pluginList);
+        // Same critical merge-before-save as _pluginRemove above — read and write the FULL
+        // shared list, never this store's filtered view.
+        const full = window.__pluginSystem.load();
+        const existingFull = full.findIndex(p => p.id === entry.id);
+        const previous = existingFull >= 0 ? full[existingFull] : null;
+        if (existingFull >= 0) full.splice(existingFull, 1, entry);
+        else full.push(entry);
+        window.__pluginSystem.save(full);
+        this._pluginList = full.filter(p => p.targetBot && p.targetBot.toLowerCase() === 'pseudochaser');
         this._pluginConflicts = window.__pluginSystem.checkConflicts(this._pluginList);
         const notice = this._pluginVersionNotice(entry, previous);
         if (notice) this._pluginNotices = [notice, ...(this._pluginNotices || [])].slice(0, 5);
@@ -4462,152 +2892,626 @@ function pw() { return {
 
 };}
 
-// ─── PLUGIN SYSTEM ───────────────────────────────────────────────────────────
-(function _pluginSystem() {
-  // Own key — PseudoWinter uses __pw_plugins_v1; sharing it caused cross-bot
-  // clobbering when both bots are served from the same origin.
-  const _PS_KEY = '__pc_plugins_v1';
-  const _PS_BOT = 'pseudochaser';
-
-  function _psLoad() {
-    try { return JSON.parse(localStorage.getItem(_PS_KEY) || '[]'); }
-    catch(e) { return []; }
-  }
-
-  function _psSort(plugins) {
-    const ids = new Set(plugins.map(p => p.id));
-    const prereqs = {};
-    for (const p of plugins) prereqs[p.id] = new Set();
-    for (const p of plugins) {
-      for (const dep of (p.after || [])) { if (ids.has(dep)) prereqs[p.id].add(dep); }
-      for (const dep of (p.before || [])) { if (ids.has(dep)) { if (!prereqs[dep]) prereqs[dep] = new Set(); prereqs[dep].add(p.id); } }
-    }
-    const order = [], visited = new Set();
-    const queue = plugins.filter(p => prereqs[p.id].size === 0).map(p => p.id);
-    visited.add(...(queue.length ? queue : []));
-    while (queue.length) {
-      const cur = queue.shift();
-      order.push(cur);
-      for (const p of plugins) {
-        if (!visited.has(p.id) && prereqs[p.id].has(cur)) {
-          prereqs[p.id].delete(cur);
-          if (prereqs[p.id].size === 0) { visited.add(p.id); queue.push(p.id); }
-        }
-      }
-    }
-    return order.length === plugins.length ? order.map(id => plugins.find(p => p.id === id)) : plugins;
-  }
-
-  window.__pluginSystem = {
-    KEY: _PS_KEY,
-    BOT: _PS_BOT,
-    load: _psLoad,
-    sort: _psSort,
-    save(plugins) { localStorage.setItem(_PS_KEY, JSON.stringify(plugins)); },
-    checkConflicts(plugins) {
-      const warns = [];
-      const ids = new Set(plugins.map(p => p.id));
-      const suppressedBy = {};
-      for (const p of plugins) {
-        for (const cid of (p.conflicts || [])) { if (ids.has(cid)) warns.push(`"${p.name}" conflicts with "${cid}"`); }
-        for (const rid of (p.requires || [])) { if (!ids.has(rid)) warns.push(`"${p.name}" requires "${rid}" (not loaded)`); }
-        for (const fn of (p.suppresses || [])) {
-          if (suppressedBy[fn]) warns.push(`"${p.name}" and "${suppressedBy[fn]}" both suppress "${fn}" — last loaded wins`);
-          else suppressedBy[fn] = p.name;
-        }
-        if (!p.src && p.transformSrc) warns.push(`"${p.name}" was saved by an older loader and is inactive — re-load its plugin file`);
-      }
-      return warns;
-    }
-  };
-
-  // Registry of every cfg key referenced anywhere in this script or any currently-stored
-  // plugin's source — lets _pruneRetiredCfg() delete keys from a retired feature
-  // automatically instead of hand-maintaining a shrinking "delete d.cfg.X" list at every
-  // import (see importData). A key only counts as "known" while something in the current
-  // codebase actually references cfg.<key> somewhere, read or write.
-  const _knownCfgKeys = new Set();
-  const _scanCfgKeys = (text) => {
-    const re = /cfg\??\.(\w+)/g;
-    let m;
-    while ((m = re.exec(text))) _knownCfgKeys.add(m[1]);
-  };
-  if (document.currentScript) _scanCfgKeys(document.currentScript.textContent);
-
-  // Skip plugins saved for a different bot (the two bots may share an origin)
-  const stored = _psLoad().filter(p => {
-    if (p.targetBot && p.targetBot.toLowerCase() !== _PS_BOT) {
-      console.warn('[Plugin] "' + p.id + '" targets "' + p.targetBot + '" — skipped on ' + _PS_BOT);
-      return false;
-    }
-    return true;
+  // ── Store registration — alpine:init fires before Alpine scans/mounts the DOM, which is
+  //    the correct place to register a store (Alpine docs: stores should exist before any
+  //    component that references them mounts). init() is called explicitly right after
+  //    registration rather than relying on any implicit Alpine store lifecycle hook, since
+  //    that behavior isn't part of Alpine's documented store contract.
+  //
+  //    Sub-plugin loader — Ashfall and MIC still declare targetBot: 'pseudochaser', which used
+  //    to mean "load into PseudoChaser's own window.pw()". That hook point doesn't exist
+  //    anymore now that chaser is a store, not a page — this rebuilds the same mechanism at
+  //    the store level instead of inventing a new one. It's a direct reuse of PseudoWinter's
+  //    own plugin system (window.__pluginSystem.load/sort, the same re-execute-src-then-
+  //    transform loop from PseudoWinter's tail IIFE), re-targeted at 'pseudochaser' entries
+  //    and applied to the chaser object before Alpine.store() rather than to a window.pw
+  //    function. PseudoWinter's own loader already skips 'pseudochaser'-targeted plugins (see
+  //    its stored.filter check) — both loaders read the same single stored list and correctly
+  //    partition it by target, since window.__pluginSystem's storage isn't itself bot-scoped. ──
+  // ── Export/Import portals — chaser's own, entirely separate from PseudoWinter's own
+  //    #pw-export-portal/#pw-import-portal (different DOM ids, different data). Built the same
+  //    way PseudoWinter's own are: vanilla DOM + addEventListener, not Alpine directives on the
+  //    portal itself — matches the existing pattern (see PseudoWinter.html's own portals) and
+  //    sidesteps needing an x-data wrapper around a fixed-position full-screen overlay. Ashfall
+  //    Profile is a 4th export option Winter's own menu doesn't have — see Ashfall's own
+  //    afExportAll()/afImport(), reused here as-is; only shown if Ashfall actually loaded
+  //    (checked at click time, not baked into this static HTML, since plugin load state isn't
+  //    known yet when this string is built). ──
+  document.body.insertAdjacentHTML('beforeend', `
+    <div id="pc-export-portal" style="display:none;position:fixed;inset:0;z-index:5002;align-items:center;justify-content:center;padding:16px;background:rgba(5,8,16,.92);backdrop-filter:blur(6px)">
+      <div class="modal-box" style="width:400px">
+        <div class="modal-title" style="color:rgba(255,150,80,.9)">↓ Export Chaser Data</div>
+        <div class="modal-sub" style="margin-bottom:18px">Choose what to export. Each file can be re-imported individually.</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <button class="btn" style="font-size:10px;padding:7px;border-color:rgba(255,150,80,.4);color:rgba(255,150,80,.9)" id="pc-export-configs">
+            ⚙ Configs
+            <span style="font-size:9px;opacity:.7;display:block;letter-spacing:.5px;margin-top:1px">Strategy settings &amp; all config params</span>
+          </button>
+          <button class="btn btn-ghost" style="font-size:10px;padding:7px" id="pc-export-positions">
+            📊 Positions &amp; Trades
+            <span style="font-size:9px;color:var(--text-lo);display:block;letter-spacing:.5px;margin-top:1px">Active positions, session stats, closed trade history</span>
+          </button>
+          <button class="btn btn-ghost" style="font-size:10px;padding:7px" id="pc-export-log">
+            📋 Activity Log
+            <span style="font-size:9px;color:var(--text-lo);display:block;letter-spacing:.5px;margin-top:1px">Current activity log entries</span>
+          </button>
+          <button class="btn btn-ghost" style="font-size:10px;padding:7px" id="pc-export-ashfall">
+            🩸 Ashfall Profile
+            <span style="font-size:9px;color:var(--text-lo);display:block;letter-spacing:.5px;margin-top:1px">Scorecard, liq history, OC history — requires Ashfall loaded</span>
+          </button>
+          <button class="btn btn-ghost" style="font-size:10px;padding:7px;margin-top:4px" id="pc-export-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <div id="pc-import-portal" style="display:none;position:fixed;inset:0;z-index:5001;align-items:center;justify-content:center;padding:16px;background:rgba(5,8,16,.92);backdrop-filter:blur(6px)">
+      <div class="modal-box" style="width:400px">
+        <div class="modal-title" style="color:rgba(255,150,80,.9)">↑ Confirm Chaser Import</div>
+        <div class="modal-sub">This will overwrite existing chaser data of the matching type.</div>
+        <div id="pc-import-meta" style="margin-top:10px;padding:8px 10px;background:var(--bg-raised);border:1px solid var(--border);border-radius:3px;font-family:var(--mono);font-size:9.5px;color:var(--text-mid);line-height:1.8">
+          <div>Type: <span id="pc-import-type" style="color:rgba(255,150,80,.9)">—</span></div>
+          <div>Exported: <span id="pc-import-exported" style="color:rgba(255,150,80,.9)">—</span></div>
+          <div>Positions: <span id="pc-import-positions" style="color:rgba(255,150,80,.9)">—</span></div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:16px">
+          <button class="btn btn-ghost" style="flex:1;font-size:10px;padding:7px" id="pc-import-cancel">Cancel</button>
+          <button class="btn btn-red" style="flex:1;font-size:10px;padding:7px" id="pc-import-confirm">Confirm</button>
+        </div>
+      </div>
+    </div>
+  `);
+  function _getChaserStore() { return window.Alpine?.store?.('chaser') || null; }
+  document.getElementById('pc-export-cancel')?.addEventListener('click', () => { const s = _getChaserStore(); if (s) s.showExportMenu = false; });
+  document.getElementById('pc-export-configs')?.addEventListener('click', () => { const s = _getChaserStore(); if (!s) return; s.exportData('configs'); s.showExportMenu = false; });
+  document.getElementById('pc-export-positions')?.addEventListener('click', () => { const s = _getChaserStore(); if (!s) return; s.exportData('positions'); s.showExportMenu = false; });
+  document.getElementById('pc-export-log')?.addEventListener('click', () => { const s = _getChaserStore(); if (!s) return; s.exportData('log'); s.showExportMenu = false; });
+  document.getElementById('pc-export-ashfall')?.addEventListener('click', () => {
+    const s = _getChaserStore(); if (!s) return;
+    if (typeof s.afExportAll === 'function') s.afExportAll();
+    else s.log("[EXP] Ashfall isn't loaded — nothing to export.", 'warn');
+    s.showExportMenu = false;
   });
-  for (const p of stored) { if (p.src) _scanCfgKeys(p.src); }
+  document.getElementById('pc-import-cancel')?.addEventListener('click', () => {
+    const s = _getChaserStore(); if (!s) return;
+    s.showImportConfirm = false; s._pendingImport = null;
+  });
+  document.getElementById('pc-import-confirm')?.addEventListener('click', () => {
+    const s = _getChaserStore(); if (!s || !s._pendingImport) return;
+    s.importData(); s.showImportConfirm = false; s.showDangerZone = false;
+  });
 
-  const _origPw = pw;
-  window.pw = function() {
-    let def = _origPw();
-    def._knownCfgKeys = _knownCfgKeys;
-    return def;
-  };
-
-  if (!stored.length) return;
-
-  const sorted = _psSort(stored);
-
-  for (const p of sorted) {
-    if (!p.css) continue;
-    const s = document.createElement('style');
-    s.setAttribute('data-plugin-id', p.id);
-    s.textContent = p.css;
-    document.head.appendChild(s);
-  }
-
-  // Re-execute each plugin's stored source to rebuild its live object (closure
-  // constants intact), then apply its transform. Stringified-function entries
-  // from the old loader (transformSrc) cannot be revived — checkConflicts flags them.
-  const _origPw2 = window.pw;
-  window.pw = function() {
-    let def = _origPw2();
-    for (const p of sorted) {
-      if (!p.src) {
-        if (p.transformSrc) console.warn('[Plugin] "' + p.id + '" was saved by an older loader — re-load its file to activate it.');
-        continue;
+  document.addEventListener('alpine:init', () => {
+    let chaserObj = chFactory();
+    try {
+      if (window.__pluginSystem) {
+        const stored = window.__pluginSystem.load()
+          .filter(p => (p.targetBot || '').toLowerCase() === 'pseudochaser');
+        const sorted = window.__pluginSystem.sort(stored);
+        for (const p of sorted) {
+          if (!p.css) continue;
+          const s = document.createElement('style');
+          s.setAttribute('data-plugin-id', p.id);
+          s.textContent = p.css;
+          document.head.appendChild(s);
+        }
+        for (const p of sorted) {
+          if (!p.src) {
+            if (p.transformSrc) console.warn('[Chaser Plugin] "' + p.id + '" was saved by an older loader — re-load its file to activate it.');
+            continue;
+          }
+          try {
+            delete window.__BotPlugin;
+            new Function(p.src)();
+            const live = window.__BotPlugin;
+            delete window.__BotPlugin;
+            if (!live || live.id !== p.id) throw new Error('source did not export plugin "' + p.id + '"');
+            if (typeof live.transform === 'function') chaserObj = live.transform(chaserObj);
+          } catch(e) { console.error('[Chaser Plugin] "' + p.id + '" transform failed:', e); }
+        }
+        // Slot injection for chaser's own sub-plugins — same mechanism as PseudoWinter's own,
+        // but scoped: only fills slots inside elements carrying data-chaser-plugin-slot (not
+        // the plain data-plugin-slot PseudoWinter's own loader already claimed), so a chaser
+        // sub-plugin's accordion can't accidentally land inside PseudoWinter's own config
+        // panel. Neither Ashfall nor MIC currently declares any slots, so this is untested
+        // against real content — flagging rather than leaving silently unverified.
+        for (const p of sorted) {
+          if (!p.slots) continue;
+          for (const [slot, html] of Object.entries(p.slots)) {
+            document.querySelectorAll('[data-chaser-plugin-slot="' + slot + '"]').forEach(el => {
+              el.insertAdjacentHTML('beforeend', html);
+            });
+          }
+        }
       }
-      try {
-        delete window.__BotPlugin;
-        new Function(p.src)();
-        const live = window.__BotPlugin;
-        delete window.__BotPlugin;
-        if (!live || live.id !== p.id) throw new Error('source did not export plugin "' + p.id + '"');
-        if (typeof live.transform === 'function') def = live.transform(def);
-      } catch(e) { console.error('[Plugin] "' + p.id + '" transform failed:', e); }
-    }
-    return def;
-  };
+    } catch(e) { console.error('[Chaser Plugin] sub-plugin loader failed:', e); }
 
-  for (const p of sorted) {
-    if (!p.slots) continue;
-    for (const [slot, html] of Object.entries(p.slots)) {
-      // Fill anchors in the live DOM and inside <template> fragments (e.g. the
-      // x-for position card), which document.querySelectorAll cannot reach.
-      const fill = (root) => {
-        root.querySelectorAll('[data-plugin-slot="' + slot + '"]').forEach(el => {
-          el.insertAdjacentHTML('beforeend', html);
-        });
-        root.querySelectorAll('template').forEach(t => fill(t.content));
-      };
-      fill(document);
-    }
-  }
+    Alpine.store('chaser', chaserObj);
+    Alpine.store('chaser').init();
+  });
+
+  window.__BotPlugin = {
+    id:        'pseudochaser',
+    name:      'PseudoChaser',
+    version:   '2.8.0',
+    targetBot: 'pseudowinter',
+    after:     ['permafrost-winter', 'multiindicator-winter'],
+    before:    [],
+    conflicts: [],
+    requires:  [],
+    touches:   [],
+    providesTab: { id: 'chaser', label: 'PSEUDOCHASER', appName: 'PSEUDOCHASER', emoji: '🔆' },
+
+    css: `
+      .ch-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+    `,
+
+    slots: {
+      // ── Checkpoint scope note: this first pass wires the store, its position/DCA/monitor/
+      //    close engine (ported unchanged), and the shared-data mechanism. The UI below is a
+      //    minimal placeholder — full position cards, trades feed renderer, and stats summary
+      //    (matching PseudoWinter's own panel layouts) are follow-up work, not yet ported. ──
+      'strategy-accordions': `
+        <span x-effect="
+          const ep = document.getElementById('pc-export-portal');
+          if (ep) ep.style.display = $store.chaser.showExportMenu ? 'flex' : 'none';
+        "></span>
+        <span x-effect="
+          const ip = document.getElementById('pc-import-portal');
+          if (ip) ip.style.display = $store.chaser.showImportConfirm ? 'flex' : 'none';
+          if ($store.chaser.showImportConfirm) {
+            const imp = $store.chaser._pendingImport;
+            const typeEl = document.getElementById('pc-import-type');
+            const expEl  = document.getElementById('pc-import-exported');
+            const posEl  = document.getElementById('pc-import-positions');
+            if (typeEl) typeEl.textContent = imp?.exportType === 'configs' ? 'Configs' : imp?.exportType === 'log' ? 'Activity Log' : imp?.scorecard ? 'Ashfall Profile' : 'Positions & Trades';
+            if (expEl)  expEl.textContent  = imp?.exportedAt ? new Date(imp.exportedAt).toLocaleString() : '—';
+            if (posEl)  posEl.textContent  = Array.isArray(imp?.positions) ? imp.positions.length : '—';
+          }
+        "></span>
+        <div x-data="{ open: false }" x-show="activeTab==='chaser'">
+          <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span>🔆 PseudoChaser</span>
+              <span x-show="$store.chaser.bot.running" style="font-size:8px;padding:1px 5px;background:rgba(255,150,80,.15);border:1px solid rgba(255,150,80,.3);border-radius:2px;color:rgba(255,150,80,.9);letter-spacing:1px">RUNNING</span>
+              <span x-show="!$store.chaser.bot.running" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">STOPPED</span>
+              <span data-chaser-plugin-slot="mode-label-extra" x-data="$store.chaser"></span>
+            </div>
+            <span class="cfg-acc-arrow">▾</span>
+          </button>
+          <div class="cfg-acc-body" x-show="open" x-collapse>
+            <div class="g">
+              <div class="lbl">Operational Mode</div>
+              <button @click="$store.chaser._chSetOperationalMode($store.chaser.cfg.chOperationalMode==='winter'?'chaser':$store.chaser.cfg.chOperationalMode==='chaser'?'both':'winter')"
+                style="font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:3px;border:1px solid rgba(255,150,80,.35);background:rgba(255,150,80,.08);color:rgba(255,150,80,.9);cursor:pointer;letter-spacing:.5px;margin-top:4px"
+                x-text="{winter:'WINTER ONLY',chaser:'CHASER ONLY',both:'BOTH ACTIVE'}[$store.chaser.cfg.chOperationalMode]"></button>
+              <div class="ch-hint">Which side opens new positions. Turning a side off bails its open positions. Scanning is always shared either way.</div>
+            </div>
+            <div class="g" style="margin-top:8px">
+              <div class="lbl">View</div>
+              <button @click="activeTab = activeTab==='winter' ? 'chaser' : 'winter'" title="Same as clicking the app name at the top"
+                style="font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:3px;border:1px solid rgba(126,232,250,.35);background:rgba(126,232,250,.08);color:rgba(126,232,250,.9);cursor:pointer;letter-spacing:.5px;margin-top:4px"
+                x-text="activeTab==='winter' ? 'SWITCH TO CHASER' : 'SWITCH TO WINTER'"></button>
+            </div>
+            <!-- Chaser's own sub-plugins (Ashfall, MIC) nest here — a distinct attribute name
+                 from PseudoWinter's own data-plugin-slot="strategy-accordions", so their
+                 accordions land inside the Chaser accordion instead of PseudoWinter's
+                 page-level config list, where they'd be confusing (Ashfall/MIC concern the
+                 chaser instance specifically, not Winter).
+                 x-data="$store.chaser" is required here, not optional: Ashfall's own accordion
+                 HTML was written for the flat-merge architecture (Permafrost's own pattern) —
+                 it uses bare this.X / cfg.X / _afScoreBuild() throughout, assuming Alpine
+                 resolves those against whatever object transform() actually modified (this
+                 store). Without this wrapper, those bare references would resolve against
+                 PseudoWinter's own component instead, since this anchor sits inside PW's
+                 x-data="pw()" tree otherwise. Safe against double-init: chFactory()'s init()
+                 is guarded by this._initDone, so Alpine re-calling it here (mounting x-data on
+                 an already-registered store) is a no-op, not a duplicate timer setup. -->
+            <div data-chaser-plugin-slot="strategy-accordions" x-data="$store.chaser" style="margin-top:6px"></div>
+
+            <!-- Chaser's own Plugin Manager — inline rather than a separate modal (PseudoWinter's
+                 own uses a full-screen modal; this accordion is already a contained settings
+                 area, so a modal-on-modal felt like more chrome than the content needs). Reads/
+                 writes the same shared window.__pluginSystem storage as PseudoWinter's own, just
+                 filtered to pseudochaser-targeted entries — see _pluginInit/_pluginLoad/
+                 _pluginRemove in the main script for the merge-before-save details that keep
+                 this from clobbering Permafrost/MIW's own entries. -->
+            <div x-data="{ pmOpen: false }" style="margin-top:10px;border-top:1px solid var(--border);padding-top:8px">
+              <button @click="pmOpen=!pmOpen" style="background:none;border:none;font-family:var(--mono);font-size:9px;color:var(--text-lo);letter-spacing:1.5px;cursor:pointer;text-transform:uppercase">
+                ⊕ Plugin Manager <span x-show="$store.chaser._pluginList.length>0" style="color:rgba(255,150,80,.9)" x-text="'('+$store.chaser._pluginList.length+')'"></span>
+              </button>
+              <div x-show="pmOpen" style="margin-top:8px">
+                <div x-show="$store.chaser._pluginNotices.length>0" style="background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.28);border-radius:6px;padding:8px 10px;margin-bottom:10px">
+                  <div style="font-size:9px;color:var(--profit);font-family:var(--mono);margin-bottom:4px">PLUGIN LOAD NOTES</div>
+                  <template x-for="n in $store.chaser._pluginNotices" :key="n">
+                    <div style="font-size:9px;color:var(--profit);margin-top:2px" x-text="n"></div>
+                  </template>
+                </div>
+                <div x-show="$store.chaser._pluginList.length===0" style="text-align:center;padding:16px 0;color:var(--text-lo);font-size:10px;font-family:var(--mono)">No chaser plugins loaded</div>
+                <template x-for="p in $store.chaser._pluginList" :key="p.id">
+                  <div style="background:var(--bg-hover);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:6px">
+                    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px">
+                      <div>
+                        <div style="font-size:11px;color:var(--text-hi);font-weight:600" x-text="p.name"></div>
+                        <div style="font-size:9px;color:var(--text-lo);font-family:var(--mono);margin-top:2px" x-text="'v'+p.version"></div>
+                      </div>
+                      <button @click="$store.chaser._pluginRemove(p.id)" style="background:rgba(255,69,96,0.12);border:1px solid rgba(255,69,96,0.25);color:#ff4560;font-size:9px;padding:2px 7px;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0">Remove</button>
+                    </div>
+                  </div>
+                </template>
+                <div style="margin-top:8px">
+                  <div style="font-size:9px;color:var(--text-lo);margin-bottom:6px">Load a plugin targeting the Chaser instance (.js or .html). Changes take effect after reload.</div>
+                  <label style="display:inline-block;background:var(--bg-hover);border:1px solid var(--border-hi);border-radius:5px;padding:5px 10px;font-size:10px;color:rgba(255,150,80,.9);cursor:pointer;font-family:var(--mono)">
+                    ⊕ Load Plugin File
+                    <input type="file" accept=".js,.html" style="display:none" @change="$store.chaser._pluginLoad($event)">
+                  </label>
+                  <div x-show="$store.chaser._pluginFileErr" style="margin-top:6px;font-size:9px;color:#ff4560;font-family:var(--mono)" x-text="$store.chaser._pluginFileErr"></div>
+                </div>
+                <div x-show="$store.chaser._pluginList.length>0" style="margin-top:8px;font-size:8.5px;color:var(--text-lo);font-family:var(--mono);text-align:center">
+                  Load order: <span x-text="$store.chaser._pluginList.map(p=>p.name).join(' → ')"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `,
+
+      'alt-tab-positions': `
+        <template x-if="activeTab==='chaser'">
+        <div style="padding:11px 13px;border-bottom:1px solid var(--border)" x-show="$store.chaser.positions.length>0">
+          <div class="sec-ttl" style="margin-bottom:9px">Chaser Positions <em x-text="$store.chaser.positions.length+' active'"></em></div>
+          <template x-for="p in $store.chaser.positions" :key="p.id">
+          <div class="pos-card">
+            <div class="pos-head">
+              <div style="display:flex;align-items:center;gap:7px;min-width:0">
+                <span class="pos-sym" x-text="fmtSym(p.symbol)"></span>
+                <span class="side-badge" style="color:var(--profit);border-color:rgba(0,229,160,.4)">▲ LONG</span>
+                <span class="phase-b"
+                  :class="p.pendingClose?'force':p.phase"
+                  x-text="p.pendingClose?'RETRY CLOSE':(p.phase==='normal'?'Active':'CLOSING')"></span>
+
+              </div>
+              <div class="pos-pnl" :class="p.upnl>=0?'p':'l'"
+                   x-text="(p.upnl>=0?'+':'')+p.upnl.toFixed(2)+' USDT'"></div>
+            </div>
+            <div class="pos-grid">
+              <div class="ps"><div class="psl">Entry</div> <div class="psv ice"  x-text="fmtP(p.originalEntryPrice ?? p.entryPrice)"></div></div>
+              <div class="ps"><div class="psl">Mark</div>  <div class="psv"      x-text="fmtP(p.markPrice)"></div></div>
+              <div class="ps" style="display:none"><div class="psl">Size</div>  <div class="psv" x-text="p.totalSize"></div></div>
+              <div class="ps"><div class="psl">Lev</div>   <div class="psv"      x-text="p.leverage+'×'"></div></div>
+              <div class="ps"><div class="psl">Margin</div><div class="psv"      x-text="'$'+p.margin.toFixed(2)"></div></div>
+              <div class="ps"><div class="psl">24h Chg</div><div class="psv" :class="'short'" x-text="(()=>{const v=parseFloat(p.change24h);if(!Number.isFinite(v))return'—';const r=+v.toFixed(4);return (r>=0?'+':'')+r+'%';})()"></div></div>
+              <!-- SalF: LSA ratio at entry (static, captured on open) -->
+              <div class="ps" x-show="false">
+                <div class="psl">LSA at Entry</div>
+                <div class="psv" style="color:#2dd4bf;font-family:var(--mono)" x-text="p._salfLsaRatio!=null?p._salfLsaRatio.toFixed(2)+'×':'—'"></div>
+              </div>
+              <div class="ps" style="min-width:0;overflow:hidden">
+                <div class="psl">Current TP</div>
+                <div class="psv" style="color:var(--profit);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" x-text="p.tpPct+'%  '+fmtP(p.currentTpPrice)"></div>
+              </div>
+              <!-- Funding Rate + Round countdown -->
+              <div class="ps" x-show="p.fundingRate!=null">
+                <div class="psl">Funding Rate</div>
+                <div class="psv" :class="p.fundingRate>0?'profit':(p.fundingRate<0?'short':'')" x-text="p.fundingRate!=null?(p.fundingRate>=0?'+':'')+p.fundingRate.toFixed(4)+'%':'—'"></div>
+              </div>
+              <div class="ps" x-show="p.fundingRate!=null">
+                <div class="psl" x-text="'Round ('+(Math.round((p._fundingIntervalMs||p._funIntervalMs||8*3600000)/3600000))+'h)'"></div>
+                <div class="psv" style="color:var(--text-lo);font-family:var(--mono);font-size:10px" x-text="(()=>{
+                  void $store.chaser.tick;
+                  const now=Date.now();
+                  let ms;
+                  if (false) {
+                    const iv = p._fundingIntervalMs || p._funIntervalMs || 8*3600000;
+                    let next = p._funNextFundingTime;
+                    while (next <= now) next += iv;
+                    ms = next - now;
+                  } else {
+                    const iv = p._fundingIntervalMs || p._funIntervalMs || 8*3600000;
+                    const next=Math.ceil((now+1)/iv)*iv;
+                    ms=next-now;
+                  }
+                  const h=Math.floor(ms/3600000);
+                  const m=Math.floor((ms%3600000)/60000);
+                  const s=Math.floor((ms%60000)/1000);
+                  return (h>0?h+'h ':'')+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s';
+                })()"></div>
+              </div>
+              <!-- Accrued Funding -->
+              <div class="ps" x-show="p.fundingRate!=null && $store.chaser.tick>=0 && (()=>{const iv=p._fundingIntervalMs||p._funIntervalMs||8*3600000;return Math.max(0,Math.floor(Date.now()/iv)-Math.ceil(p.openedAt/iv)+1)})()>0">
+                <div class="psl" x-text="'Accrued Funding ('+(Math.round((p._fundingIntervalMs||p._funIntervalMs||8*3600000)/3600000))+'h)'"></div>
+                <div class="psv" :class="(()=>{const iv=p._fundingIntervalMs||p._funIntervalMs||8*3600000;const n=Math.max(0,Math.floor(Date.now()/iv)-Math.ceil(p.openedAt/iv)+1);const f=p._fundingAccrued!=null?p._fundingAccrued:(p.fundingRate/100)*((p.markPrice||p.entryPrice)*p.totalSize)*n;return f>=0?'profit':'short'})()">
+                  <span x-text="(()=>{
+                    const iv=p._fundingIntervalMs||p._funIntervalMs||8*3600000;
+                    const n=Math.max(0,Math.floor(Date.now()/iv)-Math.ceil(p.openedAt/iv)+1);
+                    const f=p._fundingAccrued!=null?p._fundingAccrued:(p.fundingRate/100)*((p.markPrice||p.entryPrice)*p.totalSize)*n;
+                    const tag=p._fundingAccrued!=null?'':'~';
+                    return (f>=0?'+':'')+f.toFixed(3)+' USDT ('+n+'×'+tag+')';
+                  })()"></span>
+                </div>
+              </div>
+              <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="(()=>{ const slRoi = p._slPctOverride ?? ($store.chaser.cfg.binaryModeEnabled ? ($store.chaser.cfg.binarySlPct??18) : 105); return '~−'+slRoi.toFixed(1)+'%  '+fmtP(p.slPrice); })()"></div></div>
+            </div>
+            <!-- ── PRICE LADDER BAR ── -->
+            <div x-data="{
+              get orders()    { return p.orders || []; },
+              get allConds()  { return this.orders.filter(o => o.type === 'cond'); },
+              get condOrders() {
+                const ep = p.entryPrice;
+                return this.allConds.filter(o => !(o.filled && o.price <= ep));
+              },
+              get totalSegs() { return this.condOrders.length + 2; },
+              get sw()        { return 100 / this.totalSegs; },
+              get cursorPct() {
+                const mk = p.markPrice, ep = p.entryPrice, tp = p.currentTpPrice;
+                const cos  = this.condOrders;
+                const adds = cos.map(o => o.price);
+                const allFired = this.allConds.length > 0 && this.allConds.every(o => o.filled);
+                const farRight = ((allFired || this.allConds.length === 0) && p.slSet && p.slPrice) ? p.slPrice : null;
+                const prices = [tp, ep, ...adds, ...(farRight ? [farRight] : [])];
+                const n = this.totalSegs;
+                const sw = this.sw;
+                if (!mk || !ep) return sw;
+                for (let i = 0; i < n; i++) {
+                  const lo = prices[i], hi = prices[i+1];
+                  if (!lo || !hi) continue;
+                  const segStart = i * sw;
+                  if (i === 0) {
+                    if (mk < lo)  return 0;
+                    if (mk <= hi) return segStart + (mk - lo) / (hi - lo) * sw;
+                  } else {
+                    if (mk >= lo && mk <= hi) return segStart + (mk - lo) / (hi - lo) * sw;
+                    if (mk > hi && i === n-1) return 100;
+                  }
+                }
+                return mk < (prices[0]||0) ? 0 : 100;
+              },
+              fillPct(si) {
+                const sw = this.sw;
+                const segStart = si * sw, segEnd = (si + 1) * sw;
+                const c = this.cursorPct;
+                if (c <= segStart) return 0;
+                if (c >= segEnd)   return 1;
+                return (c - segStart) / sw;
+              },
+              segTriggered(si) {
+                if (si < 2) return false;
+                const co = this.condOrders[si - 2];
+                return co ? !!co.filled : false;
+              },
+              segLabel(si) {
+                if (si === 0) return 'TP';
+                if (si === 1) return 'ENTRY';
+                const co = this.condOrders[si - 2];
+                return co ? co.label.replace('Add','A') : '';
+              },
+              segPrice(si) {
+                if (si === 0) return p.currentTpPrice;
+                if (si === 1) return p.entryPrice;
+                const co = this.condOrders[si - 2];
+                return co ? co.price : null;
+              }
+            }" style="padding:6px 10px 8px;isolation:isolate">
+
+              <!-- Bar — taller to fit inline labels -->
+              <div style="position:relative;height:34px;border-radius:3px;overflow:visible;display:flex">
+                <template x-for="si in Array.from({length:totalSegs},(_,i)=>i)" :key="si">
+                  <div :style="
+                    'position:relative;flex:1;height:100%;overflow:hidden;' +
+                    'background:' + (si===0 ? 'rgba(0,229,160,0.05)' : si===1 ? 'rgba(126,232,250,0.05)' : segTriggered(si) ? 'rgba(240,192,96,0.10)' : 'rgba(240,192,96,0.04)') + ';' +
+                    'border-top:'    + (si===1 ? '1px' : segTriggered(si) ? '2px' : '1px') + ' solid ' + (si===0 ? 'rgba(0,229,160,0.35)' : si===1 ? 'rgba(126,232,250,0.45)' : segTriggered(si) ? 'rgba(240,192,96,0.85)' : 'rgba(240,192,96,0.22)') + ';' +
+                    'border-bottom:' + (si===1 ? '1px' : segTriggered(si) ? '2px' : '1px') + ' solid ' + (si===0 ? 'rgba(0,229,160,0.35)' : si===1 ? 'rgba(126,232,250,0.45)' : segTriggered(si) ? 'rgba(240,192,96,0.85)' : 'rgba(240,192,96,0.22)') + ';' +
+                    (si===0 ? 'border-left:1px solid rgba(0,229,160,0.35);border-radius:3px 0 0 3px;' : '') +
+                    (si===totalSegs-1 ? 'border-right:' + (segTriggered(si)&&si!==1?'2px':'1px') + ' solid ' + (si===1?'rgba(126,232,250,0.45)':segTriggered(si)?'rgba(240,192,96,0.85)':'rgba(240,192,96,0.22)') + ';border-radius:0 3px 3px 0;' : '') +
+                    (segTriggered(si) && si!==1 ? 'box-shadow:0 0 6px rgba(240,192,96,0.35),inset 0 0 8px rgba(240,192,96,0.08);' : '')
+                  ">
+                    <!-- Fill -->
+                    <div :style="
+                      'position:absolute;top:0;left:0;bottom:0;' +
+                      'width:' + (fillPct(si)*100) + '%;' +
+                      'transition:width 0.45s ease;' +
+                      'background:' + (
+                        si === 0 ? 'rgba(0,229,160,0.45)' :
+                        si === 1 ? 'rgba(126,232,250,0.28)' :
+                        segTriggered(si) ? 'rgba(240,192,96,0.50)' : 'rgba(240,192,96,0.28)'
+                      )
+                    "></div>
+                    <!-- Inline label — bright white text for contrast against all fill colors -->
+                    <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;pointer-events:none;z-index:4">
+                      <span style="font-family:var(--mono);font-size:7.5px;letter-spacing:0.5px;line-height:1;color:#ddeef8;text-shadow:0 1px 3px rgba(0,0,0,0.8)"
+                            x-text="segLabel(si)+(si>1&&segTriggered(si)?' ⚡':'')"></span>
+                      <span style="font-family:var(--mono);font-size:7px;line-height:1;color:rgba(221,238,248,0.70);text-shadow:0 1px 3px rgba(0,0,0,0.8)"
+                            x-text="fmtP(segPrice(si))"></span>
+                    </div>
+                    <!-- Divider $store.chaser.tick -->
+                    <div x-show="si > 0" style="position:absolute;left:0;top:-3px;bottom:-3px;width:1px;z-index:5"
+                      :style="'background:' + (si===1 ? 'rgba(126,232,250,0.60)' : 'rgba(126,232,250,0.18)')"></div>
+                    <!-- Entry divider — taller & brighter -->
+                    <div x-show="si === 1" style="position:absolute;left:-1px;top:-5px;bottom:-5px;width:2px;background:rgba(126,232,250,0.70);box-shadow:0 0 4px rgba(126,232,250,0.4);z-index:6"></div>
+                  </div>
+                </template>
+              </div>
+
+            </div>
+            <div class="pos-timer">
+              <span>Open: <span x-text="fmtAge(p.openedAt, $store.chaser.tick)"></span></span>
+              <span x-show="p.phase==='normal'">Force close in: <span class="hi" x-text="cdTo(p.openedAt+($store.chaser.cfg.runtimeHours*3600000), $store.chaser.tick)"></span></span>
+              <span x-show="p.openedAt" style="color:var(--text-lo)" x-text="p.openedAt?(()=>{const d=new Date(p.openedAt);return d.toLocaleDateString([],{month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});})():''"></span>
+            </div>
+          </div>
+
+          </template>
+        </div>
+        </template>
+      `,
+
+      // The three elements below (ch-stats-count/wl/net + last/best/worst) are populated by
+      // renderTradeFeed() — ported unchanged from PseudoChaser, already wired to call this on
+      // every position close. Real numbers from first close onward, not a placeholder.
+      'alt-tab-stats-summary': `
+        <template x-if="activeTab==='chaser'">
+        <div>
+        <div class="sec">
+          <div class="sec-ttl">Session <em x-text="$store.chaser.bot.startTime?fmtAge($store.chaser.bot.startTime, $store.chaser.tick):''"></em></div>
+          <div class="sg3">
+            <div class="stat"><div class="sl">Trades</div><div class="sv sm"        x-text="$store.chaser.sess.trades"></div></div>
+            <div class="stat"><div class="sl">Wins</div>  <div class="sv profit sm" x-text="$store.chaser.sess.wins"></div></div>
+            <div class="stat"><div class="sl">Losses</div><div class="sv short sm"  x-text="$store.chaser.sess.losses"></div></div>
+          </div>
+          <div class="sg3 gs">
+            <div class="stat"><div class="sl">Win Skew</div>
+              <div class="sv sm" :class="(()=>{ const s=$store.chaser._sessionPnlStats(); return s.denom>0 ? (s.skew>=50?'profit':'short') : ''; })()"
+                   x-text="(()=>{ const s=$store.chaser._sessionPnlStats(); return s.denom>0?s.skew.toFixed(1)+'%':'—'; })()"></div>
+            </div>
+            <div class="stat"><div class="sl">Realised PnL</div>
+              <div class="sv sm" :class="(()=>{ const ct=$store.chaser.closedTrades; const ru=ct.find(t=>t.reason==='period-rollup'); const cards=ct.filter(t=>t.reason!=='period-rollup'); const v=(cards.length||ru?.rollup?.netPnl!=null)?cards.reduce((s,t)=>s+(t.totalPnl??t.pnl??0),0)+(ru?.rollup?.netPnl??0):0; return v>=0?'profit':'short'; })()"
+                   x-text="(()=>{ const ct=$store.chaser.closedTrades; const ru=ct.find(t=>t.reason==='period-rollup'); const cards=ct.filter(t=>t.reason!=='period-rollup'); const v=(cards.length||ru?.rollup?.netPnl!=null)?cards.reduce((s,t)=>s+(t.totalPnl??t.pnl??0),0)+(ru?.rollup?.netPnl??0):0; return (v>=0?'+':'')+v.toFixed(2)+' USDT'; })()"></div>
+            </div>
+            <div class="stat"><div class="sl">Force Closes</div><div class="sv warn sm" x-text="$store.chaser.sess.forceClose"></div></div>
+          </div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-ttl">Chaser Trade History</div>
+          <div style="font-family:var(--mono);font-size:10.5px;line-height:1.8">
+            <div>Closed: <span id="ch-stats-count" style="color:var(--ice)">—</span></div>
+            <div>W/L: <span id="ch-stats-wl">—</span></div>
+            <div>Net: <span id="ch-stats-net">—</span></div>
+            <div>Last: <span id="ch-stats-last">—</span></div>
+            <div>Best: <span id="ch-stats-best" style="color:var(--profit)">—</span></div>
+            <div>Worst: <span id="ch-stats-worst" style="color:var(--short)">—</span></div>
+          </div>
+        </div>
+        <!-- MIC's own 'stats-eda' slot lands here once it has a working host (M7) — same
+             chaser-scoped attribute name and x-data wrapper as strategy-accordions/
+             mode-label-extra above, same reason. -->
+        <div data-chaser-plugin-slot="stats-eda" x-data="$store.chaser"></div>
+
+        <div class="sec">
+          <div class="sec-ttl">Persistence</div>
+          <div style="font-size:10px;color:var(--text-mid);font-family:var(--mono);line-height:1.7">
+            <div>Active: <span style="color:var(--ice)" x-text="$store.chaser.positions.length+' position(s)'"></span></div>
+            <div>Stored: <span :style="$store.chaser.positions.length!==$store.chaser.savedPositions.length?'color:var(--short)':'color:var(--ice)'" x-text="$store.chaser.savedPositions.length+' in localStorage'"></span></div>
+          </div>
+          <div style="margin-top:6px">
+            <span @click="$store.chaser.showStorageBreakdown=!$store.chaser.showStorageBreakdown" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
+              <span x-text="$store.chaser.showStorageBreakdown?'▾':'▸'"></span> Storage usage
+            </span>
+            <span x-show="$store.chaser.showStorageBreakdown" @click="$store.chaser._exportStorageBreakdown()" title="Download this breakdown as a text file" style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;text-decoration:underline;user-select:none">⤓ Export</span>
+            <div x-show="$store.chaser.showStorageBreakdown" x-html="$store.chaser._storageBreakdown($store.chaser.showStorageBreakdown)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
+          </div>
+          <div style="margin-top:6px">
+            <span @click="$store.chaser.showPowerUsage=!$store.chaser.showPowerUsage" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
+              <span x-text="$store.chaser.showPowerUsage?'▾':'▸'"></span> Power usage
+            </span>
+            <div x-show="$store.chaser.showPowerUsage" x-html="$store.chaser._powerUsageHtml($store.chaser.showPowerUsage)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
+          </div>
+          <button class="btn btn-ghost" style="margin-top:8px;font-size:10px;padding:5px;letter-spacing:1px"
+            @click="$store.chaser.showDangerZone=!$store.chaser.showDangerZone"
+            :style="$store.chaser.showDangerZone?'color:var(--warn);border-color:rgba(240,192,96,.4)':''">
+            <span x-text="$store.chaser.showDangerZone?'▲ Hide Actions':'⚠ Show Actions'"></span>
+          </button>
+          <div x-show="$store.chaser.showDangerZone" style="margin-top:6px;display:flex;flex-direction:column;gap:5px">
+            <button class="btn btn-red" style="font-size:10px;padding:5px;border-color:rgba(255,69,96,.5)"
+              x-show="$store.chaser.positions.length>0"
+              @click="if(confirm('Bail ALL chaser positions at mark price? Profit or loss — no questions asked.')) { $store.chaser.bailAll(); $store.chaser.showDangerZone=false; }">
+              Bail All Chaser Positions
+            </button>
+            <button class="btn btn-red" style="font-size:10px;padding:5px"
+              x-show="$store.chaser.savedPositions.length>0||$store.chaser.positions.length>0"
+              @click="if(confirm('Clear all saved chaser state? This cannot be undone.')) { $store.chaser.clearSaved(); $store.chaser.showDangerZone=false; }">
+              Clear Saved State
+            </button>
+            <button class="btn btn-red" style="font-size:10px;padding:5px"
+              @click="if(confirm('Reset chaser session stats? This cannot be undone.')) { $store.chaser.clearStats(); $store.chaser.showDangerZone=false; }">
+              ↺ Reset Stats
+            </button>
+            <button class="btn btn-ghost" style="font-size:10px;padding:5px"
+              @click="$store.chaser.showExportMenu=true">
+              ↓ Export Data
+            </button>
+            <button class="btn btn-ghost" style="font-size:10px;padding:5px;color:var(--ice);border-color:rgba(126,232,250,.35)"
+              @click="$refs.chImportFileInput.click()">
+              ↑ Import Data (JSON)
+            </button>
+            <button class="btn btn-ghost" style="font-size:10px;padding:5px"
+              x-show="typeof $store.chaser.afImport === 'function'"
+              @click="$refs.chAshfallImportInput.click()">
+              🩸 Import Ashfall Profile
+            </button>
+            <input type="file" accept=".json,application/json" x-ref="chAshfallImportInput"
+              style="display:none" @change="$store.chaser.afImport($event)">
+            <input type="file" accept=".json,application/json" x-ref="chImportFileInput"
+              style="display:none"
+              @change="
+                const file = $event.target.files[0];
+                $event.target.value = '';
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = e => {
+                  try {
+                    const parsed = JSON.parse(e.target.result);
+                    if (!parsed || typeof parsed !== 'object') throw new Error('Invalid JSON structure');
+                    $store.chaser._pendingImport = parsed;
+                    $store.chaser.showImportConfirm = true;
+                  } catch(err) {
+                    $store.chaser.log('Import failed: ' + err.message, 'error');
+                  }
+                };
+                reader.readAsText(file);
+              ">
+          </div>
+        </div>
+
+        <div class="sec" style="flex:1">
+          <div class="sec-ttl">
+            Activity Log
+            <button @click="$store.chaser.logs=[]" style="background:none;border:none;cursor:pointer;color:var(--text-lo);font-family:var(--mono);font-size:9px">CLEAR</button>
+          </div>
+          <div class="log-box">
+            <template x-for="(l,i) in $store.chaser.logs" :key="i">
+              <div class="ll">
+                <span class="lt" x-text="l.t"></span>
+                <span class="lm" :class="l.type" x-text="l.m"></span>
+              </div>
+            </template>
+            <div x-show="$store.chaser.logs.length===0" style="color:var(--text-lo);padding:4px 0;font-size:10px">No activity yet.</div>
+          </div>
+        </div>
+        </div>
+        </template>
+      `,
+
+      // Same layout contract as PseudoWinter's own col-pnl (sticky header, empty state, vanilla
+      // -DOM card feed) — renderTradeFeed() (ported unchanged) already targets these exact IDs.
+      'alt-tab-trades-column': `
+        <div style="position:sticky;top:0;z-index:3;background:var(--bg-panel);border-bottom:1px solid var(--border);padding:10px 13px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+          <div>
+            <div class="sec-ttl" style="margin-bottom:2px">Chaser Trades <em id="ch-trade-count">0 closed</em></div>
+            <div id="ch-trade-meta" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);display:none"></div>
+          </div>
+          <button id="ch-trade-clear" class="btn btn-ghost" style="width:auto;font-size:9px;padding:3px 10px;letter-spacing:1px;display:none"
+                  @click="if(confirm('Clear chaser trade history and session stats? This cannot be undone.'))$store.chaser.clearStats()">CLEAR</button>
+        </div>
+        <div x-data="{open:false}" x-show="$store.chaser.closedTrades.filter(t=>t.reason!=='period-rollup').length>=2" style="border-bottom:1px solid var(--border);flex-shrink:0">
+          <div @click="open=!open" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:4px 13px;user-select:none">
+            <span style="font-family:var(--mono);font-size:8px;letter-spacing:1px;color:var(--text-lo)">PNL CHART</span>
+            <span style="font-size:8px;color:var(--text-lo)" x-text="open?'▲':'▼'"></span>
+          </div>
+          <div x-show="open" style="padding:0 11px 8px"><div x-html="$store.chaser._pnlChartSvg()"></div></div>
+        </div>
+        <div id="ch-trade-empty" class="empty-state" style="flex:1">
+          <div class="snowflake">🔆</div>
+          <span>No closed chaser trades yet</span>
+        </div>
+        <div id="ch-trade-feed" style="padding:10px 11px;display:flex;flex-direction:column;gap:7px;"></div>
+      `,
+    },
+
+    transform(def) {
+      // No merge into PseudoWinter's own def — this plugin registers an independent Alpine
+      // store instead (see the header comment). Nothing here needs to change on the host's
+      // own component.
+      return def;
+    },
+  };
 })();
 </script>
-
-<!--
-  Alpine CDN — loaded LAST, AFTER pw() is defined above.
-  No defer, no async. Synchronous load ensures Alpine finds
-  the component function immediately when it scans the DOM.
--->
-<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
-</body>
-</html>
