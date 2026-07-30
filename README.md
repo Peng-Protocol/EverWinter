@@ -29,6 +29,10 @@ Open any `.html` file directly in a browser. No build step, no server, no instal
 
 **Running both bots**: open PseudoWinter and PseudoChaser in separate tabs from the same origin. When both are open simultaneously they automatically share bulk ticker fetches, kline caches, and liquidation results to halve API load. Either bot works normally on its own when the other tab isn't open.
 
+Every background/bulk fetch — bulk tickers, market watch, and any loaded plugin's kline/OC/liq/PEC batches — runs through a single per-bot scheduling queue (**Scan Scheduling** in Main Config) instead of firing all at once, which is what keeps the browser responsive with one bot open and workable with two. Execution-critical single-symbol calls (opening/closing/watching a position) bypass the queue entirely so order execution is never delayed behind background scanning.
+
+For a tighter coupling than passive data-sharing, **Leader / Follower** (Main Config) lets one bot fully defer to the other: flip **Follow Partner Bot** on and that instance stops fetching bulk tickers, OC, liquidation surveillance, and kline/PEC data on its own, relying entirely on the partner's shared cache. The partner needs no toggle of its own — it's leader by default as long as it keeps completing scan cycles. If the partner goes quiet for two full scan intervals, the follower automatically resumes scanning independently, then steps back down the moment the partner's heartbeat returns — no manual re-arming either direction.
+
 In addition to the shared data pool, the Permafrost and Ashfall plugins maintain a separate cross-bot sample state (`__ew_sample_state_v1`) written after each structure cycle and read every 15 seconds. This state carries wave score, funding skew, OI skew, kline bar data, and liquidation cycle history. When one bot is in a drawdown halt or gains lock, its plugin reads the partner's sample to keep the Status Block bars, liq chart, and WAVE score line current — the halted bot's displays stay populated from the running partner's latest readings without opening any new entries.
 
 ---
@@ -84,6 +88,9 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Symbol Banlist** (`banlistEnabled`) | When on, symbols on the ban list are excluded from all scans. Entries expire after 7 days. |
 | **Position Price Feed** (`restPollEnabled`) | When on, replaces the WebSocket price stream for open positions with periodic REST API calls. Use if the WS feed returns stale or incorrect prices. |
 | **Price Poll Interval** (`restPollBaseSec`) | Base polling interval in seconds for REST mode. The interval doubles automatically when price moves less than 0.1% between ticks and resets to base on any meaningful move. |
+| **Dispatch Every** (`schedIntervalMs`) | Minimum gap (ms, default 150) between successive background fetches dispatched from the scheduling queue. Lower = faster background data turnover, at the cost of more simultaneous requests. |
+| **Max Concurrent** (`schedMaxConcurrent`) | Hard cap (default 4) on background fetches in flight at once, regardless of how many subsystems have work queued. |
+| **Follow Partner Bot** (`lfFollowPartner`) | When on, this bot stops fetching bulk tickers, OC, liquidation surveillance, and kline/PEC data on its own and relies entirely on the partner's shared cache. The partner needs no toggle — it's leader as long as its heartbeat (written once per completed scan cycle) stays fresh, judged against 2× **Scan Interval**. Auto-resumes independent scanning if the partner goes stale, and steps back down the moment it returns. |
 | **Config Lock** (`cfgLocked`) | Locks all config controls to prevent accidental changes while the bot is running. |
 
 ---
@@ -506,7 +513,7 @@ Developer-level detail with no operational consequence. Included for reference.
 | `pc_v1` | PseudoChaser: same structure as pw_v1 |
 | `pc_v1_log` | PseudoChaser activity log |
 | `__pc_plugins_v1` | PseudoChaser serialized plugin list |
-| `__ew_shared_v1` | Cross-tab shared data registry (bulkTickers, watchTickers, klines_1h, klines_1h_last, pec_{granularity}_last, liqResults) |
+| `__ew_shared_v1` | Cross-tab shared data registry (bulkTickers, watchTickers, klines_1h, klines_1h_last, pec_{granularity}_last, liqResults, hb_chaser/hb_winter — Leader/Follower heartbeats) |
 | `__ew_sample_state_v1` | Cross-bot sample state written by Permafrost/Ashfall after each structure cycle. Contains `state.winter` and `state.chaser` — each carrying waveScore, fundSkew, oiSkew, klineBar, and liqHistory. Read every 15 s by the partner bot to keep displays current during halts. |
 | `__pf_liq_batches` | Permafrost active liq batch snapshots (for reconnect on reload) |
 | `__ash_liq_batches` | Ashfall active liq batch snapshots |

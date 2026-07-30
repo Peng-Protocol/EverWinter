@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.11.1 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.12.1 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -638,7 +638,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.11.1 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.12.1 · Long Only · No Real Orders</div>
     </div>
     <!-- ── PC-ONLY OVERLAY-MENU BUTTONS (hidden on mobile; mobile keeps its own tab bar below) ── -->
     <div class="topbar-menu-btns">
@@ -770,6 +770,32 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <div class="lbl">Cooldown <b x-text="(cfg.bulkTickerCooldownHours??1)+'h'"></b></div>
                 <input type="range" min="1" max="12" step="1" x-model.number="cfg.bulkTickerCooldownHours" @change="persist()">
                 <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);margin-top:3px" x-text="(()=>{ void tick; const rem=Math.max(0,((cfg.bulkTickerCooldownHours??1)*3600000)-(Date.now()-(_lastAllTickersAt||0))); if(!_lastAllTickersAt||rem<=0) return 'ready — will fetch on next scan'; const h=Math.floor(rem/3600000); const m=Math.floor((rem%3600000)/60000); return 'next refresh in '+h+'h '+String(m).padStart(2,'0')+'m'; })()"></div>
+              </div>
+            </div>
+
+            <!-- Scan Scheduling -->
+            <div class="g" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+              <div class="lbl" style="margin-bottom:6px;letter-spacing:1px">Scan Scheduling</div>
+              <div style="font-size:9px;color:var(--text-lo);margin-bottom:6px;line-height:1.5">Every background fetch (bulk tickers, market watch, and any loaded plugin's kline/OC/liq/PEC batches) runs through this one queue instead of firing all at once — this is what stops the browser stall during a scan.</div>
+              <div class="lbl">Dispatch Every <b x-text="(cfg.schedIntervalMs??150)+'ms'"></b></div>
+              <input type="range" min="50" max="1000" step="50" x-model.number="cfg.schedIntervalMs" @change="persist()">
+              <div class="lbl" style="margin-top:6px">Max Concurrent <b x-text="cfg.schedMaxConcurrent??4"></b></div>
+              <input type="range" min="1" max="10" step="1" x-model.number="cfg.schedMaxConcurrent" @change="persist()">
+            </div>
+
+            <!-- Leader/Follower -->
+            <div class="g" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+              <div class="lbl" style="margin-bottom:6px;letter-spacing:1px">Leader / Follower</div>
+              <label class="tog">
+                <div class="tog-t" :class="cfg.lfFollowPartner?'on':''" @click="cfg.lfFollowPartner=!cfg.lfFollowPartner;persist()"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l">Follow Partner Bot</div>
+                  <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Stop this bot's own bulk ticker fetch and use the partner's shared data instead. The partner needs no toggle — it stays leader as long as it's alive. If its heartbeat goes stale this bot auto-resumes scanning on its own, then steps back down the moment the partner returns.</div>
+                </div>
+              </label>
+              <div x-show="cfg.lfFollowPartner" style="margin-top:8px">
+                <div class="lbl">Partner Stale After <b x-text="(Math.max(1,cfg.scanMins??10)*2)+'min'"></b> <span style="color:var(--text-lo);font-weight:400">(2× Scan Every)</span></div>
+                <div style="font-family:var(--mono);font-size:9px;margin-top:4px" :class="_lfPartnerAlive()?'profit':'loss'" x-text="(()=>{ void tick; return _lfPartnerAlive() ? '🤝 following — partner alive' : '⚠ partner unresponsive — scanning independently'; })()"></div>
               </div>
             </div>
 
@@ -1928,6 +1954,74 @@ function pw() { return {
     return this._symData[symbol]?.[field] ?? null;
   },
 
+  // ─── Centralized fetch scheduler ─────────────────────────────────────────
+  // Background/bulk network calls (bulk tickers, market-watch refresh, and
+  // every plugin's kline/OC/liq/PEC batch fetches) are routed through this
+  // queue instead of firing directly or in an unspaced Promise.all burst.
+  // The queue dispatches at most one new request per schedIntervalMs tick,
+  // and never lets more than schedMaxConcurrent sit in flight at once — that
+  // combination is what actually stops the pile-up (several subsystems each
+  // launching their own 10-25 request burst back to back) that stalls the
+  // browser during a scan.
+  //
+  // Execution-critical single-symbol calls (instrument info, funding rate,
+  // live ticker for open/close/watch, whiplash kline audit) deliberately
+  // stay on direct fetch() — they're low-frequency and time-sensitive, and
+  // queuing them behind a stack of background scan requests would delay
+  // real order execution for no benefit.
+  _fetchQueue: [],
+  _fetchActive: 0,
+  _fetchTimer: null,
+  _qFetch(url, options) {
+    return new Promise((resolve, reject) => {
+      this._fetchQueue.push({ url, options, resolve, reject });
+      this._qEnsureTimer();
+    });
+  },
+  _qEnsureTimer() {
+    if (this._fetchTimer) return;
+    const ms = Math.max(50, this.cfg.schedIntervalMs ?? 150);
+    this._fetchTimer = setInterval(() => this._qDrain(), ms);
+  },
+  _qDrain() {
+    const maxConc = Math.max(1, this.cfg.schedMaxConcurrent ?? 4);
+    if (!this._fetchQueue.length) {
+      if (this._fetchActive === 0 && this._fetchTimer) { clearInterval(this._fetchTimer); this._fetchTimer = null; }
+      return;
+    }
+    if (this._fetchActive >= maxConc) return;
+    const job = this._fetchQueue.shift();
+    this._fetchActive++;
+    fetch(job.url, job.options)
+      .then(r => { this._fetchActive--; job.resolve(r); })
+      .catch(e => { this._fetchActive--; job.reject(e); });
+  },
+
+  // ─── Leader/Follower (cross-bot scan coordination) ───────────────────────
+  // cfg.lfFollowPartner is the only toggle: flipping it on tells THIS bot to
+  // stop driving its own background scan (bulk tickers, and — once plugins
+  // wire into _lfIsFollowing() — OC/liq/kline) and consume the partner's
+  // shared data instead. The partner needs no toggle of its own: it just
+  // keeps running normally and its heartbeat is what makes it "leader".
+  // If the partner's heartbeat goes stale (tab closed, bot stopped, halted
+  // long enough to stop cycling) this bot auto-resumes its own scanning; the
+  // moment the partner's heartbeat is fresh again it silently steps back
+  // down to following — no manual re-arming needed either direction.
+  _partnerBotId() { return BOT_ID === 'chaser' ? 'winter' : 'chaser'; },
+  _lfHeartbeat() { this._sharedWrite('hb_' + BOT_ID, true); },
+  _lfPartnerAlive() {
+    // Heartbeat only updates once per completed cycle, so "stale" has to be judged
+    // against the scan cadence itself, not a fixed wall-clock number — otherwise a
+    // slow scanMins (e.g. 10min) would look "unresponsive" every cycle even though
+    // the partner is fine. Two full cycles of slack covers one missed/slow cycle.
+    const staleMs = Math.max(1, this.cfg.scanMins ?? 10) * 2 * 60 * 1000;
+    const hb = this._sharedRead('hb_' + this._partnerBotId());
+    return !!(hb && hb.ts && (Date.now() - hb.ts) < staleMs);
+  },
+  _lfIsFollowing() {
+    return !!(this.cfg.lfFollowPartner && this._lfPartnerAlive());
+  },
+
   // Fetch instrument info (lot size, tick size, min notional) for a symbol.
   // Cached indefinitely per session (instrument specs don't change mid-session).
   // Returns null if the symbol is unsupported or the fetch fails.
@@ -2967,6 +3061,7 @@ function pw() { return {
     this.bot.lastScanAt = Date.now();
     this._sweepExpiredData();
     this._cycleRunning = true;
+    this._lfHeartbeat();
     this.log('[CYC] ⚙ Cycle starting...', 'info');
     try {
       // 1. Losers scan
@@ -3005,7 +3100,7 @@ function pw() { return {
     }
     for (const entry of (this._mktWatch || [])) {
       try {
-        const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${entry.symbol}`);
+        const r = await this._qFetch(`${this.base}/v5/market/tickers?category=linear&symbol=${entry.symbol}`);
         const d = await r.json();
         const t = d?.retCode === 0 ? d.result?.list?.[0] : null;
         if (!t) continue;
@@ -3044,20 +3139,26 @@ function pw() { return {
     this.ui.scanning = true;
     this.bot.lastScanAt = Date.now();
     try {
+      const _following      = this._lfIsFollowing();
       const _cooldownMs     = (this.cfg.bulkTickerCooldownHours ?? 1) * 3600 * 1000;
       const _cooldownActive = this.cfg.bulkTickerCooldownEnabled !== false;
-      const _ownFresh       = _cooldownActive && this._lastAllTickers?.length > 0
+      const _ownFresh       = !_following && _cooldownActive && this._lastAllTickers?.length > 0
         && (Date.now() - (this._lastAllTickersAt || 0)) < _cooldownMs;
       if (!_ownFresh) {
-        const _shared       = _cooldownActive ? this._sharedRead('bulkTickers') : null;
-        const _partnerFresh = _shared?.data?.length > 0 && (Date.now() - (_shared.ts || 0)) < _cooldownMs;
+        const _shared       = (_following || _cooldownActive) ? this._sharedRead('bulkTickers') : null;
+        // While following: any shared snapshot (regardless of cooldown age) is used —
+        // this bot must not fall through to its own fetch. Not following: only a
+        // cooldown-fresh snapshot is treated as "already covered" by the partner.
+        const _partnerFresh = _shared?.data?.length > 0 && (_following || (Date.now() - (_shared.ts || 0)) < _cooldownMs);
         if (_partnerFresh) {
           this._lastAllTickers   = _shared.data;
           this._lastAllTickersAt = _shared.ts;
           this._seedFromTickers(_shared.data);
           this.log(`[SCN] 🤝 Bulk tickers from ${_shared.by} (${Math.round((Date.now()-_shared.ts)/60000)}m ago)`, 'scan');
+        } else if (_following) {
+          this.log('[SCN] 👥 Following partner — no shared bulk tickers yet, skipping this cycle', 'warn');
         } else {
-          const tr=await fetch(`${this.base}/v5/market/tickers?category=linear`);
+          const tr=await this._qFetch(`${this.base}/v5/market/tickers?category=linear`);
           const td=await tr.json();
           if (td.retCode!==0) throw new Error('Tickers: '+td.retMsg);
           const allTickers = td.result?.list || [];
