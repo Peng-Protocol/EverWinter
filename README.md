@@ -90,7 +90,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Price Poll Interval** (`restPollBaseSec`) | Base polling interval in seconds for REST mode. The interval doubles automatically when price moves less than 0.1% between ticks and resets to base on any meaningful move. |
 | **Dispatch Every** (`schedIntervalMs`) | Minimum gap (ms, default 150) between successive background fetches dispatched from the scheduling queue. Lower = faster background data turnover, at the cost of more simultaneous requests. |
 | **Max Concurrent** (`schedMaxConcurrent`) | Hard cap (default 4) on background fetches in flight at once, regardless of how many subsystems have work queued. |
-| **Follow Partner Bot** (`lfFollowPartner`) | When on, this bot stops fetching bulk tickers, OC, liquidation surveillance, and kline/PEC data on its own and relies entirely on the partner's shared cache. The partner needs no toggle — it's leader as long as its heartbeat (written once per completed scan cycle) stays fresh, judged against 2× **Scan Interval**. Auto-resumes independent scanning if the partner goes stale, and steps back down the moment it returns. |
+| **Follow Partner Bot** (`lfFollowPartner`) | When on, this bot stops fetching bulk tickers, OC, liquidation surveillance, and kline/PEC data on its own and relies entirely on the partner's shared cache. The partner needs no toggle — it's leader as long as its heartbeat (written once per completed scan cycle) stays fresh, judged against 2× **Scan Interval**. Auto-resumes independent scanning if the partner goes stale, and steps back down the moment it returns. Also blocks this bot from opening a position on any ticker the leader already holds — checked at entry, before any instrument/price lookups. |
 | **Config Lock** (`cfgLocked`) | Locks all config controls to prevent accidental changes while the bot is running. |
 
 ---
@@ -513,7 +513,7 @@ Developer-level detail with no operational consequence. Included for reference.
 | `pc_v1` | PseudoChaser: same structure as pw_v1 |
 | `pc_v1_log` | PseudoChaser activity log |
 | `__pc_plugins_v1` | PseudoChaser serialized plugin list |
-| `__ew_shared_v1` | Cross-tab shared data registry (bulkTickers, watchTickers, klines_1h, klines_1h_last, pec_{granularity}_last, liqResults, hb_chaser/hb_winter — Leader/Follower heartbeats) |
+| `__ew_shared_v1` | Cross-tab shared data registry (bulkTickers, watchTickers, klines_1h, klines_1h_last, pec_{granularity}_last, liqResults, hb_chaser/hb_winter — Leader/Follower heartbeats, pos_chaser/pos_winter — each bot's currently open symbol list, resynced each heartbeat) |
 | `__ew_sample_state_v1` | Cross-bot sample state written by Permafrost/Ashfall after each structure cycle. Contains `state.winter` and `state.chaser` — each carrying waveScore, fundSkew, oiSkew, klineBar, and liqHistory. Read every 15 s by the partner bot to keep displays current during halts. |
 | `__pf_liq_batches` | Permafrost active liq batch snapshots (for reconnect on reload) |
 | `__ash_liq_batches` | Ashfall active liq batch snapshots |
@@ -531,6 +531,8 @@ Developer-level detail with no operational consequence. Included for reference.
 ### Cross-Tab Data Pool
 
 Both bots share market data via `localStorage.__ew_shared_v1` and `BroadcastChannel('ew_shared')`. Writes are last-write-wins per data type. Either bot operates normally solo — the registry is simply absent and all ladder checks fall through to normal fetches.
+
+Each bot publishes its own open-symbol list to this registry on every position open/close, and resynced once more per heartbeat as a safety net for close paths that bypass `pseudoClosePosition` (e.g. the gap-fill audit). A following bot (`lfFollowPartner` on, partner heartbeat fresh) checks the leader's published list before opening and skips any ticker the leader already holds; the leader itself never checks its own publish. Because the check is gated on `_lfIsFollowing()`, it disables itself automatically the instant the leader's heartbeat goes stale — no separate expiry logic on the position data itself.
 
 ### Plugin Transform Pipeline
 

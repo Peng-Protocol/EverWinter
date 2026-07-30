@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoWinter fork
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🌑 PSEUDOWINTER v1.16.1 — Pseudo Mainnet Sim</title>
+<title>🌑 PSEUDOWINTER v1.17.0 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -635,7 +635,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.16.1 · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.17.0 · No Real Orders</div>
     </div>
     <!-- ── PC-ONLY OVERLAY-MENU BUTTONS (hidden on mobile; mobile keeps its own tab bar below) ── -->
     <div class="topbar-menu-btns">
@@ -787,7 +787,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                 <div class="tog-t" :class="cfg.lfFollowPartner?'on':''" @click="cfg.lfFollowPartner=!cfg.lfFollowPartner;persist()"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Follow Partner Bot</div>
-                  <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Stop this bot's own bulk ticker fetch and use the partner's shared data instead. The partner needs no toggle — it stays leader as long as it's alive. If its heartbeat goes stale this bot auto-resumes scanning on its own, then steps back down the moment the partner returns.</div>
+                  <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Stop this bot's own bulk ticker fetch and use the partner's shared data instead. The partner needs no toggle — it stays leader as long as it's alive. If its heartbeat goes stale this bot auto-resumes scanning on its own, then steps back down the moment the partner returns. Also blocks entries on any ticker the leader already holds.</div>
                 </div>
               </label>
               <div x-show="cfg.lfFollowPartner" style="margin-top:8px">
@@ -1891,7 +1891,7 @@ function pw() { return {
   // moment the partner's heartbeat is fresh again it silently steps back
   // down to following — no manual re-arming needed either direction.
   _partnerBotId() { return BOT_ID === 'chaser' ? 'winter' : 'chaser'; },
-  _lfHeartbeat() { this._sharedWrite('hb_' + BOT_ID, true); },
+  _lfHeartbeat() { this._sharedWrite('hb_' + BOT_ID, true); this._lfPublishPositions(); },
   _lfPartnerAlive() {
     // Heartbeat only updates once per completed cycle, so "stale" has to be judged
     // against the scan cadence itself, not a fixed wall-clock number — otherwise a
@@ -1903,6 +1903,17 @@ function pw() { return {
   },
   _lfIsFollowing() {
     return !!(this.cfg.lfFollowPartner && this._lfPartnerAlive());
+  },
+  // Published on every open/close (and resynced each heartbeat as a safety net for
+  // removal paths that don't route through pseudoClosePosition, e.g. the gap-fill
+  // audit). Only consulted by a bot that is actively following — the leader itself
+  // never checks its own publish, and a follower whose partner goes stale stops
+  // respecting it the same moment _lfIsFollowing() flips false.
+  _lfPublishPositions() { this._sharedWrite('pos_' + BOT_ID, this.positions.map(p => p.symbol)); },
+  _lfPartnerHasSymbol(sym) {
+    if (!this._lfIsFollowing()) return false;
+    const bucket = this._sharedRead('pos_' + this._partnerBotId());
+    return !!(bucket && Array.isArray(bucket.data) && bucket.data.includes(sym));
   },
 
   init() {
@@ -3516,6 +3527,10 @@ function pw() { return {
       this.log(`[OPN] ${sym}: max positions reached (${this.positions.length}/${this.cfg.maxPos}) — skipping`, 'warn');
       return;
     }
+    if (this._lfPartnerHasSymbol(sym)) {
+      this.log(`[OPN] ${sym}: entry blocked — leader (${this._partnerBotId()}) already holds a position on this ticker`, 'warn');
+      return;
+    }
     if (this._isSymbolBanned(sym)) { this.log(`[OPN] ${sym}: banned — skipping entry (${this._banReason(sym)})`, 'warn'); return; }
     const instr = await this.getInstrInfo(sym);
     if (!instr) { this.log(`[OPN] ${sym}: instrument not supported — skipping`, 'warn'); return; }
@@ -3640,6 +3655,7 @@ function pw() { return {
       _pseudo:true, _lastSeenAt:Date.now(),
     };
     this.positions.push(newPos);
+    this._lfPublishPositions();
     { const _openSkip = new Set(['_pseudo','_lastSeenAt','_stageCount','_swStageCount','_binary','_slPctOverride','_fundingIntervalMs','_funIntervalMs','_fundingAccrued']); for (const [k,v] of Object.entries(candidate)) { if (k.startsWith('_') && !_openSkip.has(k)) newPos[k] = v; } }
     const _binTag = binary ? ` | SL:${fmtP(slPrice)} [Binary]` : '';
     this.log(`[OPN] ${this.themeEmoji} ▼ PSEUDO SHORT ${sym} @ ${fmtP(price)} | Qty:${qty} | Notional:$${actualNotional.toFixed(2)} | Margin:$${margin.toFixed(2)} | TP:${fmtP(tpPrice)} (${effTp0}%) | 24hΔ:${(candidate.change ?? 0) >= 0 ? '+' : ''}${(candidate.change ?? 0).toFixed(2)}%${_binTag}`, 'trade');
@@ -4497,6 +4513,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     if (this.isDuplicateClose(pos.entryPrice, exitPrice, pos.margin)) {
       this.log(`[CLZ] ⚠ ${pos.symbol}: duplicate close detected — record suppressed, position removed.`, 'warn');
       this.positions = this.positions.filter(x => x.id !== pos.id);
+      this._lfPublishPositions();
       this.acct.upnl = this.positions.reduce((s, p) => s + (p.upnl || 0), 0);
       this.persist();
       this.renderTradeFeed();
@@ -4532,6 +4549,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       if (k.startsWith('_') && !_skipStamps.has(k)) this.closedTrades[0][k] = v;
     }
     this.positions = this.positions.filter(x => x.id !== pos.id);
+    this._lfPublishPositions();
     this.acct.upnl = this.positions.reduce((s, p) => s + (p.upnl || 0), 0);
 
     // Drawdown throttle / Gains lock: record and evaluate immediately — not at the next scan cycle
