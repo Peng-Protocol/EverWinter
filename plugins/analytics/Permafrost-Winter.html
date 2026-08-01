@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.63.0';
+  const VERSION        = '1.64.2';
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -94,7 +94,7 @@
   const PFR_LIQ_SEQUESTER_KEY = '__pf_liq_sequester';
   const PFR_OC_HIST_KEY     = '__pf_oc_history';
   const CROSS_KEY      = '__everwinter_cross_v1';
-  const CROSS_TTL      = 6 * 3600 * 1000;
+  const CROSS_TTL      = 25 * 3600 * 1000; // must outlast the longest configurable halt/gains-lock (24h slider max), or a bot's own ddh-start/glk-start marker ages off the shared bus mid-halt and Mutual DDH/Gains Lock lift can never fire for the back half of a long halt — was 6h against a 6-24h configurable range
   const SCORE_KEY      = '__everwinter_scorecard_v1';
   const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
   // Full-universe PEC/VSG candle log for Pre-Screening — same same-origin-localStorage
@@ -731,6 +731,32 @@
           // *older* halt to lift, so an inflated timestamp can flip which side loses the halt).
           _pfWasHalted      = this._isDrawdownHalted?.() ?? false;
           _pfWasGainsLocked = this._isGainsLocked?.()    ?? false;
+          // The sync above deliberately skips writing a ddh-start/glk-start cross event on a
+          // mid-halt reload (see comment above) to avoid an inflated "now" timestamp — but that
+          // means a bot whose tab restarts mid-halt (backgrounded/killed on mobile, manual
+          // refresh, etc.) never broadcasts *any* ddh-start for that halt, so Mutual DDH Lift can
+          // never react to it no matter how long the halt runs or what the partner does — this
+          // is the actual cause of a same-halt lift silently never firing, not CROSS_TTL. Backfill
+          // one here if the bus doesn't already show us as actively halted, using the halt's real
+          // start time (back-calculated from the restored _drawdownHaltUntil) rather than "now" —
+          // that preserves the age comparison Mutual DDH Lift depends on instead of trading a
+          // missing marker for a too-recent one.
+          if ((this.cfg.permafrostCrossEnabled ?? true)) {
+            if (_pfWasHalted && !this._manualHalt && typeof this._drawdownHaltUntil === 'number') {
+              const _ownDdh = this._pfCrossRead().filter(e => e.source === 'winter' && (e.kind === 'ddh-start' || e.kind === 'ddh-end')).at(-1);
+              if (!_ownDdh || _ownDdh.kind === 'ddh-end') {
+                const _haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+                this._pfCrossWrite('ddh-start', null, { ts: this._drawdownHaltUntil - _haltMs });
+              }
+            }
+            if (_pfWasGainsLocked && typeof this._gainsLockHaltUntil === 'number') {
+              const _ownGlk = this._pfCrossRead().filter(e => e.source === 'winter' && (e.kind === 'glk-start' || e.kind === 'glk-end')).at(-1);
+              if (!_ownGlk || _ownGlk.kind === 'glk-end') {
+                const _lockMs = (this.cfg.gainsLockHours ?? 6) * 3600 * 1000;
+                this._pfCrossWrite('glk-start', null, { ts: this._gainsLockHaltUntil - _lockMs });
+              }
+            }
+          }
           // Regime scorecard's auto-follow display — synced to whatever regime is actually live
           // right now, not left at its false/null initial value, so a reload snaps straight to
           // the correct segment instead of waiting for the first threshold cross after load.
@@ -2659,7 +2685,7 @@
         // _pfVolIoWindowAvg), just without paying for a fetch neither criterion needs.
         async _ocFetchBatch(symbols, volIoMap, wantOc) {
           if (!this.cfg.pfOcEnabled || !symbols?.length) return;
-          if (this._lfIsFollowing?.()) return; // following — rely on partner's shared OC history
+          if (this._lfIsFollowing?.()) { this._ocSeedFromShared(); return; } // following — seed from partner's shared OC data instead of fetching our own
           // Guard against overlapping calls: if a slower fetch (e.g. from a re-triggered
           // scan) finishes after a newer one already pushed, its stale ticker set would
           // otherwise land in history too, mixing symbols that were never part of the
@@ -2706,6 +2732,12 @@
           this._pfOcCycleHistory.push(entry);
           if (this._pfOcCycleHistory.length > 25) this._pfOcCycleHistory = this._pfOcCycleHistory.slice(-25);
           this._ocPersistHistory();
+          // Publish this cycle's OC sample so a partner bot that's following can seed its own
+          // pfOcResults/_pfOcCycleHistory instead of going without OC data entirely while
+          // following (see _ocSeedFromShared) — unlike liqResults/PEC, OC previously had no
+          // cross-bot channel at all, so a follower's ocs/ocx checks silently starved for as
+          // long as it kept following.
+          this._sharedWrite?.('ocResults', results);
           const withInterval = Object.values(results).filter(r => r.avgMs != null);
           const withVolIo = Object.values(results).filter(r => r.vol != null || r.oi != null);
           const parts = [`${Object.keys(results).length}t`];
@@ -2726,7 +2758,14 @@
         // value into their own local map instead.
         async _ocFetchSingle(sym) {
           if (!this.cfg.pfOcEnabled || !sym) return null;
-          if (this._lfIsFollowing?.()) return null; // following — rely on partner's shared OC history
+          if (this._lfIsFollowing?.()) {
+            // following — seed pfOcResults from the partner's shared snapshot and answer from
+            // that instead of fetching our own (see _ocSeedFromShared). Not tagged `live` —
+            // it's the leader's real historied batch entry, not a fresh unhistoried sample.
+            this._ocSeedFromShared();
+            const rec = this.pfOcResults?.[sym];
+            return rec ? { ...rec } : null;
+          }
           try {
             const limit = this.cfg.pfOcOrderLimit;
             const res = await this._qFetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
@@ -2744,6 +2783,25 @@
             // counting once a later batch fetch pushes the same ticker into history for real.
             return { bc, sc, avgMs, n: trades.length, live: true };
           } catch(_) { return null; }
+        },
+
+        // Following: no own OC fetch runs (see the guards in _ocFetchBatch/_ocFetchSingle), so
+        // pull whatever the leader most recently published instead of leaving pfOcResults/
+        // _pfOcCycleHistory to go stale forever. Mirrors how PEC (_miwPrefetchPec's shared seed)
+        // and liq (_liqResults + sharedRead merge) already cross the leader/follower boundary.
+        // Dedupes on the shared snapshot's own ts so a cycle already folded in doesn't get
+        // pushed into history twice across repeated calls within the same scan.
+        _ocSeedFromShared() {
+          const shared = this._sharedRead?.('ocResults');
+          if (!shared?.data) return;
+          this.pfOcResults = shared.data;
+          if (shared.ts && shared.ts !== this._pfOcLastSharedTs) {
+            this._pfOcLastSharedTs = shared.ts;
+            const histEntry = { id: (this._pfOcCycleCounter = (this._pfOcCycleCounter % 99) + 1), ts: shared.ts, results: Object.entries(shared.data).map(([sym, r]) => ({ sym, ...r })) };
+            this._pfOcCycleHistory.push(histEntry);
+            if (this._pfOcCycleHistory.length > 25) this._pfOcCycleHistory = this._pfOcCycleHistory.slice(-25);
+            this._ocPersistHistory();
+          }
         },
 
         // Shared by init() (loading from localStorage) and pfImport() (loading from a file)
