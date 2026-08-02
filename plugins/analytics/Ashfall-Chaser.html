@@ -23,19 +23,65 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.61.2';
+  const VERSION        = '1.65.0';
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
   // change. Shared key name with MultiIndicator-Chaser's own seed so either plugin can init it first.
   const DEFAULT_MEGACAP_EXCLUDE = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','ADAUSDT','TRXUSDT','LINKUSDT'];
+  // Single source of truth for Ashfall's own scalar config defaults. Merged into cfg once
+  // during init() (see below) — call sites read this.cfg.<key> directly, no inline `?? literal`.
+  // Excludes: megacapExclude (array, own migration line), ashfallFioEnabled/ashfallWaveShowFio
+  // (renamed from retired ashfallIoEnabled/ashfallWaveShowIo, own migration line — see init()),
+  // and any key actually owned by the MultiIndicator-Chaser sibling plugin (those keep their
+  // defensive `?? literal` at the cross-read call site since MIC owns their default).
+  const ASHFALL_DEFAULT_CFG = Object.freeze({
+    ashfallEnabled: true,
+    ashfallSlopeWindowHours: 24,
+    ashfallWaveShowMain: true,
+    afShowScore: true,
+    ashfallCrossEnabled: true,
+    ashfallMutualDdLiftEnabled: true,
+    ashfallScorecardEnabled: true,
+    afCoQualPenaltyEnabled: true,
+    afCoQualDepthPct: 10,
+    afScorecardView: 'combined',
+    afRegimeScoringEnabled: false,
+    afRegimeMinSample: 5,
+    afSpongeQuota: 30,
+    afStaleSlotDays: 7,
+    afPartnerScoreMode: 'wins',
+    ashLiqEnabled: true,
+    ashLiqBatchSize: 25,
+    ashLiqThresholdPct: 50,
+    ashLiqSequesterEnabled: true,
+    ashLiqSequesterCap: 12,
+    ashLiqPrescreenEnabled: false,
+    ashPecPrescreenEnabled: false,
+    ashPecBatchSize: 25,
+    ashPecBatchDelayMs: 2000,
+    afOcEnabled: true,
+    afOcOrderLimit: 100,
+    afShowStructure: false,
+    afShowLiq: true,
+    afShowFunding: false,
+    afShowVol: true,
+    // Gains Continuation (GC): own rolling 6h PnL, stepped in increments of afGcThresholdPct
+    // of base margin (minNotional/leverage). Each new step crossed broadcasts a one-shot 'gc'
+    // cross event; if Permafrost also has GC on and reads it within afGcFreshnessMult scan
+    // intervals, it triggers a full drawdown halt on Permafrost (and vice versa). Off by
+    // default — opt-in on both sides, same as Mutual DDH Lift.
+    afGcEnabled: false,
+    afGcThresholdPct: 50,
+    afGcFreshnessMult: 2,
+  });
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
   const ASH_LIQ_HISTORY_KEY = '__ash_liq_history';
   const ASH_LIQ_SEQUESTER_KEY = '__ash_liq_sequester';
   const ASH_OC_HIST_KEY     = '__ash_oc_history';
   const CROSS_KEY      = '__everwinter_cross_v1';
-  const CROSS_TTL      = 6 * 3600 * 1000;
+  const CROSS_TTL      = 25 * 3600 * 1000; // must outlast the longest configurable halt/gains-lock (24h slider max), or a bot's own ddh-start/glk-start marker ages off the shared bus mid-halt and Mutual DDH/Gains Lock lift can never fire for the back half of a long halt — was 6h against a 6-24h configurable range
   const SCORE_KEY      = '__everwinter_scorecard_v1';
   const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
   // Full-universe PEC/VSG candle log for Pre-Screening — same same-origin-localStorage
@@ -224,6 +270,24 @@
                     <div class="ash-hint">When Permafrost is also in drawdown halt, lifts this bot's halt. Checked every 15 s.</div>
                   </div>
                 </label>
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.afGcEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afGcEnabled=!cfg.afGcEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Gains Continuation (GC)</div>
+                    <div class="ash-hint">Broadcasts each base-margin step of 6hr profit to Permafrost; if Permafrost also has GC on and the broadcast is fresh, it takes a full drawdown halt (and vice versa). Requires GC on both bots.</div>
+                  </div>
+                </label>
+                <div x-show="cfg.afGcEnabled" style="margin-top:8px">
+                  <div class="g">
+                    <div class="lbl">Step Size <b x-text="cfg.afGcThresholdPct+'%'"></b> of base margin</div>
+                    <input type="range" min="10" max="200" step="5" x-model.number="cfg.afGcThresholdPct" @change="persist()">
+                    <span style="font-size:9px;color:var(--text-lo);margin-left:6px" x-text="'($'+(cfg.minNotional/cfg.leverage*(cfg.afGcThresholdPct/100)).toFixed(2)+' per step)'"></span>
+                  </div>
+                  <div class="g" style="margin-top:6px">
+                    <div class="lbl">Freshness Window <b x-text="(Math.max(1,cfg.scanMins??10)*cfg.afGcFreshnessMult)+'min'"></b> <span style="color:var(--text-lo);font-weight:400" x-text="'('+cfg.afGcFreshnessMult+'× Scan Every)'"></span></div>
+                    <input type="range" min="1" max="6" step="1" x-model.number="cfg.afGcFreshnessMult" @change="persist()">
+                  </div>
+                </div>
               </div>
               <div x-show="cfg.ashfallCrossEnabled && afCrossEvents.length" class="ash-hint" style="margin-top:5px" x-text="afCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Winter — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
             </div>
@@ -237,12 +301,12 @@
               </label>
               <div x-show="cfg.ashfallScorecardEnabled" style="margin-top:8px">
                 <div class="g">
-                  <div class="lbl">Sponge Quota <b x-text="cfg.afSpongeQuota??30"></b> closes/criterion</div>
+                  <div class="lbl">Sponge Quota <b x-text="cfg.afSpongeQuota"></b> closes/criterion</div>
                   <input type="range" min="10" max="200" step="10" x-model.number="cfg.afSpongeQuota" @change="_afScoreBuild();persist()">
                   <div class="ash-hint">Max recent closes per criterion used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation.</div>
                 </div>
                 <div class="g" style="margin-top:8px">
-                  <div class="lbl">Stale Purge <b x-text="cfg.afStaleSlotDays??7"></b> days</div>
+                  <div class="lbl">Stale Purge <b x-text="cfg.afStaleSlotDays"></b> days</div>
                   <input type="number" min="1" step="1" x-model.number="cfg.afStaleSlotDays" @change="_afScoreTrim();_afScoreBuild();persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="ash-hint">Slots with no new closes in this many days are fully removed from the scorecard.</div>
                 </div>
@@ -254,7 +318,7 @@
                   </div>
                 </label>
                 <div x-show="cfg.afRegimeScoringEnabled" class="g" style="margin-top:8px">
-                  <div class="lbl">Regime Min Sample <b x-text="cfg.afRegimeMinSample??5"></b> closes</div>
+                  <div class="lbl">Regime Min Sample <b x-text="cfg.afRegimeMinSample"></b> closes</div>
                   <input type="range" min="1" max="30" step="1" x-model.number="cfg.afRegimeMinSample" @change="_afScoreBuild();persist()">
                   <div class="ash-hint">Below this many closes, a regime bucket falls back to the flat score for entry blocking/ranking — display still shows the raw regime figure.</div>
                 </div>
@@ -271,7 +335,7 @@
                   </div>
                 </label>
                 <div class="g" x-show="cfg.afCoQualPenaltyEnabled" style="margin-top:8px">
-                  <div class="lbl">Depth Multiplier <b x-text="(cfg.afCoQualDepthPct??10)+'%'"></b> per tier</div>
+                  <div class="lbl">Depth Multiplier <b x-text="(cfg.afCoQualDepthPct)+'%'"></b> per tier</div>
                   <input type="range" min="0" max="50" step="1" x-model.number="cfg.afCoQualDepthPct" @change="persist()">
                   <div class="ash-hint">Scales a criterion's collapsed score by how deep the ticker qualifies at — a good score gets better with depth, a bad score gets worse. E.g. at 10%, a criterion scoring +$0.50 is applied as +$0.70 for a ticker qualifying 4 tiers deep.</div>
                 </div>
@@ -283,26 +347,26 @@
                 <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);margin-bottom:4px">SAMPLING BARS</div>
                 <div style="display:flex;flex-wrap:wrap;gap:4px 16px">
                   <label class="tog">
-                    <div class="tog-t" :class="(cfg.afShowStructure??false)?'on':''" @click.prevent="if(!cfgLocked){cfg.afShowStructure=!(cfg.afShowStructure??false);persist()}"><div class="tog-k"></div></div>
+                    <div class="tog-t" :class="(cfg.afShowStructure)?'on':''" @click.prevent="if(!cfgLocked){cfg.afShowStructure=!(cfg.afShowStructure);persist()}"><div class="tog-k"></div></div>
                     <span class="tog-l">Structure</span>
                   </label>
                   <label class="tog">
-                    <div class="tog-t" :class="(cfg.afShowFunding??false)?'on':''" @click.prevent="if(!cfgLocked){cfg.afShowFunding=!(cfg.afShowFunding??false);persist()}"><div class="tog-k"></div></div>
+                    <div class="tog-t" :class="(cfg.afShowFunding)?'on':''" @click.prevent="if(!cfgLocked){cfg.afShowFunding=!(cfg.afShowFunding);persist()}"><div class="tog-k"></div></div>
                     <span class="tog-l">Funding</span>
                   </label>
                   <label class="tog">
-                    <div class="tog-t" :class="(cfg.afShowLiq??true)?'on':''" @click.prevent="if(!cfgLocked){cfg.afShowLiq=!(cfg.afShowLiq??true);persist()}"><div class="tog-k"></div></div>
+                    <div class="tog-t" :class="(cfg.afShowLiq)?'on':''" @click.prevent="if(!cfgLocked){cfg.afShowLiq=!(cfg.afShowLiq);persist()}"><div class="tog-k"></div></div>
                     <span class="tog-l">Liq</span>
                   </label>
                   <label class="tog">
-                    <div class="tog-t" :class="(cfg.afShowVol??true)?'on':''" @click.prevent="if(!cfgLocked){cfg.afShowVol=!(cfg.afShowVol??true);persist()}"><div class="tog-k"></div></div>
+                    <div class="tog-t" :class="(cfg.afShowVol)?'on':''" @click.prevent="if(!cfgLocked){cfg.afShowVol=!(cfg.afShowVol);persist()}"><div class="tog-k"></div></div>
                     <span class="tog-l">Vol</span>
                   </label>
                 </div>
               </div>
               <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
               <div class="g">
-                <div class="lbl">Slope Window <b x-text="(cfg.ashfallSlopeWindowHours??24)+'h'"></b></div>
+                <div class="lbl">Slope Window <b x-text="(cfg.ashfallSlopeWindowHours)+'h'"></b></div>
                 <input type="range" min="1" max="24" step="1" x-model.number="cfg.ashfallSlopeWindowHours" @change="persist()">
                 <div class="ash-hint">Timeframe for the directional comparison — "turning bullish/bearish" means the avg lean over the last N hours has shifted vs the N hours before it. Default 6h; raise to 12h for a slower, less reactive signal.</div>
               </div>
@@ -322,12 +386,12 @@
               </label>
               <div x-show="cfg.ashLiqEnabled" style="margin-top:8px">
                 <div class="g">
-                  <div class="lbl">S/B Dominance Threshold <b x-text="(cfg.ashLiqThresholdPct??50)+'%'"></b></div>
+                  <div class="lbl">S/B Dominance Threshold <b x-text="(cfg.ashLiqThresholdPct)+'%'"></b></div>
                   <input type="range" min="10" max="90" step="5" x-model.number="cfg.ashLiqThresholdPct" @change="persist()">
                   <div class="ash-hint">Qualifies S-Liq or B-Liq when that side represents ≥ this share of the ticker's total liquidation turnover in the cycle.</div>
                 </div>
                 <div class="g" style="margin-top:6px">
-                  <div class="lbl">Batch Size <b x-text="(cfg.ashLiqBatchSize??25)"></b> tickers</div>
+                  <div class="lbl">Batch Size <b x-text="(cfg.ashLiqBatchSize)"></b> tickers</div>
                   <input type="range" min="5" max="50" step="5" x-model.number="cfg.ashLiqBatchSize" @change="persist()">
                   <div class="ash-hint" x-text="'Per 1h window from ≥6% 24h move pool, disjoint across concurrent batches — '+(cfg.ashLiqPrescreenEnabled?'scored fill when Pre-Screening is on.':'random draw.')"></div>
                 </div>
@@ -339,7 +403,7 @@
                   </div>
                 </label>
                 <div class="g" x-show="cfg.ashLiqSequesterEnabled" style="margin-top:6px">
-                  <div class="lbl">Sequester Draw Cap <b x-text="(cfg.ashLiqSequesterCap??12)"></b> tickers</div>
+                  <div class="lbl">Sequester Draw Cap <b x-text="(cfg.ashLiqSequesterCap)"></b> tickers</div>
                   <input type="range" min="1" max="25" step="1" x-model.number="cfg.ashLiqSequesterCap" @change="persist()">
                   <div class="ash-hint">Max sequestered tickers pulled per batch; excess rotate in on later cycles.</div>
                 </div>
@@ -358,12 +422,12 @@
                   </div>
                 </label>
                 <div class="g" x-show="cfg.ashPecPrescreenEnabled" style="margin-top:6px">
-                  <div class="lbl">Universe Fetch Batch Size <b x-text="(cfg.ashPecBatchSize??25)"></b> tickers</div>
+                  <div class="lbl">Universe Fetch Batch Size <b x-text="(cfg.ashPecBatchSize)"></b> tickers</div>
                   <input type="range" min="5" max="100" step="5" x-model.number="cfg.ashPecBatchSize" @change="persist()">
                   <div class="ash-hint">Concurrent klines per batch across the full ticker universe.</div>
                 </div>
                 <div class="g" x-show="cfg.ashPecPrescreenEnabled" style="margin-top:6px">
-                  <div class="lbl">Universe Fetch Batch Delay <b x-text="(cfg.ashPecBatchDelayMs??2000)"></b> ms</div>
+                  <div class="lbl">Universe Fetch Batch Delay <b x-text="(cfg.ashPecBatchDelayMs)"></b> ms</div>
                   <input type="range" min="0" max="10000" step="250" x-model.number="cfg.ashPecBatchDelayMs" @change="persist()">
                   <div class="ash-hint">Pause between batches — spreads a full-universe fetch out instead of firing it all at once.</div>
                 </div>
@@ -377,7 +441,7 @@
               </label>
               <div x-show="cfg.afOcEnabled" style="margin-top:8px">
                 <div class="g">
-                  <div class="lbl">Order Limit <b x-text="(cfg.afOcOrderLimit??100)"></b> orders/ticker</div>
+                  <div class="lbl">Order Limit <b x-text="(cfg.afOcOrderLimit)"></b> orders/ticker</div>
                   <input type="range" min="10" max="500" step="10" x-model.number="cfg.afOcOrderLimit" @change="persist()">
                   <div class="ash-hint">Recent trades fetched per ticker per scan cycle. Buy/sell skew and average order interval are computed from this sample alone — no accumulation across cycles.</div>
                 </div>
@@ -433,9 +497,9 @@
                 <div class="lbl">Structure Wave <b x-text="(()=>{ void tick; const s=afStatus.slope??0; return s>0.05?'rising ▲':s<-0.05?'falling ▼':'steady ▬'; })()"></b></div>
                 <div x-html="_afWaveSvg(open && cfg.ashfallEnabled)" style="margin-top:4px;border:1px solid rgba(255,150,80,.15);border-radius:3px;background:rgba(255,150,80,.03)"></div>
                 <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap">
-                  <button @click="cfg.ashfallWaveShowMain=!(cfg.ashfallWaveShowMain??true);persist()" :style="(cfg.ashfallWaveShowMain??true)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Structure</button>
-                  <button @click="cfg.ashfallWaveShowFio=!(cfg.ashfallWaveShowFio??true);persist()" :style="(cfg.ashfallWaveShowFio??true)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">FIO</button>
-                  <button @click="cfg.afShowScore=!(cfg.afShowScore??true);persist()" :style="(cfg.afShowScore??true)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Score</button>
+                  <button @click="cfg.ashfallWaveShowMain=!(cfg.ashfallWaveShowMain);persist()" :style="(cfg.ashfallWaveShowMain)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Structure</button>
+                  <button @click="cfg.ashfallWaveShowFio=!(cfg.ashfallWaveShowFio);persist()" :style="(cfg.ashfallWaveShowFio)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">FIO</button>
+                  <button @click="cfg.afShowScore=!(cfg.afShowScore);persist()" :style="(cfg.afShowScore)?'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.12)':'border-color:var(--border);color:var(--text-lo);background:transparent'" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid;cursor:pointer;letter-spacing:.5px">Score</button>
                 </div>
                 <div class="ash-hint">Structure lean path (bull ↑ / bear ↓), up to ~1 week of history. Direction matters — falling tape reads negative for longs even if mildly bullish. History takes priority over the inherent wave when the profile is rich.</div>
                 <div class="ash-hint" style="margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">
@@ -443,7 +507,7 @@
                   <span x-show="(()=>{ void tick; return _afScoreNet().abs>0; })()">Score <span x-text="(()=>{ void tick; const {net,abs}=_afScoreNet(); if(!abs) return ''; const p=net/abs*100; return (p>=0?'+':'')+p.toFixed(1)+'%'; })()" :style="(()=>{ void tick; const {net}=_afScoreNet(); return net>0?'color:#6cd2aa':net<0?'color:#f08080':''; })()"></span></span>
                 </div>
                 <div style="margin-top:10px">
-                  <div x-show="cfg.afShowStructure??false">
+                  <div x-show="cfg.afShowStructure">
                   <div class="lbl">Structure Sampling <b x-text="afKlineBar.bearSum > 0 || afKlineBar.bullSum > 0 ? '🔴 '+(afKlineBar.bearSum/(afKlineBar.bearSum+afKlineBar.bullSum)*100).toFixed(1)+'% · 🟢 '+(afKlineBar.bullSum/(afKlineBar.bearSum+afKlineBar.bullSum)*100).toFixed(1)+'%' : '—'"></b></div>
                   <div style="display:flex;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
                     <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,80,80,.04)">
@@ -456,7 +520,7 @@
                   </div>
                   <div class="ash-hint" style="margin-top:2px">1h candle aggregate % change — last kline sample. Red ← bears · bulls → Green.</div>
                   </div>
-                  <div x-show="_micLoaded && (cfg.afShowFunding??false) && _micFundSkew" style="margin-top:8px">
+                  <div x-show="_micLoaded && (cfg.afShowFunding) && _micFundSkew" style="margin-top:8px">
                     <div class="lbl">Funding Rate Sample <b x-text="_micFundSkew ? 'neg '+_micFundSkew.negPct.toFixed(1)+'% · pos '+_micFundSkew.posPct.toFixed(1)+'%' : '—'"></b></div>
                     <div style="display:flex;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
                       <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,80,80,.04)">
@@ -469,7 +533,7 @@
                     </div>
                     <div class="ash-hint" style="margin-top:2px">Funding skew — kline + liq sample union. Red ← neg · pos → Green.</div>
                   </div>
-                  <div x-show="_micLoaded && (cfg.afShowVol??true) && _micVolSkew" style="margin-top:8px">
+                  <div x-show="_micLoaded && (cfg.afShowVol) && _micVolSkew" style="margin-top:8px">
                     <div class="lbl">Volume Sample <b x-text="_micVolSkew ? 'below '+_micVolSkew.belowPct.toFixed(1)+'% · above '+_micVolSkew.abovePct.toFixed(1)+'%' : '—'"></b></div>
                     <div style="display:flex;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
                       <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,255,255,.03)">
@@ -551,7 +615,7 @@
               </div>
             </div>
             <!-- Liquidation Surveillance -->
-            <div x-show="(cfg.afShowLiq??true) && cfg.ashLiqEnabled && _liqAllSummary().total > 0" style="margin-top:10px">
+            <div x-show="(cfg.afShowLiq) && cfg.ashLiqEnabled && _liqAllSummary().total > 0" style="margin-top:10px">
               <div class="lbl">Liquidation Flow <b x-text="(()=>{ const a=_liqAllSummary(); return a.total?'B-Liq '+a.bPct.toFixed(1)+'% · S-Liq '+a.sPct.toFixed(1)+'%':'—'; })()"></b></div>
               <div style="display:flex;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;border:1px solid rgba(255,255,255,.08)">
                 <div style="flex:1;display:flex;justify-content:flex-end;background:rgba(255,80,80,.04)">
@@ -625,6 +689,16 @@
         _afStructureList: null, _afStructureAt: 0, // own 3h ticker cache independent of host
         afStatus:  { skew: null, breadth: null, score: null, mass: 0, count: 0, lean: 0, slope: 0, inherent: 0, eff: null, fioScore: null, at: 0 },
         afCrossEvents: [],
+        // Gains Continuation (GC) — own rolling 6h closed-trade PnL log, independent of the
+        // host's Gains Lock window (that one only populates when cfg.gainsLockEnabled is on;
+        // GC needs to work regardless). _afGcLastStep is the highest step index already
+        // broadcast (high-water-mark — never re-fires a step already crossed); resets to 0 once
+        // rolling PnL drops back to ≤0 so a fresh climb re-arms from the first step. _afGcLastSeenTs
+        // is the ts of the latest partner 'gc' event already reacted to (fresh or stale), so the
+        // 15s loop doesn't re-evaluate the same event every tick.
+        afGcWindow:      [],
+        _afGcLastStep:   0,
+        _afGcLastSeenTs: 0,
         _liqBatches: [],
         _liqLastBatchSyms: [], // tickers picked for liq surveillance on the most recent scan only
         _liqMessageHooks: [], // plugins push (batch, sym) => void here to react to live liq turnover, e.g. Liquid-Diver
@@ -670,49 +744,50 @@
           // *older* halt to lift, so an inflated timestamp can flip which side loses the halt).
           _afWasHalted      = this._isDrawdownHalted?.() ?? false;
           _afWasGainsLocked = this._isGainsLocked?.()    ?? false;
+          // The sync above deliberately skips writing a ddh-start/glk-start cross event on a
+          // mid-halt reload (see comment above) to avoid an inflated "now" timestamp — but that
+          // means a bot whose tab restarts mid-halt (backgrounded/killed on mobile, manual
+          // refresh, etc.) never broadcasts *any* ddh-start for that halt, so Mutual DDH Lift can
+          // never react to it no matter how long the halt runs or what the partner does — this
+          // is the actual cause of a same-halt lift silently never firing, not CROSS_TTL. Backfill
+          // one here if the bus doesn't already show us as actively halted, using the halt's real
+          // start time (back-calculated from the restored _drawdownHaltUntil) rather than "now" —
+          // that preserves the age comparison Mutual DDH Lift depends on instead of trading a
+          // missing marker for a too-recent one.
+          if ((this.cfg.ashfallCrossEnabled ?? true)) {
+            if (_afWasHalted && !this._manualHalt && typeof this._drawdownHaltUntil === 'number') {
+              const _ownDdh = this._afCrossRead().filter(e => e.source === 'chaser' && (e.kind === 'ddh-start' || e.kind === 'ddh-end')).at(-1);
+              if (!_ownDdh || _ownDdh.kind === 'ddh-end') {
+                const _haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+                this._afCrossWrite('ddh-start', null, { ts: this._drawdownHaltUntil - _haltMs });
+              }
+            }
+            if (_afWasGainsLocked && typeof this._gainsLockHaltUntil === 'number') {
+              const _ownGlk = this._afCrossRead().filter(e => e.source === 'chaser' && (e.kind === 'glk-start' || e.kind === 'glk-end')).at(-1);
+              if (!_ownGlk || _ownGlk.kind === 'glk-end') {
+                const _lockMs = (this.cfg.gainsLockHours ?? 6) * 3600 * 1000;
+                this._afCrossWrite('glk-start', null, { ts: this._gainsLockHaltUntil - _lockMs });
+              }
+            }
+          }
           // Regime scorecard's auto-follow display — synced to whatever regime is actually live
           // right now, not left at its false/null initial value, so a reload snaps straight to
           // the correct segment instead of waiting for the first threshold cross after load.
           _afWasRegimeType     = this._afRegimeCurrentType();
           this.afRegimeDisplayType = _afWasRegimeType;
-          if (this.cfg.ashfallEnabled          === undefined) this.cfg.ashfallEnabled          = true;
           if (this.cfg.ashfallSlopeWindowHours === undefined) this.cfg.ashfallSlopeWindowHours = 24;
           // Renamed from ashfallIoEnabled/ashfallWaveShowIo ('IO' read as Open Interest, confusable
           // with the unrelated iot/iom criteria — this line is purely funding-rate-derived). Fall
           // back to the old key so an existing user's toggle choice survives the rename.
           if (this.cfg.ashfallFioEnabled        === undefined) this.cfg.ashfallFioEnabled        = this.cfg.ashfallIoEnabled ?? true;
-          if (this.cfg.ashfallWaveShowMain      === undefined) this.cfg.ashfallWaveShowMain      = true;
           if (this.cfg.ashfallWaveShowFio        === undefined) this.cfg.ashfallWaveShowFio        = this.cfg.ashfallWaveShowIo ?? true;
           if (!Array.isArray(this.cfg.megacapExclude)) this.cfg.megacapExclude = [...DEFAULT_MEGACAP_EXCLUDE];
-          if (this.cfg.afShowScore              === undefined) this.cfg.afShowScore              = true;
-          if (this.cfg.ashfallCrossEnabled        === undefined) this.cfg.ashfallCrossEnabled        = true;
-          if (this.cfg.ashfallMutualDdLiftEnabled          === undefined) this.cfg.ashfallMutualDdLiftEnabled          = true;
-          if (this.cfg.ashfallScorecardEnabled           === undefined) this.cfg.ashfallScorecardEnabled           = true;
-          if (this.cfg.afCoQualPenaltyEnabled           === undefined) this.cfg.afCoQualPenaltyEnabled           = true;
-          if (this.cfg.afCoQualDepthPct                 === undefined) this.cfg.afCoQualDepthPct                 = 10;
-          if (this.cfg.afScorecardView                   === undefined) this.cfg.afScorecardView                   = 'combined';
-          // afScorecardSource ('hist'/'traded'/'both') retired — no longer read anywhere;
-          // left un-migrated in old saved configs, harmless if present.
-          if (this.cfg.afRegimeScoringEnabled            === undefined) this.cfg.afRegimeScoringEnabled            = false;
-          if (this.cfg.afRegimeMinSample                 === undefined) this.cfg.afRegimeMinSample                 = 5;
-          if (this.cfg.afSpongeQuota                     === undefined) this.cfg.afSpongeQuota                     = 30;
-          if (this.cfg.afStaleSlotDays                   === undefined) this.cfg.afStaleSlotDays                   = 7;
-          if (this.cfg.afPartnerScoreMode                === undefined) this.cfg.afPartnerScoreMode                = 'wins';
-          if (this.cfg.ashLiqEnabled      === undefined) this.cfg.ashLiqEnabled      = true;
-          if (this.cfg.ashLiqBatchSize    === undefined) this.cfg.ashLiqBatchSize    = 25;
-          if (this.cfg.ashLiqThresholdPct === undefined) this.cfg.ashLiqThresholdPct = 50;
-          if (this.cfg.ashLiqSequesterEnabled === undefined) this.cfg.ashLiqSequesterEnabled = true;
-          if (this.cfg.ashLiqSequesterCap     === undefined) this.cfg.ashLiqSequesterCap     = 12;
-          if (this.cfg.ashLiqPrescreenEnabled === undefined) this.cfg.ashLiqPrescreenEnabled = false;
-          if (this.cfg.ashPecPrescreenEnabled === undefined) this.cfg.ashPecPrescreenEnabled = false;
-          if (this.cfg.ashPecBatchSize        === undefined) this.cfg.ashPecBatchSize        = 25;
-          if (this.cfg.ashPecBatchDelayMs     === undefined) this.cfg.ashPecBatchDelayMs     = 2000;
-          if (this.cfg.afOcEnabled            === undefined) this.cfg.afOcEnabled            = true;
-          if (this.cfg.afOcOrderLimit         === undefined) this.cfg.afOcOrderLimit         = 100;
-          if (this.cfg.afShowStructure === undefined) this.cfg.afShowStructure = false;
-          if (this.cfg.afShowLiq       === undefined) this.cfg.afShowLiq       = true;
-          if (this.cfg.afShowFunding   === undefined) this.cfg.afShowFunding   = false;
-          if (this.cfg.afShowVol       === undefined) this.cfg.afShowVol       = true;
+          // Single source of truth for all other Ashfall scalar defaults — see
+          // ASHFALL_DEFAULT_CFG above. Call sites read this.cfg.<key> directly with no inline
+          // fallback, since this guarantees every key below is present after init runs once.
+          for (const [k, v] of Object.entries(ASHFALL_DEFAULT_CFG)) {
+            if (this.cfg[k] === undefined) this.cfg[k] = v;
+          }
           try {
             const saved = JSON.parse(localStorage.getItem(ASH_LIQ_KEY) || 'null');
             if (Array.isArray(saved) && this.cfg.ashLiqEnabled) {
@@ -770,6 +845,11 @@
               if (Array.isArray(s.closes)) this.afCloses = s.closes.slice(-CLOSES_CAP);
               if (Array.isArray(s.wave))      this.afWave      = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
               if (s.afKlineBar?.bearSum != null) this.afKlineBar = s.afKlineBar;
+              // GC window is re-filtered to the live 6h cutoff on load, same as the host's own
+              // gainsWindow restore — a stale entry surviving a long-offline reload shouldn't
+              // count toward a step it wouldn't have reached had the tab stayed open.
+              if (Array.isArray(s.gcWindow)) this.afGcWindow = s.gcWindow.filter(e => e?.ts && (Date.now() - e.ts) < 6 * 3600 * 1000);
+              if (typeof s.gcLastStep === 'number') this._afGcLastStep = s.gcLastStep;
             }
           } catch(e) {}
           this.log(`[ASH] Ashfall (Chaser) v${VERSION} loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afCloses.length} closes on record`, 'info');
@@ -818,9 +898,29 @@
                   }
                 }
               }
+              // Gains Continuation (GC) receive side — requires this bot to also have GC on
+              // (own toggle doubles as the opt-in to react to the partner's broadcast, same
+              // convention as Mutual DDH Lift). Freshness window mirrors the codebase's
+              // established partner-staleness pattern (2× scan cadence = 1 missed-cycle grace),
+              // just user-configurable here via afGcFreshnessMult instead of hardcoded 2×.
+              // Dedupes on event ts via _afGcLastSeenTs so a still-fresh event isn't re-actioned
+              // every 15s tick, and a since-gone-stale one isn't re-checked forever either.
+              if (this.cfg.afGcEnabled) {
+                const _gcEvt = this._afCrossRead().filter(e => e.source === 'winter' && e.kind === 'gc').at(-1);
+                if (_gcEvt && _gcEvt.ts !== this._afGcLastSeenTs) {
+                  this._afGcLastSeenTs = _gcEvt.ts;
+                  const _gcFreshMs = Math.max(1, this.cfg.scanMins ?? 10) * (this.cfg.afGcFreshnessMult ?? 2) * 60 * 1000;
+                  if ((Date.now() - _gcEvt.ts) < _gcFreshMs) {
+                    this._drawdownHaltUntil = Date.now() + (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+                    this._haltLoggedKind = null;
+                    this.persist();
+                    this.log(`[ASH] 🚨 Gains Continuation — fresh broadcast from Permafrost (step ${_gcEvt.step ?? '?'}, +${(_gcEvt.pnl ?? 0).toFixed(2)} USDT 6hr) — full drawdown halt triggered.`, 'warn');
+                  }
+                }
+              }
             }
             if (this.cfg.ashfallEnabled && (this._isDrawdownHalted?.() ?? false)) {
-              const _cdMs = (this.cfg.bulkTickerCooldownHours ?? 3) * 3600 * 1000;
+              const _cdMs = this.cfg.bulkTickerCooldownHours * 3600 * 1000;
               if ((Date.now() - (this._afStructureAt || 0)) >= _cdMs) {
                 this._afFetchStructure().then(r => {
                   if (!r) return;
@@ -872,9 +972,10 @@
             this.afEvents     = trimToByteCap(this.afEvents);
             this.afCloses     = trimToByteCap(this.afCloses);
             this.afWave       = trimToByteCap(this.afWave);
+            this.afGcWindow   = trimToByteCap(this.afGcWindow);
             localStorage.setItem(ASH_KEY, JSON.stringify({
               events: this.afEvents, closes: this.afCloses, wave: this.afWave,
-              afKlineBar: this.afKlineBar,
+              afKlineBar: this.afKlineBar, gcWindow: this.afGcWindow, gcLastStep: this._afGcLastStep,
             }));
           } catch(e) {}
         },
@@ -884,7 +985,7 @@
           try {
             // Reuse the host scan's bulk ticker response when fresh (slow-tick
             // sampling during halts falls back to fetching — scans don't run then)
-            const cooldownMs = (this.cfg.bulkTickerCooldownHours ?? 3) * 3600 * 1000;
+            const cooldownMs = this.cfg.bulkTickerCooldownHours * 3600 * 1000;
             let list, _freshData = false;
             if (this._afStructureList?.length && (Date.now() - (this._afStructureAt || 0)) < cooldownMs) {
               list = this._afStructureList; // own cache within cooldown
@@ -900,8 +1001,10 @@
                 this._afStructureList = list;
                 this._afStructureAt   = _shared.ts;
                 _freshData = true;
+              } else if (this._lfIsFollowing?.()) {
+                return null; // following a live partner — no shared structure data yet, skip this cycle
               } else {
-                const r = await fetch(`${this.base}/v5/market/tickers?category=linear`);
+                const r = await this._qFetch(`${this.base}/v5/market/tickers?category=linear`);
                 const d = await r.json();
                 if (d.retCode !== 0) return null;
                 list = d.result?.list || [];
@@ -1006,7 +1109,7 @@
           const n    = wave.length;
           const lean = n ? wave[n - 1].lean : (((this.afStatus.skew ?? 0) + (this.afStatus.breadth ?? 0)) / 2);
           if (n < WAVE_MIN_PTS) return { lean, slope: 0, n };
-          const winMs     = (this.cfg.ashfallSlopeWindowHours ?? 24) * 3600 * 1000;
+          const winMs     = (this.cfg.ashfallSlopeWindowHours) * 3600 * 1000;
           const now       = Date.now();
           const recentPts = wave.filter(p => p.ts >= now - winMs);
           const olderPts  = wave.filter(p => p.ts >= now - 2 * winMs && p.ts < now - winMs);
@@ -1055,6 +1158,7 @@
           if (this._afKlineBarAt === lastHourStart && (this.afKlineBar.bearSum > 0 || this.afKlineBar.bullSum > 0)) {
             this._afMergeKlineBar(); return;
           }
+          if (this._lfIsFollowing?.()) { this._afMergeKlineBar(); return; } // following — no own kline sample
           try {
             const allTickers = this._lastAllTickers || [];
             const cap = this.cfg.micKlineScanCap ?? 20;
@@ -1070,7 +1174,7 @@
             let bearSum = 0, bullSum = 0;
             await Promise.all(syms.map(async sym => {
               try {
-                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
+                const r = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
                 const d = await r.json();
                 if (d.retCode !== 0) return;
                 const list = d?.result?.list;
@@ -1146,8 +1250,8 @@
         _afScoreTrim() {
           try {
             const records   = this._afScoreRead();
-            const quota     = this.cfg.afSpongeQuota   ?? 30;
-            const staleDays = this.cfg.afStaleSlotDays ?? 7;
+            const quota     = this.cfg.afSpongeQuota;
+            const staleDays = this.cfg.afStaleSlotDays;
             const staleMs   = staleDays * 24 * 3600 * 1000;
             const now       = Date.now();
             // +fund/-fund are NOT legacy — Blind-Entry and Liquid-Diver actively write them as
@@ -1202,7 +1306,7 @@
             const rec = { ts: Date.now(), criteria, pnl, source: 'chaser' };
             if (hist) rec.hist = true;
             records.push(rec);
-            const quota = this.cfg.afSpongeQuota ?? 30;
+            const quota = this.cfg.afSpongeQuota;
             const bySlot = {};
             for (const r of records) {
               const k = collapseKey(r.criteria);
@@ -1236,7 +1340,7 @@
         _afScoreBuild(records) {
           records = records || this._afScoreRead();
           const exclude = new Set(this.cfg.micAutoSlotExclude || []);
-          const quota = this.cfg.afSpongeQuota ?? 30;
+          const quota = this.cfg.afSpongeQuota;
           const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
           // Sorted once and reused by both passes below — they use the identical sort
           // criteria (newest-first), so sorting twice was pure duplicate work.
@@ -1334,7 +1438,7 @@
           if (this.cfg.afRegimeScoringEnabled && this.afRegimeActiveTypes.length) {
             const curType = this._afRegimeCurrentType();
             if (curType && this.afRegimeActiveTypes.includes(curType)) {
-              const minSample = this.cfg.afRegimeMinSample ?? 5;
+              const minSample = this.cfg.afRegimeMinSample;
               const curBucket = regimeStats[curType] || {};
               const mergedRanks = {};
               const allKeys = new Set([...Object.keys(critStats), ...Object.keys(curBucket)]);
@@ -1548,7 +1652,7 @@
           // also needs headroom above the scan cadence itself so ordinary scan-timing jitter
           // doesn't get misread as a gap.
           const BIN_MS = WAVE_TTL_MS / BINS;
-          const WAVE_GAP_MS = Math.max(BIN_MS * 2, 3 * (this.cfg.scanMins ?? 15) * 60000);
+          const WAVE_GAP_MS = Math.max(BIN_MS * 2, 3 * this.cfg.scanMins * 60000);
 
           // FIO line: crowd funding-rate sentiment; only present in newer wave entries (guard p.fio != null)
           const fioBins = new Array(BINS).fill(null).map(() => ({ iSum: 0, n: 0 }));
@@ -1586,9 +1690,9 @@
             scoreSvg += `<line x1="${p1.x.toFixed(1)}" y1="${y(p1.s).toFixed(1)}" x2="${p2.x.toFixed(1)}" y2="${y(p2.s).toFixed(1)}" stroke="rgba(${gv},${gv},${gv},.8)" stroke-width="1.5"/>`;
           }
 
-          const showMain  = this.cfg.ashfallWaveShowMain ?? true;
-          const showFio    = this.cfg.ashfallWaveShowFio   ?? true;
-          const showScore = this.cfg.afShowScore         ?? true;
+          const showMain  = this.cfg.ashfallWaveShowMain;
+          const showFio    = this.cfg.ashfallWaveShowFio;
+          const showScore = this.cfg.afShowScore;
           const cur = pts[pts.length - 1].lean;
           const col = cur > 0.05 ? 'var(--profit)' : cur < -0.05 ? 'var(--short)' : '#ff9650';
           const leanGroups = [[pts[0]]];
@@ -1733,6 +1837,29 @@
               const now = Date.now();
               this.afCloses.push({ ts: now, pnl, skew: this.afStatus.skew, breadth: this.afStatus.breadth });
               if (this.afCloses.length > CLOSES_CAP) this.afCloses = this.afCloses.slice(-CLOSES_CAP);
+            }
+            // Gains Continuation (GC) — own rolling 6h PnL, independent of the host's Gains
+            // Lock window. Stepped in afGcThresholdPct-of-base-margin increments (default 50% —
+            // e.g. $0.50, $1.00, $1.50 at $1 base margin): every NEW step crossed upward fires a
+            // one-shot 'gc' broadcast (high-water-mark — a step already fired never re-fires on
+            // its own, only on a fresh climb after the window resets to ≤0). Read side is in the
+            // 15s loop below.
+            if (this.cfg.afGcEnabled && typeof pnl === 'number') {
+              const _gcNow = Date.now();
+              const _gcCut = _gcNow - 6 * 3600 * 1000;
+              this.afGcWindow.push({ pnl, ts: _gcNow });
+              this.afGcWindow = this.afGcWindow.filter(e => (e.ts || 0) >= _gcCut);
+              const _gcRolling = this.afGcWindow.reduce((s, e) => s + (e.pnl || 0), 0);
+              const _gcBaseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+              const _gcStep = _gcBaseMargin * Math.max(0.01, (this.cfg.afGcThresholdPct ?? 50) / 100);
+              const _gcStepIdx = Math.floor(_gcRolling / _gcStep);
+              if (_gcStepIdx > this._afGcLastStep) {
+                this._afGcLastStep = _gcStepIdx;
+                if (this.cfg.ashfallCrossEnabled) this._afCrossWrite('gc', null, { pnl: _gcRolling, step: _gcStepIdx });
+                this.log(`[ASH] 📡 Gains Continuation — 6hr rolling PnL +${_gcRolling.toFixed(2)} crossed step ${_gcStepIdx} (+${_gcStep.toFixed(2)} USDT increments) — broadcast to Permafrost.`, 'success');
+              } else if (_gcRolling <= 0 && this._afGcLastStep !== 0) {
+                this._afGcLastStep = 0; // back to flat/negative — re-arm from the first step
+              }
             }
           }
           if (this.cfg.ashfallCrossEnabled) {
@@ -2134,6 +2261,7 @@
         // window every time).
         async _afPecUniverseFetch() {
           if (!this.cfg.ashPecPrescreenEnabled) return;
+          if (this._lfIsFollowing?.()) return; // following — rely on partner's shared kline log
           const freshAt = this._lastAllTickersAt || 0;
           if (!freshAt || freshAt === this._afPecUniverseFetchedAt) return;
           const allTickers = this._lastAllTickers || [];
@@ -2150,8 +2278,8 @@
 
           const bucket  = this._afKlineLogRead(gran);
           const symbols = allTickers.filter(t => t?.symbol?.endsWith('USDT')).map(t => t.symbol);
-          const batchSize = Math.max(1, this.cfg.ashPecBatchSize ?? 25);
-          const delayMs   = Math.max(0, this.cfg.ashPecBatchDelayMs ?? 2000);
+          const batchSize = Math.max(1, this.cfg.ashPecBatchSize);
+          const delayMs   = Math.max(0, this.cfg.ashPecBatchDelayMs);
 
           for (let i = 0; i < symbols.length; i += batchSize) {
             const slice = symbols.slice(i, i + batchSize);
@@ -2163,7 +2291,7 @@
                 if (newestHave >= lastBarStart) { if (entry) entry.lastSeenAt = now; return; }
                 const barsNeeded = have.length ? Math.round((lastBarStart - newestHave) / barMs) + 1 : total;
                 const limit = Math.min(barsNeeded + 1, 200); // +1 — Bybit's first row is the still-forming candle
-                const r = await fetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=${bybitInterval}&limit=${limit}`);
+                const r = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=${bybitInterval}&limit=${limit}`);
                 if (!r.ok) return;
                 const d = await r.json();
                 const list = d?.result?.list;
@@ -2219,6 +2347,9 @@
         },
 
         _liqLaunchBatch() {
+          // While following a live partner, don't open our own liq WS surveillance —
+          // consume the partner's shared liqResults instead (see init()'s _sharedRead).
+          if (this._lfIsFollowing?.()) return;
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) { this._liqLastBatchSyms = []; return; }
           const activeSyms = new Set((this._liqBatches || []).flatMap(b => b.symbols));
@@ -2239,9 +2370,9 @@
           // symbols drawn first each time (see _liqCloseBatch for how membership is maintained).
           const tickerBySym = new Map(allTickers.map(t => [t.symbol, t]));
           let sequesterPicks = [];
-          if (this.cfg.ashLiqSequesterEnabled ?? true) {
+          if (this.cfg.ashLiqSequesterEnabled) {
             if (!this._liqSequester) this._liqSequester = {};
-            const cap = this.cfg.ashLiqSequesterCap ?? 12;
+            const cap = this.cfg.ashLiqSequesterCap;
             sequesterPicks = Object.entries(this._liqSequester)
               .filter(([sym]) => {
                 const t = tickerBySym.get(sym);
@@ -2254,7 +2385,7 @@
           }
           for (const sym of sequesterPicks) activeSyms.add(sym);
 
-          const remaining = Math.max(0, (this.cfg.ashLiqBatchSize ?? 25) - sequesterPicks.length);
+          const remaining = Math.max(0, (this.cfg.ashLiqBatchSize) - sequesterPicks.length);
           const gainers = allTickers.filter(t => base(t) && parseFloat(t.price24hPcnt || 0) >  0.06);
           const losers  = allTickers.filter(t => base(t) && parseFloat(t.price24hPcnt || 0) < -0.06);
           if (!sequesterPicks.length && !gainers.length && !losers.length) {
@@ -2339,7 +2470,7 @@
           // BEFORE this cycle (updated after, at the bottom of this function) so a cycle is
           // never judged against a baseline that already includes itself.
           const calcDepth  = (raw, avg) => avg > 0 ? Math.trunc(((raw / avg) - 1) * 100) : 0;
-          const threshold  = this.cfg.ashLiqThresholdPct ?? 50;
+          const threshold  = this.cfg.ashLiqThresholdPct;
           const results    = batch.symbols.map(sym => {
             const sLiqRaw  = batch.sLiqTurnover[sym] || 0;
             const bLiqRaw  = batch.bLiqTurnover[sym] || 0;
@@ -2616,6 +2747,7 @@
         // _afVolIoWindowAvg), just without paying for a fetch neither criterion needs.
         async _ocFetchBatch(symbols, volIoMap, wantOc) {
           if (!this.cfg.afOcEnabled || !symbols?.length) return;
+          if (this._lfIsFollowing?.()) { this._ocSeedFromShared(); return; } // following — seed from partner's shared OC data instead of fetching our own
           // Guard against overlapping calls: if a slower fetch (e.g. from a re-triggered
           // scan) finishes after a newer one already pushed, its stale ticker set would
           // otherwise land in history too, mixing symbols that were never part of the
@@ -2630,13 +2762,13 @@
             return null;
           };
           if (wantOc) {
-            const limit = this.cfg.afOcOrderLimit ?? 100;
+            const limit = this.cfg.afOcOrderLimit;
             const CONC = 10;
             for (let i = 0; i < symbols.length; i += CONC) {
               await Promise.all(symbols.slice(i, i + CONC).map(async sym => {
                 let rec = seedVolIo(sym);
                 try {
-                  const res = await fetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
+                  const res = await this._qFetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
                   const js  = await res.json();
                   const trades = js?.result?.list || [];
                   if (trades.length >= 2) {
@@ -2662,6 +2794,12 @@
           this._afOcCycleHistory.push(entry);
           if (this._afOcCycleHistory.length > 25) this._afOcCycleHistory = this._afOcCycleHistory.slice(-25);
           this._ocPersistHistory();
+          // Publish this cycle's OC sample so a partner bot that's following can seed its own
+          // afOcResults/_afOcCycleHistory instead of going without OC data entirely while
+          // following (see _ocSeedFromShared) — unlike liqResults/PEC, OC previously had no
+          // cross-bot channel at all, so a follower's ocs/ocx checks silently starved for as
+          // long as it kept following.
+          this._sharedWrite?.('ocResults', results);
           const withInterval = Object.values(results).filter(r => r.avgMs != null);
           const withVolIo = Object.values(results).filter(r => r.vol != null || r.oi != null);
           const parts = [`${Object.keys(results).length}t`];
@@ -2682,9 +2820,17 @@
         // value into their own local map instead.
         async _ocFetchSingle(sym) {
           if (!this.cfg.afOcEnabled || !sym) return null;
+          if (this._lfIsFollowing?.()) {
+            // following — seed afOcResults from the partner's shared snapshot and answer from
+            // that instead of fetching our own (see _ocSeedFromShared). Not tagged `live` —
+            // it's the leader's real historied batch entry, not a fresh unhistoried sample.
+            this._ocSeedFromShared();
+            const rec = this.afOcResults?.[sym];
+            return rec ? { ...rec } : null;
+          }
           try {
-            const limit = this.cfg.afOcOrderLimit ?? 100;
-            const res = await fetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
+            const limit = this.cfg.afOcOrderLimit;
+            const res = await this._qFetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
             const js  = await res.json();
             const trades = js?.result?.list || [];
             if (trades.length < 2) return null;
@@ -2699,6 +2845,25 @@
             // counting once a later batch fetch pushes the same ticker into history for real.
             return { bc, sc, avgMs, n: trades.length, live: true };
           } catch(_) { return null; }
+        },
+
+        // Following: no own OC fetch runs (see the guards in _ocFetchBatch/_ocFetchSingle), so
+        // pull whatever the leader most recently published instead of leaving afOcResults/
+        // _afOcCycleHistory to go stale forever. Mirrors how PEC (_micPrefetchPec's shared seed)
+        // and liq (_liqResults + sharedRead merge) already cross the leader/follower boundary.
+        // Dedupes on the shared snapshot's own ts so a cycle already folded in doesn't get
+        // pushed into history twice across repeated calls within the same scan.
+        _ocSeedFromShared() {
+          const shared = this._sharedRead?.('ocResults');
+          if (!shared?.data) return;
+          this.afOcResults = shared.data;
+          if (shared.ts && shared.ts !== this._afOcLastSharedTs) {
+            this._afOcLastSharedTs = shared.ts;
+            const histEntry = { id: (this._afOcCycleCounter = (this._afOcCycleCounter % 99) + 1), ts: shared.ts, results: Object.entries(shared.data).map(([sym, r]) => ({ sym, ...r })) };
+            this._afOcCycleHistory.push(histEntry);
+            if (this._afOcCycleHistory.length > 25) this._afOcCycleHistory = this._afOcCycleHistory.slice(-25);
+            this._ocPersistHistory();
+          }
         },
 
         // Shared by init() (loading from localStorage) and afImport() (loading from a file)
