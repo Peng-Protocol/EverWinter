@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.64.2';
+  const VERSION        = '1.65.0';
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -87,6 +87,14 @@
     pfPecBatchDelayMs: 2000,
     pfOcEnabled: true,
     pfOcOrderLimit: 100,
+    // Gains Continuation (GC): own rolling 6h PnL, stepped in increments of pfGcThresholdPct
+    // of base margin (minNotional/leverage). Each new step crossed broadcasts a one-shot 'gc'
+    // cross event; if Ashfall also has GC on and reads it within pfGcFreshnessMult scan
+    // intervals, it triggers a full drawdown halt on Ashfall (and vice versa). Off by default —
+    // opt-in on both sides, same as Mutual DDH Lift.
+    pfGcEnabled: false,
+    pfGcThresholdPct: 50,
+    pfGcFreshnessMult: 2,
   });
   const PFR_KEY        = '__permafrost_winter_v1';
   const PFR_LIQ_KEY         = '__pf_liq_batches';
@@ -283,6 +291,24 @@
                     <div class="pfr-hint">When Ashfall is also in drawdown halt, lifts this bot's halt. Checked every 15 s.</div>
                   </div>
                 </label>
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.pfGcEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.pfGcEnabled=!cfg.pfGcEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Gains Continuation (GC)</div>
+                    <div class="pfr-hint">Broadcasts each base-margin step of 6hr profit to Ashfall; if Ashfall also has GC on and the broadcast is fresh, it takes a full drawdown halt (and vice versa). Requires GC on both bots.</div>
+                  </div>
+                </label>
+                <div x-show="cfg.pfGcEnabled" style="margin-top:8px">
+                  <div class="g">
+                    <div class="lbl">Step Size <b x-text="cfg.pfGcThresholdPct+'%'"></b> of base margin</div>
+                    <input type="range" min="10" max="200" step="5" x-model.number="cfg.pfGcThresholdPct" @change="persist()">
+                    <span style="font-size:9px;color:var(--text-lo);margin-left:6px" x-text="'($'+(cfg.minNotional/cfg.leverage*(cfg.pfGcThresholdPct/100)).toFixed(2)+' per step)'"></span>
+                  </div>
+                  <div class="g" style="margin-top:6px">
+                    <div class="lbl">Freshness Window <b x-text="(Math.max(1,cfg.scanMins??10)*cfg.pfGcFreshnessMult)+'min'"></b> <span style="color:var(--text-lo);font-weight:400" x-text="'('+cfg.pfGcFreshnessMult+'× Scan Every)'"></span></div>
+                    <input type="range" min="1" max="6" step="1" x-model.number="cfg.pfGcFreshnessMult" @change="persist()">
+                  </div>
+                </div>
               </div>
               <div x-show="cfg.permafrostCrossEnabled && pfCrossEvents.length" class="pfr-hint" style="margin-top:5px" x-text="pfCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Chaser — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
             </div>
@@ -686,6 +712,16 @@
         _pfStructureList: null, _pfStructureAt: 0, // own 3h ticker cache independent of host
         pfStatus:  { skew: null, breadth: null, score: null, mass: 0, count: 0, lean: 0, slope: 0, inherent: 0, eff: null, fioScore: null, at: 0 },
         pfCrossEvents: [],
+        // Gains Continuation (GC) — own rolling 6h closed-trade PnL log, independent of the
+        // host's Gains Lock window (that one only populates when cfg.gainsLockEnabled is on;
+        // GC needs to work regardless). _pfGcLastStep is the highest step index already
+        // broadcast (high-water-mark — never re-fires a step already crossed); resets to 0 once
+        // rolling PnL drops back to ≤0 so a fresh climb re-arms from the first step. _pfGcLastSeenTs
+        // is the ts of the latest partner 'gc' event already reacted to (fresh or stale), so the
+        // 15s loop doesn't re-evaluate the same event every tick.
+        pfGcWindow:      [],
+        _pfGcLastStep:   0,
+        _pfGcLastSeenTs: 0,
         _liqBatches: [],
         _liqLastBatchSyms: [], // tickers picked for liq surveillance on the most recent scan only
         _liqMessageHooks: [], // plugins push (batch, sym) => void here to react to live liq turnover, e.g. Liquid-Diver
@@ -832,6 +868,11 @@
               if (Array.isArray(s.closes)) this.pfCloses  = s.closes.slice(-CLOSES_CAP);
               if (Array.isArray(s.wave))      this.pfWave      = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
               if (s.pfKlineBar?.bearSum != null) this.pfKlineBar = s.pfKlineBar;
+              // GC window is re-filtered to the live 6h cutoff on load, same as the host's own
+              // gainsWindow restore — a stale entry surviving a long-offline reload shouldn't
+              // count toward a step it wouldn't have reached had the tab stayed open.
+              if (Array.isArray(s.gcWindow)) this.pfGcWindow = s.gcWindow.filter(e => e?.ts && (Date.now() - e.ts) < 6 * 3600 * 1000);
+              if (typeof s.gcLastStep === 'number') this._pfGcLastStep = s.gcLastStep;
             }
           } catch(e) {}
           this.log(`[PFR] Permafrost (Winter) v${VERSION} loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfCloses.length} closes on record`, 'info');
@@ -877,6 +918,26 @@
                     this._haltLoggedKind = null;
                     this.persist();
                     this.log('[PFR] ❄ Mutual DDH lift — own halt is older; cleared.', 'info');
+                  }
+                }
+              }
+              // Gains Continuation (GC) receive side — requires this bot to also have GC on
+              // (own toggle doubles as the opt-in to react to the partner's broadcast, same
+              // convention as Mutual DDH Lift). Freshness window mirrors the codebase's
+              // established partner-staleness pattern (2× scan cadence = 1 missed-cycle grace),
+              // just user-configurable here via pfGcFreshnessMult instead of hardcoded 2×.
+              // Dedupes on event ts via _pfGcLastSeenTs so a still-fresh event isn't re-actioned
+              // every 15s tick, and a since-gone-stale one isn't re-checked forever either.
+              if (this.cfg.pfGcEnabled) {
+                const _gcEvt = this._pfCrossRead().filter(e => e.source === 'chaser' && e.kind === 'gc').at(-1);
+                if (_gcEvt && _gcEvt.ts !== this._pfGcLastSeenTs) {
+                  this._pfGcLastSeenTs = _gcEvt.ts;
+                  const _gcFreshMs = Math.max(1, this.cfg.scanMins ?? 10) * (this.cfg.pfGcFreshnessMult ?? 2) * 60 * 1000;
+                  if ((Date.now() - _gcEvt.ts) < _gcFreshMs) {
+                    this._drawdownHaltUntil = Date.now() + (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+                    this._haltLoggedKind = null;
+                    this.persist();
+                    this.log(`[PFR] 🚨 Gains Continuation — fresh broadcast from Ashfall (step ${_gcEvt.step ?? '?'}, +${(_gcEvt.pnl ?? 0).toFixed(2)} USDT 6hr) — full drawdown halt triggered.`, 'warn');
                   }
                 }
               }
@@ -934,9 +995,10 @@
             this.pfEvents     = trimToByteCap(this.pfEvents);
             this.pfCloses     = trimToByteCap(this.pfCloses);
             this.pfWave       = trimToByteCap(this.pfWave);
+            this.pfGcWindow   = trimToByteCap(this.pfGcWindow);
             localStorage.setItem(PFR_KEY, JSON.stringify({
               events: this.pfEvents, closes: this.pfCloses, wave: this.pfWave,
-              pfKlineBar: this.pfKlineBar,
+              pfKlineBar: this.pfKlineBar, gcWindow: this.pfGcWindow, gcLastStep: this._pfGcLastStep,
             }));
           } catch(e) {}
         },
@@ -1804,6 +1866,29 @@
               const now = Date.now();
               this.pfCloses.push({ ts: now, pnl, skew: this.pfStatus.skew, breadth: this.pfStatus.breadth });
               if (this.pfCloses.length > CLOSES_CAP) this.pfCloses = this.pfCloses.slice(-CLOSES_CAP);
+            }
+            // Gains Continuation (GC) — own rolling 6h PnL, independent of the host's Gains
+            // Lock window. Stepped in pfGcThresholdPct-of-base-margin increments (default 50% —
+            // e.g. $0.50, $1.00, $1.50 at $1 base margin): every NEW step crossed upward fires a
+            // one-shot 'gc' broadcast (high-water-mark — a step already fired never re-fires on
+            // its own, only on a fresh climb after the window resets to ≤0). Read side is in the
+            // 15s loop below.
+            if (this.cfg.pfGcEnabled && typeof pnl === 'number') {
+              const _gcNow = Date.now();
+              const _gcCut = _gcNow - 6 * 3600 * 1000;
+              this.pfGcWindow.push({ pnl, ts: _gcNow });
+              this.pfGcWindow = this.pfGcWindow.filter(e => (e.ts || 0) >= _gcCut);
+              const _gcRolling = this.pfGcWindow.reduce((s, e) => s + (e.pnl || 0), 0);
+              const _gcBaseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+              const _gcStep = _gcBaseMargin * Math.max(0.01, (this.cfg.pfGcThresholdPct ?? 50) / 100);
+              const _gcStepIdx = Math.floor(_gcRolling / _gcStep);
+              if (_gcStepIdx > this._pfGcLastStep) {
+                this._pfGcLastStep = _gcStepIdx;
+                if (this.cfg.permafrostCrossEnabled) this._pfCrossWrite('gc', null, { pnl: _gcRolling, step: _gcStepIdx });
+                this.log(`[PFR] 📡 Gains Continuation — 6hr rolling PnL +${_gcRolling.toFixed(2)} crossed step ${_gcStepIdx} (+${_gcStep.toFixed(2)} USDT increments) — broadcast to Ashfall.`, 'success');
+              } else if (_gcRolling <= 0 && this._pfGcLastStep !== 0) {
+                this._pfGcLastStep = 0; // back to flat/negative — re-arm from the first step
+              }
             }
           }
           if (this.cfg.permafrostCrossEnabled) {

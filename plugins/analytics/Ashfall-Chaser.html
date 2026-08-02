@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.64.2';
+  const VERSION        = '1.65.0';
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -66,6 +66,14 @@
     afShowLiq: true,
     afShowFunding: false,
     afShowVol: true,
+    // Gains Continuation (GC): own rolling 6h PnL, stepped in increments of afGcThresholdPct
+    // of base margin (minNotional/leverage). Each new step crossed broadcasts a one-shot 'gc'
+    // cross event; if Permafrost also has GC on and reads it within afGcFreshnessMult scan
+    // intervals, it triggers a full drawdown halt on Permafrost (and vice versa). Off by
+    // default — opt-in on both sides, same as Mutual DDH Lift.
+    afGcEnabled: false,
+    afGcThresholdPct: 50,
+    afGcFreshnessMult: 2,
   });
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
@@ -262,6 +270,24 @@
                     <div class="ash-hint">When Permafrost is also in drawdown halt, lifts this bot's halt. Checked every 15 s.</div>
                   </div>
                 </label>
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.afGcEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afGcEnabled=!cfg.afGcEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Gains Continuation (GC)</div>
+                    <div class="ash-hint">Broadcasts each base-margin step of 6hr profit to Permafrost; if Permafrost also has GC on and the broadcast is fresh, it takes a full drawdown halt (and vice versa). Requires GC on both bots.</div>
+                  </div>
+                </label>
+                <div x-show="cfg.afGcEnabled" style="margin-top:8px">
+                  <div class="g">
+                    <div class="lbl">Step Size <b x-text="cfg.afGcThresholdPct+'%'"></b> of base margin</div>
+                    <input type="range" min="10" max="200" step="5" x-model.number="cfg.afGcThresholdPct" @change="persist()">
+                    <span style="font-size:9px;color:var(--text-lo);margin-left:6px" x-text="'($'+(cfg.minNotional/cfg.leverage*(cfg.afGcThresholdPct/100)).toFixed(2)+' per step)'"></span>
+                  </div>
+                  <div class="g" style="margin-top:6px">
+                    <div class="lbl">Freshness Window <b x-text="(Math.max(1,cfg.scanMins??10)*cfg.afGcFreshnessMult)+'min'"></b> <span style="color:var(--text-lo);font-weight:400" x-text="'('+cfg.afGcFreshnessMult+'× Scan Every)'"></span></div>
+                    <input type="range" min="1" max="6" step="1" x-model.number="cfg.afGcFreshnessMult" @change="persist()">
+                  </div>
+                </div>
               </div>
               <div x-show="cfg.ashfallCrossEnabled && afCrossEvents.length" class="ash-hint" style="margin-top:5px" x-text="afCrossEvents.slice().reverse().slice(0,3).map(e=>(e.kind==='cascade'?'⚡ Cascade':'🩸 Sacrifice')+' from Winter — '+new Date(e.ts).toISOString().slice(11,19)+' UTC').join(' · ')"></div>
             </div>
@@ -663,6 +689,16 @@
         _afStructureList: null, _afStructureAt: 0, // own 3h ticker cache independent of host
         afStatus:  { skew: null, breadth: null, score: null, mass: 0, count: 0, lean: 0, slope: 0, inherent: 0, eff: null, fioScore: null, at: 0 },
         afCrossEvents: [],
+        // Gains Continuation (GC) — own rolling 6h closed-trade PnL log, independent of the
+        // host's Gains Lock window (that one only populates when cfg.gainsLockEnabled is on;
+        // GC needs to work regardless). _afGcLastStep is the highest step index already
+        // broadcast (high-water-mark — never re-fires a step already crossed); resets to 0 once
+        // rolling PnL drops back to ≤0 so a fresh climb re-arms from the first step. _afGcLastSeenTs
+        // is the ts of the latest partner 'gc' event already reacted to (fresh or stale), so the
+        // 15s loop doesn't re-evaluate the same event every tick.
+        afGcWindow:      [],
+        _afGcLastStep:   0,
+        _afGcLastSeenTs: 0,
         _liqBatches: [],
         _liqLastBatchSyms: [], // tickers picked for liq surveillance on the most recent scan only
         _liqMessageHooks: [], // plugins push (batch, sym) => void here to react to live liq turnover, e.g. Liquid-Diver
@@ -809,6 +845,11 @@
               if (Array.isArray(s.closes)) this.afCloses = s.closes.slice(-CLOSES_CAP);
               if (Array.isArray(s.wave))      this.afWave      = s.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
               if (s.afKlineBar?.bearSum != null) this.afKlineBar = s.afKlineBar;
+              // GC window is re-filtered to the live 6h cutoff on load, same as the host's own
+              // gainsWindow restore — a stale entry surviving a long-offline reload shouldn't
+              // count toward a step it wouldn't have reached had the tab stayed open.
+              if (Array.isArray(s.gcWindow)) this.afGcWindow = s.gcWindow.filter(e => e?.ts && (Date.now() - e.ts) < 6 * 3600 * 1000);
+              if (typeof s.gcLastStep === 'number') this._afGcLastStep = s.gcLastStep;
             }
           } catch(e) {}
           this.log(`[ASH] Ashfall (Chaser) v${VERSION} loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afCloses.length} closes on record`, 'info');
@@ -854,6 +895,26 @@
                     this._haltLoggedKind = null;
                     this.persist();
                     this.log('[ASH] ♨ Mutual DDH lift — own halt is older; cleared.', 'info');
+                  }
+                }
+              }
+              // Gains Continuation (GC) receive side — requires this bot to also have GC on
+              // (own toggle doubles as the opt-in to react to the partner's broadcast, same
+              // convention as Mutual DDH Lift). Freshness window mirrors the codebase's
+              // established partner-staleness pattern (2× scan cadence = 1 missed-cycle grace),
+              // just user-configurable here via afGcFreshnessMult instead of hardcoded 2×.
+              // Dedupes on event ts via _afGcLastSeenTs so a still-fresh event isn't re-actioned
+              // every 15s tick, and a since-gone-stale one isn't re-checked forever either.
+              if (this.cfg.afGcEnabled) {
+                const _gcEvt = this._afCrossRead().filter(e => e.source === 'winter' && e.kind === 'gc').at(-1);
+                if (_gcEvt && _gcEvt.ts !== this._afGcLastSeenTs) {
+                  this._afGcLastSeenTs = _gcEvt.ts;
+                  const _gcFreshMs = Math.max(1, this.cfg.scanMins ?? 10) * (this.cfg.afGcFreshnessMult ?? 2) * 60 * 1000;
+                  if ((Date.now() - _gcEvt.ts) < _gcFreshMs) {
+                    this._drawdownHaltUntil = Date.now() + (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+                    this._haltLoggedKind = null;
+                    this.persist();
+                    this.log(`[ASH] 🚨 Gains Continuation — fresh broadcast from Permafrost (step ${_gcEvt.step ?? '?'}, +${(_gcEvt.pnl ?? 0).toFixed(2)} USDT 6hr) — full drawdown halt triggered.`, 'warn');
                   }
                 }
               }
@@ -911,9 +972,10 @@
             this.afEvents     = trimToByteCap(this.afEvents);
             this.afCloses     = trimToByteCap(this.afCloses);
             this.afWave       = trimToByteCap(this.afWave);
+            this.afGcWindow   = trimToByteCap(this.afGcWindow);
             localStorage.setItem(ASH_KEY, JSON.stringify({
               events: this.afEvents, closes: this.afCloses, wave: this.afWave,
-              afKlineBar: this.afKlineBar,
+              afKlineBar: this.afKlineBar, gcWindow: this.afGcWindow, gcLastStep: this._afGcLastStep,
             }));
           } catch(e) {}
         },
@@ -1775,6 +1837,29 @@
               const now = Date.now();
               this.afCloses.push({ ts: now, pnl, skew: this.afStatus.skew, breadth: this.afStatus.breadth });
               if (this.afCloses.length > CLOSES_CAP) this.afCloses = this.afCloses.slice(-CLOSES_CAP);
+            }
+            // Gains Continuation (GC) — own rolling 6h PnL, independent of the host's Gains
+            // Lock window. Stepped in afGcThresholdPct-of-base-margin increments (default 50% —
+            // e.g. $0.50, $1.00, $1.50 at $1 base margin): every NEW step crossed upward fires a
+            // one-shot 'gc' broadcast (high-water-mark — a step already fired never re-fires on
+            // its own, only on a fresh climb after the window resets to ≤0). Read side is in the
+            // 15s loop below.
+            if (this.cfg.afGcEnabled && typeof pnl === 'number') {
+              const _gcNow = Date.now();
+              const _gcCut = _gcNow - 6 * 3600 * 1000;
+              this.afGcWindow.push({ pnl, ts: _gcNow });
+              this.afGcWindow = this.afGcWindow.filter(e => (e.ts || 0) >= _gcCut);
+              const _gcRolling = this.afGcWindow.reduce((s, e) => s + (e.pnl || 0), 0);
+              const _gcBaseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
+              const _gcStep = _gcBaseMargin * Math.max(0.01, (this.cfg.afGcThresholdPct ?? 50) / 100);
+              const _gcStepIdx = Math.floor(_gcRolling / _gcStep);
+              if (_gcStepIdx > this._afGcLastStep) {
+                this._afGcLastStep = _gcStepIdx;
+                if (this.cfg.ashfallCrossEnabled) this._afCrossWrite('gc', null, { pnl: _gcRolling, step: _gcStepIdx });
+                this.log(`[ASH] 📡 Gains Continuation — 6hr rolling PnL +${_gcRolling.toFixed(2)} crossed step ${_gcStepIdx} (+${_gcStep.toFixed(2)} USDT increments) — broadcast to Permafrost.`, 'success');
+              } else if (_gcRolling <= 0 && this._afGcLastStep !== 0) {
+                this._afGcLastStep = 0; // back to flat/negative — re-arm from the first step
+              }
             }
           }
           if (this.cfg.ashfallCrossEnabled) {
