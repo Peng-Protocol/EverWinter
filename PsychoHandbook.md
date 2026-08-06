@@ -131,7 +131,7 @@ Inside the card:
 - **uPnL / ROI** — unrealized profit or loss, in dollars and as a percentage of margin.
 - **TP / SL row** — shows whichever exit target currently governs the position: normal TP, an exhumed recovery target (**EH TP**), a laggard-adjusted target (**EDa TP**), or a live stop-loss (**SL**, which blinks once every stage has filled).
 - **Margin** — capital committed to this position.
-- **Funding row** — alternates every five seconds between the funding fee paid or received so far, and a live countdown to the position's next funding round (pulled straight from the exchange for that specific ticker, so it's accurate to whatever interval that symbol actually runs on).
+- **Funding row** — cycles through three states every five seconds: the funding fee paid or received so far, a live countdown to the position's next funding round (pulled straight from the exchange for that specific ticker, so it's accurate to whatever interval that symbol actually runs on), and the current funding rate itself — colored green when it's presently working in your favor (positive, since shorts collect on positive funding) and red when it's costing you.
 - **Age** — how long the position has been open.
 - **Stage boxes** — a small grid showing every DCA (or AMa) stage and whether it's triggered, currently active, queued, or missed.
 - **Progress bar** — visual read on how close price is to the next stage boundary.
@@ -157,11 +157,10 @@ This is the analytical sidebar — a stack of live-updating panels, followed by 
 
 - **CONDITIONALS** — every position with a pending DCA order: what it's set at, what's queued behind it, and when the next one places.
 - **EXHUMED** — positions currently running on a recovery target instead of their original take-profit, with how much they've absorbed and how far they are from clearing it.
-- **SESSION** — trade count, wins, losses, net PnL, win rate, force closes, and cascade count for the current session.
+- **SESSION** — trade count, wins, losses, net PnL, win rate, force closes, and cascade count for the current session — plus peak and current allocation: your utilized margin adjusted for floating uPnL (a loss deepens it, a profit trims it). Peak tracks the all-time high; current shows where you sit right now. Watch peak allocation for new highs as a read on whether the bot is ever concurrently over-committing.
 - **LAGGARD** — the position currently designated to absorb the book's debt, its target, and how close it is to clearing.
 - **OPEN NOW** — your best and worst position by uPnL, and whichever position has DCA'd the furthest.
 - **DCA SPREAD** — a count of how many open positions sit at each DCA stage.
-- **PEAK ALLOCATION · DRAWDOWN** — tracks the highest amount of capital effectively committed at any point, all-time. This figure is your utilized margin adjusted for floating losses: a drawdown deepens it, a floating profit trims it. Watch this for new highs as a read on whether the bot is ever concurrently over-committing.
 - **ACTIVITY LOG** — the full scrolling event log: every open, close, DCA fire, absorption cut, funding settlement, and warning, timestamped.
 
 ### Danger Zone
@@ -208,3 +207,7 @@ If your allocation is over threshold but you're also sitting at or below your co
 ### Funding countdown accuracy depends on the exchange, not the app
 
 The funding countdown shown on each position card is only as fresh as the last time that symbol's funding time was fetched from the exchange. It's seeded once when a position opens and only re-synced after that round actually settles — so if a symbol's funding schedule changed mid-position (rare, but exchanges do this occasionally), the countdown won't reflect that until the next settlement.
+
+### Absorbed Loss' impact on net PnL
+
+Look out for loss absorbtion rollups which may sink to the bottom of the trades menu, obscuring the actual losses and potentially causing confusion about net PnL. Read the entire trades menu before coming to a conclusion about performance, absorbed loss is added to net PnL as soon as it is absorbed.
