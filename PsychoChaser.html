@@ -1,6 +1,46 @@
 <!--
-PsychoChaser v1.0.0
+PsychoChaser v1.2.0
 Copyleft 2026 Peng Protocol — PsychoChaser fork of PsychoWinter
+
+v1.2.0 — Native TP consolidation (Pass 2 of the live-mode robustness work):
+  - Collapsed three independent order-based TP mechanisms (normal DCA-stage TP via
+    tpOrderId, laggard EDa TP via _edaTpOrderId, exhumed EDa TP via _exhumedTpOrderId)
+    into one governing price via the existing _activeTpForPos precedence, mirrored to
+    the exchange with exchange-native trading-stop (liveSetTp/liveReconcileTp) —
+    matching the consolidation already done in PseudoWinter/PseudoChaser
+  - liveReconcileTp runs once per live position at the end of every watchPositions
+    tick (~5s), after every subsystem (DCA, AMa, laggard, exhumation, second wind)
+    has had a chance to update the governing price that cycle — so this is the single
+    place TP gets pushed live, rather than N separate cancel/replace call sites that
+    could leave a stale or duplicate resting order if a cancel silently failed
+  - Local mark-price TP/EDa-TP triggers now correctly skip live positions (previously
+    only the laggard EDa TP check had this guard — the normal TP and exhumed EDa TP
+    checks fired for live positions too, redundantly racing the exchange-native trigger
+    on every single TP hit, not just as a rare backstop)
+  - tpOrderId/_edaTpOrderId/_exhumedTpOrderId and their order-management code removed
+    entirely — TP is exchange-managed like SL now, no local order-tracking state left
+
+v1.1.0 — Live-mode robustness pass (ported from proven patterns in EverWinter/SunChaser):
+  - Native exchange SL via position/trading-stop, replacing client-side-only enforcement
+    (previously: zero exchange-side protection if the app disconnected once the final
+    DCA stage locked in SL; now enforced server-side, local check kept as a backstop)
+  - Fixed a rate-limiter race in liveApiCall — slot is now reserved synchronously before
+    the await, so back-to-back signed calls can no longer both under-space
+  - Timestamp sync against Bybit server time (liveSyncTs) — _tsOffset previously never
+    ran, relying entirely on host clock accuracy for the 5s recvWindow
+  - Entry fills now confirmed via position/list polling with timeout+cancel fallback
+    (liveWaitForFill), replacing a single best-effort 500ms read that could silently
+    record the wrong entryPrice under normal exchange latency
+  - liveClosePosition now verifies the exchange position is actually gone after a close
+    order, retrying with a market order if an IOC limit missed — previously the position
+    was dropped from local state unconditionally, risking orphaned live exposure
+  - Added minOrderAmt pre-flight check before entry — previously only discovered via
+    order rejection after the fact
+  - watchPositions now polls liveSyncPositions periodically (12s) whenever live positions
+    are held, not just via the post-close flag — needed since native SL fills happen
+    exchange-side without the bot ever calling closePosition
+  - Native TP consolidation (normal/laggard EDa/exhumed/AMa → single governing price
+    mirrored via trading-stop) deferred to a follow-up pass
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -424,7 +464,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
           <div class="hint">Each DCA add is this multiple of the previous add. At 2× and 7 stages, final add is 128× base.</div>
         </div>
         <div style="margin-top:8px;font-family:var(--mono);font-size:9.5px;color:var(--text-lo)">
-          Add triggers (% above entry): <span style="color:var(--ice)" x-text="addPctDisplay()"></span>
+          Add triggers (% below entry): <span style="color:var(--ice)" x-text="addPctDisplay()"></span>
         </div>
         <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
           <label class="tog" @click.prevent="if(!cfgLocked){cfg.amaEnabled=!cfg.amaEnabled;persist()}">
@@ -470,7 +510,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
         <div class="g">
           <div class="lbl">Entry TP ROI <b x-text="cfg.entryTpRoi+'%'"></b></div>
           <input type="range" min="5" max="200" step="5" x-model.number="cfg.entryTpRoi" :disabled="bot.running||cfgLocked" @change="persist()">
-          <div class="hint">ROI % on entry margin. At 10× leverage a 50% ROI requires a 5% price drop.</div>
+          <div class="hint">ROI % on entry margin. At 10× leverage a 50% ROI requires a 5% price rise.</div>
         </div>
         <div class="g">
           <div class="lbl">Whiplash Proximity <b x-text="cfg.whiplashProximityPct+'% remaining'"></b></div>
@@ -634,8 +674,8 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
         </div>
         <div class="g" x-show="cfg.sacrificeEnabled">
           <div class="lbl">Sacrifice Trigger Threshold <b x-text="cfg.sacrificeThresholdMult.toFixed(2)+'×'"></b> <span style="color:var(--text-lo);font-size:9px">per-slot margin</span></div>
-          <input type="range" min="0.25" max="10" step="0.25" x-model.number="cfg.sacrificeThresholdMult" :disabled="cfgLocked" @change="persist()">
-          <div class="hint">Total allocated margin, as a multiple of per-slot margin × max positions, that triggers sacrifice.</div>
+          <input type="number" min="0.25" max="100" step="0.25" x-model.number="cfg.sacrificeThresholdMult" :disabled="cfgLocked" @change="cfg.sacrificeThresholdMult=Math.min(100,Math.max(0.25,cfg.sacrificeThresholdMult||0.25));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px">
+          <div class="hint">Total allocated margin, as a multiple of per-slot margin × max positions, that triggers sacrifice. Min 0.25×, max 100×.</div>
         </div>
         <div class="g" x-show="cfg.sacrificeEnabled">
           <div class="lbl">Position Floor <b x-text="cfg.sacrificeFloor"></b></div>
@@ -768,7 +808,10 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
         </div>
 
         <div class="pc-grid">
-          <div class="pc-row"><span class="pc-k">Entry</span><span class="pc-v" x-text="fmtP(pos.entryPrice)"></span></div>
+          <div class="pc-row">
+            <span class="pc-k" x-text="(()=>{if(!pos.dcaStage)return'Entry';void tick;return Math.floor(tick/5)%2===0?'Avg Entry':'Orig Entry'})()"></span>
+            <span class="pc-v" x-text="(()=>{if(!pos.dcaStage)return fmtP(pos.entryPrice);void tick;return Math.floor(tick/5)%2===0?fmtP(pos.entryPrice):fmtP(pos._origEntryPrice||pos.entryPrice)})()"></span>
+          </div>
           <div class="pc-row"><span class="pc-k">Mark</span><span class="pc-v" x-text="fmtP(pos.markPrice)"></span></div>
           <div class="pc-row">
             <span class="pc-k">uPnL</span>
@@ -922,6 +965,9 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
                 <span :class="item.trade.pnlPct>=0?'profit':'loss'" x-text="(item.trade.pnlPct>=0?'+':'')+item.trade.pnlPct.toFixed(1)+'%'"></span>
                 <span x-text="(()=>{const ms=item.trade.duration;const h=Math.floor(ms/3600000);const m=Math.floor((ms%3600000)/60000);return h+'h '+m+'m'})()"></span>
               </div>
+              <div style="font-family:var(--mono);font-size:7.5px;color:var(--text-lo);margin-top:2px" x-text="'Open '+fmtP(item.trade.origEntryPrice??item.trade.entryPrice)+' → Avg '+fmtP(item.trade.entryPrice)+' → Close '+fmtP(item.trade.exitPrice)"></div>
+              <div x-show="item.trade.fundingFee" style="font-family:var(--mono);font-size:7.5px;margin-top:1px" :class="item.trade.fundingFee>=0?'profit':'loss'"
+                x-text="'Funding '+(item.trade.fundingFee>=0?'+':'')+(item.trade.fundingFee||0).toFixed(3)+' USDT'"></div>
               <div x-show="item.trade.closedAt" style="font-family:var(--mono);font-size:7.5px;color:var(--text-lo);margin-top:2px;display:flex;gap:10px">
                 <span x-show="item.trade.closedAt && item.trade.duration" x-text="'opened '+new Date(item.trade.closedAt-item.trade.duration).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
                 <span x-text="item.trade.closedAt ? 'closed '+new Date(item.trade.closedAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''"></span>
@@ -996,6 +1042,10 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
               </div>
               <div x-show="item.tab.cuts.length>0" style="font-family:var(--mono);font-size:7.5px;color:var(--text-lo);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
                 x-text="item.tab.cuts.map(c=>(c.pnl>=0?'+':'')+c.pnl.toFixed(3)).join(' · ')"></div>
+              <div x-show="!item.tab.isOpen && item.tab.finalClose" style="font-family:var(--mono);font-size:7.5px;color:var(--text-lo);margin-top:2px"
+                x-text="item.tab.finalClose ? ('Open '+fmtP(item.tab.finalClose.origEntryPrice??item.tab.origEntryPrice??item.tab.entryPrice)+' → Avg '+fmtP(item.tab.finalClose.entryPrice??item.tab.entryPrice)+' → Close '+fmtP(item.tab.finalClose.exitPrice)) : ''"></div>
+              <div x-show="!item.tab.isOpen && item.tab.finalClose && item.tab.finalClose.fundingFee" style="font-family:var(--mono);font-size:7.5px;margin-top:1px" :class="item.tab.finalClose && item.tab.finalClose.fundingFee>=0?'profit':'loss'"
+                x-text="item.tab.finalClose ? ('Funding '+(item.tab.finalClose.fundingFee>=0?'+':'')+item.tab.finalClose.fundingFee.toFixed(3)+' USDT') : ''"></div>
               <div style="font-family:var(--mono);font-size:7.5px;color:var(--text-lo);margin-top:2px;display:flex;gap:10px">
                 <span x-show="item.tab.firstCutAt" x-text="'first cut '+new Date(item.tab.firstCutAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
                 <span x-show="!item.tab.isOpen && item.tab.closedAt" x-text="'closed '+new Date(item.tab.closedAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
@@ -1027,18 +1077,18 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
       get pending(){ return this.rows.filter(r=>r.nextAt).length; },
       get modeStage(){ const r=this.rows; if(!r.length)return '—'; const freq={}; for(const x of r)freq[x.stage]=(freq[x.stage]||0)+1; return Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0]; }
     }" x-show="rows.length>0">
-      <div class="stat-ttl" style="cursor:pointer;user-select:none;display:flex;justify-content:space-between;align-items:center" @click="open=!open">
-        <span>CONDITIONALS</span>
-        <span style="font-family:var(--mono);font-size:9px;color:var(--text-lo);font-weight:400;letter-spacing:0">
-          <span x-show="!open">
-            <span style="color:rgba(240,195,40,.9)" x-text="live+' live'"></span>
-            <span style="color:var(--text-lo)"> · </span>
-            <span style="color:rgba(0,194,199,.65)" x-text="pending+' pending'"></span>
-            <span style="color:var(--text-lo)"> · common DCA</span>
-            <span style="color:var(--text-mid)" x-text="modeStage"></span>
-          </span>
-          <span x-text="open?'▲':'▼'" style="margin-left:6px;font-size:8px"></span>
-        </span>
+      <div class="stat-ttl" style="cursor:pointer;user-select:none" @click="open=!open">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span>CONDITIONALS</span>
+          <span x-text="open?'▲':'▼'" style="font-size:8px;color:var(--text-lo)"></span>
+        </div>
+        <div x-show="!open" style="font-family:var(--mono);font-size:9px;font-weight:400;letter-spacing:0;margin-top:3px">
+          <span style="color:rgba(240,195,40,.9)" x-text="live+' live'"></span>
+          <span style="color:var(--text-lo)"> · </span>
+          <span style="color:rgba(0,194,199,.65)" x-text="pending+' pending'"></span>
+          <span style="color:var(--text-lo)"> · common DCA</span>
+          <span style="color:var(--text-mid)" x-text="modeStage"></span>
+        </div>
       </div>
       <div x-show="open" style="font-family:var(--mono);font-size:9px;margin-top:6px">
         <div style="display:grid;grid-template-columns:3fr 3fr 3fr 2fr;gap:2px 6px;padding-bottom:4px;border-bottom:1px solid var(--border);color:var(--text-lo);letter-spacing:.5px">
@@ -1121,17 +1171,17 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
           <div class="sl">FORCE CLOSES</div>
           <div class="sv sm warn" x-text="sess.forceClose"></div>
         </div>
+      </div>
+      <div class="sg3" style="margin-top:6px" x-show="sess.cascadeClose>0 || positions.length>0 || peakAllocation>0">
         <div class="stat-box" x-show="sess.cascadeClose>0">
           <div class="sl">CASCADE</div>
           <div class="sv sm" style="color:var(--ice)" x-text="sess.cascadeClose"></div>
         </div>
-      </div>
-      <div class="sg3" style="margin-top:6px" x-show="positions.length>0 || peakAllocation>0">
-        <div class="stat-box">
+        <div class="stat-box" x-show="positions.length>0 || peakAllocation>0">
           <div class="sl">PEAK ALLOC</div>
           <div class="sv sm" style="color:var(--ice)" x-text="'$'+peakAllocation.toFixed(2)"></div>
         </div>
-        <div class="stat-box">
+        <div class="stat-box" x-show="positions.length>0 || peakAllocation>0">
           <div class="sl">CURRENT ALLOC</div>
           <div class="sv sm" x-text="'$'+(_totalAllocated()-acct.upnl).toFixed(2)"></div>
         </div>
@@ -1188,13 +1238,51 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
     </div>
 
     <!-- DCA spread -->
-    <div class="stat-sec" x-show="positions.length>0">
-      <div class="stat-ttl">DCA SPREAD</div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px">
-        <template x-for="s in [0,1,2,3,4,5,6,7]" :key="s">
-          <div class="stat-box" x-data="{get cnt(){return positions.filter(p=>p.dcaStage===s).length}}">
-            <div class="sl" x-text="'S'+s"></div>
-            <div class="sv" :class="cnt>0?(s>=4?'loss':'warn'):''" x-text="cnt"></div>
+    <div class="stat-sec" x-data="{
+      open: false,
+      get stageCounts(){ return Array.from({length:8},(_,s)=>({ s, n: positions.filter(p=>p.dcaStage===s).length })); },
+      get rows(){
+        return positions.map(p=>{
+          const active  = (p.orders||[]).find(o=>o.type==='cond'&&!o.filled);
+          const queued  = (p._dcaDelayQueue||[]);
+          const next    = active ? { label:active.label, price:active.price } : (queued[0] ? { label:queued[0].label, price:queued[0].price } : null);
+          const more    = active ? queued.length : Math.max(0, queued.length - 1);
+          return { sym:p.symbol.replace('USDT',''), stage:p.dcaStage||0, next, more };
+        });
+      }
+    }" x-show="positions.length>0">
+      <div class="stat-ttl" style="cursor:pointer;user-select:none" @click="open=!open">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span>DCA SPREAD</span>
+          <span x-text="open?'▲':'▼'" style="font-size:8px;color:var(--text-lo)"></span>
+        </div>
+        <div x-show="!open" style="font-family:var(--mono);font-size:9px;font-weight:400;letter-spacing:0;margin-top:3px">
+          <template x-for="(c,i) in stageCounts" :key="c.s">
+            <span>
+              <span :style="c.n>0?'color:rgba(240,195,40,.9);font-weight:700':'color:var(--text-lo);font-weight:400'" x-text="'S'+c.s+':'+c.n"></span>
+              <span x-show="i<stageCounts.length-1" style="color:var(--text-lo)"> · </span>
+            </span>
+          </template>
+        </div>
+      </div>
+      <div x-show="open" style="font-family:var(--mono);font-size:9px;margin-top:6px">
+        <div style="display:grid;grid-template-columns:2fr 1fr 3fr 2fr;gap:2px 6px;padding-bottom:4px;border-bottom:1px solid var(--border);color:var(--text-lo);letter-spacing:.5px">
+          <span>TICKER</span><span>STAGE</span><span>NEXT TRIGGER</span><span>REMAINING</span>
+        </div>
+        <template x-for="r in rows" :key="r.sym">
+          <div style="display:grid;grid-template-columns:2fr 1fr 3fr 2fr;gap:2px 6px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04);align-items:center">
+            <span style="color:var(--text-hi);font-weight:700" x-text="r.sym"></span>
+            <span style="color:var(--loss)" x-text="'S'+r.stage"></span>
+            <span>
+              <template x-if="r.next">
+                <span>
+                  <span style="color:rgba(240,195,40,.9)" x-text="r.next.label"></span>
+                  <span style="color:var(--text-lo)" x-text="' '+fmtP(r.next.price)"></span>
+                </span>
+              </template>
+              <template x-if="!r.next"><span style="color:var(--text-lo)">—</span></template>
+            </span>
+            <span style="color:var(--text-lo)" x-text="r.more>0?('+'+r.more+' more'):'none'"></span>
           </div>
         </template>
       </div>
@@ -1250,7 +1338,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
 </div><!-- end .main -->
 
 <script>
-const VERSION = '1.0.5'; // x=production-only, y=significant additions/subtractions, z=tweaks
+const VERSION = '1.1.1'; // x=production-only, y=significant additions/subtractions, z=tweaks
 
 // ── HMAC-SHA256 signing ──
 async function hmac(secret, msg) {
@@ -1445,6 +1533,7 @@ function psycho() { return {
   _symbolBanlist: {},
   _whiplashScheduled: {},
   _tsOffset:      0,
+  _lastLiveSync:  0,
   _lastSignedAt:  0,
   _pwNeedsSync:   false,
   _lastTickerFetch: 0, // timestamp of last per-symbol REST ticker fallback round in watchPositions
@@ -1558,6 +1647,7 @@ function psycho() { return {
     setInterval(() => { this.tick++; }, 1000);
     if (_watchTimer) clearInterval(_watchTimer);
     _watchTimer = setInterval(() => this.watchPositions(), 5000);
+    if (this.cfg.liveMode && this.cfg.apiKey && this.cfg.apiSecret) await this.liveSyncTs();
   },
 
   persist() {
@@ -1611,6 +1701,7 @@ function psycho() { return {
       this.log('Live mode requires API key and secret.', 'error');
       return;
     }
+    if (this.cfg.liveMode) await this.liveSyncTs();
     this.bot.running  = true;
     this.bot.startTime = Date.now();
     await this._refreshPositionTPs();
@@ -1890,6 +1981,7 @@ function psycho() { return {
       symbol:               sym,
       side:                 'Long',
       entryPrice:           price,
+      _origEntryPrice:      price,
       qty,
       totalSize:            qty,
       margin,
@@ -1971,14 +2063,22 @@ function psycho() { return {
     const rawQty = this.cfg.minNotional / price;
     const qty    = this.snapQty(rawQty, instr);
     if (qty <= 0) { this.log(`${sym}: qty below min — skipping`, 'warn'); return; }
+    if (instr.minOrderAmt > 0 && qty * price < instr.minOrderAmt) {
+      this._symbolBanlist[sym] = `notional below exchange minOrderAmt ${instr.minOrderAmt}`;
+      this.log(`${sym}: notional ${(qty*price).toFixed(2)} below exchange minOrderAmt ${instr.minOrderAmt} — permanently banned`, 'warn');
+      this.persist(); return;
+    }
 
-    // Place market long
+    // Place market long, then confirm the real fill via position/list rather
+    // than trusting a single early read — order/realtime can lag the actual fill.
     let fillPrice = price, orderId = null;
     try {
       const res = await this.livePlaceOrder({ symbol:sym, side:'Buy', orderType:'Market', qty:qty.toString(), timeInForce:'IOC', reduceOnly:false });
       orderId   = res.orderId;
-      fillPrice = parseFloat(res.avgPrice || res.price || price) || price;
     } catch(e) { this.log(`${sym}: entry order failed — ${e.message}`, 'error'); return; }
+    const confirmedFill = await this.liveWaitForFill(sym, 'Buy', orderId);
+    if (!confirmedFill) { this.log(`${sym}: entry fill not confirmed — aborting open`, 'error'); return; }
+    fillPrice = confirmedFill;
 
     const actualNotional = qty * fillPrice;
     const margin         = actualNotional / lev;
@@ -2033,21 +2133,12 @@ function psycho() { return {
       filled: false, filledAt: null,
     })) : null;
 
-    // Place TP limit order (non-AMa only)
-    let tpOrderId = null;
-    if (!useAma && tpPrice > 0) {
-      try {
-        const tpRes = await this.livePlaceOrder({ symbol:sym, side:'Sell', orderType:'Limit', qty:qty.toString(), price:tpPrice.toString(), timeInForce:'GTC', reduceOnly:true });
-        tpOrderId = tpRes.orderId;
-      } catch(e) { this.log(`${sym}: TP order failed — ${e.message}`, 'warn'); }
-    }
-
     const pos = {
       id: Date.now() + Math.random(),
       symbol: sym, side:'Long',
-      entryPrice: fillPrice, qty, totalSize: qty,
+      entryPrice: fillPrice, _origEntryPrice: fillPrice, qty, totalSize: qty,
       margin, notional: actualNotional, leverage: lev,
-      currentTpPrice: tpPrice, tpPct: tpRoi0, tpOrderId,
+      currentTpPrice: tpPrice, tpPct: tpRoi0,
       openedAt: Date.now(), dcaStage:0, phase:'normal',
       orders, _stageCount: this.cfg.dcaStages,
       fundingRate: candidate.fundingRate ?? 0,
@@ -2057,6 +2148,7 @@ function psycho() { return {
       markPrice: fillPrice, upnl:0,
       _live: true, slSet:true, slPrice:_initSlPriceLive,
       _slFinalSet: false,
+      _lastSyncedTp: 0,
       _amaActive:    useAma,
       _amaCancelled: false,
       _amaStage:     0,
@@ -2068,6 +2160,7 @@ function psycho() { return {
       _change24h:    candidate.change24h ?? 0,
     };
     this.positions.push(pos);
+    await this.liveReconcileTp(pos);
     this._logOpenBatch(sym, candidate.change24h ?? 0, fillPrice);
     this.persist();
   },
@@ -2075,11 +2168,16 @@ function psycho() { return {
   // ── Watch Positions ──
   async watchPositions() {
     if (this.positions.length === 0) { wsWatchSymbols([]); return; } // drop the WS stream when nothing is held
+    const now = Date.now();
     if (this._pwNeedsSync) {
       this._pwNeedsSync = false;
       await this.liveSyncPositions();
+    } else if (this.cfg.liveMode && this.positions.some(p => p._live) && (now - (this._lastLiveSync || 0)) >= 12000) {
+      // Native SL/TP fills happen exchange-side without the bot calling closePosition,
+      // so this can't rely solely on the _pwNeedsSync flag — poll periodically instead.
+      this._lastLiveSync = now;
+      await this.liveSyncPositions();
     }
-    const now = Date.now();
 
     // Keep the WS ticker subscriptions aligned with the held position symbols
     wsWatchSymbols(this.positions.map(p => p.symbol),
@@ -2252,21 +2350,8 @@ function psycho() { return {
             this.log(`📗→⚠️ ${pos.symbol}: AMa cancelled — DCA${pos.dcaStage} triggered, TP → ${fmtP(newTp)}`, 'warn');
           }
 
-          // Live: cancel old TP, place new (exhumed positions use their EDa TP price)
-          const _liveTpPrice = (this.cfg.exhumationEnabled !== false && pos._exhumed && pos._exhumedEdaTpPrice > 0) ? pos._exhumedEdaTpPrice : newTp;
-          if (pos._live && pos.tpOrderId) {
-            try { await this.liveCancelOrder(pos.symbol, pos.tpOrderId); } catch(e) {}
-            try {
-              const tpRes = await this.livePlaceOrder({ symbol:pos.symbol, side:'Sell', orderType:'Limit', qty:pos.totalSize.toString(), price:_liveTpPrice.toString(), timeInForce:'GTC', reduceOnly:true });
-              pos.tpOrderId = tpRes.orderId;
-            } catch(e) { this.log(`${pos.symbol}: TP replace failed — ${e.message}`, 'warn'); }
-          } else if (pos._live && pos._amaActive && pos._amaCancelled && !pos.tpOrderId) {
-            // First TP after AMa cancel: place fresh order
-            try {
-              const tpRes = await this.livePlaceOrder({ symbol:pos.symbol, side:'Sell', orderType:'Limit', qty:pos.totalSize.toString(), price:_liveTpPrice.toString(), timeInForce:'GTC', reduceOnly:true });
-              pos.tpOrderId = tpRes.orderId;
-            } catch(e) { this.log(`${pos.symbol}: AMa→TP order failed — ${e.message}`, 'warn'); }
-          }
+          // Live: exhumed positions use their EDa TP price, mirrored via liveReconcileTp
+          // below along with everything else — no separate order management needed.
 
           // Update SL to actual weighted avg after final stage fills
           if (pos.dcaStage >= pos._stageCount && !pos._slFinalSet && instr) {
@@ -2276,7 +2361,14 @@ function psycho() { return {
               pos.slPrice    = this._projectedSL(pos, instr);
               pos.slSet      = true;
               pos._slFinalSet = true;
-              this.log(`⚠️ ${pos.symbol}: DCA${pos.dcaStage} — SL @ ${fmtP(pos.slPrice)}`, 'warn');
+              if (pos._live) {
+                const ok = await this.liveSetSL(pos.symbol, pos.slPrice);
+                this.log(ok
+                  ? `⚠️ ${pos.symbol}: DCA${pos.dcaStage} — exchange SL @ ${fmtP(pos.slPrice)}`
+                  : `${pos.symbol}: exchange SL set failed — local SL @ ${fmtP(pos.slPrice)} still enforced client-side`, ok ? 'warn' : 'error');
+              } else {
+                this.log(`⚠️ ${pos.symbol}: DCA${pos.dcaStage} — SL @ ${fmtP(pos.slPrice)}`, 'warn');
+              }
             }
           }
           this.log(`📊 ${pos.symbol}: ${add.label} @ ${fmtP(add.price)} | Avg ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(newTp)} (${stageRoi}% ROI)`, 'trade');
@@ -2319,12 +2411,6 @@ function psycho() { return {
             if (pos._amaStage >= 7) {
               const tpP = amaInstr ? this.snapPrice(pos._amaOrigEntry * 1.22, amaInstr) : parseFloat((pos._amaOrigEntry * 1.22).toFixed(8));
               pos.currentTpPrice = tpP;
-              if (pos._live) {
-                try {
-                  const r = await this.livePlaceOrder({ symbol:pos.symbol, side:'Sell', orderType:'Limit', qty:pos.totalSize.toString(), price:tpP.toString(), timeInForce:'GTC', reduceOnly:true });
-                  pos.tpOrderId = r.orderId;
-                } catch(e) { this.log(`${pos.symbol}: AMa7 TP order failed — ${e.message}`, 'warn'); }
-              }
               this.log(`📗 ${pos.symbol}: AMa7 complete — TP → ${fmtP(tpP)} (+22% from ${fmtP(pos._amaOrigEntry)}) | Margin $${pos.margin.toFixed(2)}`, 'trade');
             } else {
               this.log(`📗 ${pos.symbol}: AMa${pos._amaStage} @ ${fmtP(ama.price)} | Avg ${fmtP(pos.entryPrice)} | Margin $${pos.margin.toFixed(2)}`, 'trade');
@@ -2435,16 +2521,18 @@ function psycho() { return {
         continue;
       }
 
-      // Exhumed EDa TP hit check — regular TP suspended for this position
-      if (this.cfg.exhumationEnabled !== false && pos._exhumed && pos._exhumedEdaTpPrice > 0 && mark >= pos._exhumedEdaTpPrice && this.positions.find(x => x.id === pos.id)) {
+      // Exhumed EDa TP hit check — regular TP suspended for this position (pseudo
+      // only — live is governed by the exchange-native TP via liveReconcileTp)
+      if (!pos._live && this.cfg.exhumationEnabled !== false && pos._exhumed && pos._exhumedEdaTpPrice > 0 && mark >= pos._exhumedEdaTpPrice && this.positions.find(x => x.id === pos.id)) {
         this.log(`🪦 ${pos.symbol.replace('USDT','')}: Exhumed EDa TP hit @ ${fmtP(mark)} — closing`, 'success');
         await this.closePosition(pos, 'tp', pos._exhumedEdaTpPrice);
         continue;
       }
 
-      // TP hit check (skip AMa positions unless stage 7 TP has been set; skip exhumed positions)
+      // TP hit check (pseudo only — live is governed by the exchange-native TP via
+      // liveReconcileTp; skip AMa positions unless stage 7 TP has been set; skip exhumed)
       const _isAmaFullRun = pos._amaActive && !pos._amaCancelled && (pos._amaStage || 0) >= 7;
-      if (pos.currentTpPrice > 0 && !(this.cfg.exhumationEnabled !== false && pos._exhumed && pos._exhumedEdaTpPrice > 0) && (!(pos._amaActive && !pos._amaCancelled) || _isAmaFullRun) && mark >= pos.currentTpPrice && this.positions.find(x => x.id === pos.id)) {
+      if (!pos._live && pos.currentTpPrice > 0 && !(this.cfg.exhumationEnabled !== false && pos._exhumed && pos._exhumedEdaTpPrice > 0) && (!(pos._amaActive && !pos._amaCancelled) || _isAmaFullRun) && mark >= pos.currentTpPrice && this.positions.find(x => x.id === pos.id)) {
         this.log(`${_isAmaFullRun ? '💚' : '✅'} ${pos.symbol}: ${_isAmaFullRun ? 'AMa TP' : 'TP'} hit @ ${fmtP(mark)} — closing`, 'success');
         await this.closePosition(pos, _isAmaFullRun ? 'AMa' : 'tp', pos.currentTpPrice);
         continue;
@@ -2511,6 +2599,13 @@ function psycho() { return {
       await this.runSacrificeCheck();
     }
 
+    // Native TP mirror — single governing price (see _activeTpForPos) reconciled
+    // once per tick after every subsystem above (DCA, AMa, laggard, exhumation,
+    // second wind) has had a chance to update it this cycle.
+    for (const pos of this.positions) {
+      if (pos._live) await this.liveReconcileTp(pos);
+    }
+
     this.persist();
   },
 
@@ -2542,7 +2637,7 @@ function psycho() { return {
     const _closedAt = Date.now();
     const closed = {
       id: pos.id, symbol: pos.symbol, reason,
-      entryPrice: pos.entryPrice, exitPrice,
+      entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, exitPrice,
       dcaStage: pos.dcaStage, margin: pos.margin,
       pnl, pnlPct, fundingFee: fundFee, totalPnl,
       duration, closedAt: _closedAt,
@@ -2551,7 +2646,7 @@ function psycho() { return {
     // Fold into absorption tab if one exists for this position
     const _absTab = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
     if (_absTab) {
-      _absTab.finalClose = { reason, exitPrice, pnl, pnlPct, closedAt: _closedAt };
+      _absTab.finalClose = { reason, exitPrice, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, pnl, pnlPct, fundingFee: fundFee, closedAt: _closedAt };
       _absTab.totalPnl   = parseFloat((_absTab.totalPnl + totalPnl).toFixed(6));
       _absTab.isOpen     = false;
       _absTab.closedAt   = _closedAt;
@@ -2579,14 +2674,8 @@ function psycho() { return {
     _closingIds.add(pos.id);
     if (!this.positions.find(x => x.id === pos.id)) { _closingIds.delete(pos.id); return; }
 
-    // Cancel TP orders
-    if (pos.tpOrderId) {
-      try { await this.liveCancelOrder(pos.symbol, pos.tpOrderId); } catch(e) {}
-    }
-    if (pos._edaTpOrderId) {
-      try { await this.liveCancelOrder(pos.symbol, pos._edaTpOrderId); } catch(e) {}
-      pos._edaTpOrderId = null;
-    }
+    // No TP/SL order cancellation needed — both are exchange-native trading-stop
+    // values scoped to the position and are cleared automatically once size hits 0.
 
     // Place market close
     let exitPrice = fillPrice || pos.markPrice || pos.entryPrice;
@@ -2603,6 +2692,24 @@ function psycho() { return {
       return;
     }
 
+    // Verify the exchange position is actually gone. An IOC limit order has no
+    // fill guarantee — on a fast-moving ticker it can miss, and without this
+    // check the position would be dropped from local state below while real
+    // exposure remains open and untracked on the exchange.
+    try {
+      await new Promise(r => setTimeout(r, 2000));
+      const vResult = await this.liveApiCall('/v5/position/list', { category:'linear', symbol:pos.symbol });
+      const still = (vResult?.list || []).find(x => x.symbol === pos.symbol && x.side === 'Buy' && parseFloat(x.size) > 0);
+      if (still) {
+        this.log(`${pos.symbol}: close verify — position still open, retrying market close`, 'warn');
+        try {
+          const rres = await this.livePlaceOrder({ symbol:pos.symbol, side:'Sell', orderType:'Market', qty:String(parseFloat(still.size)), timeInForce:'IOC', reduceOnly:true });
+          exitPrice = parseFloat(rres.avgPrice || rres.price || exitPrice) || exitPrice;
+          await new Promise(r => setTimeout(r, 2000));
+        } catch(e2) { this.log(`${pos.symbol}: retry close failed — ${e2.message}`, 'error'); }
+      }
+    } catch(e) { this.log(`${pos.symbol}: close verify error — ${e.message}`, 'warn'); }
+
     const pnl      = (exitPrice - pos.entryPrice) / pos.entryPrice * pos.leverage * pos.margin;
     const pnlPct   = (exitPrice - pos.entryPrice) / pos.entryPrice * pos.leverage * 100;
     const fundFee  = pos._fundingAccrued ?? 0;
@@ -2617,11 +2724,11 @@ function psycho() { return {
     if (reason === 'cascade') this.sess.cascadeClose++;
 
     const _closedAt = Date.now();
-    this.closedTrades.push({ id:pos.id, symbol:pos.symbol, reason, entryPrice:pos.entryPrice, exitPrice, dcaStage:pos.dcaStage, margin:pos.margin, pnl, pnlPct, fundingFee:fundFee, totalPnl, duration, closedAt:_closedAt });
+    this.closedTrades.push({ id:pos.id, symbol:pos.symbol, reason, entryPrice:pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, exitPrice, dcaStage:pos.dcaStage, margin:pos.margin, pnl, pnlPct, fundingFee:fundFee, totalPnl, duration, closedAt:_closedAt });
     // Fold into absorption tab if one exists for this position
     const _absTab = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
     if (_absTab) {
-      _absTab.finalClose = { reason, exitPrice, pnl, pnlPct, closedAt: _closedAt };
+      _absTab.finalClose = { reason, exitPrice, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, pnl, pnlPct, fundingFee: fundFee, closedAt: _closedAt };
       _absTab.totalPnl   = parseFloat((_absTab.totalPnl + totalPnl).toFixed(6));
       _absTab.isOpen     = false;
       _absTab.closedAt   = _closedAt;
@@ -2726,18 +2833,19 @@ function psycho() { return {
           const tabId = 'absorption_' + laggard.id;
           let tab = this.closedTrades.find(t => t.id === tabId);
           if (!tab) {
-            tab = { id: tabId, posId: laggard.id, reason: 'absorption', symbol: laggard.symbol, openedAt: laggard.openedAt, dcaStage: laggard.dcaStage, cuts: [], totalPnl: 0, finalClose: null, isOpen: true, firstCutAt: now };
+            tab = { id: tabId, posId: laggard.id, reason: 'absorption', symbol: laggard.symbol, openedAt: laggard.openedAt, entryPrice: laggard.entryPrice, origEntryPrice: laggard._origEntryPrice ?? laggard.entryPrice, dcaStage: laggard.dcaStage, cuts: [], totalPnl: 0, finalClose: null, isOpen: true, firstCutAt: now };
             this.closedTrades.push(tab);
           }
           tab.cuts.push({ pnl: cutPnl, roi: cutRoi, mark, cutAt: now });
           tab.totalPnl  = parseFloat((tab.totalPnl + cutPnl).toFixed(6));
+          tab.entryPrice = laggard.entryPrice;
           tab.dcaStage  = laggard.dcaStage;
           tab.lastCutAt = now;
           this.log(`✂️ ${sym}: laggard absorption — ED $${buffedED.toFixed(2)} ≤ 0, 5% cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${laggard.margin.toFixed(2)}`, 'warn');
           if (laggard.totalSize <= 0) {
             // Final drain — live order already closed the exchange position above.
             // Finalise the bot record without placing a second order.
-            tab.finalClose = { reason: 'absorption', exitPrice: mark, pnl: cutPnl, pnlPct: cutRoi, closedAt: now };
+            tab.finalClose = { reason: 'absorption', exitPrice: mark, entryPrice: laggard.entryPrice, origEntryPrice: laggard._origEntryPrice ?? laggard.entryPrice, pnl: cutPnl, pnlPct: cutRoi, fundingFee: laggard._fundingAccrued ?? 0, closedAt: now };
             tab.isOpen     = false;
             tab.closedAt   = now;
             tab.duration   = now - (laggard.openedAt || now);
@@ -2829,22 +2937,15 @@ function psycho() { return {
     const laggard = this._pickLaggard();
     if (!laggard) return;
 
-    // Exhumed laggard: clear standard EDa TP — exhumation manages the live order separately
+    // Exhumed laggard: clear standard EDa TP — exhumation governs the price instead,
+    // and liveReconcileTp mirrors whichever is active via _activeTpForPos.
     if (this.cfg.exhumationEnabled !== false && laggard._exhumed && laggard._exhumedEdaTpPrice > 0) {
-      if (laggard._edaTpOrderId) {
-        try { await this.liveCancelOrder(laggard.symbol, laggard._edaTpOrderId); } catch(e) {}
-        laggard._edaTpOrderId = null;
-      }
       laggard._edaTpPrice = 0;
       return;
     }
 
-    // Laggard absorption owns the exit — EDa TP not used. Cancel any standing order and clear state.
+    // Laggard absorption owns the exit — EDa TP not used.
     if (this.cfg.laggardAbsorptionEnabled) {
-      if (laggard._edaTpOrderId) {
-        try { await this.liveCancelOrder(laggard.symbol, laggard._edaTpOrderId); } catch(e) {}
-        laggard._edaTpOrderId = null;
-      }
       laggard._edaTpPrice = 0;
       return;
     }
@@ -2852,32 +2953,9 @@ function psycho() { return {
     const raw   = this._computeEdaTp(laggard);
     const instr = await this.getInstrInfo(laggard.symbol).catch(() => null);
     const snapped = raw > 0 ? (instr ? this.snapPrice(raw, instr) : parseFloat(raw.toFixed(8))) : 0;
-    laggard._edaTpPrice = snapped;
-
-    if (!laggard._live) return;
-    if (snapped <= 0) {
-      if (laggard._edaTpOrderId) {
-        try { await this.liveCancelOrder(laggard.symbol, laggard._edaTpOrderId); } catch(e) {}
-        laggard._edaTpOrderId = null;
-      }
-      return;
-    }
-
-    // Only cancel+replace if price moved by at least one tick
-    const tick = instr?.tickSize || 0.001;
-    if (laggard._edaTpOrderId && Math.abs((laggard._edaTpSnapped || 0) - snapped) < tick) return;
-
-    if (laggard._edaTpOrderId) {
-      try { await this.liveCancelOrder(laggard.symbol, laggard._edaTpOrderId); } catch(e) {}
-      laggard._edaTpOrderId = null;
-    }
-    try {
-      const res = await this.livePlaceOrder({ symbol: laggard.symbol, side: 'Sell', orderType: 'Limit', qty: laggard.totalSize.toString(), price: snapped.toString(), timeInForce: 'GTC', reduceOnly: true });
-      laggard._edaTpOrderId  = res.orderId;
-      laggard._edaTpSnapped  = snapped;
-      this.log(`🎯 ${laggard.symbol}: EDa TP → ${fmtP(snapped)}`, 'info');
-    } catch(e) {
-      this.log(`${laggard.symbol}: EDa TP order failed — ${e.message}`, 'warn');
+    if (laggard._edaTpPrice !== snapped) {
+      laggard._edaTpPrice = snapped;
+      if (snapped > 0) this.log(`🎯 ${laggard.symbol}: EDa TP → ${fmtP(snapped)}`, 'info');
     }
   },
 
@@ -3005,10 +3083,10 @@ function psycho() { return {
               if (closeReason === 'force') {
                 this._addForceRollup({ symbol: pos.symbol, exitPrice: closePrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin, id: pos.id });
               } else {
-                this.closedTrades.push({ id: pos.id, symbol: pos.symbol, reason: closeReason, entryPrice: pos.entryPrice, exitPrice: closePrice, dcaStage: pos.dcaStage, margin: pos.margin, pnl, pnlPct, fundingFee: fundFee, totalPnl, duration, closedAt });
+                this.closedTrades.push({ id: pos.id, symbol: pos.symbol, reason: closeReason, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, exitPrice: closePrice, dcaStage: pos.dcaStage, margin: pos.margin, pnl, pnlPct, fundingFee: fundFee, totalPnl, duration, closedAt });
                 const _absTabGap = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
                 if (_absTabGap) {
-                  _absTabGap.finalClose = { reason: closeReason, exitPrice: closePrice, pnl, pnlPct, closedAt };
+                  _absTabGap.finalClose = { reason: closeReason, exitPrice: closePrice, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, pnl, pnlPct, fundingFee: fundFee, closedAt };
                   _absTabGap.totalPnl   = parseFloat((_absTabGap.totalPnl + totalPnl).toFixed(6));
                   _absTabGap.isOpen     = false;
                   _absTabGap.closedAt   = closedAt;
@@ -3234,11 +3312,12 @@ function psycho() { return {
       const tabId = 'absorption_' + pos.id;
       let tab = this.closedTrades.find(t => t.id === tabId);
       if (!tab) {
-        tab = { id: tabId, posId: pos.id, reason: 'absorption', symbol: pos.symbol, openedAt: pos.openedAt, dcaStage: pos.dcaStage, cuts: [], totalPnl: 0, finalClose: null, isOpen: true, firstCutAt: now };
+        tab = { id: tabId, posId: pos.id, reason: 'absorption', symbol: pos.symbol, openedAt: pos.openedAt, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, dcaStage: pos.dcaStage, cuts: [], totalPnl: 0, finalClose: null, isOpen: true, firstCutAt: now };
         this.closedTrades.push(tab);
       }
       tab.cuts.push({ pnl: cutPnl, roi: cutRoi, mark, cutAt: now });
       tab.totalPnl   = parseFloat((tab.totalPnl + cutPnl).toFixed(6));
+      tab.entryPrice = pos.entryPrice;
       tab.dcaStage   = pos.dcaStage;
       tab.lastCutAt  = now;
       const sym = pos.symbol.replace('USDT', '');
@@ -3405,7 +3484,10 @@ function psycho() { return {
       const instr = await this.getInstrInfo(pos.symbol);
       if (!instr) continue;
       const applied = this._applySecondWind(pos, mark, instr);
-      if (applied && pos._slFinalSet) pos._slFinalSet = false;
+      if (applied && pos._slFinalSet) {
+        pos._slFinalSet = false;
+        if (pos._live) { try { await this.liveSetSL(pos.symbol, 0); } catch(e) {} }
+      }
     }
   },
 
@@ -3421,11 +3503,6 @@ function psycho() { return {
         if (pos._exhumed) {
           pos._exhumed            = false;
           pos._exhumedEdaTpPrice  = 0;
-          // Cancel live exhumed TP order if recovery has happened
-          if (pos._live && pos._exhumedTpOrderId) {
-            try { await this.liveCancelOrder(pos.symbol, pos._exhumedTpOrderId); } catch(e) {}
-            pos._exhumedTpOrderId = null;
-          }
         }
         continue;
       }
@@ -3439,38 +3516,9 @@ function psycho() { return {
       pos._exhumed               = snapped > 0;
       pos._exhumedEdaTpPrice     = snapped;
 
-      if (!pos._live) continue;
-
-      // Live: manage a dedicated TP order at _exhumedEdaTpPrice
-      if (snapped <= 0) {
-        if (pos._exhumedTpOrderId) {
-          try { await this.liveCancelOrder(pos.symbol, pos._exhumedTpOrderId); } catch(e) {}
-          pos._exhumedTpOrderId = null;
-        }
-        continue;
-      }
-
-      // Newly exhumed: cancel regular TP order and replace with exhumed EDa TP
-      if (!wasExhumed && pos.tpOrderId) {
-        try { await this.liveCancelOrder(pos.symbol, pos.tpOrderId); } catch(e) {}
-        pos.tpOrderId = null;
-      }
-
-      const tick = instr?.tickSize || 0.001;
-      if (pos._exhumedTpOrderId && Math.abs((pos._exhumedTpSnapped || 0) - snapped) < tick) continue;
-
-      if (pos._exhumedTpOrderId) {
-        try { await this.liveCancelOrder(pos.symbol, pos._exhumedTpOrderId); } catch(e) {}
-        pos._exhumedTpOrderId = null;
-      }
-      try {
-        const res = await this.livePlaceOrder({ symbol: pos.symbol, side: 'Sell', orderType: 'Limit', qty: pos.totalSize.toString(), price: snapped.toString(), timeInForce: 'GTC', reduceOnly: true });
-        pos._exhumedTpOrderId = res.orderId;
-        pos._exhumedTpSnapped = snapped;
+      if (!wasExhumed && snapped > 0) {
         const sym = pos.symbol.replace('USDT', '');
         this.log(`🪦 ${sym}: Exhumed EDa TP → ${fmtP(snapped)} (absorbed $${Math.abs(absLoss).toFixed(3)})`, 'info');
-      } catch(e) {
-        this.log(`${pos.symbol}: Exhumed TP order failed — ${e.message}`, 'warn');
       }
     }
     this.persist();
@@ -3591,7 +3639,7 @@ function psycho() { return {
   },
 
   addPctDisplay() {
-    return this._addPcts().map(p => '+'+p+'%').join(', ');
+    return this._addPcts().map(p => '-'+p+'%').join(', ');
   },
 
   // ── Closed trades grouping ──
@@ -3980,11 +4028,15 @@ function psycho() { return {
   },
 
   async liveApiCall(endpoint, params={}, method='GET') {
-    // Enforce minimum spacing between signed calls
+    // Enforce minimum spacing between signed calls. The slot is reserved
+    // synchronously (before the await) so two calls fired close together both
+    // see the updated _lastSignedAt and queue correctly, instead of both reading
+    // the same stale value and firing under-spaced.
+    const GAP = 200;
     const now = Date.now();
-    const gap = now - this._lastSignedAt;
-    if (gap < 200) await new Promise(r => setTimeout(r, 200 - gap));
-    this._lastSignedAt = Date.now();
+    const t   = Math.max(now, (this._lastSignedAt || 0) + GAP);
+    this._lastSignedAt = t;
+    if (t > now) await new Promise(r => setTimeout(r, t - now));
 
     const k = this.cfg.apiKey, s = this.cfg.apiSecret;
     if (!k || !s) throw new Error('No API credentials');
@@ -4006,8 +4058,87 @@ function psycho() { return {
     }
   },
 
+  // Syncs local clock against Bybit server time — required so signed request
+  // timestamps stay inside the 5s recvWindow. Never ran before this pass;
+  // _tsOffset sat at 0 indefinitely, relying on the host clock being exact.
+  async liveSyncTs() {
+    try {
+      const r = await fetch(`${this._baseUrl()}/v5/market/time`);
+      const d = await r.json();
+      const ms = parseInt(d.result?.timeNano ? d.result.timeNano / 1000000 : (d.result?.timeSecond || 0) * 1000);
+      if (ms > 0) this._tsOffset = ms - Date.now();
+    } catch(e) { this._tsOffset = 0; }
+  },
+
   async liveSetLeverage(symbol, lev) {
     await this.liveApiCall('/v5/position/set-leverage', { category:'linear', symbol, buyLeverage:String(lev), sellLeverage:String(lev) }, 'POST');
+  },
+
+  // Sets exchange-native SL via position/trading-stop — enforced server-side,
+  // survives the browser tab closing/losing connection. Pass 0 to clear.
+  async liveSetSL(symbol, slPrice) {
+    try {
+      await this.liveApiCall('/v5/position/trading-stop', {
+        category: 'linear', symbol, positionIdx: 0,
+        stopLoss: slPrice > 0 ? String(slPrice) : '0',
+        slTriggerBy: 'LastPrice',
+      }, 'POST');
+      return true;
+    } catch(e) { this.log(`${symbol}: setSL failed — ${e.message}`, 'warn'); return false; }
+  },
+
+  // Sets exchange-native TP via position/trading-stop. Pass 0 to clear.
+  async liveSetTp(symbol, tpPrice) {
+    try {
+      await this.liveApiCall('/v5/position/trading-stop', {
+        category: 'linear', symbol, positionIdx: 0,
+        takeProfit: tpPrice > 0 ? String(tpPrice) : '0',
+        tpTriggerBy: 'LastPrice',
+      }, 'POST');
+      return true;
+    } catch(e) { this.log(`${symbol}: setTp failed — ${e.message}`, 'warn'); return false; }
+  },
+
+  // Mirrors the single governing TP price (normal / laggard EDa / exhumed EDa /
+  // AMa-stage7 — see _activeTpForPos) to the exchange. This is the only place
+  // that pushes TP live, replacing the old per-subsystem cancel/replace
+  // limit-order dance, which tracked up to three independent resting orders
+  // per position and could leave one stale or duplicated if a cancel silently
+  // failed. Cheap to call every tick — only fires an API call when the target
+  // actually changed.
+  async liveReconcileTp(pos) {
+    if (!pos._live) return;
+    const target = this._activeTpForPos(pos).price || 0;
+    if (Math.abs((pos._lastSyncedTp || 0) - target) < 1e-9) return;
+    if (pos._tpSyncAttemptAt && Date.now() - pos._tpSyncAttemptAt < 4000) return;
+    pos._tpSyncAttemptAt = Date.now();
+    const ok = await this.liveSetTp(pos.symbol, target);
+    if (ok) pos._lastSyncedTp = target;
+  },
+
+  // Polls position/list until a real fill is visible, rather than trusting a
+  // single early read of order/realtime. On timeout, cancels the order and
+  // checks once more before giving up.
+  async liveWaitForFill(symbol, side, orderId = null) {
+    const POLL = 2500, TIMEOUT = 30000;
+    const end  = Date.now() + TIMEOUT;
+    const check = async () => {
+      const result = await this.liveApiCall('/v5/position/list', { category:'linear', symbol });
+      const e = (result?.list || []).find(x => x.symbol === symbol && x.side === side && parseFloat(x.size) > 0);
+      if (!e) return null;
+      const fp = parseFloat(e.avgPrice || e.entryPrice || 0);
+      return fp > 0 ? fp : null;
+    };
+    while (Date.now() < end) {
+      await new Promise(r => setTimeout(r, POLL));
+      try { const fp = await check(); if (fp) return fp; } catch(e) {}
+    }
+    if (orderId) {
+      try { await this.liveCancelOrder(symbol, orderId); } catch(e) {}
+      try { const fp = await check(); if (fp) return fp; } catch(e) {}
+    }
+    this.log(`${symbol}: fill timeout — aborted.`, 'warn');
+    return null;
   },
 
   async livePlaceOrder(params) {
