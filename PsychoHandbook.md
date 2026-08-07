@@ -73,6 +73,8 @@ Governs what happens when a position moves against you.
 | Multiplier | How much bigger each successive add is than the one before it. |
 | Anti-Martingale (AMa) | An alternate laddering mode — flat-sized adds as price falls, no take-profit until the final AMa stage. If the price reverses and a normal DCA add fires instead, AMa cancels and the position falls back to a regular take-profit. |
 
+Tooltip wording throughout this section is bot-specific: Chaser's copy describes long-side mechanics (adds trigger below entry, AMa scales into price rises), Winter's describes the short-side mirror — cleaned up after some leftover short-biased phrasing survived Chaser's initial port.
+
 ### Take Profit
 
 | Setting | What it does |
@@ -110,7 +112,7 @@ This is the largest section — it holds the safety nets that manage a book once
 - *Accelerated Absorption* — speeds up the absorption interval progressively through the first few DCA stages, then resets and re-accelerates after a Second Wind event.
 
 **Sacrifice** — when too much of your total capital is tied up, this closes the single best eligible position each cycle until margin usage cools back down.
-- *Sacrifice Trigger Threshold* — the allocation ceiling, expressed as a multiple of one slot's margin times your max positions.
+- *Sacrifice Trigger Threshold* — the allocation ceiling, expressed as a multiple of one slot's margin times your max positions. Numeric input field (0.25× steps, max 100×).
 - *Position Floor* — Sacrifice won't close positions if doing so would drop you below this many open at once.
 - *Retraction* — a second, independent tripwire: if the book's combined floating loss crosses a threshold, Sacrifice fires regardless of how much margin is actually in use.
 - *Retraction Threshold* — how deep that combined loss needs to be, as a multiple of base margin.
@@ -127,7 +129,7 @@ This is the largest section — it holds the safety nets that manage a book once
 Each open position gets a card. The header row shows the ticker and any status badges: **SHORT** (direction), **DCAx** (current stage), **FORCE** (past its deadline, closing), **EXHUMED** (recovering from absorbed losses), **2ND WIND** (recalibrated final stage), **LAGGARD** (currently the book's designated absorber).
 
 Inside the card:
-- **Entry / Mark** — entry price and current mark price.
+- **Entry / Mark** — current mark price, and the entry price — which, once a position has DCA'd at least once, alternates every 5 seconds between **Avg Entry** (the current averaged entry across all filled stages) and **Orig Entry** (the very first fill, before any adds). Before any DCA fires it's just a plain **Entry**, no cycling.
 - **uPnL / ROI** — unrealized profit or loss, in dollars and as a percentage of margin.
 - **TP / SL row** — shows whichever exit target currently governs the position: normal TP, an exhumed recovery target (**EH TP**), a laggard-adjusted target (**EDa TP**), or a live stop-loss (**SL**, which blinks once every stage has filled).
 - **Margin** — capital committed to this position.
@@ -160,7 +162,7 @@ This is the analytical sidebar — a stack of live-updating panels, followed by 
 - **SESSION** — trade count, wins, losses, net PnL, win rate, force closes, and cascade count for the current session — plus peak and current allocation: your utilized margin adjusted for floating uPnL (a loss deepens it, a profit trims it). Peak tracks the all-time high; current shows where you sit right now. Watch peak allocation for new highs as a read on whether the bot is ever concurrently over-committing.
 - **LAGGARD** — the position currently designated to absorb the book's debt, its target, and how close it is to clearing.
 - **OPEN NOW** — your best and worst position by uPnL, and whichever position has DCA'd the furthest.
-- **DCA SPREAD** — a count of how many open positions sit at each DCA stage.
+- **DCA SPREAD** — the expanded view lists every open position with its current stage and next trigger price (plus how many more are queued behind it), not just a stage-count summary. It can only ever show the next trigger, since later stages aren't fixed numbers — they're computed on the fly as each prior stage fills. That's also why this looks similar to CONDITIONALS above at a glance but tracks distinct data: CONDITIONALS only lists positions with something pending right now (live or queued) and includes placement timing, while DCA SPREAD covers every open position for a full stage-distribution view.
 - **ACTIVITY LOG** — the full scrolling event log: every open, close, DCA fire, absorption cut, funding settlement, and warning, timestamped.
 
 ### Danger Zone
