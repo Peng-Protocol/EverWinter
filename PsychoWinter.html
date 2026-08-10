@@ -1,6 +1,117 @@
 <!--
-PsychoWinter v1.4.0
+PsychoWinter v1.7.2
 Copyleft 2026 Peng Protocol — PsychoWinter fork
+
+v1.7.2 — UI tweaks:
+  - Operational Balance input was missing the explicit dark styling other
+    numeric config inputs (e.g. Sacrifice Trigger Threshold) carry, so it fell
+    back to browser-default white. Matched to the same style.
+  - Loss Absorption Threshold changed from a 0.25-step slider to a numeric
+    input (0.05 step, matching Sacrifice Trigger Threshold's pattern), so
+    arbitrary values like 0.40 are settable.
+
+v1.7.1 — Margin reconciliation audit + deceleration confirmation gap, addressing
+general Bybit flakiness:
+  - Order placement spacing: checked, already sufficient — every signed API
+    call (across every position and mechanism) already goes through one shared
+    200ms-minimum-gap serializer in liveApiCall. No change needed there.
+  - liveSyncPositions now compares actual exchange margin (positionIM, or
+    size×avgPrice/leverage as fallback) against local pos.margin for every live
+    position on each sync pass. Log-only — surfaces drift (missed fill, partial
+    fill, a rejection Bybit didn't clearly error on) rather than auto-correcting,
+    so it can be reviewed rather than silently papered over.
+  - Outlier Deceleration fires a plain Market order and updates local margin
+    optimistically, with no fill-confirmation step (unlike DCA/AMa, which
+    confirm via execution history before touching local state). It now stamps
+    pos._marginPendingUntil (+8s) after firing, and skips further deceleration
+    attempts on that position until the window clears — no stacking a second
+    unconfirmed add on top of one that hasn't settled. The margin audit above
+    also skips a position during this same window, since the exchange genuinely
+    hasn't caught up yet there, not drifted.
+
+v1.7.0 — Operational Balance Cap: mediates DCA escalation against a fixed
+ceiling instead of letting the 2×+ exponential ladder run unbounded.
+  - New DCA config: opBalanceEnabled / opBalance / opBalanceBufferPct (default
+    1%). When on, each DCA stage is checked against (allocated − collective
+    uPnL) before it becomes active; if the full-size add would push that figure
+    above opBalance, the add is shrunk to land at (100 − buffer)% of it instead.
+  - The clamp math is exact for this position's own contribution: adding size
+    at a fixed price doesn't change the dollar uPnL already accrued on existing
+    size (the new units start flat at their own entry price), so solving for
+    the max qty that keeps the position under the ceiling has a closed form —
+    no iteration or approximation needed there. Other positions' allocation/
+    uPnL are taken from the current tick's snapshot, since their state at this
+    stage's eventual (unknown, future) fire time can't be predicted — the same
+    approximation the rest of the watcher already accepts by re-checking every
+    ~5s rather than solving the whole book forward.
+  - Applied at the moment each stage becomes active — position-open Add1, a
+    delay-queue stage unlocking, or self-heal placement for a live order
+    missing its exchange counterpart — for both live and pseudo positions.
+    Does not continuously re-amend an already-resting order as headroom shifts
+    between placement and fill; that's a possible follow-up if the gap between
+    the two matters in practice.
+  - If even a clamped add would round below the exchange minimum qty, the
+    stage is skipped entirely (not placed as a dust order) and retried every
+    30s — self-recovers once headroom frees up as other positions close or
+    move into profit, without spamming logs on every tick while capped.
+  - Scope: DCA adds only, matching the original ask. AMa and Second Wind are
+    unaffected by this cap for now.
+
+v1.6.0 — AMa and Second Wind brought onto exchange-side conditional orders too
+(Pass 4 of the live-mode robustness work), closing the gap the v1.5.0 "Scope"
+note flagged:
+  - Second Wind needed no new plumbing — it's just a resumed DCA ladder pushed
+    into the same _dcaDelayQueue the v1.5.0 delay-queue processor already places
+    live conditionals from. Verified it flows through correctly, not re-implemented.
+  - AMa gets different treatment than DCA on purpose: all 7 stages are placed as
+    resting conditional orders immediately on open (triggerDirection 2 — AMa adds
+    fire on price falling in the position's favor), rather than one-at-a-time like
+    DCA. The ladder is meant to survive independently of the bot regardless of
+    which stage fires next, so there's no "next stage unlocks" concept to gate on.
+  - AMa qty is now precomputed at position-open (flat minNotional/price per
+    stage, same math as before) instead of at fill time, since live conditional
+    orders need qty at placement, not just at fill.
+  - AMa fills are detected via execution history by order link id, same pattern
+    as DCA — catches fills that happened while the bot was offline.
+  - When a DCA trigger invalidates AMa (existing behavior), any AMa conditionals
+    still resting on the exchange are now actively cancelled, not just marked
+    dead locally — previously an invalidated-but-still-resting AMa order could
+    still fire on the exchange after the bot considered AMa cancelled.
+  - liveClosePosition now also cancels any resting AMa conditionals, alongside
+    the DCA conditional cancellation added in v1.5.0.
+  - Renamed the v1.5.0 live-conditional helpers from Dca-specific to Ladder-
+    generic (livePlaceLadderConditional / liveCancelLadderConditional /
+    liveCheckLadderFill) since they're now shared across DCA, AMa, and Second Wind.
+  - Operational-balance DCA sizing clamp still deferred to its own pass, as noted
+    in v1.5.0 — this pass is exchange-order-model only.
+
+v1.5.0 — Live DCA adds now real exchange-side conditional orders (Pass 3 of the
+live-mode robustness work). Previously "conditional" DCA orders were pure local
+bookkeeping: the watcher polled mark price itself every ~5s and fired a plain
+Market order once it crossed the trigger — meaning a closed tab or dropped
+connection silently skipped the add even though price traded through the level:
+  - livePlaceLadderConditional places a real Bybit trigger order (triggerPrice/
+    triggerDirection/triggerBy, orderType Market) tagged with a deterministic
+    orderLinkId, so the add is enforced exchange-side regardless of whether this
+    tab is open — mirrors the same robustness already given to SL (v1.3.0) and TP
+    (v1.4.0), extended to DCA adds
+  - liveCheckLadderFill polls execution history by orderLinkId rather than watching
+    mark price locally — this also means a fill that happened while the bot was
+    offline is picked up correctly on the next tick, replaying the real fill price
+  - Only one resting conditional order per position at a time, matching the
+    existing "lowest-stage unfilled conditional is active" model — next stage is
+    placed live only once the delay queue unlocks it, not the whole ladder upfront
+  - liveClosePosition now cancels any resting DCA conditional before closing, so
+    an add can't refill exposure on a symbol just exited
+  - Duplicate-conditional dedup now cancels the exchange-side order for any
+    pruned duplicate, not just the local record
+  - Self-healing: any live position whose unfilled cond order has no orderLinkId
+    (pre-upgrade positions, or a placement that failed) gets it placed on the next
+    watcher tick — no separate migration step needed
+  - Scope: this pass covers DCA adds only. AMa and Second Wind still simulate
+    fills locally — same treatment deferred to a follow-up pass if wanted
+  - Operational-balance DCA sizing clamp (discussed, not yet built) will amend
+    this same resting order via order/amend rather than firing a fresh order
 
 v1.4.0 — Native TP consolidation (Pass 2 of the live-mode robustness work):
   - Collapsed three independent order-based TP mechanisms (normal DCA-stage TP via
@@ -463,6 +574,19 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
           Add triggers (% above entry): <span style="color:var(--ice)" x-text="addPctDisplay()"></span>
         </div>
         <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+          <label class="tog" @click.prevent="if(!cfgLocked){cfg.opBalanceEnabled=!cfg.opBalanceEnabled;persist()}">
+            <div class="tog-t" :class="cfg.opBalanceEnabled?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Operational Balance Cap</span>
+          </label>
+          <div class="hint" style="margin-top:4px">Caps DCA escalation against a fixed balance instead of letting the exponential ladder run unbounded. If a stage would push (allocated − collective uPnL) above this level, the add is shrunk to land at (100 − buffer)% of it instead. Once even a shrunk add would fall below the exchange minimum, further DCA on that position is skipped until headroom frees up.</div>
+          <div x-show="cfg.opBalanceEnabled" style="margin-top:8px">
+            <div class="lbl">Operational Balance <b x-text="'$'+(cfg.opBalance||0).toFixed(0)"></b></div>
+            <input type="number" min="0" step="10" x-model.number="cfg.opBalance" :disabled="cfgLocked" @change="persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px">
+            <div class="lbl" style="margin-top:6px">Buffer <b x-text="(cfg.opBalanceBufferPct??1)+'%'"></b> below cap</div>
+            <input type="range" min="0.1" max="10" step="0.1" x-model.number="cfg.opBalanceBufferPct" :disabled="cfgLocked" @change="persist()">
+          </div>
+        </div>
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
           <label class="tog" @click.prevent="if(!cfgLocked){cfg.amaEnabled=!cfg.amaEnabled;persist()}">
             <div class="tog-t" :class="cfg.amaEnabled?'on':''"><div class="tog-k"></div></div>
             <span class="tog-l">Anti-Martingale (AMa)</span>
@@ -617,7 +741,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
         </div>
         <div class="g" x-show="cfg.lossAbsorptionEnabled" style="margin-top:8px">
           <div class="lbl">Absorption Trigger Threshold <b x-text="cfg.lossAbsorptionThresholdMult.toFixed(2)+'×'"></b> <span style="color:var(--text-lo);font-size:9px">base margin</span></div>
-          <input type="range" min="0.25" max="10" step="0.25" x-model.number="cfg.lossAbsorptionThresholdMult" :disabled="cfgLocked" @change="persist()">
+          <input type="number" min="0.05" max="10" step="0.05" x-model.number="cfg.lossAbsorptionThresholdMult" :disabled="cfgLocked" @change="cfg.lossAbsorptionThresholdMult=Math.min(10,Math.max(0.05,cfg.lossAbsorptionThresholdMult||0.05));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px">
           <div class="hint">Loss depth, as a multiple of base margin, that qualifies a position as a deep loser.</div>
         </div>
         <div class="g" x-show="cfg.lossAbsorptionEnabled" style="margin-top:8px">
@@ -1334,7 +1458,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
 </div><!-- end .main -->
 
 <script>
-const VERSION = '1.1.1'; // x=production-only, y=significant additions/subtractions, z=tweaks
+const VERSION = '1.7.2'; // x=production-only, y=significant additions/subtractions, z=tweaks
 
 // ── HMAC-SHA256 signing ──
 async function hmac(secret, msg) {
@@ -1513,6 +1637,9 @@ function psycho() { return {
     ppcEscalationMult: 2,
     cascadeMinRoiPct: 3,
     amaEnabled: false,
+    opBalanceEnabled: false,
+    opBalance: 0,
+    opBalanceBufferPct: 1,
     exhumationEnabled: true,
     secondWindEnabled: true,
     passiveSecondWindEnabled: true,
@@ -1964,13 +2091,18 @@ function psycho() { return {
     for (const q of _dcaDelayQueue) { _slSimN += q.price * q.qty; _slSimS += q.qty; }
     const _initSlPrice = this.snapPrice((_slSimS > 0 ? _slSimN / _slSimS : price) * (1 + 1.05 / lev), instr);
 
-    // Build AMa orders when enabled
+    // Build AMa orders when enabled — qty precomputed now (flat minNotional/price
+    // per stage) since live conditional orders need qty at placement time, not
+    // just at fill time.
     const amaLevels = [1.5, 3, 6, 9, 12, 15, 18];
-    const amaOrders = useAma ? amaLevels.map((pct, i) => ({
-      label: 'AMa' + (i + 1), stage: i + 1,
-      price: this.snapPrice(price * (1 - pct / 100), instr),
-      filled: false, filledAt: null,
-    })) : null;
+    const amaOrders = useAma ? amaLevels.map((pct, i) => {
+      const amaPrice = this.snapPrice(price * (1 - pct / 100), instr);
+      return {
+        label: 'AMa' + (i + 1), stage: i + 1,
+        price: amaPrice, qty: this.snapQty(this.cfg.minNotional / amaPrice, instr),
+        filled: false, filledAt: null,
+      };
+    }) : null;
 
     const pos = {
       id:                   Date.now() + Math.random(),
@@ -2014,6 +2146,8 @@ function psycho() { return {
     };
 
     this.positions.push(pos);
+    const _pAdd1 = pos.orders.find(o => o.type === 'cond' && !o.filled);
+    if (_pAdd1) await this._dcaFinalizeStage(pos, _pAdd1);
     this._logOpenBatch(sym, candidate.change24h ?? 0, price);
     this.persist();
   },
@@ -2121,13 +2255,18 @@ function psycho() { return {
     for (const q of _dcaDelayQueueLive) { _slSimN += q.price * q.qty; _slSimS += q.qty; }
     const _initSlPriceLive = this.snapPrice((_slSimS > 0 ? _slSimN / _slSimS : fillPrice) * (1 + 1.05 / lev), instr);
 
-    // Build AMa orders
+    // Build AMa orders — qty precomputed now (flat minNotional/price per stage)
+    // since all 7 are placed as live conditional orders immediately, not one at
+    // a time like DCA.
     const amaLevels = [1.5, 3, 6, 9, 12, 15, 18];
-    const amaOrders = useAma ? amaLevels.map((pct, i) => ({
-      label: 'AMa' + (i + 1), stage: i + 1,
-      price: this.snapPrice(fillPrice * (1 - pct / 100), instr),
-      filled: false, filledAt: null,
-    })) : null;
+    const amaOrders = useAma ? amaLevels.map((pct, i) => {
+      const amaPrice = this.snapPrice(fillPrice * (1 - pct / 100), instr);
+      return {
+        label: 'AMa' + (i + 1), stage: i + 1,
+        price: amaPrice, qty: this.snapQty(this.cfg.minNotional / amaPrice, instr),
+        filled: false, filledAt: null,
+      };
+    }) : null;
 
     const pos = {
       id: Date.now() + Math.random(),
@@ -2157,6 +2296,18 @@ function psycho() { return {
     };
     this.positions.push(pos);
     await this.liveReconcileTp(pos);
+    const _add1 = pos.orders.find(o => o.type === 'cond' && !o.filled);
+    if (_add1) {
+      const _ok = await this._dcaFinalizeStage(pos, _add1);
+      if (_ok) await this.livePlaceLadderConditional(pos, _add1);
+    }
+    // AMa: unlike DCA (one active order at a time), all 7 stages are placed as
+    // resting conditionals immediately — the whole ladder is meant to survive
+    // independently of the bot, since any of them can fire while price is
+    // falling in the position's favor.
+    if (useAma && amaOrders) {
+      for (const ama of amaOrders) { await this.livePlaceLadderConditional(pos, ama, 2); }
+    }
     this._logOpenBatch(sym, candidate.change24h ?? 0, fillPrice);
     this.persist();
   },
@@ -2284,135 +2435,170 @@ function psycho() { return {
       if (_unfilledConds.length > 1) {
         _unfilledConds.sort((a, b) => parseInt(a.label.replace('Add','')) - parseInt(b.label.replace('Add','')));
         const _keepCond = _unfilledConds[0];
+        const _dropConds = _unfilledConds.slice(1);
+        if (pos._live) { for (const _d of _dropConds) await this.liveCancelLadderConditional(pos, _d); }
         pos.orders = pos.orders.filter(o => !(o.type === 'cond' && !o.filled && o !== _keepCond));
         this.log(`⚠️ ${pos.symbol.replace('USDT','')}: removed ${_unfilledConds.length - 1} duplicate conditional(s) — kept ${_keepCond.label} @ ${fmtP(_keepCond.price)}`, 'warn');
       }
 
-      // Check DCA add triggers
+      // Check DCA add triggers.
+      // Live positions no longer watch mark price locally to decide when to fire —
+      // the conditional order rests on the exchange and fires there regardless of
+      // whether this tab is open. This loop just needs to notice it happened, via
+      // execution history keyed on the order's link id.
       const pendingAdds = pos.orders.filter(o => o.type==='cond' && !o.filled);
       for (const add of pendingAdds) {
-        if (mark >= add.price) {
-          add.filled   = true;
-          add.filledAt = now;
-          const addQty = add.qty || 0;
+        let fillPrice = null, fillQty = null;
 
-          if (addQty > 0) {
+        if (pos._live) {
+          if (!add._orderLinkId) {
+            // No resting order yet — either migrated from the old local-trigger
+            // model, or a prior placement attempt failed. Place it now and pick
+            // up the fill on a later tick.
+            const _ok = await this._dcaFinalizeStage(pos, add);
+            if (_ok) await this.livePlaceLadderConditional(pos, add);
+            continue;
+          }
+          const fill = await this.liveCheckLadderFill(pos, add);
+          if (!fill) continue;
+          fillPrice = fill.price;
+          fillQty   = fill.qty;
+        } else {
+          if (mark < add.price) continue;
+          fillPrice = add.price;
+          fillQty   = add.qty || 0;
+        }
+
+        add.filled   = true;
+        add.filledAt = now;
+        const addQty = fillQty || 0;
+
+        if (addQty > 0) {
+          const newTotalNotional = (pos.entryPrice * pos.totalSize) + (fillPrice * addQty);
+          pos.totalSize  = parseFloat((pos.totalSize + addQty).toFixed(8));
+          pos.entryPrice = newTotalNotional / pos.totalSize;
+          pos.margin     = (pos.entryPrice * pos.totalSize) / pos.leverage;
+          pos.dcaStage   = pos.orders.filter(o => o.type==='cond' && o.filled).length;
+        }
+
+        // Recalculate TP
+        const stageRoi     = this._tpRoi(pos.dcaStage);
+        const instr        = await this.getInstrInfo(pos.symbol);
+        const newTp        = instr
+          ? this.snapPrice(pos.entryPrice * (1 - (stageRoi / 100) / pos.leverage), instr)
+          : parseFloat((pos.entryPrice * (1 - (stageRoi / 100) / pos.leverage)).toFixed(8));
+        pos.currentTpPrice = newTp;
+        pos.tpPct          = stageRoi;
+        // Keep laggard EV in sync with the current stage so EDa TP is correct
+        // regardless of which position is currently the laggard.
+        pos._laggardInitialEV = pos.margin * (stageRoi / 100);
+        this._refreshLaggardEdaTp();
+        // Exhumed: recompute EDa TP now that _laggardInitialEV has been updated
+        if (this.cfg.exhumationEnabled !== false && pos._exhumed) {
+          const _absTab = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
+          if (_absTab && _absTab.totalPnl < 0) {
+            const _exRaw = this._computeExhumedEdaTp(pos, _absTab.totalPnl);
+            pos._exhumedEdaTpPrice = _exRaw > 0 ? (instr ? this.snapPrice(_exRaw, instr) : parseFloat(_exRaw.toFixed(8))) : 0;
+          }
+        }
+
+        // DCA triggers AMa cancellation — activate normal TP
+        if (pos._amaActive && !pos._amaCancelled) {
+          pos._amaCancelled = true;
+          // Cancel whatever AMa conditionals are still resting on the exchange —
+          // AMa is invalidated, those adds should never fire now.
+          if (pos._live && pos._amaOrders) {
+            for (const _a of pos._amaOrders.filter(o => !o.filled && o._orderLinkId)) {
+              await this.liveCancelLadderConditional(pos, _a);
+            }
+          }
+          // Rescale remaining DCA orders to the AMa-inflated margin so adds stay
+          // proportional to the position that actually exists, not the original entry size.
+          const baseMargin   = this.cfg.minNotional / this.cfg.leverage;
+          const scaleFactor  = baseMargin > 0 ? pos.margin / baseMargin : 1;
+          if (scaleFactor > 1.05 && instr) {
+            for (const dcaOrd of pos.orders.filter(o => o.type === 'cond' && !o.filled)) {
+              dcaOrd.qty = this.snapQty(dcaOrd.qty * scaleFactor, instr);
+            }
+          }
+          this.log(`📗→⚠️ ${pos.symbol}: AMa cancelled — DCA${pos.dcaStage} triggered, TP → ${fmtP(newTp)}`, 'warn');
+        }
+
+        // Live: exhumed positions use their EDa TP price, mirrored via liveReconcileTp
+        // below along with everything else — no separate order management needed.
+
+        // Update SL to actual weighted avg after final stage fills
+        if (pos.dcaStage >= pos._stageCount && !pos._slFinalSet && instr) {
+          if (this.cfg.secondWindEnabled !== false && this._applySecondWind(pos, mark, instr)) {
+            // Second Wind applied — SL deferred, new stages queued
+          } else {
+            pos.slPrice    = this._projectedSL(pos, instr);
+            pos.slSet      = true;
+            pos._slFinalSet = true;
             if (pos._live) {
-              // Place live add order
-              try {
-                await this.livePlaceOrder({ symbol:pos.symbol, side:'Sell', orderType:'Market', qty:addQty.toString(), timeInForce:'IOC', reduceOnly:false });
-              } catch(e) { this.log(`${pos.symbol}: DCA add failed — ${e.message}`, 'error'); add.filled=false; continue; }
-            }
-            const newTotalNotional = (pos.entryPrice * pos.totalSize) + (add.price * addQty);
-            pos.totalSize  = parseFloat((pos.totalSize + addQty).toFixed(8));
-            pos.entryPrice = newTotalNotional / pos.totalSize;
-            pos.margin     = (pos.entryPrice * pos.totalSize) / pos.leverage;
-            pos.dcaStage   = pos.orders.filter(o => o.type==='cond' && o.filled).length;
-          }
-
-          // Recalculate TP
-          const stageRoi     = this._tpRoi(pos.dcaStage);
-          const instr        = await this.getInstrInfo(pos.symbol);
-          const newTp        = instr
-            ? this.snapPrice(pos.entryPrice * (1 - (stageRoi / 100) / pos.leverage), instr)
-            : parseFloat((pos.entryPrice * (1 - (stageRoi / 100) / pos.leverage)).toFixed(8));
-          pos.currentTpPrice = newTp;
-          pos.tpPct          = stageRoi;
-          // Keep laggard EV in sync with the current stage so EDa TP is correct
-          // regardless of which position is currently the laggard.
-          pos._laggardInitialEV = pos.margin * (stageRoi / 100);
-          this._refreshLaggardEdaTp();
-          // Exhumed: recompute EDa TP now that _laggardInitialEV has been updated
-          if (this.cfg.exhumationEnabled !== false && pos._exhumed) {
-            const _absTab = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
-            if (_absTab && _absTab.totalPnl < 0) {
-              const _exRaw = this._computeExhumedEdaTp(pos, _absTab.totalPnl);
-              pos._exhumedEdaTpPrice = _exRaw > 0 ? (instr ? this.snapPrice(_exRaw, instr) : parseFloat(_exRaw.toFixed(8))) : 0;
-            }
-          }
-
-          // DCA triggers AMa cancellation — activate normal TP
-          if (pos._amaActive && !pos._amaCancelled) {
-            pos._amaCancelled = true;
-            // Rescale remaining DCA orders to the AMa-inflated margin so adds stay
-            // proportional to the position that actually exists, not the original entry size.
-            const baseMargin   = this.cfg.minNotional / this.cfg.leverage;
-            const scaleFactor  = baseMargin > 0 ? pos.margin / baseMargin : 1;
-            if (scaleFactor > 1.05 && instr) {
-              for (const dcaOrd of pos.orders.filter(o => o.type === 'cond' && !o.filled)) {
-                dcaOrd.qty = this.snapQty(dcaOrd.qty * scaleFactor, instr);
-              }
-            }
-            this.log(`📗→⚠️ ${pos.symbol}: AMa cancelled — DCA${pos.dcaStage} triggered, TP → ${fmtP(newTp)}`, 'warn');
-          }
-
-          // Live: exhumed positions use their EDa TP price, mirrored via liveReconcileTp
-          // below along with everything else — no separate order management needed.
-
-          // Update SL to actual weighted avg after final stage fills
-          if (pos.dcaStage >= pos._stageCount && !pos._slFinalSet && instr) {
-            if (this.cfg.secondWindEnabled !== false && this._applySecondWind(pos, mark, instr)) {
-              // Second Wind applied — SL deferred, new stages queued
+              const ok = await this.liveSetSL(pos.symbol, pos.slPrice);
+              this.log(ok
+                ? `⚠️ ${pos.symbol}: DCA${pos.dcaStage} — exchange SL @ ${fmtP(pos.slPrice)}`
+                : `${pos.symbol}: exchange SL set failed — local SL @ ${fmtP(pos.slPrice)} still enforced client-side`, ok ? 'warn' : 'error');
             } else {
-              pos.slPrice    = this._projectedSL(pos, instr);
-              pos.slSet      = true;
-              pos._slFinalSet = true;
-              if (pos._live) {
-                const ok = await this.liveSetSL(pos.symbol, pos.slPrice);
-                this.log(ok
-                  ? `⚠️ ${pos.symbol}: DCA${pos.dcaStage} — exchange SL @ ${fmtP(pos.slPrice)}`
-                  : `${pos.symbol}: exchange SL set failed — local SL @ ${fmtP(pos.slPrice)} still enforced client-side`, ok ? 'warn' : 'error');
-              } else {
-                this.log(`⚠️ ${pos.symbol}: DCA${pos.dcaStage} — SL @ ${fmtP(pos.slPrice)}`, 'warn');
-              }
+              this.log(`⚠️ ${pos.symbol}: DCA${pos.dcaStage} — SL @ ${fmtP(pos.slPrice)}`, 'warn');
             }
           }
-          this.log(`📊 ${pos.symbol}: ${add.label} @ ${fmtP(add.price)} | Avg ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(newTp)} (${stageRoi}% ROI)`, 'trade');
-          this.persist();
-          // DCA Delay: schedule next stage placement 5 minutes after this fill.
-          // Always (re)set the timer here — overrides any stale immediate timer that
-          // may have been set by startup recovery while this conditional was live.
-          if (pos._dcaDelayQueue && pos._dcaDelayQueue.length > 0) {
-            pos._nextDcaPlaceAt = now + 5 * 60 * 1000;
-            this.log(`📊 ${pos.symbol}: DCA${pos.dcaStage} filled — next stage queued, placing in 5 min`, 'info');
-          }
+        }
+        this.log(`📊 ${pos.symbol}: ${add.label} @ ${fmtP(add.price)} | Avg ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(newTp)} (${stageRoi}% ROI)`, 'trade');
+        this.persist();
+        // DCA Delay: schedule next stage placement 5 minutes after this fill.
+        // Always (re)set the timer here — overrides any stale immediate timer that
+        // may have been set by startup recovery while this conditional was live.
+        if (pos._dcaDelayQueue && pos._dcaDelayQueue.length > 0) {
+          pos._nextDcaPlaceAt = now + 5 * 60 * 1000;
+          this.log(`📊 ${pos.symbol}: DCA${pos.dcaStage} filled — next stage queued, placing in 5 min`, 'info');
         }
       }
 
-      // AMa stage checks — fills when price drops to each AMa level
+      // AMa stage checks. All 7 are placed as resting conditionals upfront for
+      // live positions (see liveOpenShort) — this loop just needs to notice a
+      // fill happened, via execution history, same as the DCA loop above.
       if (pos._amaActive && !pos._amaCancelled && pos._amaOrders) {
         const pendingAma = pos._amaOrders.filter(o => !o.filled);
         for (const ama of pendingAma) {
-          if (mark <= ama.price) {
-            ama.filled   = true;
-            ama.filledAt = now;
-            pos._amaStage = pos._amaOrders.filter(o => o.filled).length;
+          let fillPrice = null, fillQty = null;
 
-            const amaInstr  = await this.getInstrInfo(pos.symbol);
-            const addQty    = this.snapQty(this.cfg.minNotional / ama.price, amaInstr);
-            if (addQty > 0) {
-              if (pos._live) {
-                try {
-                  await this.livePlaceOrder({ symbol:pos.symbol, side:'Sell', orderType:'Market', qty:addQty.toString(), timeInForce:'IOC', reduceOnly:false });
-                } catch(e) { this.log(`${pos.symbol}: AMa${ama.stage} add failed — ${e.message}`, 'error'); ama.filled=false; pos._amaStage--; continue; }
-              }
-              const newNotional  = pos.entryPrice * pos.totalSize + ama.price * addQty;
-              pos.totalSize  = parseFloat((pos.totalSize + addQty).toFixed(8));
-              pos.entryPrice = newNotional / pos.totalSize;
-              pos.margin     = pos.entryPrice * pos.totalSize / pos.leverage;
-              pos.upnl       = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * pos.margin;
-            }
-
-            // At stage 7: set TP at -22% of original entry
-            if (pos._amaStage >= 7) {
-              const tpP = amaInstr ? this.snapPrice(pos._amaOrigEntry * 0.78, amaInstr) : parseFloat((pos._amaOrigEntry * 0.78).toFixed(8));
-              pos.currentTpPrice = tpP;
-              this.log(`📗 ${pos.symbol}: AMa7 complete — TP → ${fmtP(tpP)} (-22% from ${fmtP(pos._amaOrigEntry)}) | Margin $${pos.margin.toFixed(2)}`, 'trade');
-            } else {
-              this.log(`📗 ${pos.symbol}: AMa${pos._amaStage} @ ${fmtP(ama.price)} | Avg ${fmtP(pos.entryPrice)} | Margin $${pos.margin.toFixed(2)}`, 'trade');
-            }
-            this.persist();
+          if (pos._live) {
+            if (!ama._orderLinkId) { await this.livePlaceLadderConditional(pos, ama, 2); continue; }
+            const fill = await this.liveCheckLadderFill(pos, ama);
+            if (!fill) continue;
+            fillPrice = fill.price;
+            fillQty   = fill.qty;
+          } else {
+            if (mark > ama.price) continue;
+            fillPrice = ama.price;
+            fillQty   = ama.qty || 0;
           }
+
+          ama.filled   = true;
+          ama.filledAt = now;
+          pos._amaStage = pos._amaOrders.filter(o => o.filled).length;
+
+          const addQty = fillQty || 0;
+          if (addQty > 0) {
+            const newNotional  = pos.entryPrice * pos.totalSize + fillPrice * addQty;
+            pos.totalSize  = parseFloat((pos.totalSize + addQty).toFixed(8));
+            pos.entryPrice = newNotional / pos.totalSize;
+            pos.margin     = pos.entryPrice * pos.totalSize / pos.leverage;
+            pos.upnl       = (pos.entryPrice - mark) / pos.entryPrice * pos.leverage * pos.margin;
+          }
+
+          // At stage 7: set TP at -22% of original entry
+          if (pos._amaStage >= 7) {
+            const amaInstr = await this.getInstrInfo(pos.symbol);
+            const tpP = amaInstr ? this.snapPrice(pos._amaOrigEntry * 0.78, amaInstr) : parseFloat((pos._amaOrigEntry * 0.78).toFixed(8));
+            pos.currentTpPrice = tpP;
+            this.log(`📗 ${pos.symbol}: AMa7 complete — TP → ${fmtP(tpP)} (-22% from ${fmtP(pos._amaOrigEntry)}) | Margin $${pos.margin.toFixed(2)}`, 'trade');
+          } else {
+            this.log(`📗 ${pos.symbol}: AMa${pos._amaStage} @ ${fmtP(ama.price)} | Avg ${fmtP(pos.entryPrice)} | Margin $${pos.margin.toFixed(2)}`, 'trade');
+          }
+          this.persist();
         }
       }
 
@@ -2450,14 +2636,24 @@ function psycho() { return {
           pos._nextDcaPlaceAt = now + _ddNext.blownCount * 5 * 60 * 1000;
           this.log(`⏭️ ${pos.symbol}: DCA Delay — ${_ddNext.label} blown @ ${fmtP(mark)} (×${_ddNext.blownCount}), bumped → ${fmtP(_ddNext.price)}, retry in ${_ddNext.blownCount * 5}min`, 'warn');
         } else {
-          // Price valid — place conditional and remove from missed list
+          // Price valid — apply operational balance clamp, then place conditional
+          // and remove from missed list (unless the clamp capped it to zero, in
+          // which case leave it queued and retry shortly — headroom may free up).
           const _origStg = _ddNext.originalStage ?? parseInt(_ddNext.label.replace('Add', ''));
           _ddNext.label = 'Add' + _ddNextNum;
-          pos.orders.push({ label: _ddNext.label, price: _ddNext.price, type: 'cond', filled: false, qty: _ddNext.qty, stageTp: _ddNext.stageTp, stageRoi: _ddNext.stageRoi, avgAfter: _ddNext.avgAfter });
-          pos._dcaDelayQueue.shift();
-          if (pos._dcaMissedStages) pos._dcaMissedStages = pos._dcaMissedStages.filter(s => s !== _origStg);
-          if (_ddInstr) { pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true; }
-          this.log(`⏱️ ${pos.symbol}: DCA Delay — ${_ddNext.label} unlocked @ ${fmtP(_ddNext.price)}`, 'info');
+          const _placedCond = { label: _ddNext.label, price: _ddNext.price, type: 'cond', filled: false, qty: _ddNext.qty, stageTp: _ddNext.stageTp, stageRoi: _ddNext.stageRoi, avgAfter: _ddNext.avgAfter };
+          const _stageOk = await this._dcaFinalizeStage(pos, _placedCond);
+          if (!_stageOk) {
+            pos._nextDcaPlaceAt = now + 30 * 1000;
+          } else {
+            _ddNext.qty = _placedCond.qty; // keep the queue item's qty in sync in case it's ever re-read
+            pos.orders.push(_placedCond);
+            if (pos._live) await this.livePlaceLadderConditional(pos, _placedCond);
+            pos._dcaDelayQueue.shift();
+            if (pos._dcaMissedStages) pos._dcaMissedStages = pos._dcaMissedStages.filter(s => s !== _origStg);
+            if (_ddInstr) { pos.slPrice = this._projectedSL(pos, _ddInstr); pos.slSet = true; }
+            this.log(`⏱️ ${pos.symbol}: DCA Delay — ${_ddNext.label} unlocked @ ${fmtP(_ddNext.price)}`, 'info');
+          }
         }
         this.persist();
       }
@@ -2672,6 +2868,15 @@ function psycho() { return {
 
     // No TP/SL order cancellation needed — both are exchange-native trading-stop
     // values scoped to the position and are cleared automatically once size hits 0.
+
+    // Cancel any resting DCA/AMa conditional orders — otherwise they stay live
+    // on the exchange and can re-open exposure on a symbol we just exited.
+    const _pendingCond = pos.orders.filter(o => o.type === 'cond' && !o.filled && o._orderLinkId);
+    for (const _c of _pendingCond) { await this.liveCancelLadderConditional(pos, _c); }
+    if (pos._amaOrders) {
+      const _pendingAma = pos._amaOrders.filter(o => !o.filled && o._orderLinkId);
+      for (const _a of _pendingAma) { await this.liveCancelLadderConditional(pos, _a); }
+    }
 
     // Place market close
     let exitPrice = fillPrice || pos.markPrice || pos.entryPrice;
@@ -3361,6 +3566,12 @@ function psycho() { return {
       const _decelDelay = Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._decelerationCount || 0)));
       if (now - (pos._lastDecelerationAt || 0) < _decelDelay) continue;
       if (pos._nextDcaPlaceAt && pos._nextDcaPlaceAt > now) continue;
+      // Deceleration fires a plain Market order and updates local margin
+      // optimistically, with no fill confirmation step (unlike DCA/AMa, which
+      // confirm via execution history before touching local state) — so give
+      // the exchange a beat to settle before considering another add on the
+      // same position, rather than stacking unconfirmed adds on top of each other.
+      if (pos._live && pos._marginPendingUntil && now < pos._marginPendingUntil) continue;
 
       const mark    = pos.markPrice || pos.entryPrice;
       const addMgn  = Math.max(pos.margin * 0.05, baseMargin);
@@ -3405,6 +3616,7 @@ function psycho() { return {
 
       pos._lastDecelerationAt = now;
       pos._decelerationCount  = (pos._decelerationCount || 0) + 1;
+      if (pos._live) pos._marginPendingUntil = now + 8000;
 
       const _nextMs  = Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._decelerationCount)));
       const _nextStr = _nextMs >= 60000 ? (_nextMs / 60000).toFixed(1) + 'min' : Math.round(_nextMs / 1000) + 's';
@@ -3527,6 +3739,70 @@ function psycho() { return {
 
   _totalAllocated() {
     return this.positions.reduce((s, p) => s + (p.margin || 0), 0);
+  },
+
+  // ── Operational Balance Cap ──
+  // Instead of letting the exponential DCA ladder (2×+ per stage) run unbounded,
+  // this clamps each stage so (allocated − collective uPnL) never crosses a
+  // configured ceiling — the same _effAlloc figure already tracked for peak
+  // allocation above. Adding size at a fixed price doesn't change the dollar
+  // uPnL already accrued on existing size (the new units start flat at their
+  // own entry), so this position's own contribution at the stage's trigger
+  // price solves exactly, independent of how much is added. Only OTHER
+  // positions' allocation/uPnL are taken from the current tick's snapshot,
+  // since their state at this stage's eventual (unknown, future) fire time
+  // can't be predicted — same approximation the rest of the watcher accepts
+  // by re-checking every ~5s rather than solving the whole book forward.
+  _dcaClampQty(pos, add, plannedQty) {
+    if (!this.cfg.opBalanceEnabled || !(this.cfg.opBalance > 0)) return plannedQty;
+    const bufferPct = this.cfg.opBalanceBufferPct ?? 1;
+    const ceiling   = this.cfg.opBalance * (1 - bufferPct / 100);
+
+    const P  = add.price;   // this stage fires here — use the trigger price, not current mark
+    const E0 = pos.entryPrice, S0 = pos.totalSize, L = pos.leverage, margin0 = pos.margin;
+    const projectedPosUpnlAtFire = S0 * (E0 - P); // exact — independent of add size
+
+    const totalAllocNow = this._totalAllocated();       // includes margin0 at current (pre-add) size
+    const totalUpnlNow  = this.acct.upnl || 0;
+    const projectedTotalUpnl = totalUpnlNow - (pos.upnl || 0) + projectedPosUpnlAtFire;
+    const effAllocBeforeAdd  = totalAllocNow - projectedTotalUpnl;
+
+    const headroom = ceiling - effAllocBeforeAdd;
+    if (headroom <= 0) return 0;
+
+    const maxMargin = margin0 + headroom;
+    const maxQty    = (maxMargin * L - E0 * S0) / P;
+    return Math.min(plannedQty, Math.max(0, maxQty));
+  },
+
+  // Applies the clamp to a DCA stage right before it becomes active — position-
+  // open Add1, a delay-queue stage unlocking, or self-heal placement for a live
+  // order missing its exchange counterpart. Mutates add.qty in place. Returns
+  // false if the stage should be skipped entirely because even a clamped add
+  // would round below the exchange minimum — caller leaves the stage un-placed
+  // and this re-checks on later ticks, since headroom can free up as other
+  // positions close or move into profit.
+  async _dcaFinalizeStage(pos, add) {
+    if (!this.cfg.opBalanceEnabled || !(this.cfg.opBalance > 0)) return true;
+    const clamped = this._dcaClampQty(pos, add, add.qty);
+    if (clamped >= add.qty) {
+      if (pos._dcaCapped) pos._dcaCapped = false;
+      return true; // no clamp needed
+    }
+    const instr   = await this.getInstrInfo(pos.symbol);
+    const snapped = instr ? this.snapQty(clamped, instr) : parseFloat(clamped.toFixed(8));
+    if (snapped <= 0 || (instr && snapped < instr.minQty)) {
+      if (!pos._dcaCapped) {
+        pos._dcaCapped = true;
+        this.log(`🧢 ${pos.symbol.replace('USDT','')}: ${add.label} capped to zero by operational balance — DCA paused on this position until headroom frees up`, 'warn');
+      }
+      return false;
+    }
+    pos._dcaCapped = false;
+    const orig = add.qty;
+    add.qty = snapped;
+    this.log(`🧢 ${pos.symbol.replace('USDT','')}: ${add.label} clamped by operational balance — ${orig.toFixed(6)} → ${snapped.toFixed(6)}`, 'warn');
+    return true;
   },
 
   _isSacrificeActive() {
@@ -4153,6 +4429,74 @@ function psycho() { return {
     await this.liveApiCall('/v5/order/cancel', { category:'linear', symbol, orderId }, 'POST');
   },
 
+  // ── Live ladder conditional orders (DCA / AMa / Second Wind) ──
+  // These used to be purely local: the watcher polled mark price itself and
+  // fired a plain Market order once it crossed the trigger — meaning a closed
+  // tab or dropped connection silently skipped the add even though price moved
+  // through the level. These place a real Bybit-side conditional (trigger) order
+  // instead, so the exchange enforces the add whether or not this tab is open.
+  // Shared by DCA adds (rise-triggered), Second Wind (just a resumed DCA ladder,
+  // same delay-queue path), and AMa adds (fall-triggered, profit-direction).
+  _ladderOrderLinkId(pos, label) {
+    return `pw${pos.id.toString(36).replace('.', '')}${label}`.slice(0, 36);
+  },
+
+  // Places a resting exchange-side conditional order for one ladder stage. Fires
+  // as a taker Market order once LastPrice trades through triggerPrice.
+  // dir: 1 = trigger on price rise (DCA adds, Second Wind — short-biased, adds
+  //          happen as price moves up against the position)
+  //      2 = trigger on price fall (AMa adds — profit-direction flat adds)
+  async livePlaceLadderConditional(pos, add, dir = 1) {
+    const linkId = this._ladderOrderLinkId(pos, add.label);
+    try {
+      const res = await this.liveApiCall('/v5/order/create', {
+        category: 'linear', symbol: pos.symbol, side: 'Sell', orderType: 'Market',
+        qty: (add.qty || 0).toString(), triggerPrice: add.price.toString(),
+        triggerDirection: dir, triggerBy: 'LastPrice', timeInForce: 'IOC',
+        reduceOnly: false, orderLinkId: linkId,
+      }, 'POST');
+      add._orderLinkId = linkId;
+      add._liveOrderId = res.orderId;
+      this.persist();
+      return true;
+    } catch(e) {
+      this.log(`${pos.symbol}: ${add.label} conditional placement failed — ${e.message}`, 'error');
+      return false;
+    }
+  },
+
+  // Cancels a resting ladder conditional order — used when a duplicate is pruned
+  // locally, a ladder is invalidated (e.g. AMa cancelled by a DCA trigger), or a
+  // position closes, so nothing orphaned is left live on Bybit.
+  async liveCancelLadderConditional(pos, add) {
+    if (!add._orderLinkId) return;
+    try {
+      await this.liveApiCall('/v5/order/cancel', { category:'linear', symbol:pos.symbol, orderLinkId: add._orderLinkId }, 'POST');
+    } catch(e) { /* already filled/cancelled on the exchange — nothing to do */ }
+  },
+
+  // Checks Bybit execution history for fills against this order's link id, since
+  // the order can trigger and fill entirely exchange-side with the bot never
+  // having called any placement/fire logic itself. Returns the volume-weighted
+  // fill price/qty, or null if nothing has filled yet.
+  async liveCheckLadderFill(pos, add) {
+    if (!add._orderLinkId) return null;
+    try {
+      const result = await this.liveApiCall('/v5/execution/list', {
+        category: 'linear', symbol: pos.symbol, orderLinkId: add._orderLinkId, limit: 10,
+      });
+      const fills = result?.list || [];
+      if (fills.length === 0) return null;
+      let totalQty = 0, totalNotional = 0;
+      for (const f of fills) {
+        const q = parseFloat(f.execQty || 0), p = parseFloat(f.execPrice || 0);
+        totalQty += q; totalNotional += q * p;
+      }
+      if (totalQty <= 0) return null;
+      return { price: totalNotional / totalQty, qty: totalQty };
+    } catch(e) { return null; }
+  },
+
   async liveSyncPositions() {
     if (!this.cfg.liveMode || !this.cfg.apiKey || !this.cfg.apiSecret) return;
     try {
@@ -4180,6 +4524,25 @@ function psycho() { return {
         } else {
           pos.markPrice = parseFloat(ep.markPrice || ep.avgPrice || pos.markPrice);
           pos.totalSize = parseFloat(ep.size      || pos.totalSize);
+
+          // Margin reconciliation audit — log-only. Compares what the exchange
+          // actually holds against what our local bookkeeping expects, so a
+          // silent drift (missed fill, partial fill, rejected order Bybit
+          // didn't clearly error on) surfaces instead of accumulating unnoticed.
+          // Positions within their post-deceleration settling window are
+          // skipped — the exchange genuinely hasn't caught up yet there, not drifted.
+          if (!pos._marginPendingUntil || Date.now() >= pos._marginPendingUntil) {
+            const actualMargin = ep.positionIM != null
+              ? parseFloat(ep.positionIM)
+              : (parseFloat(ep.size || 0) * parseFloat(ep.avgPrice || pos.entryPrice)) / (parseFloat(ep.leverage) || pos.leverage);
+            const expectedMargin = pos.margin || 0;
+            if (actualMargin > 0 && expectedMargin > 0) {
+              const diffPct = Math.abs(actualMargin - expectedMargin) / expectedMargin * 100;
+              if (diffPct > 3 && Math.abs(actualMargin - expectedMargin) > 0.5) {
+                this.log(`⚠️ ${pos.symbol.replace('USDT','')}: margin mismatch — expected $${expectedMargin.toFixed(2)}, exchange shows $${actualMargin.toFixed(2)} (${diffPct.toFixed(1)}% off)`, 'warn');
+              }
+            }
+          }
         }
       }
     } catch(e) {

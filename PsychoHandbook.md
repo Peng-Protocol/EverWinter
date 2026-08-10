@@ -71,7 +71,28 @@ Governs what happens when a position moves against you.
 |---|---|
 | Stages | How many DCA adds are queued beyond the initial entry. |
 | Multiplier | How much bigger each successive add is than the one before it. |
-| Anti-Martingale (AMa) | An alternate laddering mode — flat-sized adds as price falls, no take-profit until the final AMa stage. If the price reverses and a normal DCA add fires instead, AMa cancels and the position falls back to a regular take-profit. |
+| Anti-Martingale (AMa) | An alternate laddering mode — flat-sized adds as price falls, no take-profit until the final AMa stage. If the price reverses and a normal DCA add fires instead, AMa cancels and the position falls back to a regular take-profit. In live mode, all 7 AMa stages are placed as resting orders on the exchange the moment the position opens, rather than one at a time — the whole ladder is meant to keep working even if the app is closed, since any stage can be the one that fires next. |
+
+In live mode, DCA and AMa adds rest on Bybit as real conditional (trigger)
+orders rather than being watched for locally — the exchange enforces the
+add and fires it even if this tab is closed or your connection drops. The
+CONDITIONALS panel (see the Log Menu section) still shows the same
+information either way.
+
+**Operational Balance Cap** — an optional ceiling on DCA escalation, off by
+default. The DCA ladder normally grows exponentially (each stage some
+multiple of the last), which can run unbounded if price keeps moving
+against you. With this on, every DCA stage is checked against your total
+allocated margin minus collective floating uPnL before it's placed — if
+the full-size stage would push that figure above your set balance, the
+add is shrunk down to land just under it instead (1% under, by default).
+If even a shrunk add would fall below the exchange's minimum order size,
+that stage is skipped entirely and retried periodically — it doesn't
+place a dust order. This only mediates DCA adds; AMa and Second Wind
+ladders aren't affected by this cap.
+- *Operational Balance* — the ceiling, in dollars. Leave at 0 / toggle off
+  to disable and let DCA escalate unbounded as before.
+- *Buffer* — how far under the ceiling a shrunk add targets, as a percent.
 
 Tooltip wording throughout this section is bot-specific: Chaser's copy describes long-side mechanics (adds trigger below entry, AMa scales into price rises), Winter's describes the short-side mirror — cleaned up after some leftover short-biased phrasing survived Chaser's initial port.
 
@@ -103,10 +124,10 @@ This is the largest section — it holds the safety nets that manage a book once
 **Cascade Close Min ROI** — the profit floor a position must clear before either cascade mechanism is allowed to use it as a target.
 
 **Loss Absorption** — trims the worst-losing position at market at a regular interval, which shortens every time it fires (and resets if the position recovers). Paused while a DCA add is in flight, since that add might fix the problem on its own.
-- *Absorption Trigger Threshold* — how deep a loss needs to be (as a multiple of base margin) to count as "deep enough" to trim.
+- *Absorption Trigger Threshold* — how deep a loss needs to be (as a multiple of base margin) to count as "deep enough" to trim. Numeric input field (0.05× steps, max 10×).
 - *Outlier Acceleration* — if a position's margin or loss stands out from the rest of the book, absorption locks to its fastest interval and defers any cut too large to digest cleanly in one go.
 - *Outlier Threshold* — how far a position has to stand out from the average of everything else to count as an outlier.
-- *Outlier Deceleration* — nudges an outlier's margin up gradually each cycle, sizing it toward the book average.
+- *Outlier Deceleration* — nudges an outlier's margin up gradually each cycle, sizing it toward the book average. In live mode, each add gets a short settling window afterward before another one is considered on the same position — this is the one margin-changing mechanism that doesn't confirm its fill against the exchange before updating locally, so it waits a beat rather than risk stacking a second add on top of one that hasn't actually landed yet.
 - *Exhumation* — a position that's had losses absorbed off it gets a personalized recovery target instead of its original take-profit, so it isn't forced to reach the original ROI to close in the green.
 - *Second Wind* — if the final DCA stage fills but absorption has already shrunk the position below where it "should" be at that stage, the stop-loss is delayed and the stage count is recalibrated so new adds can still queue from the current price.
 - *Accelerated Absorption* — speeds up the absorption interval progressively through the first few DCA stages, then resets and re-accelerates after a Second Wind event.
@@ -209,6 +230,19 @@ If your allocation is over threshold but you're also sitting at or below your co
 ### Funding countdown accuracy depends on the exchange, not the app
 
 The funding countdown shown on each position card is only as fresh as the last time that symbol's funding time was fetched from the exchange. It's seeded once when a position opens and only re-synced after that round actually settles — so if a symbol's funding schedule changed mid-position (rare, but exchanges do this occasionally), the countdown won't reflect that until the next settlement.
+
+### A "margin mismatch" warning in the log isn't necessarily a bug
+
+Live mode periodically compares what Bybit actually holds for each open
+position against what the app's own bookkeeping expects, and logs a
+warning if they drift apart by more than a few percent. This is a
+detection mechanism, not an auto-corrector — nothing gets changed
+automatically when it fires. Most of the time this means a fill landed at
+a slightly different size or price than assumed and is worth a look; it's
+not itself an indication that anything urgent went wrong. It deliberately
+skips checking a position for a few seconds right after Outlier
+Deceleration adds to it, since the exchange needs a moment to catch up
+and would otherwise be flagged as "drifted" when it's actually just lagging.
 
 ### Absorbed Loss' impact on net PnL
 
