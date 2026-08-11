@@ -328,25 +328,20 @@ Sizing for binary mode is simple: `total margin = positions × (notional / lever
 
 **Psycho Mode:**
 
-DCA structure adds margin at each subsequent stage.
+DCA structure adds margin at each subsequent stage, but two other mechanisms keep that growth from running away: Loss Absorption trims oversized positions before they get too large, and Sacrifice trims the book once total allocation gets too high. Layered on top of both, the Operational Balance Cap puts a hard ceiling on any single position's DCA escalation.
 
-**Margin requirements for 10 open positions at $6 notional (3-stage flat):**
+At default settings (50 max positions, $6 notional, 6× leverage, Operational Balance Cap on at its $500 default), the book typically uses around **$200** in allocated margin before Sacrifice starts trimming, and — because of the Operational Balance Cap — no single position's margin will grow past **$500** regardless of how far its DCA ladder runs.
 
-| Scenario | Stages Used | Margin per Position | Total Margin |
-|---|---|---|---|
-| Pessimistic | 0 → 2 | $3 | $30 |
-| Moderate | 0 → 1 | $2 | $20 |
-| Optimistic | 0 only | $1 | $10 |
+**Sacrifice and Loss Absorption thresholds**
 
-**Sizing formula (Psycho Mode)**: notional = balance × inverse ratio × leverage
+Both of these should scale with your actual operational balance rather than sitting at defaults sized for the $200–$500 range above, once you're running a smaller book.
 
-| Scenario | Inverse Ratio | Balance-to-Margin |
-|---|---|---|
-| Pessimistic | 0.033 (1/30) | 30× |
-| Moderate | 0.05 (1/20) | 20× |
-| Optimistic | 0.1 (1/10) | 10× |
+- *Sacrifice Trigger Threshold* — set to roughly 50% of your operational balance. Example: 5 max positions and a $40 balance calls for a threshold of **4×**, landing the ceiling around $20 — half your balance, kept low deliberately for safety margin.
+- *Absorption Trigger Threshold* — set to roughly 0.01× your total balance. For the same $40 balance, that's **0.40×**. This keeps individual positions from growing too large relative to your book before Loss Absorption starts trimming them.
 
-**Psycho Mode recommended minimum**: **$250** with default settings (50 max positions, $6 notional, 6× leverage).
+These figures ($40 balance, 5 max positions, 4× Sacrifice, 0.40× Absorption) are the smallest configuration tested against the live system so far. Every other setting can stay at default.
+
+**Psycho Mode recommended Balance**: **$500** with default settings (50 max positions, $6 notional, 6× leverage).
 
 ---
 

@@ -19,6 +19,7 @@ By default, Config sits on the left and Log sits on the right, with Trades tucke
 ## 2. Top Bar
 
 - **PSYCHO / LIVE pill** — shows which mode you're in. Grey "PSYCHO" means pseudo (paper) trading; red "LIVE" means real orders are going out.
+- **Balance** — live mode only. Your Bybit wallet balance (realized, no floating uPnL folded in). Not polled continuously — refreshed at the start of each scan cycle and after every position close, so it stays reasonably current without adding an extra call to the fast position-watch loop.
 - **ON / INACTIVE pill** — whether the scan loop is currently running.
 - **SYNC** — only appears if your browser has muted the background audio keepalive. Tap it to resume.
 
@@ -79,8 +80,8 @@ add and fires it even if this tab is closed or your connection drops. The
 CONDITIONALS panel (see the Log Menu section) still shows the same
 information either way.
 
-**Operational Balance Cap** — an optional ceiling on DCA escalation, off by
-default. The DCA ladder normally grows exponentially (each stage some
+**Operational Balance Cap** — an optional ceiling on DCA escalation, **on by
+default** ($500). The DCA ladder normally grows exponentially (each stage some
 multiple of the last), which can run unbounded if price keeps moving
 against you. With this on, every DCA stage is checked against your total
 allocated margin minus collective floating uPnL before it's placed — if
@@ -90,8 +91,8 @@ If even a shrunk add would fall below the exchange's minimum order size,
 that stage is skipped entirely and retried periodically — it doesn't
 place a dust order. This only mediates DCA adds; AMa and Second Wind
 ladders aren't affected by this cap.
-- *Operational Balance* — the ceiling, in dollars. Leave at 0 / toggle off
-  to disable and let DCA escalate unbounded as before.
+- *Operational Balance* — the ceiling, in dollars. Toggle off to disable
+  and let DCA escalate unbounded instead.
 - *Buffer* — how far under the ceiling a shrunk add targets, as a percent.
 
 Tooltip wording throughout this section is bot-specific: Chaser's copy describes long-side mechanics (adds trigger below entry, AMa scales into price rises), Winter's describes the short-side mirror — cleaned up after some leftover short-biased phrasing survived Chaser's initial port.
@@ -127,7 +128,7 @@ This is the largest section — it holds the safety nets that manage a book once
 - *Absorption Trigger Threshold* — how deep a loss needs to be (as a multiple of base margin) to count as "deep enough" to trim. Numeric input field (0.05× steps, max 10×).
 - *Outlier Acceleration* — if a position's margin or loss stands out from the rest of the book, absorption locks to its fastest interval and defers any cut too large to digest cleanly in one go.
 - *Outlier Threshold* — how far a position has to stand out from the average of everything else to count as an outlier.
-- *Outlier Deceleration* — nudges an outlier's margin up gradually each cycle, sizing it toward the book average. In live mode, each add gets a short settling window afterward before another one is considered on the same position — this is the one margin-changing mechanism that doesn't confirm its fill against the exchange before updating locally, so it waits a beat rather than risk stacking a second add on top of one that hasn't actually landed yet.
+- *Outlier Deceleration* — nudges an outlier's margin up gradually each cycle, sizing it toward the book average. In live mode, this places a real market order and updates average entry from the exchange-confirmed fill (price and quantity), the same way DCA and AMa adds do — not from a pre-order price estimate. Each add still gets a short settling window afterward before another one is considered on the same position, since the exchange needs a moment to catch up before the next margin check.
 - *Exhumation* — a position that's had losses absorbed off it gets a personalized recovery target instead of its original take-profit, so it isn't forced to reach the original ROI to close in the green.
 - *Second Wind* — if the final DCA stage fills but absorption has already shrunk the position below where it "should" be at that stage, the stop-loss is delayed and the stage count is recalibrated so new adds can still queue from the current price.
 - *Accelerated Absorption* — speeds up the absorption interval progressively through the first few DCA stages, then resets and re-accelerates after a Second Wind event.
@@ -170,7 +171,14 @@ The header above the cards gives you:
 
 ## 5. Trades Menu
 
-A running history of closed trades, most recent first. Trades from the same batch event get grouped into rollup cards (Period Rollup, Force Rollup, Cascade, Swap, Funding, etc.) showing net PnL, win count, average duration, and best/worst performers for that batch, rather than flooding the list with dozens of individual lines. A **CLEAR** button wipes the closed-trade history for the session.
+A running history of closed trades, most recent first — with one exception: a loss-absorption card stays pinned to the top for as long as its underlying position is still open, since that card keeps updating as new cuts land and shouldn't get buried under unrelated closes on other positions. Once that position actually closes, its card drops back into normal chronological order with everything else. Trades from the same batch event get grouped into rollup cards (Period Rollup, Force Rollup, Cascade, Swap, Funding, etc.) showing net PnL, win count, average duration, and best/worst performers for that batch, rather than flooding the list with dozens of individual lines. A **CLEAR** button wipes the closed-trade history for the session.
+
+In live mode, the headline PnL on a closed-trade card is Bybit's own reported
+figure for that close, not a locally calculated estimate. The Funding line
+underneath is still the app's own running estimate of funding paid/received
+over the position's life — shown separately, not added into the headline
+number, since the two are tracked independently and aren't meant to be
+reconciled against each other.
 
 ---
 
@@ -246,4 +254,4 @@ and would otherwise be flagged as "drifted" when it's actually just lagging.
 
 ### Absorbed Loss' impact on net PnL
 
-Look out for loss absorbtion rollups which may sink to the bottom of the trades menu, obscuring the actual losses and potentially causing confusion about net PnL. Read the entire trades menu before coming to a conclusion about performance, absorbed loss is added to net PnL as soon as it is absorbed.
+An open loss-absorption card pins to the top of the trades menu and keeps updating as it absorbs, rather than sinking down among unrelated closes — but it still isn't done until the underlying position actually closes. Absorbed loss is added to net PnL as soon as it's absorbed, so read a card's full history rather than judging performance off a single cut.

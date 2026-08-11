@@ -1,6 +1,80 @@
 <!--
-PsychoWinter v1.7.2
+PsychoWinter v1.10.1
 Copyleft 2026 Peng Protocol — PsychoWinter fork
+
+v1.10.1 — Trades menu: open loss-absorption cards now pin to the top instead
+of sitting at their fixed insertion-time slot, where unrelated closes on other
+positions would bury a still-open, still-updating absorption card. Fix is
+render-only, inside _groupedTrades(): the already-ordered list is partitioned
+into open-absorption items (pinned first) and everything else (unchanged
+reverse-chronological order below), with no reordering of the underlying
+closedTrades array — _compactClosedTrades and persistence both depend on that
+array's real insertion order, which is almost certainly what broke last time
+this was attempted. Once the position closes (isOpen flips false) the card
+drops back into its normal chronological slot among the rest.
+
+v1.10.0 — Operational Balance Cap defaults, and a deceleration TP-snapping fix:
+  - opBalanceEnabled now defaults to true, opBalance defaults to $500 (was
+    disabled / $0). Existing persisted configs are unaffected — this only
+    changes what a fresh instance starts with.
+  - Fix: Outlier Deceleration's TP recompute (both the normal currentTpPrice
+    and the exhumed EDa TP) skipped instrument tick-size snapping — every
+    other TP recompute site (DCA fill, laggard EDa, exhumation) snaps via
+    snapPrice(instr) first. Since liveReconcileTp mirrors currentTpPrice to
+    the exchange verbatim with no snapping of its own, an unsnapped price
+    from deceleration could land on the exchange differently than what the
+    local UI showed, or fail the trading-stop call outright. instr is now
+    fetched (or reused from the live-order branch) before either TP recompute
+    and both are snapped, matching every other site.
+
+v1.9.1 — Fix: Outlier Deceleration's live-mode market add updated average entry
+from the pre-order local mark price and raw unsnapped qty, discarding the
+actual exchange fill entirely. livePlaceOrder already fetches the real
+avgPrice via /v5/order/realtime — now also returns cumExecQty — and
+deceleration uses both to build the new weighted-average entry/margin from the
+confirmed fill, the same way DCA/AMa confirm via execution history before
+touching local state. Falls back to the local mark/qty estimate only if the
+order response comes back without a usable avgPrice/qty. Pseudo mode is
+unaffected (no exchange fill to confirm, same local-estimate math as before).
+
+v1.9.0 — Live-mode close PnL now sourced from Bybit's own closed-pnl records
+instead of the local price-math estimate.
+  - New liveFetchClosedPnl(pos): sums /v5/position/closed-pnl records for the
+    position's lifetime (startTime=openedAt, limit 50 — a single close can
+    land as multiple fills). Returns null on failure so callers fall back to
+    the local calc.
+  - liveClosePosition (bot-initiated close) now fetches this after the close
+    is verified and uses it as pnl/totalPnl when available; pnlPct derives
+    from pnl/margin to stay consistent.
+  - liveSyncPositions' exchange-detected-close branch (native TP/SL firing
+    without the bot calling closePosition) now sums the same records instead
+    of reading limit:1 for exitPrice alone, and passes the total through to
+    pseudoClosePosition via a new optional realizedPnl param.
+  - pseudoClosePosition(pos, reason, fillPrice, realizedPnl=null): when
+    realizedPnl is supplied, it's used as pnl/totalPnl directly. Local funding
+    accrual (_fundingAccrued) is kept as a separate, informational figure on
+    the closed-trade card in that case — not folded into totalPnl, since it's
+    a local estimate and the exchange figure is a different, unreconciled
+    number. Pure pseudo-mode closes (realizedPnl always null there) are
+    unaffected — same pnl+fundFee math as before.
+
+v1.8.1 — Fix: topbar Balance span's x-text evaluated on every reactive tick
+regardless of the sibling x-show, since x-show only toggles CSS display and
+doesn't gate other directives on the same element. liveBalance.toFixed(2) was
+throwing on the null default before the first fetch. Null-guarded inside the
+x-text expression itself.
+
+v1.8.0 — Topbar Balance: live-mode-only wallet balance readout, mirrored in
+PsychoChaser.
+  - New liveFetchBalance() call against /v5/account/wallet-balance
+    (accountType UNIFIED), reading totalWalletBalance — realized balance only,
+    no unrealized PnL folded in.
+  - Not polled on a timer. Fetched at the top of each scheduled scan cycle and
+    after every position close (both bot-initiated and exchange-detected via
+    liveSyncPositions), so it stays reasonably fresh without adding a signed
+    call to the 5s watchPositions loop.
+  - Topbar shows "Balance $X.XX" next to the LIVE/PSEUDO pill, hidden entirely
+    in pseudo mode and before the first successful fetch.
 
 v1.7.2 — UI tweaks:
   - Operational Balance input was missing the explicit dark styling other
@@ -380,6 +454,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
   <div class="nav-mid">
     <span class="pill" :class="cfg.liveMode ? 'pill-live' : 'pill-pseudo'"
       x-text="cfg.liveMode ? 'LIVE' : 'PSEUDO'"></span>
+    <span class="mono fs-10 mid" x-show="cfg.liveMode && liveBalance!=null">Balance <b class="hi" x-text="liveBalance!=null ? ('$'+liveBalance.toFixed(2)) : ''"></b></span>
     <span class="pill pill-on" x-show="bot.running">ON</span>
     <span class="pill pill-inactive" x-show="!bot.running">INACTIVE</span>
     <span x-show="audioState==='suspended'" style="font-family:var(--mono);font-size:9px;color:var(--warn);cursor:pointer"
@@ -1458,7 +1533,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
 </div><!-- end .main -->
 
 <script>
-const VERSION = '1.7.2'; // x=production-only, y=significant additions/subtractions, z=tweaks
+const VERSION = '1.10.1'; // x=production-only, y=significant additions/subtractions, z=tweaks
 
 // ── HMAC-SHA256 signing ──
 async function hmac(secret, msg) {
@@ -1637,8 +1712,8 @@ function psycho() { return {
     ppcEscalationMult: 2,
     cascadeMinRoiPct: 3,
     amaEnabled: false,
-    opBalanceEnabled: false,
-    opBalance: 0,
+    opBalanceEnabled: true,
+    opBalance: 500,
     opBalanceBufferPct: 1,
     exhumationEnabled: true,
     secondWindEnabled: true,
@@ -1657,6 +1732,7 @@ function psycho() { return {
   _whiplashScheduled: {},
   _tsOffset:      0,
   _lastLiveSync:  0,
+  liveBalance:    null,
   _lastSignedAt:  0,
   _pwNeedsSync:   false,
   _lastTickerFetch: 0, // timestamp of last per-symbol REST ticker fallback round in watchPositions
@@ -1901,6 +1977,7 @@ function psycho() { return {
 
   async runScheduledCycle() {
     await this.liveSyncPositions();
+    await this.liveFetchBalance();
     try { await this.runPsychoScan(); } catch(e) { this.bot.scanning = false; this.log('Scan error: '+e.message, 'error'); }
   },
 
@@ -2807,16 +2884,21 @@ function psycho() { return {
     return this.pseudoClosePosition(pos, reason, fillPrice);
   },
 
-  async pseudoClosePosition(pos, reason='manual', fillPrice=null) {
+  async pseudoClosePosition(pos, reason='manual', fillPrice=null, realizedPnl=null) {
     if (_closingIds.has(pos.id)) return;
     _closingIds.add(pos.id);
     if (!this.positions.find(x => x.id === pos.id)) { _closingIds.delete(pos.id); return; }
 
     const exitPrice = fillPrice || pos.markPrice || pos.entryPrice;
-    const pnl       = (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * pos.margin;
-    const pnlPct    = (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * 100;
+    // realizedPnl is set when this close was detected via exchange sync (live
+    // mode) — Bybit's own closed-pnl figure, used in place of the local
+    // price-math estimate. Local funding accrual stays a separate, informational
+    // figure in that case rather than folding into totalPnl — the two numbers
+    // come from different sources and aren't meant to be reconciled.
+    const pnl       = realizedPnl != null ? realizedPnl : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * pos.margin;
+    const pnlPct    = realizedPnl != null ? (pos.margin ? (pnl / pos.margin * 100) : 0) : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * 100;
     const fundFee   = pos._fundingAccrued ?? 0;
-    const totalPnl  = pnl + fundFee;
+    const totalPnl  = realizedPnl != null ? pnl : (pnl + fundFee);
     const duration  = Date.now() - pos.openedAt;
     const isWin     = totalPnl > 0;
 
@@ -2858,6 +2940,7 @@ function psycho() { return {
       this._logCloseBatch(pos.symbol, totalPnl, pnlPct, reason, isWin);
     }
     _closingIds.delete(pos.id);
+    if (this.cfg.liveMode) this.liveFetchBalance();
     this.persist();
   },
 
@@ -2911,10 +2994,15 @@ function psycho() { return {
       }
     } catch(e) { this.log(`${pos.symbol}: close verify error — ${e.message}`, 'warn'); }
 
-    const pnl      = (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * pos.margin;
-    const pnlPct   = (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * 100;
+    // Prefer Bybit's own realized closed-pnl over the local price-math estimate.
+    // Local funding accrual is kept as a separate, informational figure below —
+    // not folded into totalPnl here, since the two numbers come from different
+    // sources and aren't meant to be reconciled.
+    const _realPnl = await this.liveFetchClosedPnl(pos);
+    const pnl      = _realPnl != null ? _realPnl : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * pos.margin;
+    const pnlPct   = _realPnl != null ? (pos.margin ? (pnl / pos.margin * 100) : 0) : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * 100;
     const fundFee  = pos._fundingAccrued ?? 0;
-    const totalPnl = pnl + fundFee;
+    const totalPnl = _realPnl != null ? pnl : (pnl + fundFee);
     const duration = Date.now() - pos.openedAt;
     const isWin    = totalPnl > 0;
 
@@ -2950,6 +3038,7 @@ function psycho() { return {
     }
     if (reason === 'sl' || reason === 'tp') this._pwNeedsSync = true;
     _closingIds.delete(pos.id);
+    this.liveFetchBalance();
     this.persist();
   },
 
@@ -3578,31 +3667,55 @@ function psycho() { return {
       const addQty  = addMgn * pos.leverage / mark;
       if (addQty <= 0) continue;
 
+      // fillPrice/filledQty default to the pre-order local estimate (pseudo mode,
+      // or a live fill-confirmation miss) and are overwritten below with the
+      // exchange-confirmed values once the order response comes back.
+      let fillPrice = mark, filledQty = addQty;
+      let instr = null;
+
       if (pos._live) {
         try {
-          const instr = await this.getInstrInfo(pos.symbol);
+          instr = await this.getInstrInfo(pos.symbol);
           const qty   = this.snapQty(addQty, instr);
           if (instr && qty < instr.minQty) {
             this.log(`📉 ${pos.symbol.replace('USDT','')}: deceleration skipped — add size below exchange minimum (${qty} < ${instr.minQty})`, 'info');
             continue;
           }
-          await this.livePlaceOrder({ symbol: pos.symbol, side: 'Sell', orderType: 'Market', qty: qty.toString(), timeInForce: 'IOC', reduceOnly: false });
+          const _res = await this.livePlaceOrder({ symbol: pos.symbol, side: 'Sell', orderType: 'Market', qty: qty.toString(), timeInForce: 'IOC', reduceOnly: false });
+          // Market IOC fires-and-fills essentially instantly, but the actual fill
+          // price can still differ from the pre-order mark on a fast-moving
+          // outlier — average entry must be built from the confirmed fill, not
+          // the stale local estimate, the same way DCA/AMa confirm via execution
+          // history before touching local state.
+          const _confirmedPrice = parseFloat(_res.avgPrice);
+          const _confirmedQty   = parseFloat(_res.qty);
+          fillPrice = (_confirmedPrice > 0) ? _confirmedPrice : mark;
+          filledQty = (_confirmedQty   > 0) ? _confirmedQty   : qty;
         } catch(e) {
           this.log(`${pos.symbol.replace('USDT','')}: deceleration add failed — ${e.message}`, 'error');
           continue;
         }
       }
 
-      // Update weighted-average entry price
+      // Update weighted-average entry price from the confirmed fill (live) or
+      // the local estimate (pseudo)
       const oldNotional  = pos.entryPrice * pos.totalSize;
-      const addNotional  = mark * addQty;
+      const addNotional  = fillPrice * filledQty;
       const _prevMgn     = pos.margin;
-      pos.totalSize     += addQty;
+      const _addMgn      = pos._live ? (addNotional / pos.leverage) : addMgn;
+      pos.totalSize     += filledQty;
       pos.entryPrice     = (oldNotional + addNotional) / pos.totalSize;
-      pos.margin        += addMgn;
-      if (pos.notional)  pos.notional += addMgn * pos.leverage;
-      // Recompute TP price and scale laggard EV proportionally with the margin increase
-      if (pos.tpPct) pos.currentTpPrice = parseFloat((pos.entryPrice * (1 - (pos.tpPct / 100) / pos.leverage)).toFixed(8));
+      pos.margin        += _addMgn;
+      if (pos.notional)  pos.notional += _addMgn * pos.leverage;
+      // Recompute TP price and scale laggard EV proportionally with the margin
+      // increase. Snapped to the instrument's tick size — matching every other
+      // TP recompute site (DCA fill, EDa, exhumation) — since liveReconcileTp
+      // mirrors this price to the exchange verbatim with no snapping of its own.
+      if (!instr) instr = await this.getInstrInfo(pos.symbol).catch(() => null);
+      if (pos.tpPct) {
+        const _rawTp = pos.entryPrice * (1 - (pos.tpPct / 100) / pos.leverage);
+        pos.currentTpPrice = instr ? this.snapPrice(_rawTp, instr) : parseFloat(_rawTp.toFixed(8));
+      }
       if (pos._laggardInitialEV) pos._laggardInitialEV = pos._laggardInitialEV * pos.margin / _prevMgn;
       this._refreshLaggardEdaTp();
       // Exhumed positions: _refreshLaggardEdaTp returns early for these, so recompute separately
@@ -3610,7 +3723,7 @@ function psycho() { return {
         const _absTab = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
         if (_absTab && _absTab.totalPnl < 0) {
           const _exRaw = this._computeExhumedEdaTp(pos, _absTab.totalPnl);
-          pos._exhumedEdaTpPrice = _exRaw > 0 ? parseFloat(_exRaw.toFixed(8)) : 0;
+          pos._exhumedEdaTpPrice = _exRaw > 0 ? (instr ? this.snapPrice(_exRaw, instr) : parseFloat(_exRaw.toFixed(8))) : 0;
         }
       }
 
@@ -3621,7 +3734,7 @@ function psycho() { return {
       const _nextMs  = Math.max(30 * 1000, Math.round(5 * 60 * 1000 / Math.pow(2, pos._decelerationCount)));
       const _nextStr = _nextMs >= 60000 ? (_nextMs / 60000).toFixed(1) + 'min' : Math.round(_nextMs / 1000) + 's';
       const sym      = pos.symbol.replace('USDT', '');
-      _decelLog.push({ sym, count: pos._decelerationCount, addMgn, nextStr: _nextStr });
+      _decelLog.push({ sym, count: pos._decelerationCount, addMgn: _addMgn, nextStr: _nextStr });
     }
 
     // Retroactive batch rollup — one log entry for all deceleration activity this cycle
@@ -3997,7 +4110,20 @@ function psycho() { return {
         i = j;
       }
     }
-    return items.reverse();
+    // Loss-absorption tabs pin to the top while the underlying laggard position
+    // is still open (isOpen:true) — otherwise a card that started absorbing a
+    // while ago gets buried by unrelated closes on other positions, even
+    // though the position it belongs to is still live and still changing.
+    // This only reorders the rendered list, not the stored closedTrades array
+    // itself — _compactClosedTrades and persistence still rely on that array's
+    // real insertion order, so nothing else is touched. Once the position
+    // closes (isOpen flips false), the tab falls back into normal
+    // reverse-chronological position among the rest, ordering preserved
+    // within each group since filter() keeps relative order.
+    const _ordered = items.reverse();
+    const _pinned  = _ordered.filter(it => it.type === 'absorption' && it.tab.isOpen);
+    const _rest    = _ordered.filter(it => !(it.type === 'absorption' && it.tab.isOpen));
+    return [..._pinned, ..._rest];
   },
 
   // ── Period rollup — compacts oldest individual trades when cap is hit ──
@@ -4420,9 +4546,9 @@ function psycho() { return {
     try {
       const hist = await this.liveApiCall('/v5/order/realtime', { category:'linear', symbol:params.symbol, orderId:res.orderId });
       const order = hist?.list?.[0];
-      if (order) return { orderId:res.orderId, avgPrice:order.avgPrice, price:order.price };
+      if (order) return { orderId:res.orderId, avgPrice:order.avgPrice, price:order.price, qty:order.cumExecQty };
     } catch(e) {}
-    return { orderId:res.orderId, avgPrice:null, price:params.price };
+    return { orderId:res.orderId, avgPrice:null, price:params.price, qty:null };
   },
 
   async liveCancelOrder(symbol, orderId) {
@@ -4497,6 +4623,32 @@ function psycho() { return {
     } catch(e) { return null; }
   },
 
+  // Topbar balance — realized wallet balance only (no uPnL). Fetched on scan
+  // cycles and after position closes, not polled continuously.
+  async liveFetchBalance() {
+    if (!this.cfg.liveMode || !this.cfg.apiKey || !this.cfg.apiSecret) return;
+    try {
+      const result = await this.liveApiCall('/v5/account/wallet-balance', { accountType:'UNIFIED' });
+      const bal = parseFloat(result?.list?.[0]?.totalWalletBalance);
+      if (!isNaN(bal)) this.liveBalance = bal;
+    } catch(e) {}
+  },
+
+  // Sums Bybit's own realized closed-pnl records for this position's lifetime
+  // (bounded by openedAt) — the exchange's own figure, not the local price-math
+  // estimate. Summed rather than limit:1 since a single close can land as
+  // multiple fills (IOC + market retry, or a native TP/SL settling in parts).
+  // Returns null on any failure so callers can fall back to the local calc.
+  async liveFetchClosedPnl(pos) {
+    try {
+      const result = await this.liveApiCall('/v5/position/closed-pnl', { category:'linear', symbol:pos.symbol, startTime:String(pos.openedAt), limit:50 });
+      const recs = result?.list || [];
+      if (recs.length === 0) return null;
+      const total = recs.reduce((s, r) => s + parseFloat(r.closedPnl || 0), 0);
+      return isNaN(total) ? null : total;
+    } catch(e) { return null; }
+  },
+
   async liveSyncPositions() {
     if (!this.cfg.liveMode || !this.cfg.apiKey || !this.cfg.apiSecret) return;
     try {
@@ -4510,17 +4662,19 @@ function psycho() { return {
         if (!pos._live) continue;
         const ep = exMap.get(pos.symbol);
         if (!ep) {
-          let exitPrice = pos.markPrice || pos.entryPrice, reason = 'tp';
+          let exitPrice = pos.markPrice || pos.entryPrice, reason = 'tp', realizedPnl = null;
           try {
-            const pr  = await this.liveApiCall('/v5/position/closed-pnl', { category:'linear', symbol:pos.symbol, limit:1 });
-            const rec = pr?.list?.[0];
-            if (rec) {
-              exitPrice = parseFloat(rec.avgExitPrice || rec.exitPrice || exitPrice);
-              reason    = parseFloat(rec.closedPnl || 0) >= 0 ? 'tp' : 'sl';
+            const pr   = await this.liveApiCall('/v5/position/closed-pnl', { category:'linear', symbol:pos.symbol, startTime:String(pos.openedAt), limit:50 });
+            const recs = pr?.list || [];
+            if (recs.length > 0) {
+              exitPrice = parseFloat(recs[0].avgExitPrice || recs[0].exitPrice || exitPrice);
+              const total = recs.reduce((s, r) => s + parseFloat(r.closedPnl || 0), 0);
+              if (!isNaN(total)) { realizedPnl = total; reason = total >= 0 ? 'tp' : 'sl'; }
+              else reason = parseFloat(recs[0].closedPnl || 0) >= 0 ? 'tp' : 'sl';
             }
           } catch(e) {}
           this.log(`[SYNC] ${pos.symbol}: exchange closed [${reason}] @ ${exitPrice}`, 'info');
-          await this.pseudoClosePosition(pos, reason, exitPrice);
+          await this.pseudoClosePosition(pos, reason, exitPrice, realizedPnl);
         } else {
           pos.markPrice = parseFloat(ep.markPrice || ep.avgPrice || pos.markPrice);
           pos.totalSize = parseFloat(ep.size      || pos.totalSize);
