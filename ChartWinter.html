@@ -626,6 +626,7 @@ body::before {
 .ext-btn:hover  { background: var(--bg-hover); }
 .ext-btn.loading { color: var(--ice); border-color: var(--ice); }
 .ext-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.ext-btn.active { background: var(--text-hi); color: var(--bg-panel); border-color: var(--text-hi); }
 
 /* Stats bar: two fixed-height rows, each scrolls horizontally */
 .chart-statsbar {
@@ -1136,7 +1137,7 @@ body::before {
     <div class="brand">
       <span class="snow">❄</span>
       <span>CHARTWINTER</span>
-      <span style="color:rgba(232,234,238,0.45);font-size:10px;letter-spacing:1px">v1.7.2</span>
+      <span style="color:rgba(232,234,238,0.45);font-size:10px;letter-spacing:1px">v1.8.2</span>
     </div>
     <div class="tb-stat">
       <span><span class="dot" :class="online?'on':''"></span><b x-text="online?'ONLINE':'OFFLINE'"></b></span>
@@ -1404,7 +1405,7 @@ body::before {
             <span class="chg"
                   :class="chart.change24h>=0?'up':'down'"
                   x-show="chart.change24h!=null"
-                  x-text="(chart.change24h>=0?'+':'')+chart.change24h.toFixed(2)+'%'"></span>
+                  x-text="chart.change24h!=null ? (chart.change24h>=0?'+':'')+chart.change24h.toFixed(2)+'%' : ''"></span>
             <span x-show="chart.updating" class="mono text-lo" style="font-size:10px;margin-left:4px">↻</span>
           </div>
         </div>
@@ -1450,6 +1451,10 @@ body::before {
           <button class="ext-btn"
                   @click="zoomIn()"
                   title="Zoom in">+</button>
+          <button class="ext-btn"
+                  :class="chart.volMetric==='turnover' ? 'active' : ''"
+                  @click="toggleVolMetric()"
+                  title="Toggle volume pane: token volume / USDT turnover">$</button>
         </div>
       </div>
 
@@ -2280,6 +2285,7 @@ function cw() { return {
     _vchart: null,  // volume LightweightCharts instance (separate pane)
     _vs:     null,  // token volume histogram
     _ts:     null,  // USDT turnover histogram
+    volMetric: 'token',  // 'token' | 'turnover' — which histogram is visible on the vol pane
     _ro:     null,  // ResizeObserver
     tempPriceLineValue: null,  // Current temporary price line value (null = no line)
     tempVolLineValue: null,    // Current temporary volume line value (null = no line)
@@ -3217,18 +3223,17 @@ function cw() { return {
       priceFormat: { type: 'custom', formatter: fmtP, minMove: 0.00000001 },
     });
 
-    // ── Volume chart (bottom pane) — token vol on left, turnover on right
+    // ── Volume chart (bottom pane) — single right scale (matches price chart's
+    //    single-axis gutter width so bars stay pixel-aligned across panes).
+    //    Token volume / USDT turnover share that one scale, toggled via visibility.
     const vchart = LightweightCharts.createChart(volHost, {
-      layout: { ...sharedLayout, fontSize: 10 },
+      layout: sharedLayout,
       grid:   sharedGrid,
       rightPriceScale: {
         visible: true, autoScale: true, borderColor: '#9097a2',
         scaleMargins: { top: 0.08, bottom: 0.08 },
       },
-      leftPriceScale: {
-        visible: true, autoScale: true, borderColor: '#9097a2',
-        scaleMargins: { top: 0.08, bottom: 0.08 },
-      },
+      leftPriceScale: { visible: false },
       timeScale: sharedTimeScale,
       crosshair: {
         mode: 1,
@@ -3240,20 +3245,24 @@ function cw() { return {
       width: vw, height: vh,
     });
 
+    const volMetric = this.chart.volMetric || 'token';
+
     const vs = vchart.addHistogramSeries({
       priceFormat:      { type: 'volume' },
-      priceScaleId:     'left',
+      priceScaleId:     'right',
       color:            'rgba(58,106,142,0.65)',
       lastValueVisible: false,
       priceLineVisible: false,
+      visible:          volMetric === 'token',
     });
 
     const ts = vchart.addHistogramSeries({
-      priceFormat:      { type: 'volume' },
+      priceFormat:      { type: 'custom', formatter: v => '$' + fmtV(v), minMove: 0.01 },
       priceScaleId:     'right',
-      color:            'rgba(166,124,32,0.55)',
+      color:            'rgba(166,124,32,0.65)',
       lastValueVisible: false,
       priceLineVisible: false,
+      visible:          volMetric === 'turnover',
     });
 
     // ── Sync time ranges: candle chart drives, vol chart follows
@@ -3263,6 +3272,7 @@ function cw() { return {
       _syncing = true;
       try { vchart.timeScale().setVisibleLogicalRange(range); } catch(e) {}
       _syncing = false;
+      this.syncVolScaleWidth();
       this.redrawPersistentVlines();
     });
     vchart.timeScale().subscribeVisibleLogicalRangeChange(range => {
@@ -4163,6 +4173,29 @@ function cw() { return {
     const center = (range.from + range.to) / 2;
     const half   = (range.to - range.from) / 2;
     ts.setVisibleLogicalRange({ from: center - half * (1 + factor), to: center + half * (1 + factor) });
+  },
+
+  // ─── Pin the volume pane's price-scale width to match the price pane's ────
+  //     (both are single right-scale now; this reads the real rendered pixel
+  //     width off the price chart and pins the volume chart's gutter to it,
+  //     so the two panes' plot areas stay identical width and bars line up)
+  syncVolScaleWidth() {
+    const chart = this.chart._chart, vchart = this.chart._vchart;
+    if (!chart || !vchart) return;
+    requestAnimationFrame(() => {
+      try {
+        const w = chart.priceScale('right').width();
+        if (w) vchart.priceScale('right').applyOptions({ minimumWidth: w });
+      } catch(e) {}
+    });
+  },
+
+  // ─── Toggle volume pane between token volume and USDT turnover ─────
+  toggleVolMetric() {
+    this.chart.volMetric = this.chart.volMetric === 'token' ? 'turnover' : 'token';
+    const showToken = this.chart.volMetric === 'token';
+    try { this.chart._vs?.applyOptions({ visible: showToken }); } catch(e) {}
+    try { this.chart._ts?.applyOptions({ visible: !showToken }); } catch(e) {}
   },
 
   //  PERSISTENT LINES (per-ticker)
