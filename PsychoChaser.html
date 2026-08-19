@@ -1,6 +1,12 @@
 <!--
-PsychoChaser v1.7.1
+PsychoChaser v1.7.2
 Copyleft 2026 Peng Protocol — PsychoChaser fork of PsychoWinter
+
+v1.7.2 — Fix: laggard absorption's live-mode market cut updated local state
+(totalSize/margin/cutPnl) from the pre-order mark price instead of the
+exchange-confirmed fill, the same class of bug 1.6.1 fixed for Outlier
+Deceleration. Now confirms avgPrice/cumExecQty from the order response before
+mutating position state, mirroring the DCA/AMa/deceleration pattern.
 
 v1.7.1 — Trades menu: open loss-absorption cards now pin to the top, mirroring
 PsychoWinter v1.10.1. Render-only change inside _groupedTrades(); closedTrades
@@ -1480,7 +1486,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
 </div><!-- end .main -->
 
 <script>
-const VERSION = '1.7.1'; // x=production-only, y=significant additions/subtractions, z=tweaks
+const VERSION = '1.7.2'; // x=production-only, y=significant additions/subtractions, z=tweaks
 
 // ── HMAC-SHA256 signing ──
 async function hmac(secret, msg) {
@@ -3037,10 +3043,13 @@ function psycho() { return {
           // position to zero over successive cuts, eventually closing it entirely.
           const cutQty   = Math.min(Math.max(laggard.totalSize * fraction, this.cfg.minNotional / mark), laggard.totalSize);
           if (cutQty <= 0) return;
-          const cutFraction = cutQty / laggard.totalSize;
-          const cutMgn   = laggard.margin * cutFraction;
-          const cutPnl   = (mark - laggard.entryPrice) / laggard.entryPrice * laggard.leverage * cutMgn;
-          const cutRoi   = (mark - laggard.entryPrice) / laggard.entryPrice * laggard.leverage * 100;
+
+          // fillPrice/filledQty default to the pre-order local estimate (pseudo mode,
+          // or a live fill-confirmation miss) and are overwritten below with the
+          // exchange-confirmed values once the order response comes back — the same
+          // pattern DCA/AMa and deceleration use to avoid mutating local state off a
+          // stale pre-order estimate.
+          let fillPrice = mark, filledQty = cutQty;
           if (laggard._live) {
             try {
               const instr = await this.getInstrInfo(laggard.symbol);
@@ -3049,13 +3058,22 @@ function psycho() { return {
                 this.log(`✂️ ${sym}: laggard absorption skipped — cut below exchange minimum`, 'info');
                 return;
               }
-              await this.livePlaceOrder({ symbol: laggard.symbol, side: 'Sell', orderType: 'Market', qty: qty.toString(), timeInForce: 'IOC', reduceOnly: true });
+              const _res = await this.livePlaceOrder({ symbol: laggard.symbol, side: 'Sell', orderType: 'Market', qty: qty.toString(), timeInForce: 'IOC', reduceOnly: true });
+              const _confirmedPrice = parseFloat(_res.avgPrice);
+              const _confirmedQty   = parseFloat(_res.qty);
+              fillPrice  = (_confirmedPrice > 0) ? _confirmedPrice : mark;
+              filledQty  = (_confirmedQty   > 0) ? _confirmedQty   : qty;
             } catch(e) {
               this.log(`${sym}: laggard absorption cut failed — ${e.message}`, 'error');
               return;
             }
           }
-          laggard.totalSize = Math.max(0, laggard.totalSize - cutQty);
+
+          const cutFraction = Math.min(1, filledQty / laggard.totalSize);
+          const cutMgn   = laggard.margin * cutFraction;
+          const cutPnl   = (fillPrice - laggard.entryPrice) / laggard.entryPrice * laggard.leverage * cutMgn;
+          const cutRoi   = (fillPrice - laggard.entryPrice) / laggard.entryPrice * laggard.leverage * 100;
+          laggard.totalSize = Math.max(0, laggard.totalSize - filledQty);
           laggard.margin   *= (1 - cutFraction);
           if (laggard.notional)          laggard.notional          *= (1 - cutFraction);
           if (laggard._laggardInitialEV) laggard._laggardInitialEV *= (1 - cutFraction);
@@ -3073,16 +3091,16 @@ function psycho() { return {
             tab = { id: tabId, posId: laggard.id, reason: 'absorption', symbol: laggard.symbol, openedAt: laggard.openedAt, entryPrice: laggard.entryPrice, origEntryPrice: laggard._origEntryPrice ?? laggard.entryPrice, dcaStage: laggard.dcaStage, cuts: [], totalPnl: 0, finalClose: null, isOpen: true, firstCutAt: now };
             this.closedTrades.push(tab);
           }
-          tab.cuts.push({ pnl: cutPnl, roi: cutRoi, mark, cutAt: now });
+          tab.cuts.push({ pnl: cutPnl, roi: cutRoi, mark: fillPrice, cutAt: now });
           tab.totalPnl  = parseFloat((tab.totalPnl + cutPnl).toFixed(6));
           tab.entryPrice = laggard.entryPrice;
           tab.dcaStage  = laggard.dcaStage;
           tab.lastCutAt = now;
-          this.log(`✂️ ${sym}: laggard absorption — ED $${buffedED.toFixed(2)} ≤ 0, 5% cut @ ${fmtP(mark)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${laggard.margin.toFixed(2)}`, 'warn');
+          this.log(`✂️ ${sym}: laggard absorption — ED $${buffedED.toFixed(2)} ≤ 0, 5% cut @ ${fmtP(fillPrice)} | ${cutPnl >= 0 ? '+' : ''}${cutPnl.toFixed(3)} USDT (${cutRoi.toFixed(1)}%) | margin $${laggard.margin.toFixed(2)}`, 'warn');
           if (laggard.totalSize <= 0) {
             // Final drain — live order already closed the exchange position above.
             // Finalise the bot record without placing a second order.
-            tab.finalClose = { reason: 'absorption', exitPrice: mark, entryPrice: laggard.entryPrice, origEntryPrice: laggard._origEntryPrice ?? laggard.entryPrice, pnl: cutPnl, pnlPct: cutRoi, fundingFee: laggard._fundingAccrued ?? 0, closedAt: now };
+            tab.finalClose = { reason: 'absorption', exitPrice: fillPrice, entryPrice: laggard.entryPrice, origEntryPrice: laggard._origEntryPrice ?? laggard.entryPrice, pnl: cutPnl, pnlPct: cutRoi, fundingFee: laggard._fundingAccrued ?? 0, closedAt: now };
             tab.isOpen     = false;
             tab.closedAt   = now;
             tab.duration   = now - (laggard.openedAt || now);

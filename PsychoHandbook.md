@@ -115,7 +115,7 @@ This is the largest section — it holds the safety nets that manage a book once
 **Laggard Check** — designates one open position at a time as "the laggard": the one responsible for absorbing the book's collective drawdown. It closes once its own numbers clear.
 - *Age Mode* — picks the laggard by which position is oldest, instead of which has DCA'd the most.
 - *Profit Offset* — how patient the laggard's exit target is. Positive numbers widen it, negative numbers make it trigger-happy.
-- *Laggard Absorption* — if the laggard's numbers hit zero but it's still net negative, this bleeds the position down gradually instead of force-closing it outright, buying time for a reversal.
+- *Laggard Absorption* — if the laggard's numbers hit zero but it's still net negative, this bleeds the position down gradually instead of force-closing it outright, buying time for a reversal. The laggard is picked and checked every 5s alongside the rest of the position watch loop, but a cut only fires once every 5 minutes, each one trimming 5% of the laggard's remaining size until it's fully drained. 
 
 **Cascade Trigger** — when the whole book's floating profit crosses a threshold, this locks some of it in by closing a couple of winning positions, seeding a payback chain toward the laggard.
 - *Cascade Trigger Threshold* — how large that collective profit needs to be, expressed as a multiple of entry margin. This same number also governs Position Cascade Trigger below — one dial, two triggers.
@@ -153,7 +153,7 @@ Each open position gets a card. The header row shows the ticker and any status b
 Inside the card:
 - **Entry / Mark** — current mark price, and the entry price — which, once a position has DCA'd at least once, alternates every 5 seconds between **Avg Entry** (the current averaged entry across all filled stages) and **Orig Entry** (the very first fill, before any adds). Before any DCA fires it's just a plain **Entry**, no cycling.
 - **uPnL / ROI** — unrealized profit or loss, in dollars and as a percentage of margin.
-- **TP / SL row** — shows whichever exit target currently governs the position: normal TP, an exhumed recovery target (**EH TP**), a laggard-adjusted target (**EDa TP**), or a live stop-loss (**SL**, which blinks once every stage has filled).
+- **TP / SL row** — shows whichever exit target currently governs the position: normal TP, an exhumed recovery target (**EH TP**), a laggard-adjusted target (**EDa TP** — only appears when Laggard Absorption is disabled; see the Laggard Absorption entry above), or a live stop-loss (**SL**, which blinks once every stage has filled).
 - **Margin** — capital committed to this position.
 - **Funding row** — cycles through three states every five seconds: the funding fee paid or received so far, a live countdown to the position's next funding round (pulled straight from the exchange for that specific ticker, so it's accurate to whatever interval that symbol actually runs on), and the current funding rate itself — colored green when it's presently working in your favor (positive, since shorts collect on positive funding) and red when it's costing you.
 - **Age** — how long the position has been open.
@@ -255,3 +255,9 @@ and would otherwise be flagged as "drifted" when it's actually just lagging.
 ### Absorbed Loss' impact on net PnL
 
 An open loss-absorption card pins to the top of the trades menu and keeps updating as it absorbs, rather than sinking down among unrelated closes — but it still isn't done until the underlying position actually closes. Absorbed loss is added to net PnL as soon as it's absorbed, so read a card's full history rather than judging performance off a single cut.
+
+### Nuances of Laggard Absorption
+
+**Important divergence from Exhumation:** with Laggard Absorption on (the default), the laggard's exit target stays the normal TP — its ED number only decides whether a cut or a force-close fires, it never retargets the exit. The EDa TP (a widened, laggard-specific exit target, shown as **EDa TP** in the TP/SL row) only comes into play if Laggard Absorption is turned off, letting the laggard force-close against a more patient target instead of cutting into it. Exhumation's recovery target (EH TP), by contrast, always applies once losses have been absorbed off a position, with no such toggle.
+  - *Why it's merged rather than a separate toggle:* this reflects a bulk-churn, cascade-oriented style of running the book — often the goal is a handful of wins across a sea of open positions to seed a cascade, and in that mode a laggard holding the book back on a widened target works against the strategy. Rather than add a second dial, EDa TP retargeting was folded into the same toggle as absorption: absorption on favors bulk churn (cut the laggard down, keep cascading), absorption off favors patience (park the laggard on a wider target and let it ride).
+  - *In live mode*, when Laggard Absorption is off and EDa TP is active, it isn't a local-only number — `liveReconcileTp` mirrors it to the exchange every tick via Bybit's native take-profit (`/v5/position/trading-stop`), the same path used for normal TP, Exhumation's EH TP, and AMa's stage-7 TP. So the laggard's real resting TP order on the exchange moves with it, matching what you'd see in simulation.
