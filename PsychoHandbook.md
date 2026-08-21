@@ -270,6 +270,10 @@ Once DAMa is on, the score shown in Config is a *live, constantly moving* number
 
 This also means a position opened right at a high streak keeps its larger order count even if the streak immediately resets to 1 afterward (idle timeout, a loss, etc.) — and conversely, a position opened at the score's floor of 1 stays a single-order AMa position for its whole life, even if the book goes on a long winning streak right after.
 
+### An AMa position's TP shows a projected price with no percent
+
+While an AMa position is mid-ladder (any stage before the last one fills), there's genuinely no active TP yet — that's intentional, not a bug. It shows the final AMa stage's precomputed target price with **(n/a)** in place of a percent. The price is a real number (computed from the entry price the moment the position opened), but the percent depends on the ladder actually completing — if a DCA add fires first, AMa cancels and a normal TP takes over instead, so the projection shown at stage 0 is a target, not a settled figure.
+
 ### DAMa's idle-reset check is lazy, not a timer
 
 The 6-hour (configurable) reset isn't a background countdown — it's checked once per tick and once whenever a position opens. In practice this means the reset fires within a few seconds of the window elapsing during normal operation, but if the scan loop itself is stopped (not just idle — actually stopped), the check doesn't run at all until you start it again, so the score can sit stale past the configured window while the bot isn't running.
