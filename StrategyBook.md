@@ -305,7 +305,7 @@ Psycho Mode is the reactive approach in its purest form — no market astrology,
 - *Second Wind* — defers SL when absorption has reduced position below expected margin
 - *Sacrifice* — closes recoverable positions when book has DCA'd heavily
 - *Cascade Triggers* — CPC and PPC; exhumed positions excluded
-- *Anti-Martingale (AMa)* (optional) — flat adds into winning positions; TP at −22% after seven adds
+- *Anti-Martingale (AMa)* (optional) — flat adds into winning positions; TP set four points past the last add. Order count is a configurable field (default seven); *Dynamic Anti-Martingale (DAMa)* (optional sub-toggle) scales that count to a live win/loss streak instead of always building the max, so a hot run gets progressively longer ladders and a cold one shrinks back to a single order
 
 **Why individual exhumation rather than collective payback**: A large reactive book with 2× DCA escalation and aggressive absorption accumulates losses faster than any single laggard could realistically recover. Each position owning its own debt is the only workable model at this scale.
 
@@ -340,6 +340,13 @@ Both of these should scale with your actual operational balance rather than sitt
 - *Absorption Trigger Threshold* — set to roughly 0.01× your total balance. For the same $40 balance, that's **0.40×**. This keeps individual positions from growing too large relative to your book before Loss Absorption starts trimming them.
 
 These figures ($40 balance, 5 max positions, 4× Sacrifice, 0.40× Absorption) are the smallest configuration tested against the live system so far. Every other setting can stay at default.
+
+**Below $40, Winter and Chaser diverge**
+
+At this size, Loss Absorption's lowered trigger threshold means cuts fire often — the book is simply too small to avoid tripping it regularly. Whether that's a problem depends on which side you're running:
+
+- **Winter (short bias), below $40**: turn **Exhumation** off, turn **Laggard Absorption** off, and set **Cascade Trigger Threshold** to **0.75×**. A bearish read struggles to pay back debt that's already been absorbed off a position — Exhumation's per-position EH TP recovery target assumes the position can climb back to a personalized recovery ROI, and at this balance the debt from frequent cuts outpaces what a short can realistically claw back. With Exhumation off, that per-position repayment path is gone — so Laggard Absorption needs to come off too, since leaving it on blocks the laggard's own EDa TP (see the Handbook's *Nuances of Laggard Absorption*), and without Exhumation, EDa TP is the only recovery path left for absorbed debt. Cascade Trigger drops to 0.75× because the default threshold is sized for a much larger book — at $40, the odds of the collective float ever reaching the normal target are low enough that cascade payback events would rarely fire at all.
+- **Chaser (long bias), below $40**: only **Laggard Absorption** needs to come off. Exhumation can stay on — a bullish read can generally pay back absorbed debt at this balance where a bearish one can't, so the per-position EH TP recovery path still works. Laggard Absorption still comes off regardless, for the same reason as Winter: it blocks EDa TP, and with cuts firing often at this size, giving the laggard the patient, widened EDa TP target is worth more than the cut-based absorption path it would otherwise use.
 
 **Psycho Mode recommended Balance**: **$500** with default settings (50 max positions, $6 notional, 6× leverage).
 

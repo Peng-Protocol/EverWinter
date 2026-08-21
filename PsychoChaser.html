@@ -1,6 +1,27 @@
 <!--
-PsychoChaser v1.7.2
+PsychoChaser v1.8.0
 Copyleft 2026 Peng Protocol — PsychoChaser fork of PsychoWinter
+
+v1.8.0 — Dynamic Anti-Martingale (DAMa), mirroring PsychoWinter v1.11.0:
+optional sub-toggle under AMa that scales the AMa order count to a win/loss
+streak instead of always building the full ladder. +1 order per profitable
+close, -1 per loss, floor of 1, reset to 1 after damaResetHours (default 6)
+with no closes. Score is global (not per-symbol) and only decided at
+position-open time — running positions are never touched. The AMa Orders
+field is repurposed as the hard cap DAMa scales up to, so a hot streak can't
+pile up an unreasonable number of resting exchange orders; with DAMa off
+it's just the fixed order count (was hardcoded to 7). Ladder trigger levels
+now generate from that count (same 1.5%/3%/+3%-per-stage cadence, extended
+or shortened as needed) instead of a fixed 7-entry array, and the
+final-stage TP (last level + 4%) is precomputed onto that order at build
+time rather than recalculated via an async instrument lookup when it
+actually fires. AMa pill row in the position card now stretches/shrinks its
+column count to fit however many orders a given position actually has.
+Also fixed a pre-existing bug in the pill's fill-progress highlighting: it
+was using the short-direction band formula (entry minus pct, upper/lower
+reversed) instead of the long-direction one, so the in-progress striped
+highlight was silently wrong; and the AMa ladder settings-preview trigger
+column was showing "-X%" instead of "+X%" for a long-bias ladder.
 
 v1.7.2 — Fix: laggard absorption's live-mode market cut updated local state
 (totalSize/margin/cutPnl) from the pre-order mark price instead of the
@@ -619,9 +640,26 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
             <div class="tog-t" :class="cfg.amaEnabled?'on':''"><div class="tog-k"></div></div>
             <span class="tog-l">Anti-Martingale (AMa)</span>
           </label>
-          <div class="hint" style="margin-top:4px">Flat adds as price rises in profit direction. No TP until AMa stage 7. If a DCA triggers (price reverses down), AMa is cancelled and normal TP is set.</div>
+          <div class="hint" style="margin-top:4px">Flat adds as price rises in profit direction. No TP until the final AMa stage. If a DCA triggers (price reverses down), AMa is cancelled and normal TP is set.</div>
           <div x-show="cfg.amaEnabled" style="margin-top:8px">
-            <div class="stat-ttl">AMa LADDER (at current settings)</div>
+            <div class="lbl" x-text="(cfg.damaEnabled?'Max ':'')+'AMa Orders'+(cfg.damaEnabled?' (cap)':'')"></div>
+            <input type="number" min="1" max="30" step="1" x-model.number="cfg.amaStages" :disabled="cfgLocked" @change="persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:60px">
+            <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+              <label class="tog" @click.prevent="if(!cfgLocked){cfg.damaEnabled=!cfg.damaEnabled;persist()}">
+                <div class="tog-t" :class="cfg.damaEnabled?'on':''"><div class="tog-k"></div></div>
+                <span class="tog-l">Dynamic Anti-Martingale (DAMa)</span>
+              </label>
+              <div class="hint" style="margin-top:4px">Order count tracks a win/loss streak instead of always using the max — +1 order per profitable close, -1 per loss, floor of 1. Only affects new positions.</div>
+              <div x-show="cfg.damaEnabled" style="margin-top:8px">
+                <div class="lbl">Reset After <b x-text="(cfg.damaResetHours??6)+'h'"></b> Idle</div>
+                <input type="range" min="1" max="48" step="1" x-model.number="cfg.damaResetHours" :disabled="cfgLocked" @change="persist()">
+                <div style="margin-top:6px;font-family:var(--mono);font-size:9.5px;color:var(--text-lo);display:flex;justify-content:space-between">
+                  <span>Current score:</span>
+                  <span style="color:var(--profit)" x-text="(damaScore||1)+' → next open uses '+_damaOrderCount()+' order'+(_damaOrderCount()===1?'':'s')"></span>
+                </div>
+              </div>
+            </div>
+            <div class="stat-ttl" style="margin-top:10px">AMa LADDER (at current settings)</div>
             <div class="ladder-row" style="font-size:8.5px;color:var(--text-lo);margin-bottom:3px;border-color:rgba(56,201,103,.12)">
               <span class="stage-lbl">STAGE</span><span class="trig">TRIGGER</span>
               <span class="notl">NOTIONAL</span><span class="marg">MARGIN</span><span class="cum">CUM. NOTL</span>
@@ -637,11 +675,11 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
             </template>
             <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);margin-top:6px;display:flex;justify-content:space-between">
               <span>Total notional (all stages):</span>
-              <span style="color:var(--warn)" x-text="'$'+(cfg.minNotional*8).toFixed(2)"></span>
+              <span style="color:var(--warn)" x-text="'$'+(cfg.minNotional*(Math.max(1,cfg.amaStages||7)+1)).toFixed(2)"></span>
             </div>
             <div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);display:flex;justify-content:space-between">
               <span>Total margin (all stages):</span>
-              <span style="color:var(--ice)" x-text="'$'+(cfg.minNotional*8/cfg.leverage).toFixed(2)"></span>
+              <span style="color:var(--ice)" x-text="'$'+(cfg.minNotional*(Math.max(1,cfg.amaStages||7)+1)/cfg.leverage).toFixed(2)"></span>
             </div>
           </div>
         </div>
@@ -987,22 +1025,26 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
           </div>
         </div>
 
-        <!-- AMa stage boxes (green) — shown when AMa active and not cancelled -->
+        <!-- AMa stage boxes (green) — shown when AMa active and not cancelled.
+             Grid stretches/shrinks to fit: columns = ceil((orders+1)/2), always
+             2 rows, so a single-order DAMa position gets A0 filling row 1 and
+             A1 filling row 2 alone, while a long streak compresses into more,
+             narrower columns instead of overflowing. -->
         <div x-show="pos._amaActive && !pos._amaCancelled && pos._amaOrders && pos.dcaStage === 0">
-          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:2px;margin-bottom:3px">
+          <div :style="'display:grid;grid-template-columns:repeat('+Math.max(1,Math.ceil(((pos._amaOrders||[]).length+1)/2))+',1fr);gap:2px;margin-bottom:3px'">
             <!-- A0: entry stage, always filled -->
             <div style="height:14px;border-radius:2px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:7px;font-weight:700;border:1px solid rgba(56,201,103,.7);background:rgba(56,201,103,.15);color:var(--profit)">A0</div>
-            <!-- A1–A7: fill levels -->
+            <!-- A1–AN: fill levels -->
             <template x-for="(ama,i) in (pos._amaOrders||[])" :key="i">
               <div :style="(()=>{
                 const filled = i < (pos._amaStage || 0);
                 const origEnt = pos._amaOrigEntry || pos.entryPrice;
                 const mark = pos.markPrice || origEnt;
-                const lvls = [1.5,3,6,9,12,15,18];
-                const ap = lvls.map(p => origEnt*(1-p/100));
-                const upper = i===0 ? origEnt : ap[i-1];
-                const lower = ap[i];
-                const inRange = filled && mark <= upper && mark > lower;
+                const lvls = _amaLevelsForN((pos._amaOrders||[]).length);
+                const ap = lvls.map(p => origEnt*(1+p/100));
+                const lower = i===0 ? origEnt : ap[i-1];
+                const upper = ap[i];
+                const inRange = filled && mark >= lower && mark < upper;
                 let border, bg, color;
                 if (inRange) {
                   border='1px solid rgba(56,201,103,.5)';
@@ -1665,6 +1707,9 @@ function psycho() { return {
     ppcEscalationMult: 2,
     cascadeMinRoiPct: 3,
     amaEnabled: false,
+    amaStages: 7,
+    damaEnabled: false,
+    damaResetHours: 6,
     opBalanceEnabled: true,
     opBalance: 500,
     opBalanceBufferPct: 1,
@@ -1680,6 +1725,8 @@ function psycho() { return {
   sess: { trades:0, wins:0, losses:0, pnl:0, forceClose:0, cascadeClose:0 },
   peakAllocation: 0,
   acct: { upnl: 0 },
+  damaScore:      1,   // DAMa momentum score — 1 win = +1, 1 loss = -1, floors at 1
+  _damaLastCloseAt: null, // last close timestamp, used for the inactivity reset window
   _instrCache:    {},
   _symbolBanlist: {},
   _whiplashScheduled: {},
@@ -1747,6 +1794,8 @@ function psycho() { return {
     this.acct         = { upnl:0 };
     this._symbolBanlist = {};
     this.logs         = [];
+    this.damaScore       = 1;
+    this._damaLastCloseAt = null;
     try {
       const raw = localStorage.getItem(this._modeKey());
       if (raw) {
@@ -1756,6 +1805,8 @@ function psycho() { return {
         if (s.sess)           { this.sess = s.sess; if (this.sess.cascadeClose == null) this.sess.cascadeClose = 0; }
         if (s.peakAllocation) this.peakAllocation = s.peakAllocation;
         if (s._symbolBanlist) this._symbolBanlist = s._symbolBanlist;
+        if (s.damaScore)        this.damaScore        = s.damaScore;
+        if (s._damaLastCloseAt) this._damaLastCloseAt = s._damaLastCloseAt;
       }
       this.acct.upnl = this.positions.reduce((s, p) => s + (p.upnl || 0), 0);
       const logRaw = localStorage.getItem(this._modeLogKey());
@@ -1778,6 +1829,7 @@ function psycho() { return {
       localStorage.setItem(this._modeKey(), JSON.stringify({
         positions: this.positions, closedTrades: this.closedTrades,
         sess: this.sess, peakAllocation: this.peakAllocation, _symbolBanlist: this._symbolBanlist,
+        damaScore: this.damaScore, _damaLastCloseAt: this._damaLastCloseAt,
       }));
       localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs));
     } catch(e) {}
@@ -1808,6 +1860,7 @@ function psycho() { return {
       localStorage.setItem(this._modeKey(), JSON.stringify({
         positions: this.positions, closedTrades: this.closedTrades,
         sess: this.sess, peakAllocation: this.peakAllocation, _symbolBanlist: this._symbolBanlist,
+        damaScore: this.damaScore, _damaLastCloseAt: this._damaLastCloseAt,
       }));
       localStorage.setItem(this._modeLogKey(), JSON.stringify(this.logs));
     } catch(e) {}
@@ -2123,14 +2176,21 @@ function psycho() { return {
 
     // Build AMa orders when enabled — qty precomputed now (flat minNotional/price
     // per stage) since live conditional orders need qty at placement time, not
-    // just at fill time.
-    const amaLevels = [1.5, 3, 6, 9, 12, 15, 18];
+    // just at fill time. Order count is fixed at open time — DAMa's score only
+    // decides how many orders THIS position gets; it's never touched again.
+    const amaStageCount = this._damaOrderCount();
+    const amaLevels = this._amaLevelsForN(amaStageCount);
     const amaOrders = useAma ? amaLevels.map((pct, i) => {
       const amaPrice = this.snapPrice(price * (1 + pct / 100), instr);
+      const isFinal = i === amaLevels.length - 1;
+      // Final-stage TP is precomputed here rather than at fill time, so the
+      // fill loop can apply it straight off the order instead of waiting on
+      // an async instrument lookup once the stage actually triggers.
+      const finalTp = isFinal ? this.snapPrice(price * (1 + (pct + 4) / 100), instr) : null;
       return {
         label: 'AMa' + (i + 1), stage: i + 1,
         price: amaPrice, qty: this.snapQty(this.cfg.minNotional / amaPrice, instr),
-        filled: false, filledAt: null,
+        filled: false, filledAt: null, isFinal, finalTp,
       };
     }) : null;
 
@@ -2286,15 +2346,22 @@ function psycho() { return {
     const _initSlPriceLive = this.snapPrice((_slSimS > 0 ? _slSimN / _slSimS : fillPrice) * (1 - 1.05 / lev), instr);
 
     // Build AMa orders — qty precomputed now (flat minNotional/price per stage)
-    // since all 7 are placed as live conditional orders immediately, not one at
-    // a time like DCA.
-    const amaLevels = [1.5, 3, 6, 9, 12, 15, 18];
+    // since all stages are placed as live conditional orders immediately, not
+    // one at a time like DCA. Order count is fixed at open time — DAMa's score
+    // only decides how many orders THIS position gets; it's never touched again.
+    const amaStageCount = this._damaOrderCount();
+    const amaLevels = this._amaLevelsForN(amaStageCount);
     const amaOrders = useAma ? amaLevels.map((pct, i) => {
       const amaPrice = this.snapPrice(fillPrice * (1 + pct / 100), instr);
+      const isFinal = i === amaLevels.length - 1;
+      // Final-stage TP is precomputed here rather than at fill time, so the
+      // fill loop can apply it straight off the order instead of waiting on
+      // an async instrument lookup once the stage actually triggers.
+      const finalTp = isFinal ? this.snapPrice(fillPrice * (1 + (pct + 4) / 100), instr) : null;
       return {
         label: 'AMa' + (i + 1), stage: i + 1,
         price: amaPrice, qty: this.snapQty(this.cfg.minNotional / amaPrice, instr),
-        filled: false, filledAt: null,
+        filled: false, filledAt: null, isFinal, finalTp,
       };
     }) : null;
 
@@ -2619,12 +2686,13 @@ function psycho() { return {
             pos.upnl       = (mark - pos.entryPrice) / pos.entryPrice * pos.leverage * pos.margin;
           }
 
-          // At stage 7: set TP at +22% of original entry
-          if (pos._amaStage >= 7) {
-            const amaInstr = await this.getInstrInfo(pos.symbol);
-            const tpP = amaInstr ? this.snapPrice(pos._amaOrigEntry * 1.22, amaInstr) : parseFloat((pos._amaOrigEntry * 1.22).toFixed(8));
+          // Final stage: TP was precomputed at order-build time (see finalTp)
+          // rather than recalculated here, so no extra instrument lookup is
+          // needed the moment the last order actually triggers.
+          if (ama.isFinal) {
+            const tpP = ama.finalTp || pos._amaOrigEntry * 1.22;
             pos.currentTpPrice = tpP;
-            this.log(`📗 ${pos.symbol}: AMa7 complete — TP → ${fmtP(tpP)} (+22% from ${fmtP(pos._amaOrigEntry)}) | Margin $${pos.margin.toFixed(2)}`, 'trade');
+            this.log(`📗 ${pos.symbol}: AMa${pos._amaStage} complete — TP → ${fmtP(tpP)} | Margin $${pos.margin.toFixed(2)}`, 'trade');
           } else {
             this.log(`📗 ${pos.symbol}: AMa${pos._amaStage} @ ${fmtP(ama.price)} | Avg ${fmtP(pos.entryPrice)} | Margin $${pos.margin.toFixed(2)}`, 'trade');
           }
@@ -2753,7 +2821,7 @@ function psycho() { return {
 
       // TP hit check (pseudo only — live is governed by the exchange-native TP via
       // liveReconcileTp; skip AMa positions unless stage 7 TP has been set; skip exhumed)
-      const _isAmaFullRun = pos._amaActive && !pos._amaCancelled && (pos._amaStage || 0) >= 7;
+      const _isAmaFullRun = pos._amaActive && !pos._amaCancelled && (pos._amaStage || 0) >= (pos._amaOrders?.length || 7);
       if (!pos._live && pos.currentTpPrice > 0 && !(this.cfg.exhumationEnabled !== false && pos._exhumed && pos._exhumedEdaTpPrice > 0) && (!(pos._amaActive && !pos._amaCancelled) || _isAmaFullRun) && mark >= pos.currentTpPrice && this.positions.find(x => x.id === pos.id)) {
         this.log(`${_isAmaFullRun ? '💚' : '✅'} ${pos.symbol}: ${_isAmaFullRun ? 'AMa TP' : 'TP'} hit @ ${fmtP(mark)} — closing`, 'success');
         await this.closePosition(pos, _isAmaFullRun ? 'AMa' : 'tp', pos.currentTpPrice);
@@ -2828,6 +2896,9 @@ function psycho() { return {
       if (pos._live) await this.liveReconcileTp(pos);
     }
 
+    // DAMa idle/no-close reset check
+    this._damaCheckReset();
+
     this.persist();
   },
 
@@ -2860,6 +2931,7 @@ function psycho() { return {
     if (isWin) this.sess.wins++; else this.sess.losses++;
     if (reason === 'force' || reason === 'sl' || reason === 'laggard') this.sess.forceClose++;
     if (reason === 'cascade') this.sess.cascadeClose++;
+    this._damaOnClose(isWin);
 
     const _closedAt = Date.now();
     const closed = {
@@ -2964,6 +3036,7 @@ function psycho() { return {
     if (isWin) this.sess.wins++; else this.sess.losses++;
     if (reason === 'force' || reason === 'sl' || reason === 'laggard') this.sess.forceClose++;
     if (reason === 'cascade') this.sess.cascadeClose++;
+    this._damaOnClose(isWin);
 
     const _closedAt = Date.now();
     this.closedTrades.push({ id:pos.id, symbol:pos.symbol, reason, entryPrice:pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, exitPrice, dcaStage:pos.dcaStage, margin:pos.margin, pnl, pnlPct, fundingFee:fundFee, totalPnl, duration, closedAt:_closedAt });
@@ -3319,7 +3392,7 @@ function psycho() { return {
               // TP check
               if (pos.currentTpPrice > 0 && c.h >= pos.currentTpPrice) {
                 closed = true; closedAt = c.t; closePrice = pos.currentTpPrice;
-                closeReason = (pos._amaActive && !pos._amaCancelled && (pos._amaStage || 0) >= 7) ? 'AMa' : 'tp'; break;
+                closeReason = (pos._amaActive && !pos._amaCancelled && (pos._amaStage || 0) >= (pos._amaOrders?.length || 7)) ? 'AMa' : 'tp'; break;
               }
             }
 
@@ -3334,6 +3407,7 @@ function psycho() { return {
               this.sess.pnl = parseFloat((this.sess.pnl + totalPnl).toFixed(6));
               if (isWin) this.sess.wins++; else this.sess.losses++;
               if (closeReason === 'force' || closeReason === 'sl') this.sess.forceClose++;
+              this._damaOnClose(isWin);
               while (this.closedTrades.some(r => r.closedAt === closedAt)) closedAt++;
               if (closeReason === 'force') {
                 this._addForceRollup({ symbol: pos.symbol, exitPrice: closePrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin, id: pos.id });
@@ -3950,6 +4024,48 @@ function psycho() { return {
     return { symbol: laggard.symbol, buffedEV, lostValue, upnl: uPnl, buffedED, edaTpPrice: laggard._edaTpPrice || null, markPrice: laggard.markPrice || 0 };
   },
 
+  // ── DAMa (Dynamic AMa) ──
+  // Score is a global streak counter, not per-symbol: +1 per profitable close,
+  // -1 per losing close, floored at 1. Idle for damaResetHours with no closes
+  // (or literally inactive that whole window — same trigger) snaps it back to 1.
+  // The score only ever decides the AMa order count for a position at the
+  // moment it opens; positions already running are never touched.
+  _amaLevelsForN(n) {
+    // Same march the original fixed 7-level ladder used: 1.5%, 3%, then +3%
+    // a stage. Extending past 7 just keeps that same +3% cadence outward.
+    const levels = [];
+    for (let i = 1; i <= n; i++) levels.push(i <= 2 ? 1.5 * i : 3 * (i - 1));
+    return levels;
+  },
+  // Mutates state — only call from the periodic tick or on close, never from
+  // a template expression (Alpine re-evaluates those on every render).
+  _damaCheckReset() {
+    if (!this.cfg.damaEnabled) return;
+    const resetMs = Math.max(0, (this.cfg.damaResetHours ?? 6)) * 3600000;
+    if (this._damaLastCloseAt && (Date.now() - this._damaLastCloseAt) > resetMs && this.damaScore !== 1) {
+      this.damaScore = 1;
+      this.persist();
+    }
+  },
+  // Order count to actually build for a NEW position — score capped by the
+  // amaStages field, which doubles as the hard ceiling so a hot streak can't
+  // pile up an unreasonable number of resting exchange orders. Read-only —
+  // safe to call from templates.
+  _damaOrderCount() {
+    const max = Math.max(1, this.cfg.amaStages || 7);
+    if (!this.cfg.damaEnabled) return max;
+    return Math.max(1, Math.min(this.damaScore || 1, max));
+  },
+  // Called from every close path (pseudo, live, and gap-backfill) so the
+  // streak reacts to every trade regardless of how it was closed.
+  _damaOnClose(isWin) {
+    if (!this.cfg.damaEnabled) { this._damaLastCloseAt = Date.now(); return; }
+    this._damaCheckReset();
+    this.damaScore = Math.max(1, (this.damaScore || 1) + (isWin ? 1 : -1));
+    this._damaLastCloseAt = Date.now();
+    this.persist();
+  },
+
   dcaLadder() {
     const rows = [];
     const addPcts = this._addPcts();
@@ -3971,14 +4087,16 @@ function psycho() { return {
   amaLadder() {
     const n   = this.cfg.minNotional;
     const lev = this.cfg.leverage;
-    const levels = [1.5, 3, 6, 9, 12, 15, 18];
+    const stages = Math.max(1, this.cfg.amaStages || 7);
+    const levels = this._amaLevelsForN(stages);
     let cumNotional = n;
     const rows = [{ label:'Entry', trigger:'Market', notional:n, margin:n/lev, cumNotional }];
     for (let i = 0; i < levels.length; i++) {
       cumNotional += n;
-      rows.push({ label:'AMa'+(i+1), trigger:'-'+levels[i]+'%', notional:n, margin:n/lev, cumNotional });
+      rows.push({ label:'AMa'+(i+1), trigger:'+'+levels[i]+'%', notional:n, margin:n/lev, cumNotional });
     }
-    rows.push({ label:'TP', trigger:'-22%', notional:0, margin:0, cumNotional });
+    const tpPct = levels[levels.length - 1] + 4;
+    rows.push({ label:'TP', trigger:'+'+tpPct+'%', notional:0, margin:0, cumNotional });
     return rows;
   },
 
@@ -4257,12 +4375,13 @@ function psycho() { return {
       const total = dca1 ? origEnt - dca1 : 0;
       return { pct: total > 0 ? Math.min(100, Math.max(0, (origEnt - mark) / total * 100)) : 0, color: 'rgba(0,194,199,.7)' };
     }
-    const levels  = [1.5, 3, 6, 9, 12, 15, 18];
+    const nStages = pos._amaOrders?.length || 7;
+    const levels  = this._amaLevelsForN(nStages);
     const prices  = levels.map(pct => origEnt * (1 + pct / 100));
     const stage   = pos._amaStage || 0;
-    // Stage 7 with TP: progress from A7 fill level toward TP price
-    if (stage >= 7 && pos.currentTpPrice > 0) {
-      const lo = prices[6], hi = pos.currentTpPrice;
+    // Final stage with TP: progress from last fill level toward TP price
+    if (stage >= nStages && pos.currentTpPrice > 0) {
+      const lo = prices[nStages - 1], hi = pos.currentTpPrice;
       const total = hi - lo;
       return { pct: total > 0 ? Math.min(100, Math.max(0, (mark - lo) / total * 100)) : 0, color: 'var(--profit)' };
     }
@@ -4270,7 +4389,7 @@ function psycho() { return {
     let lo, hi;
     const idx = prices.findIndex(p => mark < p);
     if (idx === -1) {
-      lo = prices[prices.length - 2]; hi = prices[prices.length - 1];
+      lo = prices.length > 1 ? prices[prices.length - 2] : origEnt; hi = prices[prices.length - 1];
     } else if (idx === 0) {
       lo = origEnt; hi = prices[0];
     } else {
