@@ -76,7 +76,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Min Notional** (`minNotional`) | Base margin per position in USDT. Actual order size = minNotional × leverage. |
 | **TP %** (`tpPct`) | Take-profit target. When EDa is active this is the buffered target — the debt-free close happens at a lower percentage. |
 | **SL %** (`slPct`) | Stop-loss. Position closes immediately when mark price hits this level. |
-| **Drawdown Throttle** (`drawdownThrottleEnabled`) | Halts new entries for 12 hours when rolling 6h realized PnL drops below a loss threshold. |
+| **Drawdown Throttle** (`drawdownThrottleEnabled`) | Halts new entries for a configurable duration (`drawdownHaltHours`, default 12h; free-entry field, no upper bound) when rolling 6h realized PnL drops below a loss threshold. |
 | **Drawdown Factor** (`drawdownThrottleFactor`) | Loss threshold as a multiple of entry margin. At 0.5× with $1 margin, $0.50 of rolling losses triggers the halt. |
 | **Gains Lock** (`gainsLockEnabled`) | Halts new entries for 12 hours once rolling 6h profit hits a target. Banks a winning streak before it reverses. |
 | **Gains Factor** (`gainsLockFactor`) | Profit target as a multiple of entry margin. Same scale as Drawdown Factor. |
