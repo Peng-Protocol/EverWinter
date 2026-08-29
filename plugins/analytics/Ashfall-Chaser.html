@@ -23,7 +23,13 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.66.1';
+  const VERSION        = '1.68.0';
+  // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
+  // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
+  // one _micOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
+  // calls (PEC/OC prefetch) — not a real lock, just a short head start so the leader always gets
+  // first refusal on a symbol before the follower is allowed to evaluate it independently.
+  const LIQ_CLAIM_TTL_MS = 10000;
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -712,6 +718,9 @@
         _liqPersistPending: false, // debounce guard for _liqPersistBatches
         _liqResults: {},
         _liqResultsVersion: 0,
+        // sym -> ms timestamp the leader's claim on it expires — see LIQ_CLAIM_TTL_MS and the
+        // liqClaim broadcast/handler.
+        _liqClaimUntil: {},
         _liqCycleHistory: [],
         // Symbols whose most recently closed batch read clean (zero combined liq turnover).
         // Map of symbol -> { qualifiedAt }, refreshed every time a clean close reconfirms it,
@@ -824,6 +833,47 @@
             const _sharedLiq = this._sharedRead?.('liqResults');
             if (_sharedLiq && Object.keys(_sharedLiq).length) this._liqResults = { ...this._liqResults, ..._sharedLiq };
           } catch(_) {}
+          // Everything below reacts to a partner tab's live pushes over the BroadcastChannel —
+          // registered once here rather than gated on _lfIsFollowing at registration time, since
+          // that flag can flip mid-session (see _lfIsFollowing()) and this hook should already be
+          // wired up the moment it does.
+          this.registerSharedMessageHook?.((msg) => {
+            if (!msg || !this.cfg.ashfallCrossEnabled) return;
+            if (msg.type === 'liqClaim') {
+              // Leader signaling "evaluating this symbol live right now" — recorded regardless of
+              // our own leader/follower state (cheap either way), but only ever consulted below
+              // while we're actually following. See LIQ_CLAIM_TTL_MS for why this is a short,
+              // self-expiring head start rather than a real lock.
+              const { sym } = msg.payload || {};
+              if (sym) this._liqClaimUntil[sym] = Date.now() + LIQ_CLAIM_TTL_MS;
+            } else if (msg.type === 'liqLiveRelay') {
+              // Live per-message relay from a leader partner — only meaningful while we're
+              // actually following (if we're leading ourselves, our own handleMsg already covers
+              // this symbol directly and reacting to our own echo again would double-fire).
+              if (!this._lfIsFollowing?.()) return;
+              const { sym, sLiqTurnover, bLiqTurnover } = msg.payload || {};
+              if (!sym) return;
+              // The leader's liqClaim for this same message always arrives first (see the
+              // handleMsg comment on why) — if it's still within its TTL, the leader gets first
+              // refusal and we skip entirely rather than risk opening the opposite side of the
+              // same ticker on the same account. A symbol the leader ultimately passes on is
+              // still fair game for us the next time it crosses, once the claim expires.
+              if ((this._liqClaimUntil[sym] || 0) > Date.now()) return;
+              const relayBatch = { sLiqTurnover: { [sym]: sLiqTurnover || 0 }, bLiqTurnover: { [sym]: bLiqTurnover || 0 } };
+              for (const fn of (this._liqMessageHooks || [])) { try { fn(relayBatch, sym); } catch(_) {} }
+            } else if (msg.type === 'liqAvgTurnover') {
+              if (!this._lfIsFollowing?.()) return;
+              const { avgS, avgB } = msg.payload || {};
+              if (typeof avgS === 'number') this._liqAvgSTurnover = avgS;
+              if (typeof avgB === 'number') this._liqAvgBTurnover = avgB;
+            } else if (msg.type === 'liqResults') {
+              // The closed-cycle snapshot (see init()'s one-time merge above) — re-pull on every
+              // update instead of only once at startup, so it doesn't quietly go stale for the
+              // rest of the session.
+              const _fresh = this._sharedRead?.('liqResults');
+              if (_fresh && Object.keys(_fresh).length) this._liqResults = { ...this._liqResults, ..._fresh };
+            }
+          });
           try {
             const _ocHist = JSON.parse(localStorage.getItem(ASH_OC_HIST_KEY) || 'null');
             if (Array.isArray(_ocHist) && _ocHist.length) {
@@ -2011,7 +2061,19 @@
                 if (side === 'Sell')      batch.sLiqTurnover[sym] += turnover;
                 else if (side === 'Buy')  batch.bLiqTurnover[sym] += turnover;
                 else continue;
+                // Claim goes out first — same synchronous handleMsg turn, same channel, so a
+                // following partner is guaranteed to see it before the relay payload below (see
+                // the liqClaim handler in init()). That ordering is what stops the follower from
+                // opening the opposite side of the same ticker mid-race — both bots trade the
+                // same account, and Bybit won't let long and short coexist on one symbol there.
+                if (this.cfg.ashfallCrossEnabled) this._sharedBroadcast?.('liqClaim', { sym });
                 for (const fn of (this._liqMessageHooks || [])) { try { fn(batch, sym); } catch(_) {} }
+                if (this.cfg.ashfallCrossEnabled) {
+                  this._sharedBroadcast?.('liqLiveRelay', {
+                    sym, cycleId: batch.id,
+                    sLiqTurnover: batch.sLiqTurnover[sym], bLiqTurnover: batch.bLiqTurnover[sym],
+                  });
+                }
               }
               this._liqPersistBatches();
             } catch(_) {}
@@ -2480,7 +2542,24 @@
                 if (side === 'Sell')      batch.sLiqTurnover[sym] += turnover;
                 else if (side === 'Buy')  batch.bLiqTurnover[sym] += turnover;
                 else continue;
+                // Claim goes out first — same synchronous handleMsg turn, same channel, so a
+                // following partner is guaranteed to see it before the relay payload below (see
+                // the liqClaim handler in init()). That ordering is what stops the follower from
+                // opening the opposite side of the same ticker mid-race — both bots trade the
+                // same account, and Bybit won't let long and short coexist on one symbol there.
+                if (this.cfg.ashfallCrossEnabled) this._sharedBroadcast?.('liqClaim', { sym });
                 for (const fn of (this._liqMessageHooks || [])) { try { fn(batch, sym); } catch(_) {} }
+                // Relay this live cross to a partner tab that's currently following us — its own
+                // _liqLaunchBatch bails out early (see top of this fn) so it never opens a liq WS
+                // of its own and would otherwise never see a fresh threshold cross until we close
+                // this batch an hour from now. No localStorage write on this hot path — see
+                // _sharedBroadcast.
+                if (this.cfg.ashfallCrossEnabled) {
+                  this._sharedBroadcast?.('liqLiveRelay', {
+                    sym, cycleId: batch.id,
+                    sLiqTurnover: batch.sLiqTurnover[sym], bLiqTurnover: batch.bLiqTurnover[sym],
+                  });
+                }
               }
               this._liqPersistBatches();
             } catch(_) {}
@@ -2570,6 +2649,14 @@
           const allB = history.flatMap(c => (c.results || []).map(r => r.bLiqRaw || 0)).filter(v => v > 0);
           this._liqAvgSTurnover = allS.length ? allS.reduce((a, b) => a + b, 0) / allS.length : 0;
           this._liqAvgBTurnover = allB.length ? allB.reduce((a, b) => a + b, 0) / allB.length : 0;
+          // Keep a following partner's depth baseline in sync — its own _liqCycleHistory never
+          // accumulates while following (it doesn't run its own batches), so without this its
+          // _liqAvgSTurnover/_liqAvgBTurnover would stay stuck at 0 and every relayed live liq
+          // message (see liqLiveRelay in _liqLaunchBatch/_liqResumeBatch) would compute a
+          // meaningless depth of 0 no matter how large the actual liquidation was.
+          if (this.cfg.ashfallCrossEnabled) {
+            this._sharedBroadcast?.('liqAvgTurnover', { avgS: this._liqAvgSTurnover, avgB: this._liqAvgBTurnover });
+          }
         },
 
         _liqChartSvg(shown) {
