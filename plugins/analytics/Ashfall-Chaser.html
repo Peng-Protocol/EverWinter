@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.69.0';
+  const VERSION        = '1.69.1';
   // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
   // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
   // one _micOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
@@ -83,7 +83,7 @@
     afGcEnabled: true,
     afGcThresholdPct: 50,
     afGcFreshnessMult: 2,
-    afLfDrawdownFailoverEnabled: true,
+    afSwitchoverEnabled: true,
   });
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
@@ -281,10 +281,10 @@
                   </div>
                 </label>
                 <label class="tog" style="margin-top:8px">
-                  <div class="tog-t" :class="cfg.afLfDrawdownFailoverEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afLfDrawdownFailoverEnabled=!cfg.afLfDrawdownFailoverEnabled;if(!cfg.afLfDrawdownFailoverEnabled)_afLfApplyDrawdownFailover(false);persist()}"><div class="tog-k"></div></div>
+                  <div class="tog-t" :class="cfg.afSwitchoverEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afSwitchoverEnabled=!cfg.afSwitchoverEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
-                    <div class="tog-l">Leader/Follower DDH Failover</div>
-                    <div class="ash-hint">Temporarily flips Main Config → Follow Partner Bot when either side enters drawdown: this bot follows during its own DDH, and leads when Permafrost is in DDH, so live-liq entry stays covered. Turning this off restores the previous Follow Partner setting if failover changed it.</div>
+                    <div class="tog-l">Switchover</div>
+                    <div class="ash-hint">Switches the leader/follower setting depending on drawdown status, ensures live liq entry</div>
                   </div>
                 </label>
                 <label class="tog" style="margin-top:8px">
@@ -719,8 +719,6 @@
         afGcWindow:      [],
         _afGcLastStep:   0,
         _afGcLastSeenTs: 0,
-        _afLfAutoFollowPrevious: null, // original lfFollowPartner before plugin drawdown failover temporarily changes it
-        _afLfAutoFollowReason: null,  // 'own-ddh' or 'partner-ddh' while the failover owns lfFollowPartner
         _liqBatches: [],
         _liqLastBatchSyms: [], // tickers picked for liq surveillance on the most recent scan only
         _liqMessageHooks: [], // plugins push (batch, sym) => void here to react to live liq turnover, e.g. Liquid-Diver
@@ -813,7 +811,7 @@
           for (const [k, v] of Object.entries(ASHFALL_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = v;
           }
-          this._afLfApplyDrawdownFailover(_afWasHalted);
+          this._afApplySwitchover(_afWasHalted);
           try {
             const saved = JSON.parse(localStorage.getItem(ASH_LIQ_KEY) || 'null');
             if (Array.isArray(saved) && this.cfg.ashLiqEnabled) {
@@ -950,7 +948,7 @@
                 _afWasGainsLocked = _glocked;
                 this._afCrossWrite(_glocked ? 'glk-start' : 'glk-end');
               }
-              this._afLfApplyDrawdownFailover(_halted);
+              this._afApplySwitchover(_halted);
               if (this.cfg.ashfallMutualDdLiftEnabled && _halted) {
                 const _allEvents   = this._afCrossRead();
                 const _fromPartner = _allEvents.filter(e => e.source === 'winter');
@@ -2798,35 +2796,19 @@
           return `regime${side}${band}`;
         },
 
-        _afLfApplyDrawdownFailover(ownHalted = this._isDrawdownHalted?.() ?? false) {
-          const failoverEnabled = this.cfg.afLfDrawdownFailoverEnabled && this.cfg.ashfallCrossEnabled;
-          const partnerHalted = failoverEnabled ? this._afPartnerHalted() : false;
-          const setFollow = (next, reason, msg) => {
-            if (this._afLfAutoFollowReason !== reason) this._afLfAutoFollowPrevious = !!this.cfg.lfFollowPartner;
-            this._afLfAutoFollowReason = reason;
-            if (this.cfg.lfFollowPartner !== next) {
-              this.cfg.lfFollowPartner = next;
-              this.persist();
-              this.log(msg, 'warn');
-            }
+        _afApplySwitchover(ownHalted = this._isDrawdownHalted?.() ?? false) {
+          if (!this.cfg.afSwitchoverEnabled || !this.cfg.ashfallCrossEnabled) return;
+          const partnerHalted = this._afPartnerHalted();
+          const setFollow = (next, msg) => {
+            if (this.cfg.lfFollowPartner === next) return;
+            this.cfg.lfFollowPartner = next;
+            this.persist();
+            this.log(msg, 'warn');
           };
-          const restore = () => {
-            if (!this._afLfAutoFollowReason) return;
-            const prev = !!this._afLfAutoFollowPrevious;
-            this._afLfAutoFollowPrevious = null;
-            this._afLfAutoFollowReason = null;
-            if (this.cfg.lfFollowPartner !== prev) {
-              this.cfg.lfFollowPartner = prev;
-              this.persist();
-              this.log('[ASH] 🤝 Leader/Follower drawdown failover cleared — restored Follow Partner Bot ' + (prev ? 'ON' : 'OFF') + '.', 'info');
-            }
-          };
-          if (failoverEnabled && ownHalted && !this._manualHalt) {
-            setFollow(true, 'own-ddh', '[ASH] 🤝 Own drawdown halt active — Follow Partner Bot turned ON so partner leads live-liq surveillance.');
+          if (ownHalted && !this._manualHalt) {
+            setFollow(true, '[ASH] 🤝 Switchover — own drawdown active; Follow Partner Bot turned ON so Permafrost leads live-liq surveillance.');
           } else if (partnerHalted) {
-            setFollow(false, 'partner-ddh', '[ASH] 🤝 Partner drawdown halt active — Follow Partner Bot turned OFF so this bot leads live-liq surveillance.');
-          } else {
-            restore();
+            setFollow(false, '[ASH] 🤝 Switchover — Permafrost drawdown active; Follow Partner Bot turned OFF so this bot leads live-liq surveillance.');
           }
         },
 
