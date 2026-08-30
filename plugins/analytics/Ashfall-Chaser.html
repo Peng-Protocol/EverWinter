@@ -83,6 +83,7 @@
     afGcEnabled: true,
     afGcThresholdPct: 50,
     afGcFreshnessMult: 2,
+    afLfDrawdownFailoverEnabled: true,
   });
   const ASH_KEY        = '__ashfall_chaser_v1';
   const ASH_LIQ_KEY         = '__ash_liq_batches';
@@ -711,6 +712,8 @@
         afGcWindow:      [],
         _afGcLastStep:   0,
         _afGcLastSeenTs: 0,
+        _afLfAutoFollowPrevious: null, // original lfFollowPartner before plugin drawdown failover temporarily changes it
+        _afLfAutoFollowReason: null,  // 'own-ddh' or 'partner-ddh' while the failover owns lfFollowPartner
         _liqBatches: [],
         _liqLastBatchSyms: [], // tickers picked for liq surveillance on the most recent scan only
         _liqMessageHooks: [], // plugins push (batch, sym) => void here to react to live liq turnover, e.g. Liquid-Diver
@@ -803,6 +806,7 @@
           for (const [k, v] of Object.entries(ASHFALL_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = v;
           }
+          this._afLfApplyDrawdownFailover(_afWasHalted);
           try {
             const saved = JSON.parse(localStorage.getItem(ASH_LIQ_KEY) || 'null');
             if (Array.isArray(saved) && this.cfg.ashLiqEnabled) {
@@ -939,6 +943,7 @@
                 _afWasGainsLocked = _glocked;
                 this._afCrossWrite(_glocked ? 'glk-start' : 'glk-end');
               }
+              this._afLfApplyDrawdownFailover(_halted);
               if (this.cfg.ashfallMutualDdLiftEnabled && _halted) {
                 const _allEvents   = this._afCrossRead();
                 const _fromPartner = _allEvents.filter(e => e.source === 'winter');
@@ -2784,6 +2789,38 @@
           const hi   = this.cfg.micRegimeHiThreshold  ?? 80;
           const band = dom >= hi ? 'hi' : dom >= mid ? 'mid' : 'lo';
           return `regime${side}${band}`;
+        },
+
+        _afLfApplyDrawdownFailover(ownHalted = this._isDrawdownHalted?.() ?? false) {
+          if (!this.cfg.afLfDrawdownFailoverEnabled || !this.cfg.ashfallCrossEnabled) return;
+          const partnerHalted = this._afPartnerHalted();
+          const setFollow = (next, reason, msg) => {
+            if (this._afLfAutoFollowReason !== reason) this._afLfAutoFollowPrevious = !!this.cfg.lfFollowPartner;
+            this._afLfAutoFollowReason = reason;
+            if (this.cfg.lfFollowPartner !== next) {
+              this.cfg.lfFollowPartner = next;
+              this.persist();
+              this.log(msg, 'warn');
+            }
+          };
+          const restore = () => {
+            if (!this._afLfAutoFollowReason) return;
+            const prev = !!this._afLfAutoFollowPrevious;
+            this._afLfAutoFollowPrevious = null;
+            this._afLfAutoFollowReason = null;
+            if (this.cfg.lfFollowPartner !== prev) {
+              this.cfg.lfFollowPartner = prev;
+              this.persist();
+              this.log('[ASH] 🤝 Leader/Follower drawdown failover cleared — restored Follow Partner Bot ' + (prev ? 'ON' : 'OFF') + '.', 'info');
+            }
+          };
+          if (ownHalted && !this._manualHalt) {
+            setFollow(true, 'own-ddh', '[ASH] 🤝 Own drawdown halt active — Follow Partner Bot turned ON so partner leads live-liq surveillance.');
+          } else if (partnerHalted) {
+            setFollow(false, 'partner-ddh', '[ASH] 🤝 Partner drawdown halt active — Follow Partner Bot turned OFF so this bot leads live-liq surveillance.');
+          } else {
+            restore();
+          }
         },
 
         // Standalone version of the boolean the Mutual DDH Lift check above computes inline —
