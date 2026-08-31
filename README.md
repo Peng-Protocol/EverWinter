@@ -35,8 +35,6 @@ For a tighter coupling than passive data-sharing, **Leader / Follower** (Main Co
 
 **Compatible with Permafrost/Ashfall.** Bulk tickers, OC, and kline/PEC all defer through the same per-cycle shared read a following bot already uses with neither plugin loaded — nothing extra needed there. Liquidation surveillance defers the same way at the batch level: a following bot's `_liqLaunchBatch`/`_liqResumeBatch` bails out immediately and never opens its own WS. A live threshold cross (`sliq`/`bliq`/`msliq`/`mbliq`) can't wait for the next shared-cache read, though — it has to reach the follower within the same WS message the leader just received, not on the following bot's own next scan cycle — so that one path has its own relay; see **Live Liq Relay** below.
 
-Permafrost/Ashfall also include a Cross-tab **Switchover** toggle for Leader/Follower. When enabled, it switches the leader/follower setting depending on drawdown status to ensure live liq entry: a bot in its own drawdown turns **Follow Partner Bot** on, while a bot whose partner is in drawdown turns it off and takes over live-liq surveillance. These are persistent setting changes, not temporary overrides.
-
 In addition to the shared data pool, the Permafrost and Ashfall plugins maintain a separate cross-bot sample state (`__ew_sample_state_v1`) written after each structure cycle and read every 15 seconds. This state carries wave score, funding skew, OI skew, kline bar data, and liquidation cycle history. When one bot is in a drawdown halt or gains lock, its plugin reads the partner's sample to keep the Status Block bars, liq chart, and WAVE score line current — the halted bot's displays stay populated from the running partner's latest readings without opening any new entries.
 
 ---
@@ -66,6 +64,16 @@ Load order matters: live trading plugins (EverWinter, SunChaser) must load befor
 
 ---
 
+## EverWinter / SunChaser (Live Trading Plugins)
+
+EverWinter turns PseudoWinter into a live short-only Bybit bot; SunChaser does the same for PseudoChaser as long-only. Both sign requests with the stored `__ew_creds`/`__sc_creds` API key and place real orders — the topbar reads **Very Real Orders** once loaded, in place of the base simulation's **No Real Orders**.
+
+- **Balance**: fetched automatically the moment a valid key/secret pair is saved in the credentials panel, not only at page load.
+- **Symbol banning**: a symbol is banned for a week if Bybit reports it as unsupported for trading, or blocked pending a required trading agreement (e.g. certain leveraged/inverse instruments) — either case needs the same manual action on Bybit's side before the symbol can trade again, so both are treated as a permanent block rather than retried every cycle.
+- **Post-bail re-check**: after a bail sweep (manual Danger Zone bail or an automatic Drawdown Throttle bail), the plugin queries the exchange directly for any position still open in its own direction (Sell for EverWinter, Buy for SunChaser) and force-flattens it with a direct reduceOnly market order. This catches positions a bail's own close order failed to fully fill. It confirms the position is flat — it does not retroactively correct the PnL already recorded for that trade from the first close attempt.
+
+---
+
 ## Main Config
 
 Changes take effect immediately and are persisted to localStorage automatically.
@@ -78,9 +86,9 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Min Notional** (`minNotional`) | Base margin per position in USDT. Actual order size = minNotional × leverage. |
 | **TP %** (`tpPct`) | Take-profit target. When EDa is active this is the buffered target — the debt-free close happens at a lower percentage. |
 | **SL %** (`slPct`) | Stop-loss. Position closes immediately when mark price hits this level. |
-| **Drawdown Throttle** (`drawdownThrottleEnabled`) | Halts new entries for a configurable duration (`drawdownHaltHours`, default 12h; free-entry field, no upper bound) when rolling 6h realized PnL drops below a loss threshold. |
+| **Drawdown Throttle** (`drawdownThrottleEnabled`) | Halts new entries for a configurable duration (`drawdownHaltHours`, default 12h; free-entry field, no upper bound) when rolling 6h realized PnL drops below a loss threshold. The Halt tab shows a live readout of the current 6h rolling PnL and a **Clear 6hr Record** button (with confirmation) to zero the window manually — independent of any active halt. |
 | **Drawdown Factor** (`drawdownThrottleFactor`) | Loss threshold as a multiple of entry margin. At 0.5× with $1 margin, $0.50 of rolling losses triggers the halt. |
-| **Gains Lock** (`gainsLockEnabled`) | Halts new entries for 12 hours once rolling 6h profit hits a target. Banks a winning streak before it reverses. |
+| **Gains Lock** (`gainsLockEnabled`) | Halts new entries for 12 hours once rolling 6h profit hits a target. Banks a winning streak before it reverses. Same 6h rolling PnL readout and **Clear 6hr Record** button as Drawdown Throttle, shown in its own section of the Halt tab. |
 | **Gains Factor** (`gainsLockFactor`) | Profit target as a multiple of entry margin. Same scale as Drawdown Factor. |
 | **Manual Halt** | Button (Halt tab) that blocks all new position entry indefinitely until manually lifted. Independent of Drawdown Throttle and Gains Lock — overrides both and doesn't stack with either. |
 | **EDa / Laggard Check** (`laggardCheckEnabled`) | Enables the Effective Debt Adjusted system. Realized losses are passed forward to surviving positions, which take higher TP targets to recover the debt. **Requires the EDa-Winter / EDa-Chaser plugin** (`plugins/modes/`). |
@@ -129,7 +137,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 - **Export** — Downloads current bot state (config, positions, closed trades, ban list, EDa state) as a `.json` file. Plugins with their own data (Permafrost/Ashfall profile, scorecard) have separate Export buttons inside their own accordions — the Stats menu Export covers the base bot state only.
 - **Import** — Restores state from a previously exported `.json` file. Config fields merge field-by-field; positions replace wholesale. A 5s debounce prevents accidental double-imports. Any config key that no longer belongs to a currently-loaded feature (the bot itself or an installed plugin) is dropped automatically on import and on every save — retired settings from an old config file don't linger indefinitely.
-- **Clear Closed Trades** — Wipes the closed trades list and resets session stats. Open positions are unaffected.
+- **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
 
 ### Activity Log
@@ -148,13 +156,13 @@ The log is capped at 300 entries in memory and in localStorage. Oldest entries a
 
 ## Trades Menu
 
-The trades panel shows a card for each closed trade, newest first. Each card carries a close-reason badge — **TP**, **SL**, **FORCE** (runtime limit), **BAIL** (drawdown throttle bail, Winter only), **EDa** (laggard debt-free close), or **Sub** (closed to free a slot for a higher-ranked candidate via MIW/MIC Substitution). Reasons introduced by other plugins show their own registered label, or the raw reason name if a plugin hasn't registered one.
+The trades panel shows a card for each closed trade, newest first. Each card carries a close-reason badge — **TP**, **SL**, **FORCE** (runtime limit), **BAIL** (drawdown throttle bail — closes every open position immediately, both bots), **EDa** (laggard debt-free close), or **Sub** (closed to free a slot for a higher-ranked candidate via MIW/MIC Substitution). Reasons introduced by other plugins show their own registered label, or the raw reason name if a plugin hasn't registered one. On EverWinter/SunChaser, a bail sweep is followed by a direct exchange re-check — see **EverWinter / SunChaser** below.
 
 **Roll-up card**: when the closed trades list exceeds 50 entries, the oldest are compacted into a single roll-up card showing their net PnL, trade count, and the date range they cover. The roll-up is not a trade — it is a historical summary. In the PnL chart, the roll-up's net value acts as a baseline offset applied to every plotted point.
 
 **PnL chart**: click the **PNL CHART** bar below the header to expand a cumulative PnL line chart. The X-axis spans from the first to the last individual closed trade at fixed spacing. The chart is green when the net result is positive, red when negative. The chart only appears once at least 2 individual trades are closed.
 
-**CLEAR button**: removes all closed trades and resets session stats. Clicking CLEAR reveals an inline confirmation ("Sure? Yes / No") before anything is deleted. Yes confirms; No cancels with no change.
+**CLEAR button**: removes all closed trades, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Clicking CLEAR reveals an inline confirmation ("Sure? Yes / No") before anything is deleted. Yes confirms; No cancels with no change.
 
 ---
 
