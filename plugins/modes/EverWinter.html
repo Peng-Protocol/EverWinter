@@ -21,13 +21,13 @@
   window.__BotPlugin = {
     id:        'everwinter',
     name:      'EverWinter',
-    version:   '1.0.4',
+    version:   '1.1.0',
     targetBot: 'pseudowinter',
     after:     [],
     before:    [],
     conflicts: [],
     requires:  [],
-    touches:   ['init', 'pseudoOpenShort', 'pseudoClosePosition', 'pseudoWatchPositions', 'refreshBalance'],
+    touches:   ['init', 'pseudoOpenShort', 'pseudoClosePosition', 'pseudoWatchPositions', 'refreshBalance', 'bailAll'],
     suppresses: ['pseudoOpenShort', 'refreshBalance'],
 
     css: `
@@ -70,6 +70,7 @@
       const _origClose = def.pseudoClosePosition;
       const _origWatch = def.pseudoWatchPositions;
       const _origCycle = def.runScheduledCycle;
+      const _origBailAll = def.bailAll;
 
       return Object.assign({}, def, {
 
@@ -85,6 +86,8 @@
           // Update loading screen immediately — it persists until showApp() fires after init completes
           const _loadLogo = document.querySelector('.pw-logo');
           if (_loadLogo) _loadLogo.textContent = '❄️ EVERWINTER';
+          const _logoSub = document.querySelector('.logo-sub');
+          if (_logoSub) _logoSub.textContent = _logoSub.textContent.replace('No Real Orders', 'Very Real Orders');
           await _origInit.call(this);
           if (typeof this.setThemeEmoji === 'function') this.setThemeEmoji('❄️');
           this.appName  = 'EVERWINTER';
@@ -104,7 +107,11 @@
 
         _ewSaveCreds() {
           localStorage.setItem('__ew_creds', JSON.stringify({ key: this.creds.key, secret: this.creds.secret }));
-          this._ewSyncTs();
+          if (this.creds.key && this.creds.secret) {
+            this._ewSyncTs().then(() => this.refreshBalance());
+          } else {
+            this._ewSyncTs();
+          }
           this.log('[EW] Credentials saved.', 'info');
         },
 
@@ -170,7 +177,7 @@
             const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
             const d = await this._ewSafeJson(r);
             if (!d)              { this.log(`[EW] placeOrder ${symbol}: empty response`, 'error'); return null; }
-            if (d.retCode !== 0) { this.log(`[EW] placeOrder ${symbol}: ${d.retMsg}`, 'error'); return d.retMsg?.toLowerCase().includes('not supported') ? 'NOT_LIVE' : null; }
+            if (d.retCode !== 0) { this.log(`[EW] placeOrder ${symbol}: ${d.retMsg}`, 'error'); const m = (d.retMsg || '').toLowerCase(); return (m.includes('not supported') || m.includes('sign the required agreement')) ? 'NOT_LIVE' : null; }
             return d.result?.orderId || null;
           } catch(e) { this.log(`[EW] placeOrder: ${e.message}`, 'error'); return null; }
         },
@@ -220,7 +227,7 @@
               this._banSymbol?.(symbol, `leverage ${lev}× exceeds exchange max`);
               return false;
             }
-            this.log(`[EW] setLeverage ${symbol}: ${msg}`, 'warn');
+            if (!msg.toLowerCase().includes('api key has expired')) this.log(`[EW] setLeverage ${symbol}: ${msg}`, 'warn');
           } catch(e) { this.log(`[EW] setLeverage error: ${e.message}`, 'warn'); }
           return true;
         },
@@ -412,7 +419,7 @@
           if (!await this._ewSetLeverage(sym, lev)) return;
           this.log(`[EW] Placing SELL ${sym} qty=${qty} @ ~${price}…`, 'info');
           const oid = await this.placeOrder(sym, 'Sell', 'Market', qty, price);
-          if (!oid || oid === 'NOT_LIVE') { if (oid === 'NOT_LIVE') { this.log(`[EW] ${sym}: not supported on exchange — banned for 1 week`, 'warn'); this._banSymbol?.(sym, 'not supported on exchange'); } return; }
+          if (!oid || oid === 'NOT_LIVE') { if (oid === 'NOT_LIVE') { this.log(`[EW] ${sym}: blocked by exchange — banned for 1 week`, 'warn'); this._banSymbol?.(sym, 'blocked by exchange (unsupported or agreement required)'); } return; }
 
           const fillPrice = await this.waitForPosition(sym, oid);
           if (!fillPrice) return;
@@ -448,12 +455,15 @@
             orders:             [],
             _stageCount:        0,
             _pseudo:            false,
-            _loser:             candidate._loser === true,
             _lastSeenAt:        Date.now(),
             _binary:            binary,
           };
 
           this.positions.push(pos);
+          // Pass through any caller-supplied tagging fields (e.g. MIW's _miw/_miwCriteria)
+          // so a registered _roleBadgeProviders entry can claim this position's badge
+          // instead of falling back to the plain GAINER/LOSER default.
+          { const _openSkip = new Set(['_pseudo','_lastSeenAt','_stageCount','_swStageCount','_binary','_slPctOverride','_fundingIntervalMs','_funIntervalMs','_fundingAccrued']); for (const [k,v] of Object.entries(candidate)) { if (k.startsWith('_') && !_openSkip.has(k)) pos[k] = v; } }
           if (typeof this.persist === 'function') this.persist();
 
           if (tpPrice > 0) await this.setTP(pos, tpPrice);
@@ -553,6 +563,38 @@
         async runScheduledCycle() {
           if (this.creds.key && this.creds.secret) await this._ewSyncPositions();
           return _origCycle.call(this);
+        },
+
+        async _ewForceFlatten(symbol, qty) {
+          try {
+            await this._ewDelay();
+            const body = JSON.stringify({ category: 'linear', symbol, side: 'Buy', orderType: 'Market', qty: String(qty), reduceOnly: true, timeInForce: 'IOC' });
+            const h = await _sign(this.creds.key, this.creds.secret, body, this._tsOffset);
+            const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body });
+            const d = await this._ewSafeJson(r);
+            if (!d || d.retCode !== 0) this.log(`[BAIL-ERR] ${symbol} — ${d?.retMsg || 'flatten order failed'}`, 'warn');
+          } catch(e) { this.log(`[BAIL-ERR] ${symbol} — ${e.message}`, 'warn'); }
+        },
+
+        async bailAll() {
+          await _origBailAll.call(this);
+          if (!(this.creds.key && this.creds.secret)) return;
+          // The close attempt above removes positions locally regardless of whether the
+          // real reduceOnly order actually filled, so re-check the exchange directly
+          // (not this.positions) for any short still open and flatten it here.
+          try {
+            await this._ewDelay();
+            const p = 'category=linear&settleCoin=USDT';
+            const h = await _sign(this.creds.key, this.creds.secret, p, this._tsOffset);
+            const r = await fetch(`${this.base}/v5/position/list?${p}`, { headers: h });
+            const d = await this._ewSafeJson(r);
+            const lingering = (d?.retCode === 0 ? (d.result?.list || []) : []).filter(e => e.side === 'Sell' && parseFloat(e.size) > 0);
+            if (lingering.length) {
+              this.log(`[BSC] ⚡ Bail re-check: ${lingering.length} short(s) still open — flattening directly…`, 'warn');
+              for (const e of lingering) await this._ewForceFlatten(e.symbol, e.size);
+              this.log(`[BSC] ⚡ Bail re-check complete.`, 'warn');
+            }
+          } catch(e) { this.log(`[BAIL-ERR] re-check failed — ${e.message}`, 'warn'); }
         },
 
         async pseudoWatchPositions() {
