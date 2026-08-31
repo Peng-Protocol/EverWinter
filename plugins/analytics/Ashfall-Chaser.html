@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.69.1';
+  const VERSION        = '1.69.3';
   // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
   // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
   // one _micOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
@@ -91,7 +91,13 @@
   const ASH_LIQ_SEQUESTER_KEY = '__ash_liq_sequester';
   const ASH_OC_HIST_KEY     = '__ash_oc_history';
   const CROSS_KEY      = '__everwinter_cross_v1';
-  const CROSS_TTL      = 25 * 3600 * 1000; // must outlast the longest configurable halt/gains-lock (24h slider max), or a bot's own ddh-start/glk-start marker ages off the shared bus mid-halt and Mutual DDH/Gains Lock lift can never fire for the back half of a long halt — was 6h against a 6-24h configurable range
+  const CROSS_TTL      = 30 * 24 * 3600 * 1000; // was tied to a 24h slider max that no longer holds (drawdown/gains-lock
+    // hours are now user-set to arbitrary values, seen well past 24h in practice) — a bot's own ddh-start/glk-start
+    // marker aging off the shared bus mid-halt used to silently kill Mutual DDH/Gains Lock lift for the back half of
+    // any halt longer than the TTL, with no error and no retry. Sized generously (30d) instead of re-deriving from a
+    // config value that can change. Own-side DDH lift math no longer depends on this at all — see _afDdhStartedAt —
+    // but partner-side reads (Switchover's _afPartnerHalted, Gains Lock lift) still do, so this still needs to
+    // outlast whatever halt length is actually configured.
   const SCORE_KEY      = '__everwinter_scorecard_v1';
   const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
   // Full-universe PEC/VSG candle log for Pre-Screening — same same-origin-localStorage
@@ -308,7 +314,7 @@
               </div>
               <div x-show="cfg.ashfallCrossEnabled && afCrossEvents.length" style="margin-top:6px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
                 <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">PARTNER FEED</div>
-                <div x-html="_afCrossFeedHtml()" style="padding:2px 8px 4px;max-height:130px;overflow-y:auto"></div>
+                <div x-html="_afCrossFeedHtml()" style="padding:2px 8px 4px;max-height:114px;overflow-y:auto"></div>
               </div>
             </div>
             <div class="ash-zone" x-show="tS">
@@ -689,6 +695,11 @@
 
       return Object.assign({}, def, {
 
+        _afDdhStartedAt: null, // Date.now() of this bot's own current DDH halt, set once at the
+                               // moment it starts and cleared on lift. Local + persisted, so Mutual
+                               // DDH Lift's age comparison never depends on reading our own ddh-start
+                               // note back off the shared cross bus, which can age out of CROSS_TTL
+                               // mid-halt on any halt longer than the TTL window.
         afEvents:     [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth } — kept for import compat, not scored
         afCloses:     [],   // { ts, pnl, skew, breadth } — per-close PnL paired with structure at close time
         afWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
@@ -767,6 +778,13 @@
           // *older* halt to lift, so an inflated timestamp can flip which side loses the halt).
           _afWasHalted      = this._isDrawdownHalted?.() ?? false;
           _afWasGainsLocked = this._isGainsLocked?.()    ?? false;
+          // Restored early (ahead of the main ASH_KEY blob load further down) because the
+          // mid-halt backfill immediately below needs it to decide whether a value already
+          // exists before falling back to a back-calculated guess.
+          try {
+            const _afEarly = JSON.parse(localStorage.getItem(ASH_KEY) || 'null');
+            if (_afEarly && typeof _afEarly.ddhStartedAt === 'number') this._afDdhStartedAt = _afEarly.ddhStartedAt;
+          } catch(_) {}
           // The sync above deliberately skips writing a ddh-start/glk-start cross event on a
           // mid-halt reload (see comment above) to avoid an inflated "now" timestamp — but that
           // means a bot whose tab restarts mid-halt (backgrounded/killed on mobile, manual
@@ -783,6 +801,17 @@
               if (!_ownDdh || _ownDdh.kind === 'ddh-end') {
                 const _haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
                 this._afCrossWrite('ddh-start', null, { ts: this._drawdownHaltUntil - _haltMs });
+              }
+              // _afDdhStartedAt is normally restored from the persisted blob above (set the moment
+              // the halt began, on whichever earlier session actually triggered it). This only
+              // fires as a one-time migration fallback — upgrading mid-halt, or a persisted value
+              // that somehow never got written — using the same back-calculation as the cross-bus
+              // backfill above. Imperfect if the halt wasn't started via drawdownHaltHours (e.g. the
+              // host's own native throttle running a different duration), but only ever needed once;
+              // every halt-start going forward stamps this directly at the moment it happens.
+              if (this._afDdhStartedAt == null) {
+                const _haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
+                this._afDdhStartedAt = this._drawdownHaltUntil - _haltMs;
               }
             }
             if (_afWasGainsLocked && typeof this._gainsLockHaltUntil === 'number') {
@@ -942,6 +971,8 @@
               const _glocked = this._isGainsLocked?.()    ?? false;
               if (_halted !== _afWasHalted) {
                 _afWasHalted = _halted;
+                this._afDdhStartedAt = _halted ? Date.now() : null;
+                this.persist();
                 this._afCrossWrite(_halted ? 'ddh-start' : 'ddh-end');
               }
               if (_glocked !== _afWasGainsLocked) {
@@ -950,15 +981,18 @@
               }
               this._afApplySwitchover(_halted);
               if (this.cfg.ashfallMutualDdLiftEnabled && _halted) {
-                const _allEvents   = this._afCrossRead();
-                const _fromPartner = _allEvents.filter(e => e.source === 'winter');
-                const _fromSelf    = _allEvents.filter(e => e.source === 'chaser');
-                const _partnerDdh  = _fromPartner.filter(e => e.kind === 'ddh-start' || e.kind === 'ddh-end').at(-1);
-                const _selfDdh     = _fromSelf.filter(e => e.kind === 'ddh-start').at(-1);
-                if (_partnerDdh?.kind === 'ddh-start' && _selfDdh) {
-                  if (_selfDdh.ts < _partnerDdh.ts) {
+                // Self side reads _afDdhStartedAt (local, persisted, never expires) instead of
+                // reading our own ddh-start note back off the shared cross bus — that note is
+                // still written below for the partner's benefit, but it ages out of CROSS_TTL on
+                // any halt longer than the TTL, which used to silently strand this comparison
+                // with nothing to compare against for the rest of a long halt. Partner side still
+                // reads the bus, since that's the only visibility we have into their state.
+                const _partnerDdh = this._afCrossRead().filter(e => e.source === 'winter' && (e.kind === 'ddh-start' || e.kind === 'ddh-end')).at(-1);
+                if (_partnerDdh?.kind === 'ddh-start' && this._afDdhStartedAt != null) {
+                  if (this._afDdhStartedAt < _partnerDdh.ts) {
                     this._drawdownHaltUntil = null;
                     this._haltLoggedKind = null;
+                    this._afDdhStartedAt = null;
                     this.persist();
                     this.log('[ASH] ♨ Mutual DDH lift — own halt is older; cleared.', 'info');
                   }
@@ -1042,6 +1076,7 @@
             localStorage.setItem(ASH_KEY, JSON.stringify({
               events: this.afEvents, closes: this.afCloses, wave: this.afWave,
               afKlineBar: this.afKlineBar, gcWindow: this.afGcWindow, gcLastStep: this._afGcLastStep,
+              ddhStartedAt: this._afDdhStartedAt,
             }));
           } catch(e) {}
         },
@@ -1712,7 +1747,7 @@
             if (e.kind === 'gc') detail = (e.pnl != null ? '+' + e.pnl.toFixed(2) : '') + (e.step != null ? ' · step ' + e.step : '');
             else if (e.kind === 'cascade' || e.kind === 'sacrifice') detail = (e.count != null ? '×' + e.count + ' ' : '') + (e.pnl != null ? (e.pnl >= 0 ? '+' : '') + e.pnl.toFixed(2) : '') + (e.symbol ? ' ' + e.symbol : '');
             else if (e.symbol) detail = e.symbol;
-            return `<div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">` +
+            return `<div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:8px;line-height:12px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">` +
               `<span>${m.icon}</span>` +
               `<span style="color:${m.color};font-weight:bold;white-space:nowrap">${m.label}</span>` +
               `<span style="color:var(--text-lo)">${detail}</span>` +
@@ -1722,8 +1757,7 @@
         },
 
         // Inline SVG wave plot — time-based 1-week window, bins data into pixel columns so
-        // the chart compacts automatically as history grows (no index stretching).
-        // `shown` comes from the caller's own x-show chain (accordion open + relevant cfg
+        // the chart compacts automatically as history grows (no index stretching).        // `shown` comes from the caller's own x-show chain (accordion open + relevant cfg
         // toggle) — Alpine still evaluates x-html bindings on hidden elements every reactive
         // tick, so without this the rebuild below would run every time `afWave` changes even
         // while the panel is collapsed. No artificial tick dependency here: Alpine already
