@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.69.3';
+  const VERSION        = '1.70.0'; // Extremity Scorer replaces the Slot Scorecard wholesale — see /versioning
   // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
   // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
   // one _micOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
@@ -48,12 +48,24 @@
     afShowScore: true,
     ashfallCrossEnabled: true,
     ashfallMutualDdLiftEnabled: true,
-    ashfallScorecardEnabled: true,
+    // Extremity Scorer (replaces the old Slot Scorecard, v1.70.0 — see /versioning).
+    // afExtremitySplitPct/afExtremityMinSamples govern the same "sort >=3 values into
+    // high/lukewarm/low" cutoff for every dial family (fund, V/A, IO/A, OCS, OCX,
+    // PEC/VSG shape magnitudes, Irregularity, Regime); afLukewarmRatioPct is the
+    // whole-ticker veto share. Liq anchors (sliq/bliq/msliq/mbliq/0liq) are not dials
+    // and are unaffected by any of these — see _afExtremityBuild.
+    afExtremityEnabled: true,
     afCoQualPenaltyEnabled: true,
     afCoQualDepthPct: 10,
-    afScorecardView: 'combined',
-    afRegimeScoringEnabled: false,
-    afRegimeMinSample: 5,
+    afExtremityView: 'combined',
+    afExtremitySplitPct: 25,
+    afExtremityMinSamples: 3,
+    afLukewarmRatioPct: 70,
+    afExtremityReEvalEnabled: true,
+    // Cap on afDialSamplePool — the rolling, in-memory-only pool of raw criterion
+    // readings (every annotation, not just closes) that the extreme-high/lukewarm/
+    // extreme-low cutoff is actually computed from. See _afDialSample/_afExtremityBuild.
+    afExtremitySampleCap: 300,
     afSpongeQuota: 30,
     afStaleSlotDays: 7,
     afPartnerScoreMode: 'wins',
@@ -98,10 +110,16 @@
     // config value that can change. Own-side DDH lift math no longer depends on this at all — see _afDdhStartedAt —
     // but partner-side reads (Switchover's _afPartnerHalted, Gains Lock lift) still do, so this still needs to
     // outlast whatever halt length is actually configured.
-  const SCORE_KEY      = '__everwinter_scorecard_v1';
+  // Extremity Scorer's own store — deliberately a fresh key, not the old scorecard's
+  // SCORE_KEY (dropped). The old records only ever carried a tag string + pnl; the
+  // magnitude-driven split this replaces it with reads that same tag string's existing
+  // numeric tier suffix (see dialInfo), so the record SHAPE is actually unchanged —
+  // but starting clean avoids mixing pre-Extremity history (recorded before any dial
+  // cutoff existed) into cutoff math it was never sampled for.
+  const EXTREMITY_KEY  = '__everwinter_extremity_v1';
   const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
   // Full-universe PEC/VSG candle log for Pre-Screening — same same-origin-localStorage
-  // sharing convention as SCORE_KEY/CROSS_KEY (Ashfall and Permafrost both read/write this,
+  // sharing convention as EXTREMITY_KEY/CROSS_KEY (Ashfall and Permafrost both read/write this,
   // so whichever fetches first each cycle saves the other one the trip), but deliberately
   // its own key rather than the generic _sharedWrite registry: that registry is capped at
   // SHARED_REGISTRY_BYTE_CAP (200KB, in PseudoChaser.html/PseudoWinter.html) sized for small
@@ -141,6 +159,11 @@
       const emoji = { vsgot: '⏫', vsgut: '⏬', vsgalpha: '🔼', vsgdelta: '🔽', vsgmomup: '⏩', vsgmomdn: '⏪', vsgirr: '🔀' }[base] || '📊';
       return emoji + c.slice(base.length);
     }
+    // regimeb+/regimes+ are the new Extremity Scorer dial keys (bull/bear dominance,
+    // Lo/Mid/Hi folded away — see dialDisplayKey); the old per-band names are kept
+    // resolvable below only so pre-Extremity history/exports still render.
+    if (c === 'regimeb+') return '🐂';
+    if (c === 'regimes+') return '🐻';
     if (/^regime([a-z]+)/.test(c)) {
       const m = c.match(/^(regime[a-z]+)/);
       const base = m[1];
@@ -166,9 +189,70 @@
   // regex branch instead of its bare-tag branch, showing a stray >/< after the emoji.
   const collapseCrit = c => c.replace(/\d+$/, '');
   const collapseKey = criteria => [...criteria].map(collapseCrit).sort().join(',');
+
+  // ── Extremity Scorer dial families ──
+  // Every continuous/tiered criterion already carries its computed depth as a numeric
+  // suffix on the annotated tag (e.g. "fund+3", "pecob+12" — see MultiIndicator-Chaser's
+  // _micOpen/_micAnnotateLiveCrit, which floor that same depth into a tier). The dial
+  // reuses that existing magnitude directly rather than needing a separate raw-value log.
+  // Two-pole families pit their '+'/'-' (or named-opposite) side against each other —
+  // "which extreme end was more profitable". Single-pole families (Irregularity) have no
+  // opposite reading at all (see StrategyBook.md: irregularity is the enemy of extremity,
+  // not a side of it) and only ever classify hot-vs-lukewarm within their own spread.
+  // Liq anchors (sliq/bliq/msliq/mbliq/0liq) are NOT here — categorical gates stay binary
+  // win/loss, no dial, see _afExtremityBuild's anchor pass.
+  const DIAL_POLES = {
+    'fund+': { family: 'fund', pole: 'pos' },       'fund-': { family: 'fund', pole: 'neg' },
+    'va+':   { family: 'va',   pole: 'pos' },       'va-':   { family: 'va',   pole: 'neg' },
+    'ioa+':  { family: 'ioa',  pole: 'pos' },       'ioa-':  { family: 'ioa',  pole: 'neg' },
+    'ocs+':  { family: 'ocs',  pole: 'pos' },       'ocs-':  { family: 'ocs',  pole: 'neg' },
+    'ocx+':  { family: 'ocx',  pole: 'pos' },       'ocx-':  { family: 'ocx',  pole: 'neg' },
+    'pecob+':    { family: 'pecshape', pole: 'pos' }, 'pecos+':    { family: 'pecshape', pole: 'neg' },
+    'pecalpha+': { family: 'pecmid',   pole: 'pos' }, 'pecdelta+': { family: 'pecmid',   pole: 'neg' },
+    'pecmomup+': { family: 'pecmom',   pole: 'pos' }, 'pecmomdn+': { family: 'pecmom',   pole: 'neg' },
+    'vsgot+':    { family: 'vsgshape', pole: 'pos' }, 'vsgut+':    { family: 'vsgshape', pole: 'neg' },
+    'vsgalpha+': { family: 'vsgmid',   pole: 'pos' }, 'vsgdelta+': { family: 'vsgmid',   pole: 'neg' },
+    'vsgmomup+': { family: 'vsgmom',   pole: 'pos' }, 'vsgmomdn+': { family: 'vsgmom',   pole: 'neg' },
+  };
+  const DIAL_SINGLE = new Set(['pecirr+', 'vsgirr+']);
+  // Bare Blind-Entry/Liquid-Diver tags carry no magnitude at all — sign is the entire
+  // signal. They fold into the SAME family as MIC's own tiered fund/ocs dial (previously
+  // kept in a deliberately separate bucket to avoid key collisions — under Extremity
+  // Scorer that collision is the point: one unified read per underlying signal) and always
+  // classify extreme, since there's no gradation to be lukewarm about.
+  const BARE_DIAL_TAGS = {
+    '+fund': { family: 'fund', pole: 'pos' }, '-fund': { family: 'fund', pole: 'neg' },
+    '+ocs':  { family: 'ocs',  pole: 'pos' }, '-ocs':  { family: 'ocs',  pole: 'neg' },
+  };
+  // Regime folds in as one more two-pole family (bull dominance vs bear dominance)
+  // instead of its old separate fixed Low/Mid/High x Bull/Bear 6-bucket system — the
+  // s/b prefix matches REGIME_SEGMENT_LABEL's existing convention (s=Bull, b=Bear); the
+  // lo/mid/hi band is dropped entirely, its old fixed thresholds replaced by the same
+  // sample-derived cutoff every other dial uses, driven by the depth already attached.
+  const regimeDialInfo = key => {
+    const m = key.match(/^regime([sb])(?:lo|mid|hi)\+$/);
+    return m ? { family: 'regime', pole: m[1] === 's' ? 'pos' : 'neg' } : null;
+  };
+  const dialInfo = key => DIAL_POLES[key] || BARE_DIAL_TAGS[key] || regimeDialInfo(key)
+    || (DIAL_SINGLE.has(key) ? { family: key.slice(0, -1), pole: 'single' } : null);
+  // Maps a family+pole back to a display/emoji-lookup key. Regime is the only family
+  // whose display key doesn't already match an existing pre-Extremity tag name (its old
+  // per-band names no longer apply once lo/mid/hi collapses into one dial) — everything
+  // else keeps its original tag string so afCritEmoji and the Blockable Criteria picker
+  // keep working unchanged.
+  const DIAL_DISPLAY = {
+    pecshape: ['pecob+', 'pecos+'], pecmid: ['pecalpha+', 'pecdelta+'], pecmom: ['pecmomup+', 'pecmomdn+'],
+    vsgshape: ['vsgot+', 'vsgut+'], vsgmid: ['vsgalpha+', 'vsgdelta+'], vsgmom: ['vsgmomup+', 'vsgmomdn+'],
+    pecirr: ['pecirr+', null], vsgirr: ['vsgirr+', null],
+  };
+  const dialDisplayKey = (family, pole) => {
+    if (family === 'regime') return pole === 'pos' ? 'regimeb+' : 'regimes+';
+    if (['fund', 'va', 'ioa', 'ocs', 'ocx'].includes(family)) return family + (pole === 'pos' ? '+' : '-');
+    const pair = DIAL_DISPLAY[family];
+    return pair ? (pole === 'neg' ? pair[1] : pair[0]) || family : family;
+  };
   // Regime segment display labels — bull = S-Liq dominant, bear = B-Liq dominant (matches
   // the S/B naming already used by the regime criteria themselves, see Regime.md).
-  const REGIME_SEGMENT_LABEL = { regimeslo: 'Low Bull', regimeblo: 'Low Bear', regimesmid: 'Mid Bull', regimebmid: 'Mid Bear', regimeshi: 'High Bull', regimebhi: 'High Bear' };
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old burns fade
   const MIN_MASS       = 6;                    // effective evidence mass required to override the timer
@@ -319,38 +403,48 @@
             </div>
             <div class="ash-zone" x-show="tS">
               <label class="tog">
-                <div class="tog-t" :class="cfg.ashfallScorecardEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashfallScorecardEnabled=!cfg.ashfallScorecardEnabled;_afScoreBuild();persist()}"><div class="tog-k"></div></div>
+                <div class="tog-t" :class="cfg.afExtremityEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afExtremityEnabled=!cfg.afExtremityEnabled;_afExtremityBuild();persist()}"><div class="tog-k"></div></div>
                 <div>
-                  <div class="tog-l">Slot Scorecard</div>
-                  <div class="ash-hint">Cumulative PnL per MIC slot combo across both bots. Partner closes are direction-inverted. Best → worst, left to right.</div>
+                  <div class="tog-l">Extremity Scorer</div>
+                  <div class="ash-hint">Sorts each criterion's own sampled readings into extreme-high / lukewarm / extreme-low, scores which extreme end closed profitably, and vetoes a ticker once too much of what it shows is lukewarm. Partner closes are direction-inverted. Replaces the old Slot Scorecard entirely.</div>
                 </div>
               </label>
-              <div x-show="cfg.ashfallScorecardEnabled" style="margin-top:8px">
+              <div x-show="cfg.afExtremityEnabled" style="margin-top:8px">
+                <div class="g">
+                  <div class="lbl">Extreme Split <b x-text="cfg.afExtremitySplitPct"></b>%</div>
+                  <input type="range" min="5" max="45" step="5" x-model.number="cfg.afExtremitySplitPct" @change="_afExtremityBuild();persist()">
+                  <div class="ash-hint">Top/bottom % of a criterion's own observed spread that counts as extreme. Everything in the middle is lukewarm.</div>
+                </div>
+                <div class="g" style="margin-top:8px">
+                  <div class="lbl">Min Samples <b x-text="cfg.afExtremityMinSamples"></b></div>
+                  <input type="range" min="3" max="30" step="1" x-model.number="cfg.afExtremityMinSamples" @change="_afExtremityBuild();persist()">
+                  <div class="ash-hint">A criterion needs at least this many sampled readings before it has a proven cutoff. Below it, every reading counts as lukewarm.</div>
+                </div>
+                <div class="g" style="margin-top:8px">
+                  <div class="lbl">Lukewarm Veto <b x-text="cfg.afLukewarmRatioPct"></b>%</div>
+                  <input type="range" min="30" max="100" step="5" x-model.number="cfg.afLukewarmRatioPct" @change="persist()">
+                  <div class="ash-hint">A ticker is vetoed once this share of its exhibited (dial-eligible) criteria come back lukewarm. Liq anchors are never counted here.</div>
+                </div>
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.afExtremityReEvalEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afExtremityReEvalEnabled=!cfg.afExtremityReEvalEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Extremity Re-Evaluation</div>
+                    <div class="ash-hint">At the end of every scan, re-checks each open position's own qualifying criteria against the current cutoffs (using this cycle's already-fetched data — no extra fetches) and closes it once it's fallen back to lukewarm by the same veto ratio above.</div>
+                  </div>
+                </label>
                 <div class="g">
                   <div class="lbl">Sponge Quota <b x-text="cfg.afSpongeQuota"></b> closes/criterion</div>
-                  <input type="range" min="10" max="200" step="10" x-model.number="cfg.afSpongeQuota" @change="_afScoreBuild();persist()">
-                  <div class="ash-hint">Max recent closes per criterion used to compute scores. Older records beyond this count are ignored. Lower = faster adaptation.</div>
+                  <input type="range" min="10" max="200" step="10" x-model.number="cfg.afSpongeQuota" @change="_afExtremityBuild();persist()">
+                  <div class="ash-hint">Max recent closes per criterion used to compute scores and cutoffs. Older records beyond this count are ignored. Lower = faster adaptation.</div>
                 </div>
                 <div class="g" style="margin-top:8px">
                   <div class="lbl">Stale Purge <b x-text="cfg.afStaleSlotDays"></b> days</div>
-                  <input type="number" min="1" step="1" x-model.number="cfg.afStaleSlotDays" @change="_afScoreTrim();_afScoreBuild();persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <input type="number" min="1" step="1" x-model.number="cfg.afStaleSlotDays" @change="_afScoreTrim();_afExtremityBuild();persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="ash-hint">Slots with no new closes in this many days are fully removed from the scorecard.</div>
-                </div>
-                <label class="tog" style="margin-top:8px">
-                  <div class="tog-t" :class="cfg.afRegimeScoringEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afRegimeScoringEnabled=!cfg.afRegimeScoringEnabled;afRegimeViewType=null;afRegimeDisplayType=_afRegimeCurrentType();_afScoreBuild();persist()}"><div class="tog-k"></div></div>
-                  <div>
-                    <div class="tog-l">Regime Based Scoring</div>
-                    <div class="ash-hint">Splits non-regime criteria scores into 6 buckets by which regime was active at open. Needs regime criteria selected in MIC.</div>
-                  </div>
-                </label>
-                <div x-show="cfg.afRegimeScoringEnabled" class="g" style="margin-top:8px">
-                  <div class="lbl">Regime Min Sample <b x-text="cfg.afRegimeMinSample"></b> closes</div>
-                  <input type="range" min="1" max="30" step="1" x-model.number="cfg.afRegimeMinSample" @change="_afScoreBuild();persist()">
-                  <div class="ash-hint">Below this many closes, a regime bucket falls back to the flat score for entry blocking/ranking — display still shows the raw regime figure.</div>
                 </div>
                 <div class="g" style="margin-top:8px">
                   <div class="lbl">Partner Score Push</div>
-                  <button @click="cfg.afPartnerScoreMode=cfg.afPartnerScoreMode==='wins'?'losses':cfg.afPartnerScoreMode==='losses'?'both':'wins';_afScoreBuild();persist()" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:3px;border:1px solid rgba(255,150,80,.35);background:rgba(255,150,80,.08);color:rgba(255,150,80,.9);cursor:pointer;letter-spacing:.5px;margin-top:4px" x-text="cfg.afPartnerScoreMode==='wins'?'Only Wins':cfg.afPartnerScoreMode==='losses'?'Only Losses':'Wins/Losses'"></button>
+                  <button @click="cfg.afPartnerScoreMode=cfg.afPartnerScoreMode==='wins'?'losses':cfg.afPartnerScoreMode==='losses'?'both':'wins';_afExtremityBuild();persist()" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:3px;border:1px solid rgba(255,150,80,.35);background:rgba(255,150,80,.08);color:rgba(255,150,80,.9);cursor:pointer;letter-spacing:.5px;margin-top:4px" x-text="cfg.afPartnerScoreMode==='wins'?'Only Wins':cfg.afPartnerScoreMode==='losses'?'Only Losses':'Wins/Losses'"></button>
                   <div class="ash-hint">Which partner outcomes move a criterion's score. Excluded outcomes still keep the criterion fresh.</div>
                 </div>
                 <label class="tog" style="margin-top:8px">
@@ -598,46 +692,24 @@
                 </div>
               </div>
             </div>
-            <div x-show="cfg.ashfallScorecardEnabled && cfg.micEnabled && _micPluginLoaded()" style="margin-top:8px;padding:6px 8px;background:rgba(255,150,80,.03);border:1px solid rgba(255,150,80,.1);border-radius:3px">
+            <div x-show="cfg.afExtremityEnabled && (cfg.micEnabled && _micPluginLoaded() || (cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded()))" style="margin-top:8px;padding:6px 8px;background:rgba(255,150,80,.03);border:1px solid rgba(255,150,80,.1);border-radius:3px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
-                <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)">SLOT SCORECARD (CHASER VIEW)</div>
+                <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)">EXTREMITY SCORER</div>
                 <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
                   <button x-show="!c" @click="if(!cfgLocked)c=true" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.35);background:rgba(255,80,80,.08);color:rgba(255,80,80,.8);cursor:pointer;letter-spacing:.5px">CLEAR</button>
                   <template x-if="c">
                     <span style="display:inline-flex;gap:3px;align-items:center">
                       <span style="font-family:var(--mono);font-size:7.5px;color:rgba(255,80,80,.8)">Sure?</span>
-                      <button @click="localStorage.removeItem('__everwinter_scorecard_v1'); _afScoreBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
+                      <button @click="localStorage.removeItem('__everwinter_extremity_v1'); _afExtremityBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
                       <button @click="c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
                     </span>
                   </template>
                 </span>
               </div>
-              <div x-html="_afScorecardHtml(open && cfg.ashfallScorecardEnabled && cfg.micEnabled && _micPluginLoaded(), 'mic')" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px"></div>
-              <div style="margin-top:5px;display:flex;justify-content:space-between;align-items:center;gap:4px">
-                <div>
-                  <button x-show="cfg.afRegimeScoringEnabled && afRegimeActiveTypes.length" @click="const a=afRegimeActiveTypes; const cur=afRegimeViewType||afRegimeDisplayType||a[0]; const i=a.indexOf(cur); afRegimeViewType=a[(i+1)%a.length]; afScorecardExpanded=null" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(190,130,255,.35);background:rgba(190,130,255,.08);color:rgba(190,130,255,.9);cursor:pointer;letter-spacing:.5px" x-text="_afRegimeSegmentLabel(afRegimeViewType||afRegimeDisplayType||afRegimeActiveTypes[0])"></button>
-                </div>
-                <button @click="cfg.afScorecardView=cfg.afScorecardView==='combined'?'own':'combined';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,150,80,.3);background:rgba(255,150,80,.06);color:rgba(255,150,80,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardView==='own'?'Own':'Combined'"></button>
-              </div>
-            </div>
-            <div x-show="cfg.ashfallScorecardEnabled && ((cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded()))" style="margin-top:8px;padding:6px 8px;background:rgba(150,150,255,.03);border:1px solid rgba(150,150,255,.1);border-radius:3px">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
-                <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)">BLIND-ENTRY / LIQUID-DIVER SCORECARD</div>
-                <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
-                  <button x-show="!c" @click="if(!cfgLocked)c=true" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.35);background:rgba(255,80,80,.08);color:rgba(255,80,80,.8);cursor:pointer;letter-spacing:.5px">CLEAR</button>
-                  <template x-if="c">
-                    <span style="display:inline-flex;gap:3px;align-items:center">
-                      <span style="font-family:var(--mono);font-size:7.5px;color:rgba(255,80,80,.8)">Sure?</span>
-                      <button @click="localStorage.removeItem('__everwinter_scorecard_v1'); _afScoreBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
-                      <button @click="c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
-                    </span>
-                  </template>
-                </span>
-              </div>
-              <div class="ash-hint">Same shared record store as the MIC/MIW scorecard above — CLEAR wipes both.</div>
-              <div x-html="_afScorecardHtml(open && cfg.ashfallScorecardEnabled && ((cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded())), 'blind')" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px"></div>
+              <div class="ash-hint" style="margin-bottom:4px">MIC and Blind-Entry/Liquid-Diver share one dial set now — same underlying signal, one read.</div>
+              <div x-html="_afExtremityHtml(open && cfg.afExtremityEnabled && (cfg.micEnabled && _micPluginLoaded() || (cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded())))" @click="const c=$event.target.closest('[data-slot]');if(c){afScorecardExpanded=afScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:6px"></div>
               <div style="margin-top:5px;display:flex;justify-content:flex-end;gap:4px">
-                <button @click="cfg.afScorecardView=cfg.afScorecardView==='combined'?'own':'combined';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(150,150,255,.3);background:rgba(150,150,255,.06);color:rgba(150,150,255,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afScorecardView==='own'?'Own':'Combined'"></button>
+                <button @click="cfg.afExtremityView=cfg.afExtremityView==='combined'?'own':'combined';afScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,150,80,.3);background:rgba(255,150,80,.06);color:rgba(255,150,80,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.afExtremityView==='own'?'Own':'Combined'"></button>
               </div>
             </div>
             <!-- Liquidation Surveillance -->
@@ -691,7 +763,6 @@
 
       let _afWasHalted               = false;
       let _afWasGainsLocked          = false;
-      let _afWasRegimeType           = null;
 
       return Object.assign({}, def, {
 
@@ -703,17 +774,18 @@
         afEvents:     [],   // { ts, kind:'drawdown'|'gainslock', skew, breadth } — kept for import compat, not scored
         afCloses:     [],   // { ts, pnl, skew, breadth } — per-close PnL paired with structure at close time
         afWave:       [],   // { ts, lean } — structure-lean trajectory, retained up to ~a week (the "wave")
-        afScoreboard: [],   // sorted scorecard entries built from SCORE_KEY records
-        afScorecardView: null,         // persisted in cfg; init below
-        afScorecardExpanded: null,     // key of currently expanded chip, or null
-        afRegimeViewType: null,        // regime key ('regimeslo' etc) currently shown by the segment
-                                        // cycle button; null = not yet picked, falls back to live current regime
-        afRegimeCritStats: null,       // {[regimeType]: {[collapsedCrit]: stats}} — built in _afScoreBuild
-        afRegimeActiveTypes: [],       // which of the 6 regime types are currently selected in MIC config
-        afRegimeLiveRanks: null,       // {[collapsedCrit]: pnl} for the currently prevailing regime — read by MIC
-        afRegimeDisplayType: null,     // the auto-follow segment shown when no manual pin is set —
-                                        // only updates on an actual Liq-skew threshold cross or app
-                                        // reload (see the setInterval loop), not on every render
+        afScoreboard: [],   // sorted Extremity Scorer entries built from EXTREMITY_KEY records
+        afScorecardExpanded: null,     // key of currently expanded dial, or null
+        afDialCutoffs: {},             // {[family|pole]: magnitude} — the live "extreme begins here" line per dial
+        // Rolling, in-memory-ONLY pool of raw criterion readings — every annotation call
+        // (scan-time pool building, live liq messages, Extremity Re-Evaluation) feeds it via
+        // _afDialSample, regardless of whether that reading ever becomes a candidate or a
+        // trade. This — NOT closed-trade records — is what afDialCutoffs is computed from.
+        // Deliberately not persisted: a single scan already produces plenty of readings per
+        // criterion, so it refills within moments of a reload rather than needing to survive one.
+        afDialSamplePool: {},          // {[family|pole]: number[]}
+        afDialSampleCounts: {},        // {[family|pole]: n} — for the "unproven, still lukewarm by default" badge
+        afAnchorStats: {},             // {[sliq|bliq|msliq|mbliq|0liq]: stats} — categorical, no dial
         afKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // merged (own + partner) kline bar for display
         _afOwnKlineBar: null,                       // own-only kline bar before partner merge
         _afKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
@@ -822,11 +894,6 @@
               }
             }
           }
-          // Regime scorecard's auto-follow display — synced to whatever regime is actually live
-          // right now, not left at its false/null initial value, so a reload snaps straight to
-          // the correct segment instead of waiting for the first threshold cross after load.
-          _afWasRegimeType     = this._afRegimeCurrentType();
-          this.afRegimeDisplayType = _afWasRegimeType;
           if (this.cfg.ashfallSlopeWindowHours === undefined) this.cfg.ashfallSlopeWindowHours = 24;
           // Renamed from ashfallIoEnabled/ashfallWaveShowIo ('IO' read as Open Interest, confusable
           // with the unrelated iot/iom criteria — this line is purely funding-rate-derived). Fall
@@ -930,7 +997,7 @@
             }
           } catch(_) {}
           this._afScoreTrim();
-          this._afScoreBuild();
+          this._afExtremityBuild();
           try {
             const raw = localStorage.getItem(ASH_KEY);
             if (raw) {
@@ -949,20 +1016,9 @@
           this.log(`[ASH] Ashfall (Chaser) v${VERSION} loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'} | ${this.afCloses.length} closes on record`, 'info');
           setInterval(() => {
             if (this.cfg.ashfallCrossEnabled) this._afCheckCross().catch(() => {});
-            // Regime scorecard auto-follow — only updates afRegimeDisplayType (what the segment
-            // view shows when nothing is manually pinned) on an actual Liq-skew threshold cross,
-            // not on every render; _afScorecardHtml reads the cached value rather than recomputing
-            // it live, so browsing doesn't jitter if skew is hovering right at a band edge.
-            if (this.cfg.afRegimeScoringEnabled) {
-              const _curRegimeType = this._afRegimeCurrentType();
-              if (_curRegimeType !== _afWasRegimeType) {
-                _afWasRegimeType = _curRegimeType;
-                this.afRegimeDisplayType = _curRegimeType;
-              }
-            }
-            // _afScoreBuild() is NOT called here on a timer — its source data (scorecard
-            // records) only changes on a trade close, a config change affecting the
-            // computation, or an import, and it's called from each of those directly. A
+            // _afExtremityBuild() is NOT called here on a timer — its source data
+            // (Extremity records) only changes on a trade close, a config change affecting
+            // the computation, or an import, and it's called from each of those directly. A
             // periodic rebuild here would just recompute the identical result between those
             // events for no reason, on every tick's worth of ticks (up to a few thousand
             // records, twice-sorted) whether or not the Score panel is even open.
@@ -1342,7 +1398,7 @@
 
         _afScoreRead() {
           try {
-            const raw = localStorage.getItem(SCORE_KEY);
+            const raw = localStorage.getItem(EXTREMITY_KEY);
             if (!raw) return [];
             const cut = Date.now() - SCORE_SAFETY_TTL;
             return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
@@ -1359,22 +1415,6 @@
             // their primary criteria tags. Only the genuinely dead pre-tiered criteria purge here.
             const LEGACY    = new Set(['>10pct','<10pct','lsa','lba','rasl','rabl']);
             const isLegacy  = r => r.criteria.some(c => LEGACY.has(c));
-            // Regime scoring splits every combo 6 ways, so exact-combo freshness (below) would
-            // purge far more aggressively — while it's on, freshness is shared per individual
-            // criterion instead: any record touching a criterion refreshes every combo that
-            // criterion appears in, not just its own exact combo. Off: unchanged, per-combo as before.
-            const regimeMode = !!this.cfg.afRegimeScoringEnabled;
-            let critLastSeen = null;
-            if (regimeMode) {
-              critLastSeen = {};
-              for (const r of records) {
-                if (isLegacy(r)) continue;
-                for (const c of r.criteria) {
-                  const ck = collapseCrit(c);
-                  if (!critLastSeen[ck] || r.ts > critLastSeen[ck]) critLastSeen[ck] = r.ts;
-                }
-              }
-            }
             const bySlot = {};
             for (const r of records) {
               if (isLegacy(r)) continue;
@@ -1387,10 +1427,7 @@
               recs.sort((a, b) => b.ts - a.ts);
               const kept = recs.slice(0, quota);
               if (!kept.length) continue;
-              const freshTs = regimeMode
-                ? Math.max(...[...new Set(kept[0].criteria.map(collapseCrit))].map(ck => critLastSeen[ck] ?? 0))
-                : kept[0].ts;
-              if (now - freshTs < staleMs) trimmed.push(...kept);
+              if (now - kept[0].ts < staleMs) trimmed.push(...kept);
             }
             const GLOBAL_CAP = 5000;
             const capped = trimmed.sort((a, b) => b.ts - a.ts).slice(0, GLOBAL_CAP);
@@ -1398,7 +1435,7 @@
             // distinct auto-generated slot buckets the total byte size can still run
             // large — apply the same atomized byte cap as a final safety net, oldest first.
             const byteCapped = trimToByteCap([...capped].reverse()).reverse();
-            localStorage.setItem(SCORE_KEY, JSON.stringify(byteCapped));
+            localStorage.setItem(EXTREMITY_KEY, JSON.stringify(byteCapped));
           } catch(e) {}
         },
         _afScoreWrite(criteria, pnl, hist = false) {
@@ -1420,14 +1457,10 @@
               trimmed.push(...recs.slice(0, quota));
             }
             const byteCapped = trimToByteCap([...trimmed].reverse()).reverse();
-            localStorage.setItem(SCORE_KEY, JSON.stringify(byteCapped));
+            localStorage.setItem(EXTREMITY_KEY, JSON.stringify(byteCapped));
             return byteCapped;
           } catch(e) { return null; }
         },
-        // `records`, when passed, skips the internal _afScoreRead() — callers on the
-        // trade-close hot path already have the just-written result from _afScoreWrite()
-        // in hand, so re-reading and re-parsing the same data straight back out of
-        // localStorage would be pure duplicate work.
         // Gates whether a partner-sourced record's PnL is allowed to move a criterion's score,
         // per cfg.afPartnerScoreMode. pnl here is the partner's own realized pnl (positive =
         // partner won that trade) — not the inverted effectivePnl used downstream. Own-sourced
@@ -1438,42 +1471,72 @@
           if (mode === 'losses') return pnl < 0;
           return pnl > 0; // 'wins' (default)
         },
-        _afScoreBuild(records) {
+        // Feeds the Extremity Scorer's cutoff computation. Called from every criterion
+        // annotation — scan-time pool building, live liq messages, Extremity Re-Evaluation —
+        // NOT gated behind a close or even an actual entry. This is deliberate: a dial's
+        // cutoff needs to be provable from the wide stream of what the market is actually
+        // showing right now, not from the narrow trickle of closed trades. Sampling only from
+        // closes would deadlock at cold start — nothing opens until a dial is proven, and a
+        // dial can only prove itself from closes that require something to have opened first.
+        _afDialSample(tag) {
+          if (!tag) return;
+          const info = dialInfo(collapseCrit(tag));
+          if (!info) return;
+          const m = tag.match(/(-?\d+)$/);
+          if (!m) return; // bare Blind-Entry/Liquid-Diver tags (+fund/-fund/+ocs/-ocs) carry no
+                           // magnitude — they always classify extreme regardless (see
+                           // _afExtremityBuild/_afExtremityVeto), nothing to prove here.
+          const dk = info.family + '|' + info.pole;
+          const pool = (this.afDialSamplePool ||= {});
+          const arr = (pool[dk] ||= []);
+          arr.push(Math.abs(parseInt(m[1], 10)));
+          const cap = this.cfg.afExtremitySampleCap || 300;
+          if (arr.length > cap) arr.splice(0, arr.length - cap);
+        },
+        // ── Extremity Scorer core build (replaces the old slot-combo + collapsed-criterion +
+        // Regime-Based-Scoring + Blind-Entry-bucket passes wholesale — see /versioning v1.70.0).
+        //
+        // Cutoffs are computed FIRST, from afDialSamplePool (the observation stream — see
+        // _afDialSample above), independent of closed-trade records entirely: for each dial
+        // pole with >= afExtremityMinSamples readings, the cutoff is the magnitude at the
+        // configured split percentile of that pole's OWN observed spread — "organically
+        // arrange them into highs and lows" per the user's own framing. A pole below the
+        // sample floor has no proven cutoff and stays lukewarm by default (never credited,
+        // never blocking) until it clears the floor — which, sampling from live readings
+        // rather than closes, usually happens within the first scan or two, not never.
+        //
+        // Records are then walked ONCE: only occurrences that classify as extreme under
+        // their pole's already-known cutoff are scored into that pole's win/loss/pnl — a
+        // lukewarm close is exactly what this system exists to avoid crediting, so it's
+        // excluded from "which extreme end was more profitable" rather than diluting it.
+        // Liq anchors (no dial) are scored directly as before, unaffected by any of this.
+        //
+        // Bare Blind-Entry/Liquid-Diver tags and single-pole families with no magnitude
+        // gradation always classify extreme — there's nothing to be lukewarm about. Regime is
+        // just one more two-pole family here (see regimeDialInfo) — its old fixed Lo/Mid/Hi
+        // bands and separate 6-bucket Regime Based Scoring pass are gone; Mid is now whatever
+        // the live sample's own middle turns out to be.
+        _afExtremityBuild(records) {
           records = records || this._afScoreRead();
           const exclude = new Set(this.cfg.micAutoSlotExclude || []);
           const quota = this.cfg.afSpongeQuota;
+          const minSamples = Math.max(3, this.cfg.afExtremityMinSamples || 3);
+          const splitPct = Math.min(0.49, Math.max(0.01, (this.cfg.afExtremitySplitPct ?? 25) / 100));
           const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
-          // Sorted once and reused by both passes below — they use the identical sort
-          // criteria (newest-first), so sorting twice was pure duplicate work.
           const sortedRecords = [...records].sort((a, b) => b.ts - a.ts);
-          const slotCount = {};
-          const map = {};
-          for (const r of sortedRecords) {
-            // Partial-combo scoring (v1.6.4): drop only the excluded criteria from this record,
-            // not the whole record — a record keeps scoring under whatever's left as long as at
-            // least one non-excluded criterion remains. Previously any single excluded criterion
-            // (e.g. a liq anchor) silently zeroed out the entire record, including criteria still
-            // actively in use (fund/va/etc).
-            const keptCrits = exclude.size ? r.criteria.filter(c => !exclude.has(critBase(c))) : r.criteria;
-            if (!keptCrits.length) continue;
-            const key = [...keptCrits].sort().join(',');
-            if ((slotCount[key] = (slotCount[key] ?? 0) + 1) > quota) continue;
-            if (!map[key]) map[key] = { criteria: keptCrits, ownPnl: 0, ownWins: 0, ownLosses: 0, ownLossSum: 0, partnerPnl: 0, partnerWins: 0, partnerLosses: 0, partnerWinSum: 0, hasHist: false, hasTrade: false };
-            if (r.hist) map[key].hasHist = true; else map[key].hasTrade = true;
-            const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
-            if (r.source === 'chaser') {
-              map[key].ownPnl += pnl;
-              if (pnl > 0) map[key].ownWins++; else { map[key].ownLosses++; map[key].ownLossSum += -pnl; }
-            } else if (this._afPartnerCounts(pnl)) {
-              const inv = -pnl;
-              map[key].partnerPnl += inv;
-              if (inv > 0) map[key].partnerWins++; else { map[key].partnerLosses++; map[key].partnerWinSum += pnl; }
-            }
+
+          const samplePool = this.afDialSamplePool || {};
+          const cutoffs = {};
+          for (const [dk, mags] of Object.entries(samplePool)) {
+            if (mags.length < minSamples) { cutoffs[dk] = null; continue; }
+            const sorted = [...mags].sort((a, b) => a - b);
+            const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * (1 - splitPct)));
+            cutoffs[dk] = sorted[idx];
           }
-          for (const s of Object.values(map)) s.totalPnl = s.ownPnl + s.partnerPnl;
-          this.afScoreboard = Object.values(map).sort((a, b) => b.totalPnl - a.totalPnl);
-          const collapse = collapseCrit;
-          const critCount = {}, collapsedRanks = {}, critStats = {};
+
+          const dialStats = {};
+          const anchorStats = {};
+          const dialCount = {}, anchorCount = {};
           for (const r of sortedRecords) {
             const keptCrits = exclude.size ? r.criteria.filter(c => !exclude.has(critBase(c))) : r.criteria;
             if (!keptCrits.length) continue;
@@ -1482,112 +1545,120 @@
             const counts = !isPartner || this._afPartnerCounts(pnl);
             const effectivePnl = isPartner ? -pnl : pnl;
             for (const c of keptCrits) {
-              const key = collapse(c);
-              if ((critCount[key] = (critCount[key] ?? 0) + 1) > quota) continue;
-              if (!critStats[key]) critStats[key] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
-              const cs = critStats[key];
-              if (counts) {
-                collapsedRanks[key] = (collapsedRanks[key] ?? 0) + effectivePnl;
-                cs.pnl += effectivePnl;
-                if (effectivePnl > 0) cs.wins++; else cs.losses++;
-              }
-              if (!isPartner) { cs.ownPnl += pnl; if (pnl > 0) cs.ownWins++; else cs.ownLosses++; }
-              if (r.hist) cs.hasHist = true; else cs.hasTrade = true;
-            }
-          }
-          this.micCollapsedSlotRanks = collapsedRanks;
-          this.micCollapsedCritStats = critStats;
-          // Regime-based scoring — splits the same non-regime criteria into 6 buckets by which
-          // regime type (regimeslo/blo/smid/bmid/shi/bhi) was tagged on each record. A record
-          // carries at most one regime tag (the six bands are mutually exclusive at any instant),
-          // so no record double-buckets. Records with no regime tag carry no regime information
-          // and are simply skipped here — see Regime.md. The regime criterion itself is excluded
-          // from its own bucket's chip list since it's tautologically true for every member.
-          const REGIME_TYPES = ['regimeslo','regimeblo','regimesmid','regimebmid','regimeshi','regimebhi'];
-          const regimeStats = {};
-          for (const t of REGIME_TYPES) regimeStats[t] = {};
-          if (this.cfg.afRegimeScoringEnabled) {
-            const regimeOfRec = r => { for (const c of r.criteria) { const t = REGIME_TYPES.find(rt => c.startsWith(rt)); if (t) return t; } return null; };
-            const regimeCount = {};
-            for (const r of sortedRecords) {
-              const keptCrits = exclude.size ? r.criteria.filter(c => !exclude.has(critBase(c))) : r.criteria;
-              if (!keptCrits.length) continue;
-              const rt = regimeOfRec(r);
-              if (!rt) continue;
-              const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
-              const isPartner = r.source !== 'chaser';
-              const counts = !isPartner || this._afPartnerCounts(pnl);
-              const effectivePnl = isPartner ? -pnl : pnl;
-              const bucket = regimeStats[rt];
-              for (const c of keptCrits) {
-                const key = collapse(c);
-                if (REGIME_TYPES.some(t => key.startsWith(t))) continue;
-                const ck = rt + '|' + key;
-                if ((regimeCount[ck] = (regimeCount[ck] ?? 0) + 1) > quota) continue;
-                if (!bucket[key]) bucket[key] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
-                const cs = bucket[key];
-                if (counts) {
-                  cs.pnl += effectivePnl;
-                  if (effectivePnl > 0) cs.wins++; else cs.losses++;
-                }
+              const key = collapseCrit(c);
+              const anchorBase = /^(sliq|bliq|msliq|mbliq)$/.test(key) ? key : (key === '0liq' ? '0liq' : null);
+              if (anchorBase) {
+                if ((anchorCount[anchorBase] = (anchorCount[anchorBase] ?? 0) + 1) > quota) continue;
+                if (!anchorStats[anchorBase]) anchorStats[anchorBase] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
+                const cs = anchorStats[anchorBase];
+                if (counts) { cs.pnl += effectivePnl; if (effectivePnl > 0) cs.wins++; else cs.losses++; }
                 if (!isPartner) { cs.ownPnl += pnl; if (pnl > 0) cs.ownWins++; else cs.ownLosses++; }
                 if (r.hist) cs.hasHist = true; else cs.hasTrade = true;
+                continue;
               }
+              const info = dialInfo(key);
+              if (!info) continue; // unrecognized/retired tag — no dial, not scored
+              const dk = info.family + '|' + info.pole;
+              if ((dialCount[dk] = (dialCount[dk] ?? 0) + 1) > quota) continue;
+              const noGradation = info.pole !== 'single' && !!BARE_DIAL_TAGS[key];
+              let mag = Infinity;
+              if (!noGradation) {
+                const m2 = c.match(/(-?\d+)$/);
+                mag = m2 ? Math.abs(parseInt(m2[1], 10)) : 0;
+              }
+              const cutoff = cutoffs[dk];
+              const isExtreme = !Number.isFinite(mag) || (cutoff != null && mag >= cutoff);
+              if (!isExtreme) continue;
+              if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
+              const stats = dialStats[dk];
+              if (counts) { stats.pnl += effectivePnl; if (effectivePnl > 0) stats.wins++; else stats.losses++; }
+              if (!isPartner) { stats.ownPnl += pnl; if (pnl > 0) stats.ownWins++; else stats.ownLosses++; }
+              if (r.hist) stats.hasHist = true; else stats.hasTrade = true;
             }
           }
-          this.afRegimeCritStats = regimeStats;
-          this.afRegimeActiveTypes = this._afRegimeActiveTypes();
-          // afRegimeLiveRanks — a plain key->pnl map for the *currently prevailing* regime, with
-          // per-key fallback to the flat aggregate below cfg.afRegimeMinSample samples. This is
-          // what MIC's own _micCritScore/_micScaledRank read (see MultiIndicator-Chaser.html) so
-          // slot blocking and ticker ordering follow the live regime — micCollapsedCritStats/
-          // micCollapsedSlotRanks themselves stay the flat aggregate, unambiguously, so the two
-          // concepts (flat vs regime-live) never get silently conflated under one property name.
-          this.afRegimeLiveRanks = null;
-          if (this.cfg.afRegimeScoringEnabled && this.afRegimeActiveTypes.length) {
-            const curType = this._afRegimeCurrentType();
-            if (curType && this.afRegimeActiveTypes.includes(curType)) {
-              const minSample = this.cfg.afRegimeMinSample;
-              const curBucket = regimeStats[curType] || {};
-              const mergedRanks = {};
-              const allKeys = new Set([...Object.keys(critStats), ...Object.keys(curBucket)]);
-              for (const key of allKeys) {
-                const rb = curBucket[key];
-                const useRegime = rb && (rb.wins + rb.losses) >= minSample;
-                mergedRanks[key] = useRegime ? rb.pnl : (collapsedRanks[key] || 0);
-              }
-              this.afRegimeLiveRanks = mergedRanks;
+          // A dial can have a proven cutoff (samples exist) but zero closes yet — still needs
+          // to show up (0 pnl, real sample count) rather than vanish from the panel/ranks.
+          for (const dk of Object.keys(cutoffs)) {
+            if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
+          }
+          for (const dk of Object.keys(dialStats)) {
+            dialStats[dk].cutoff = cutoffs[dk] ?? null;
+            dialStats[dk].sampleCount = (samplePool[dk] || []).length;
+          }
+
+          this.afDialCutoffs = cutoffs;
+          this.afDialSampleCounts = Object.fromEntries(Object.entries(samplePool).map(([k, v]) => [k, v.length]));
+          this.afAnchorStats = anchorStats;
+          // Flat display-key -> stats map, same shape the old micCollapsedSlotRanks/
+          // micCollapsedCritStats used — _micScaledRank/_micCritScore/_micIsCritBlocked keep
+          // reading this one flat lookup unchanged, with no idea dials or poles exist beneath it.
+          const ranks = {}, dispStats = {};
+          for (const [base, cs] of Object.entries(anchorStats)) { ranks[base] = cs.pnl; dispStats[base] = cs; }
+          for (const [dk, stats] of Object.entries(dialStats)) {
+            const [family, pole] = dk.split('|');
+            const key = dialDisplayKey(family, pole);
+            ranks[key] = stats.pnl;
+            dispStats[key] = stats;
+          }
+          this.micCollapsedSlotRanks = ranks;
+          this.micCollapsedCritStats = dispStats;
+          this.afScoreboard = Object.entries(dispStats).sort(([,a],[,b]) => b.pnl - a.pnl).map(([key, s]) => ({ key, ...s }));
+        },
+        // Overall-lukewarmness veto — "explicitly avoid any ticker exhibiting lukewarm
+        // values". Counts, across every dial-eligible criterion the ticker actually
+        // exhibits (liq anchors excluded — they have no lukewarm state), what share
+        // classifies lukewarm against the current cutoffs; an unproven dial (below
+        // afExtremityMinSamples) counts as lukewarm, same as a genuinely middling reading.
+        // Vetoes once that share reaches afLukewarmRatioPct (default 70%). A slot built
+        // entirely from anchors (no dial-eligible criteria at all) is never vetoed here.
+        _afExtremityVeto(annotCrits) {
+          if (!this.cfg.afExtremityEnabled) return false;
+          const cutoffs = this.afDialCutoffs || {};
+          let total = 0, lukewarm = 0;
+          for (const c of (annotCrits || [])) {
+            const key = collapseCrit(c);
+            if (/^(sliq|bliq|msliq|mbliq)$/.test(key) || key === '0liq') continue;
+            const info = dialInfo(key);
+            if (!info) continue;
+            total++;
+            if (info.pole === 'single' ? false : !!BARE_DIAL_TAGS[key]) continue; // no gradation, never lukewarm
+            const dk = info.family + '|' + info.pole;
+            const cutoff = cutoffs[dk];
+            const m2 = c.match(/(-?\d+)$/);
+            const mag = m2 ? Math.abs(parseInt(m2[1], 10)) : 0;
+            if (cutoff == null || mag < cutoff) lukewarm++;
+          }
+          if (!total) return false;
+          return (lukewarm / total * 100) >= (this.cfg.afLukewarmRatioPct ?? 70);
+        },
+        // Extremity Re-Evaluation (secondary toggle, off by default). At the end of every
+        // scan, re-derives each open position's own qualifying criteria against the CURRENT
+        // dial cutoffs and closes it once it crosses the same lukewarm-ratio bar it had to
+        // clear to open in the first place — held to the same standard throughout its life,
+        // not just at entry. Deliberately reads only data this cycle already cached (bulk
+        // ticker snapshot + MIC's live PEC/OC caches) rather than firing fresh fetches of its
+        // own, so it rides the existing scan cadence instead of adding load on top of the
+        // scan scheduler. A symbol with no fresh-enough cached tick this cycle is skipped
+        // rather than forcing a fetch.
+        async _afExtremityReEval() {
+          if (!this.cfg.afExtremityEnabled || !this.cfg.afExtremityReEvalEnabled) return;
+          const snapshot = [...(this.positions || [])];
+          for (const pos of snapshot) {
+            if (!pos || !pos.symbol) continue;
+            const crits = pos._micCriteria || pos._becCriteria || pos._ldcCriteria;
+            if (!crits || !crits.length) continue;
+            const t = (this._lastAllTickers || []).find(x => x.symbol === pos.symbol);
+            if (!t) continue;
+            const liveCrits = crits.map(c => {
+              const base = collapseCrit(c).replace(/[+-]$/, '');
+              if (/^(sliq|bliq|msliq|mbliq)/.test(base) || base === '0liq') return c; // anchors don't decay under Extremity, unaffected by re-eval
+              return this._micAnnotateLiveCrit?.(base, t, null, 0, this.afOcResults) ?? c;
+            });
+            if (this._afExtremityVeto(liveCrits)) {
+              await this.pseudoClosePosition(pos, 'extremity-reeval');
+              this.log(`[ASH] ${pos.symbol} closed — Extremity Re-Evaluation: fallen back to lukewarm.`, 'info');
             }
           }
-          // Blind-Entry / Liquid-Diver bucket — a *separate* pass over the same records, not a
-          // filter of critStats above. Their bare-sign tags (+fund/-fund, +ocs/-ocs) collapse to
-          // the exact same keys MIC's own tiered criteria collapse to (e.g. '+fund' and 'fund>5'
-          // both become 'fund>'), so once folded into critStats they're no longer separable —
-          // this has to be built independently, straight from the raw records. MIC's own
-          // critStats/collapsedRanks above are left untouched since real trading logic
-          // (co-qualification ranking, _afScoreNet) reads them.
-          const isBlindRec = r => Array.isArray(r.criteria) && r.criteria.some(c => c === '+fund' || c === '-fund' || c === '+ocs' || c === '-ocs');
-          const blindCritCount = {}, blindCritStats = {};
-          for (const r of sortedRecords) {
-            if (!isBlindRec(r)) continue;
-            const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
-            const isPartner = r.source !== 'chaser';
-            const counts = !isPartner || this._afPartnerCounts(pnl);
-            const effectivePnl = isPartner ? -pnl : pnl;
-            for (const c of r.criteria) {
-              const key = collapse(c);
-              if ((blindCritCount[key] = (blindCritCount[key] ?? 0) + 1) > quota) continue;
-              if (!blindCritStats[key]) blindCritStats[key] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
-              const cs = blindCritStats[key];
-              if (counts) {
-                cs.pnl += effectivePnl;
-                if (effectivePnl > 0) cs.wins++; else cs.losses++;
-              }
-              if (!isPartner) { cs.ownPnl += pnl; if (pnl > 0) cs.ownWins++; else cs.ownLosses++; }
-              if (r.hist) cs.hasHist = true; else cs.hasTrade = true;
-            }
-          }
-          this.blindCollapsedCritStats = blindCritStats;
         },
         // cfg.micEnabled is a persisted toggle value — it survives MIC being removed via the
         // Plugin Manager, so it alone can't tell us whether MIC is actually loaded right now.
@@ -1609,92 +1680,88 @@
         _ocChartViable() {
           return this._micPluginLoaded() || this._becPluginLoaded();
         },
-        // Pure display — unlike _afScoreBuild() (which micCollapsedCritStats/micCollapsedSlotRanks
-        // come from and which real trading logic reads), this chip-rendering step has no
-        // consumer besides this panel, so it's safe to skip while the panel isn't visible.
-        // Mirrors MIC's actual Slot Blocking decision (_micIsCritBlocked/_micIsEntryBlocked) so
-        // the scorecard can show, at a glance, which chips are currently contributing to a block.
-        // Only meaningful for the MIW/MIC bucket — Slot Blocking is an MIW/MIC mechanism, the
-        // Blind-Entry/Liquid-Diver bucket has no equivalent concept.
-        // Liq-anchor types (sliq/bliq/msliq/mbliq/0liq) are always eligible, matching
-        // _micIsEntryBlocked's unconditional anchor check; their score is the sign-combined total
-        // (matching _micCritScore, which sums the '+' and '-' buckets for a bare anchor name —
-        // blocking is per anchor TYPE, not per sign, so both a type's chips share one verdict).
-        // Past-1 is a path, not a criterion — it never appears as a collapsed key here, so there's
-        // nothing to match it against.
-        // User-selected Blockable Criteria (cfg.micSlotBlockCriteria) are eligible when
-        // micSlotBlockTags is on. This now mirrors the strategy plugin's configurable
-        // blockable criteria picker instead of the old hardcoded kline/PEC-only list, so
-        // fund/vm/iot/iom/ocs/ocx chips can turn purple once opted in and below threshold.
-        // ranksOverride lets the scorecard highlight a specific *viewed* regime segment's own
-        // blocked status (see _afScorecardHtml) rather than always reflecting live/flat data —
-        // defaults to the flat aggregate, matching pre-regime-scoring behavior.
-        _afIsCritBlocked(key, ranksOverride) {
+        // Slot Blocking: true once a criterion's collapsed score is a loss beyond the
+        // configured % of base margin. Auto-clears the moment the score recovers — no manual
+        // reset needed. Anchors (sliq/bliq/msliq/mbliq/0liq) are always eligible, matching
+        // _micIsEntryBlocked's unconditional anchor check; dial poles are only eligible when
+        // explicitly opted into cfg.micSlotBlockCriteria. A lukewarm-classified occurrence
+        // never reaches this score at all (see _afExtremityBuild pass 3) — blocking only ever
+        // reacts to a losing EXTREME, same standard the dial applies everywhere else.
+        _afIsCritBlocked(key) {
           if (!this.cfg.micSlotBlockEnabled) return false;
-          const ranks = ranksOverride ?? (this.micCollapsedSlotRanks || {});
+          const ranks = this.micCollapsedSlotRanks || {};
           const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const threshold  = baseMargin * ((this.cfg.micSlotBlockPct ?? 25) / 100);
-          const anchorM = key.match(/^(sliq|bliq|msliq|mbliq)[+-]/);
-          if (anchorM || key === '0liq') {
-            const base = anchorM ? anchorM[1] : '0liq'; // '0liq' is bare, never sign-tagged
-            const score = (ranks[base] ?? 0) + (ranks[base + '+'] ?? 0) + (ranks[base + '-'] ?? 0);
-            return score <= -threshold;
+          if (/^(sliq|bliq|msliq|mbliq)$/.test(key) || key === '0liq') {
+            return (ranks[key] ?? 0) <= -threshold;
           }
           if (!this.cfg.micSlotBlockTags) return false;
           const blockable = (this.cfg.micSlotBlockCriteria || []).filter(Boolean);
           if (!blockable.length) return false;
           const esc = v => String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const rx = new RegExp('^(' + blockable.map(esc).join('|') + ')[+-]');
+          const rx = new RegExp('^(' + blockable.map(esc).join('|') + ')[+-]?$');
           return rx.test(key) && (ranks[key] ?? 0) <= -threshold;
         },
-
-        // Friendly label for the regime cycle button / empty-state text.
-        _afRegimeSegmentLabel(type) {
-          return REGIME_SEGMENT_LABEL[type] || '—';
-        },
-        _afScorecardHtml(shown, bucket) {
+        // Extremity Scorer dial UI — one vertical dial per family, positive-pole emoji on
+        // top, negative-pole emoji on the bottom, the live "extreme begins here" cutoff
+        // shown underneath (or "unproven" below afExtremityMinSamples). Liq anchors and the
+        // single-pole Irregularity readings render as a one-ended card (no opposite pole
+        // exists for either — see StrategyBook.md). MIC and Blind-Entry/Liquid-Diver tags
+        // share one unified panel now — under Extremity Scorer they're the same dial.
+        _afExtremityHtml(shown) {
           if (!shown) return '';
-          // Regime segment replaces the flat MIC view whenever regime scoring is on and at
-          // least one regime type is active — raw per-segment figures, no min-sample fallback
-          // (that fallback only protects live blocking/ranking, see _afScoreBuild; display shows
-          // the segment honestly, thin or not). Blind-Entry/Liquid-Diver bucket never regime-splits.
-          const regimeActive = bucket !== 'blind' && this.cfg.afRegimeScoringEnabled && (this.afRegimeActiveTypes || []).length;
-          const viewType = regimeActive ? (this.afRegimeViewType || this.afRegimeDisplayType || this.afRegimeActiveTypes[0]) : null;
-          const stats = regimeActive ? ((this.afRegimeCritStats || {})[viewType] || {}) : ((bucket === 'blind' ? this.blindCollapsedCritStats : this.micCollapsedCritStats) || {});
-          if (!Object.keys(stats).length) {
-            const label = regimeActive ? `${this._afRegimeSegmentLabel(viewType)} regime` : (bucket === 'blind' ? 'Blind-Entry/Liquid-Diver' : 'MIC');
-            return `<span style="font-size:9px;color:var(--text-lo)">No ${label} closes recorded yet.</span>`;
-          }
-          const own = (this.cfg.afScorecardView || 'combined') === 'own';
-          const expanded = this.afScorecardExpanded;
-          const _chipHtml = (key, emoji, title, val, wins, losses, isExpanded, expandedInner, blocked) => {
-            let clr, bg, bdr;
-            if (blocked) {
-              clr = 'rgba(190,130,255,.95)'; bg = 'rgba(160,90,255,.14)'; bdr = 'rgba(190,130,255,.55)';
-            } else {
-              clr = val > 0 ? 'rgba(100,220,150,.9)' : val < 0 ? 'var(--short)' : 'var(--text-lo)';
-              bg  = val > 0 ? 'rgba(100,220,150,.08)' : val < 0 ? 'rgba(255,80,80,.08)' : 'rgba(255,255,255,.04)';
-              bdr = val > 0 ? 'rgba(100,220,150,.35)' : val < 0 ? 'rgba(255,80,80,.35)' : 'rgba(255,255,255,.12)';
+          const stats = this.micCollapsedCritStats || {};
+          const keys = Object.keys(stats);
+          if (!keys.length) return `<span style="font-size:9px;color:var(--text-lo)">No Extremity closes recorded yet.</span>`;
+          const own = (this.cfg.afExtremityView || 'combined') === 'own';
+          const val = cs => own ? cs.ownPnl : cs.pnl;
+          const wl  = cs => own ? [cs.ownWins, cs.ownLosses] : [cs.wins, cs.losses];
+          const used = new Set();
+          const dials = [];
+          for (const k of keys) {
+            if (used.has(k)) continue;
+            const famM = k.match(/^(fund|va|ioa|ocs|ocx)[+-]$/);
+            if (famM) {
+              const fam = famM[1], pos = fam + '+', neg = fam + '-';
+              dials.push([stats[pos] ? pos : null, stats[neg] ? neg : null]);
+              used.add(pos); used.add(neg);
+              continue;
             }
-            const inner = isExpanded ? expandedInner : `<b>${(val >= 0 ? '+$' : '-$') + Math.abs(val).toFixed(2)}</b> <span style="opacity:.55;font-size:8px">${wins}W ${losses}L</span>`;
-            const titleFull = blocked ? title + ' (blocked)' : title;
-            return `<span data-slot="${key}" title="${titleFull}" style="cursor:pointer;font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${emoji || '?'} ${inner}</span>`;
+            dials.push([k, null]);
+            used.add(k);
+          }
+          const fmt = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2);
+          const dialCard = (posKey, negKey) => {
+            const posCs = posKey ? stats[posKey] : null, negCs = negKey ? stats[negKey] : null;
+            const posVal = posCs ? val(posCs) : 0, negVal = negCs ? val(negCs) : 0;
+            const posBlocked = posKey && this._afIsCritBlocked(posKey);
+            const negBlocked = negKey && this._afIsCritBlocked(negKey);
+            const colorOf = (v, blocked) => blocked ? 'rgba(190,130,255,.95)' : v > 0 ? 'rgba(100,220,150,.9)' : v < 0 ? 'var(--short)' : 'var(--text-lo)';
+            const posColor = colorOf(posVal, posBlocked), negColor = colorOf(negVal, negBlocked);
+            const label = (posKey || negKey || '').replace(/[+-]$/, '');
+            const isAnchor = /^(sliq|bliq|msliq|mbliq|0liq)$/.test(posKey || negKey || '');
+            const cutoffSrc = posCs?.cutoff ?? negCs?.cutoff;
+            const sampleSrc = (posCs?.sampleCount ?? 0) + (negCs?.sampleCount ?? 0);
+            const cutoffLbl = isAnchor ? '' : (cutoffSrc != null ? `extreme ≥ ${cutoffSrc}` : `unproven (${sampleSrc}/${this.cfg.afExtremityMinSamples ?? 3})`);
+            const dataKey = posKey || negKey;
+            const wlLbl = (cs) => { if (!cs) return ''; const [w,l] = wl(cs); return `${w}W ${l}L`; };
+            return `<div data-slot="${dataKey}" title="${label}${cutoffLbl ? ' — ' + cutoffLbl : ''}" style="cursor:pointer;display:flex;flex-direction:column;align-items:center;width:52px;font-family:var(--mono)">`
+              + `<div style="font-size:12px">${posKey ? afCritEmoji(posKey) : '·'}</div>`
+              + `<div style="font-size:7px;color:${posColor}">${posKey ? `<b>${fmt(posVal)}</b>` : ''}</div>`
+              + `<div style="font-size:6.5px;opacity:.5">${posKey ? wlLbl(posCs) : ''}</div>`
+              + `<div style="width:5px;height:30px;border-radius:3px;margin:2px 0;background:linear-gradient(to bottom, ${posColor} 0%, rgba(255,255,255,.10) 46%, rgba(255,255,255,.10) 54%, ${negColor} 100%)"></div>`
+              + `<div style="font-size:6.5px;opacity:.5">${negKey ? wlLbl(negCs) : ''}</div>`
+              + `<div style="font-size:7px;color:${negColor}">${negKey ? `<b>${fmt(negVal)}</b>` : ''}</div>`
+              + `<div style="font-size:12px">${negKey ? afCritEmoji(negKey) : '·'}</div>`
+              + `<div style="font-size:6px;opacity:.45;margin-top:2px;text-align:center;line-height:1.3">${label}${cutoffLbl ? '<br>' + cutoffLbl : ''}</div>`
+              + `</div>`;
           };
-          // When viewing a regime segment, the blocked highlight reflects THAT segment's own
-          // score (built straight from the stats already being rendered) — not the live
-          // prevailing regime, which may differ from the segment currently being browsed.
-          const segRanksOverride = regimeActive ? Object.fromEntries(Object.entries(stats).map(([k, cs]) => [k, cs.pnl])) : undefined;
-          const sorted = Object.entries(stats).sort(([,a],[,b]) => own ? b.ownPnl-a.ownPnl : b.pnl-a.pnl);
-          return sorted.map(([key, cs]) => {
-            const val = own ? cs.ownPnl : cs.pnl;
-            const wins = own ? cs.ownWins : cs.wins;
-            const losses = own ? cs.ownLosses : cs.losses;
-            const expandedInner = `<span style="opacity:.55;font-size:8px">${wins}W ${losses}L of ${wins+losses} recorded</span>`;
-            const blocked = bucket !== 'blind' && this._afIsCritBlocked(key, segRanksOverride);
-            return _chipHtml(key, afCritEmoji(key), key, val, wins, losses, expanded===key, expandedInner, blocked);
-          }).join('');
+          const score = ([pk, nk]) => {
+            const a = pk ? val(stats[pk]) : 0, b = nk ? val(stats[nk]) : 0;
+            return Math.max(a, b);
+          };
+          return dials.sort((a, b) => score(b) - score(a)).map(([a, b]) => dialCard(a, b)).join('');
         },
-
         _afCrossRead() {
           try {
             const raw = localStorage.getItem(CROSS_KEY);
@@ -1900,7 +1967,7 @@
         },
         afExportAll() {
           try {
-            const scorecardRaw = localStorage.getItem(SCORE_KEY);
+            const extremityRaw = localStorage.getItem(EXTREMITY_KEY);
             const liqRaw       = localStorage.getItem(ASH_LIQ_HISTORY_KEY);
             const ocRaw        = localStorage.getItem(ASH_OC_HIST_KEY);
             this._afDownload(`ashfall-profile-${new Date().toISOString().slice(0, 10)}.json`, {
@@ -1908,7 +1975,7 @@
               events: this.afEvents,
               closes: this.afCloses,
               wave: this.afWave,
-              scorecard: scorecardRaw ? JSON.parse(scorecardRaw) : [],
+              extremity: extremityRaw ? JSON.parse(extremityRaw) : [],
               liqHistory: liqRaw ? JSON.parse(liqRaw) : [],
               ocHistory: ocRaw ? JSON.parse(ocRaw) : [],
             });
@@ -1925,8 +1992,12 @@
               if (Array.isArray(d.events)) this.afEvents = d.events.slice(-EVENTS_CAP);
               if (Array.isArray(d.closes)) this.afCloses = d.closes.slice(-CLOSES_CAP);
               if (Array.isArray(d.wave))   this.afWave   = d.wave.filter(p => Date.now() - p.ts < WAVE_TTL_MS).slice(-WAVE_CAP);
-              if (Array.isArray(d.scorecard)) {
-                try { localStorage.setItem(SCORE_KEY, JSON.stringify(d.scorecard)); } catch(_) {}
+              // Accepts either the new 'extremity' field or a legacy 'scorecard' field from a
+              // pre-Extremity export — the record shape (tag string + pnl) never changed, only
+              // how it's interpreted, so an old export still populates the new store correctly.
+              const importedScore = d.extremity || d.scorecard;
+              if (Array.isArray(importedScore)) {
+                try { localStorage.setItem(EXTREMITY_KEY, JSON.stringify(importedScore)); } catch(_) {}
               }
               if (Array.isArray(d.liqHistory)) {
                 this._liqCycleHistory = d.liqHistory.slice(-25);
@@ -1939,8 +2010,8 @@
               }
               this.persist();
               this._afScoreTrim();
-              this._afScoreBuild();
-              this.log(`[ASH] Profile imported — ${this.afCloses.length} closes, ${this.afWave.length} wave points, ${(d.scorecard||[]).length} scorecard records, ${(d.liqHistory||[]).length} liq cycles, ${(d.ocHistory||[]).length} OC cycles`, 'info');
+              this._afExtremityBuild();
+              this.log(`[ASH] Profile imported — ${this.afCloses.length} closes, ${this.afWave.length} wave points, ${(importedScore||[]).length} Extremity records, ${(d.liqHistory||[]).length} liq cycles, ${(d.ocHistory||[]).length} OC cycles`, 'info');
             } catch(err) {
               this.log('[ASH] Import failed — file could not be parsed as a valid Ashfall profile', 'warn');
             }
@@ -1958,6 +2029,10 @@
           // Deferred so MIC's _micRunScan (which fetches klines) finishes first —
           // MIC wraps after AF, so _origScan returns before MIC's own kline fetch runs.
           setTimeout(() => this._afUpdateKlineBar(), 0);
+          // Same deferral for Extremity Re-Evaluation — it re-derives live magnitudes via
+          // MIC's own annotation helpers, which need this cycle's MIC/OC/PEC caches to have
+          // already landed.
+          setTimeout(() => this._afExtremityReEval().catch(() => {}), 0);
           this._afFetchStructure().then(r => {
             if (!r) return;
             this._afAddSample(r);
@@ -2014,11 +2089,11 @@
             : (pos._bec && pos._becCriteria?.length) ? pos._becCriteria
             : (pos._ldc && pos._ldcCriteria?.length) ? pos._ldcCriteria
             : null;
-          if (this.cfg.ashfallScorecardEnabled && _scoreCriteria) {
+          if (this.cfg.afExtremityEnabled && _scoreCriteria) {
             const _t = this.closedTrades?.[0];
             const _pnl = _t?.totalPnl ?? _t?.pnl;
             if (typeof _pnl === 'number') {
-              this._afScoreBuild(this._afScoreWrite(_scoreCriteria, _pnl));
+              this._afExtremityBuild(this._afScoreWrite(_scoreCriteria, _pnl));
             }
           }
           // MIC-only feedback: direction-awareness lock (always, independent of the scorecard
@@ -2182,7 +2257,7 @@
         },
 
         // Ranks a bulk-ticker candidate by MIC's own collapsed critStats (this.micCollapsedCritStats,
-        // built in _afScoreBuild) restricted to the criteria actually readable at prescreen time —
+        // built in _afExtremityBuild) restricted to the criteria actually readable at prescreen time —
         // fund, V/A, IO/A always (straight off the ticker payload); PEC/VSG too once the universe
         // prefetch (ashPecPrescreenEnabled, see _afPecUniverseFetch) has populated
         // _afPecUniverseCache. ocs/ocx still need a live OC sample and are left out regardless. Tier
@@ -2368,7 +2443,7 @@
         },
 
         // Persistent, byte-capped candle log (KLINE_LOG_KEY) shared cross-bot the same way
-        // SCORE_KEY/CROSS_KEY are — read fresh every call rather than cached on `this`, since
+        // EXTREMITY_KEY/CROSS_KEY are — read fresh every call rather than cached on `this`, since
         // Permafrost may have written a newer version of the same bucket since this bot last read
         // it. Keyed by granularity so a differently-configured partner never corrupts this bot's
         // bars.
@@ -2801,35 +2876,6 @@
           if (!total) return null;
           return { sPct: s / total * 100, bPct: b / total * 100, total };
         },
-        // Which of the 6 regime types are currently selected in MIC's own config — Auto mode
-        // reads micAutoSlotExclude (already the source of truth for "included in scoring" for
-        // every other criterion, see _afScoreBuild), manual mode scans the slot builder's raw
-        // criteria lists. Drives both which segments the regime scorecard/cycle button show and
-        // whether regime-based scoring can engage at all (needs >=1 active type).
-        _afRegimeActiveTypes() {
-          const REGIME_TYPES = ['regimeslo','regimeblo','regimesmid','regimebmid','regimeshi','regimebhi'];
-          if (this.cfg.micAutoSlots) {
-            const excl = new Set(this.cfg.micAutoSlotExclude || []);
-            return REGIME_TYPES.filter(t => !excl.has(t));
-          }
-          const used = new Set();
-          for (const slot of (this.cfg.micSlots || [])) for (const c of slot) if (REGIME_TYPES.includes(c)) used.add(c);
-          return REGIME_TYPES.filter(t => used.has(t));
-        },
-        // Which regime type the market is in *right now* — same side/band derivation MIC uses
-        // to annotate a criterion at open (see MultiIndicator-Chaser's regime annotation), kept
-        // here since Ashfall owns _afRegimeSkew and both files must agree on band edges.
-        _afRegimeCurrentType() {
-          const sk = this._afRegimeSkew?.();
-          if (!sk) return null;
-          const dom  = Math.max(sk.sPct, sk.bPct);
-          const side = sk.sPct >= sk.bPct ? 's' : 'b';
-          const mid  = this.cfg.micRegimeMidThreshold ?? 60;
-          const hi   = this.cfg.micRegimeHiThreshold  ?? 80;
-          const band = dom >= hi ? 'hi' : dom >= mid ? 'mid' : 'lo';
-          return `regime${side}${band}`;
-        },
-
         _afApplySwitchover(ownHalted = this._isDrawdownHalted?.() ?? false) {
           if (!this.cfg.afSwitchoverEnabled || !this.cfg.ashfallCrossEnabled) return;
           const partnerHalted = this._afPartnerHalted();

@@ -72,7 +72,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.72.0';
+  const VERSION       = '1.73.0'; // Consumes Ashfall's Extremity Scorer (was Slot Scorecard) — see /versioning
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence modes (default ['1'] — live only). Enabling 0/Past-1 won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
@@ -1149,8 +1149,8 @@
           const freshAt = this._lastAllTickersAt || 0;
           if (!freshAt || freshAt === this._micLastActedAt) return;
 
-          // Rebuild block state from scorecard immediately before any slot or pool decisions
-          this._afScoreBuild?.();
+          // Rebuild block state from Extremity Scorer immediately before any slot or pool decisions
+          this._afExtremityBuild?.();
 
           // Entry slots — Auto mode has no generated slot list any more (see _micAutoQualify);
           // Manual mode keeps its exact combo list as before.
@@ -1241,9 +1241,19 @@
 
           // Build pool before capacity check so historical matches are logged regardless
           const _coQualEnabled = this.cfg.afCoQualPenaltyEnabled;
-          const _cqRanks = _coQualEnabled ? ((this.cfg.afRegimeScoringEnabled && this.afRegimeLiveRanks) ? this.afRegimeLiveRanks : (this.micCollapsedSlotRanks || {})) : null;
+          const _cqRanks = _coQualEnabled ? (this.micCollapsedSlotRanks || {}) : null;
           const _cqScaledRank = (rawC, annotC) => this._micScaledRank(rawC, annotC, _cqRanks);
+          // Wraps the raw annotation so every criterion reading produced during this scan's
+          // pool building feeds the Extremity Scorer's sample pool (see _afDialSample) —
+          // regardless of whether this ticker ends up matching a slot or opening a trade.
+          // Cutoffs need to be provable from the wide stream of what's actually out there,
+          // not just from the narrow trickle of closed trades.
           const _micAnnotateCrit = (c, t) => {
+            const tag = _micAnnotateCritRaw(c, t);
+            this._afDialSample?.(tag);
+            return tag;
+          };
+          const _micAnnotateCritRaw = (c, t) => {
             const _liqR = _allLiqResults[t.symbol];
             if (/^msliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `msliq${d >= 0 ? '+' : ''}${d}`; }
             if (/^mbliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `mbliq${d >= 0 ? '+' : ''}${d}`; }
@@ -1509,6 +1519,10 @@
             }
             return c;
           });
+          // Feeds the Extremity Scorer's sample pool (see _afDialSample) — this is the
+          // actual-open annotation path, not just scan-time pool building, so a position's
+          // own qualifying readings count toward the cutoff too.
+          for (const tag of annotCrits) this._afDialSample?.(tag);
           if (this.cfg.micForceGeneralCriteria && this.cfg.micAutoSlots && this.cfg.afCoQualPenaltyEnabled) {
             compositeScore = criteria.reduce((s, c, i) => s + this._micScaledRank(c, annotCrits[i]), 0);
           }
@@ -1821,17 +1835,15 @@
 
         // Co-Qualifying Penalty scoring for one criterion. Base rank is looked up from the
         // ticker's actual annotated tier (e.g. "fund+3" -> "fund+"), matching exactly how the
-        // scorecard collapses closes into rank buckets. sliq/bliq/msliq/mbliq sum both depth
-        // directions for a base score, since sign there reflects depth intensity, not a
-        // "good vs bad" direction reversal. Shared by the scan-time entry pool (runScan) and the
-        // live liq-message path (_micOnLiqMessage). This drives ticker ordering (compositeScore
-        // sort in the entry pool) as well as the co-qualification penalty itself, so when Regime
-        // Based Scoring is on, the default ranks source below follows the live regime the same
-        // way _micCritScore does — ranksOverride (used by the substitute-check path) still wins
-        // when explicitly supplied.
+        // Extremity Scorer collapses closes into dial-pole buckets (see _afExtremityBuild).
+        // sliq/bliq/msliq/mbliq sum both depth directions for a base score, since sign there
+        // reflects depth intensity, not a "good vs bad" direction reversal. Shared by the
+        // scan-time entry pool (runScan) and the live liq-message path (_micOnLiqMessage).
+        // This drives ticker ordering (compositeScore sort in the entry pool) as well as the
+        // co-qualification penalty itself. ranksOverride (used by the substitute-check path)
+        // still wins when explicitly supplied.
         _micScaledRank(rawC, annotC, ranksOverride) {
-          const liveDefault = (this.cfg.afRegimeScoringEnabled && this.afRegimeLiveRanks) ? this.afRegimeLiveRanks : (this.micCollapsedSlotRanks || {});
-          const ranks = ranksOverride ?? (this.cfg.afCoQualPenaltyEnabled ? liveDefault : null);
+          const ranks = ranksOverride ?? (this.cfg.afCoQualPenaltyEnabled ? (this.micCollapsedSlotRanks || {}) : null);
           if (!ranks) return 0;
           let base;
           if (/^msliq/.test(rawC)) base = (ranks['msliq+'] ?? 0) + (ranks['msliq-'] ?? 0);
@@ -1872,7 +1884,15 @@
         // Annotation for a live-triggered slot's criteria — sliq/bliq/msliq/mbliq use the live
         // depth just computed from the message (never _liqResults, which is closed-cycle only).
         // Everything else mirrors _micOpen's cache-based annotation.
+        // Also feeds the Extremity Scorer's sample pool (see _afDialSample) — this is the
+        // path Extremity Re-Evaluation and live liq messages both go through, so every one of
+        // those readings contributes to the cutoff too, not just scan-time pool building.
         _micAnnotateLiveCrit(c, t, liveType, liveDepth, ocResults) {
+          const tag = this._micAnnotateLiveCritRaw(c, t, liveType, liveDepth, ocResults);
+          this._afDialSample?.(tag);
+          return tag;
+        },
+        _micAnnotateLiveCritRaw(c, t, liveType, liveDepth, ocResults) {
           if (LIQ_TYPES.some(ty => c.startsWith(ty))) return `${liveType}${liveDepth >= 0 ? '+' : ''}${liveDepth}`;
           if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._afVolIoWindowAvg?.('vol'); const step = this.cfg.micVaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
           if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._afVolIoWindowAvg?.('oi'); const step = this.cfg.micIoaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
@@ -2186,12 +2206,11 @@
         // for a single criterion key. Every criterion's rank accumulates under a sign-suffixed key
         // (e.g. 'sliq+', 'fund-', 'pecob+'), so both variants are summed — PEC is tiered like
         // fund/vm/iot (always non-negative, '+' only) rather than a bare unsigned key like 0liq.
-        // Regime Based Scoring: when on, Ashfall/Permafrost publish afRegimeLiveRanks — the
-        // currently-prevailing regime's own scores, per-key falling back to the flat aggregate
-        // below the configured min sample (see _afScoreBuild) — and slot blocking/ordering follows
-        // that instead of the flat aggregate, so it recognizes which regime the market is in now.
+        // Regime is just one more dial family now (bull/bear dominance, see _afExtremityBuild in
+        // Ashfall-Chaser) — its old separate 6-bucket live-regime ranks table is retired, this
+        // reads the same flat micCollapsedSlotRanks every other criterion does.
         _micCritScore(c) {
-          const ranks = (this.cfg.afRegimeScoringEnabled && this.afRegimeLiveRanks) ? this.afRegimeLiveRanks : (this.micCollapsedSlotRanks || {});
+          const ranks = this.micCollapsedSlotRanks || {};
           return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
         },
 
@@ -2204,13 +2223,17 @@
           return this._micCritScore(c) <= -threshold;
         },
 
-        // Always checks the triggering liq-anchor type. micSlotBlockTags additionally checks
-        // every criterion selected in cfg.micSlotBlockCriteria (see the Blockable Criteria
-        // picker) — configurable rather than a hardcoded set, so any secondary criterion
-        // (including fund) can be opted in. Nothing is blockable by default beyond the
-        // pre-existing PEC/kline set — see DEFAULT_BLOCKABLE_CRITS.
+        // Always checks the triggering liq-anchor type, plus the Extremity Scorer's whole-
+        // ticker lukewarm veto (see _afExtremityVeto in Ashfall-Chaser — "explicitly avoid any
+        // ticker exhibiting lukewarm values", checked here regardless of micSlotBlockTags since
+        // it's a qualification veto, not a per-criterion block). micSlotBlockTags additionally
+        // checks every criterion selected in cfg.micSlotBlockCriteria (see the Blockable
+        // Criteria picker) — configurable rather than a hardcoded set, so any secondary
+        // criterion (including fund) can be opted in. Nothing is blockable by default beyond
+        // the pre-existing PEC/kline set — see DEFAULT_BLOCKABLE_CRITS.
         _micIsEntryBlocked(anchor, annotCrits) {
           if (this._micIsCritBlocked(anchor)) return true;
+          if (this._afExtremityVeto?.(annotCrits)) return true;
           if (!this.cfg.micSlotBlockTags) return false;
           const blockable = (this.cfg.micSlotBlockCriteria || []).filter(Boolean);
           if (!blockable.length) return false;
