@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.70.0'; // Extremity Scorer replaces the Slot Scorecard wholesale — see /versioning
+  const VERSION        = '1.71.1'; // PEC/VSG magnitude now the actual aggregate 6h/12h/24h index level (distance from high/low midpoint), shared by all 6 sub-tags, not each shape test's own formula; regime counts equally in Re-Eval's veto (not excluded), just no longer needs a ticker snapshot to re-derive — see /versioning
   // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
   // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
   // one _miwOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
@@ -169,6 +169,12 @@
     if (/^iom/.test(c))  return '🧲' + c.slice(3);
     if (/^ocs/.test(c))  return '🔭' + c.slice(3);
     if (/^ocx/.test(c))  return '📡' + c.slice(3);
+    // pec+/pec-/vsg+/vsg- are the new Extremity Scorer aggregate dial keys (one PEC/VSG
+    // reading, shape/mid/momentum folded away — see dialDisplayKey/collapseFamilyDupes);
+    // the old per-sub-tag names below are kept resolvable so pre-aggregate history/exports
+    // still render.
+    if (c === 'pec+') return '⬆️'; if (c === 'pec-') return '⬇️';
+    if (c === 'vsg+') return '⏫'; if (c === 'vsg-') return '⏬';
     if (/^pec([a-z]+)/.test(c)) {
       const m = c.match(/^(pec[a-z]+)/);
       const base = m[1];
@@ -227,12 +233,18 @@
     'ioa+':  { family: 'ioa',  pole: 'pos' },       'ioa-':  { family: 'ioa',  pole: 'neg' },
     'ocs+':  { family: 'ocs',  pole: 'pos' },       'ocs-':  { family: 'ocs',  pole: 'neg' },
     'ocx+':  { family: 'ocx',  pole: 'pos' },       'ocx-':  { family: 'ocx',  pole: 'neg' },
-    'pecob+':    { family: 'pecshape', pole: 'pos' }, 'pecos+':    { family: 'pecshape', pole: 'neg' },
-    'pecalpha+': { family: 'pecmid',   pole: 'pos' }, 'pecdelta+': { family: 'pecmid',   pole: 'neg' },
-    'pecmomup+': { family: 'pecmom',   pole: 'pos' }, 'pecmomdn+': { family: 'pecmom',   pole: 'neg' },
-    'vsgot+':    { family: 'vsgshape', pole: 'pos' }, 'vsgut+':    { family: 'vsgshape', pole: 'neg' },
-    'vsgalpha+': { family: 'vsgmid',   pole: 'pos' }, 'vsgdelta+': { family: 'vsgmid',   pole: 'neg' },
-    'vsgmomup+': { family: 'vsgmom',   pole: 'pos' }, 'vsgmomdn+': { family: 'vsgmom',   pole: 'neg' },
+    // PEC/VSG: one aggregate dial per family, not one per boolean shape tag — a ticker
+    // is credited/vetoed on how extreme PEC (or VSG) reads OVERALL, not separately for
+    // each of the shape/mid/momentum sub-tests it happens to also satisfy. All three PEC
+    // sub-reads share the single 'pec' family+pole below; likewise VSG. When a position
+    // matches more than one PEC (or VSG) sub-tag at once, collapseFamilyDupes keeps only
+    // the single strongest reading before it ever reaches the veto or the build pass.
+    'pecob+':    { family: 'pec', pole: 'pos' }, 'pecos+':    { family: 'pec', pole: 'neg' },
+    'pecalpha+': { family: 'pec', pole: 'pos' }, 'pecdelta+': { family: 'pec', pole: 'neg' },
+    'pecmomup+': { family: 'pec', pole: 'pos' }, 'pecmomdn+': { family: 'pec', pole: 'neg' },
+    'vsgot+':    { family: 'vsg', pole: 'pos' }, 'vsgut+':    { family: 'vsg', pole: 'neg' },
+    'vsgalpha+': { family: 'vsg', pole: 'pos' }, 'vsgdelta+': { family: 'vsg', pole: 'neg' },
+    'vsgmomup+': { family: 'vsg', pole: 'pos' }, 'vsgmomdn+': { family: 'vsg', pole: 'neg' },
   };
   const DIAL_SINGLE = new Set(['pecirr+', 'vsgirr+']);
   // Bare Blind-Entry/Liquid-Diver tags carry no magnitude at all — sign is the entire
@@ -261,8 +273,7 @@
   // else keeps its original tag string so pfCritEmoji and the Blockable Criteria picker
   // keep working unchanged.
   const DIAL_DISPLAY = {
-    pecshape: ['pecob+', 'pecos+'], pecmid: ['pecalpha+', 'pecdelta+'], pecmom: ['pecmomup+', 'pecmomdn+'],
-    vsgshape: ['vsgot+', 'vsgut+'], vsgmid: ['vsgalpha+', 'vsgdelta+'], vsgmom: ['vsgmomup+', 'vsgmomdn+'],
+    pec: ['pec+', 'pec-'], vsg: ['vsg+', 'vsg-'],
     pecirr: ['pecirr+', null], vsgirr: ['vsgirr+', null],
   };
   const dialDisplayKey = (family, pole) => {
@@ -270,6 +281,29 @@
     if (['fund', 'va', 'ioa', 'ocs', 'ocx'].includes(family)) return family + (pole === 'pos' ? '+' : '-');
     const pair = DIAL_DISPLAY[family];
     return pair ? (pole === 'neg' ? pair[1] : pair[0]) || family : family;
+  };
+  // Collapses same-family duplicate readings down to the single strongest one before
+  // anything scores or vetoes off them. A position can genuinely satisfy more than one
+  // PEC sub-tag at once (e.g. pecob AND pecalpha both true) — under Extremity that's
+  // still ONE PEC reading, not two votes, so only the highest-magnitude sub-tag survives
+  // per family. Same for VSG. Every other family already has at most one matching tag per
+  // position, so this is a no-op for them; anchors and unrecognized tags pass straight
+  // through untouched.
+  const AGGREGATE_FAMILIES = new Set(['pec', 'vsg']);
+  const collapseFamilyDupes = crits => {
+    const byFamily = new Map();
+    const passthrough = [];
+    for (const c of (crits || [])) {
+      const key = collapseCrit(c);
+      const info = dialInfo(key);
+      if (!info || !AGGREGATE_FAMILIES.has(info.family)) { passthrough.push(c); continue; }
+      const noGradation = info.pole !== 'single' && !!BARE_DIAL_TAGS[key];
+      const m2 = c.match(/(-?\d+)$/);
+      const mag = noGradation ? Infinity : (m2 ? Math.abs(parseInt(m2[1], 10)) : 0);
+      const cur = byFamily.get(info.family);
+      if (!cur || mag > cur.mag) byFamily.set(info.family, { crit: c, mag });
+    }
+    return [...passthrough, ...[...byFamily.values()].map(v => v.crit)];
   };
   // Regime segment display labels — bull = S-Liq dominant, bear = B-Liq dominant (matches
   // the S/B naming already used by the regime criteria themselves, see Regime.md).
@@ -1039,12 +1073,10 @@
           this.log(`[PFR] Permafrost (Winter) v${VERSION} loaded — ${this.cfg.permafrostEnabled ? 'enabled' : 'disabled'} | ${this.pfCloses.length} closes on record`, 'info');
           setInterval(() => {
             if (this.cfg.permafrostCrossEnabled) this._pfCheckCross().catch(() => {});
-            // _pfExtremityBuild() is NOT called here on a timer — its source data
-            // (Extremity records) only changes on a trade close, a config change affecting
-            // the computation, or an import, and it's called from each of those directly. A
-            // periodic rebuild here would just recompute the identical result between those
-            // events for no reason, on every tick's worth of ticks (up to a few thousand
-            // records, twice-sorted) whether or not the Score panel is even open.
+            // _pfExtremityBuild() is NOT called on THIS setInterval timer (it runs every few
+            // seconds, purely for cross-plugin housekeeping) — it's called once per runScan
+            // cycle instead (see runScan), which is frequent enough to track the sample pool
+            // filling in without redoing the full sort/rebuild on every single interval tick.
             if (this.cfg.permafrostCrossEnabled) {
               const _halted  = this._isDrawdownHalted?.() ?? false;
               const _glocked = this._isGainsLocked?.()    ?? false;
@@ -1584,7 +1616,7 @@
             const isPartner = r.source !== 'winter';
             const counts = !isPartner || this._pfPartnerCounts(pnl);
             const effectivePnl = isPartner ? -pnl : pnl;
-            for (const c of keptCrits) {
+            for (const c of collapseFamilyDupes(keptCrits)) {
               const key = collapseCrit(c);
               const anchorBase = /^(sliq|bliq|msliq|mbliq)$/.test(key) ? key : (key === '0liq' ? '0liq' : null);
               if (anchorBase) {
@@ -1655,7 +1687,7 @@
           if (!this.cfg.pfExtremityEnabled) return false;
           const cutoffs = this.pfDialCutoffs || {};
           let total = 0, lukewarm = 0;
-          for (const c of (annotCrits || [])) {
+          for (const c of collapseFamilyDupes(annotCrits)) {
             const key = collapseCrit(c);
             if (/^(sliq|bliq|msliq|mbliq)$/.test(key) || key === '0liq') continue;
             const info = dialInfo(key);
@@ -1670,6 +1702,46 @@
           }
           if (!total) return false;
           return (lukewarm / total * 100) >= (this.cfg.pfLukewarmRatioPct ?? 70);
+        },
+        // Extremity Re-Evaluation (secondary toggle, off by default). At the end of every
+        // scan, re-derives each open position's own qualifying criteria against the CURRENT
+        // dial cutoffs and closes it once it crosses the same lukewarm-ratio bar it had to
+        // clear to open in the first place — held to the same standard throughout its life,
+        // not just at entry. Deliberately reads only data this cycle already cached (bulk
+        // ticker snapshot + MIW's live PEC/OC caches) rather than firing fresh fetches of its
+        // own, so it rides the existing scan cadence instead of adding load on top of the
+        // scan scheduler. A symbol with no fresh-enough cached tick this cycle is skipped
+        // rather than forcing a fetch.
+        async _pfExtremityReEval() {
+          if (!this.cfg.pfExtremityEnabled || !this.cfg.pfExtremityReEvalEnabled) return;
+          const snapshot = [...(this.positions || [])];
+          const isRegime = c => /^regime/.test(collapseCrit(c).replace(/[+-]$/, ''));
+          for (const pos of snapshot) {
+            if (!pos || !pos.symbol) continue;
+            const crits = pos._miwCriteria || pos._bewCriteria || pos._ldwCriteria;
+            if (!crits || !crits.length) continue;
+            // Every other criterion re-evaluates the ticker on what changed about IT — that
+            // needs this cycle's own tick, so a position is skipped this cycle if it's
+            // missing. Regime re-evaluates on what changed about the MARKET instead
+            // (_miwAnnotateLiveCritRaw's regime branch never reads its `t` argument at all),
+            // so it alone shouldn't block on ticker availability — only require `t` when
+            // there's at least one non-regime criterion that actually needs it.
+            const needsTicker = crits.some(c => !isRegime(c));
+            const t = needsTicker ? (this._lastAllTickers || []).find(x => x.symbol === pos.symbol) : null;
+            if (needsTicker && !t) continue;
+            // Regime counts equally alongside every other criterion in the veto below — one
+            // vote in the same ratio, not excluded and not authoritative on its own. It's
+            // just re-derived from the market rather than from `t`.
+            const liveCrits = crits.map(c => {
+              const base = collapseCrit(c).replace(/[+-]$/, '');
+              if (/^(sliq|bliq|msliq|mbliq)/.test(base) || base === '0liq') return c; // anchors don't decay under Extremity, unaffected by re-eval
+              return this._miwAnnotateLiveCrit?.(base, isRegime(c) ? null : t, null, 0, this.pfOcResults) ?? c;
+            });
+            if (this._pfExtremityVeto(liveCrits)) {
+              await this.pseudoClosePosition(pos, 'Ext-Rvl');
+              this.log(`[PF] ${pos.symbol} closed — Extremity Re-Evaluation: fallen back to lukewarm.`, 'info');
+            }
+          }
         },
         // cfg.miwEnabled is a persisted toggle value — it survives MIW being removed via the
         // Plugin Manager, so it alone can't tell us whether MIW is actually loaded right now.
@@ -1713,12 +1785,14 @@
           const rx = new RegExp('^(' + blockable.map(esc).join('|') + ')[+-]?$');
           return rx.test(key) && (ranks[key] ?? 0) <= -threshold;
         },
-        // Extremity Scorer dial UI — one vertical dial per family, positive-pole emoji on
-        // top, negative-pole emoji on the bottom, the live "extreme begins here" cutoff
-        // shown underneath (or "unproven" below pfExtremityMinSamples). Liq anchors and the
-        // single-pole Irregularity readings render as a one-ended card (no opposite pole
-        // exists for either — see StrategyBook.md). MIW and Blind-Entry/Liquid-Diver tags
-        // share one unified panel now — under Extremity Scorer they're the same dial.
+        // Extremity Scorer pill UI — one pill per family, split into a positive-pole half
+        // and a negative-pole half, each showing its own emoji/PnL/W-L/cutoff independently
+        // (previously only one shared cutoff was shown for the whole dial — each pole has
+        // its own sample-derived cutoff and both are now surfaced, e.g. fund's positive half
+        // reading "›0.2" and its negative half reading "‹-0.8", not the same number twice).
+        // Liq anchors and the single-pole Irregularity readings render as a one-ended pill
+        // (no opposite pole exists for either — see StrategyBook.md). Regime folds bull/bear
+        // into one pill the same way fund/va/pec/etc. do, rather than two separate ones.
         _pfExtremityHtml(shown) {
           if (!shown) return '';
           const stats = this.miwCollapsedCritStats || {};
@@ -1731,7 +1805,12 @@
           const dials = [];
           for (const k of keys) {
             if (used.has(k)) continue;
-            const famM = k.match(/^(fund|va|ioa|ocs|ocx)[+-]$/);
+            if (k === 'regimeb+' || k === 'regimes+') {
+              dials.push([stats['regimeb+'] ? 'regimeb+' : null, stats['regimes+'] ? 'regimes+' : null]);
+              used.add('regimeb+'); used.add('regimes+');
+              continue;
+            }
+            const famM = k.match(/^(fund|va|ioa|ocs|ocx|pec|vsg)[+-]$/);
             if (famM) {
               const fam = famM[1], pos = fam + '+', neg = fam + '-';
               dials.push([stats[pos] ? pos : null, stats[neg] ? neg : null]);
@@ -1742,36 +1821,41 @@
             used.add(k);
           }
           const fmt = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2);
-          const dialCard = (posKey, negKey) => {
-            const posCs = posKey ? stats[posKey] : null, negCs = negKey ? stats[negKey] : null;
-            const posVal = posCs ? val(posCs) : 0, negVal = negCs ? val(negCs) : 0;
+          const cutoffText = cs => {
+            if (!cs) return '';
+            if (cs.cutoff == null) return `unproven ${cs.sampleCount ?? 0}/${this.cfg.pfExtremityMinSamples ?? 3}`;
+            return cs.pole === 'neg' ? `‹-${cs.cutoff}` : `›${cs.cutoff}`;
+          };
+          const half = (key, cs, blocked) => {
+            const v = cs ? val(cs) : 0;
+            const color = blocked ? 'rgba(190,130,255,.95)' : v > 0 ? 'rgba(100,220,150,.9)' : v < 0 ? 'var(--short)' : 'var(--text-lo)';
+            const [w, l] = cs ? wl(cs) : [0, 0];
+            const isAnchor = /^(sliq|bliq|msliq|mbliq|0liq)$/.test((key || '').replace(/[+-]$/, ''));
+            return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:0">`
+              + `<div style="font-size:11px">${pfCritEmoji(key)}</div>`
+              + `<div style="font-size:7.5px;color:${color}"><b>${fmt(v)}</b></div>`
+              + `<div style="font-size:6px;opacity:.5">${w}W ${l}L</div>`
+              + (isAnchor ? '' : `<div style="font-size:6px;opacity:.45;white-space:nowrap">${cutoffText(cs)}</div>`)
+              + `</div>`;
+          };
+          const pill = (posKey, negKey) => {
+            const posCs = posKey ? { ...stats[posKey], pole: 'pos' } : null;
+            const negCs = negKey ? { ...stats[negKey], pole: 'neg' } : null;
             const posBlocked = posKey && this._pfIsCritBlocked(posKey);
             const negBlocked = negKey && this._pfIsCritBlocked(negKey);
-            const colorOf = (v, blocked) => blocked ? 'rgba(190,130,255,.95)' : v > 0 ? 'rgba(100,220,150,.9)' : v < 0 ? 'var(--short)' : 'var(--text-lo)';
-            const posColor = colorOf(posVal, posBlocked), negColor = colorOf(negVal, negBlocked);
             const label = (posKey || negKey || '').replace(/[+-]$/, '');
-            const isAnchor = /^(sliq|bliq|msliq|mbliq|0liq)$/.test(posKey || negKey || '');
-            const cutoffSrc = posCs?.cutoff ?? negCs?.cutoff;
-            const sampleSrc = (posCs?.sampleCount ?? 0) + (negCs?.sampleCount ?? 0);
-            const cutoffLbl = isAnchor ? '' : (cutoffSrc != null ? `extreme ≥ ${cutoffSrc}` : `unproven (${sampleSrc}/${this.cfg.pfExtremityMinSamples ?? 3})`);
             const dataKey = posKey || negKey;
-            const wlLbl = (cs) => { if (!cs) return ''; const [w,l] = wl(cs); return `${w}W ${l}L`; };
-            return `<div data-slot="${dataKey}" title="${label}${cutoffLbl ? ' — ' + cutoffLbl : ''}" style="cursor:pointer;display:flex;flex-direction:column;align-items:center;width:52px;font-family:var(--mono)">`
-              + `<div style="font-size:12px">${posKey ? pfCritEmoji(posKey) : '·'}</div>`
-              + `<div style="font-size:7px;color:${posColor}">${posKey ? `<b>${fmt(posVal)}</b>` : ''}</div>`
-              + `<div style="font-size:6.5px;opacity:.5">${posKey ? wlLbl(posCs) : ''}</div>`
-              + `<div style="width:5px;height:30px;border-radius:3px;margin:2px 0;background:linear-gradient(to bottom, ${posColor} 0%, rgba(255,255,255,.10) 46%, rgba(255,255,255,.10) 54%, ${negColor} 100%)"></div>`
-              + `<div style="font-size:6.5px;opacity:.5">${negKey ? wlLbl(negCs) : ''}</div>`
-              + `<div style="font-size:7px;color:${negColor}">${negKey ? `<b>${fmt(negVal)}</b>` : ''}</div>`
-              + `<div style="font-size:12px">${negKey ? pfCritEmoji(negKey) : '·'}</div>`
-              + `<div style="font-size:6px;opacity:.45;margin-top:2px;text-align:center;line-height:1.3">${label}${cutoffLbl ? '<br>' + cutoffLbl : ''}</div>`
+            const single = !posKey || !negKey;
+            return `<div data-slot="${dataKey}" title="${label}" style="cursor:pointer;display:flex;align-items:stretch;border:1px solid var(--border);border-radius:14px;background:var(--bg-raised);padding:4px ${single ? 10 : 8}px;font-family:var(--mono);min-width:${single ? 46 : 84}px">`
+              + half(posKey || negKey, posKey ? posCs : negCs, posKey ? posBlocked : negBlocked)
+              + (single ? '' : `<div style="width:1px;align-self:stretch;background:rgba(255,255,255,.12);margin:0 4px"></div>${half(negKey, negCs, negBlocked)}`)
               + `</div>`;
           };
           const score = ([pk, nk]) => {
             const a = pk ? val(stats[pk]) : 0, b = nk ? val(stats[nk]) : 0;
             return Math.max(a, b);
           };
-          return dials.sort((a, b) => score(b) - score(a)).map(([a, b]) => dialCard(a, b)).join('');
+          return dials.sort((a, b) => score(b) - score(a)).map(([a, b]) => pill(a, b)).join('');
         },
         _pfCrossRead() {
           try {
@@ -2027,6 +2111,17 @@
           // MIW's own annotation helpers, which need this cycle's MIW/OC/PEC caches to have
           // already landed.
           setTimeout(() => this._pfExtremityReEval().catch(() => {}), 0);
+          // pfDialSamplePool is deliberately NOT persisted (see its declaration) — every
+          // fresh page load starts it empty, so every dial's cutoff comes back "unproven"
+          // until enough live readings land. _pfExtremityBuild() is otherwise only called on
+          // a close/config-change/import (see runScan's own long-standing comment on why it's
+          // not on a timer), which used to leave a freshly-loaded page showing every dial-
+          // based score as zero — anchors (sliq/bliq/etc, no cutoff needed) unaffected — until
+          // the next real close happened to trigger a rebuild, sometimes hours later. Once per
+          // scan is cheap enough (same call the toggles above already make on every slider
+          // drag) and keeps the panel in sync with the pool as it fills in, rather than
+          // requiring a load-bearing trade close just to redraw existing history.
+          this._pfExtremityBuild();
           this._pfFetchStructure().then(r => {
             if (!r) return;
             this._pfAddSample(r);
