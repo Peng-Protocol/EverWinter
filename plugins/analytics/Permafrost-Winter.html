@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.72.0'; // 0-liq/live-liq now a real two-pole dial (was uncounted, bugged); PEC/VSG sub-tags block on their own record, not the pooled family; Irregularity splits high/lukewarm/low; new liqturnover dial + 3-way pill; pfDialSamplePool now persists — see /versioning
+    const VERSION        = '1.73.0'; // configurable 72-batch liq snapshot window; two Bull/Bear regime criteria; aggregate PEC/VSG includes every matching sub-tag
   // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
   // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
   // one _miwOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
@@ -96,6 +96,7 @@
     pfPartnerScoreMode: 'wins',
     pfLiqEnabled: true,
     pfLiqBatchSize: 25,
+    pfLiqSampleWindow: 72, // completed-batch snapshots retained for liquidation skew/regime
     pfLiqThresholdPct: 50,
     pfLiqSequesterEnabled: true,
     pfLiqSequesterCap: 12,
@@ -199,7 +200,7 @@
     if (/^regime([a-z]+)/.test(c)) {
       const m = c.match(/^(regime[a-z]+)/);
       const base = m[1];
-      const emoji = { regimeslo: '🌤️', regimeblo: '🌤️', regimesmid: '☁️', regimebmid: '☁️', regimeshi: '⛈️', regimebhi: '🌪️' }[base] || '📊';
+      const emoji = { regimebull: '🐂', regimebear: '🐻' }[base] || '📊';
       return emoji + c.slice(base.length);
     }
     if (c === '+24h') return '⬆️'; if (c === '-24h') return '⬇️';
@@ -287,8 +288,8 @@
   // lo/mid/hi band is dropped entirely, its old fixed thresholds replaced by the same
   // sample-derived cutoff every other dial uses, driven by the depth already attached.
   const regimeDialInfo = key => {
-    const m = key.match(/^regime([sb])(?:lo|mid|hi)\+$/);
-    return m ? { family: 'regime', pole: m[1] === 's' ? 'pos' : 'neg' } : null;
+    const m = key.match(/^regime(bull|bear)\+$/);
+    return m ? { family: 'regime', pole: m[1] === 'bull' ? 'pos' : 'neg' } : null;
   };
   const dialInfo = key => DIAL_POLES[key] || BARE_DIAL_TAGS[key] || regimeDialInfo(key)
     || (DIAL_SINGLE.has(key) ? { family: key.slice(0, -1), pole: 'single' } : null);
@@ -351,7 +352,7 @@
   };
   // Regime segment display labels — bull = S-Liq dominant, bear = B-Liq dominant (matches
   // the S/B naming already used by the regime criteria themselves, see Regime.md).
-  const REGIME_SEGMENT_LABEL = { regimeslo: 'Low Bull', regimeblo: 'Low Bear', regimesmid: 'Mid Bull', regimebmid: 'Mid Bear', regimeshi: 'High Bull', regimebhi: 'High Bear' };
+  const REGIME_SEGMENT_LABEL = { regimebull: 'Bull', regimebear: 'Bear' };
   const KERNEL_H       = 0.25;                 // gaussian bandwidth in (skew, breadth) space
   const HALF_LIFE_MS   = 7 * 24 * 3600 * 1000; // recency decay half-life — old scars fade
   const MIN_MASS       = 6;                    // evidence mass (kernel-weighted closes) required to use history
@@ -613,6 +614,11 @@
                   <div class="lbl">Batch Size <b x-text="(cfg.pfLiqBatchSize)"></b> tickers</div>
                   <input type="range" min="5" max="50" step="5" x-model.number="cfg.pfLiqBatchSize" @change="persist()">
                   <div class="pfr-hint" x-text="'Per 1h window from ≥6% 24h move pool, disjoint across concurrent batches — '+(cfg.pfLiqPrescreenEnabled?'scored fill when Pre-Screening is on.':'random draw.')"></div>
+                </div>
+                <div class="g" style="margin-top:6px">
+                  <div class="lbl">Liq Sample Window <b x-text="cfg.pfLiqSampleWindow"></b> batches</div>
+                  <input type="range" min="3" max="144" step="1" x-model.number="cfg.pfLiqSampleWindow" @change="_liqCycleHistory=(_liqCycleHistory||[]).slice(-Math.max(3,cfg.pfLiqSampleWindow));_liqPersistHistory();persist()">
+                  <div class="pfr-hint">Completed-batch liquidation-skew snapshots retained for the Bull/Bear regime read.</div>
                 </div>
                 <label class="tog" style="margin-top:8px">
                   <div class="tog-t" :class="cfg.pfLiqSequesterEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.pfLiqSequesterEnabled=!cfg.pfLiqSequesterEnabled;persist()}"><div class="tog-k"></div></div>
@@ -1021,7 +1027,7 @@
           try {
             const hist = JSON.parse(localStorage.getItem(PFR_LIQ_HISTORY_KEY) || 'null');
             if (Array.isArray(hist) && hist.length) {
-              this._liqCycleHistory = hist.slice(-25);
+              this._liqCycleHistory = hist.slice(-Math.max(3, this.cfg.pfLiqSampleWindow || 72));
               const last = hist[hist.length - 1];
               this._liqLatestResults = last.results || [];
               for (const r of last.results || [])
@@ -1202,7 +1208,7 @@
                   const _added = _ps.liqHistory.filter(e => e.ts && !_ownTs.has(e.ts));
                   if (_added.length) {
                     this._liqCycleHistory = [...(this._liqCycleHistory || []), ..._added]
-                      .sort((a, b) => a.ts - b.ts).slice(-25);
+                      .sort((a, b) => a.ts - b.ts).slice(-Math.max(3, this.cfg.pfLiqSampleWindow || 72));
                     this._liqPersistHistory();
                   }
                 }
@@ -1655,8 +1661,8 @@
         // Bare Blind-Entry/Liquid-Diver tags and single-pole families with no magnitude
         // gradation always classify extreme — there's nothing to be lukewarm about. Regime is
         // just one more two-pole family here (see regimeDialInfo) — its old fixed Lo/Mid/Hi
-        // bands and separate 6-bucket Regime Based Scoring pass are gone; Mid is now whatever
-        // the live sample's own middle turns out to be.
+        // bands and separate Regime-Based Scoring pass are gone; the signed Bull/Bear snapshot
+        // is scored through the same sample-derived cutoff as every other two-pole family.
         _pfExtremityBuild(records) {
           records = records || this._pfScoreRead();
           const exclude = new Set(this.cfg.miwAutoSlotExclude || []);
@@ -1699,7 +1705,7 @@
             const isPartner = r.source !== 'winter';
             const counts = !isPartner || this._pfPartnerCounts(pnl);
             const effectivePnl = isPartner ? -pnl : pnl;
-            for (const c of collapseFamilyDupes(keptCrits)) {
+            for (const c of keptCrits) {
               const key = collapseCrit(c);
               const info = dialInfo(key);
               if (!info) continue; // unrecognized/retired tag — no dial, not scored
@@ -1788,7 +1794,7 @@
           if (!this.cfg.pfExtremityEnabled) return false;
           const cutoffs = this.pfDialCutoffs || {};
           let total = 0, lukewarm = 0;
-          for (const c of collapseFamilyDupes(annotCrits)) {
+          for (const c of (annotCrits || [])) {
             if (c === LIQ_LUKEWARM) { total++; lukewarm++; continue; }
             const key = collapseCrit(c);
             const info = dialInfo(key);
@@ -1906,32 +1912,11 @@
         // MIW's _miwOnLiqClose), it's the live High/Lukewarm/Low read _miwLiqHighCutoff/
         // _miwLiqLowCutoff gate entries against right now. Shown unconditionally, even with
         // zero closes recorded — it reflects the current market read, not trade history.
-        _pfLiqTurnoverPillHtml() {
-          const cutoffs = this.pfDialCutoffs || {};
-          const hi = cutoffs['liqturnover|pos'], lo = cutoffs['liqturnover|neg'];
-          if (hi === undefined && lo === undefined) return ''; // no samples at all yet — nothing to show
-          const minSamples = this.cfg.pfExtremityMinSamples ?? 3;
-          const sampleN = (this.pfDialSampleCounts || {})['liqturnover|single'] ?? 0;
-          const seg = (label, emoji, cutoffTxt) => `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:0">`
-            + `<div style="font-size:11px">${emoji}</div>`
-            + `<div style="font-size:7.5px;color:var(--text-lo)"><b>${label}</b></div>`
-            + `<div style="font-size:6px;opacity:.5;white-space:nowrap">${cutoffTxt}</div>`
-            + `</div>`;
-          const hiText = hi == null ? `unproven ${sampleN}/${minSamples}` : `›${hi}`;
-          const loText = lo == null ? `unproven ${sampleN}/${minSamples}` : `‹${lo}`;
-          const bar = `<div style="width:1px;align-self:stretch;background:rgba(255,255,255,.12);margin:0 4px"></div>`;
-          const activityPct = this._miwLiqActivityPct;
-          const activityHtml = activityPct == null ? '' : bar + seg('Mkt Liq', '📡', `${activityPct}% active`);
-          return `<div title="Market-wide liquidation turnover this sample window — live-liq only enters at High, Past-1 only enters at Low" style="display:flex;align-items:stretch;border:1px solid var(--border);border-radius:14px;background:var(--bg-raised);padding:4px 8px;font-family:var(--mono);min-width:110px">`
-            + seg('High', '🌊', hiText) + bar + seg('Mid', '➖', 'no gate') + bar + seg('Low', '🏜️', loText) + activityHtml
-            + `</div>`;
-        },
         _pfExtremityHtml(shown) {
           if (!shown) return '';
           const stats = this.miwCollapsedCritStats || {};
           const keys = Object.keys(stats);
-          const liqTurnoverHtml = this._pfLiqTurnoverPillHtml();
-          if (!keys.length) return liqTurnoverHtml || `<span style="font-size:9px;color:var(--text-lo)">No Extremity closes recorded yet.</span>`;
+          if (!keys.length) return `<span style="font-size:9px;color:var(--text-lo)">No Extremity closes recorded yet.</span>`;
           const own = (this.cfg.pfExtremityView || 'combined') === 'own';
           const val = cs => own ? cs.ownPnl : cs.pnl;
           const wl  = cs => own ? [cs.ownWins, cs.ownLosses] : [cs.wins, cs.losses];
@@ -1994,7 +1979,7 @@
             const a = pk ? val(stats[pk]) : 0, b = nk ? val(stats[nk]) : 0;
             return Math.max(a, b);
           };
-          return liqTurnoverHtml + dials.sort((a, b) => score(b) - score(a)).map(([a, b]) => pill(a, b)).join('');
+          return dials.sort((a, b) => score(b) - score(a)).map(([a, b]) => pill(a, b)).join('');
         },
         _pfCrossRead() {
           try {
@@ -2217,7 +2202,7 @@
                 try { localStorage.setItem(EXTREMITY_KEY, JSON.stringify(importedScore)); } catch(_) {}
               }
               if (Array.isArray(d.liqHistory)) {
-                this._liqCycleHistory = d.liqHistory.slice(-25);
+                this._liqCycleHistory = d.liqHistory.slice(-Math.max(3, this.cfg.pfLiqSampleWindow || 72));
                 try { localStorage.setItem(PFR_LIQ_HISTORY_KEY, JSON.stringify(this._liqCycleHistory)); } catch(_) {}
                 this._liqUpdateAvgTurnover();
               }
@@ -2965,7 +2950,8 @@
           this._liqPersistSequester();
           const entry = { id: batch.id, ts: _now, results };
           this._liqCycleHistory.push(entry);
-          if (this._liqCycleHistory.length > 25) this._liqCycleHistory = this._liqCycleHistory.slice(-25);
+          const sampleWindow = Math.max(3, this.cfg.pfLiqSampleWindow || 72);
+          if (this._liqCycleHistory.length > sampleWindow) this._liqCycleHistory = this._liqCycleHistory.slice(-sampleWindow);
           this._liqPersistHistory();
           this._liqUpdateAvgTurnover();
           this._liqLatestResults = results;
@@ -3096,7 +3082,8 @@
           }
           const total = s + b;
           if (!total) return null;
-          return { sPct: s / total * 100, bPct: b / total * 100, total };
+          const skew = ((s - b) / total) * 100; // -100 Bear (buy-liquidation dominant) … +100 Bull
+          return { sPct: s / total * 100, bPct: b / total * 100, skew, total };
         },
         _pfApplySwitchover(ownHalted = this._isDrawdownHalted?.() ?? false) {
           if (!this.cfg.pfSwitchoverEnabled || !this.cfg.permafrostCrossEnabled) return;
