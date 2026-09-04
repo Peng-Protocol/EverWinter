@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-  const VERSION        = '1.71.1'; // PEC/VSG magnitude now the actual aggregate 6h/12h/24h index level (distance from high/low midpoint), shared by all 6 sub-tags, not each shape test's own formula; regime counts equally in Re-Eval's veto (not excluded), just no longer needs a ticker snapshot to re-derive — see /versioning
+  const VERSION        = '1.72.0'; // 0-liq/live-liq now a real two-pole dial (was uncounted, bugged); PEC/VSG sub-tags block on their own record, not the pooled family; Irregularity splits high/lukewarm/low; new liqturnover dial + 3-way pill; afDialSamplePool now persists — see /versioning
   // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
   // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
   // one _micOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
@@ -51,9 +51,8 @@
     // Extremity Scorer (replaces the old Slot Scorecard, v1.70.0 — see /versioning).
     // afExtremitySplitPct/afExtremityMinSamples govern the same "sort >=3 values into
     // high/lukewarm/low" cutoff for every dial family (fund, V/A, IO/A, OCS, OCX,
-    // PEC/VSG shape magnitudes, Irregularity, Regime); afLukewarmRatioPct is the
-    // whole-ticker veto share. Liq anchors (sliq/bliq/msliq/mbliq/0liq) are not dials
-    // and are unaffected by any of these — see _afExtremityBuild.
+    // PEC/VSG shape magnitudes, Irregularity, Regime, 0-Liq); afLukewarmRatioPct is the
+    // whole-ticker veto share — see _afExtremityBuild.
     afExtremityEnabled: true,
     afCoQualPenaltyEnabled: true,
     afCoQualDepthPct: 10,
@@ -118,6 +117,10 @@
   // cutoff existed) into cutoff math it was never sampled for.
   const EXTREMITY_KEY  = '__everwinter_extremity_v1';
   const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
+  // afDialSamplePool's own persistence key — deliberately per-side (not shared with Permafrost
+  // like EXTREMITY_KEY/CROSS_KEY), since the two sides' dial families are computed
+  // independently and have no reason to pool. See _afLoadDialPool/_afSaveDialPool.
+  const DIAL_POOL_KEY = '__ew_af_dialpool_v1';
   // Full-universe PEC/VSG candle log for Pre-Screening — same same-origin-localStorage
   // sharing convention as EXTREMITY_KEY/CROSS_KEY (Ashfall and Permafrost both read/write this,
   // so whichever fetches first each cycle saves the other one the trip), but deliberately
@@ -180,6 +183,9 @@
     if (c === '+fund') return '💸'; if (c === '-fund') return '🤑';
     if (c === '+ocs') return '🔭+'; if (c === '-ocs') return '🔭-';
     if (c === '0liq') return '⚫';
+    if (c === 'liveliq+') return '💥';
+    if (c === 'liqturnover+') return '🌊';
+    if (c === 'liqturnover-') return '🏜️';
     if (c === '>10pct') return '🔊'; if (c === '<10pct') return '🔉';
     return c;
   };
@@ -205,8 +211,11 @@
   // "which extreme end was more profitable". Single-pole families (Irregularity) have no
   // opposite reading at all (see StrategyBook.md: irregularity is the enemy of extremity,
   // not a side of it) and only ever classify hot-vs-lukewarm within their own spread.
-  // Liq anchors (sliq/bliq/msliq/mbliq/0liq) are NOT here — categorical gates stay binary
-  // win/loss, no dial, see _afExtremityBuild's anchor pass.
+  // 0-liq is a two-pole family like any other: '0liq' (bare, no gradation — zero liquidation
+  // across the window) is its positive pole; any live liq reading (sliq/bliq/msliq/mbliq,
+  // all four folded into one aggregate reading — sign there is depth direction, not a
+  // separate criterion) is its negative pole, tiered on live depth same as fund/pec/etc.
+  // See _afExtremityBuild for the lukewarm (Past-1/liq-) classification used at veto/re-eval time.
   const DIAL_POLES = {
     'fund+': { family: 'fund', pole: 'pos' },       'fund-': { family: 'fund', pole: 'neg' },
     'va+':   { family: 'va',   pole: 'pos' },       'va-':   { family: 'va',   pole: 'neg' },
@@ -225,16 +234,31 @@
     'vsgot+':    { family: 'vsg', pole: 'pos' }, 'vsgut+':    { family: 'vsg', pole: 'neg' },
     'vsgalpha+': { family: 'vsg', pole: 'pos' }, 'vsgdelta+': { family: 'vsg', pole: 'neg' },
     'vsgmomup+': { family: 'vsg', pole: 'pos' }, 'vsgmomdn+': { family: 'vsg', pole: 'neg' },
+    // Live liq — sliq/bliq/msliq/mbliq are one aggregate negative-pole reading against 0liq's
+    // positive pole (see DIAL_POLES comment above), not four separate anchors. Sign here is
+    // depth direction, so both '+' and '-' variants of all four types route to the same pole.
+    'sliq+':  { family: '0liq', pole: 'neg' }, 'sliq-':  { family: '0liq', pole: 'neg' },
+    'bliq+':  { family: '0liq', pole: 'neg' }, 'bliq-':  { family: '0liq', pole: 'neg' },
+    'msliq+': { family: '0liq', pole: 'neg' }, 'msliq-': { family: '0liq', pole: 'neg' },
+    'mbliq+': { family: '0liq', pole: 'neg' }, 'mbliq-': { family: '0liq', pole: 'neg' },
   };
-  const DIAL_SINGLE = new Set(['pecirr+', 'vsgirr+']);
+  const DIAL_SINGLE = new Set(['pecirr+', 'vsgirr+', 'liqturnover+']);
+  // Sentinel for 0-liq's lukewarm reading (Past-1/liq- — real liquidation, never crossed the
+  // live threshold). Not a magnitude/cutoff reading like every other dial's lukewarm state,
+  // so it's asserted directly rather than derived — see _afExtremityVeto and MIC's
+  // _micLiqCurrentRead (same literal string, independently defined — the two plugins don't
+  // share a JS scope).
+  const LIQ_LUKEWARM = '0liq~lukewarm';
   // Bare Blind-Entry/Liquid-Diver tags carry no magnitude at all — sign is the entire
   // signal. They fold into the SAME family as MIC's own tiered fund/ocs dial (previously
   // kept in a deliberately separate bucket to avoid key collisions — under Extremity
   // Scorer that collision is the point: one unified read per underlying signal) and always
-  // classify extreme, since there's no gradation to be lukewarm about.
+  // classify extreme, since there's no gradation to be lukewarm about. '0liq' is the same
+  // shape: bare, untiered, always the 0-liq family's extreme positive pole.
   const BARE_DIAL_TAGS = {
     '+fund': { family: 'fund', pole: 'pos' }, '-fund': { family: 'fund', pole: 'neg' },
     '+ocs':  { family: 'ocs',  pole: 'pos' }, '-ocs':  { family: 'ocs',  pole: 'neg' },
+    '0liq':  { family: '0liq', pole: 'pos' },
   };
   // Regime folds in as one more two-pole family (bull dominance vs bear dominance)
   // instead of its old separate fixed Low/Mid/High x Bull/Bear 6-bucket system — the
@@ -247,17 +271,37 @@
   };
   const dialInfo = key => DIAL_POLES[key] || BARE_DIAL_TAGS[key] || regimeDialInfo(key)
     || (DIAL_SINGLE.has(key) ? { family: key.slice(0, -1), pole: 'single' } : null);
-  // Maps a family+pole back to a display/emoji-lookup key. Regime is the only family
-  // whose display key doesn't already match an existing pre-Extremity tag name (its old
-  // per-band names no longer apply once lo/mid/hi collapses into one dial) — everything
-  // else keeps its original tag string so afCritEmoji and the Blockable Criteria picker
-  // keep working unchanged.
+  // Single-pole families (Irregularity) split their OWN sample spread into three, same
+  // "organically arrange into highs and lows" idea as every two-pole dial, just from one
+  // shared magnitude stream instead of two separately-tagged ones: top splitPct of
+  // pecirr/vsgirr's own readings is "high" (family|pos), bottom splitPct is "low"
+  // (family|neg), everything between is lukewarm. Cutoffs for both sides come from
+  // _afExtremityBuild's cutoff pass below; this just applies them to one reading.
+  const singlePoleClassify = (family, mag, cutoffs) => {
+    const hi = cutoffs[family + '|pos'], lo = cutoffs[family + '|neg'];
+    if (hi != null && mag >= hi) return 'pos';
+    if (lo != null && mag <= lo) return 'neg';
+    return null; // lukewarm — below the high cutoff, above the low cutoff (or neither is proven yet)
+  };
+  // Maps a family+pole back to a display/emoji-lookup key. Regime and 0liq are the only
+  // families whose display key doesn't already match an existing pre-Extremity tag name
+  // (0liq's positive pole keeps the bare '0liq' tag; its negative pole is the new synthetic
+  // 'liveliq+' aggregate — no single sliq/bliq/msliq/mbliq name would represent all four)
+  // — everything else keeps its original tag string so afCritEmoji and the Blockable
+  // Criteria picker keep working unchanged.
   const DIAL_DISPLAY = {
     pec: ['pec+', 'pec-'], vsg: ['vsg+', 'vsg-'],
-    pecirr: ['pecirr+', null], vsgirr: ['vsgirr+', null],
+    pecirr: ['pecirr+', 'pecirr-'], vsgirr: ['vsgirr+', 'vsgirr-'],
+    // liqturnover isn't a criterion tag by itself — it's the market-wide raw liquidation
+    // turnover magnitude MIC samples from every closed batch (see MIC's _micOnLiqClose),
+    // regardless of whether any ticker actually fired live or Past-1 off of it. Its own
+    // extreme-high/extreme-low split (via singlePoleClassify) IS what live-liq/Past-1 entry
+    // gating now reads — see _micLiqHighCutoff/_micLiqLowCutoff in MultiIndicator-Chaser.
+    liqturnover: ['liqturnover+', 'liqturnover-'],
   };
   const dialDisplayKey = (family, pole) => {
     if (family === 'regime') return pole === 'pos' ? 'regimeb+' : 'regimes+';
+    if (family === '0liq') return pole === 'pos' ? '0liq' : 'liveliq+';
     if (['fund', 'va', 'ioa', 'ocs', 'ocx'].includes(family)) return family + (pole === 'pos' ? '+' : '-');
     const pair = DIAL_DISPLAY[family];
     return pair ? (pole === 'neg' ? pair[1] : pair[0]) || family : family;
@@ -457,7 +501,7 @@
                 <div class="g" style="margin-top:8px">
                   <div class="lbl">Lukewarm Veto <b x-text="cfg.afLukewarmRatioPct"></b>%</div>
                   <input type="range" min="30" max="100" step="5" x-model.number="cfg.afLukewarmRatioPct" @change="persist()">
-                  <div class="ash-hint">A ticker is vetoed once this share of its exhibited (dial-eligible) criteria come back lukewarm. Liq anchors are never counted here.</div>
+                  <div class="ash-hint">A ticker is vetoed once this share of its exhibited (dial-eligible) criteria come back lukewarm.</div>
                 </div>
                 <label class="tog" style="margin-top:8px">
                   <div class="tog-t" :class="cfg.afExtremityReEvalEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afExtremityReEvalEnabled=!cfg.afExtremityReEvalEnabled;persist()}"><div class="tog-k"></div></div>
@@ -819,7 +863,6 @@
         // criterion, so it refills within moments of a reload rather than needing to survive one.
         afDialSamplePool: {},          // {[family|pole]: number[]}
         afDialSampleCounts: {},        // {[family|pole]: n} — for the "unproven, still lukewarm by default" badge
-        afAnchorStats: {},             // {[sliq|bliq|msliq|mbliq|0liq]: stats} — categorical, no dial
         afKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // merged (own + partner) kline bar for display
         _afOwnKlineBar: null,                       // own-only kline bar before partner merge
         _afKlineBarAt: 0,                           // hourly candle timestamp of last own kline sample
@@ -1519,11 +1562,30 @@
                            // magnitude — they always classify extreme regardless (see
                            // _afExtremityBuild/_afExtremityVeto), nothing to prove here.
           const dk = info.family + '|' + info.pole;
-          const pool = (this.afDialSamplePool ||= {});
+          const pool = (this.afDialSamplePool ||= this._afLoadDialPool());
           const arr = (pool[dk] ||= []);
           arr.push(Math.abs(parseInt(m[1], 10)));
           const cap = this.cfg.afExtremitySampleCap || 300;
           if (arr.length > cap) arr.splice(0, arr.length - cap);
+          this._afSaveDialPool();
+        },
+        // afDialSamplePool now persists (DIAL_POOL_KEY) instead of being memory-only, so a
+        // restart doesn't reset every dial to "unproven" and blank out every extreme
+        // classification until live samples happen to rebuild it — which is what was
+        // happening before. Loaded lazily (first _afDialSample/_afExtremityBuild call each
+        // session) rather than at some fixed init point, and saved with a light throttle since
+        // _afDialSample fires on every live annotation, not just closes.
+        _afLoadDialPool() {
+          try {
+            const raw = localStorage.getItem(DIAL_POOL_KEY);
+            return raw ? JSON.parse(raw) : {};
+          } catch (e) { return {}; }
+        },
+        _afSaveDialPool() {
+          const now = Date.now();
+          if (now - (this._afDialPoolLastWrite || 0) < 3000) return;
+          this._afDialPoolLastWrite = now;
+          try { localStorage.setItem(DIAL_POOL_KEY, JSON.stringify(this.afDialSamplePool || {})); } catch (e) {}
         },
         // ── Extremity Scorer core build (replaces the old slot-combo + collapsed-criterion +
         // Regime-Based-Scoring + Blind-Entry-bucket passes wholesale — see /versioning v1.70.0).
@@ -1557,9 +1619,20 @@
           const critBase = c => /^sliq/.test(c) ? 'sliq' : /^bliq/.test(c) ? 'bliq' : c;
           const sortedRecords = [...records].sort((a, b) => b.ts - a.ts);
 
-          const samplePool = this.afDialSamplePool || {};
+          const samplePool = (this.afDialSamplePool ||= this._afLoadDialPool());
           const cutoffs = {};
           for (const [dk, mags] of Object.entries(samplePool)) {
+            const [family, pole] = dk.split('|');
+            if (pole === 'single') {
+              // One shared sample stream, two cutoffs — see singlePoleClassify.
+              if (mags.length < minSamples) { cutoffs[family + '|pos'] = null; cutoffs[family + '|neg'] = null; continue; }
+              const sorted = [...mags].sort((a, b) => a - b);
+              const hiIdx = Math.min(sorted.length - 1, Math.floor(sorted.length * (1 - splitPct)));
+              const loIdx = Math.max(0, Math.floor(sorted.length * splitPct));
+              cutoffs[family + '|pos'] = sorted[hiIdx];
+              cutoffs[family + '|neg'] = sorted[loIdx];
+              continue;
+            }
             if (mags.length < minSamples) { cutoffs[dk] = null; continue; }
             const sorted = [...mags].sort((a, b) => a - b);
             const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * (1 - splitPct)));
@@ -1567,8 +1640,11 @@
           }
 
           const dialStats = {};
-          const anchorStats = {};
-          const dialCount = {}, anchorCount = {};
+          const dialCount = {};
+          // Per-tag blocking-only record — see PEC_VSG_AGGREGATE comment below. Every family
+          // except pec/vsg has exactly one raw tag per pole already, so this ends up identical
+          // to dialStats for them; harmless, not worth special-casing away.
+          const subtagStats = {};
           for (const r of sortedRecords) {
             const keptCrits = exclude.size ? r.criteria.filter(c => !exclude.has(critBase(c))) : r.criteria;
             if (!keptCrits.length) continue;
@@ -1578,34 +1654,38 @@
             const effectivePnl = isPartner ? -pnl : pnl;
             for (const c of collapseFamilyDupes(keptCrits)) {
               const key = collapseCrit(c);
-              const anchorBase = /^(sliq|bliq|msliq|mbliq)$/.test(key) ? key : (key === '0liq' ? '0liq' : null);
-              if (anchorBase) {
-                if ((anchorCount[anchorBase] = (anchorCount[anchorBase] ?? 0) + 1) > quota) continue;
-                if (!anchorStats[anchorBase]) anchorStats[anchorBase] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
-                const cs = anchorStats[anchorBase];
-                if (counts) { cs.pnl += effectivePnl; if (effectivePnl > 0) cs.wins++; else cs.losses++; }
-                if (!isPartner) { cs.ownPnl += pnl; if (pnl > 0) cs.ownWins++; else cs.ownLosses++; }
-                if (r.hist) cs.hasHist = true; else cs.hasTrade = true;
-                continue;
-              }
               const info = dialInfo(key);
               if (!info) continue; // unrecognized/retired tag — no dial, not scored
-              const dk = info.family + '|' + info.pole;
-              if ((dialCount[dk] = (dialCount[dk] ?? 0) + 1) > quota) continue;
               const noGradation = info.pole !== 'single' && !!BARE_DIAL_TAGS[key];
               let mag = Infinity;
               if (!noGradation) {
                 const m2 = c.match(/(-?\d+)$/);
                 mag = m2 ? Math.abs(parseInt(m2[1], 10)) : 0;
               }
-              const cutoff = cutoffs[dk];
-              const isExtreme = !Number.isFinite(mag) || (cutoff != null && mag >= cutoff);
-              if (!isExtreme) continue;
+              let pole = info.pole;
+              if (pole === 'single') {
+                pole = singlePoleClassify(info.family, mag, cutoffs);
+                if (!pole) continue; // lukewarm — not scored
+              } else {
+                const cutoff = cutoffs[info.family + '|' + pole];
+                const isExtreme = !Number.isFinite(mag) || (cutoff != null && mag >= cutoff);
+                if (!isExtreme) continue;
+              }
+              const dk = info.family + '|' + pole;
+              if ((dialCount[dk] = (dialCount[dk] ?? 0) + 1) > quota) continue;
               if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
               const stats = dialStats[dk];
               if (counts) { stats.pnl += effectivePnl; if (effectivePnl > 0) stats.wins++; else stats.losses++; }
               if (!isPartner) { stats.ownPnl += pnl; if (pnl > 0) stats.ownWins++; else stats.ownLosses++; }
               if (r.hist) stats.hasHist = true; else stats.hasTrade = true;
+              // Individual PEC/VSG sub-tags (pecob, pecalpha, pecmomup, ...) each get their
+              // OWN win/loss record here, keyed by the raw tag itself — separate from the
+              // pooled dk above. See PEC_VSG_AGGREGATE comment in MultiIndicator-Chaser for
+              // why: Slot Blocking needs to react to one sub-tag going bad without waiting
+              // for its whole 3-way pooled family to go bad too.
+              if (!subtagStats[key]) subtagStats[key] = { pnl: 0, wins: 0, losses: 0 };
+              const ts = subtagStats[key];
+              if (counts) { ts.pnl += effectivePnl; if (effectivePnl > 0) ts.wins++; else ts.losses++; }
             }
           }
           // A dial can have a proven cutoff (samples exist) but zero closes yet — still needs
@@ -1615,22 +1695,32 @@
           }
           for (const dk of Object.keys(dialStats)) {
             dialStats[dk].cutoff = cutoffs[dk] ?? null;
-            dialStats[dk].sampleCount = (samplePool[dk] || []).length;
+            // Single-pole families sample under one shared '|single' pool key, not the
+            // synthetic '|pos'/'|neg' keys singlePoleClassify derives — fall back to it so
+            // the sample count shown actually reflects what proved the cutoff.
+            const [dkFamily, dkPole] = dk.split('|');
+            const poolKey = samplePool[dkFamily + '|single'] ? dkFamily + '|single' : dk;
+            dialStats[dk].sampleCount = (samplePool[poolKey] || []).length;
           }
 
           this.afDialCutoffs = cutoffs;
           this.afDialSampleCounts = Object.fromEntries(Object.entries(samplePool).map(([k, v]) => [k, v.length]));
-          this.afAnchorStats = anchorStats;
           // Flat display-key -> stats map, same shape the old micCollapsedSlotRanks/
           // micCollapsedCritStats used — _micScaledRank/_micCritScore/_micIsCritBlocked keep
           // reading this one flat lookup unchanged, with no idea dials or poles exist beneath it.
           const ranks = {}, dispStats = {};
-          for (const [base, cs] of Object.entries(anchorStats)) { ranks[base] = cs.pnl; dispStats[base] = cs; }
           for (const [dk, stats] of Object.entries(dialStats)) {
             const [family, pole] = dk.split('|');
             const key = dialDisplayKey(family, pole);
             ranks[key] = stats.pnl;
             dispStats[key] = stats;
+          }
+          // Per-tag scores layer on top for blocking's benefit — never overwrites a dk-based
+          // key above (raw sub-tags like 'pecob+' are always distinct strings from their
+          // pooled dk display key 'pec+'; every other family's raw tag already equals its own
+          // dk key, so this is a no-op re-write for them, not a collision).
+          for (const [tag, ts] of Object.entries(subtagStats)) {
+            ranks[tag] = ts.pnl;
           }
           this.micCollapsedSlotRanks = ranks;
           this.micCollapsedCritStats = dispStats;
@@ -1638,26 +1728,33 @@
         },
         // Overall-lukewarmness veto — "explicitly avoid any ticker exhibiting lukewarm
         // values". Counts, across every dial-eligible criterion the ticker actually
-        // exhibits (liq anchors excluded — they have no lukewarm state), what share
-        // classifies lukewarm against the current cutoffs; an unproven dial (below
-        // afExtremityMinSamples) counts as lukewarm, same as a genuinely middling reading.
-        // Vetoes once that share reaches afLukewarmRatioPct (default 70%). A slot built
-        // entirely from anchors (no dial-eligible criteria at all) is never vetoed here.
+        // exhibits, what share classifies lukewarm against the current cutoffs; an unproven
+        // dial (below afExtremityMinSamples) counts as lukewarm, same as a genuinely middling
+        // reading. Vetoes once that share reaches afLukewarmRatioPct (default 70%). 0-liq's
+        // lukewarm state (the LIQ_LUKEWARM sentinel — a Past-1/liq- reading, real liquidation
+        // that never crossed the live threshold) is asserted directly rather than derived
+        // from a magnitude/cutoff, since Past-1 territory isn't a depth reading — see
+        // _micLiqCurrentRead in MultiIndicator-Chaser. Single-pole families (Irregularity)
+        // use the same singlePoleClassify split as the build pass — lukewarm is "neither
+        // cutoff crossed", same meaning as everywhere else.
         _afExtremityVeto(annotCrits) {
           if (!this.cfg.afExtremityEnabled) return false;
           const cutoffs = this.afDialCutoffs || {};
           let total = 0, lukewarm = 0;
           for (const c of collapseFamilyDupes(annotCrits)) {
+            if (c === LIQ_LUKEWARM) { total++; lukewarm++; continue; }
             const key = collapseCrit(c);
-            if (/^(sliq|bliq|msliq|mbliq)$/.test(key) || key === '0liq') continue;
             const info = dialInfo(key);
             if (!info) continue;
             total++;
-            if (info.pole === 'single' ? false : !!BARE_DIAL_TAGS[key]) continue; // no gradation, never lukewarm
-            const dk = info.family + '|' + info.pole;
-            const cutoff = cutoffs[dk];
             const m2 = c.match(/(-?\d+)$/);
             const mag = m2 ? Math.abs(parseInt(m2[1], 10)) : 0;
+            if (info.pole === 'single') {
+              if (!singlePoleClassify(info.family, mag, cutoffs)) lukewarm++;
+              continue;
+            }
+            if (!!BARE_DIAL_TAGS[key]) continue; // no gradation, never lukewarm
+            const cutoff = cutoffs[info.family + '|' + info.pole];
             if (cutoff == null || mag < cutoff) lukewarm++;
           }
           if (!total) return false;
@@ -1676,6 +1773,7 @@
           if (!this.cfg.afExtremityEnabled || !this.cfg.afExtremityReEvalEnabled) return;
           const snapshot = [...(this.positions || [])];
           const isRegime = c => /^regime/.test(collapseCrit(c).replace(/[+-]$/, ''));
+          const isLiq0   = c => /^(sliq|bliq|msliq|mbliq|0liq)/.test(collapseCrit(c).replace(/[+-]$/, ''));
           for (const pos of snapshot) {
             if (!pos || !pos.symbol) continue;
             const crits = pos._micCriteria || pos._becCriteria || pos._ldcCriteria;
@@ -1684,17 +1782,18 @@
             // needs this cycle's own tick, so a position is skipped this cycle if it's
             // missing. Regime re-evaluates on what changed about the MARKET instead
             // (_micAnnotateLiveCritRaw's regime branch never reads its `t` argument at all),
-            // so it alone shouldn't block on ticker availability — only require `t` when
-            // there's at least one non-regime criterion that actually needs it.
-            const needsTicker = crits.some(c => !isRegime(c));
+            // and 0-liq/live-liq re-evaluates from MIC's closed-batch liq pool
+            // (_micLiqCurrentRead) — neither needs this cycle's ticker snapshot, so only
+            // require `t` when there's at least one other criterion that actually needs it.
+            const needsTicker = crits.some(c => !isRegime(c) && !isLiq0(c));
             const t = needsTicker ? (this._lastAllTickers || []).find(x => x.symbol === pos.symbol) : null;
             if (needsTicker && !t) continue;
-            // Regime counts equally alongside every other criterion in the veto below — one
-            // vote in the same ratio, not excluded and not authoritative on its own. It's
-            // just re-derived from the market rather than from `t`.
+            // Regime and 0-liq/live-liq count equally alongside every other criterion in the
+            // veto below — one vote in the same ratio, not excluded and not authoritative on
+            // their own.
             const liveCrits = crits.map(c => {
+              if (isLiq0(c)) return this._micLiqCurrentRead?.(pos.symbol) ?? c; // no fresh closed-batch data this cycle — keep the stale tag
               const base = collapseCrit(c).replace(/[+-]$/, '');
-              if (/^(sliq|bliq|msliq|mbliq)/.test(base) || base === '0liq') return c; // anchors don't decay under Extremity, unaffected by re-eval
               return this._micAnnotateLiveCrit?.(base, isRegime(c) ? null : t, null, 0, this.afOcResults) ?? c;
             });
             if (this._afExtremityVeto(liveCrits)) {
@@ -1725,17 +1824,18 @@
         },
         // Slot Blocking: true once a criterion's collapsed score is a loss beyond the
         // configured % of base margin. Auto-clears the moment the score recovers — no manual
-        // reset needed. Anchors (sliq/bliq/msliq/mbliq/0liq) are always eligible, matching
-        // _micIsEntryBlocked's unconditional anchor check; dial poles are only eligible when
-        // explicitly opted into cfg.micSlotBlockCriteria. A lukewarm-classified occurrence
-        // never reaches this score at all (see _afExtremityBuild pass 3) — blocking only ever
-        // reacts to a losing EXTREME, same standard the dial applies everywhere else.
+        // reset needed. The 0-liq family's own two poles ('0liq' and the live-liq aggregate
+        // 'liveliq+') are always eligible, matching _micIsEntryBlocked's unconditional
+        // liq-anchor check; every other dial pole is only eligible when explicitly opted into
+        // cfg.micSlotBlockCriteria. A lukewarm-classified occurrence never reaches this score
+        // at all (see _afExtremityBuild pass 3) — blocking only ever reacts to a losing
+        // EXTREME, same standard the dial applies everywhere else.
         _afIsCritBlocked(key) {
           if (!this.cfg.micSlotBlockEnabled) return false;
           const ranks = this.micCollapsedSlotRanks || {};
           const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const threshold  = baseMargin * ((this.cfg.micSlotBlockPct ?? 25) / 100);
-          if (/^(sliq|bliq|msliq|mbliq)$/.test(key) || key === '0liq') {
+          if (key === '0liq' || key === 'liveliq+') {
             return (ranks[key] ?? 0) <= -threshold;
           }
           if (!this.cfg.micSlotBlockTags) return false;
@@ -1750,14 +1850,41 @@
         // (previously only one shared cutoff was shown for the whole dial — each pole has
         // its own sample-derived cutoff and both are now surfaced, e.g. fund's positive half
         // reading "›0.2" and its negative half reading "‹-0.8", not the same number twice).
-        // Liq anchors and the single-pole Irregularity readings render as a one-ended pill
-        // (no opposite pole exists for either — see StrategyBook.md). Regime folds bull/bear
-        // into one pill the same way fund/va/pec/etc. do, rather than two separate ones.
+        // The single-pole Irregularity readings render as a one-ended pill (no opposite pole
+        // exists — see StrategyBook.md). Regime and 0-liq each fold their two poles into one
+        // pill the same way fund/va/pec/etc. do, rather than two separate ones.
+        // Standalone 3-segment diagnostic pill for live-liq/Past-1's shared market-wide
+        // turnover dial — NOT a per-position win/loss pill like every other one here (see
+        // dials.push below): 'liqturnover' is never itself a position's own criterion (see
+        // MIC's _micOnLiqClose), it's the live High/Lukewarm/Low read _micLiqHighCutoff/
+        // _micLiqLowCutoff gate entries against right now. Shown unconditionally, even with
+        // zero closes recorded — it reflects the current market read, not trade history.
+        _afLiqTurnoverPillHtml() {
+          const cutoffs = this.afDialCutoffs || {};
+          const hi = cutoffs['liqturnover|pos'], lo = cutoffs['liqturnover|neg'];
+          if (hi === undefined && lo === undefined) return ''; // no samples at all yet — nothing to show
+          const minSamples = this.cfg.afExtremityMinSamples ?? 3;
+          const sampleN = (this.afDialSampleCounts || {})['liqturnover|single'] ?? 0;
+          const seg = (label, emoji, cutoffTxt) => `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:0">`
+            + `<div style="font-size:11px">${emoji}</div>`
+            + `<div style="font-size:7.5px;color:var(--text-lo)"><b>${label}</b></div>`
+            + `<div style="font-size:6px;opacity:.5;white-space:nowrap">${cutoffTxt}</div>`
+            + `</div>`;
+          const hiText = hi == null ? `unproven ${sampleN}/${minSamples}` : `›${hi}`;
+          const loText = lo == null ? `unproven ${sampleN}/${minSamples}` : `‹${lo}`;
+          const bar = `<div style="width:1px;align-self:stretch;background:rgba(255,255,255,.12);margin:0 4px"></div>`;
+          const activityPct = this._micLiqActivityPct;
+          const activityHtml = activityPct == null ? '' : bar + seg('Mkt Liq', '📡', `${activityPct}% active`);
+          return `<div title="Market-wide liquidation turnover this sample window — live-liq only enters at High, Past-1 only enters at Low" style="display:flex;align-items:stretch;border:1px solid var(--border);border-radius:14px;background:var(--bg-raised);padding:4px 8px;font-family:var(--mono);min-width:110px">`
+            + seg('High', '🌊', hiText) + bar + seg('Mid', '➖', 'no gate') + bar + seg('Low', '🏜️', loText) + activityHtml
+            + `</div>`;
+        },
         _afExtremityHtml(shown) {
           if (!shown) return '';
           const stats = this.micCollapsedCritStats || {};
           const keys = Object.keys(stats);
-          if (!keys.length) return `<span style="font-size:9px;color:var(--text-lo)">No Extremity closes recorded yet.</span>`;
+          const liqTurnoverHtml = this._afLiqTurnoverPillHtml();
+          if (!keys.length) return liqTurnoverHtml || `<span style="font-size:9px;color:var(--text-lo)">No Extremity closes recorded yet.</span>`;
           const own = (this.cfg.afExtremityView || 'combined') === 'own';
           const val = cs => own ? cs.ownPnl : cs.pnl;
           const wl  = cs => own ? [cs.ownWins, cs.ownLosses] : [cs.wins, cs.losses];
@@ -1770,7 +1897,12 @@
               used.add('regimeb+'); used.add('regimes+');
               continue;
             }
-            const famM = k.match(/^(fund|va|ioa|ocs|ocx|pec|vsg)[+-]$/);
+            if (k === '0liq' || k === 'liveliq+') {
+              dials.push([stats['0liq'] ? '0liq' : null, stats['liveliq+'] ? 'liveliq+' : null]);
+              used.add('0liq'); used.add('liveliq+');
+              continue;
+            }
+            const famM = k.match(/^(fund|va|ioa|ocs|ocx|pec|vsg|pecirr|vsgirr|liqturnover)[+-]$/);
             if (famM) {
               const fam = famM[1], pos = fam + '+', neg = fam + '-';
               dials.push([stats[pos] ? pos : null, stats[neg] ? neg : null]);
@@ -1790,7 +1922,7 @@
             const v = cs ? val(cs) : 0;
             const color = blocked ? 'rgba(190,130,255,.95)' : v > 0 ? 'rgba(100,220,150,.9)' : v < 0 ? 'var(--short)' : 'var(--text-lo)';
             const [w, l] = cs ? wl(cs) : [0, 0];
-            const isAnchor = /^(sliq|bliq|msliq|mbliq|0liq)$/.test((key || '').replace(/[+-]$/, ''));
+            const isAnchor = key === '0liq'; // bare, no gradation — the only half with no cutoff to show
             return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:0">`
               + `<div style="font-size:11px">${afCritEmoji(key)}</div>`
               + `<div style="font-size:7.5px;color:${color}"><b>${fmt(v)}</b></div>`
@@ -1815,7 +1947,7 @@
             const a = pk ? val(stats[pk]) : 0, b = nk ? val(stats[nk]) : 0;
             return Math.max(a, b);
           };
-          return dials.sort((a, b) => score(b) - score(a)).map(([a, b]) => pill(a, b)).join('');
+          return liqTurnoverHtml + dials.sort((a, b) => score(b) - score(a)).map(([a, b]) => pill(a, b)).join('');
         },
         _afCrossRead() {
           try {

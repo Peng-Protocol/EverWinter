@@ -48,8 +48,11 @@
 
   Auto Slots always includes the liq anchor as one of the combo's criteria; at size 1 every
   generated slot is bare liquidation with no secondary confirmation. The live depth threshold
-  used by Auto Slots is one general value (micLiveDepthThreshold); manual slots keep granular
-  per-slot/per-type depth via the existing criteria picker.
+  used by Auto Slots (micLiveDepthThreshold) is now a FLOOR, not the sole cutoff — the actual
+  entry gate is the greater of that floor and Ashfall's own sample-derived extreme-high read on
+  market-wide liquidation turnover (see _micLiqHighCutoff/_micLiqLowCutoff, _micOnLiqClose).
+  Manual slots keep granular per-slot/per-type depth via the existing criteria picker,
+  bypassing this entirely.
 
   Substitution now considers any held position in the book, not just MIC's own, same as
   Liquid-Diver did. The removed path-A guard no longer shields 0-liq positions from
@@ -72,7 +75,7 @@
 (function () {
   'use strict';
 
-  const VERSION       = '1.73.2'; // PEC/VSG annotation now computes one shared aggregate-index-level magnitude for all 6 sub-tags, not each one's own shape formula — see /versioning
+  const VERSION       = '1.74.0'; // Live liq entry now gates on Ashfall's extreme-high liqturnover cutoff (was a flat threshold); Past-1 tightened to extreme-low only; micLiveDepthThreshold is now a floor; PEC/VSG sub-tag Slot Blocking fixed; new Dead Switch (idle-time drawdown trip) — see /versioning
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence modes (default ['1'] — live only). Enabling 0/Past-1 won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
@@ -80,6 +83,10 @@
   const DEFAULT_SLOTS = [['sliq','fund<-1','vsgot'],['bliq','va>10','vsgot'],['msliq','fund>1','vsgot'],['mbliq','va<10','vsgot'],['sliq','fund>1','vsgot'],['bliq','fund<-1','vsgot'],['sliq','va>10','vsgot'],['bliq','va<10','vsgot']];
   const MIC_HIST_KEY  = '__mic_hist_batches';
   const LIQ_TYPES     = ['sliq', 'bliq', 'msliq', 'mbliq'];
+  // Sentinel for 0-liq's lukewarm reading (Past-1/liq- — real liquidation, never crossed the
+  // live threshold). Same literal string Ashfall's Extremity Scorer checks for in
+  // _afExtremityVeto — independently defined here since the two plugins don't share a JS scope.
+  const LIQ_LUKEWARM  = '0liq~lukewarm';
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
   // Auto picker, and the Blockable Criteria picker, so all three stay in sync by construction.
   const SECONDARY_CRITS = ['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','pecirr','va','vsgot','vsgut','vsgalpha','vsgdelta','vsgmomup','vsgmomdn','vsgirr','regimeslo','regimeblo','regimesmid','regimebmid','regimeshi','regimebhi','ioa','ocs','ocx'];
@@ -128,6 +135,15 @@
     micSlotBlockPct: 25,
     micSlotBlockTags: false,
     micLiveDepthThreshold: 1,
+    // Dead Switch: with per-criterion Slot Blocking now able to block on any single
+    // underperforming sub-tag rather than needing a whole pooled family bad at once (see
+    // _micIsCritBlocked), enough criteria can go stale/blocked together to leave the bot
+    // producing no new entries at all for a while — a "dead period" rather than a bad trade.
+    // Off by default since it fires the SAME drawdown halt Drawdown Throttle uses
+    // (_drawdownHaltUntil, cfg.drawdownHaltHours) purely off idle time, with no PnL signal
+    // behind it — an intentionally quiet market during this window shouldn't halt on its own.
+    micDeadSwitchEnabled: false,
+    micDeadSwitchHours: 1,
     micReentryBlockMode: 'both',
     micBlockableCritsMigrated: true,
     micAutoSlots: true,
@@ -555,9 +571,22 @@
                     </div>
                   </div>
                   <div class="g" x-show="cfg.micAutoSlots && (cfg.micLiqPresenceModes||['1']).includes('1')" style="margin-top:8px">
-                    <div class="lbl">Live Depth Threshold <b x-text="((cfg.micLiveDepthThreshold)>=0?'+':'')+(cfg.micLiveDepthThreshold)"></b></div>
+                    <div class="lbl">Live Depth Threshold (floor) <b x-text="((cfg.micLiveDepthThreshold)>=0?'+':'')+(cfg.micLiveDepthThreshold)"></b></div>
                     <input type="number" class="inp" min="-100" step="1" x-model.number="cfg.micLiveDepthThreshold" :disabled="cfgLocked" @change="persist()" style="width:80px">
                     <div class="mic-hint">Depth threshold (% vs. historical avg liq size) for every Auto-Slot live anchor; manual slots set depth per-slot.</div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
+                    <label class="tog">
+                      <div class="tog-t" :class="cfg.micDeadSwitchEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micDeadSwitchEnabled=!cfg.micDeadSwitchEnabled;persist()}"><div class="tog-k"></div></div>
+                      <div>
+                        <div class="tog-l">Dead Switch</div>
+                        <div class="mic-hint">Triggers the Drawdown Throttle halt if MIC hasn't made a single new entry in <span x-text="cfg.micDeadSwitchHours ?? 1"></span>h — an idle-time trip, independent of PnL.</div>
+                      </div>
+                    </label>
+                    <div x-show="cfg.micDeadSwitchEnabled" style="margin-top:5px;margin-left:2px">
+                      <div class="lbl">Idle Hours <b x-text="(cfg.micDeadSwitchHours ?? 1)+'h'"></b></div>
+                      <input type="number" class="inp" min="0.25" step="0.25" x-model.number="cfg.micDeadSwitchHours" :disabled="cfgLocked" @change="cfg.micDeadSwitchHours=Math.max(0.25,cfg.micDeadSwitchHours||1);persist()" style="width:80px">
+                    </div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <div class="lbl" style="margin-bottom:4px">Re-entry Block Mode</div>
@@ -889,6 +918,10 @@
           this.registerCloseReason?.('substitution', 'Sub');
           this.registerLiqCloseHook?.((results, batch) => { this._micOnLiqClose(results, batch); });
           this.registerLiqMessageHook?.((batch, sym) => { this._micOnLiqMessage(batch, sym); });
+          // Dead Switch baseline — counts idle time from whichever is more recent: the plugin's
+          // own load (so a fresh session with zero entries yet doesn't immediately read as
+          // "dead") or the last entry it actually made. See _micDeadSwitchCheck.
+          this._micLoadedAt = Date.now();
           const _presenceStr = (this.cfg.micLiqPresenceModes || ['1']).join('+');
           this.log(`[MIC] Multi-Indicator (Chaser) v${VERSION} loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle | presence: ${_presenceStr}`, 'info');
           this.renderTradeFeed?.();
@@ -1094,6 +1127,27 @@
             this._micLastActedAt = 0;
           }
           await this._micRunScan();
+          this._micDeadSwitchCheck();
+        },
+
+        // Dead Switch: triggers the SAME drawdown halt Drawdown Throttle uses
+        // (_drawdownHaltUntil) once MIC has gone micDeadSwitchHours without a single new entry
+        // — a pure idle-time trip, unrelated to PnL. Baseline is the more recent of plugin load
+        // (_micLoadedAt, so a fresh session with no entries yet isn't immediately "dead") and
+        // the last actual entry (_micLastEntryTs, set at both pseudoOpenLong call sites). A
+        // no-op while already halted (manual or drawdown) — this only ever starts a halt, never
+        // stacks or extends one already running.
+        _micDeadSwitchCheck() {
+          if (!this.cfg.micDeadSwitchEnabled) return;
+          if (this._manualHalt || (this._drawdownHaltUntil || 0) > Date.now()) return;
+          const idleMs = (this.cfg.micDeadSwitchHours ?? 1) * 3600000;
+          const baseline = Math.max(this._micLoadedAt || 0, this._micLastEntryTs || 0);
+          if (!baseline || (Date.now() - baseline) < idleMs) return;
+          const haltHours = this.cfg.drawdownHaltHours ?? 6;
+          this._drawdownHaltUntil = Date.now() + haltHours * 3600000;
+          this._drawdownWindow = [];
+          if (typeof this.persist === 'function') this.persist();
+          this.log(`[MIC] 💀 Dead Switch: no new entries in ${this.cfg.micDeadSwitchHours ?? 1}h — triggering drawdown halt (${haltHours}h).`, 'warn');
         },
 
         _micComputeSamplingData() {
@@ -1571,6 +1625,7 @@
               _micCriteria: annotCrits,
             });
             if (pos) {
+              this._micLastEntryTs = Date.now(); // Dead Switch — see _micDeadSwitchCheck
               if (typeof this.persist === 'function') this.persist();
               return true;
             }
@@ -1859,10 +1914,10 @@
           const ranks = ranksOverride ?? (this.cfg.afCoQualPenaltyEnabled ? (this.micCollapsedSlotRanks || {}) : null);
           if (!ranks) return 0;
           let base;
-          if (/^msliq/.test(rawC)) base = (ranks['msliq+'] ?? 0) + (ranks['msliq-'] ?? 0);
-          else if (/^mbliq/.test(rawC)) base = (ranks['mbliq+'] ?? 0) + (ranks['mbliq-'] ?? 0);
-          else if (/^sliq/.test(rawC)) base = (ranks['sliq+'] ?? 0) + (ranks['sliq-'] ?? 0);
-          else if (/^bliq/.test(rawC)) base = (ranks['bliq+'] ?? 0) + (ranks['bliq-'] ?? 0);
+          // All four live-liq types fold into one aggregate negative-pole reading against
+          // 0liq's positive pole (see Ashfall's DIAL_POLES) — not four separate per-type
+          // ranks, so all of them read the same 'liveliq+' key regardless of which type.
+          if (/^(?:m?sliq|m?bliq)/.test(rawC)) base = ranks['liveliq+'] ?? 0;
           else base = ranks[(() => {
             const annotKey = (annotC || '').replace(/\d+$/, '');
             const agg = PEC_VSG_AGGREGATE[annotKey.replace(/[+-]$/, '')];
@@ -1888,13 +1943,15 @@
 
         // Live liquidation criterion match — sliq/bliq/msliq/mbliq only, evaluated against a
         // depth value already computed from the live message (see calcLiveDepth / _micOnLiqMessage).
-        // A bare anchor (no depth suffix — always true for Auto Slots, optional for manual) falls
-        // back to the general Live Depth Threshold; a manual per-slot suffix overrides it.
+        // A bare anchor (no depth suffix — always true for Auto Slots, optional for manual)
+        // now qualifies against _micLiqHighCutoff (floor vs. Extremity's own extreme-high
+        // read on market-wide turnover, whichever is stricter) rather than the flat floor
+        // alone; a manual per-slot suffix is an explicit override and bypasses this.
         _micCheckLiveLiqCrit(c, type, depth) {
           const base = c.match(/^(?:m?sliq|m?bliq)/)?.[0];
           if (base !== type) return false;
           const m = c.match(/^(?:m?sliq|m?bliq)([<>])([+-]?\d+)$/);
-          if (!m) return depth >= (this.cfg.micLiveDepthThreshold);
+          if (!m) return depth >= this._micLiqHighCutoff();
           return m[1] === '>' ? depth >= parseInt(m[2], 10) : depth <= parseInt(m[2], 10);
         },
 
@@ -2180,6 +2237,7 @@
               _micCriteria: annotCrits,
             });
             if (pos) {
+              this._micLastEntryTs = Date.now(); // Dead Switch — see _micDeadSwitchCheck
               if (typeof this.persist === 'function') this.persist();
               return true;
             }
@@ -2229,6 +2287,9 @@
         // reads the same flat micCollapsedSlotRanks every other criterion does.
         _micCritScore(c) {
           const ranks = this.micCollapsedSlotRanks || {};
+          // All four live-liq types (bare or manually gated, e.g. 'sliq>5') read the same
+          // aggregate 'liveliq+' key — see _micScaledRank.
+          if (/^(?:m?sliq|m?bliq)/.test(c || '')) return ranks['liveliq+'] ?? 0;
           const agg = PEC_VSG_AGGREGATE[(c || '').replace(/[+-]$/, '')];
           if (agg) return ranks[agg] ?? 0;
           return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
@@ -2236,11 +2297,20 @@
 
         // Slot Blocking: true once a criterion's collapsed score is a loss beyond the configured
         // % of base margin. Auto-clears the moment the score recovers — no manual reset needed.
+        // Individual PEC/VSG sub-tags (pecob, pecalpha, pecmomup, ...) block on their OWN
+        // record when Ashfall has one (see _afExtremityBuild's per-tag pass), not the pooled
+        // 3-way family aggregate _micCritScore uses for Co-Qualifying Penalty and richness/sort
+        // — a single underperforming sub-tag shouldn't need its whole pooled group to go bad
+        // too before it can block. Every other criterion (fund/va/ioa/ocs/ocx/0liq/live-liq)
+        // already has exactly one tag per pole, so _micCritScore already gives the right
+        // per-criterion answer for those.
         _micIsCritBlocked(c) {
           if (!this.cfg.micSlotBlockEnabled) return false;
           const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const threshold  = baseMargin * ((this.cfg.micSlotBlockPct) / 100);
-          return this._micCritScore(c) <= -threshold;
+          const isPecVsgSubtag = PEC_VSG_AGGREGATE[(c || '').replace(/[+-]$/, '')] !== undefined;
+          const score = isPecVsgSubtag ? ((this.micCollapsedSlotRanks || {})[c] ?? 0) : this._micCritScore(c);
+          return score <= -threshold;
         },
 
         // Always checks the triggering liq-anchor type, plus the Extremity Scorer's whole-
@@ -2301,7 +2371,43 @@
               sLiqRaw: r.sLiqRaw ?? 0, bLiqRaw: r.bLiqRaw ?? 0,
               sDepth:  r.sDepth  ?? 0, bDepth:  r.bDepth  ?? 0,
             };
+            // Feed Ashfall's Extremity sample pool with this cycle's raw liquidation turnover
+            // magnitude — every symbol, every closed batch, regardless of whether it ends up
+            // firing live or Past-1 off of it. This is what _micLiqHighCutoff/_micLiqLowCutoff
+            // read to decide entry eligibility below; see Ashfall's DIAL_SINGLE/liqturnover.
+            const _turnover = Math.max(r.sDepth ?? 0, r.bDepth ?? 0);
+            if (_turnover > 0) this._afDialSample?.(`liqturnover+${_turnover}`);
           }
+          // Market-wide liquidation-activity read — what share of this batch showed ANY
+          // liquidation at all, regardless of size. Currently informational only (surfaced
+          // next to the 0-liq pill in Ashfall's scorecard, see _afLiqTurnoverPillHtml) — a
+          // ticker's OWN 0-liq qualification and score are unaffected by it for now. Wiring
+          // this into 0-liq's actual score (so a 0-liq read counts for more when the rest of
+          // the market IS seeing liquidations) needs a market-snapshot stamped onto every
+          // closed 0-liq trade record, which touches the bare-tag assumptions Slot Blocking/
+          // Re-Evaluation/veto all currently rely on — deliberately deferred rather than rushed.
+          if ((results || []).length) {
+            const withLiq = results.filter(r => ((r.sLiqRaw || 0) + (r.bLiqRaw || 0)) > 0).length;
+            this._micLiqActivityPct = Math.round(100 * withLiq / results.length);
+          }
+        },
+
+        // Live-fire boundary for the bare (Auto Slot) liq anchor — the greater of the
+        // configured floor (micLiveDepthThreshold) and the Extremity Scorer's own
+        // sample-derived extreme-high cutoff for market-wide liquidation turnover. An
+        // unproven cutoff (not enough samples yet) falls back to the floor alone, same
+        // "stay conservative until proven" default the rest of the Extremity system uses.
+        // A manual per-slot '>'/'<' gate (see _micCheckLiveLiqCrit) is an explicit override
+        // and bypasses this entirely.
+        _micLiqHighCutoff() {
+          const extreme = this.afDialCutoffs?.['liqturnover|pos'];
+          return extreme != null ? Math.max(this.cfg.micLiveDepthThreshold, extreme) : this.cfg.micLiveDepthThreshold;
+        },
+        // Past-1 eligibility floor — the Extremity Scorer's own sample-derived extreme-low
+        // cutoff for market-wide liquidation turnover. Unproven (null) means nothing
+        // qualifies yet, not "everything qualifies" — same default as everywhere else.
+        _micLiqLowCutoff() {
+          return this.afDialCutoffs?.['liqturnover|neg'] ?? null;
         },
 
         // Retrospective classification of a closed batch's dominance against the same 70%/30%
@@ -2317,31 +2423,54 @@
 
         // past1 candidate set: fresh closed-batch entries (same TTL as PEC, uncapped — this is
         // pure lookup, no fetch) that are liq- — real liquidation happened (sLiqRaw+bLiqRaw > 0,
-        // so not 0-Liq's territory) but neither side's raw turnover cleared its own historical
-        // average (sDepth/bDepth, the same calcDepth Ashfall already computed against
-        // _liqAvgSTurnover/_liqAvgBTurnover) beyond micLiveDepthThreshold (default 1, i.e. "≥1%
-        // above average"). This is independent of sell/buy dominance — the 70/30 split
+        // so not 0-Liq's territory) but land at the EXTREME LOW end of market-wide liquidation
+        // turnover for this sample window (_micLiqLowCutoff), not merely "somewhere below the
+        // live-fire boundary" as before. A reading between the low and high cutoffs is now
+        // excluded from both pools — genuinely middling turnover no longer qualifies as
+        // anything. This is independent of sell/buy dominance — the 70/30 split
         // (_micClassifyLiqDominance) only labels sliq/bliq/msliq/mbliq for the live path and has
-        // no bearing on the liq+/liq-/0-liq classification here. A ticker is liq- (past1) as long
-        // as the stronger of its two sides never cleared the threshold; if either side did, it's
-        // liq+ and would have fired live already, so it's excluded. Checked against the global
-        // threshold (a manual per-slot depth override on a live anchor has no bearing on this
-        // pool). Consumed by the scan loop as the match gate for anchorless (Past-1) slots — past1
-        // is a path, not a criterion, so this is never called from checkCrit.
+        // no bearing on the liq+/liq-/0-liq classification here. Consumed by the scan loop as
+        // the match gate for anchorless (Past-1) slots — past1 is a path, not a criterion, so
+        // this is never called from checkCrit.
         _micPast1FreshSymbols() {
           const pool = this._micPecPool || {};
           const ttl  = (this.cfg.micPecFreshCycles) * this.cfg.scanMins * 60000;
-          const threshold = this.cfg.micLiveDepthThreshold;
+          const hi   = this._micLiqHighCutoff();
+          const lo   = this._micLiqLowCutoff();
           const now  = Date.now();
           const out  = new Set();
+          if (lo == null) return out; // extreme-low not proven yet — nothing qualifies
           for (const [sym, e] of Object.entries(pool)) {
             if ((now - e.ts) >= ttl) continue;
             if ((e.sLiqRaw || 0) + (e.bLiqRaw || 0) <= 0) continue; // no liquidation at all — 0-Liq's territory
             const maxDepth = Math.max(e.sDepth ?? 0, e.bDepth ?? 0);
-            if (maxDepth >= threshold) continue; // liq+ — a side cleared its average, would have fired live
-            out.add(sym); // liq- — real liquidation, but neither side cleared its average
+            if (maxDepth >= hi) continue; // liq+ — would have fired live
+            if (maxDepth > lo) continue;  // middling — no longer Past-1 eligible
+            out.add(sym); // liq- — extreme-low turnover
           }
           return out;
+        },
+
+        // Retrospective liq+/0-liq/liq- read for Ashfall's Extremity Re-Evaluation of an
+        // already-open 0-liq/live-liq position (see _afExtremityReEval) — same trichotomy
+        // _micPast1FreshSymbols uses for Past-1 candidate matching, exposed generically here.
+        // Returns '0liq' (clean across the window), a live-type tag carrying the crossed
+        // depth (the specific type doesn't matter — sliq/bliq/msliq/mbliq all fold into the
+        // same aggregate dial pole, see Ashfall's DIAL_POLES), the LIQ_LUKEWARM sentinel
+        // (real liquidation, at the extreme-low end of market-wide turnover — Past-1/liq-
+        // territory, only asserted while 'past1' is an active Liquidation Presence mode), or
+        // null when there's no fresh closed-batch data this cycle, or the reading is
+        // currently in the unclassified middle band between the two cutoffs.
+        _micLiqCurrentRead(sym) {
+          if (this._micLiqZeroAcrossWindow(sym) === true) return '0liq';
+          const e = (this._micPecPool || {})[sym];
+          if (!e) return null;
+          if ((e.sLiqRaw || 0) + (e.bLiqRaw || 0) <= 0) return null; // stale/no data this window
+          const depth = Math.max(e.sDepth ?? 0, e.bDepth ?? 0);
+          if (depth >= this._micLiqHighCutoff()) return `sliq${depth >= 0 ? '+' : ''}${depth}`;
+          const lo = this._micLiqLowCutoff();
+          if (lo != null && depth > 0 && depth <= lo && this._micEffectivePresenceModes().includes('past1')) return LIQ_LUKEWARM;
+          return null;
         },
 
         // Auto's minimum-gate qualifier. "Criteria per Slot" (micAutoSlotSize) is a FLOOR, not a
