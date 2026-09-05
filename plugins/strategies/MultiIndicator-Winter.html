@@ -76,7 +76,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.76.0'; // two signed Bull/Bear regime criteria; PEC/VSG sub-tags all contribute to aggregate Extremity score
+    const VERSION       = '1.77.0'; // stamps synthetic 'past1' tag on genuine Past-1 matches (Auto + manual); samples liqquiet (100-activityPct) into Permafrost's Extremity pool each closed liq batch
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence modes (default ['1'] — live only). Enabling 0/Past-1 won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
@@ -1374,14 +1374,32 @@
                 }
                 if (!matched && _isPast1Fresh && this._miwEffectivePresenceModes().includes('past1')) {
                   const m = this._miwAutoQualify(null, critOk, c => _miwAnnotateCrit(c, t));
-                  if (m) matched = { ...m, slotIdx: -1 };
+                  // Past-1 has no anchor criterion (see header comment) so the Extremity
+                  // Scorer would otherwise never see a trade that came from here at all —
+                  // stamp a synthetic bare 'past1' tag on afterward (not run through
+                  // _miwAnnotateCrit/checkCrit — it isn't a real checkable criterion, just a
+                  // record of which path this entry took). See Permafrost's BARE_DIAL_TAGS.
+                  if (m) matched = { criteria: [...m.criteria, 'past1'], annotCrits: [...m.annotCrits, 'past1'], slotIdx: -1 };
                 }
               } else {
                 const slotIdx = slots.findIndex(s => {
                   if (!this._miwSlotLiqAnchor(s) && !_isPast1Fresh) return false;
                   return s.every(c => checkCrit(c, fr, pec, t));
                 });
-                if (slotIdx !== -1) matched = { criteria: slots[slotIdx], annotCrits: slots[slotIdx].map(c => _miwAnnotateCrit(c, t)), slotIdx };
+                if (slotIdx !== -1) {
+                  const _slotCrits = slots[slotIdx];
+                  // Same Past-1 stamp as the Auto-mode branch above, for a manual slot that
+                  // matched purely because it has no anchor of its own and this ticker is in
+                  // the Past-1-fresh pool — not for a slot with a real anchor that also
+                  // happens to be Past-1-fresh right now (that's a live/0-liq match, not Past-1).
+                  const _viaPast1 = _isPast1Fresh && !this._miwSlotLiqAnchor(_slotCrits);
+                  const _baseAnnot = _slotCrits.map(c => _miwAnnotateCrit(c, t));
+                  matched = {
+                    criteria: _viaPast1 ? [..._slotCrits, 'past1'] : _slotCrits,
+                    annotCrits: _viaPast1 ? [..._baseAnnot, 'past1'] : _baseAnnot,
+                    slotIdx,
+                  };
+                }
               }
               if (!matched) {
                 if (autoMode) {
@@ -2280,6 +2298,8 @@
         // too before it can block. Every other criterion (fund/va/ioa/ocs/ocx/0liq/live-liq)
         // already has exactly one tag per pole, so _miwCritScore already gives the right
         // per-criterion answer for those.
+        // TODO(slot-blocking): see matching TODO on _micIsCritBlocked in MultiIndicator-Chaser —
+        // same unresolved report, not yet root-caused, likely affects both sides equally.
         _miwIsCritBlocked(c) {
           if (!this.cfg.miwSlotBlockEnabled) return false;
           const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
@@ -2361,16 +2381,15 @@
             if (_turnover > 0) this._pfDialSample?.(`liqturnover+${_turnover}`);
           }
           // Market-wide liquidation-activity read — what share of this batch showed ANY
-          // liquidation at all, regardless of size. Currently informational only (surfaced
-          // inside the 0-liq/live-liq score path) — a
-          // ticker's OWN 0-liq qualification and score are unaffected by it for now. Wiring
-          // this into 0-liq's actual score (so a 0-liq read counts for more when the rest of
-          // the market IS seeing liquidations) needs a market-snapshot stamped onto every
-          // closed 0-liq trade record, which touches the bare-tag assumptions Slot Blocking/
-          // Re-Evaluation/veto all currently rely on — deliberately deferred rather than rushed.
+          // liquidation at all, regardless of size. Surfaced both as this raw %% (informational,
+          // inside the 0-liq/live-liq score path) AND sampled into its own Extremity dial below
+          // (the inverse, quiet-%%, gated on 100-withLiq%% crossing its own sample-derived
+          // cutoff — see Permafrost's 'liqquiet' family) — a ticker's OWN 0-liq qualification
+          // and score are still unaffected by it either way.
           if ((results || []).length) {
             const withLiq = results.filter(r => ((r.sLiqRaw || 0) + (r.bLiqRaw || 0)) > 0).length;
             this._miwLiqActivityPct = Math.round(100 * withLiq / results.length);
+            this._pfDialSample?.(`liqquiet+${100 - this._miwLiqActivityPct}`);
           }
         },
 

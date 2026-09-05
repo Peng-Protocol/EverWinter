@@ -44,7 +44,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '1.73.0'; // configurable 72-batch liq snapshot window; two Bull/Bear regime criteria; aggregate PEC/VSG includes every matching sub-tag
+    const VERSION        = '1.74.0'; // liqquiet (0-liq%% snapshot dial, high/low/lukewarm like liqturnover) + past1 3rd block on the 0-liq pill; fixed liveliq+/liqturnover-/pecirr-/vsgirr- cutoff sign display
   // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
   // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
   // one _miwOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
@@ -208,8 +208,11 @@
     if (c === '+ocs') return '🔭+'; if (c === '-ocs') return '🔭-';
     if (c === '0liq') return '⚫';
     if (c === 'liveliq+') return '💥';
+    if (c === 'past1') return '⏳';
     if (c === 'liqturnover+') return '🌊';
     if (c === 'liqturnover-') return '🏜️';
+    if (c === 'liqquiet+') return '🤫';
+    if (c === 'liqquiet-') return '🚨';
     if (c === '>10pct') return '🔊'; if (c === '<10pct') return '🔉';
     return c;
   };
@@ -264,7 +267,14 @@
     'msliq+': { family: '0liq', pole: 'neg' }, 'msliq-': { family: '0liq', pole: 'neg' },
     'mbliq+': { family: '0liq', pole: 'neg' }, 'mbliq-': { family: '0liq', pole: 'neg' },
   };
-  const DIAL_SINGLE = new Set(['pecirr+', 'vsgirr+', 'liqturnover+']);
+  // Single-pole families split their OWN sample spread into three (see singlePoleClassify):
+  // top splitPct is "high", bottom splitPct is "low", the middle is lukewarm. liqquiet is the
+  // market-wide "quiet window" read — % of a closed batch's symbols with zero liquidation
+  // (see MIW's _miwOnLiqClose) — same shape as liqturnover: one raw magnitude stream, always
+  // tagged '+' at the source, with BOTH extremes (very quiet / very active) emerging
+  // naturally from where a given reading falls in that stream's own distribution over time,
+  // not asserted up front the way a two-pole family's opposite sign would be.
+  const DIAL_SINGLE = new Set(['pecirr+', 'vsgirr+', 'liqturnover+', 'liqquiet+']);
   // Sentinel for 0-liq's lukewarm reading (Past-1/liq- — real liquidation, never crossed the
   // live threshold). Not a magnitude/cutoff reading like every other dial's lukewarm state,
   // so it's asserted directly rather than derived — see _pfExtremityVeto and MIW's
@@ -276,11 +286,17 @@
   // kept in a deliberately separate bucket to avoid key collisions — under Extremity
   // Scorer that collision is the point: one unified read per underlying signal) and always
   // classify extreme, since there's no gradation to be lukewarm about. '0liq' is the same
-  // shape: bare, untiered, always the 0-liq family's extreme positive pole.
+  // shape: bare, untiered, always the 0-liq family's extreme positive pole. 'past1' is its
+  // own independent family (not nested under 0liq's two poles, to avoid touching the
+  // cutoff/veto/blocking machinery those two already share) — boolean by nature (a trade
+  // either was or wasn't a Past-1 entry, see MIW's Past-1 matching branch), so it's always
+  // extreme the same way. Rendered as a visual 3rd block on the 0-liq pill regardless —
+  // see _pfExtremityHtml's dial grouping.
   const BARE_DIAL_TAGS = {
     '+fund': { family: 'fund', pole: 'pos' }, '-fund': { family: 'fund', pole: 'neg' },
     '+ocs':  { family: 'ocs',  pole: 'pos' }, '-ocs':  { family: 'ocs',  pole: 'neg' },
     '0liq':  { family: '0liq', pole: 'pos' },
+    'past1': { family: 'past1', pole: 'pos' },
   };
   // Regime folds in as one more two-pole family (bull dominance vs bear dominance)
   // instead of its old separate fixed Low/Mid/High x Bull/Bear 6-bucket system — the
@@ -319,6 +335,7 @@
     // extreme-high/extreme-low split (via singlePoleClassify) IS what live-liq/Past-1 entry
     // gating now reads — see _miwLiqHighCutoff/_miwLiqLowCutoff in MultiIndicator-Winter.
     liqturnover: ['liqturnover+', 'liqturnover-'],
+    liqquiet: ['liqquiet+', 'liqquiet-'],
   };
   const dialDisplayKey = (family, pole) => {
     if (family === 'regime') return pole === 'pos' ? 'regimeb+' : 'regimes+';
@@ -884,12 +901,13 @@
         pfScoreboard: [],   // sorted Extremity Scorer entries built from EXTREMITY_KEY records
         pfScorecardExpanded: null,     // key of currently expanded dial, or null
         pfDialCutoffs: {},             // {[family|pole]: magnitude} — the live "extreme begins here" line per dial
-        // Rolling, in-memory-ONLY pool of raw criterion readings — every annotation call
-        // (scan-time pool building, live liq messages, Extremity Re-Evaluation) feeds it via
-        // _pfDialSample, regardless of whether that reading ever becomes a candidate or a
-        // trade. This — NOT closed-trade records — is what pfDialCutoffs is computed from.
-        // Deliberately not persisted: a single scan already produces plenty of readings per
-        // criterion, so it refills within moments of a reload rather than needing to survive one.
+        // Rolling pool of raw criterion readings — every annotation call (scan-time pool
+        // building, live liq messages, Extremity Re-Evaluation) feeds it via _pfDialSample,
+        // regardless of whether that reading ever becomes a candidate or a trade. This — NOT
+        // closed-trade records — is what pfDialCutoffs is computed from. Persists across
+        // restarts via DIAL_POOL_KEY (init() loads it explicitly — see there for why the
+        // lazy `||=` pattern used elsewhere can't do this on its own, since this declared
+        // default is already truthy).
         pfDialSamplePool: {},          // {[family|pole]: number[]}
         pfDialSampleCounts: {},        // {[family|pole]: n} — for the "unproven, still lukewarm by default" badge
         pfKlineBar:   { bearSum: 0, bullSum: 0, max: 50 }, // merged (own + partner) kline bar for display
@@ -1102,6 +1120,13 @@
               this._pfOcCycleCounter = Math.max(this._pfOcCycleCounter, _last?.id || 0);
             }
           } catch(_) {}
+          // Explicit load, not the lazy `||=` _pfDialSample/_pfExtremityBuild otherwise use —
+          // pfDialSamplePool's own reactive declaration above starts it at `{}`, which is
+          // already truthy, so `this.pfDialSamplePool ||= this._pfLoadDialPool()` never actually
+          // ran the load; every restart silently kept the freshly-declared empty pool instead of
+          // the persisted one, forcing every dial's cutoff to reprove itself from scratch. Load
+          // for real here, before the first _pfExtremityBuild() call below.
+          this.pfDialSamplePool = this._pfLoadDialPool();
           this._pfScoreTrim();
           this._pfExtremityBuild();
           try {
@@ -1904,8 +1929,11 @@
         // its own sample-derived cutoff and both are now surfaced, e.g. fund's positive half
         // reading "›0.2" and its negative half reading "‹-0.8", not the same number twice).
         // The single-pole Irregularity readings render as a one-ended pill (no opposite pole
-        // exists — see StrategyBook.md). Regime and 0-liq each fold their two poles into one
-        // pill the same way fund/va/pec/etc. do, rather than two separate ones.
+        // exists — see StrategyBook.md).
+        // Regime and 0-liq each fold their two poles into one pill the same way fund/va/pec/etc.
+        // do, rather than two separate ones — 0-liq's pill additionally carries a 3rd block for
+        // Past-1 (bare 'past1' tag, its own independent family — see BARE_DIAL_TAGS), grouped
+        // in visually only, not part of 0liq's own two-pole cutoff/veto machinery.
         // Standalone 3-segment diagnostic pill for live-liq/Past-1's shared market-wide
         // turnover dial — NOT a per-position win/loss pill like every other one here (see
         // dials.push below): 'liqturnover' is never itself a position's own criterion (see
@@ -1929,12 +1957,12 @@
               used.add('regimeb+'); used.add('regimes+');
               continue;
             }
-            if (k === '0liq' || k === 'liveliq+') {
-              dials.push([stats['0liq'] ? '0liq' : null, stats['liveliq+'] ? 'liveliq+' : null]);
-              used.add('0liq'); used.add('liveliq+');
+            if (k === '0liq' || k === 'liveliq+' || k === 'past1') {
+              dials.push([stats['0liq'] ? '0liq' : null, stats['liveliq+'] ? 'liveliq+' : null, stats['past1'] ? 'past1' : null]);
+              used.add('0liq'); used.add('liveliq+'); used.add('past1');
               continue;
             }
-            const famM = k.match(/^(fund|va|ioa|ocs|ocx|pec|vsg|pecirr|vsgirr|liqturnover)[+-]$/);
+            const famM = k.match(/^(fund|va|ioa|ocs|ocx|pec|vsg|pecirr|vsgirr|liqturnover|liqquiet)[+-]$/);
             if (famM) {
               const fam = famM[1], pos = fam + '+', neg = fam + '-';
               dials.push([stats[pos] ? pos : null, stats[neg] ? neg : null]);
@@ -1945,41 +1973,58 @@
             used.add(k);
           }
           const fmt = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2);
-          const cutoffText = cs => {
+          // liveliq+'s cutoff is NOT a signed "must dip below -X" threshold the way fund-/
+          // va-/etc. are — sliq/bliq/msliq/mbliq all route to 0liq's 'neg' pole regardless of
+          // their own tag's sign (see DIAL_POLES comment: "sign here is depth direction"), so
+          // its cutoff is an extreme-HIGH magnitude floor exactly like the 'pos' pole case,
+          // just labeled 'neg' because it's 0liq's opposite pole, not because "extreme" means
+          // "very negative" for this family the way it does for the bidirectional ones.
+          const cutoffText = (cs, key) => {
             if (!cs) return '';
             if (cs.cutoff == null) return `unproven ${cs.sampleCount ?? 0}/${this.cfg.pfExtremityMinSamples ?? 3}`;
+            if (key === 'liveliq+') return `›${cs.cutoff}`;
+            // Single-pole families' magnitude is always sampled as an absolute value (see
+            // _pfDialSample) — there's no genuinely negative-signed reading behind these,
+            // so their low/neg pole means "below X", not "below negative X" the way a real
+            // signed metric's (fund/va/ioa/ocs/ocx) negative pole does. Same bug class as
+            // liveliq+ above, just on the single-pole families instead of 0liq.
+            if (cs.pole === 'neg' && /^(liqturnover|pecirr|vsgirr|liqquiet)-$/.test(key)) return `‹${cs.cutoff}`;
             return cs.pole === 'neg' ? `‹-${cs.cutoff}` : `›${cs.cutoff}`;
           };
           const half = (key, cs, blocked) => {
             const v = cs ? val(cs) : 0;
             const color = blocked ? 'rgba(190,130,255,.95)' : v > 0 ? 'rgba(100,220,150,.9)' : v < 0 ? 'var(--short)' : 'var(--text-lo)';
             const [w, l] = cs ? wl(cs) : [0, 0];
-            const isAnchor = key === '0liq'; // bare, no gradation — the only half with no cutoff to show
+            const isAnchor = key === '0liq' || key === 'past1'; // bare, no gradation — no cutoff to show
             return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:0">`
               + `<div style="font-size:11px">${pfCritEmoji(key)}</div>`
               + `<div style="font-size:7.5px;color:${color}"><b>${fmt(v)}</b></div>`
               + `<div style="font-size:6px;opacity:.5">${w}W ${l}L</div>`
-              + (isAnchor ? '' : `<div style="font-size:6px;opacity:.45;white-space:nowrap">${cutoffText(cs)}</div>`)
+              + (isAnchor ? '' : `<div style="font-size:6px;opacity:.45;white-space:nowrap">${cutoffText(cs, key)}</div>`)
               + `</div>`;
           };
-          const pill = (posKey, negKey) => {
+          const pill = (posKey, negKey, extraKey) => {
             const posCs = posKey ? { ...stats[posKey], pole: 'pos' } : null;
             const negCs = negKey ? { ...stats[negKey], pole: 'neg' } : null;
+            const extraCs = extraKey ? { ...stats[extraKey], pole: 'pos' } : null; // past1: bare, no signed pole
             const posBlocked = posKey && this._pfIsCritBlocked(posKey);
             const negBlocked = negKey && this._pfIsCritBlocked(negKey);
-            const label = (posKey || negKey || '').replace(/[+-]$/, '');
-            const dataKey = posKey || negKey;
-            const single = !posKey || !negKey;
-            return `<div data-slot="${dataKey}" title="${label}" style="cursor:pointer;display:flex;align-items:stretch;border:1px solid var(--border);border-radius:14px;background:var(--bg-raised);padding:4px ${single ? 10 : 8}px;font-family:var(--mono);min-width:${single ? 46 : 84}px">`
-              + half(posKey || negKey, posKey ? posCs : negCs, posKey ? posBlocked : negBlocked)
-              + (single ? '' : `<div style="width:1px;align-self:stretch;background:rgba(255,255,255,.12);margin:0 4px"></div>${half(negKey, negCs, negBlocked)}`)
+            const extraBlocked = extraKey && this._pfIsCritBlocked(extraKey);
+            const segs = [posKey, negKey, extraKey].filter(Boolean);
+            const label = (segs[0] || '').replace(/[+-]$/, '');
+            const dataKey = segs[0];
+            const single = segs.length <= 1;
+            const parts = [];
+            if (posKey) parts.push(half(posKey, posCs, posBlocked));
+            if (negKey) parts.push(half(negKey, negCs, negBlocked));
+            if (extraKey) parts.push(half(extraKey, extraCs, extraBlocked));
+            const divider = `<div style="width:1px;align-self:stretch;background:rgba(255,255,255,.12);margin:0 4px"></div>`;
+            return `<div data-slot="${dataKey}" title="${label}" style="cursor:pointer;display:flex;align-items:stretch;border:1px solid var(--border);border-radius:14px;background:var(--bg-raised);padding:4px ${single ? 10 : 8}px;font-family:var(--mono);min-width:${single ? 46 : segs.length * 42}px">`
+              + parts.join(divider)
               + `</div>`;
           };
-          const score = ([pk, nk]) => {
-            const a = pk ? val(stats[pk]) : 0, b = nk ? val(stats[nk]) : 0;
-            return Math.max(a, b);
-          };
-          return dials.sort((a, b) => score(b) - score(a)).map(([a, b]) => pill(a, b)).join('');
+          const score = (keys) => Math.max(0, ...keys.filter(Boolean).map(k => val(stats[k])));
+          return dials.sort((a, b) => score(b) - score(a)).map(([a, b, c]) => pill(a, b, c)).join('');
         },
         _pfCrossRead() {
           try {
@@ -2235,16 +2280,16 @@
           // MIW's own annotation helpers, which need this cycle's MIW/OC/PEC caches to have
           // already landed.
           setTimeout(() => this._pfExtremityReEval().catch(() => {}), 0);
-          // pfDialSamplePool is deliberately NOT persisted (see its declaration) — every
-          // fresh page load starts it empty, so every dial's cutoff comes back "unproven"
-          // until enough live readings land. _pfExtremityBuild() is otherwise only called on
-          // a close/config-change/import (see runScan's own long-standing comment on why it's
-          // not on a timer), which used to leave a freshly-loaded page showing every dial-
-          // based score as zero — anchors (sliq/bliq/etc, no cutoff needed) unaffected — until
-          // the next real close happened to trigger a rebuild, sometimes hours later. Once per
-          // scan is cheap enough (same call the toggles above already make on every slider
-          // drag) and keeps the panel in sync with the pool as it fills in, rather than
-          // requiring a load-bearing trade close just to redraw existing history.
+          // pfDialSamplePool now persists across restarts (loaded explicitly in init(), see
+          // its declaration) — this call just keeps the panel in sync as new live samples land.
+          // _pfExtremityBuild() is otherwise only called on a close/config-change/import (see
+          // runScan's own long-standing comment on why it's not on a timer), which used to leave
+          // a freshly-loaded page showing every dial-based score as zero — anchors (sliq/bliq/etc,
+          // no cutoff needed) unaffected — until the next real close happened to trigger a
+          // rebuild, sometimes hours later. Once per scan is cheap enough (same call the toggles
+          // above already make on every slider drag) and keeps the panel in sync with the pool
+          // as it fills in, rather than requiring a load-bearing trade close just to redraw
+          // existing history.
           this._pfExtremityBuild();
           this._pfFetchStructure().then(r => {
             if (!r) return;
