@@ -131,6 +131,30 @@
     // config value that can change. Own-side DDH lift math no longer depends on this at all — see _pfDdhStartedAt —
     // but partner-side reads (Switchover's _pfPartnerHalted, Gains Lock lift) still do, so this still needs to
     // outlast whatever halt length is actually configured.
+  // CROSS_TTL alone doesn't bound this bucket's size — it's a 30d floor sized for the rare
+  // long-halt marker, but most event kinds (0liq-win, gc) only need minutes to hours and end
+  // up carrying that same 30d tail for no reason. Byte-cap as the actual backstop, same
+  // pattern and cap as _trimSharedRegistry in PseudoChaser/PseudoWinter — oldest event first,
+  // regardless of kind, so a halt marker can still get evicted early under sustained pressure
+  // (TTL is not a floor against eviction, only against premature natural expiry).
+  const CROSS_BYTE_CAP = 200 * 1024;
+  function _trimCrossEvents(events, maxBytes = CROSS_BYTE_CAP) {
+    let json = JSON.stringify({ events });
+    let size = new Blob([json]).size;
+    if (size <= maxBytes) return events;
+    const sorted = events.slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    let idx = 0, guard = 0;
+    while (size > maxBytes && idx < sorted.length && guard < 25) {
+      const avg = size / Math.max(1, sorted.length - idx);
+      const excess = size - maxBytes;
+      const drop = Math.min(sorted.length - idx, Math.max(1, Math.ceil(excess / avg)));
+      idx += drop;
+      json = JSON.stringify({ events: sorted.slice(idx) });
+      size = new Blob([json]).size;
+      guard++;
+    }
+    return sorted.slice(idx);
+  }
   // Extremity Scorer's own store — deliberately a fresh key, not the old scorecard's
   // SCORE_KEY (dropped). Shared literally between Permafrost and Ashfall (same key
   // string), same as the old SCORE_KEY was — cross-bot sharing depends on that. The old
@@ -1511,8 +1535,15 @@
             const state = raw ? JSON.parse(raw) : {};
             // liqHistory duplicates data already fully persisted under its own key
             // (PFR_LIQ_HISTORY_KEY) — it's shared here only so a halted partner can
-            // backfill cycles it missed. Cap it as its own atomized type rather than
-            // embedding the full (already independently-capped) history verbatim.
+            // backfill cycles it missed. It was capped by trimToByteCap's generic 200KB
+            // (same constant every other atomized type uses), which — since batches close
+            // hourly and pfLiqSampleWindow defaults to 72 — meant this embed was carrying
+            // nearly the bot's ENTIRE own history verbatim, not a small transit slice. A
+            // recovering partner only needs enough to bridge the gap left by however long
+            // it was actually halted, not the bot's own full multi-day analytical window.
+            // Fixed count instead of a byte cap: 48h comfortably covers a long halt
+            // (drawdown/gains-lock hours have been seen well past 24h — see CROSS_TTL's
+            // comment) with margin, at roughly a third the size of the old embed.
             state.winter = {
               ts: reading.ts,
               klineBar: this._pfOwnKlineBar ?? this.pfKlineBar,
@@ -1522,7 +1553,7 @@
               volAbs: reading.volAbs ?? 0,
               fioScore: reading.fioScore ?? null,
               lean: +((reading.skew + reading.breadth) / 2).toFixed(4),
-              liqHistory: trimToByteCap(this._liqCycleHistory ?? []),
+              liqHistory: (this._liqCycleHistory ?? []).slice(-48),
             };
             localStorage.setItem(SAMPLE_STATE_KEY, JSON.stringify(state));
           } catch(e) {}
@@ -1919,9 +1950,16 @@
           if (!this.cfg.miwSlotBlockTags) return false;
           const blockable = (this.cfg.miwSlotBlockCriteria || []).filter(Boolean);
           if (!blockable.length) return false;
+          // Regime's display key ('regimeb+'/'regimes+') doesn't share a prefix with its raw
+          // blockable-list name ('regimebull'/'regimebear' — see _miwCritScore in
+          // MultiIndicator-Winter) the way every other criterion's display key does. Translate
+          // back before the regex test so the picker's regime checkboxes actually gate this
+          // pill's blocked-color, same as everything else.
+          const regimeRaw = { 'regimeb+': 'regimebull', 'regimes+': 'regimebear' }[key];
+          const testKey = regimeRaw ?? key;
           const esc = v => String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           const rx = new RegExp('^(' + blockable.map(esc).join('|') + ')[+-]?$');
-          return rx.test(key) && (ranks[key] ?? 0) <= -threshold;
+          return rx.test(testKey) && (ranks[key] ?? 0) <= -threshold;
         },
         // Extremity Scorer pill UI — one pill per family, split into a positive-pole half
         // and a negative-pole half, each showing its own emoji/PnL/W-L/cutoff independently
@@ -2042,7 +2080,7 @@
             if (symbol) rec.symbol = symbol;
             if (extra) Object.assign(rec, extra);
             events.push(rec);
-            localStorage.setItem(CROSS_KEY, JSON.stringify({ events }));
+            localStorage.setItem(CROSS_KEY, JSON.stringify({ events: _trimCrossEvents(events) }));
           } catch(e) {}
         },
 

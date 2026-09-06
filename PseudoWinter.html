@@ -1362,7 +1362,17 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             <span x-text="showStorageBreakdown?'▾':'▸'"></span> Storage usage
           </span>
           <span x-show="showStorageBreakdown" @click="_exportStorageBreakdown()" title="Download this breakdown as a text file" style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;text-decoration:underline;user-select:none">⤓ Export</span>
-          <div x-show="showStorageBreakdown" x-html="_storageBreakdown(showStorageBreakdown)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
+          <div x-show="showStorageBreakdown" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6">
+            <template x-for="row in _storageRowsList(showStorageBreakdown)" :key="row.label">
+              <div :style="row.isTotal ? 'display:flex;justify-content:space-between;gap:8px;margin-top:3px;padding-top:3px;border-top:1px solid rgba(255,255,255,.08)' : 'display:flex;justify-content:space-between;gap:8px'">
+                <span :style="row.isTotal ? '' : ('color:' + (row.over ? 'var(--short)' : 'var(--text-lo)'))" x-text="row.label"></span>
+                <span style="display:flex;align-items:center;gap:6px">
+                  <span :style="'color:' + (row.isTotal ? 'var(--ice)' : (row.over ? 'var(--short)' : 'var(--ice)'))" x-text="row.fmt"></span>
+                  <span x-show="row.clearable" @click="_storageClearRow(row.label)" title="Clear this bucket" style="cursor:pointer;color:var(--text-lo);user-select:none">✕</span>
+                </span>
+              </div>
+            </template>
+          </div>
         </div>
         <div style="margin-top:6px">
           <span @click="showPowerUsage=!showPowerUsage" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
@@ -2281,43 +2291,60 @@ function pw() { return {
   // breakdown and the export-to-file button so both report the same numbers.
   _storageRows() {
     const byteSize = v => { try { return new Blob([v]).size; } catch(e) { return (v||'').length; } };
-    // Every localStorage key maps to exactly one atomized data-type row — deliberately
-    // granular (liq samples separate from structure wave, separate from OC samples, etc.)
-    // so a single bloated data type is visible on its own instead of hiding inside a
-    // whole-plugin lump sum, matching the per-type 200KB cap plugins enforce on write.
+    // This screen used to walk the WHOLE shared origin and label the partner's private
+    // keys too ("PseudoChaser (partner): core state" etc.) — technically harmless (those
+    // three lines were just label text, PW never actually read or wrote PC's keys), but
+    // showing another bot's data inside "your" storage total is misleading regardless of
+    // whether any bytes were duplicated. This bot's screen now only accounts for its own
+    // keys plus the genuinely shared/cross-bot ones — see PARTNER_EXCLUSIVE_KEYS below for
+    // what's deliberately left out and why.
     const singleKeyMap = {
       [LS_KEY]:                    'This Bot (PseudoWinter): core state',
       'pw_v1_log':                 'This Bot (PseudoWinter): activity log',
       '__pw_plugins_v1':           'This Bot (PseudoWinter): plugin config',
-      'pc_v1':                     'PseudoChaser (partner): core state',
-      'pc_v1_log':                 'PseudoChaser (partner): activity log',
-      '__pc_plugins_v1':           'PseudoChaser (partner): plugin config',
-      '__pf_liq_batches':          'Permafrost: liq batches (in-progress)',
-      '__pf_liq_history':          'Permafrost: liquidation samples',
-      '__pf_oc_history':           'Permafrost: OC samples',
-      '__ash_liq_batches':         'Ashfall: liq batches (in-progress)',
-      '__ash_liq_history':         'Ashfall: liquidation samples',
-      '__ash_oc_history':          'Ashfall: OC samples',
+      '__pf_liq_batches':          'Permafrost (this bot\u2019s plugin): liq batches (in-progress)',
+      '__pf_liq_history':          'Permafrost (this bot\u2019s plugin): liquidation samples',
+      '__pf_oc_history':           'Permafrost (this bot\u2019s plugin): OC samples',
+      '__miw_hist_batches':        'MultiIndicator (this bot\u2019s plugin): hist batches',
       '__everwinter_scorecard_v1': 'Cross-Bot: scorecard',
       '__everwinter_cross_v1':     'Cross-Bot: broadcast log',
       '__ew_sample_state_v1':      'Cross-Bot: sample state (incl. shared liq backfill)',
       '__ew_shared_v1':            'Cross-Bot: shared registry',
       '__cgCoinList':              'Market Cap Cache: CoinGecko',
       '__cpCoinList':              'Market Cap Cache: CoinPaprika',
-      '__miw_hist_batches':        'MultiIndicator (Winter): hist batches',
-      '__mic_hist_batches':        'MultiIndicator (Chaser): hist batches',
     };
-    // These two keys bundle several distinct data types into one JSON blob — break each
-    // field out into its own row rather than reporting one combined "Permafrost"/"Ashfall" figure.
+    // Keys that exist on this origin but belong exclusively to PseudoChaser or its own
+    // loaded plugins (Ashfall, MultiIndicator-Chaser) — not shared, not read or written
+    // by this bot at all, just sitting on the same origin because the browser gives
+    // every script here one shared quota. Skipped entirely (not even folded into
+    // 'Other') so neither the row list nor this bot's own total includes them.
+    const PARTNER_EXCLUSIVE_KEYS = new Set([
+      'pc_v1', 'pc_v1_log', '__pc_plugins_v1',
+      '__ash_liq_batches', '__ash_liq_history', '__ash_oc_history',
+      '__mic_hist_batches', '__ashfall_chaser_v1',
+    ]);
+    // This key bundles several distinct data types into one JSON blob — break each field
+    // out into its own row rather than reporting one combined "Permafrost" figure.
     const blobFieldMap = {
       '__permafrost_winter_v1': { prefix: 'Permafrost', fields: { wave: 'structure wave', closes: 'closed-trade samples', events: 'events (legacy)', volHistory: 'volume history', oiHistory: 'OI/MC history', pfKlineBar: 'kline bar snapshot' } },
-      '__ashfall_chaser_v1':    { prefix: 'Ashfall',    fields: { wave: 'structure wave', closes: 'closed-trade samples', events: 'events (legacy)', volHistory: 'volume history', oiHistory: 'OI/MC history', afKlineBar: 'kline bar snapshot' } },
     };
     const rows = {};
+    // Per-label list of what a manual "clear" on that row should actually delete — a
+    // single-key row deletes the whole key, a blob-field row deletes just that field and
+    // re-saves the rest of the blob untouched. Rows with no entry here (Other, and a
+    // blob's own "structure overhead") get no clear button — 'Other' could be a key
+    // belonging to some completely different tool sharing this origin, and "overhead" is
+    // whatever the blob holds beyond the tracked fields (config, position state, etc.),
+    // not a discrete, safely-removable thing.
+    const targets = {};
     let grand = 0;
-    const addRow = (label, bytes) => { rows[label] = (rows[label] || 0) + bytes; };
+    const addRow = (label, bytes, target) => {
+      rows[label] = (rows[label] || 0) + bytes;
+      if (target) (targets[label] || (targets[label] = [])).push(target);
+    };
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
+      if (PARTNER_EXCLUSIVE_KEYS.has(k)) continue;
       const v = localStorage.getItem(k) || '';
       const bytes = byteSize(v);
       grand += bytes;
@@ -2329,7 +2356,7 @@ function pw() { return {
           for (const [field, label] of Object.entries(blob.fields)) {
             if (parsed[field] === undefined) continue;
             const fbytes = byteSize(JSON.stringify(parsed[field]));
-            addRow(`${blob.prefix}: ${label}`, fbytes);
+            addRow(`${blob.prefix}: ${label}`, fbytes, { key: k, field });
             accounted += fbytes;
           }
         } catch(e) {}
@@ -2337,43 +2364,69 @@ function pw() { return {
         if (overhead > 0) addRow(`${blob.prefix}: structure overhead`, overhead);
         continue;
       }
-      addRow(singleKeyMap[k] || 'Other', bytes);
+      addRow(singleKeyMap[k] || 'Other', bytes, singleKeyMap[k] ? { key: k } : null);
     }
-    return { rows, grand };
+    return { rows, targets, grand };
   },
-  // `shown` mirrors the pattern used for the analytics plugins' chart builders: without it,
-  // Alpine still evaluates this on every tick even while the dropdown is collapsed, and this
-  // one is expensive — it Blob-sizes every localStorage value (megabytes' worth, once storage
-  // grows) plus a JSON.parse/re-stringify of the two Permafrost/Ashfall blobs, every second,
-  // regardless of visibility. Alpine's own dependency tracking (which reactive property was
-  // read) doesn't help here since the cost comes from localStorage, not a tracked property —
-  // so unlike the chart fixes, this still needs the tick read, just gated on visibility.
-  _storageBreakdown(shown) {
-    if (!shown) return '';
+  _storageFmtBytes(b) {
+    return b >= 1048576 ? (b/1048576).toFixed(2)+' MB' : b >= 1024 ? (b/1024).toFixed(1)+' KB' : b+' B';
+  },
+  // Replaces the old x-html string-built breakdown — that approach couldn't wire up a
+  // real click handler per row (x-html sets innerHTML, which Alpine never compiles), so
+  // clearing a bucket meant going to devtools. Returns a plain array for x-for instead,
+  // with the grand total folded in as a last synthetic row (isTotal) so this stays the
+  // one and only per-tick call into the expensive part (_storageRows Blob-sizes every
+  // localStorage value and re-parses the two blob keys — see the visibility-gating note
+  // this inherited from the old method).
+  _storageRowsList(shown) {
+    if (!shown) return [];
     void this.tick;
-    const fmt = b => b >= 1048576 ? (b/1048576).toFixed(2)+' MB' : b >= 1024 ? (b/1024).toFixed(1)+' KB' : b+' B';
-    const { rows, grand } = this._storageRows();
+    const { rows, targets, grand } = this._storageRows();
     const TYPE_WARN_BYTES = 200 * 1024;
-    const rowsHtml = Object.entries(rows).sort((a,b) => b[1]-a[1]).map(([name,bytes]) => {
-      const over = bytes > TYPE_WARN_BYTES;
-      const clr = over ? 'var(--short)' : 'var(--ice)';
-      return `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:${over?'var(--short)':'var(--text-lo)'}">${name}</span><span style="color:${clr}">${fmt(bytes)}</span></div>`;
-    }).join('');
-    return rowsHtml + `<div style="display:flex;justify-content:space-between;gap:8px;margin-top:3px;padding-top:3px;border-top:1px solid rgba(255,255,255,.08)"><span>Total</span><span style="color:var(--ice)">${fmt(grand)}</span></div>`;
+    const list = Object.entries(rows).sort((a, b) => b[1] - a[1]).map(([label, bytes]) => ({
+      label, bytes,
+      fmt: this._storageFmtBytes(bytes),
+      over: bytes > TYPE_WARN_BYTES,
+      clearable: !!targets[label],
+      isTotal: false,
+    }));
+    list.push({ label: 'Total', bytes: grand, fmt: this._storageFmtBytes(grand), over: false, clearable: false, isTotal: true });
+    return list;
   },
-  // Dumps the same numbers as _storageBreakdown() to a downloadable .txt file — the
-  // on-screen rows live inside an x-html block that's unreliable to click-drag select,
-  // so this is the actual "get this data out to paste elsewhere" path.
+  // Deletes whatever a row's clear button points at (see targets above) — the whole key
+  // for a single-key row, or just that one field (re-saving the rest of the blob intact)
+  // for a blob-field row. No-ops for a row with no target (isTotal, Other, overhead).
+  _storageClearRow(label) {
+    const { targets } = this._storageRows();
+    const acts = targets[label];
+    if (!acts || !acts.length) return;
+    if (!confirm(`Clear "${label}"? This can't be undone.`)) return;
+    for (const t of acts) {
+      if (t.field) {
+        try {
+          const raw = localStorage.getItem(t.key);
+          if (!raw) continue;
+          const parsed = JSON.parse(raw);
+          delete parsed[t.field];
+          localStorage.setItem(t.key, JSON.stringify(parsed));
+        } catch(e) {}
+      } else {
+        localStorage.removeItem(t.key);
+      }
+    }
+  },
+  // Dumps the same numbers as the on-screen breakdown to a downloadable .txt file —
+  // the on-screen rows are unreliable to click-drag select, so this is the actual
+  // "get this data out to paste elsewhere" path.
   _exportStorageBreakdown() {
-    const fmt = b => b >= 1048576 ? (b/1048576).toFixed(2)+' MB' : b >= 1024 ? (b/1024).toFixed(1)+' KB' : b+' B';
     const { rows, grand } = this._storageRows();
     const sorted = Object.entries(rows).sort((a,b) => b[1]-a[1]);
     const lines = [
       `EverWinter storage usage — PseudoWinter — ${new Date().toISOString()}`,
       '',
-      ...sorted.map(([name,bytes]) => `${fmt(bytes).padStart(10)}  (${bytes} B)  ${name}`),
+      ...sorted.map(([name,bytes]) => `${this._storageFmtBytes(bytes).padStart(10)}  (${bytes} B)  ${name}`),
       '',
-      `${fmt(grand).padStart(10)}  (${grand} B)  Total`,
+      `${this._storageFmtBytes(grand).padStart(10)}  (${grand} B)  Total`,
     ];
     const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -4667,7 +4720,14 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
   _pluginRemove(id) {
     this._pluginList = this._pluginList.filter(p => p.id !== id);
-    window.__pluginSystem.save(this._pluginList);
+    const saved = window.__pluginSystem.save(this._pluginList);
+    if (!saved) {
+      // Removal is still reflected in the UI (intentional — the person asked to remove
+      // it), but it didn't actually persist: some other plugin still in the list is
+      // large enough on its own to exceed the quota. Surface it so this doesn't just
+      // silently reappear on next reload.
+      this.log('[Plugin] ⚠ Removed, but the remaining plugin list still exceeds localStorage quota — remove another plugin to actually free space.', 'warn');
+    }
     const ws = window.__pluginSystem.checkConflicts(this._pluginList);
     ws.forEach(w => this.log('[Plugin] ⚠ ' + w, 'warn'));
   },
@@ -4711,7 +4771,16 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         const previous = existing >= 0 ? this._pluginList[existing] : null;
         if (existing >= 0) this._pluginList.splice(existing, 1, entry);
         else this._pluginList.push(entry);
-        window.__pluginSystem.save(this._pluginList);
+        const saved = window.__pluginSystem.save(this._pluginList);
+        if (!saved) {
+          // Never actually persisted (localStorage quota — a plugin's full raw src is
+          // stored verbatim, see the entry object above). Roll back the in-memory
+          // mutation too, or the UI would show this as "loaded" right up until the next
+          // reload, when it silently vanishes since it was never really saved.
+          if (existing >= 0) this._pluginList.splice(existing, 1, previous);
+          else this._pluginList.pop();
+          throw new Error(`"${entry.name}" loaded but couldn't be saved — localStorage quota exceeded. Remove another plugin to free space, then try again.`);
+        }
         const ws = window.__pluginSystem.checkConflicts(this._pluginList);
         this._pluginConflicts = ws;
         ws.forEach(w => this.log('[Plugin] ⚠ ' + w, 'warn'));
@@ -4768,7 +4837,16 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     BOT: _PS_BOT,
     load: _psLoad,
     sort: _psSort,
-    save(plugins) { localStorage.setItem(_PS_KEY, JSON.stringify(plugins)); },
+    // Returns true/false instead of throwing — a plugin's raw src is stored verbatim
+    // (see _pluginLoad below) and localStorage's per-origin quota (~5-10MB, shared with
+    // this bot's own state/log keys on the same origin) can be exceeded by one oversized
+    // plugin or several loaded together. Callers decide what to do with a false: roll
+    // back an in-memory add that never actually persisted, or warn on a remove that
+    // still doesn't fit.
+    save(plugins) {
+      try { localStorage.setItem(_PS_KEY, JSON.stringify(plugins)); return true; }
+      catch (e) { return false; }
+    },
     checkConflicts(plugins) {
       const warns = [];
       const ids = new Set(plugins.map(p => p.id));
