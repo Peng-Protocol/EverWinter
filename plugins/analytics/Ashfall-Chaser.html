@@ -23,7 +23,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '1.75.0'; // Liquidation Sample panel now shows a live diagnostic line: current liqquiet market-wide quiet% (with its extreme cutoffs) and the current liqturnover extreme cutoffs, so both regime-style dials have a visible current-state readout
+    const VERSION        = '1.76.0'; // Added Lukewarm Targeting sub-toggle under the Extremity Scorer: complete inversion of the veto direction (avoid extremes, target lukewarm), applies to both entry blocking and Extremity Re-Evaluation via _afExtremityVeto
   // How long a liqClaim (see the handleMsg additions in _liqLaunchBatch/_liqResumeBatch) holds a
   // symbol against the following partner's own live-jump path. Just needs to comfortably outlast
   // one _micOnLiqMessage pass — its slowest branch is at most a couple of awaited single REST
@@ -60,6 +60,9 @@
     afExtremitySplitPct: 25,
     afExtremityMinSamples: 3,
     afLukewarmRatioPct: 70,
+    // Lukewarm Targeting: complete inversion of the veto direction — target lukewarm,
+    // avoid extremes. See _afExtremityVeto.
+    afLukewarmTargetingEnabled: false,
     afExtremityReEvalEnabled: true,
     // Cap on afDialSamplePool — the rolling, in-memory-only pool of raw criterion
     // readings (every annotation, not just closes) that the extreme-high/lukewarm/
@@ -541,15 +544,22 @@
                   <div class="ash-hint">A criterion needs at least this many sampled readings before it has a proven cutoff. Below it, every reading counts as lukewarm.</div>
                 </div>
                 <div class="g" style="margin-top:8px">
-                  <div class="lbl">Lukewarm Veto <b x-text="cfg.afLukewarmRatioPct"></b>%</div>
+                  <div class="lbl" x-text="(cfg.afLukewarmTargetingEnabled?'Extreme Veto ':'Lukewarm Veto ')+cfg.afLukewarmRatioPct+'%'"></div>
                   <input type="range" min="30" max="100" step="5" x-model.number="cfg.afLukewarmRatioPct" @change="persist()">
-                  <div class="ash-hint">A ticker is vetoed once this share of its exhibited (dial-eligible) criteria come back lukewarm.</div>
+                  <div class="ash-hint" x-text="cfg.afLukewarmTargetingEnabled?'A ticker is vetoed once this share of its exhibited (dial-eligible) criteria come back extreme.':'A ticker is vetoed once this share of its exhibited (dial-eligible) criteria come back lukewarm.'"></div>
                 </div>
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.afLukewarmTargetingEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afLukewarmTargetingEnabled=!cfg.afLukewarmTargetingEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Lukewarm Targeting</div>
+                    <div class="ash-hint">Complete inversion of the scorer: avoid extremes, target lukewarm values instead. A ticker is now vetoed once too much of it is extreme, and Extremity Re-Evaluation closes a position once it drifts into extreme territory rather than back to lukewarm.</div>
+                  </div>
+                </label>
                 <label class="tog" style="margin-top:8px">
                   <div class="tog-t" :class="cfg.afExtremityReEvalEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afExtremityReEvalEnabled=!cfg.afExtremityReEvalEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Extremity Re-Evaluation</div>
-                    <div class="ash-hint">At the end of every scan, re-checks each open position's own qualifying criteria against the current cutoffs (using this cycle's already-fetched data — no extra fetches) and closes it once it's fallen back to lukewarm by the same veto ratio above.</div>
+                    <div class="ash-hint" x-text="cfg.afLukewarmTargetingEnabled?'At the end of every scan, re-checks each open position against the current cutoffs and closes it once it has drifted into extreme territory by the same veto ratio above.':'At the end of every scan, re-checks each open position\\'s own qualifying criteria against the current cutoffs (using this cycle\\'s already-fetched data — no extra fetches) and closes it once it\\'s fallen back to lukewarm by the same veto ratio above.'"></div>
                   </div>
                 </label>
                 <div class="g">
@@ -1667,6 +1677,9 @@
         // lukewarm close is exactly what this system exists to avoid crediting, so it's
         // excluded from "which extreme end was more profitable" rather than diluting it.
         // Liq anchors (no dial) are scored directly as before, unaffected by any of this.
+        // Lukewarm Targeting (cfg.afLukewarmTargetingEnabled) does not change any of this
+        // build/scoring pass — it only flips the comparison direction inside
+        // _afExtremityVeto below.
         //
         // Bare Blind-Entry/Liquid-Diver tags and single-pole families with no magnitude
         // gradation always classify extreme — there's nothing to be lukewarm about. Regime is
@@ -1809,6 +1822,10 @@
         // _micLiqCurrentRead in MultiIndicator-Chaser. Single-pole families (Irregularity)
         // use the same singlePoleClassify split as the build pass — lukewarm is "neither
         // cutoff crossed", same meaning as everywhere else.
+        //
+        // Lukewarm Targeting (cfg.afLukewarmTargetingEnabled) inverts the veto direction
+        // entirely — the classification pass above (lukewarm vs. extreme, per criterion)
+        // is unchanged, only which side gets vetoed flips: avoid extremes, target lukewarm.
         _afExtremityVeto(annotCrits) {
           if (!this.cfg.afExtremityEnabled) return false;
           const cutoffs = this.afDialCutoffs || {};
@@ -1830,13 +1847,24 @@
             if (cutoff == null || mag < cutoff) lukewarm++;
           }
           if (!total) return false;
-          return (lukewarm / total * 100) >= (this.cfg.afLukewarmRatioPct ?? 70);
+          const lukewarmPct = lukewarm / total * 100;
+          // Lukewarm Targeting inverts the whole veto: instead of blocking a ticker once
+          // too much of it is lukewarm, block it once too much of it is EXTREME — same
+          // ratio slider, same "total" denominator, just flipped which share is compared
+          // against it. Since _afExtremityReEval closes purely by calling this function on
+          // a position's live criteria, the inversion applies there for free: it now closes
+          // once a position has drifted INTO extreme territory rather than back out of it.
+          if (this.cfg.afLukewarmTargetingEnabled) return (100 - lukewarmPct) >= (this.cfg.afLukewarmRatioPct ?? 70);
+          return lukewarmPct >= (this.cfg.afLukewarmRatioPct ?? 70);
         },
         // Extremity Re-Evaluation (secondary toggle, off by default). At the end of every
         // scan, re-derives each open position's own qualifying criteria against the CURRENT
         // dial cutoffs and closes it once it crosses the same lukewarm-ratio bar it had to
         // clear to open in the first place — held to the same standard throughout its life,
-        // not just at entry. Deliberately reads only data this cycle already cached (bulk
+        // not just at entry. Under Lukewarm Targeting this closes a position once it's
+        // drifted INTO extreme territory instead — see _afExtremityVeto, the sole choke
+        // point both this and entry-blocking route through, for the actual inversion.
+        // Deliberately reads only data this cycle already cached (bulk
         // ticker snapshot + MIC's live PEC/OC caches) rather than firing fresh fetches of its
         // own, so it rides the existing scan cadence instead of adding load on top of the
         // scan scheduler. A symbol with no fresh-enough cached tick this cycle is skipped
