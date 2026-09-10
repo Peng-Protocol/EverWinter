@@ -75,7 +75,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.77.0'; // stamps synthetic 'past1' tag on genuine Past-1 matches (Auto + manual); samples liqquiet (100-activityPct) into Ashfall's Extremity pool each closed liq batch
+    const VERSION       = '1.77.2'; // Dead Switch cooldown: now requires a full idle duration from its own last trigger before it can fire again, fixing back-to-back trips when halt duration < idle duration
   // Every default slot anchors on a live liq criterion, matching the default Liquidation
   // Presence modes (default ['1'] — live only). Enabling 0/Past-1 won't retroactively populate
   // 0liq-anchored presets; users building 0-Liq slots do so manually.
@@ -581,7 +581,7 @@
                       <div class="tog-t" :class="cfg.micDeadSwitchEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micDeadSwitchEnabled=!cfg.micDeadSwitchEnabled;persist()}"><div class="tog-k"></div></div>
                       <div>
                         <div class="tog-l">Dead Switch</div>
-                        <div class="mic-hint">Triggers the Drawdown Throttle halt if MIC hasn't made a single new entry in <span x-text="cfg.micDeadSwitchHours ?? 1"></span>h — an idle-time trip, independent of PnL.</div>
+                        <div class="mic-hint">Triggers the Drawdown Throttle halt — and bails the open book, same as Drawdown Throttle's own bail — if MIC hasn't made a single new entry in <span x-text="cfg.micDeadSwitchHours ?? 1"></span>h. An idle-time trip, independent of PnL. Bail follows the host's Drawdown Bail toggle (Halt tab).</div>
                       </div>
                     </label>
                     <div x-show="cfg.micDeadSwitchEnabled" style="margin-top:5px;margin-left:2px">
@@ -1136,22 +1136,35 @@
 
         // Dead Switch: triggers the SAME drawdown halt Drawdown Throttle uses
         // (_drawdownHaltUntil) once MIC has gone micDeadSwitchHours without a single new entry
-        // — a pure idle-time trip, unrelated to PnL. Baseline is the more recent of plugin load
-        // (_micLoadedAt, so a fresh session with no entries yet isn't immediately "dead") and
-        // the last actual entry (_micLastEntryTs, set at both pseudoOpenLong call sites). A
+        // — a pure idle-time trip, unrelated to PnL. Baseline is the most recent of plugin load
+        // (_micLoadedAt, so a fresh session with no entries yet isn't immediately "dead"), the
+        // last actual entry (_micLastEntryTs, set at both pseudoOpenLong call sites), and the
+        // last time Dead Switch itself fired (_micLastDeadSwitchAt) — that last one is what stops
+        // back-to-back trips: if the halt window is shorter than the idle window, no entries will
+        // have happened by the time the halt clears, so without it the very next scan would see
+        // the same stale baseline and re-trigger immediately. With it, a full idle duration has to
+        // elapse from the trigger itself before Dead Switch can fire again, halt or no halt. A
         // no-op while already halted (manual or drawdown) — this only ever starts a halt, never
-        // stacks or extends one already running.
+        // stacks or extends one already running. Also bails any open book the same way Drawdown
+        // Throttle's own trigger does — gated by the same cfg.drawdownBailEnabled toggle, and
+        // deferred via setTimeout so the host's bailAll() (which awaits pseudoClosePosition per
+        // position) runs after this scan tick finishes rather than nested inside it.
         _micDeadSwitchCheck() {
           if (!this.cfg.micDeadSwitchEnabled) return;
           if (this._manualHalt || (this._drawdownHaltUntil || 0) > Date.now()) return;
           const idleMs = (this.cfg.micDeadSwitchHours ?? 1) * 3600000;
-          const baseline = Math.max(this._micLoadedAt || 0, this._micLastEntryTs || 0);
+          const baseline = Math.max(this._micLoadedAt || 0, this._micLastEntryTs || 0, this._micLastDeadSwitchAt || 0);
           if (!baseline || (Date.now() - baseline) < idleMs) return;
+          this._micLastDeadSwitchAt = Date.now();
           const haltHours = this.cfg.drawdownHaltHours ?? 6;
           this._drawdownHaltUntil = Date.now() + haltHours * 3600000;
           this._drawdownWindow = [];
           if (typeof this.persist === 'function') this.persist();
           this.log(`[MIC] 💀 Dead Switch: no new entries in ${this.cfg.micDeadSwitchHours ?? 1}h — triggering drawdown halt (${haltHours}h).`, 'warn');
+          if (this.cfg.drawdownBailEnabled !== false && this.positions.length > 0 && typeof this.bailAll === 'function') {
+            this.log(`[MIC] 💀 Dead Switch bail — closing ${this.positions.length} open position(s)`, 'warn');
+            setTimeout(() => { this.bailAll().catch(() => {}); }, 0);
+          }
         },
 
         _micComputeSamplingData() {
