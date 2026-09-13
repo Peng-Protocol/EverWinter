@@ -5076,6 +5076,43 @@ function psycho() { return {
       catch(e) { this.log(`[BAIL-ERR] ${pos.symbol} — ${e.message}`, 'warn'); }
     }
     this.log('[PW] Bail complete.', 'warn');
+    await this._bailFlattenLingering();
+  },
+
+  // Post-sweep safety net. bailAll()'s per-position close (whichever reason
+  // it falls through as — tp/sl/manual/bail) always ends in local bookkeeping
+  // regardless of whether the real reduceOnly close order actually filled: a
+  // thin-liquidity IOC that only partially fills, or a swallowed exception in
+  // the per-position retry inside liveClosePosition, still gets the position
+  // dropped from this.positions. Since liveSyncPositions() only reconciles
+  // positions still present in this.positions, one that's been (wrongly)
+  // removed locally is never rediscovered even though it's still open on
+  // Bybit — it lingers, untracked, outside the bot's own bookkeeping.
+  //
+  // This queries Bybit's live position list directly (not this.positions)
+  // and force-flattens anything still open, independent of the normal
+  // close/bookkeeping pipeline — so a lingering position gets closed even
+  // when the bot has already lost track of it.
+  async _bailFlattenLingering() {
+    if (!this.cfg.liveMode || !this.cfg.apiKey || !this.cfg.apiSecret) return;
+    try {
+      await new Promise(r => setTimeout(r, 1500));
+      const result = await this.liveApiCall('/v5/position/list', { category:'linear', settleCoin:'USDT' });
+      const lingering = (result?.list || []).filter(e => e.side === 'Sell' && parseFloat(e.size) > 0);
+      if (!lingering.length) return;
+      this.log(`[PW] Bail: ${lingering.length} position(s) still open on Bybit after sweep — force-flattening`, 'warn');
+      for (const ep of lingering) {
+        try {
+          const qty = String(parseFloat(ep.size));
+          await this.livePlaceOrder({ symbol: ep.symbol, side:'Buy', orderType:'Market', qty, timeInForce:'IOC', reduceOnly:true });
+          this.log(`[PW] Bail: force-flattened ${ep.symbol} (${qty}) — was still open on exchange after sweep`, 'warn');
+        } catch(e) {
+          this.log(`[BAIL-FLATTEN-ERR] ${ep.symbol} — ${e.message}`, 'error');
+        }
+      }
+    } catch(e) {
+      this.log(`[PW] Bail: post-sweep verify error — ${e.message}`, 'warn');
+    }
   },
 
   // ── Clear ──
