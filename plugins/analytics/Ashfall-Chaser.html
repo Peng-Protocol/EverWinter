@@ -1,18 +1,25 @@
 <!--
   Ashfall Strategy Plugin for PseudoChaser
-  Builds a learned market-structure profile by recording the climate at every
-  drawdown-throttle and gains-lock event — drawdown events mark hostile climate,
-  gains-lock events mark favorable climate. Scan cycles add weaker PnL-labeled
-  samples between those anchors.
+  Scoring and cross-bot coordination layer for MultiIndicator-Chaser. The climate
+  profile, structure/wave engine and adaptive halt timing this file used to carry
+  were all removed in v1.80.0 — halts run the host's own stock timers again.
 
-  Structure trajectory ("the wave"): a reading is judged in the context of what
-  preceded it, not in isolation. The recent path of the structure lean is tracked
-  and plotted in the accordion, and its direction folds into an inherent bull⇄bear
-  oscillation prior — so a mildly-bullish tape that is turning down reads negative
-  (don't long into the start of a dump). Learned history stays primary; the
-  inherent wave only takes the helm when the profile is thin.
+  Extremity Scorer / Lukewarm Scoring: every criterion reading MIC annotates is
+  sampled into a rolling pool and sorted, per pole, into extreme vs lukewarm
+  against that pole's own observed spread. Closed trades score both a per-pole
+  dial (what MIC's blocking and co-qual ranking read) and a two-bucket Extreme vs
+  Lukewarm tally; whichever bucket is in higher net profit becomes the side the
+  entry veto targets, re-decided on every rebuild rather than toggled by hand.
 
-  The profile is direction-agnostic: it only learns what realized PnL says
+  Cross bus: cascade/sacrifice triggers, drawdown-halt and gains-lock transitions
+  and Gains Continuation steps are broadcast to Permafrost and read back, so the
+  two sides can lift each other's halts (Mutual DDH Lift) or halt pre-emptively
+  on the partner's winning streak (GC).
+
+  Order Count Surveillance supplies the OC/volume/OI population samples that
+  MIC's ocs, ocx, va and ioa criteria are all measured against.
+
+  The scorer is direction-agnostic: it only learns what realized PnL says
   about this installation — the same logic powers Permafrost on PseudoWinter.
 
   Load via Plugin Manager in PseudoChaser's config panel.
@@ -23,7 +30,8 @@
 (function () {
   'use strict';
 
-    const VERSION        = '1.80.0'; // Major cut-down: Wave tab removed entirely (sampling bars, Collective FIO, Liquidation Surveillance/Prospect Pre-Screening/PEC-VSG Universe Weighing, and the whole structure/wave halt-bias engine — _afFetchStructure/afStatus/afWave/afKlineBar and the gaussian kernel model, all dead weight with no real consumers left). OC Surveillance moved into the Score tab. Cross Broadcast is now always-on (toggle removed); Switchover removed. Extremity Scorer's criteria universe trimmed to fund/V-A/IO-A/OCS/OCX (regime, PEC/VSG, live-liq/0-liq/Past-1, liqturnover/liqquiet all retired). Lukewarm Targeting replaced by Lukewarm Scoring: two buckets (Extreme/Lukewarm) each headlined by aggregate $, with per-criterion pills nested inside — see afLukewarmScoreboard/_afExtremityHtml.
+    const VERSION        = '1.80.1'; // Housekeeping: file-header and Mode-hint text corrected (they still described the climate/wave profile engine v1.80.0 removed); dead KLINE_LOG_KEY/KLINE_LOG_BYTE_CAP consts dropped along with PEC/VSG Universe Weighing.
+    // v1.80.0 — Major cut-down: Wave tab removed entirely (sampling bars, Collective FIO, Liquidation Surveillance/Prospect Pre-Screening/PEC-VSG Universe Weighing, and the whole structure/wave halt-bias engine — _afFetchStructure/afStatus/afWave/afKlineBar and the gaussian kernel model, all dead weight with no real consumers left). OC Surveillance moved into the Score tab. Cross Broadcast is now always-on (toggle removed); Switchover removed. Extremity Scorer's criteria universe trimmed to fund/V-A/IO-A/OCS/OCX (regime, PEC/VSG, live-liq/0-liq/Past-1, liqturnover/liqquiet all retired). Lukewarm Targeting replaced by Lukewarm Scoring: two buckets (Extreme/Lukewarm) each headlined by aggregate $, with per-criterion pills nested inside — see afLukewarmScoreboard/_afExtremityHtml.
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -120,17 +128,6 @@
   // like EXTREMITY_KEY/CROSS_KEY), since the two sides' dial families are computed
   // independently and have no reason to pool. See _afLoadDialPool/_afSaveDialPool.
   const DIAL_POOL_KEY = '__ew_af_dialpool_v1';
-  // Full-universe PEC/VSG candle log for Pre-Screening — same same-origin-localStorage
-  // sharing convention as EXTREMITY_KEY/CROSS_KEY (Ashfall and Permafrost both read/write this,
-  // so whichever fetches first each cycle saves the other one the trip), but deliberately
-  // its own key rather than the generic _sharedWrite registry: that registry is capped at
-  // SHARED_REGISTRY_BYTE_CAP (200KB, in PseudoChaser.html/PseudoWinter.html) sized for small
-  // recent-snapshot caches (bulkTickers, pec_1h_last, liqResults) — a real per-symbol candle
-  // history for the whole exchange is an order of magnitude bigger and would evict those on
-  // arrival. Keyed by granularity bucket ('15m'/'1h'/'3h') so this stays correct even if
-  // micPecGranularity and miwPecGranularity are set differently on the two installs.
-  const KLINE_LOG_KEY      = '__everwinter_kline_log_v1';
-  const KLINE_LOG_BYTE_CAP = 1.5 * 1024 * 1024;
   const afCritEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '🤑' : '💸') + s; }
     if (/^vm/.test(c))   return '🔊' + c.slice(2);
@@ -296,7 +293,7 @@
               <div class="tog-t" :class="cfg.ashfallEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashfallEnabled=!cfg.ashfallEnabled;persist()}"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l">Ashfall Mode</div>
-                <div class="ash-hint">Learns from historical market conditions and outcomes to adapt halt timing and entry behavior.</div>
+                <div class="ash-hint">Scores which end of each criterion's range is currently paying, and vetoes candidates sitting on the other end.</div>
               </div>
             </label>
             <div class="ash-tabs" style="margin-top:10px">

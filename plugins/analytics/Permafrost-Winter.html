@@ -1,41 +1,27 @@
 <!--
   Permafrost Strategy Plugin for PseudoWinter
-  Self-calibrating halt governor: replaces the fixed 12h drawdown-throttle /
-  gains-lock timers with a learned market-structure profile.
+  Scoring and cross-bot coordination layer for MultiIndicator-Winter. The climate
+  profile, structure/wave engine, PLK preemptive lock and adaptive halt timing this
+  file used to carry were all removed in v1.80.0 — halts run the host's own stock
+  timers again.
 
-  Every halt event records the market structure (gainer/loser skew + breadth)
-  at the moment it fired — drawdown events mark hostile climate, gains-lock
-  events mark favorable climate. Scan cycles add weaker PnL-labeled samples
-  between those anchors. While halted, structure is re-sampled on a slow
-  timer. Halts run the stock 12h horizon by default. Only a *strong* historical
-  bias (large |score| backed by enough evidence mass) changes that: it can hold
-  the halt past 12h up to a hard cap (24h — the extreme case) while structure
-  stays hostile, or "thaw" it early (as soon as 1h) once structure scores
-  favorably. Without a strong bias the lock is never lifted early — it just
-  serves its 12h. A thin profile falls back to the stock 12h timer too.
+  Extremity Scorer / Lukewarm Scoring: every criterion reading MIW annotates is
+  sampled into a rolling pool and sorted, per pole, into extreme vs lukewarm
+  against that pole's own observed spread. Closed trades score both a per-pole
+  dial (what MIW's blocking and co-qual ranking read) and a two-bucket Extreme vs
+  Lukewarm tally; whichever bucket is in higher net profit becomes the side the
+  entry veto targets, re-decided on every rebuild rather than toggled by hand.
 
-  PLK (preemptive lock, on by default): proactive rather than reactive — when
-  a routine structure check reads a climate that is historically bad (score at
-  or below the PLK trigger, with sufficient evidence), entries lock before any
-  PnL damage occurs. A PLK rides the drawdown gate so every entry choke point
-  respects it, and surfaces as a "PLK" countdown pill on the topbar (click to
-  lift manually). Its duration scales with the strength of the historical bias
-  up to the hard cap — an arbitrary span like 3h 20m — and it also lifts early
-  once structure clears the thaw score under a strong bias. A real drawdown/
-  gains-lock halt supersedes an active PLK. After a PLK ends, a dynamic cooldown
-  equal to that lock's own duration must pass before another can engage — no
-  back-to-back preemptive locks.
+  Cross bus: cascade/sacrifice triggers, drawdown-halt and gains-lock transitions
+  and Gains Continuation steps are broadcast to Ashfall and read back, so the
+  two sides can lift each other's halts (Mutual DDH Lift) or halt pre-emptively
+  on the partner's winning streak (GC).
 
-  Structure trajectory ("the wave"): a reading is judged in the context of what
-  preceded it, not in isolation. The recent path of the structure lean is tracked
-  and plotted in the accordion, and its direction folds into an inherent bull⇄bear
-  oscillation prior — so a mildly-bearish tape that is turning up reads negative
-  (don't short into the start of a pump). Learned history stays primary; the
-  inherent wave only takes the helm when the profile is thin.
+  Order Count Surveillance supplies the OC/volume/OI population samples that
+  MIW's ocs, ocx, va and ioa criteria are all measured against.
 
-  The profile is direction-agnostic: it only learns what realized PnL says
+  The scorer is direction-agnostic: it only learns what realized PnL says
   about this installation, so the same logic powers Ashfall on PseudoChaser.
-
   Load via Plugin Manager in PseudoWinter's config panel.
   Load AFTER EverWinter if using live trading — see README Plugin Stack Order.
   targetBot: pseudowinter
@@ -44,7 +30,8 @@
 (function () {
   'use strict';
 
-    const VERSION        = '1.80.0'; // Major cut-down: Wave tab removed entirely (sampling bars, Collective FIO, Liquidation Surveillance/Prospect Pre-Screening/PEC-VSG Universe Weighing, and the whole structure/wave halt-bias engine — _pfFetchStructure/pfStatus/pfWave/pfKlineBar and the gaussian kernel model, all dead weight with no real consumers left). OC Surveillance moved into the Score tab. Cross Broadcast is now always-on (toggle removed); Switchover removed. Extremity Scorer's criteria universe trimmed to fund/V-A/IO-A/OCS/OCX (regime, PEC/VSG, live-liq/0-liq/Past-1, liqturnover/liqquiet all retired). Lukewarm Targeting replaced by Lukewarm Scoring: two buckets (Extreme/Lukewarm) each headlined by aggregate $, with per-criterion pills nested inside — see pfLukewarmScoreboard/_pfExtremityHtml.
+    const VERSION        = '1.80.1'; // Fix: _pfScoreRead/_pfScoreTrim/_pfScoreWrite/_pfPartnerCounts were dropped from this file in the v1.80.0 cut-down while every call site kept calling them, so _pfExtremityBuild threw on every cycle and Permafrost never opened a position — restored, mirroring Ashfall's. Housekeeping: stale header/Mode-hint text corrected; dead KLINE_LOG_KEY/KLINE_LOG_BYTE_CAP consts dropped.
+    // v1.80.0 — Major cut-down: Wave tab removed entirely (sampling bars, Collective FIO, Liquidation Surveillance/Prospect Pre-Screening/PEC-VSG Universe Weighing, and the whole structure/wave halt-bias engine — _pfFetchStructure/pfStatus/pfWave/pfKlineBar and the gaussian kernel model, all dead weight with no real consumers left). OC Surveillance moved into the Score tab. Cross Broadcast is now always-on (toggle removed); Switchover removed. Extremity Scorer's criteria universe trimmed to fund/V-A/IO-A/OCS/OCX (regime, PEC/VSG, live-liq/0-liq/Past-1, liqturnover/liqquiet all retired). Lukewarm Targeting replaced by Lukewarm Scoring: two buckets (Extreme/Lukewarm) each headlined by aggregate $, with per-criterion pills nested inside — see pfLukewarmScoreboard/_pfExtremityHtml.
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -143,17 +130,6 @@
   // like EXTREMITY_KEY/CROSS_KEY), since the two sides' dial families are computed
   // independently and have no reason to pool. See _pfLoadDialPool/_pfSaveDialPool.
   const DIAL_POOL_KEY = '__ew_pf_dialpool_v1';
-  // Full-universe PEC/VSG candle log for Pre-Screening — same same-origin-localStorage
-  // sharing convention as EXTREMITY_KEY/CROSS_KEY (Ashfall and Permafrost both read/write this,
-  // so whichever fetches first each cycle saves the other one the trip), but deliberately
-  // its own key rather than the generic _sharedWrite registry: that registry is capped at
-  // SHARED_REGISTRY_BYTE_CAP (200KB, in PseudoChaser.html/PseudoWinter.html) sized for small
-  // recent-snapshot caches (bulkTickers, pec_1h_last, liqResults) — a real per-symbol candle
-  // history for the whole exchange is an order of magnitude bigger and would evict those on
-  // arrival. Keyed by granularity bucket ('15m'/'1h'/'3h') so this stays correct even if
-  // micPecGranularity and miwPecGranularity are set differently on the two installs.
-  const KLINE_LOG_KEY      = '__everwinter_kline_log_v1';
-  const KLINE_LOG_BYTE_CAP = 1.5 * 1024 * 1024;
   const pfCritEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '💸' : '🤑') + s; }
     if (/^vm/.test(c))   return '🔊' + c.slice(2);
@@ -317,7 +293,7 @@
               <div class="tog-t" :class="cfg.permafrostEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.permafrostEnabled=!cfg.permafrostEnabled;persist()}"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l">Permafrost Mode</div>
-                <div class="pfr-hint">Learns from historical market conditions and outcomes to adapt halt timing and entry behavior.</div>
+                <div class="pfr-hint">Scores which end of each criterion's range is currently paying, and vetoes candidates sitting on the other end.</div>
               </div>
             </label>
             <div class="pfr-tabs" style="margin-top:10px">
@@ -745,6 +721,82 @@
           } catch(e) {}
         },
 
+        _pfScoreRead() {
+          try {
+            const raw = localStorage.getItem(EXTREMITY_KEY);
+            if (!raw) return [];
+            const cut = Date.now() - SCORE_SAFETY_TTL;
+            return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
+          } catch(e) { return []; }
+        },
+        _pfScoreTrim() {
+          try {
+            const records   = this._pfScoreRead();
+            const quota     = this.cfg.pfSpongeQuota;
+            const staleDays = this.cfg.pfStaleSlotDays;
+            const staleMs   = staleDays * 24 * 3600 * 1000;
+            const now       = Date.now();
+            // +fund/-fund are NOT legacy — Blind-Entry and Liquid-Diver actively write them as
+            // their primary criteria tags. Only the genuinely dead pre-tiered criteria purge here.
+            const LEGACY    = new Set(['>10pct','<10pct','lsa','lba','rasl','rabl']);
+            const isLegacy  = r => r.criteria.some(c => LEGACY.has(c));
+            const bySlot = {};
+            for (const r of records) {
+              if (isLegacy(r)) continue;
+              const k = collapseKey(r.criteria);
+              if (!bySlot[k]) bySlot[k] = [];
+              bySlot[k].push(r);
+            }
+            const trimmed = [];
+            for (const recs of Object.values(bySlot)) {
+              recs.sort((a, b) => b.ts - a.ts);
+              const kept = recs.slice(0, quota);
+              if (!kept.length) continue;
+              if (now - kept[0].ts < staleMs) trimmed.push(...kept);
+            }
+            const GLOBAL_CAP = 5000;
+            const capped = trimmed.sort((a, b) => b.ts - a.ts).slice(0, GLOBAL_CAP);
+            // Per-slot quota + GLOBAL_CAP bound the record *count*, but with enough
+            // distinct auto-generated slot buckets the total byte size can still run
+            // large — apply the same atomized byte cap as a final safety net, oldest first.
+            const byteCapped = trimToByteCap([...capped].reverse()).reverse();
+            localStorage.setItem(EXTREMITY_KEY, JSON.stringify(byteCapped));
+          } catch(e) {}
+        },
+        _pfScoreWrite(criteria, pnl, hist = false) {
+          try {
+            const records = this._pfScoreRead();
+            const rec = { ts: Date.now(), criteria, pnl, source: 'winter' };
+            if (hist) rec.hist = true;
+            records.push(rec);
+            const quota = this.cfg.pfSpongeQuota;
+            const bySlot = {};
+            for (const r of records) {
+              const k = collapseKey(r.criteria);
+              if (!bySlot[k]) bySlot[k] = [];
+              bySlot[k].push(r);
+            }
+            const trimmed = [];
+            for (const recs of Object.values(bySlot)) {
+              recs.sort((a, b) => b.ts - a.ts);
+              trimmed.push(...recs.slice(0, quota));
+            }
+            const byteCapped = trimToByteCap([...trimmed].reverse()).reverse();
+            localStorage.setItem(EXTREMITY_KEY, JSON.stringify(byteCapped));
+            return byteCapped;
+          } catch(e) { return null; }
+        },
+        // Gates whether a partner-sourced record's PnL is allowed to move a criterion's score,
+        // per cfg.pfPartnerScoreMode. pnl here is the partner's own realized pnl (positive =
+        // partner won that trade) — not the inverted effectivePnl used downstream. Own-sourced
+        // records are never gated; this only concerns the seesaw between own and partner.
+        _pfPartnerCounts(pnl) {
+          const mode = this.cfg.pfPartnerScoreMode || 'wins';
+          if (mode === 'both') return true;
+          if (mode === 'losses') return pnl < 0;
+          return pnl > 0; // 'wins' (default)
+        },
+
         // Feeds the Extremity Scorer's cutoff computation. Called from every criterion
         // annotation — scan-time pool building, live liq messages, Extremity Re-Evaluation —
         // NOT gated behind a close or even an actual entry. This is deliberate: a dial's
@@ -759,7 +811,7 @@
           const m = tag.match(/(-?\d+)$/);
           if (!m) return; // bare Blind-Entry/Liquid-Diver tags (+fund/-fund/+ocs/-ocs) carry no
                            // magnitude — they always classify extreme regardless (see
-                           // _pfExtremityBuild/_afExtremityVeto), nothing to prove here.
+                           // _pfExtremityBuild/_pfExtremityVeto), nothing to prove here.
           const dk = info.family + '|' + info.pole;
           const pool = (this.pfDialSamplePool ||= this._pfLoadDialPool());
           const arr = (pool[dk] ||= []);
