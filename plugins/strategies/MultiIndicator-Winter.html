@@ -1,74 +1,35 @@
 <!--
   Multi-Indicator Strategy Plugin for PseudoWinter
-  Slot-based entry filter built around liquidation presence as the primary, mandatory signal,
-  with fund rate, PEC, population-relative volume/OI, candle, and order-flow criteria layered on as secondary
-  confirmation. Liquidation Presence (miwLiqPresenceModes: any combination of '1' / '0' /
-  'past1') selects which of three paths a slot can run under:
-    '1'     (Live)   — every slot anchors on exactly one of sliq/bliq/msliq/mbliq, a real
-      criterion evaluated the instant a liquidation message crosses the depth threshold
-      mid-cycle (see _miwOnLiqMessage, registered via Permafrost's registerLiqMessageHook).
-      These never resolve from a closed cycle — the data is too temporal to be meaningful an
-      hour later — so they no longer appear in the scan-time criteria checker at all.
-    '0'     (0-Liq)  — every slot anchors on the 0liq criterion, a real criterion confirmable
-      only once a ticker's surveillance cycle closes clean, checked against the full retained
-      window of Permafrost's closed liq cycles (_liqCycleHistory, up to miwLiqLookbackCycles of
-      them) — a ticker only reads 0-Liq if every cycle it appeared in within that window came
-      back clean. See _miwLiqZeroAcrossWindow.
-    'past1' (Past-1) — NOT a criterion. A Past-1 slot has no liquidation criterion in it at all;
-      it's built entirely from secondary criteria. Every closed cycle sorts each ticker into
-      exactly one of three buckets, independent of sell/buy dominance: liq+ (some side's raw
-      turnover cleared its own historical average, i.e. would have fired live), 0-liq (no
-      liquidation at all this cycle, across the full retained window), or liq- (real liquidation
-      happened, but neither side's turnover cleared its average — too weak to have fired live).
-      Past-1 slots match liq- tickers. See _miwPast1FreshSymbols, sourced from the same
-      closed-batch pool (_miwPecPool, populated by registerLiqCloseHook) that feeds PEC. The
-      ticker-pool restriction *is* the anchor; there's nothing to tag in the slot or the
-      scorecard. A manually-built slot with no liquidation criterion is only valid while 'past1'
-      is an active mode — otherwise it's the same mistake it always was (see the anchorless-slot
-      warning at startup).
+  Slot-based entry filter. A slot (Auto-generated or manually built) qualifies once a ticker
+  exhibits at least miwAutoSlotSize (Auto) or all of its own criteria (manual) from the
+  secondary criteria set: fund, V/A, IO/A, OCS, OCX. No criterion is mandatory — this was
+  liquidation-anchored in earlier versions (every slot required a real-time liquidation
+  criterion), but that was an addition along the way, not the original design; v1.80.0 (see
+  /versioning) removed liquidation, PEC, VSG, and Regime from the bot entirely, along with the
+  live-message entry path, the closed-batch liq/Past-1 reads, and PEC/VSG's own kline-fetch
+  pipeline.
 
-  This is why "every slot must have exactly one liquidation criterion" is no longer quite true:
-  '1'/'0' slots do; 'past1' slots deliberately don't. See _miwSlotLiqAnchor (returns the
-  criterion or null) and _miwAutoQualify (the null-anchor case is the Past-1 match).
+  Slot Blocking (miwSlotBlockEnabled) is a per-criterion loss circuit breaker: if a criterion's
+  collapsed scorecard score (own + partner, see miwCollapsedSlotRanks) drops beyond
+  miwSlotBlockPct% of base margin in loss, new entries carrying that criterion are blocked —
+  continuously re-checked, no manual clear needed. miwSlotBlockTags opts individual secondary
+  criteria into this (see the Blockable Criteria picker) — nothing is blockable by default.
 
-  Slot Blocking (miwSlotBlockEnabled) is a per-criterion loss circuit breaker: if a liq-anchor
-  type's collapsed scorecard score (own + partner, see miwCollapsedSlotRanks) drops
-  beyond miwSlotBlockPct% of base margin in loss, new entries carrying that type are blocked —
-  continuously re-checked, no manual clear needed. Only applies to '1'/'0' slots (sliq/bliq/
-  msliq/mbliq/0liq are real, blockable anchors) — Past-1 slots have no anchor to block on, so
-  they're only ever blockable via miwSlotBlockTags below. miwSlotBlockTags extends the same check to the entry's own PEC and
-  VSG tags only — fund and the other secondary criteria are too
-  generalized to include here, since blocking on them tends to block nearly every entry off one
-  bad stretch. Standalone toggle, independent of Liquidation Presence mode.
+  Auto Slots evaluates every non-excluded secondary criterion against each ticker and keeps
+  every one that's true — not sliced down to a fixed count. Manual slots keep the existing
+  criteria picker, an exact AND-gate of whatever's selected.
 
-  Secondary criteria (fund, PEC 6h/12h/24h, V/A, VSG 6h/12h/24h, Regime, IO/A, OCS, OCX) combine with
-  the liq anchor via the same AND-gate slot logic as before. On the live path, anything not
-  fetched fresh this cycle (PEC/VSG, OC) is fetched synchronously for just the triggering
-  symbol before the slot match is judged — see _miwOnLiqMessage. va/ioa need no fetch at all —
-  the per-ticker value is already on the live ticker payload.
-
-  Auto Slots always includes the liq anchor as one of the combo's criteria; at size 1 every
-  generated slot is bare liquidation with no secondary confirmation. The live depth threshold
-  used by Auto Slots (miwLiveDepthThreshold) is now a FLOOR, not the sole cutoff — the actual
-  entry gate is the greater of that floor and Permafrost's own sample-derived extreme-high read
-  on market-wide liquidation turnover (see _miwLiqHighCutoff/_miwLiqLowCutoff, _miwOnLiqClose).
-  Manual slots keep granular per-slot/per-type depth via the existing criteria picker,
-  bypassing this entirely.
-
-  Substitution now considers any held position in the book, not just MIW's own, same as
-  Liquid-Diver did. The removed path-A guard no longer shields 0-liq positions from
-  live substitutions. The swap itself remains score-gated, not a
-  blanket "depth cleared is enough" — one liq type scoring better than another still matters.
+  Substitution considers any held position in the book, not just MIW's own, same as
+  Liquid-Diver did — score-gated, not automatic.
 
   Re-entry Block Mode (miwReentryBlockMode: 'both' / 'losers') is ported from Liquid-Diver:
   'losers' lets a symbol that just closed in profit re-trigger immediately.
 
   Entry pool fires once per fresh bulk ticker fetch (_lastAllTickersAt) — will not re-scan
   the same cached snapshot twice. TP, SL, and all exit logic use the host's settings.
-  Drawdown throttle and gains lock gate all entries (including the live liq path).
+  Drawdown throttle and gains lock gate all entries.
 
-  Load via Plugin Manager in PseudoWinter's config panel. Requires Permafrost (Liq
-  Surveillance on) — liquidation is no longer optional data, it's the entry gate itself.
+  Load via Plugin Manager in PseudoWinter's config panel.
   Load AFTER EverWinter if using live trading — see README Plugin Stack Order.
   targetBot: pseudowinter
 -->
@@ -76,27 +37,18 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.77.2'; // Dead Switch cooldown: now requires a full idle duration from its own last trigger before it can fire again, fixing back-to-back trips when halt duration < idle duration
-  // Every default slot anchors on a live liq criterion, matching the default Liquidation
-  // Presence modes (default ['1'] — live only). Enabling 0/Past-1 won't retroactively populate
-  // 0liq-anchored presets; users building 0-Liq slots do so manually.
-  // rasl/rabl (low-vol confirmation) retired in favor of VSG's vsgut (Under-Traded) — see VSG.md.
-  const DEFAULT_SLOTS = [['sliq','fund>1','vsgut'],['bliq','va<10','vsgut'],['msliq','fund<-1','vsgut'],['mbliq','fund>1','vsgut'],['sliq','va>10','vsgut'],['bliq','fund<-1','vsgut']];
+    const VERSION       = '1.80.0'; // Major cut-down (see /versioning): liquidation is no longer the mandatory per-slot anchor — PEC/VSG shape-matching, the live liq-message entry path, closed-batch liq/regime/Past-1 reads, and the whole liq-anchor concept are gone. Slots (Auto or manual) now qualify on any N of the 5 remaining secondary criteria alone: fund, V/A, IO/A, OCS, OCX.
+  const DEFAULT_SLOTS = [];
   const MIW_HIST_KEY  = '__miw_hist_batches';
-  const LIQ_TYPES     = ['sliq', 'bliq', 'msliq', 'mbliq'];
-  // Sentinel for 0-liq's lukewarm reading (Past-1/liq- — real liquidation, never crossed the
-  // live threshold). Same literal string Permafrost's Extremity Scorer checks for in
-  // _pfExtremityVeto — independently defined here since the two plugins don't share a JS scope.
-  const LIQ_LUKEWARM  = '0liq~lukewarm';
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
   // Auto picker, and the Blockable Criteria picker, so all three stay in sync by construction.
-  const SECONDARY_CRITS = ['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','pecirr','va','vsgot','vsgut','vsgalpha','vsgdelta','vsgmomup','vsgmomdn','vsgirr','regimebull','regimebear','liqturnover','liqquiet','ioa','ocs','ocx'];
+  const SECONDARY_CRITS = ['fund','va','ioa','ocs','ocx'];
   // Pre-existing "Include Sign Tags" behavior, preserved as the default selection now that the
   // set is configurable — fund is deliberately NOT included by default (see _miwIsEntryBlocked),
   // matching the old hardcoded behavior exactly. Opt fund in manually via the picker.
   // va/ioa are blockable by default (unlike the vm/iot/iom they replace, which never were) —
   // population-relative criteria are a much cleaner signal than the old own-ratio ones.
-  const DEFAULT_BLOCKABLE_CRITS = ['vsgot','vsgut','vsgalpha','vsgdelta','vsgmomup','vsgmomdn','vsgirr','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','pecirr','va','ioa','ocs','ocx','regimebull','regimebear','liqturnover','liqquiet'];
+  const DEFAULT_BLOCKABLE_CRITS = ['va','ioa','ocs','ocx'];
 
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
@@ -105,12 +57,9 @@
   const DEFAULT_MEGACAP_EXCLUDE = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','ADAUSDT','TRXUSDT','LINKUSDT'];
   // Single source of truth for MIW's own scalar config defaults. Merged into cfg once during
   // init() (see below) — call sites read this.cfg.<key> directly, no inline `?? literal`.
-  // Excludes: megacapExclude/miwSlots/miwSlotBlockCriteria/miwLiqPresenceModes (arrays with their
-  // own migration logic in init()), and any key actually owned by the Permafrost sibling plugin
-  // (those keep their defensive `?? literal` at the cross-read call site since Permafrost owns
-  // their default). miwReentryBlockMode canonically defaults to 'both'; miwSubstitutionProtectWinners
-  // to false — both previously had a conflicting stray `?? literal` at a usage site that disagreed
-  // with the actual persisted default, now resolved to one value.
+  // Excludes: megacapExclude/miwSlots/miwSlotBlockCriteria (arrays with their own migration
+  // logic in init()), and any key actually owned by the Permafrost sibling plugin (those keep
+  // their defensive `?? literal` at the cross-read call site since Permafrost owns their default).
   const MIW_DEFAULT_CFG = Object.freeze({
     miwEnabled: true,
     miwPicks: 5,
@@ -121,114 +70,36 @@
     miwCascadeEnabled: true,
     miwCascadePct: 25,
     miwSacrificeEnabled: true,
-    miwRollingSacrificeEnabled: true,
     miwSacrificePct: 25,
-    miwKlineVolMin: 25,
-    miwKlineScanCap: 20,
-    miwHalvingEnabled: true,
-    miwHalvingHours: 0.5,
     miwSubstitutionEnabled: true,
     miwSubstitutionMarginPct: 5,
     miwSubstitutionMinAgeMins: 10,
-    miwSubstitutionProtectWinners: false,
-    miwLiqLookbackCycles: 25,
     miwSlotBlockEnabled: true,
     miwSlotBlockPct: 25,
     miwSlotBlockTags: false,
-    miwLiveDepthThreshold: 1,
-    // Dead Switch: with per-criterion Slot Blocking now able to block on any single
-    // underperforming sub-tag rather than needing a whole pooled family bad at once (see
-    // _miwIsCritBlocked), enough criteria can go stale/blocked together to leave the bot
-    // producing no new entries at all for a while — a "dead period" rather than a bad trade.
-    // Off by default since it fires the SAME drawdown halt Drawdown Throttle uses
-    // (_drawdownHaltUntil, cfg.drawdownHaltHours) purely off idle time, with no PnL signal
-    // behind it — an intentionally quiet market during this window shouldn't halt on its own.
     miwDeadSwitchEnabled: false,
     miwDeadSwitchHours: 1,
     miwReentryBlockMode: 'both',
-    miwBlockableCritsMigrated: true,
-    miwLiqCritsMigrated: true,
     miwAutoSlots: true,
     miwAutoSlotSize: 3,
     miwAutoSlotExclude: [],
     miwForceGeneralCriteria: true,
     miwFundStep: 0.25,
     miwVaStep: 1,
-    miwSpikeStep: 1,
     miwIoaStep: 1,
     miwOcsStep: 1,
     miwOcxStep: 1,
-    miwVmStep: 1,
-    miwPecThresholdHigh: 70,
-    miwPecThresholdLow: 30,
-    miwPecIrrThreshold: 60,
-    miwPecGranularity: '1h',
-    miwPecDepthStep: 5,
-    miwPecFreshCycles: 4,
-    miwPecScanCap: 20,
-    miwVsgThresholdHigh: 70,
-    miwVsgThresholdLow: 30,
-    miwVsgIrrThreshold: 60,
-    miwVsgDepthStep: 5,
   });
-
-  // Same formula as Permafrost's calcDepth: % deviation of this side's liquidated $ from the
-  // average liquidation size recorded across all history. Depth +1 means 1% above average.
-  const calcLiveDepth = (raw, avg) => avg > 0 ? Math.trunc(((raw / avg) - 1) * 100) : 0;
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
   // +fund = longs paying = good carry for shorts (🤑), bad for longs (💸).
   // -fund = shorts paying = bad for shorts (💸), good for longs (🤑).
-  const CRIT_EMOJI = { 'pecob': '⬆️', 'pecos': '⬇️', 'pecalpha': '⤵️', 'pecdelta': '⤴️', 'pecmomup': '↗️', 'pecmomdn': '↘️', 'pecirr': '🔄', 'vsgot': '⏫', 'vsgut': '⏬', 'vsgalpha': '🔼', 'vsgdelta': '🔽', 'vsgmomup': '⏩', 'vsgmomdn': '⏪', 'vsgirr': '🔀', 'fund': '💰', 'va': '🔊', 'vm': '🔊', 'sliq': '🥵', 'bliq': '🥶', 'msliq': '💦', 'mbliq': '🧊', '0liq': '⚫', 'ioa': '🎲', 'iot': '🎲', 'iom': '🧲', 'ocs': '🔭', 'ocx': '📡', 'regimebull': '🐂', 'regimebear': '🐻', 'liqturnover': '🌊', 'liqquiet': '🤫' };
-  // Permafrost's Extremity Scorer (v1.70.1+) scores PEC and VSG as one aggregate dial each —
-  // 'pec+'/'pec-' and 'vsg+'/'vsg-' in micCollapsedSlotRanks — rather than one dial per
-  // boolean shape sub-tag (pecob/pecalpha/pecmomup/... each used to get their own entry).
-  // _miwCritScore/_miwScaledRank/_miwIsCritBlocked below all key off micCollapsedSlotRanks
-  // directly, so any raw PEC/VSG sub-tag needs translating to its aggregate key before a
-  // ranks lookup, or Prospect Pre-Screening/Co-Qualifying Penalty/Slot Blocking would look
-  // up a key that no longer exists and silently read every PEC/VSG criterion as zero.
-  const PEC_VSG_AGGREGATE = {
-    pecob: 'pec+', pecos: 'pec-', pecalpha: 'pec+', pecdelta: 'pec-', pecmomup: 'pec+', pecmomdn: 'pec-',
-    vsgot: 'vsg+', vsgut: 'vsg-', vsgalpha: 'vsg+', vsgdelta: 'vsg-', vsgmomup: 'vsg+', vsgmomdn: 'vsg-',
-  };
-  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', 'pecob': 'PEC Overbought (6h, 12h and 24h all above high threshold)', 'pecos': 'PEC Oversold (6h, 12h and 24h all below low threshold)', 'pecalpha': 'PEC Red Mountain (12h more bullish than both 6h and 24h)', 'pecdelta': 'PEC Green Delta (12h more bearish than both 6h and 24h)', 'pecmomup': 'PEC Bullish Momentum (6h > 12h > 24h — trended up all day)', 'pecmomdn': 'PEC Bearish Momentum (6h < 12h < 24h — trended down all day)', 'pecirr': 'PEC Irregular (price efficiency below threshold — spikey/choppy, not directional)', 'va': 'V/A (volume vs. population sample-window average)', 'vm': 'V/M (vol/mcap ratio) — retired, replaced by V/A', 'vsgot': 'VSG Over-Traded (6h, 12h and 24h volume-shape all above high threshold)', 'vsgut': 'VSG Under-Traded (6h, 12h and 24h volume-shape all below low threshold)', 'vsgalpha': 'VSG Volume Mountain (12h volume-shape higher than both 6h and 24h)', 'vsgdelta': 'VSG Volume Trough (12h volume-shape lower than both 6h and 24h)', 'vsgmomup': 'VSG Building Momentum (6h > 12h > 24h — volume building all day)', 'vsgmomdn': 'VSG Fading Momentum (6h < 12h < 24h — volume fading all day)', 'vsgirr': 'VSG Irregular (volume efficiency below threshold — spikey/choppy, not directional)', 'lsa': 'LSA (1h sell spike) — retired, replaced by VSG', 'lba': 'LBA (1h buy spike) — retired, replaced by VSG', 'rasl': 'R-ASL (1h low-vol red) — retired, replaced by VSG', 'rabl': 'R-ABL (1h low-vol green) — retired, replaced by VSG', 'sliq': 'S-Liq (Sell-Liquidation: sell side ≥70% dominant)', 'bliq': 'B-Liq (Buy-Liquidation: buy side ≥70% dominant)', 'msliq': 'mS-Liq (Mixed Sell-Liq: sell majority, buy ≥30%)', 'mbliq': 'mB-Liq (Mixed Buy-Liq: buy majority, sell ≥30%)', '0liq': '0-Liq (no liquidation at all this cycle)', 'ioa': 'IO/A (open interest vs. population sample-window average)', 'iot': 'IO/T (OI vs Turnover) — retired, replaced by IO/A', 'iom': 'IO/M (OI vs MCap) — retired, replaced by IO/A', 'ocs': 'OCS (buy/sell skew %)', 'ocx': 'OCX (% faster/slower than the full-window avg order interval)', 'regimebull': 'Regime Bull (positive liquidation skew)', 'regimebear': 'Regime Bear (negative liquidation skew)', 'liqturnover': 'Liq Turnover (this ticker’s liquidation depth at a sample-derived extreme, high or low)', 'liqquiet': 'Liq Quiet (market-wide 0-liq batch share at a sample-derived extreme, high or low)' };
-  // PEC (Price Effect Coefficient): replaces the old raw +24h/-24h ticker-field boolean. For each
-  // of 6h/12h/24h, builds a composite candle from cached klines at cfg.miwPecGranularity and scores
-  // (Close-Open)/(High-Low) onto a 0-100 scale (50=neutral). Six criteria, all derived from the
-  // resulting I_6h/I_12h/I_24h triple:
-  //   pecob    — Confluent Overbought: I_6h, I_12h, and I_24h all above miwPecThresholdHigh.
-  //   pecos    — Confluent Oversold: I_6h, I_12h, and I_24h all below miwPecThresholdLow.
-  //   pecalpha — Red Mountain: I_12h higher than both I_6h and I_24h (a peak on the middle timeframe).
-  //   pecdelta — Green Delta: I_12h lower than both I_6h and I_24h (a trough on the middle timeframe).
-  //   pecmomup — Bullish Momentum: I_6h > I_12h > I_24h, a pure upward tilt across the whole day.
-  //   pecmomdn — Bearish Momentum: I_6h < I_12h < I_24h, a pure downward tilt across the whole day.
-  // (The Bullish/Bearish Reversion pair that used to sit here was retired as redundant with
-  // Red Mountain/Green Delta.) pecalpha/pecdelta/pecmomup/pecmomdn only compare the three
-  // readings to each other, not to any threshold. Only pecob/pecos gate on
-  // High/Low. Every criterion is also tiered with a depth score (miwPecDepthStep) reflecting how
-  // strongly it's expressed — a clean distance-past-threshold measure for pecob/pecos/momentum,
-  // a looser divergence-intensity proxy for Reversion/Mountain/Delta. Only ever
-  // computed for tickers whose liq surveillance batch just closed (see _miwOnLiqClose /
-  // _miwPecPool) and are still within miwPecFreshCycles — the same
-  // universe every liq anchor already requires, so this adds no new fetch scope, just reuses it.
-  // BOC/SOC (raw buy/sell fill counts requiring 24h surveillance runway) were considered but scrapped:
-  // a 24h watch period only tells you counts at the end of the period, not a meaningful trend, and
-  // hardware restarts every ~6h make a reliable 24h runway impractical on this device.
-
-  // VSG (Volume Shape Graph): replaces the old LSA/LBA/R-ASL/R-ABL 1h-vs-24h-avg spike family
-  // (see VSG.md). PEC's math applied to volume instead of price — same 6h/12h/24h composite
-  // windows, riding PEC's own cache (each cached sub-candle now also carries its volume), so this
-  // adds no new fetch path at all; it retires one (_miwPrefetchKlines' criteria-scan call site).
-  //   vsgot    — Over-Traded: VI_6h, VI_12h, and VI_24h all above miwVsgThresholdHigh.
-  //   vsgut    — Under-Traded: VI_6h, VI_12h, and VI_24h all below miwVsgThresholdLow.
-  //   vsgalpha — Volume Mountain: VI_12h higher than both VI_6h and VI_24h (a burst that crested).
-  //   vsgdelta — Volume Trough: VI_12h lower than both VI_6h and VI_24h (a lull, picking back up).
-  //   vsgmomup — Building Momentum: VI_6h > VI_12h > VI_24h, loudest right now.
-  //   vsgmomdn — Fading Momentum: VI_6h < VI_12h < VI_24h, quietest right now.
-  // Unlike LSA/LBA/R-ASL/R-ABL, VSG makes no directional claim at all — candle color was always a
-  // proxy for order flow, not a measurement of it; sliq/bliq/ocs already measure that directly.
-  // Depth-tiered via miwVsgDepthStep exactly like PEC. Same liq-fresh scope as PEC (deliberate —
-  // see VSG.md's Open Question, decided in favor of the narrow pool).
+  const CRIT_EMOJI = { 'fund': '💰', 'va': '🔊', 'vm': '🔊', 'ioa': '🎲', 'iot': '🎲', 'iom': '🧲', 'ocs': '🔭', 'ocx': '📡' };
+  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', 'va': 'V/A (volume vs. population sample-window average)', 'vm': 'V/M (vol/mcap ratio) — retired, replaced by V/A', 'ioa': 'IO/A (open interest vs. population sample-window average)', 'iot': 'IO/T (OI vs Turnover) — retired, replaced by IO/A', 'iom': 'IO/M (OI vs MCap) — retired, replaced by IO/A', 'ocs': 'OCS (buy/sell skew %)', 'ocx': 'OCX (% faster/slower than the full-window avg order interval)' };
+  // PEC, VSG, liquidation anchors (S-Liq/B-Liq/mS-Liq/mB-Liq/0-Liq/Past-1), and Regime were all
+  // retired in v1.80.0 (see /versioning) — liquidation is no longer fetched or required at all,
+  // and PEC/VSG's kline-shape-matching pipeline went with it. Slots now qualify on any N of the
+  // 5 remaining secondary criteria (fund, V/A, IO/A, OCS, OCX) alone — see _miwAutoQualify.
 
   const critEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const num = parseFloat(s.replace(/^[<>]/,'')); return (num < 0 ? '💸' : '🤑') + s; }
@@ -380,23 +251,23 @@
 
                   <!-- Auto slots controls -->
                   <div x-show="cfg.miwAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(96,210,255,.04);border:1px solid rgba(96,210,255,.12);border-radius:3px">
-                    <div class="lbl">Minimum Criteria per Slot <b x-text="cfg.miwAutoSlotSize"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.miwAutoSlotSize;const excl=new Set(cfg.miwAutoSlotExclude||[]);const secTotal=['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','pecirr','va','vsgot','vsgut','vsgalpha','vsgdelta','vsgmomup','vsgmomdn','vsgirr','regimebull','regimebear','liqturnover','liqquiet','ioa','ocs','ocx'].filter(c=>!excl.has(c)).length;return 'qualifies on the anchor + at least '+Math.max(0,n-1)+' of '+secTotal+' secondary criteria — every one true gets scored, not capped at this minimum.'})()"></span></div>
+                    <div class="lbl">Minimum Criteria per Slot <b x-text="cfg.miwAutoSlotSize"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.miwAutoSlotSize;const excl=new Set(cfg.miwAutoSlotExclude||[]);const secTotal=['fund','va','ioa','ocs','ocx'].filter(c=>!excl.has(c)).length;return 'qualifies on any '+n+' of '+secTotal+' secondary criteria — every one true gets scored, not capped at this minimum.'})()"></span></div>
                     <input type="range" min="1" max="5" step="1" x-model.number="cfg.miwAutoSlotSize" @change="persist()">
                     <div class="lbl" style="margin-top:5px;margin-bottom:3px">Exclude from Auto</div>
                     <div class="crit-pick" style="display:flex;flex-wrap:wrap;gap:3px">
-                      <template x-for="c in ['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','pecirr','va','vsgot','vsgut','vsgalpha','vsgdelta','vsgmomup','vsgmomdn','vsgirr','regimebull','regimebear','liqturnover','liqquiet','sliq','bliq','msliq','mbliq','0liq','ioa','ocs','ocx']" :key="c">
+                      <template x-for="c in ['fund','va','ioa','ocs','ocx']" :key="c">
                         <button @click.prevent="if(!cfgLocked){ const ex=(cfg.miwAutoSlotExclude||[]).slice(); const i=ex.indexOf(c); if(i>=0) ex.splice(i,1); else ex.push(c); cfg.miwAutoSlotExclude=ex; persist(); }"
                                 :style="'font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;cursor:pointer;border:1px solid;' + ((cfg.miwAutoSlotExclude||[]).includes(c) ? 'border-color:rgba(255,80,80,.5);background:rgba(255,80,80,.15);color:rgba(255,80,80,.8)' : 'border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)')"
-                                x-text="c.replace('fund','Fund').replace('va','V/A').replace('sliq','S-Liq').replace('bliq','B-Liq').replace('0liq','0-Liq').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')">
+                                x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')">
                         </button>
                       </template>
                     </div>
-                    <div class="miw-hint" style="margin-top:4px">Excluded criteria are dropped from auto combos and scoring; tiered criteria (Fund, V/A, IO/A, OCS, OCX) score per tier, not per slot.</div>
+                    <div class="miw-hint" style="margin-top:4px">Excluded criteria are dropped from auto combos and scoring; every criterion scores per tier, not per slot.</div>
                     <label class="tog" style="margin-top:8px">
                       <div class="tog-t" :class="cfg.miwForceGeneralCriteria?'on':''" @click.prevent="if(!cfgLocked){cfg.miwForceGeneralCriteria=!cfg.miwForceGeneralCriteria;persist()}"><div class="tog-k"></div></div>
                       <div>
                         <div class="tog-l">Force-Evaluate General Criteria</div>
-                        <div class="miw-hint">Forces a fresh per-symbol check of Fund/PEC/VSG/OCS/OCX before each entry, appending newly-true ones — a few extra requests per open. V/A and IO/A read directly from ticker/population data.</div>
+                        <div class="miw-hint">Forces a fresh per-symbol check of Fund/OCS/OCX before each entry, appending newly-true ones — a few extra requests per open. V/A and IO/A read directly from ticker/population data.</div>
                       </div>
                     </label>
                   </div>
@@ -407,46 +278,28 @@
 
                     <!-- Criteria picker — visible when a slot is selected -->
                     <div x-show="cfg.miwActiveSlot !== null && cfg.miwActiveSlot !== undefined && cfg.miwActiveSlot < (cfg.miwSlots||[]).length"
-                         x-data="{ liqFocus: null, liqDir: '>', liqVal: 1, ratioFocus: null, ratioDir: '>', ratioTier: 5, gateFocus: null, gateDir: '>', gateTier: 1, ocFocus: null, ocDir: '>', ocVal: 100 }"
-                         @click.outside="liqFocus = null; ratioFocus = null; gateFocus = null; ocFocus = null"
+                         x-data="{ ratioFocus: null, ratioDir: '>', ratioTier: 5, gateFocus: null, gateDir: '>', gateTier: 1, ocFocus: null, ocDir: '>', ocVal: 100 }"
+                         @click.outside="ratioFocus = null; gateFocus = null; ocFocus = null"
                          style="display:flex;gap:3px;flex-wrap:wrap;align-items:center;margin-bottom:7px;padding:6px 7px;background:rgba(255,255,255,.04);border-radius:3px;border:1px solid rgba(255,255,255,.08)">
                       <span style="font-size:9px;color:var(--text-lo);margin-right:2px">Slot <span x-text="(cfg.miwActiveSlot)+1"></span>:</span>
-                      <template x-for="c in ['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','pecirr','va','vsgot','vsgut','vsgalpha','vsgdelta','vsgmomup','vsgmomdn','vsgirr','regimebull','regimebear','liqturnover','liqquiet','sliq','bliq','msliq','mbliq','0liq','ioa','ocs','ocx']" :key="c">
+                      <template x-for="c in ['fund','va','ioa','ocs','ocx']" :key="c">
                         <button class="miw-opt"
                           @click.prevent="if(!cfgLocked){
-                            if(c==='sliq'||c==='bliq'||c==='msliq'||c==='mbliq'){
-                              liqFocus=(liqFocus===c?null:c); ratioFocus=null; gateFocus=null; ocFocus=null;
-                              if(liqFocus){ const ex=(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:m?sliq|m?bliq)([<>])([+-]?\d+)$/); if(m){liqDir=m[1];liqVal=parseInt(m[2],10)} } }
-                            } else if(c==='ioa'){
-                              ratioFocus=(ratioFocus===c?null:c); liqFocus=null; gateFocus=null; ocFocus=null;
+                            if(c==='ioa'){
+                              ratioFocus=(ratioFocus===c?null:c); gateFocus=null; ocFocus=null;
                               if(ratioFocus){ const ex=(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^ioa([<>])(-?\d+)$/); if(m){ratioDir=m[1];ratioTier=parseInt(m[2],10)} } }
                             } else if(c==='fund'||c==='va'){
-                              gateFocus=(gateFocus===c?null:c); liqFocus=null; ratioFocus=null; ocFocus=null;
+                              gateFocus=(gateFocus===c?null:c); ratioFocus=null; ocFocus=null;
                               if(gateFocus){ const ex=(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:fund|va)([<>])(-?\d+)$/); if(m){gateDir=m[1];gateTier=parseInt(m[2],10)} } else { gateDir='>'; gateTier=c==='fund'?1:c==='va'?10:25; } }
                             } else if(c==='ocs'||c==='ocx'){
-                              ocFocus=(ocFocus===c?null:c); liqFocus=null; ratioFocus=null; gateFocus=null;
+                              ocFocus=(ocFocus===c?null:c); ratioFocus=null; gateFocus=null;
                               if(ocFocus){ const ex=(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:ocs|ocx)([<>])(-?\d+)$/); if(m){ocDir=m[1];ocVal=parseInt(m[2],10)} } else { ocDir='>'; ocVal=c==='ocs'?60:1; } }
-                            } else { liqFocus=null; ratioFocus=null; gateFocus=null; ocFocus=null; _miwToggle(cfg.miwActiveSlot, c) }
+                            } else { ratioFocus=null; gateFocus=null; ocFocus=null; _miwToggle(cfg.miwActiveSlot, c) }
                           }"
-                          :style="(c==='sliq'||c==='bliq'||c==='msliq'||c==='mbliq') ? (liqFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ioa') ? (ratioFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='va') ? (gateFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ocs'||c==='ocx') ? (ocFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.miwSlots?.[cfg.miwActiveSlot]||[]).includes(c) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
-                          x-text="c.replace('fund','Fund').replace('va','V/A').replace('sliq','S-Liq').replace('bliq','B-Liq').replace('0liq','0-Liq').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')">
+                          :style="(c==='ioa') ? (ratioFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='va') ? (gateFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ocs'||c==='ocx') ? (ocFocus===c ? 'border-color:rgba(96,210,255,.8);color:var(--ice);background:rgba(96,210,255,.25)' : (cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.miwSlots?.[cfg.miwActiveSlot]||[]).includes(c) ? 'border-color:rgba(96,210,255,.6);color:var(--ice);background:rgba(96,210,255,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
+                          x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')">
                         </button>
                       </template>
-                      <!-- Liq depth config panel -->
-                      <div x-show="liqFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(96,210,255,.06);border:1px solid rgba(96,210,255,.2);border-radius:3px">
-                        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                          <span style="font-size:9px;color:var(--text-lo)" x-text="({'sliq':'S-Liq','bliq':'B-Liq','msliq':'mS-Liq','mbliq':'mB-Liq'}[liqFocus]||liqFocus)+' live trigger depth (% vs. history avg)'"></span>
-                          <button @click.prevent="liqDir=(liqDir==='>'?'<':'>')"
-                            style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(96,210,255,.1);border:1px solid rgba(96,210,255,.35);border-radius:2px;color:var(--ice);cursor:pointer"
-                            x-text="liqDir"></button>
-                          <input type="range" min="-100" max="200" step="1" x-model.number="liqVal" style="flex:1;min-width:60px">
-                          <span style="font-size:9px;color:var(--ice);min-width:24px;text-align:right" x-text="(liqVal>=0?'+':'')+liqVal"></span>
-                          <button @click.prevent="if(!cfgLocked&&liqFocus){ const slots=(cfg.miwSlots||[]).map(s=>[...s]); const si=cfg.miwActiveSlot; if(!slots[si]) return; const existIdx=slots[si].findIndex(x=>x.startsWith(liqFocus)); if(existIdx!==-1){ slots[si].splice(existIdx,1); } else { slots[si].push(liqFocus+liqDir+(liqVal>=0?'+':'')+liqVal); } cfg.miwSlots=slots; persist?.(); }"
-                            :style="(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(liqFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(96,210,255,.1);border:1px solid rgba(96,210,255,.35);color:var(--ice)'"
-                            x-text="(cfg.miwSlots?.[cfg.miwActiveSlot]||[]).some(x=>x.startsWith(liqFocus??'__')) ? 'Remove' : 'Add'">
-                          </button>
-                        </div>
-                      </div>
                       <!-- IO/A tier config panel -->
                       <div x-show="ratioFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(96,210,255,.06);border:1px solid rgba(96,210,255,.2);border-radius:3px">
                         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
@@ -503,7 +356,7 @@
                           <div style="font-size:8px;color:var(--text-lo)">Slot <span x-text="i+1"></span></div>
                           <div style="display:flex;flex-direction:column;gap:2px;min-height:14px">
                             <template x-for="c in slot" :key="c">
-                              <span class="miw-crit" x-text="c.replace('fund','Fund').replace('va','V/A').replace('sliq','S-Liq').replace('bliq','B-Liq').replace('0liq','0-Liq').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')"></span>
+                              <span class="miw-crit" x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')"></span>
                             </template>
                             <span x-show="!slot.length" style="font-size:8px;color:var(--text-lo);font-style:italic">empty</span>
                           </div>
@@ -516,36 +369,15 @@
                         @click.prevent="_miwAddSlot()"
                         style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(96,210,255,.06);border:1px dashed rgba(96,210,255,.3);border-radius:3px;color:var(--ice);cursor:pointer">+</button>
                     </div>
-                    <div class="miw-hint" style="margin-top:5px">Each slot is an AND-gate needing a liquidation anchor (S-Liq/B-Liq/mS-Liq/mB-Liq/0-Liq) plus every other listed criterion; any matching slot qualifies the ticker. Full timing/data-source details are in the README.</div>
-                    <div class="miw-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑/💸 Fund · ⬆️ PEC OB · ⬇️ PEC OS · ⤵️ PEC Red Mountain · ⤴️ PEC Green Delta · ↗️ PEC Bull Momentum · ↘️ PEC Bear Momentum · 🔄 PEC Irregular · 🔊 V/A · ⏫ VSG Over-Traded · ⏬ VSG Under-Traded · 🔼 VSG Volume Mountain · 🔽 VSG Volume Trough · ⏩ VSG Building Momentum · ⏪ VSG Fading Momentum · 🔀 VSG Irregular · 🥵 S-Liq · 🥶 B-Liq · 💦 mS-Liq · 🧊 mB-Liq · ⚫ 0-Liq · 🎲 IO/A · 🔭 OCS · 📡 OCX · 🐂 Regime Bull · 🐻 Regime Bear — click any tiered criterion to configure gate</div>
+                    <div class="miw-hint" style="margin-top:5px">Each slot is an AND-gate of every criterion listed in it; any matching slot qualifies the ticker. Full timing/data-source details are in the README.</div>
+                    <div class="miw-hint" style="margin-top:5px;line-height:1.8">Badge key: 🤑/💸 Fund · 🔊 V/A · 🎲 IO/A · 🔭 OCS · 📡 OCX — click any tiered criterion to configure gate</div>
                   </div><!-- end manual builder -->
-                  <div class="g" style="margin-top:8px">
-                    <div class="lbl">PEC Threshold High/Low <b x-text="(cfg.miwPecThresholdHigh)+' / '+(cfg.miwPecThresholdLow)"></b></div>
-                    <input type="range" min="50" max="95" step="1" x-model.number="cfg.miwPecThresholdHigh" @change="persist()">
-                    <input type="range" min="5" max="50" step="1" x-model.number="cfg.miwPecThresholdLow" @change="persist()">
-                    <div class="miw-hint">Only pecob/pecos use this threshold — the other four PEC shapes just compare timeframes to each other.</div>
-                  </div>
-                  <div class="g" style="margin-top:8px">
-                    <div class="lbl">Irregularity Threshold (PEC / VSG) <b x-text="(cfg.miwPecIrrThreshold)+' / '+(cfg.miwVsgIrrThreshold)"></b></div>
-                    <input type="range" min="50" max="95" step="1" x-model.number="cfg.miwPecIrrThreshold" @change="persist()">
-                    <input type="range" min="50" max="95" step="1" x-model.number="cfg.miwVsgIrrThreshold" @change="persist()">
-                    <div class="miw-hint">🔄 pecirr/🔀 vsgirr fire once average window efficiency drops below this (spikey, not directional). Same thresholds also dampen pecmomup/pecmomdn and vsgmomup/vsgmomdn once irregularity climbs past them — a strict monotonic reading is treated as less believable the choppier the window gets.</div>
-                  </div>
-                  <div class="g" style="margin-top:8px">
-                    <div class="lbl" style="margin-bottom:4px">Liquidation Presence</div>
-                    <div style="display:flex;flex-wrap:wrap;gap:4px">
-                      <button class="miw-tab" :class="(cfg.miwLiqPresenceModes||['1']).includes('1')?'on':''" @click.prevent="_miwToggleLiqMode('1')">Live</button>
-                      <button class="miw-tab" :class="(cfg.miwLiqPresenceModes||['1']).includes('0')?'on':''" @click.prevent="_miwToggleLiqMode('0')">0-Liq</button>
-                      <button class="miw-tab" :class="(cfg.miwLiqPresenceModes||['1']).includes('past1')?'on':''" @click.prevent="_miwToggleLiqMode('past1')">Past-1</button>
-                    </div>
-                    <div class="miw-hint">Liquidation is mandatory for every slot; select any combination to run their slots side by side.</div>
-                  </div>
                   <div class="g" style="margin-top:8px">
                     <label class="tog">
                       <div class="tog-t" :class="cfg.miwSlotBlockEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.miwSlotBlockEnabled=!cfg.miwSlotBlockEnabled;persist()}"><div class="tog-k"></div></div>
                       <div>
                         <div class="tog-l">Slot Blocking</div>
-                        <div class="miw-hint">Blocks new entries of a liq type that lost beyond <span x-text="-(cfg.miwSlotBlockPct)"></span>% of base margin, clearing once its score recovers.</div>
+                        <div class="miw-hint">Blocks new entries carrying a criterion that lost beyond <span x-text="-(cfg.miwSlotBlockPct)"></span>% of base margin, clearing once its score recovers.</div>
                       </div>
                     </label>
                     <div x-show="cfg.miwSlotBlockEnabled" style="margin-top:4px;margin-left:2px">
@@ -555,27 +387,22 @@
                         <div class="tog-t" :class="cfg.miwSlotBlockTags?'on':''" @click.prevent="if(!cfgLocked){cfg.miwSlotBlockTags=!cfg.miwSlotBlockTags;persist()}"><div class="tog-k"></div></div>
                         <div>
                           <div class="tog-l">Include Sign Tags</div>
-                            <div class="miw-hint">Also blocks on a losing score from any criterion selected below, not just the liq type.</div>
+                            <div class="miw-hint">Blocks on a losing score from any criterion selected below.</div>
                         </div>
                       </label>
                       <div x-show="cfg.miwSlotBlockTags" style="margin-top:5px;margin-left:2px">
                         <div class="lbl" style="margin-bottom:3px">Blockable Criteria</div>
                         <div class="crit-pick" style="display:flex;flex-wrap:wrap;gap:3px">
-                          <template x-for="c in ['fund','pecob','pecos','pecalpha','pecdelta','pecmomup','pecmomdn','pecirr','va','vsgot','vsgut','vsgalpha','vsgdelta','vsgmomup','vsgmomdn','vsgirr','regimebull','regimebear','liqturnover','liqquiet','ioa','ocs','ocx']" :key="c">
+                          <template x-for="c in ['fund','va','ioa','ocs','ocx']" :key="c">
                             <button @click.prevent="if(!cfgLocked){ const bl=(cfg.miwSlotBlockCriteria||[]).slice(); const i=bl.indexOf(c); if(i>=0) bl.splice(i,1); else bl.push(c); cfg.miwSlotBlockCriteria=bl; persist(); }"
                                     :style="'font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;cursor:pointer;border:1px solid;' + ((cfg.miwSlotBlockCriteria||[]).includes(c) ? 'border-color:rgba(255,80,80,.5);background:rgba(255,80,80,.15);color:rgba(255,80,80,.8)' : 'border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)')"
-                                    x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX').replace('pecob','PEC-OB').replace('pecos','PEC-OS').replace('pecalpha','PEC-α').replace('pecdelta','PEC-Δ').replace('pecmomup','PEC-Mom↑').replace('pecmomdn','PEC-Mom↓').replace('pecirr','PEC-Irr')">
+                                    x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')">
                             </button>
                           </template>
                         </div>
-                        <div class="miw-hint" style="margin-top:3px">Blocks entries once a selected criterion's own score crosses the threshold above — fund/ocs/ocx start off since most entries share a similar band.</div>
+                        <div class="miw-hint" style="margin-top:3px">Blocks entries once a selected criterion's own score crosses the threshold above — nothing is blockable by default.</div>
                       </div>
                     </div>
-                  </div>
-                  <div class="g" x-show="cfg.miwAutoSlots && (cfg.miwLiqPresenceModes||['0']).includes('1')" style="margin-top:8px">
-                    <div class="lbl">Live Depth Threshold (floor) <b x-text="((cfg.miwLiveDepthThreshold)>=0?'+':'')+(cfg.miwLiveDepthThreshold)"></b></div>
-                    <input type="number" class="inp" min="-100" step="1" x-model.number="cfg.miwLiveDepthThreshold" :disabled="cfgLocked" @change="persist()" style="width:80px">
-                    <div class="miw-hint">Depth threshold (% vs. historical avg liq size) for every Auto-Slot live anchor; manual slots set depth per-slot.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <label class="tog">
@@ -625,26 +452,6 @@
                 <div class="g" x-show="cfg.miwSacrificeEnabled" style="margin-top:8px">
                   <div class="lbl">Trigger at <b x-text="'-'+(cfg.miwSacrificePct)+'% of base margin'"></b></div>
                   <input type="range" min="5" max="200" step="5" x-model.number="cfg.miwSacrificePct" @change="persist()">
-                  <label class="tog" style="margin-top:8px">
-                    <div class="tog-t" :class="cfg.miwRollingSacrificeEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.miwRollingSacrificeEnabled=!cfg.miwRollingSacrificeEnabled;persist()}"><div class="tog-k"></div></div>
-                    <div>
-                      <div class="tog-l">Rolling Window</div>
-                      <div class="miw-hint">On trigger: close oldest position only instead of bailing all.</div>
-                    </div>
-                  </label>
-                </div>
-
-                <label class="tog" style="margin-top:10px">
-                  <div class="tog-t" :class="cfg.miwHalvingEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.miwHalvingEnabled=!cfg.miwHalvingEnabled;persist()}"><div class="tog-k"></div></div>
-                  <div>
-                    <div class="tog-l">Target Halving</div>
-                    <div class="miw-hint">Halves the cascade/sacrifice trigger threshold once per interval, based on the age of the oldest MIW position — the longer they're held, the easier the collective exit fires.</div>
-                  </div>
-                </label>
-                <div class="g" x-show="cfg.miwHalvingEnabled" style="margin-top:8px">
-                  <div class="lbl">Halving Interval <b x-text="(h=>(h<1?Math.round(h*60)+'m':h%1===0?h+'h':Math.floor(h)+'h '+Math.round((h%1)*60)+'m'))(cfg.miwHalvingHours)"></b></div>
-                  <input type="number" class="inp" min="0.1" max="24" step="0.1" x-model.number="cfg.miwHalvingHours" @change="persist()" style="width:80px">
-                  <div class="miw-hint" x-text="(()=>{ const pos=(positions||[]).filter(p=>p._miw); if(!pos.length) return 'No active MIW positions.'; const oldest=pos.reduce((m,p)=>Math.min(m,p.openedAt||Date.now()),Date.now()); const ageMs=Date.now()-oldest; const halvMs=(cfg.miwHalvingHours)*3600000; const mul=Math.pow(0.5,ageMs/halvMs); const h=Math.floor(ageMs/3600000); const m=Math.floor((ageMs%3600000)/60000); return 'Oldest: '+h+'h '+String(m).padStart(2,'0')+'m old → ×'+mul.toFixed(3)+' on trigger'; })()"></div>
                 </div>
 
                 <label class="tog" style="margin-top:10px">
@@ -665,13 +472,6 @@
                     <input type="range" min="5" max="240" step="5" x-model.number="cfg.miwSubstitutionMinAgeMins" @change="persist()">
                     <div class="miw-hint">A position must be held at least this long before it can be substituted out.</div>
                   </div>
-                  <label class="tog" style="margin-top:8px">
-                    <div class="tog-t" :class="cfg.miwSubstitutionProtectWinners?'on':''" @click.prevent="if(!cfgLocked){cfg.miwSubstitutionProtectWinners=!cfg.miwSubstitutionProtectWinners;persist()}"><div class="tog-k"></div></div>
-                    <div>
-                      <div class="tog-l">Protect Winners</div>
-                      <div class="miw-hint">When on, positions currently in profit are never substituted out.</div>
-                    </div>
-                  </label>
                 </div>
               </div><!-- end exit zone -->
               <!-- Fade tab retired; extracted to /junk/MultiIndicator-fade-protectpathA-scrap.html. -->
@@ -679,74 +479,15 @@
               <!-- Fetch Zone -->
               <div class="miw-zone" x-show="tFe">
                 <div class="g">
-                  <div class="lbl">Kline Scan Cap <b x-text="(cfg.miwKlineScanCap)"></b> tickers</div>
-                  <input type="range" min="10" max="500" step="10" x-model.number="cfg.miwKlineScanCap" @change="persist()">
-                  <div class="miw-hint">Legacy cap retained for compatibility; no longer sizes a criteria scan now that VSG rides PEC's cache.</div>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">PEC Granularity</div>
-                  <div style="display:flex;flex-wrap:wrap;gap:4px">
-                    <button class="miw-tab" :class="(cfg.miwPecGranularity)==='15m'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPecGranularity='15m';persist()}">15m×96</button>
-                    <button class="miw-tab" :class="(cfg.miwPecGranularity)==='1h'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPecGranularity='1h';persist()}">1h×24</button>
-                    <button class="miw-tab" :class="(cfg.miwPecGranularity)==='3h'?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPecGranularity='3h';persist()}">3h×8</button>
-                  </div>
-                  <div class="miw-hint">Sub-candle size for the 6h/12h/24h composite windows. Finer = more precise, heavier fetch.</div>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">PEC Depth Step <b x-text="(cfg.miwPecDepthStep)"></b></div>
-                  <input type="range" min="1" max="20" step="1" x-model.number="cfg.miwPecDepthStep" @change="persist()">
-                  <div class="miw-hint">Index-point size of one depth tier, for the collapsed-rank score. Strongest for pecob/pecos/Momentum; noisier for Reversion/Mountain/Delta.</div>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <label class="tog">
-                    <div class="tog-t" :class="cfg.miwPecWickDampen?'on':''" @click.prevent="if(!cfgLocked){cfg.miwPecWickDampen=!cfg.miwPecWickDampen;persist()}"><div class="tog-k"></div></div>
-                    <div>
-                      <div class="tog-l">Wick Dampening</div>
-                      <div class="miw-hint">Uses the average sub-candle range instead of window high/low, so one liquidation wick can't dominate the reading.</div>
-                    </div>
-                  </label>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">PEC Fresh Cycles <b x-text="(cfg.miwPecFreshCycles)"></b></div>
-                  <input type="range" min="1" max="20" step="1" x-model.number="cfg.miwPecFreshCycles" @change="persist()">
-                  <div class="miw-hint">How many scan cycles a closed liq batch's tickers stay eligible for PEC before going stale.</div>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">PEC Scan Cap <b x-text="(cfg.miwPecScanCap)"></b> tickers</div>
-                  <input type="range" min="5" max="200" step="5" x-model.number="cfg.miwPecScanCap" @change="persist()">
-                  <div class="miw-hint">Max freshly-surveilled tickers to fetch PEC candles for per cycle.</div>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">VSG Threshold High <b x-text="(cfg.miwVsgThresholdHigh)"></b></div>
-                  <input type="range" min="50" max="95" step="1" x-model.number="cfg.miwVsgThresholdHigh" @change="persist()">
-                  <div class="miw-hint">VSG index level all three windows must clear for Over-Traded (vsgot).</div>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">VSG Threshold Low <b x-text="(cfg.miwVsgThresholdLow)"></b></div>
-                  <input type="range" min="5" max="50" step="1" x-model.number="cfg.miwVsgThresholdLow" @change="persist()">
-                  <div class="miw-hint">VSG index level all three windows must stay under for Under-Traded (vsgut).</div>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">VSG Depth Step <b x-text="(cfg.miwVsgDepthStep)"></b></div>
-                  <input type="range" min="1" max="20" step="1" x-model.number="cfg.miwVsgDepthStep" @change="persist()">
-                  <div class="miw-hint">Index-point size of one depth tier for VSG's collapsed-rank score. Same scale as PEC Depth Step.</div>
-                </div>
-                <div class="g" style="margin-top:8px">
                   <div class="lbl" style="margin-bottom:4px">Tier Step Sizes</div>
                   <div style="display:flex;flex-wrap:wrap;gap:4px">
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="Fund" x-text="'💰 '+(cfg.miwFundStep)+'%'"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="V/A" x-text="'🔊 '+(cfg.miwVaStep)+'%'"></span>
-                    <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="VSG" x-text="'⏫⏬🔼🔽 '+(cfg.miwVsgDepthStep)"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="IO/A" x-text="'🎲 '+(cfg.miwIoaStep)+'%'"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="OCS" x-text="'🔭 '+(cfg.miwOcsStep)+'%'"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="OCX" x-text="'📡 '+(cfg.miwOcxStep)+'%'"></span>
                   </div>
                   <div class="miw-hint" style="margin-top:4px">One tier equals the listed percentage step. OCX/V-A/IO-A tiers measure percentage deviation from a full-window population average.</div>
-                </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">0-Liq Lookback <b x-text="(cfg.miwLiqLookbackCycles)+' cycles'"></b></div>
-                  <input type="range" min="1" max="25" step="1" x-model.number="cfg.miwLiqLookbackCycles" @change="persist()">
-                  <div class="miw-hint">Requires zero liquidation in every retained cycle the ticker appeared in; doesn't affect live sliq/bliq/msliq/mbliq entries.</div>
                 </div>
               </div><!-- end fetch zone -->
             </div>
@@ -784,45 +525,20 @@
       const _origInit  = def.init;
       const _origScan  = def.runScan;
       const _origWatch = def.pseudoWatchPositions;
-      const _origPers  = def.persist;
 
       return Object.assign({}, def, {
 
         miwCollapsedSlotRanks: {},
-        _miwFundSkew: null,
-        _miwVolSkew: null,
         _miwLastSampledAt: 0,
         _miwHaltLogged: false,
 
-        persist() {
-          _origPers.call(this);
-          try { localStorage.setItem(MIW_HIST_KEY, JSON.stringify({ fundSkew: this._miwFundSkew || null })); } catch(e) {}
-        },
-
         async init() {
           await _origInit.call(this);
-          // Presence flag other plugins (Ashfall/Permafrost) check to decide whether to show
-          // MIW-specific UI (sampling bars) — set unconditionally on load, not on miwEnabled,
-          // since the plugin being loaded is what matters for "is this data available at all."
           this._miwLoaded = true;
-          try { const _r = localStorage.getItem(MIW_HIST_KEY); if (_r) { const _p = JSON.parse(_r); if (_p && !Array.isArray(_p) && _p.fundSkew) this._miwFundSkew = _p.fundSkew; } } catch(e) {}
           if (!this.miwCollapsedSlotRanks) this.miwCollapsedSlotRanks = {};
           if (!this.miwCollapsedCritStats) this.miwCollapsedCritStats = {};
-          if (!Array.isArray(this.cfg.miwSlots) || !this.cfg.miwSlots.length)
-            this.cfg.miwSlots = DEFAULT_SLOTS.map(s => [...s]);
-          if (!Array.isArray(this.cfg.miwLiqPresenceModes)) {
-            let _old = this.cfg.miwLiqPresenceMode;
-            if (_old === undefined) _old = '0';
-            if (_old === 'auto') {
-              _old = 'both';
-              this.log('[MIW] Auto Liquidation Presence removed — migrated to Both.', 'warn');
-            }
-            this.cfg.miwLiqPresenceModes = _old === 'both' ? ['1','0'] : [_old];
-            delete this.cfg.miwLiqPresenceMode;
-          }
+          if (!Array.isArray(this.cfg.miwSlots)) this.cfg.miwSlots = DEFAULT_SLOTS.map(s => [...s]);
           if (!Array.isArray(this.cfg.miwSlotBlockCriteria)) this.cfg.miwSlotBlockCriteria      = [...DEFAULT_BLOCKABLE_CRITS];
-          this._miwFundSkew       = null;
-          this._miwVolSkew        = null;
           // V/M, IO/T, IO/M retired in favor of population-relative V/A and IO/A (see
           // _pfVolIoWindowAvg) — no mcap fetch machinery to init anymore. One-time cleanup of
           // saved config: strip the retired keys from exclude/blockable lists (defensive — they
@@ -831,64 +547,25 @@
           if (Array.isArray(this.cfg.miwAutoSlotExclude) && this.cfg.miwAutoSlotExclude.some(c => c==='vm'||c==='iot'||c==='iom')) {
             this.cfg.miwAutoSlotExclude = this.cfg.miwAutoSlotExclude.filter(c => c!=='vm'&&c!=='iot'&&c!=='iom');
           }
-          // Gated behind miwBlockableCritsMigrated so this only ever runs once per config —
-          // without the flag it was re-forcing va/ioa/regime back into the blockable list on
-          // every load, silently overriding manual unchecks in the Blockable Criteria picker.
-          if (!this.cfg.miwBlockableCritsMigrated && Array.isArray(this.cfg.miwSlotBlockCriteria)) {
-            let _bc = this.cfg.miwSlotBlockCriteria.filter(c => c!=='vm'&&c!=='iot'&&c!=='iom');
-            if (!_bc.includes('va'))  _bc = [..._bc, 'va'];
-            if (!_bc.includes('ioa')) _bc = [..._bc, 'ioa'];
-            // Regime (see Regime.md) — blockable by default from launch, same treatment as va/ioa above.
-            for (const _rc of ['regimebull','regimebear']) {
-              if (!_bc.includes(_rc)) _bc = [..._bc, _rc];
-            }
-            this.cfg.miwSlotBlockCriteria = _bc;
-          }
-          // liqturnover/liqquiet were sampled into Permafrost's Extremity dial pool from day
-          // one but never attached to a position as a real criterion — see _miwCheckCrit/
-          // annotCrits below. Now that they are, seed them into an already-migrated install's
-          // blockable list too (fresh installs already get them via DEFAULT_BLOCKABLE_CRITS
-          // above) — gated behind its own one-time flag so it doesn't re-fight a manual
-          // uncheck later.
-          if (!this.cfg.miwLiqCritsMigrated && Array.isArray(this.cfg.miwSlotBlockCriteria)) {
-            let _lc = this.cfg.miwSlotBlockCriteria.slice();
-            for (const _c of ['liqturnover','liqquiet']) {
-              if (!_lc.includes(_c)) _lc = [..._lc, _c];
-            }
-            this.cfg.miwSlotBlockCriteria = _lc;
-            this.cfg.miwLiqCritsMigrated = true;
-          }
           if (!Array.isArray(this.cfg.megacapExclude)) this.cfg.megacapExclude = [...DEFAULT_MEGACAP_EXCLUDE];
-          if (!this._miwOpening) this._miwOpening = new Set(); // symbols with an in-flight live-liq open, guards double-fire
           // Single source of truth for all other MIW scalar defaults — see MIW_DEFAULT_CFG above.
           // Call sites read this.cfg.<key> directly with no inline fallback, since this
-          // guarantees every key below is present after init runs once. Must run after the
-          // miwBlockableCritsMigrated gate above, which depends on reading its pre-default state.
+          // guarantees every key below is present after init runs once.
           for (const [k, v] of Object.entries(MIW_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : v;
           }
           if (Number(this.cfg.miwOcxStep) === 0.1) this.cfg.miwOcxStep = 1;
-          // Legacy migration: convert old +fund/-fund/>10pct/<10pct/bare lsa/lba/rasl/rabl to tiered form
+          // Legacy migration: convert old +fund/-fund to tiered form
           {
             const _fundStep   = this.cfg.miwFundStep;
-            const _vmStep     = this.cfg.miwVmStep;
-            const _spikeStep  = this.cfg.miwSpikeStep;
             const _frThr      = this.cfg.miwFrThreshold;
-            const _volMin     = this.cfg.miwKlineVolMin;
-            const _vmTier     = Math.max(1, Math.round(10 / _vmStep));
             const _frTier     = Math.max(1, Math.ceil(_frThr / _fundStep));
             const _migCrit = c => {
               if (c === '+fund')   return `fund>${_frTier}`;
               if (c === '-fund')   return `fund<-${_frTier}`;
-              if (c === '>10pct')  return `vm>${_vmTier}`;
-              if (c === '<10pct')  return `vm<${_vmTier}`;
-              if (c === 'lsa')     return `lsa>${_volMin}`;
-              if (c === 'lba')     return `lba>${_volMin}`;
-              if (c === 'rasl')    return `rasl>${_volMin}`;
-              if (c === 'rabl')    return `rabl>${_volMin}`;
               return c;
             };
-            const _legacyNames = new Set(['+fund','-fund','>10pct','<10pct','lsa','lba','rasl','rabl']);
+            const _legacyNames = new Set(['+fund','-fund']);
             if (Array.isArray(this.cfg.miwSlots) && this.cfg.miwSlots.some(s => s.some(c => _legacyNames.has(c)))) {
               this.cfg.miwSlots = this.cfg.miwSlots.map(s => s.map(_migCrit));
               this.persist();
@@ -898,21 +575,14 @@
               this.persist();
             }
           }
-          // V/M, IO/T, IO/M no longer match anything (see the migration above) — a manual slot
-          // still referencing them will never qualify. Not auto-rewritten (va/ioa isn't a 1:1
-          // semantic substitution), just flagged once so it doesn't silently go dead.
+          // V/M, IO/T, IO/M, and every retired liquidation/PEC/VSG/regime tag no longer match
+          // anything (see the migration above and /versioning v1.80.0) — a manual slot still
+          // referencing one will never qualify. Not auto-rewritten (va/ioa isn't a 1:1 semantic
+          // substitution), just flagged once so it doesn't silently go dead.
           {
-            const _retiredIn = s => s.filter(c => /^(vm|iot|iom)/.test(c));
+            const _retiredIn = s => s.filter(c => /^(vm|iot|iom|pec|vsg|regime|liqturnover|liqquiet|sliq|bliq|msliq|mbliq|0liq|past1)/.test(c));
             const _retiredSlots = (this.cfg.miwSlots || []).map((s,i) => ({ i, crits: _retiredIn(s) })).filter(x => x.crits.length);
-            if (_retiredSlots.length) this.log(`[MIW] ⚠️ ${_retiredSlots.length} manual slot(s) reference retired criteria (V/M, IO/T, IO/M) and will never match — slot(s) ${_retiredSlots.map(x=>x.i+1).join(', ')}. Replace with V/A / IO/A.`, 'warn');
-          }
-          // Liquidation is now a mandatory anchor — a manual slot saved before this restructure
-          // (or built without one) will never match. Flag it once on load rather than silently.
-          if (!this.cfg.miwAutoSlots) {
-            // Anchorless is only a mistake when 'past1' isn't active — with it active, an
-            // anchorless manual slot is a valid Past-1 slot (see header comment).
-            const anchorless = (this.cfg.miwSlots || []).filter(s => s.length && !this._miwSlotLiqAnchor(s)).length;
-            if (anchorless && !this._miwEffectivePresenceModes().includes('past1')) this.log(`[MIW] ⚠️ ${anchorless} manual slot(s) have no liquidation criterion and will never match — add S-Liq/B-Liq/mS-Liq/mB-Liq/0-Liq to each, or enable the Past-1 presence mode.`, 'warn');
+            if (_retiredSlots.length) this.log(`[MIW] ⚠️ ${_retiredSlots.length} manual slot(s) reference retired criteria and will never match — slot(s) ${_retiredSlots.map(x=>x.i+1).join(', ')}. Replace with fund / V/A / IO/A / OCS / OCX.`, 'warn');
           }
           this.registerRoleBadge?.(item => {
             if (!item || !item._miw) return null;
@@ -922,14 +592,11 @@
             return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(96,210,255,.45);color:var(--ice);background:rgba(96,210,255,.10)" title="${title}">${emoji || 'Multi'}</span>`;
           });
           this.registerCloseReason?.('substitution', 'Sub');
-          this.registerLiqCloseHook?.((results, batch) => { this._miwOnLiqClose(results, batch); });
-          this.registerLiqMessageHook?.((batch, sym) => { this._miwOnLiqMessage(batch, sym); });
           // Dead Switch baseline — counts idle time from whichever is more recent: the plugin's
           // own load (so a fresh session with zero entries yet doesn't immediately read as
           // "dead") or the last entry it actually made. See _miwDeadSwitchCheck.
           this._miwLoadedAt = Date.now();
-          const _presenceStr = (this.cfg.miwLiqPresenceModes || ['0']).join('+');
-          this.log(`[MIW] Multi-Indicator (Winter) v${VERSION} loaded — ${this.cfg.miwEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.miwSlots||[]).length} slots | ${this.cfg.miwPicks}/cycle | presence: ${_presenceStr}`, 'info');
+          this.log(`[MIW] Multi-Indicator (Winter) v${VERSION} loaded — ${this.cfg.miwEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.miwSlots||[]).length} slots | ${this.cfg.miwPicks}/cycle`, 'info');
           this.renderTradeFeed?.();
         },
 
@@ -971,14 +638,6 @@
           this.persist?.();
         },
 
-        _miwHalvingMultiplier() {
-          if (!this.cfg.miwHalvingEnabled) return 1;
-          const pos = this.positions || [];
-          if (!pos.length) return 1;
-          const oldest = pos.reduce((m, p) => Math.min(m, p.openedAt || Date.now()), Date.now());
-          return Math.pow(0.5, (Date.now() - oldest) / ((this.cfg.miwHalvingHours) * 3600000));
-        },
-
         // Collective uPnL and the resulting bail set both cover every open position, not just
         // MIW's own — a winning position from another strategy should be able to push the
         // portfolio into Cascade the same as a winning MIW position would, and a Sacrifice
@@ -989,11 +648,9 @@
           if (!allPositions.length) return;
           const totalUPnL   = allPositions.reduce((s, p) => s + (p.upnl || 0), 0);
           const baseMargin  = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
-          const halvMul     = this._miwHalvingMultiplier();
-          const threshold   = baseMargin * ((this.cfg.miwCascadePct) / 100) * halvMul;
+          const threshold   = baseMargin * ((this.cfg.miwCascadePct) / 100);
           if (totalUPnL >= threshold) {
-            const halvNote = halvMul < 0.999 ? ` × halving ×${halvMul.toFixed(3)}` : '';
-            this.log(`[MIW] 🌊 Cascade triggered — collective uPnL +${totalUPnL.toFixed(4)} ≥ ${threshold.toFixed(4)} USDT (${this.cfg.miwCascadePct}%${halvNote} of ${baseMargin.toFixed(4)} base margin) — bailing ${allPositions.length} position(s)`, 'info');
+            this.log(`[MIW] 🌊 Cascade triggered — collective uPnL +${totalUPnL.toFixed(4)} ≥ ${threshold.toFixed(4)} USDT (${this.cfg.miwCascadePct}% of ${baseMargin.toFixed(4)} base margin) — bailing ${allPositions.length} position(s)`, 'info');
             if (this.cfg.permafrostCrossEnabled && typeof this._pfCrossWrite === 'function') {
               this._pfCrossWrite('cascade', null, { count: allPositions.length, pnl: totalUPnL });
             }
@@ -1012,29 +669,18 @@
           if (!allPositions.length) return;
           const totalUPnL   = allPositions.reduce((s, p) => s + (p.upnl || 0), 0);
           const baseMargin  = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
-          const halvMul     = this._miwHalvingMultiplier();
-          const threshold   = -(baseMargin * ((this.cfg.miwSacrificePct) / 100) * halvMul);
+          const threshold   = -(baseMargin * ((this.cfg.miwSacrificePct) / 100));
           if (totalUPnL <= threshold) {
-            const halvNote = halvMul < 0.999 ? ` × halving ×${halvMul.toFixed(3)}` : '';
-            if (this.cfg.miwRollingSacrificeEnabled) {
-              const oldest = allPositions.reduce((a, b) => (a.openedAt || 0) <= (b.openedAt || 0) ? a : b);
-              this.log(`[MIW] 🩸 Rolling sacrifice — uPnL ${totalUPnL.toFixed(4)} ≤ ${threshold.toFixed(4)} USDT (${this.cfg.miwSacrificePct}%${halvNote} of ${baseMargin.toFixed(4)} base margin) — closing oldest: ${oldest.symbol}`, 'info');
-              if (this.cfg.permafrostCrossEnabled && typeof this._pfCrossWrite === 'function') {
-                this._pfCrossWrite('sacrifice', oldest.symbol, { count: 1, pnl: totalUPnL });
-              }
-              await this.pseudoClosePosition(oldest, 'sacrifice');
-            } else {
-              this.log(`[MIW] 🩸 Sacrifice triggered — collective uPnL ${totalUPnL.toFixed(4)} ≤ ${threshold.toFixed(4)} USDT (${this.cfg.miwSacrificePct}%${halvNote} of ${baseMargin.toFixed(4)} base margin) — bailing ${allPositions.length} position(s)`, 'info');
-              if (this.cfg.permafrostCrossEnabled && typeof this._pfCrossWrite === 'function') {
-                this._pfCrossWrite('sacrifice', null, { count: allPositions.length, pnl: totalUPnL });
-              }
-              this._logBatchBegin?.();
-              try {
-                for (const pos of allPositions) {
-                  await this.pseudoClosePosition(pos, 'sacrifice');
-                }
-              } finally { this._logBatchEnd?.('[MIW] 🩸 Sacrifice roll-up'); }
+            this.log(`[MIW] 🩸 Sacrifice triggered — collective uPnL ${totalUPnL.toFixed(4)} ≤ ${threshold.toFixed(4)} USDT (${this.cfg.miwSacrificePct}% of ${baseMargin.toFixed(4)} base margin) — bailing ${allPositions.length} position(s)`, 'info');
+            if (this.cfg.permafrostCrossEnabled && typeof this._pfCrossWrite === 'function') {
+              this._pfCrossWrite('sacrifice', null, { count: allPositions.length, pnl: totalUPnL });
             }
+            this._logBatchBegin?.();
+            try {
+              for (const pos of allPositions) {
+                await this.pseudoClosePosition(pos, 'sacrifice');
+              }
+            } finally { this._logBatchEnd?.('[MIW] 🩸 Sacrifice roll-up'); }
           }
         },
 
@@ -1084,22 +730,17 @@
 
         // Only meaningful when Co-Qualifying Penalty is on (Permafrost) — otherwise compositeScore
         // is always 0 for both sides and the margin check never clears, so this is a safe no-op.
-        // entryPool only ever contains 0-liq (path-A) candidates — sliq/bliq/msliq/mbliq are
-        // live-only and never appear here (see _miwCheckCrit / runScan's checkCrit). Path-A is the
-        // higher-conviction read, so unlike the live path's substitution (_miwLiveTrySubstitute)
-        // there's no path restriction on what it can close — cross-strategy, any held position,
-        // same as Liquid-Diver's version. The swap is still score-gated, not automatic.
+        // No path restriction on what it can close — cross-strategy, any held position, same as
+        // Liquid-Diver's version. The swap is still score-gated, not automatic.
         async _miwTrySubstitute(entryPool) {
           if (!this.cfg.miwSubstitutionEnabled || !entryPool?.length) return false;
           const now           = Date.now();
           const minAgeMs       = (this.cfg.miwSubstitutionMinAgeMins) * 60000;
-          const protectWinners = this.cfg.miwSubstitutionProtectWinners;
           const baseMargin     = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const marginThreshold = baseMargin * ((this.cfg.miwSubstitutionMarginPct) / 100);
 
           const eligible = (this.positions || []).filter(p => {
             if ((now - (p.openedAt || 0)) < minAgeMs) return false;
-            if (protectWinners && (p.upnl || 0) > 0) return false;
             return true;
           });
           if (!eligible.length) return false;
@@ -1167,50 +808,6 @@
           }
         },
 
-        _miwComputeSamplingData() {
-          // Funding skew — always computed for PF visualization. Population sample used to be
-          // "symbols the broad kline-criteria scan touched this cycle" (klineSyms); now that VSG
-          // rides PEC's own liq-fresh-pool fetch instead of a broad scan, the PEC cache's key set
-          // is the equivalent population.
-          const pecSyms = Object.keys(this._miwPecCache || {});
-          const sharedLiq = this._sharedRead('liqResults');
-          const fundCombined = { ...(sharedLiq?.data || {}), ...(this._liqResults || {}) };
-          const liqSyms = Object.keys(fundCombined);
-          const unionSyms = [...new Set([...pecSyms, ...liqSyms])];
-          const tickerMap = {};
-          for (const t of (this._lastAllTickers || [])) tickerMap[t.symbol] = t;
-          let posCount = 0, negCount = 0;
-          for (const sym of unionSyms) {
-            const t = tickerMap[sym];
-            if (!t) continue;
-            const fr = parseFloat(t.fundingRate || 0) * 100;
-            if (fr > 0) posCount++;
-            else if (fr < 0) negCount++;
-          }
-          const fundTotal = posCount + negCount;
-          if (fundTotal > 0) {
-            this._miwFundSkew = { negPct: negCount / fundTotal * 100, posPct: posCount / fundTotal * 100, domDir: posCount >= negCount ? 'fund+' : 'fund-', domPct: Math.max(posCount, negCount) / fundTotal * 100 };
-          }
-
-          // Volume skew — always computed for PF visualization. Used to read the retired 1h-vs-
-          // 24h-avg kline multiplier; now reads VSG's 6h/12h/24h composite index instead (50 =
-          // neutral), summed across all three windows per symbol — same population, richer signal.
-          let aboveSum = 0, belowSum = 0;
-          for (const [sym, p] of Object.entries(this._miwPecCache || {})) {
-            const t = tickerMap[sym];
-            const v = p?.vsg;
-            if (!t || !v || v['6h'] == null || v['12h'] == null || v['24h'] == null) continue;
-            for (const win of ['6h', '12h', '24h']) {
-              const vi = v[win];
-              if (vi > 50) aboveSum += (vi - 50) / 50;
-              else if (vi < 50) belowSum += (50 - vi) / 50;
-            }
-          }
-          const volTotal = aboveSum + belowSum;
-          if (volTotal > 0) {
-            this._miwVolSkew = { abovePct: aboveSum / volTotal * 100, belowPct: belowSum / volTotal * 100, aboveSum, belowSum };
-          }
-        },
 
         _extraStatusPills() {
           return [];
@@ -1241,7 +838,6 @@
           const hasActiveEntry = autoMode ? this._miwAutoActive() : slots.length > 0;
 
           if (!hasActiveEntry) {
-            this._miwComputeSamplingData();
             this._miwLastActedAt = freshAt;
             this.log('[MIW] 💡 No active slots — skipping', 'info');
             return;
@@ -1249,7 +845,6 @@
 
           const activeSyms  = new Set((this.positions || []).map(p => p.symbol));
 
-          const _allLiqResults = { ...((this._sharedRead?.('liqResults'))?.data || {}), ...(this._liqResults || {}) };
           // Criteria pool to scan for data-fetch needs — Auto's non-excluded secondary list, or
           // every criterion actually used across manual slots.
           const _critPool = autoMode
@@ -1257,10 +852,9 @@
             : [...new Set(slots.flat())];
           const needsVolIo = _critPool.some(c => /^(va|ioa)/.test(c));
           const needsOc    = _critPool.some(c => /^(ocs|ocx)/.test(c));
-          const needsPec   = _critPool.some(c => /^(pec|vsg)/.test(c));
           const scanSkip = {
             excluded: { nonUsdt: 0, btc: 0, lowPrice: 0, active: 0, banned: 0, reentry: 0, },
-            unmatched: { noScanAnchor: 0, criteria: 0 },
+            unmatched: { criteria: 0 },
             blocked: 0
           };
           const basePool = [];
@@ -1278,23 +872,14 @@
           // when a slot actually uses ocs/ocx. Stateless — no accumulation across cycles, no
           // cross-ticker mean required for OCX. A ticker missing from this sample simply fails
           // the ocs/ocx criterion in checkCrit — it no longer blocks the rest of the pool.
-          //
-          // Tickers this scan just picked for liq surveillance are always included first, so OC
-          // data exists for exactly the tickers a liquidation event might be about to hit (e.g.
-          // to look back at order skew/velocity ahead of a liquidation) — not the accumulated set
-          // across every still-open, hour-long liq batch, just this cycle's pick. The remaining
-          // headroom up to the shared cap (same size as the Liq Batch Size config) is filled with
-          // random pool candidates, same as before this coordination existed.
           if ((needsOc || needsVolIo) && this.cfg.pfOcEnabled) {
-            const ocCap = this.cfg.pfLiqBatchSize ?? 25;
-            const liqSyms = this._liqLastBatchSyms || [];
-            const liqSet  = new Set(liqSyms);
-            let fillSyms = basePool.map(t => t.symbol).filter(s => !liqSet.has(s));
+            const ocCap = 25;
+            let fillSyms = basePool.map(t => t.symbol);
             for (let i = fillSyms.length - 1; i > 0; i--) {
               const j = Math.floor(Math.random() * (i + 1));
               [fillSyms[i], fillSyms[j]] = [fillSyms[j], fillSyms[i]];
             }
-            const ocSyms = liqSyms.concat(fillSyms).slice(0, ocCap);
+            const ocSyms = fillSyms.slice(0, ocCap);
             // Vol/OI is already on the ticker payload — no fetch needed, just carried into the
             // same tethered cycle history alongside OC (see _ocFetchBatch, Option A design).
             const volIoMap = {};
@@ -1303,20 +888,7 @@
           }
           const _pfOcResults = this.pfOcResults || {};
 
-          // Criteria-scan kline discovery (the old LSA/LBA/R-ASL/R-ABL random-sample prefetch)
-          // is retired — VSG replaces that family and rides PEC's own liq-fresh-pool fetch below
-          // instead (see VSG.md). _miwPrefetchKlines/_miwKlineCache still exist and are still used,
-
-          // PEC only ever fetches for tickers whose liq surveillance batch just closed (see
-          // _miwOnLiqClose) and are still within miwPecFreshCycles — never the general pool.
-          // A ticker outside that set simply fails every pec{tf}+/- check, same as any other
-          // criterion whose backing data isn't available this cycle.
-          if (needsPec) await this._miwPrefetchPec(this._miwPecFreshCandidates());
-
-          // Always compute sampling data for PF visualizations (PLK evaluated inside)
-          this._miwComputeSamplingData();
-
-          const checkCrit = (c, fr, pec, t) => this._miwCheckCrit(c, fr, pec, t, _pfOcResults);
+          const checkCrit = (c, fr, t) => this._miwCheckCrit(c, fr, t, _pfOcResults);
 
           this._miwLastActedAt = freshAt;
 
@@ -1335,125 +907,39 @@
             return tag;
           };
           const _miwAnnotateCritRaw = (c, t) => {
-            const _liqR = _allLiqResults[t.symbol];
-            if (/^msliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `msliq${d >= 0 ? '+' : ''}${d}`; }
-            if (/^mbliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `mbliq${d >= 0 ? '+' : ''}${d}`; }
-            if (/^sliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `sliq${d >= 0 ? '+' : ''}${d}`; }
-            if (/^bliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `bliq${d >= 0 ? '+' : ''}${d}`; }
             if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._pfVolIoWindowAvg?.('vol'); const step = this.cfg.miwVaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
             if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._pfVolIoWindowAvg?.('oi'); const step = this.cfg.miwIoaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
             if (/^fund/.test(c)) { const step = this.cfg.miwFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_ / step); return `fund${tier>=0?'+':''}${tier}`; }
-            if (/^vsg/.test(c)) { const p = this._miwGetPecSync(t.symbol); const v = p?.vsg; if (!v || v['6h']==null || v['12h']==null || v['24h']==null) return `${c}+0`; const step = this.cfg.miwVsgDepthStep; const high = this.cfg.miwVsgThresholdHigh; const low = this.cfg.miwVsgThresholdLow; let depth = 0; const mid = (high + low) / 2;
- const avg = (v['6h'] + v['12h'] + v['24h']) / 3;
- if (c === 'vsgot' || c === 'vsgalpha' || c === 'vsgmomup') depth = avg - mid;
- else if (c === 'vsgut' || c === 'vsgdelta' || c === 'vsgmomdn') depth = mid - avg; else if (c==='vsgirr') { if (!p.vsgIrr || p.vsgIrr['6h']==null) return `${c}+0`; depth = ((p.vsgIrr['6h']+p.vsgIrr['12h']+p.vsgIrr['24h'])/3) - (this.cfg.miwVsgIrrThreshold); } const tier = Math.max(0, Math.floor(depth/step)); return `${c}+${tier}`; }
             if (/^ocs/.test(c)) { const _a = this._pfOcAccumSkew?.(t.symbol); const _live = this.pfOcResults?.[t.symbol]?.live ? this.pfOcResults[t.symbol] : null; const bc=(_a?.bc||0)+(_live?.bc||0), sc=(_a?.sc||0)+(_live?.sc||0); const tot = bc+sc; const buyPct = tot ? bc/tot*100 : 50; const step = this.cfg.miwOcsStep; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
             if (/^ocx/.test(c)) { const _r = this.pfOcResults?.[t.symbol]; const _w = this._pfOcWindowAvgMs?.(); const step = this.cfg.miwOcxStep; const tier = (_r?.avgMs!=null && _w) ? Math.floor(((_w - _r.avgMs) / _w * 100) / step) : 0; return `ocx${tier>=0?'+':''}${tier}`; }
-            if (/^pec/.test(c)) {
-              const p = this._miwGetPecSync(t.symbol);
-              if (!p || p['6h'] == null || p['12h'] == null || p['24h'] == null) return `${c}+0`;
-              const step = this.cfg.miwPecDepthStep;
-              const high = this.cfg.miwPecThresholdHigh;
-              const low  = this.cfg.miwPecThresholdLow;
-              let depth = 0;
-              const mid = (high + low) / 2;
-              const avg = (p['6h'] + p['12h'] + p['24h']) / 3;
-              if (c === 'pecob' || c === 'pecalpha' || c === 'pecmomup') depth = avg - mid;
-              else if (c === 'pecos' || c === 'pecdelta' || c === 'pecmomdn') depth = mid - avg;
-              else if (c === 'pecirr') { if (!p.pecIrr || p.pecIrr['6h']==null) return c; depth = ((p.pecIrr['6h']+p.pecIrr['12h']+p.pecIrr['24h'])/3) - (this.cfg.miwPecIrrThreshold); }
-              else return c;
-              const tier = Math.max(0, Math.floor(depth/step));
-              return `${c}+${tier}`;
-            }
-            if (/^regime/.test(c)) {
-              const sk = this._pfRegimeSkew?.();
-              if (!sk) return `${c}+0`;
-              const depth = Math.round(Math.abs(sk.skew ?? (sk.sPct - sk.bPct)));
-              return `${c}+${depth}`;
-            }
-            if (/^liqturnover/.test(c)) {
-              const e = (this._miwPecPool || {})[t.symbol];
-              const depth = e ? Math.max(e.sDepth ?? 0, e.bDepth ?? 0) : 0;
-              return `liqturnover+${depth}`;
-            }
-            if (/^liqquiet/.test(c)) {
-              const depth = Math.round(100 - (this._miwLiqActivityPct ?? 0));
-              return `liqquiet+${depth}`;
-            }
             return c;
           };
-          // Past-1 slots have no anchor criterion (see _miwSlotLiqAnchor/_miwAutoQualify) — the
-          // ticker-pool restriction below IS their anchor. Computed once per scan, not per-ticker.
-          const _past1Pool = this._miwEffectivePresenceModes().includes('past1') ? this._miwPast1FreshSymbols() : null;
           // Richness score for sort priority when Co-Qual is off — sum of each matched
           // criterion's own collapsed rank, so capacity still favors historically-stronger
-          // tickers even without Co-Qual scoring turned on. Replaces the old slotIdx-based
-          // ordering (which relied on a pre-sorted combo list that no longer exists in Auto).
+          // tickers even without Co-Qual scoring turned on.
           const _richness = e => e.criteria.reduce((s, c) => s + this._miwCritScore(c), 0);
           const pool = basePool
             .map(t => {
               const fr       = parseFloat(t.fundingRate || 0) * 100;
-              const _isPast1Fresh = !!_past1Pool && _past1Pool.has(t.symbol);
-              const pec      = this._miwGetPecSync(t.symbol);
-              const critOk = c => checkCrit(c, fr, pec, t);
+              const critOk = c => checkCrit(c, fr, t);
 
               let matched = null; // { criteria, annotCrits, slotIdx }
               if (autoMode) {
-                // Only 0-Liq and Past-1 ever resolve at scan time — sliq/bliq/msliq/mbliq are
-                // live-only (checkCrit has no branch for them). Mutually exclusive by
-                // definition (0-Liq needs zero liquidation in-window, Past-1 needs some), so
-                // there's no ambiguity in trying one then the other. _miwAnchorAllowed only
-                // confirms '0' is an active mode — it says nothing about THIS ticker, so
-                // critOk('0liq') (the real _miwLiqZeroAcrossWindow check) has to run here too,
-                // or every ticker clearing the secondary-criteria floor gets falsely tagged
-                // 0liq regardless of its actual liquidation history.
-                if (this._miwAnchorAllowed('0liq') && critOk('0liq')) {
-                  const m = this._miwAutoQualify('0liq', critOk, c => _miwAnnotateCrit(c, t));
-                  if (m) matched = { ...m, slotIdx: -1 };
-                }
-                if (!matched && _isPast1Fresh && this._miwEffectivePresenceModes().includes('past1')) {
-                  const m = this._miwAutoQualify(null, critOk, c => _miwAnnotateCrit(c, t));
-                  // Past-1 has no anchor criterion (see header comment) so the Extremity
-                  // Scorer would otherwise never see a trade that came from here at all —
-                  // stamp a synthetic bare 'past1' tag on afterward (not run through
-                  // _miwAnnotateCrit/checkCrit — it isn't a real checkable criterion, just a
-                  // record of which path this entry took). See Permafrost's BARE_DIAL_TAGS.
-                  if (m) matched = { criteria: [...m.criteria, 'past1'], annotCrits: [...m.annotCrits, 'past1'], slotIdx: -1 };
-                }
+                const m = this._miwAutoQualify(critOk, c => _miwAnnotateCrit(c, t));
+                if (m) matched = { ...m, slotIdx: -1 };
               } else {
-                const slotIdx = slots.findIndex(s => {
-                  if (!this._miwSlotLiqAnchor(s) && !_isPast1Fresh) return false;
-                  return s.every(c => checkCrit(c, fr, pec, t));
-                });
+                const slotIdx = slots.findIndex(s => s.length > 0 && s.every(c => checkCrit(c, fr, t)));
                 if (slotIdx !== -1) {
                   const _slotCrits = slots[slotIdx];
-                  // Same Past-1 stamp as the Auto-mode branch above, for a manual slot that
-                  // matched purely because it has no anchor of its own and this ticker is in
-                  // the Past-1-fresh pool — not for a slot with a real anchor that also
-                  // happens to be Past-1-fresh right now (that's a live/0-liq match, not Past-1).
-                  const _viaPast1 = _isPast1Fresh && !this._miwSlotLiqAnchor(_slotCrits);
-                  const _baseAnnot = _slotCrits.map(c => _miwAnnotateCrit(c, t));
                   matched = {
-                    criteria: _viaPast1 ? [..._slotCrits, 'past1'] : _slotCrits,
-                    annotCrits: _viaPast1 ? [..._baseAnnot, 'past1'] : _baseAnnot,
+                    criteria: _slotCrits,
+                    annotCrits: _slotCrits.map(c => _miwAnnotateCrit(c, t)),
                     slotIdx,
                   };
                 }
               }
               if (!matched) {
-                if (autoMode) {
-                  const _canScan0 = this._miwAnchorAllowed('0liq');
-                  const _canScanPast1 = _isPast1Fresh && this._miwEffectivePresenceModes().includes('past1');
-                  if (!_canScan0 && !_canScanPast1) scanSkip.unmatched.noScanAnchor++;
-                  else scanSkip.unmatched.criteria++;
-                } else {
-                  const slotReasons = slots.map(s => {
-                    if (!this._miwSlotLiqAnchor(s) && !_isPast1Fresh) return 'noScanAnchor';
-                    return 'criteria';
-                  });
-                  if (slotReasons.length && slotReasons.every(r => r === 'noScanAnchor')) scanSkip.unmatched.noScanAnchor++;
-                  else scanSkip.unmatched.criteria++;
-                }
+                scanSkip.unmatched.criteria++;
                 return null;
               }
 
@@ -1472,8 +958,7 @@
                   let penalty = 0;
                   for (let i = 0; i < slots.length; i++) {
                     if (i === matched.slotIdx) continue;
-                    if (!this._miwSlotLiqAnchor(slots[i]) && !_isPast1Fresh) continue;
-                    if (!slots[i].every(c => checkCrit(c, fr, pec, t))) continue;
+                    if (!slots[i].length || !slots[i].every(c => checkCrit(c, fr, t))) continue;
                     const otherAnnot = slots[i].map(c => _miwAnnotateCrit(c, t));
                     const sc = slots[i].reduce((s, c, j) => s + _cqScaledRank(c, otherAnnot[j]), 0);
                     if (sc < 0) penalty += sc;
@@ -1489,11 +974,8 @@
               : (_richness(b) - _richness(a) || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0))));
           // Slot Blocking runs after hist logging so a blocked type keeps generating the
           // data it needs to recover (see _miwIsEntryBlocked) — it only stops the real open.
-          // Each entry's own matched criteria decide its anchor; Past-1 entries have none
-          // (null), which _miwIsEntryBlocked already treats as "not anchor-blockable" — only
-          // their Include Sign Tags criteria (if any) can still block them.
           const entryPool = pool.filter(e => {
-            const blocked = this._miwIsEntryBlocked(this._miwSlotLiqAnchor(e.criteria), e.annotCrits);
+            const blocked = this._miwIsEntryBlocked(e.annotCrits);
             if (blocked) scanSkip.blocked++;
             return !blocked;
           });
@@ -1504,13 +986,13 @@
 
           if (_miwHalted) return;
 
-          // Reserve-counted headroom: a live liq entry (_miwLiveTryOpen/_miwLiveOpen) can be
-          // mid-open — past its own headroom check, still awaiting its price refetch — at the
-          // exact same moment this scan runs. this.positions.length alone doesn't reflect that
-          // in-flight slot, so both paths would see room and open, overshooting maxPos. _miwPending
-          // is incremented the instant either path commits to an open and released once that
-          // attempt resolves (see _miwOpen/_miwLiveOpen), so it always reflects slots that are
-          // spoken for even before pseudoOpenShort actually pushes them onto this.positions.
+          // Reserve-counted headroom: guards against a substitution path (_miwTrySubstitute) or
+          // this same open loop being mid-open — past its own headroom check, still awaiting a
+          // price refetch — at the exact same moment another scan runs. this.positions.length
+          // alone doesn't reflect that in-flight slot, so both paths would see room and open,
+          // overshooting maxPos. _miwPending is incremented the instant an open is committed to
+          // and released once that attempt resolves (see _miwOpen), so it always reflects slots
+          // that are spoken for even before pseudoOpenShort actually pushes them onto this.positions.
           const _miwInFlight = this._miwPending || 0;
 
           if ((this.positions?.length ?? 0) + _miwInFlight >= this.cfg.maxPos) {
@@ -1537,11 +1019,8 @@
             const fundStep = this.cfg.miwFundStep;
             const posFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 >= fundStep).length;
             const negFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 <= -fundStep).length;
-            const pecHits   = needsPec ? Object.keys(this._miwPecCache||{}).length : 0;
             const volIoNote = needsVolIo ? ` va/ioa-window:${this._pfVolIoWindowAvg?.('vol')!=null?'ready':'warming'}` : '';
-            const pecNote   = needsPec   ? ` pec/vsg:${pecHits}fresh` : '';
-            const liqNote   = ` 0liq:${Object.keys(_allLiqResults).length}surveilled`;
-            this.log(`[MIW] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund}${volIoNote}${pecNote}${liqNote}`, 'info');
+            this.log(`[MIW] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund}${volIoNote}`, 'info');
             return;
           }
 
@@ -1584,50 +1063,12 @@
           if (this.cfg.miwForceGeneralCriteria && this.cfg.miwAutoSlots) {
             criteria = await this._miwTopUpGeneralCriteria(t, criteria);
           }
-          const _liqR = this._liqResults?.[sym];
           const annotCrits = (criteria || []).map(c => {
-            if (/^sliq/.test(c)) { const d = _liqR?.sDepth ?? 0; return `sliq${d >= 0 ? '+' : ''}${d}`; }
-            if (/^bliq/.test(c)) { const d = _liqR?.bDepth ?? 0; return `bliq${d >= 0 ? '+' : ''}${d}`; }
             if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._pfVolIoWindowAvg?.('vol'); const step = this.cfg.miwVaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
             if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._pfVolIoWindowAvg?.('oi'); const step = this.cfg.miwIoaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
             if (/^fund/.test(c)) { const step = this.cfg.miwFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_/step); return `fund${tier>=0?'+':''}${tier}`; }
-            if (/^vsg/.test(c)) { const p = this._miwGetPecSync(t.symbol); const v = p?.vsg; if (!v || v['6h']==null || v['12h']==null || v['24h']==null) return `${c}+0`; const step = this.cfg.miwVsgDepthStep; const high = this.cfg.miwVsgThresholdHigh; const low = this.cfg.miwVsgThresholdLow; let depth = 0; const mid = (high + low) / 2;
- const avg = (v['6h'] + v['12h'] + v['24h']) / 3;
- if (c === 'vsgot' || c === 'vsgalpha' || c === 'vsgmomup') depth = avg - mid;
- else if (c === 'vsgut' || c === 'vsgdelta' || c === 'vsgmomdn') depth = mid - avg; else if (c==='vsgirr') { if (!p.vsgIrr || p.vsgIrr['6h']==null) return `${c}+0`; depth = ((p.vsgIrr['6h']+p.vsgIrr['12h']+p.vsgIrr['24h'])/3) - (this.cfg.miwVsgIrrThreshold); } const tier = Math.max(0, Math.floor(depth/step)); return `${c}+${tier}`; }
             if (/^ocs/.test(c)) { const _a = this._pfOcAccumSkew?.(t.symbol); const _live = this.pfOcResults?.[t.symbol]?.live ? this.pfOcResults[t.symbol] : null; const bc=(_a?.bc||0)+(_live?.bc||0), sc=(_a?.sc||0)+(_live?.sc||0); const tot = bc+sc; const buyPct = tot ? bc/tot*100 : 50; const step = this.cfg.miwOcsStep; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
             if (/^ocx/.test(c)) { const _r = this.pfOcResults?.[t.symbol]; const _w = this._pfOcWindowAvgMs?.(); const step = this.cfg.miwOcxStep; const tier = (_r?.avgMs!=null && _w) ? Math.floor(((_w - _r.avgMs) / _w * 100) / step) : 0; return `ocx${tier>=0?'+':''}${tier}`; }
-            if (/^pec/.test(c)) {
-              const p = this._miwGetPecSync(t.symbol);
-              if (!p || p['6h'] == null || p['12h'] == null || p['24h'] == null) return `${c}+0`;
-              const step = this.cfg.miwPecDepthStep;
-              const high = this.cfg.miwPecThresholdHigh;
-              const low  = this.cfg.miwPecThresholdLow;
-              let depth = 0;
-              const mid = (high + low) / 2;
-              const avg = (p['6h'] + p['12h'] + p['24h']) / 3;
-              if (c === 'pecob' || c === 'pecalpha' || c === 'pecmomup') depth = avg - mid;
-              else if (c === 'pecos' || c === 'pecdelta' || c === 'pecmomdn') depth = mid - avg;
-              else if (c === 'pecirr') { if (!p.pecIrr || p.pecIrr['6h']==null) return c; depth = ((p.pecIrr['6h']+p.pecIrr['12h']+p.pecIrr['24h'])/3) - (this.cfg.miwPecIrrThreshold); }
-              else return c;
-              const tier = Math.max(0, Math.floor(depth/step));
-              return `${c}+${tier}`;
-            }
-            if (/^regime/.test(c)) {
-              const sk = this._pfRegimeSkew?.();
-              if (!sk) return `${c}+0`;
-              const depth = Math.round(Math.abs(sk.skew ?? (sk.sPct - sk.bPct)));
-              return `${c}+${depth}`;
-            }
-            if (/^liqturnover/.test(c)) {
-              const e = (this._miwPecPool || {})[t.symbol];
-              const depth = e ? Math.max(e.sDepth ?? 0, e.bDepth ?? 0) : 0;
-              return `liqturnover+${depth}`;
-            }
-            if (/^liqquiet/.test(c)) {
-              const depth = Math.round(100 - (this._miwLiqActivityPct ?? 0));
-              return `liqquiet+${depth}`;
-            }
             return c;
           });
           // Feeds the Extremity Scorer's sample pool (see _pfDialSample) — this is the
@@ -1643,13 +1084,10 @@
           // as the first, cheaper pass, this is the one that has to hold once the real criteria
           // list is final.
           if (this.cfg.miwForceGeneralCriteria && this.cfg.miwAutoSlots
-              && this._miwIsEntryBlocked(this._miwSlotLiqAnchor(criteria), annotCrits)) {
+              && this._miwIsEntryBlocked(annotCrits)) {
             return false;
           }
-          // Reserve this slot for the duration of the price refetch + open call below — the
-          // live liq path (_miwLiveOpen) does the same awaited refetch against this.positions,
-          // and without a reservation both paths can see identical headroom and open
-          // concurrently, overshooting maxPos (see _miwPending in _miwRunScan/_miwLiveTryOpen).
+          // Reserve this slot for the duration of the price refetch + open call below.
           this._miwPending = (this._miwPending || 0) + 1;
           try {
             try {
@@ -1680,18 +1118,18 @@
         },
 
         // Force-Evaluate General Criteria (see the toggle in the Auto slots panel). Scan-time's
-        // pool build only ever sees whatever PEC/OC data that cycle's capped bulk prefetches
-        // covered — fund, one PEC shape, one VSG shape, and one side each of OCS/OCX/IO/A are
-        // expected to resolve for virtually any ticker once real data exists, so a match can end
-        // up missing several of them purely because the fetch hadn't happened yet, not because
-        // they're actually false. Re-checks exactly those, forced and uncapped, for this one
-        // symbol — cheap here since _miwOpen only ever runs for tickers actually about to open,
-        // never the whole pool — and returns criteria with any newly-true ones appended. Never
-        // drops anything the original match already found, even if it would now read differently.
+        // pool build only ever sees whatever OC data that cycle's capped bulk prefetch covered —
+        // fund and one side each of OCS/OCX/IO/A are expected to resolve for virtually any ticker
+        // once real data exists, so a match can end up missing several of them purely because the
+        // fetch hadn't happened yet, not because they're actually false. Re-checks exactly those,
+        // forced and uncapped, for this one symbol — cheap here since _miwOpen only ever runs for
+        // tickers actually about to open, never the whole pool — and returns criteria with any
+        // newly-true ones appended. Never drops anything the original match already found, even
+        // if it would now read differently.
         async _miwTopUpGeneralCriteria(t, criteria) {
           const sym = t.symbol;
           const have = new Set(criteria);
-          const GENERAL = ['fund', 'pecob', 'pecos', 'pecalpha', 'pecdelta', 'pecmomup', 'pecmomdn','pecirr', 'vsgot', 'vsgut', 'vsgalpha', 'vsgdelta', 'vsgmomup', 'vsgmomdn','vsgirr', 'ocs', 'ocx', 'ioa'];
+          const GENERAL = ['fund', 'ocs', 'ocx', 'ioa'];
           const exclude = new Set(this.cfg.miwAutoSlotExclude || []);
           const missing = GENERAL.filter(c => !have.has(c) && !exclude.has(c));
           if (!missing.length) return criteria;
@@ -1699,10 +1137,8 @@
           const jobs = [];
           // `true` here is the one loophole in the follower's no-own-fetch rule: right before
           // opening, if the leader's shared cache has nothing for this symbol, fetch it directly
-          // rather than opening with PEC/VSG/OC criteria silently unscored. Every other caller of
-          // these two functions leaves the flag off, so scan-time pool building and the live
-          // liq-message handler still fetch nothing on a follower, as before.
-          if (missing.some(c => /^(pec|vsg)/.test(c)) && !this._miwGetPecSync(sym)) jobs.push(this._miwPrefetchPec([sym], true));
+          // rather than opening with OC criteria silently unscored. Every other caller of this
+          // leaves the flag off, so scan-time pool building still fetches nothing on a follower.
           if (missing.some(c => /^(ocs|ocx)/.test(c)) && this.cfg.pfOcEnabled && !this.pfOcResults?.[sym]) {
             jobs.push((async () => {
               const r = await this._ocFetchSingle?.(sym, true);
@@ -1715,101 +1151,13 @@
           if (jobs.length) await Promise.all(jobs);
 
           const fr           = parseFloat(t.fundingRate || 0) * 100;
-          const pec          = this._miwGetPecSync(sym);
           const ocResultsMap = this.pfOcResults?.[sym] ? { [sym]: this.pfOcResults[sym] } : {};
 
-          const appended = missing.filter(c => this._miwCheckCrit(c, fr, pec, t, ocResultsMap));
+          const appended = missing.filter(c => this._miwCheckCrit(c, fr, t, ocResultsMap));
           return appended.length ? [...criteria, ...appended] : criteria;
         },
 
-
-        // Checks the full retained window of Permafrost's closed liq cycles (_liqCycleHistory,
-        // capped at 25 there) rather than just the symbol's most recently closed batch. A ticker
-        // only reads 0-Liq if it appeared at least once within the last miwLiqLookbackCycles
-        // retained cycles and every appearance came back with zero combined turnover. Returns
-        // null (not false) when the symbol never appeared in the window at all — "no data" is
-        // deliberately distinct from "confirmed clean" everywhere this is used.
-        _miwLiqZeroAcrossWindow(sym) {
-          const n = this.cfg.miwLiqLookbackCycles;
-          const cycles = (this._liqCycleHistory || []).slice(-n);
-          let seen = false;
-          for (const cycle of cycles) {
-            const r = (cycle.results || []).find(x => x.sym === sym);
-            if (!r) continue;
-            seen = true;
-            if ((r.sLiqRaw || 0) + (r.bLiqRaw || 0) > 0) return false;
-          }
-          return seen ? true : null;
-        },
-
-        // Non-liquidation criteria only — sliq/bliq/msliq/mbliq are live-only now (see
-        // _miwOnLiqMessage) and never resolve from a closed cycle, so they have no branch here.
-        // 0liq stays here since a zero reading can only ever be confirmed at cycle close.
-        // Shared between the scan-time entry pool and the live liq-message handler, so
-        // ocResults is threaded through as a parameter rather than closed over.
-        // pecalpha/pecdelta/pecmomup/pecmomdn are a mutually exclusive quartet — for any three
-        // strictly-ordered 6h/12h/24h readings, exactly one of the four shape checks below is
-        // true by construction. The gray area only opens up on a tie between two of the three
-        // readings (most commonly a flat-range window, which _miwCalcPecWindow deliberately
-        // returns as exactly 50 rather than dividing by zero) — a tie fails every strict check,
-        // leaving the ticker with no PEC criterion at all despite having entirely valid data.
-        // When that happens, this falls back to nearest-equivalent-by-magnitude: score each
-        // archetype by how close the triple comes to satisfying it (the smaller of its two
-        // defining gaps) and assign whichever comes closest, even if that margin is <=0. This
-        // always lands on the same single winner across all four calls for a given pec object,
-        // so the quartet stays mutually exclusive in the fallback case too.
-        _miwPecShapeMatch(pec, want, irr) {
-          const a = pec['6h'], b = pec['12h'], c = pec['24h'];
-          // A strict monotonic ordering is less believable as genuine momentum once the window
-          // is spikey rather than directional (see _miwCalcPriceIrregular) — above
-          // miwPecIrrThreshold, skip the momup/momdn strict shortcuts below and let the
-          // tie-break scoring decide instead, with momentum's score dampened toward 0 as
-          // irregularity climbs from the threshold to 100.
-          const irrAvg = irr && irr['6h'] != null ? (irr['6h'] + irr['12h'] + irr['24h']) / 3 : null;
-          const irrThresh = this.cfg.miwPecIrrThreshold;
-          const tooSpikey = irrAvg != null && irrAvg > irrThresh;
-          if (b > a && b > c) return want === 'pecalpha';
-          if (b < a && b < c) return want === 'pecdelta';
-          if (!tooSpikey) {
-            if (a > b && b > c) return want === 'pecmomup';
-            if (a < b && b < c) return want === 'pecmomdn';
-          }
-          const momDampen = tooSpikey ? Math.max(0, (100 - irrAvg) / (100 - irrThresh)) : 1;
-          const scores = {
-            pecalpha: Math.min(b - a, b - c),
-            pecdelta: Math.min(a - b, c - b),
-            pecmomup: Math.min(a - b, b - c) * momDampen,
-            pecmomdn: Math.min(b - a, c - b) * momDampen,
-          };
-          const best = Object.entries(scores).reduce((p, n) => n[1] > p[1] ? n : p);
-          return want === best[0];
-        },
-
-        // Same shape-quartet logic as _miwPecShapeMatch, applied to VSG's volume-shape readings
-        // instead of PEC's price-shape ones — see VSG.md.
-        _miwVsgShapeMatch(vsg, want, irr) {
-          const a = vsg['6h'], b = vsg['12h'], c = vsg['24h'];
-          const irrAvg = irr && irr['6h'] != null ? (irr['6h'] + irr['12h'] + irr['24h']) / 3 : null;
-          const irrThresh = this.cfg.miwVsgIrrThreshold;
-          const tooSpikey = irrAvg != null && irrAvg > irrThresh;
-          if (b > a && b > c) return want === 'vsgalpha';
-          if (b < a && b < c) return want === 'vsgdelta';
-          if (!tooSpikey) {
-            if (a > b && b > c) return want === 'vsgmomup';
-            if (a < b && b < c) return want === 'vsgmomdn';
-          }
-          const momDampen = tooSpikey ? Math.max(0, (100 - irrAvg) / (100 - irrThresh)) : 1;
-          const scores = {
-            vsgalpha: Math.min(b - a, b - c),
-            vsgdelta: Math.min(a - b, c - b),
-            vsgmomup: Math.min(a - b, b - c) * momDampen,
-            vsgmomdn: Math.min(b - a, c - b) * momDampen,
-          };
-          const best = Object.entries(scores).reduce((p, n) => n[1] > p[1] ? n : p);
-          return want === best[0];
-        },
-
-        _miwCheckCrit(c, fr, pec, t, ocResults) {
+        _miwCheckCrit(c, fr, t, ocResults) {
           if (/^fund/.test(c)) {
             const step = this.cfg.miwFundStep;
             const tier = Math.floor(fr / step);
@@ -1831,23 +1179,6 @@
             if (!m) return fr !== 0;
             return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
           }
-          if (/^pec/.test(c)) {
-            if (!pec || pec['6h'] == null || pec['12h'] == null || pec['24h'] == null) return false;
-            const high = this.cfg.miwPecThresholdHigh;
-            const low  = this.cfg.miwPecThresholdLow;
-            if (c === 'pecob')   return pec['6h'] > high && pec['12h'] > high && pec['24h'] > high;
-            if (c === 'pecos')   return pec['6h'] < low  && pec['12h'] < low  && pec['24h'] < low;
-            if (c === 'pecalpha') return this._miwPecShapeMatch(pec, 'pecalpha', pec.pecIrr);
-            if (c === 'pecdelta') return this._miwPecShapeMatch(pec, 'pecdelta', pec.pecIrr);
-            if (c === 'pecmomup') return this._miwPecShapeMatch(pec, 'pecmomup', pec.pecIrr);
-            if (c === 'pecmomdn') return this._miwPecShapeMatch(pec, 'pecmomdn', pec.pecIrr);
-            if (c === 'pecirr') {
-              if (!pec.pecIrr || pec.pecIrr['6h'] == null) return false;
-              const irrAvg = (pec.pecIrr['6h'] + pec.pecIrr['12h'] + pec.pecIrr['24h']) / 3;
-              return irrAvg > (this.cfg.miwPecIrrThreshold);
-            }
-            return true;
-          }
           if (/^va/.test(c)) {
             const val = parseFloat(t.turnover24h || 0);
             const windowAvg = this._pfVolIoWindowAvg?.('vol');
@@ -1857,60 +1188,6 @@
             const m = c.match(/^va([<>])(-?\d+)$/);
             if (!m) return true;
             return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
-          }
-          if (/^vsg/.test(c)) {
-            const v = pec?.vsg;
-            if (!v || v['6h'] == null || v['12h'] == null || v['24h'] == null) return false;
-            const high = this.cfg.miwVsgThresholdHigh;
-            const low  = this.cfg.miwVsgThresholdLow;
-            if (c === 'vsgot') return v['6h'] > high && v['12h'] > high && v['24h'] > high;
-            if (c === 'vsgut') return v['6h'] < low  && v['12h'] < low  && v['24h'] < low;
-            if (c === 'vsgalpha') return this._miwVsgShapeMatch(v, 'vsgalpha', pec?.vsgIrr);
-            if (c === 'vsgdelta') return this._miwVsgShapeMatch(v, 'vsgdelta', pec?.vsgIrr);
-            if (c === 'vsgmomup') return this._miwVsgShapeMatch(v, 'vsgmomup', pec?.vsgIrr);
-            if (c === 'vsgmomdn') return this._miwVsgShapeMatch(v, 'vsgmomdn', pec?.vsgIrr);
-            if (c === 'vsgirr') {
-              const irr = pec?.vsgIrr;
-              if (!irr || irr['6h'] == null) return false;
-              const irrAvg = (irr['6h'] + irr['12h'] + irr['24h']) / 3;
-              return irrAvg > (this.cfg.miwVsgIrrThreshold);
-            }
-            return true;
-          }
-          if (/^regime/.test(c)) {
-            // Population-wide liq skew (Permafrost's own _pfRegimeSkew, already recomputed on
-            // demand from _liqCycleHistory for Presence Regime) — not ticker-derived, so it reads
-            // the same for every candidate this cycle. See Regime.md.
-            const sk = this._pfRegimeSkew?.();
-            if (!sk) return false;
-            const dom  = Math.max(sk.sPct, sk.bPct);
-            if (dom < 50) return false;
-            const side = sk.sPct >= sk.bPct ? 's' : 'b';
-            return c === (side === 's' ? 'regimebull' : 'regimebear');
-          }
-          if (c === '0liq') {
-            return this._miwLiqZeroAcrossWindow(t.symbol) === true;
-          }
-          if (/^liqturnover/.test(c)) {
-            // This ticker's own last-closed-batch liquidation depth (same _miwPecPool entry
-            // Past-1 reads — see _miwPast1FreshSymbols) against Permafrost's own sample-derived
-            // high/low cutoffs for the market-wide turnover stream (see DIAL_SINGLE in
-            // Permafrost-Winter). Unproven cutoffs (null) mean nothing qualifies yet, same
-            // "stay conservative until proven" default every other dial uses.
-            const e = (this._miwPecPool || {})[t.symbol];
-            if (!e) return false;
-            const mag = Math.max(e.sDepth ?? 0, e.bDepth ?? 0);
-            const hi = this.pfDialCutoffs?.['liqturnover|pos'];
-            const lo = this.pfDialCutoffs?.['liqturnover|neg'];
-            return (hi != null && mag >= hi) || (lo != null && mag <= lo);
-          }
-          if (/^liqquiet/.test(c)) {
-            // Market-wide "quiet window" read (100 - this cycle's %% of symbols with any
-            // liquidation at all) — same reading for every candidate this cycle, like regime.
-            const pct = 100 - (this._miwLiqActivityPct ?? 0);
-            const hi = this.pfDialCutoffs?.['liqquiet|pos'];
-            const lo = this.pfDialCutoffs?.['liqquiet|neg'];
-            return (hi != null && pct >= hi) || (lo != null && pct <= lo);
           }
           if (/^ioa/.test(c)) {
             const val = parseFloat(t.openInterestValue || 0);
@@ -1966,34 +1243,20 @@
         // Co-Qualifying Penalty scoring for one criterion. Base rank is looked up from the
         // ticker's actual annotated tier (e.g. "fund+3" -> "fund+"), matching exactly how the
         // Extremity Scorer collapses closes into dial-pole buckets (see _pfExtremityBuild in
-        // Permafrost-Winter). sliq/bliq/msliq/mbliq sum both depth directions for a base score,
-        // since sign there reflects depth intensity, not a "good vs bad" direction reversal.
-        // Shared by the scan-time entry pool (runScan) and the live liq-message path
-        // (_miwOnLiqMessage). This drives ticker ordering (compositeScore sort in the entry
+        // Permafrost-Winter). This drives ticker ordering (compositeScore sort in the entry
         // pool) as well as the co-qualification penalty itself. ranksOverride (used by the
         // substitute-check path) still wins when explicitly supplied.
         _miwScaledRank(rawC, annotC, ranksOverride) {
           const ranks = ranksOverride ?? (this.cfg.pfCoQualPenaltyEnabled ? (this.miwCollapsedSlotRanks || {}) : null);
           if (!ranks) return 0;
-          let base;
-          // All four live-liq types fold into one aggregate negative-pole reading against
-          // 0liq's positive pole (see Permafrost's DIAL_POLES) — not four separate per-type
-          // ranks, so all of them read the same 'liveliq+' key regardless of which type.
-          if (/^(?:m?sliq|m?bliq)/.test(rawC)) base = ranks['liveliq+'] ?? 0;
-          else base = ranks[(() => {
-            const annotKey = (annotC || '').replace(/\d+$/, '');
-            const agg = PEC_VSG_AGGREGATE[annotKey.replace(/[+-]$/, '')];
-            // Same regime key-naming mismatch as _miwCritScore ('regimebull+'/'regimebear+'
-            // never equals its own scorecard key 'regimeb+'/'regimes+') — translate here too.
-            const regimeKey = { regimebull: 'regimeb+', regimebear: 'regimes+' }[annotKey.replace(/[+-]$/, '')];
-            return agg || regimeKey || annotKey;
-          })()] ?? 0;
+          const annotKey = (annotC || '').replace(/\d+$/, '');
+          const base = ranks[annotKey] ?? 0;
           if (!base) return 0;
           // Depth = distance past the slot's own gate threshold, in the qualifying direction —
           // NOT raw tier magnitude. For a ">" gate, a higher tier is further past threshold and
-          // deeper. For a "<" gate (vm<N, iot<N, iom<N, ocx<N), a LOWER tier is further past
-          // threshold and deeper — using raw magnitude there would score a barely-qualifying
-          // ticker as "deeper" than one that qualifies strongly, which is backwards.
+          // deeper. For a "<" gate, a LOWER tier is further past threshold and deeper — using
+          // raw magnitude there would score a barely-qualifying ticker as "deeper" than one
+          // that qualifies strongly, which is backwards.
           const annotM = (annotC || '').match(/([+-]?\d+)$/);
           const tierVal = annotM ? parseInt(annotM[1], 10) : 0;
           const gateM = rawC.match(/([<>])(-?\d+)$/);
@@ -2006,424 +1269,37 @@
           return base * (1 + depth * depthPct);
         },
 
-        // Live liquidation criterion match — sliq/bliq/msliq/mbliq only, evaluated against a
-        // depth value already computed from the live message (see calcLiveDepth / _miwOnLiqMessage).
-        // A bare anchor (no depth suffix — always true for Auto Slots, optional for manual)
-        // now qualifies against _miwLiqHighCutoff (floor vs. Extremity's own extreme-high
-        // read on market-wide turnover, whichever is stricter) rather than the flat floor
-        // alone; a manual per-slot suffix is an explicit override and bypasses this.
-        _miwCheckLiveLiqCrit(c, type, depth) {
-          const base = c.match(/^(?:m?sliq|m?bliq)/)?.[0];
-          if (base !== type) return false;
-          const m = c.match(/^(?:m?sliq|m?bliq)([<>])([+-]?\d+)$/);
-          if (!m) return depth >= this._miwLiqHighCutoff();
-          return m[1] === '>' ? depth >= parseInt(m[2], 10) : depth <= parseInt(m[2], 10);
-        },
-
-        // Annotation for a live-triggered slot's criteria — sliq/bliq/msliq/mbliq use the live
-        // depth just computed from the message (never _liqResults, which is closed-cycle only).
-        // Everything else mirrors _miwOpen's cache-based annotation.
-        // Also feeds the Extremity Scorer's sample pool (see _pfDialSample) — this is the
-        // path Extremity Re-Evaluation and live liq messages both go through, so every one of
-        // those readings contributes to the cutoff too, not just scan-time pool building.
-        _miwAnnotateLiveCrit(c, t, liveType, liveDepth, ocResults) {
-          const tag = this._miwAnnotateLiveCritRaw(c, t, liveType, liveDepth, ocResults);
-          this._pfDialSample?.(tag);
-          return tag;
-        },
-        _miwAnnotateLiveCritRaw(c, t, liveType, liveDepth, ocResults) {
-          if (LIQ_TYPES.some(ty => c.startsWith(ty))) return `${liveType}${liveDepth >= 0 ? '+' : ''}${liveDepth}`;
-          if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._pfVolIoWindowAvg?.('vol'); const step = this.cfg.miwVaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
-          if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._pfVolIoWindowAvg?.('oi'); const step = this.cfg.miwIoaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
-          if (/^fund/.test(c)) { const step = this.cfg.miwFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_/step); return `fund${tier>=0?'+':''}${tier}`; }
-          if (/^vsg/.test(c)) { const p = this._miwGetPecSync(t.symbol); const v = p?.vsg; if (!v || v['6h']==null || v['12h']==null || v['24h']==null) return `${c}+0`; const step = this.cfg.miwVsgDepthStep; const high = this.cfg.miwVsgThresholdHigh; const low = this.cfg.miwVsgThresholdLow; let depth = 0; const mid = (high + low) / 2;
- const avg = (v['6h'] + v['12h'] + v['24h']) / 3;
- if (c === 'vsgot' || c === 'vsgalpha' || c === 'vsgmomup') depth = avg - mid;
- else if (c === 'vsgut' || c === 'vsgdelta' || c === 'vsgmomdn') depth = mid - avg; else if (c==='vsgirr') { if (!p.vsgIrr || p.vsgIrr['6h']==null) return `${c}+0`; depth = ((p.vsgIrr['6h']+p.vsgIrr['12h']+p.vsgIrr['24h'])/3) - (this.cfg.miwVsgIrrThreshold); } const tier = Math.max(0, Math.floor(depth/step)); return `${c}+${tier}`; }
-          if (/^ocs/.test(c)) { const _a = this._pfOcAccumSkew?.(t.symbol); const _live = ocResults?.[t.symbol]?.live ? ocResults[t.symbol] : null; const bc=(_a?.bc||0)+(_live?.bc||0), sc=(_a?.sc||0)+(_live?.sc||0); const tot = bc+sc; const buyPct = tot ? bc/tot*100 : 50; const step = this.cfg.miwOcsStep; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
-          if (/^ocx/.test(c)) { const _r = ocResults?.[t.symbol]; const _w = this._pfOcWindowAvgMs?.(); const step = this.cfg.miwOcxStep; const tier = (_r?.avgMs!=null && _w) ? Math.floor(((_w - _r.avgMs) / _w * 100) / step) : 0; return `ocx${tier>=0?'+':''}${tier}`; }
-          if (/^pec/.test(c)) {
-            const p = this._miwGetPecSync(t.symbol);
-            if (!p || p['6h'] == null || p['12h'] == null || p['24h'] == null) return `${c}+0`;
-            const step = this.cfg.miwPecDepthStep;
-            const high = this.cfg.miwPecThresholdHigh;
-            const low  = this.cfg.miwPecThresholdLow;
-            let depth = 0;
-            // PEC is a 1-100 index per timeframe; Extremity scores ONE aggregate reading —
-            // how far the 6h/12h/24h average sits from the high/low midpoint — shared by every
-            // PEC sub-tag, rather than each shape test's own distance formula. Which sub-tag
-            // matched still decides bull vs bear pole (ob/alpha/momup high-leaning, os/delta/
-            // momdn low-leaning); only the MAGNITUDE is now unified across all six.
-            const mid = (high + low) / 2;
-            const avg = (p['6h'] + p['12h'] + p['24h']) / 3;
-            if (c === 'pecob' || c === 'pecalpha' || c === 'pecmomup') depth = avg - mid;
-            else if (c === 'pecos' || c === 'pecdelta' || c === 'pecmomdn') depth = mid - avg;
-            else if (c === 'pecirr') { if (!p.pecIrr || p.pecIrr['6h']==null) return c; depth = ((p.pecIrr['6h']+p.pecIrr['12h']+p.pecIrr['24h'])/3) - (this.cfg.miwPecIrrThreshold); }
-            else return c;
-            const tier = Math.max(0, Math.floor(depth/step));
-            return `${c}+${tier}`;
-          }
-          if (/^regime/.test(c)) {
-            const sk = this._pfRegimeSkew?.();
-            if (!sk) return `${c}+0`;
-            const depth = Math.round(Math.abs(sk.skew ?? (sk.sPct - sk.bPct)));
-              return `${c}+${depth}`;
-          }
-          if (/^liqturnover/.test(c)) {
-            const e = (this._miwPecPool || {})[t.symbol];
-            const depth = e ? Math.max(e.sDepth ?? 0, e.bDepth ?? 0) : 0;
-            return `liqturnover+${depth}`;
-          }
-          if (/^liqquiet/.test(c)) {
-            const depth = Math.round(100 - (this._miwLiqActivityPct ?? 0));
-            return `liqquiet+${depth}`;
-          }
-          return c;
-        },
-
-        // Live liq-message hook — registered via Permafrost's registerLiqMessageHook. Not
-        // scan-gated: fires the instant a message crosses this ticker's slot(s) depth threshold.
-        // Only sliq/bliq/msliq/mbliq route through here — 0liq/past1 are closed-cycle-only and
-        // stay on the regular runScan/checkCrit path. Skipped entirely when 'live' isn't active.
-        async _miwOnLiqMessage(batch, sym) {
-          if (!this.cfg.miwEnabled) return;
-          if (!this._miwEffectivePresenceModes().includes('1')) return;
-          const halted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
-          if (halted) return;
-          if (this._isSymbolBanned?.(sym)) return;
-          if (!halted && this._miwIsReentryBlocked(sym)) return;
-          if (this._miwOpening.has(sym)) return;
-          if ((this.positions || []).some(p => p.symbol === sym)) return;
-
-          const sRaw  = batch.sLiqTurnover?.[sym] || 0;
-          const bRaw  = batch.bLiqTurnover?.[sym] || 0;
-          const total = sRaw + bRaw;
-          if (!total) return;
-          const sPct = sRaw / total, bPct = bRaw / total;
-
-          const type = this._miwClassifyLiqDominance(sPct, bPct);
-          if (!type) return;
-
-          // Tell Ashfall this ticker just produced a live liq event for cross-bot telemetry.
-          // The old partner graylist reaction was extracted with the fade machinery.
-          if (this.cfg.permafrostCrossEnabled) this._pfCrossWrite?.('live-liq', sym);
-
-          const autoMode = !!this.cfg.miwAutoSlots;
-          const isSell = type === 'sliq' || type === 'msliq';
-          const raw    = isSell ? sRaw : bRaw;
-          const avg    = isSell ? (this._liqAvgSTurnover || 0) : (this._liqAvgBTurnover || 0);
-          const depth  = calcLiveDepth(raw, avg);
-
-          const t = (this._lastAllTickers || []).find(x => x.symbol === sym);
-          if (!t) return;
-          const fr      = parseFloat(t.fundingRate || 0) * 100;
-          let pec       = this._miwGetPecSync(sym);
-          // PEC is normally only ever populated for tickers whose liq batch just closed (see
-          // _miwPrefetchPec) — a different population than "this symbol just triggered a live
-          // entry." Unlike kline/OC below, it had no on-demand fallback here at all, so a
-          // live entry could open with fund/OCS/OCX guaranteed but PEC left entirely to chance.
-          if (this.cfg.miwForceGeneralCriteria && !pec) {
-            await this._miwPrefetchPec([sym]);
-            pec = this._miwGetPecSync(sym);
-          }
-
-          this._miwOpening.add(sym);
-          try {
-            if (autoMode) {
-              // Auto's anchor is always bare (no per-slot depth override), so the live-trigger
-              // depth check is a single general-threshold test, done once — not once per combo.
-              if (!this._miwAnchorAllowed(type) || !this._miwCheckLiveLiqCrit(type, type, depth)) return;
-
-              const exclude    = new Set(this.cfg.miwAutoSlotExclude || []);
-              const activeSec  = SECONDARY_CRITS.filter(c => !exclude.has(c));
-              const needsVsg   = activeSec.some(c => /^vsg/.test(c));
-              const needsOc    = activeSec.some(c => /^(ocs|ocx)/.test(c));
-
-              if (needsVsg && !pec) { await this._miwPrefetchPec([sym]); pec = this._miwGetPecSync(sym); }
-              let ocResult = this.pfOcResults?.[sym] ?? null;
-              if (needsOc && !ocResult && this.cfg.pfOcEnabled) ocResult = await this._ocFetchSingle?.(sym) ?? null;
-              const ocResultsMap = ocResult ? { [sym]: ocResult } : {};
-
-              // va/ioa need no live prefetch — the per-ticker value is already on `t`, and the
-              // population average comes from the tethered _pfOcCycleHistory window.
-              const matched = this._miwAutoQualify(
-                type,
-                c => this._miwCheckCrit(c, fr, pec, t, ocResultsMap),
-                c => this._miwAnnotateLiveCrit(c, t, type, depth, ocResultsMap)
-              );
-              if (!matched) return;
-
-              if (halted || this._miwIsEntryBlocked(type, matched.annotCrits)) {
-                return;
-              }
-
-              let compositeScore = 0;
-              if (this.cfg.pfCoQualPenaltyEnabled) {
-                // Every true criterion is already captured — sum directly, same reasoning as
-                // the scan-time path (see the pool-build loop's Auto compositeScore comment).
-                compositeScore = matched.criteria.reduce((s, c, j) => s + this._miwScaledRank(c, matched.annotCrits[j]), 0);
-              }
-              await this._miwLiveTryOpen(t, matched.criteria, matched.annotCrits, compositeScore, type, depth);
-              return;
-            }
-
-            // Manual mode — exact AND-gate combos, unchanged.
-            const candidateSlots = this._miwEffectiveSlots().filter(s => {
-              const anchor = this._miwSlotLiqAnchor(s);
-              return anchor && anchor.startsWith(type);
-            });
-            if (!candidateSlots.length) return;
-
-            for (let i = 0; i < candidateSlots.length; i++) {
-              const slot   = candidateSlots[i];
-              const anchor = this._miwSlotLiqAnchor(slot);
-              if (!this._miwCheckLiveLiqCrit(anchor, type, depth)) continue;
-
-              const secondary  = slot.filter(c => c !== anchor);
-              const needsVsg   = secondary.some(c => /^vsg/.test(c));
-              const needsOc    = secondary.some(c => /^(ocs|ocx)/.test(c));
-
-              if (needsVsg && !pec) { await this._miwPrefetchPec([sym]); pec = this._miwGetPecSync(sym); }
-              // Reuses this symbol's fresh scan-time OC data if it happens to already be in
-              // pfOcResults, but otherwise fetches via the isolated _ocFetchSingle — never
-              // _ocFetchBatch, which would replace the whole shared pfOcResults snapshot other
-              // tickers' checks still need this cycle, and would flood the OC chart's history
-              // with a noisy 1-ticker sample (see _ocFetchSingle's own comment).
-              let ocResult = this.pfOcResults?.[sym] ?? null;
-              if (needsOc && !ocResult && this.cfg.pfOcEnabled) ocResult = await this._ocFetchSingle?.(sym) ?? null;
-              const ocResultsMap = ocResult ? { [sym]: ocResult } : {};
-
-              // va/ioa need no live prefetch — the per-ticker value is already on `t`, and the
-              // population average comes from the tethered _pfOcCycleHistory window.
-              if (!secondary.every(c => this._miwCheckCrit(c, fr, pec, t, ocResultsMap))) continue;
-
-              // Matched — annotate and score against this same-type slot subset. Co-Qualifying
-              // Penalty against slots anchored on a different liq type or 0liq is moot: only one
-              // liq classification can be true for this ticker at this moment, so any such slot
-              // would fail its own anchor check anyway.
-              const annotCrits = slot.map(c => this._miwAnnotateLiveCrit(c, t, type, depth, ocResultsMap));
-
-              // Halted or Slot-Blocked: everything above (banlist, direction lock, cross-win
-              // graylist, criteria match) is exactly what a real entry would have checked, so
-              // this is a genuine match a real entry would have taken were it not blocked — log
-              // it as a hist target and stop, same as the real path does below. Slot Blocking
-              // still lets hist scoring log through it so the score has data to recover with.
-              if (halted || this._miwIsEntryBlocked(anchor, annotCrits)) {
-                return;
-              }
-
-              let compositeScore = 0;
-              if (this.cfg.pfCoQualPenaltyEnabled) {
-                const bestScore = slot.reduce((s, c, j) => s + this._miwScaledRank(c, annotCrits[j]), 0);
-                let penalty = 0;
-                for (let k = 0; k < candidateSlots.length; k++) {
-                  if (k === i) continue;
-                  const other = candidateSlots[k];
-                  if (!this._miwCheckLiveLiqCrit(this._miwSlotLiqAnchor(other), type, depth)) continue;
-                  const otherSecondary = other.filter(c => c !== this._miwSlotLiqAnchor(other));
-                  if (!otherSecondary.every(c => this._miwCheckCrit(c, fr, pec, t, ocResultsMap))) continue;
-                  const otherAnnot = other.map(c => this._miwAnnotateLiveCrit(c, t, type, depth, ocResultsMap));
-                  const sc = other.reduce((s, c, j) => s + this._miwScaledRank(c, otherAnnot[j]), 0);
-                  if (sc < 0) penalty += sc;
-                }
-                compositeScore = bestScore + penalty;
-              }
-
-              await this._miwLiveTryOpen(t, slot, annotCrits, compositeScore, type, depth);
-              return;
-            }
-          } finally {
-            this._miwOpening.delete(sym);
-          }
-        },
-
-        async _miwLiveTryOpen(t, criteria, annotCrits, compositeScore, liqType, depth) {
-          // See _miwRunScan's matching comment — this must count the scan path's in-flight
-          // opens too, or a 0-liq/Past-1 entry mid-refetch (past its own headroom check) is
-          // invisible to this check and both paths open, overshooting maxPos.
-          let headroom = this.cfg.maxPos - (this.positions?.length ?? 0) - (this._miwPending || 0);
-          if (this.cfg.miwShareCapEnabled) {
-            const capSlots = Math.max(1, Math.floor(this.cfg.maxPos * ((this.cfg.miwShareCapPct) / 100)));
-            const miwCount = (this.positions || []).filter(p => p._miw).length;
-            headroom = Math.min(headroom, capSlots - miwCount);
-          }
-          if (headroom >= 1) return await this._miwLiveOpen(t, criteria, annotCrits, compositeScore, liqType, depth);
-          if (!(this.cfg.miwSubstitutionEnabled)) return false;
-          return await this._miwLiveTrySubstitute(t, criteria, annotCrits, compositeScore, liqType, depth);
-        },
-        // Path-B (live) substitution uses the same cross-strategy, score-gated swap test
-        // as the scan-time version — clearing the depth threshold alone isn't sufficient.
-        async _miwLiveTrySubstitute(t, criteria, annotCrits, compositeScore, liqType, depth) {
-          const now            = Date.now();
-          const minAgeMs       = (this.cfg.miwSubstitutionMinAgeMins) * 60000;
-          const protectWinners = this.cfg.miwSubstitutionProtectWinners;
-          const baseMargin     = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
-          const marginThreshold = baseMargin * ((this.cfg.miwSubstitutionMarginPct) / 100);
-
-          const eligible = (this.positions || []).filter(p => {
-            if ((now - (p.openedAt || 0)) < minAgeMs) return false;
-            if (protectWinners && (p.upnl || 0) > 0) return false;
-            return true;
-          });
-          if (!eligible.length) return false;
-
-          const scoreOf = p => p._miw ? (p._miwCompositeScore ?? 0) : -Infinity;
-          eligible.sort((a, b) => scoreOf(a) - scoreOf(b));
-          const worst      = eligible[0];
-          const worstScore = scoreOf(worst);
-          if ((compositeScore - worstScore) < marginThreshold) return false;
-          const _candPrice = parseFloat(t.lastPrice || 0);
-          if (!(await this._miwCandidateOpenFeasible(t.symbol, _candPrice))) {
-            this.log(`[MIW] 🔁 Live Substitution skipped — ${t.symbol} would fail open-time checks (tick precision/notional/leverage) at ${_candPrice} — leaving ${worst.symbol} in place`, 'warn');
-            return false;
-          }
-
-          this.log(`[MIW] 🔁 Live Substitution — closing ${worst.symbol} (score ${worstScore === -Infinity ? 'n/a' : worstScore.toFixed(4)}) for ${t.symbol} (score ${compositeScore.toFixed(4)}), Δ${(compositeScore - worstScore).toFixed(4)} ≥ ${marginThreshold.toFixed(4)} margin`, 'info');
-          await this.pseudoClosePosition(worst, 'substitution');
-          return await this._miwLiveOpen(t, criteria, annotCrits, compositeScore, liqType, depth);
-        },
-
-        // All _miw* tagging fields go into pseudoOpenShort's candidate object (see _miwOpen's
-        // comment above for why — the atomic tag-on-open avoids a momentary "Multi" badge).
-        async _miwLiveOpen(t, criteria, annotCrits, compositeScore, liqType, depth) {
-          const sym = t.symbol;
-          let price = parseFloat(t.lastPrice || 0);
-          if (!price) return false;
-          // Same reservation as _miwOpen — this refetch-then-push is the exact race window a
-          // concurrent scan-time open can slip through in, so hold a slot for its duration.
-          this._miwPending = (this._miwPending || 0) + 1;
-          try {
-            try {
-              const r  = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
-              const d  = await r.json();
-              const lp = parseFloat(d?.result?.list?.[0]?.lastPrice);
-              if (lp > 0) price = lp;
-            } catch(e) {}
-            const change = parseFloat(t.price24hPcnt || 0) * 100;
-            const fr     = parseFloat(t.fundingRate  || 0) * 100;
-            const pos = await this.pseudoOpenShort({
-              symbol: sym, price, change, fundingRate: fr,
-              _miw: true,
-              _miwPathA: false, // live/reactive entry
-              _miwSlotIdx: 0,
-              _miwCompositeScore: compositeScore ?? 0,
-              _miwLiqType: liqType,
-              _miwLiqDepth: depth,
-              _miwCriteria: annotCrits,
-            });
-            if (pos) {
-              this._miwLastEntryTs = Date.now(); // Dead Switch — see _miwDeadSwitchCheck
-              if (typeof this.persist === 'function') this.persist();
-              return true;
-            }
-            return false;
-          } finally {
-            this._miwPending = Math.max(0, (this._miwPending || 0) - 1);
-          }
-        },
-
-        // The liq criterion a slot is anchored on, or null if the slot has none. sliq/bliq/
-        // msliq/mbliq are the live-only anchors; 0liq is the closed-cycle-only anchor. null no
-        // longer means "invalid" outright — it also describes a valid Past-1 slot, IF 'past1' is
-        // an active presence mode (see _miwEffectiveSlots, which is where that distinction gets
-        // made; this function only reports what's literally in the slot).
-        _miwSlotLiqAnchor(slot) {
-          return (slot || []).find(c => LIQ_TYPES.some(t => c.startsWith(t)) || c === '0liq') || null;
-        },
-
-        // Every other reader of the mode should call this, not cfg.miwLiqPresenceModes directly.
-        // Always non-empty — falls back to ['1'] the same way the old single-mode getter did.
-        _miwEffectivePresenceModes() {
-          const m = this.cfg.miwLiqPresenceModes;
-          return Array.isArray(m) && m.length ? m : ['1'];
-        },
-
-        // Multi-select toggle for the Liquidation Presence buttons. Refuses to drop the last
-        // active mode — a slot with no reachable anchor type would never match anything.
-        _miwToggleLiqMode(v) {
-          if (this.cfgLocked) return;
-          const cur = new Set(this._miwEffectivePresenceModes());
-          if (cur.has(v)) {
-            if (cur.size <= 1) return;
-            cur.delete(v);
-          } else {
-            cur.add(v);
-          }
-          this.cfg.miwLiqPresenceModes = ['1','0','past1'].filter(m => cur.has(m));
-          this.persist();
-        },
-
         // Shared collapsed-rank lookup (own + partner + historical PnL, see miwCollapsedSlotRanks)
         // for a single criterion key. Every criterion's rank accumulates under a sign-suffixed key
-        // (e.g. 'sliq+', 'fund-', 'pecob+'), so both variants are summed — PEC is tiered like
-        // fund/vm/iot (always non-negative, '+' only) rather than a bare unsigned key like 0liq.
-        // Regime is just one more dial family now (bull/bear dominance, see _pfExtremityBuild in
-        // Permafrost-Winter) — its old separate 6-bucket live-regime ranks table is retired, this
-        // reads the same flat miwCollapsedSlotRanks every other criterion does.
+        // (e.g. 'fund-', 'va+'), so both variants are summed.
         _miwCritScore(c) {
           const ranks = this.miwCollapsedSlotRanks || {};
-          // All four live-liq types (bare or manually gated, e.g. 'sliq>5') read the same
-          // aggregate 'liveliq+' key — see _miwScaledRank.
-          if (/^(?:m?sliq|m?bliq)/.test(c || '')) return ranks['liveliq+'] ?? 0;
-          const agg = PEC_VSG_AGGREGATE[(c || '').replace(/[+-]$/, '')];
-          if (agg) return ranks[agg] ?? 0;
-          // Regime's raw tag prefix ('regimebull'/'regimebear', with or without a trailing
-          // sign — see _miwIsEntryBlocked's c.replace(/\d+$/, '')) never matches its own
-          // scorecard display key ('regimeb+'/'regimes+' — see dialDisplayKey in
-          // Permafrost-Winter) the way every other criterion's raw tag does, so the generic
-          // lookup below silently read regime as 0 forever. Translate first.
-          const regimeKey = { regimebull: 'regimeb+', regimebear: 'regimes+' }[(c || '').replace(/[+-]$/, '')];
-          if (regimeKey) return ranks[regimeKey] ?? 0;
           return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
         },
 
         // Slot Blocking: true once a criterion's collapsed score is a loss beyond the configured
         // % of base margin. Auto-clears the moment the score recovers — no manual reset needed.
-        // Individual PEC/VSG sub-tags (pecob, pecalpha, pecmomup, ...) block on their OWN
-        // record when Permafrost has one (see _pfExtremityBuild's per-tag pass), not the pooled
-        // 3-way family aggregate _miwCritScore uses for Co-Qualifying Penalty and richness/sort
-        // — a single underperforming sub-tag shouldn't need its whole pooled group to go bad
-        // too before it can block. Every other criterion (fund/va/ioa/ocs/ocx/0liq/live-liq)
-        // already has exactly one tag per pole, so _miwCritScore already gives the right
-        // per-criterion answer for those.
-        // RESOLVED (was TODO(slot-blocking)): root cause was the regime bull/bear key-naming
-        // mismatch after all — same fix as MultiIndicator-Chaser's _micCritScore. See
-        // _miwCritScore above.
         _miwIsCritBlocked(c) {
           if (!this.cfg.miwSlotBlockEnabled) return false;
           const baseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
           const threshold  = baseMargin * ((this.cfg.miwSlotBlockPct) / 100);
-          const isPecVsgSubtag = PEC_VSG_AGGREGATE[(c || '').replace(/[+-]$/, '')] !== undefined;
-          const score = isPecVsgSubtag ? ((this.miwCollapsedSlotRanks || {})[c] ?? 0) : this._miwCritScore(c);
-          return score <= -threshold;
+          return this._miwCritScore(c) <= -threshold;
         },
 
-        // Always checks the triggering liq-anchor type, plus the Extremity Scorer's whole-
-        // ticker lukewarm veto (see _pfExtremityVeto in Permafrost-Winter — "explicitly avoid
-        // any ticker exhibiting lukewarm values", checked here regardless of miwSlotBlockTags
-        // since it's a qualification veto, not a per-criterion block). miwSlotBlockTags
-        // additionally checks every criterion selected in cfg.miwSlotBlockCriteria (see the
-        // Blockable Criteria picker) — configurable rather than a hardcoded set, so any
-        // secondary criterion (including fund) can be opted in. Nothing is blockable by default
-        // beyond the pre-existing PEC/VSG set — see DEFAULT_BLOCKABLE_CRITS.
-        _miwIsEntryBlocked(anchor, annotCrits) {
-          if (this._miwIsCritBlocked(anchor)) return true;
+        // The Extremity Scorer's whole-ticker lukewarm veto (see _pfExtremityVeto in
+        // Permafrost-Winter — "explicitly avoid any ticker exhibiting lukewarm values", checked
+        // here regardless of miwSlotBlockTags since it's a qualification veto, not a
+        // per-criterion block). miwSlotBlockTags additionally checks every criterion selected
+        // in cfg.miwSlotBlockCriteria (see the Blockable Criteria picker) — configurable rather
+        // than a hardcoded set, so any secondary criterion (including fund) can be opted in.
+        // Nothing is blockable by default — see DEFAULT_BLOCKABLE_CRITS.
+        _miwIsEntryBlocked(annotCrits) {
           if (this._pfExtremityVeto?.(annotCrits)) return true;
           if (!this.cfg.miwSlotBlockTags) return false;
           const blockable = (this.cfg.miwSlotBlockCriteria || []).filter(Boolean);
           if (!blockable.length) return false;
           const rx = new RegExp('^(' + blockable.join('|') + ')[+-]');
           return (annotCrits || []).some(c => rx.test(c) ? this._miwIsCritBlocked(c.replace(/\d+$/, '')) : false);
-        },
-
-        // true if this liq anchor is allowed under the current Liquidation Presence modes.
-        // Only ever called with a real criterion (0liq or a live type) — Past-1 has no anchor
-        // criterion, so it's never passed in here; see _miwEffectiveSlots/_miwAutoQualify for
-        // where the 'past1' mode is actually consulted.
-        _miwAnchorAllowed(anchorCrit) {
-          const modes = this._miwEffectivePresenceModes();
-          if (anchorCrit === '0liq') return modes.includes('0');
-          return modes.includes('1'); // sliq/bliq/msliq/mbliq
         },
 
         // Reads the same shared graylist the host writes on every close (any strategy, keyed by
@@ -2438,449 +1314,43 @@
           if ((this.cfg.miwReentryBlockMode) === 'losers') return g.isWin === false;
           return true;
         },
-        // Records closed-batch liquidation stats for PEC freshness and Past-1 candidate lookup.
-        _miwOnLiqClose(results, batch) {
-          // Closed-batch pool: every symbol whose surveillance batch just closed lands here for
-          // miwPecFreshCycles cycles, carrying its dominance stats alongside the timestamp. This
-          // is the shared foundation for two consumers: PEC (see _miwPecFreshCandidates, which
-          // only needs the timestamp) and the past1 liq anchor (see _miwPast1FreshSymbols, which
-          // needs sLiqPct/bLiqPct/sLiqRaw/bLiqRaw/sDepth/bDepth to tell "had some liquidation
-          // but never crossed the live threshold" apart from "genuinely clean"). Tracked unconditionally.
-          if (!this._miwPecPool) this._miwPecPool = {};
-          const _now = Date.now();
-          for (const r of (results || [])) {
-            if (!r?.sym) continue;
-            this._miwPecPool[r.sym] = {
-              ts: _now,
-              sLiqPct: r.sLiqPct ?? 0, bLiqPct: r.bLiqPct ?? 0,
-              sLiqRaw: r.sLiqRaw ?? 0, bLiqRaw: r.bLiqRaw ?? 0,
-              sDepth:  r.sDepth  ?? 0, bDepth:  r.bDepth  ?? 0,
-            };
-            // Feed Permafrost's Extremity sample pool with this cycle's raw liquidation
-            // turnover magnitude — every symbol, every closed batch, regardless of whether it
-            // ends up firing live or Past-1 off of it. This is what _miwLiqHighCutoff/
-            // _miwLiqLowCutoff read to decide entry eligibility below; see Permafrost's
-            // DIAL_SINGLE/liqturnover.
-            // Feed Permafrost's Extremity sample pool with this cycle's raw liquidation
-            // turnover magnitude — every symbol, every closed batch, regardless of whether it
-            // ends up firing live or Past-1 off of it. This is what _miwLiqHighCutoff/
-            // _miwLiqLowCutoff read to decide entry eligibility below; see Permafrost's
-            // DIAL_SINGLE/liqturnover.
-            const _turnover = Math.max(r.sDepth ?? 0, r.bDepth ?? 0);
-            if (_turnover > 0) this._pfDialSample?.(`liqturnover+${_turnover}`);
-          }
-          // Market-wide liquidation-activity read — what share of this batch showed ANY
-          // liquidation at all, regardless of size. Surfaced both as this raw %% (informational,
-          // inside the 0-liq/live-liq score path) AND sampled into its own Extremity dial below
-          // (the inverse, quiet-%%, gated on 100-withLiq%% crossing its own sample-derived
-          // cutoff — see Permafrost's 'liqquiet' family) — a ticker's OWN 0-liq qualification
-          // and score are still unaffected by it either way.
-          if ((results || []).length) {
-            const withLiq = results.filter(r => ((r.sLiqRaw || 0) + (r.bLiqRaw || 0)) > 0).length;
-            this._miwLiqActivityPct = Math.round(100 * withLiq / results.length);
-            this._pfDialSample?.(`liqquiet+${100 - this._miwLiqActivityPct}`);
-          }
-        },
-
-        // Live-fire boundary for the bare (Auto Slot) liq anchor — the greater of the
-        // configured floor (miwLiveDepthThreshold) and the Extremity Scorer's own
-        // sample-derived extreme-high cutoff for market-wide liquidation turnover. An
-        // unproven cutoff (not enough samples yet) falls back to the floor alone, same
-        // "stay conservative until proven" default the rest of the Extremity system uses.
-        // A manual per-slot '>'/'<' gate (see _miwCheckLiveLiqCrit) is an explicit override
-        // and bypasses this entirely.
-        _miwLiqHighCutoff() {
-          const extreme = this.pfDialCutoffs?.['liqturnover|pos'];
-          return extreme != null ? Math.max(this.cfg.miwLiveDepthThreshold, extreme) : this.cfg.miwLiveDepthThreshold;
-        },
-        // Past-1 eligibility floor — the Extremity Scorer's own sample-derived extreme-low
-        // cutoff for market-wide liquidation turnover. Unproven (null) means nothing
-        // qualifies yet, not "everything qualifies" — same default as everywhere else.
-        _miwLiqLowCutoff() {
-          return this.pfDialCutoffs?.['liqturnover|neg'] ?? null;
-        },
-
-        // Retrospective classification of a closed batch's dominance against the same 70%/30%
-        // thresholds _miwOnLiqMessage checks live (sFrac/bFrac as 0-1 fractions). Shared so the
-        // two never drift apart. Returns the live criterion it would have fired, or null.
-        _miwClassifyLiqDominance(sFrac, bFrac) {
-          if (sFrac >= 0.70) return 'sliq';
-          if (bFrac >= 0.70) return 'bliq';
-          if (sFrac > bFrac && bFrac >= 0.30) return 'msliq';
-          if (bFrac > sFrac && sFrac >= 0.30) return 'mbliq';
-          return null;
-        },
-
-        // past1 candidate set: fresh closed-batch entries (same TTL as PEC, uncapped — this is
-        // pure lookup, no fetch) that are liq- — real liquidation happened (sLiqRaw+bLiqRaw > 0,
-        // so not 0-Liq's territory) but land at the EXTREME LOW end of market-wide liquidation
-        // turnover for this sample window (_miwLiqLowCutoff), not merely "somewhere below the
-        // live-fire boundary" as before. A reading between the low and high cutoffs is now
-        // excluded from both pools — genuinely middling turnover no longer qualifies as
-        // anything. This is independent of sell/buy dominance — the 70/30 split
-        // (_miwClassifyLiqDominance) only labels sliq/bliq/msliq/mbliq for the live path and has
-        // no bearing on the liq+/liq-/0-liq classification here. Consumed by the scan loop as
-        // the match gate for anchorless (Past-1) slots — past1 is a path, not a criterion, so
-        // this is never called from checkCrit.
-        _miwPast1FreshSymbols() {
-          const pool = this._miwPecPool || {};
-          const ttl  = (this.cfg.miwPecFreshCycles) * this.cfg.scanMins * 60000;
-          const hi   = this._miwLiqHighCutoff();
-          const lo   = this._miwLiqLowCutoff();
-          const now  = Date.now();
-          const out  = new Set();
-          if (lo == null) return out; // extreme-low not proven yet — nothing qualifies
-          for (const [sym, e] of Object.entries(pool)) {
-            if ((now - e.ts) >= ttl) continue;
-            if ((e.sLiqRaw || 0) + (e.bLiqRaw || 0) <= 0) continue; // no liquidation at all — 0-Liq's territory
-            const maxDepth = Math.max(e.sDepth ?? 0, e.bDepth ?? 0);
-            if (maxDepth >= hi) continue; // liq+ — would have fired live
-            if (maxDepth > lo) continue;  // middling — no longer Past-1 eligible
-            out.add(sym); // liq- — extreme-low turnover
-          }
-          return out;
-        },
-
-        // Retrospective liq+/0-liq/liq- read for Permafrost's Extremity Re-Evaluation of an
-        // already-open 0-liq/live-liq position (see _pfExtremityReEval) — same trichotomy
-        // _miwPast1FreshSymbols uses for Past-1 candidate matching, exposed generically here.
-        // Returns '0liq' (clean across the window), a live-type tag carrying the crossed
-        // depth (the specific type doesn't matter — sliq/bliq/msliq/mbliq all fold into the
-        // same aggregate dial pole, see Permafrost's DIAL_POLES), the LIQ_LUKEWARM sentinel
-        // (real liquidation, at the extreme-low end of market-wide turnover — Past-1/liq-
-        // territory, only asserted while 'past1' is an active Liquidation Presence mode), or
-        // null when there's no fresh closed-batch data this cycle, or the reading is
-        // currently in the unclassified middle band between the two cutoffs.
-        _miwLiqCurrentRead(sym) {
-          if (this._miwLiqZeroAcrossWindow(sym) === true) return '0liq';
-          const e = (this._miwPecPool || {})[sym];
-          if (!e) return null;
-          if ((e.sLiqRaw || 0) + (e.bLiqRaw || 0) <= 0) return null; // stale/no data this window
-          const depth = Math.max(e.sDepth ?? 0, e.bDepth ?? 0);
-          if (depth >= this._miwLiqHighCutoff()) return `sliq${depth >= 0 ? '+' : ''}${depth}`;
-          const lo = this._miwLiqLowCutoff();
-          if (lo != null && depth > 0 && depth <= lo && this._miwEffectivePresenceModes().includes('past1')) return LIQ_LUKEWARM;
-          return null;
-        },
-
         // Auto's minimum-gate qualifier. "Criteria per Slot" (miwAutoSlotSize) is a FLOOR, not a
-        // fixed count: given an anchor (or null for an anchorless Past-1 match), this evaluates
-        // EVERY non-excluded secondary criterion against the ticker and qualifies once at least
-        // (size - 1) of them are true (the full size for Past-1, since there's no anchor slot to
-        // reserve room for). Unlike the old fixed-size combo system, every true criterion is kept
-        // — a ticker exhibiting 5 genuine criteria is scored on all 5, not sliced down to however
+        // fixed count: this evaluates EVERY non-excluded secondary criterion against the ticker
+        // and qualifies once at least that many are true. Every true criterion is kept — a
+        // ticker exhibiting 5 genuine criteria is scored on all 5, not sliced down to however
         // many the slider happens to say. checkFn(c) -> bool and annotFn(c) -> annotated string
-        // are supplied by the caller so this works identically at scan time and live time.
-        _miwAutoQualify(anchor, checkFn, annotFn) {
+        // are supplied by the caller.
+        _miwAutoQualify(checkFn, annotFn) {
           const exclude = new Set(this.cfg.miwAutoSlotExclude || []);
-          const need = Math.max(0, (this.cfg.miwAutoSlotSize) - (anchor ? 1 : 0));
+          const need = Math.max(0, this.cfg.miwAutoSlotSize);
           const trueCrits = [];
           for (const c of SECONDARY_CRITS) {
             if (exclude.has(c)) continue;
             if (checkFn(c)) trueCrits.push(c);
           }
           if (trueCrits.length < need) return null;
-          const criteria = anchor ? [anchor, ...trueCrits] : trueCrits;
-          return { criteria, annotCrits: criteria.map(c => annotFn(c)) };
+          return { criteria: trueCrits, annotCrits: trueCrits.map(c => annotFn(c)) };
         },
 
-        // True if Auto mode could produce a qualifying match at all right now — i.e. at least
-        // one anchor (or Past-1) is reachable under the current presence modes/exclusions, and
-        // enough non-excluded secondary criteria exist to ever reach the minimum. Auto's
-        // equivalent of "any active slots" now that there's no generated slot list to check.
+        // True if Auto mode could produce a qualifying match at all right now — i.e. enough
+        // non-excluded secondary criteria exist to ever reach the minimum. Auto's equivalent of
+        // "any active slots" now that there's no generated slot list to check.
         _miwAutoActive() {
           if (!this.cfg.miwAutoSlots) return false;
           const exclude = new Set(this.cfg.miwAutoSlotExclude || []);
           const secAvail = SECONDARY_CRITS.filter(c => !exclude.has(c)).length;
-          const minAnchored = Math.max(0, (this.cfg.miwAutoSlotSize) - 1);
-          const anchors = ['sliq','bliq','msliq','mbliq','0liq'].filter(c => !exclude.has(c) && this._miwAnchorAllowed(c));
-          if (anchors.length && secAvail >= minAnchored) return true;
-          if (this._miwEffectivePresenceModes().includes('past1') && secAvail >= (this.cfg.miwAutoSlotSize)) return true;
-          return false;
+          return secAvail >= this.cfg.miwAutoSlotSize;
         },
 
         // Manual mode only now — Auto no longer generates a slot list (see _miwAutoQualify).
-        // Liquidation presence is mandatory, but that no longer means every slot needs an
-        // anchor criterion: an anchorless slot is valid exactly when 'past1' is an active
-        // mode (it's a Past-1 slot — see header comment), and an anchored slot is valid when
-        // its specific anchor's mode ('0' or '1') is active.
         _miwEffectiveSlots() {
-          const modes = this._miwEffectivePresenceModes();
-          const filtered = (this.cfg.miwSlots || []).filter(s => s.length > 0).filter(s => {
-            const anchor = this._miwSlotLiqAnchor(s);
-            return anchor ? this._miwAnchorAllowed(anchor) : modes.includes('past1');
-          });
+          const filtered = (this.cfg.miwSlots || []).filter(s => s.length > 0);
           if (!Object.keys(this.miwCollapsedSlotRanks || {}).length) return filtered;
           return filtered.slice().sort((a, b) => {
             const sa = a.reduce((s, c) => s + this._miwCritScore(c), 0);
             const sb = b.reduce((s, c) => s + this._miwCritScore(c), 0);
             return sb - sa;
           });
-        },
-
-        async _miwPrefetchKlines(symbols) {
-          const now           = Date.now();
-          const lastHourStart = Math.floor(now / 3_600_000) * 3_600_000 - 3_600_000;
-          const scanMs        = (this.cfg.scanMins || 15) * 60 * 1000;
-          // Seed from shared klines — entries must be for the current completed hour and within 1 scan cycle
-          const sharedKlines = this._sharedRead('klines_1h_last');
-          const seedCache = {};
-          if (sharedKlines?.data) {
-            for (const sym of symbols) {
-              const e = sharedKlines.data[sym];
-              if (e && e.candleStart >= lastHourStart && e.ts && (now - e.ts) < scanMs) seedCache[sym] = e;
-            }
-          }
-          this._miwKlineCache = { ...seedCache };
-          const toFetch = symbols.filter(sym => !seedCache[sym]);
-          if (this._lfIsFollowing?.()) return; // following — only use what the partner already shared, no own fetch
-          const CONC = 10;
-          for (let i = 0; i < toFetch.length; i += CONC) {
-            await Promise.all(toFetch.slice(i, i + CONC).map(async sym => {
-              try {
-                const r = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=2`);
-                if (!r.ok) return;
-                const d = await r.json();
-                const list = d?.result?.list;
-                if (!list || list.length < 2) return;
-                const candle = list[1];
-                this._miwKlineCache[sym] = {
-                  candleStart: parseInt(candle[0]),
-                  open:   parseFloat(candle[1]),
-                  high:   parseFloat(candle[2]),
-                  low:    parseFloat(candle[3]),
-                  close:  parseFloat(candle[4]),
-                  volume: parseFloat(candle[5]),
-                  ts: now,
-                };
-              } catch(e) {}
-            }));
-          }
-          // Write newly fetched entries to shared
-          const patch = {};
-          for (const sym of toFetch) { if (this._miwKlineCache[sym]) patch[sym] = this._miwKlineCache[sym]; }
-          if (Object.keys(patch).length) this._sharedMerge('klines_1h_last', patch);
-        },
-
-        _miwGetKlineSync(symbol) {
-          return this._miwKlineCache?.[symbol] || null;
-        },
-
-        // PEC candidate pool: tickers whose liq surveillance batch closed within the last
-        // miwPecFreshCycles scan cycles, capped at miwPecScanCap. Draws from the same
-        // _miwPecPool that past1 uses (see _miwOnLiqClose / _miwPast1FreshSymbols) — this is
-        // just PEC's own capped, timestamp-sorted view of it, since fetching costs bandwidth
-        // and past1's lookup doesn't.
-        _miwPecFreshCandidates() {
-          const pool = this._miwPecPool || {};
-          const ttl  = (this.cfg.miwPecFreshCycles) * this.cfg.scanMins * 60000;
-          const cap  = this.cfg.miwPecScanCap;
-          const now  = Date.now();
-          return Object.entries(pool)
-            .filter(([, e]) => (now - e.ts) < ttl)
-            .sort((a, b) => b[1].ts - a[1].ts)
-            .slice(0, cap)
-            .map(([sym]) => sym);
-        },
-
-        _miwPecIntervalMinutes() {
-          const g = this.cfg.miwPecGranularity;
-          return g === '15m' ? 15 : g === '3h' ? 180 : 60;
-        },
-
-        _miwPecCandleCount() {
-          return Math.round(1440 / this._miwPecIntervalMinutes());
-        },
-
-        // Price Effect Coefficient for one window: (Close-Open)/(range), mapped to 0-100
-        // (50=neutral). Close is always the latest completed candle — only Open/range change
-        // per window, so all three timeframes read off the same current price (see PEC.md).
-        // Wick-dampened range uses the average sub-candle range instead of window high/low; since
-        // that can be smaller than the actual |close-open| displacement, P is clamped to ±1.
-        _miwCalcPecWindow(candles, windowCount, dampen) {
-          if (!candles.length) return null;
-          const subset = candles.slice(-windowCount);
-          if (!subset.length) return null;
-          const open  = subset[0].open;
-          const close = candles[candles.length - 1].close;
-          let range;
-          if (dampen) {
-            range = subset.reduce((s, c) => s + (c.high - c.low), 0) / subset.length;
-          } else {
-            range = Math.max(...subset.map(c => c.high)) - Math.min(...subset.map(c => c.low));
-          }
-          if (!(range > 0)) return 50;
-          let p = (close - open) / range;
-          if (p > 1) p = 1; else if (p < -1) p = -1;
-          return p * 50 + 50;
-        },
-
-        // Fetches enough completed candles at miwPecGranularity to cover 24h, then derives the
-        // 6h/12h/24h composite index for each symbol. Seeds from the shared cache first (same
-        // pattern as _miwPrefetchKlines) so MIC doesn't refetch what MIW already pulled this bar.
-        // Volume Shape Graph for one window: (V-VO_t)/(VH_t-VL_t), mapped to 0-100 (50=neutral).
-        // PEC's math applied to volume instead of price — see VSG.md. V is always the latest
-        // completed sub-candle's volume, same one shared across all three windows as PEC's C.
-        // No wick-dampening equivalent (VSG.md flags it but doesn't propose it as default).
-        _miwCalcVsgWindow(candles, windowCount) {
-          if (!candles.length) return null;
-          const subset = candles.slice(-windowCount);
-          if (!subset.length) return null;
-          const vOpen = subset[0].volume;
-          const v     = candles[candles.length - 1].volume;
-          const vHigh = Math.max(...subset.map(c => c.volume));
-          const vLow  = Math.min(...subset.map(c => c.volume));
-          if (!(vHigh > vLow)) return 50;
-          let vp = (v - vOpen) / (vHigh - vLow);
-          if (vp > 1) vp = 1; else if (vp < -1) vp = -1;
-          return vp * 50 + 50;
-        },
-
-        // Price irregularity ("spikiness") for one window — see MultiIndicator-Chaser.html's
-        // _micCalcPriceIrregular for the full derivation (same formula here).
-        _miwCalcPriceIrregular(candles, windowCount) {
-          if (!candles.length) return null;
-          const subset = candles.slice(-windowCount);
-          if (!subset.length) return null;
-          const netRange = Math.max(...subset.map(c => c.high)) - Math.min(...subset.map(c => c.low));
-          const pathSum  = subset.reduce((s, c) => s + (c.high - c.low), 0);
-          if (!(pathSum > 0)) return 50;
-          const efficiency = Math.min(1, netRange / pathSum);
-          return (1 - efficiency) * 100;
-        },
-
-        // Volume irregularity for one window — see MultiIndicator-Chaser.html's
-        // _micCalcVolIrregular for the full derivation (same formula here).
-        _miwCalcVolIrregular(candles, windowCount) {
-          if (!candles.length) return null;
-          const subset = candles.slice(-windowCount);
-          if (subset.length < 2) return null;
-          const vHigh = Math.max(...subset.map(c => c.volume));
-          const vLow  = Math.min(...subset.map(c => c.volume));
-          const netRange = vHigh - vLow;
-          let pathSum = 0;
-          for (let i = 1; i < subset.length; i++) pathSum += Math.abs(subset[i].volume - subset[i-1].volume);
-          if (!(pathSum > 0)) return 50;
-          const efficiency = Math.min(1, netRange / pathSum);
-          return (1 - efficiency) * 100;
-        },
-
-        // Fetches enough completed candles at miwPecGranularity to cover 24h, then derives the
-        // 6h/12h/24h composite index for each symbol. Seeds from the shared cache first (same
-        // pattern as _miwPrefetchKlines) so MIC doesn't refetch what MIW already pulled this bar.
-        async _miwPrefetchPec(symbols, allowOwnFetch = false) {
-          if (!symbols || !symbols.length) return;
-          const gran         = this.cfg.miwPecGranularity;
-          const bybitInterval= gran === '15m' ? '15' : gran === '3h' ? '180' : '60';
-          const intervalMin  = this._miwPecIntervalMinutes();
-          const total        = this._miwPecCandleCount();
-          const barMs        = intervalMin * 60 * 1000;
-          const now          = Date.now();
-          const lastBarStart = Math.floor(now / barMs) * barMs - barMs;
-          const scanMs       = (this.cfg.scanMins || 15) * 60 * 1000;
-          const dampen       = !!this.cfg.miwPecWickDampen;
-          const sharedKey    = `pec_${gran}_last`;
-          const shared       = this._sharedRead(sharedKey);
-          const seedCache    = {};
-          if (shared?.data) {
-            for (const sym of symbols) {
-              const e = shared.data[sym];
-              // candleStart is a deterministic bar-aligned epoch — e.candleStart >= lastBarStart
-              // is already full proof this reading is from the current, still-valid bar, exactly
-              // like the uniCache check just below reasons through. The old `(now - e.ts) <
-              // scanMs` add-on gated on *this bot's own* scanMins instead of the data's actual
-              // validity window (barMs, up to 3h) — so a symbol the leader fetched more than one
-              // scan cycle ago got treated as unusable even though the candle hadn't rolled over,
-              // making shared PEC/VSG/Irregularity coverage look like a coin flip on both bots,
-              // worse for a follower with no fetch of its own to fall back on. `ts` is kept only
-              // as a generous sanity guard against a stale artifact, not as the freshness gate.
-              if (e && e.candleStart >= lastBarStart && e.ts && (now - e.ts) < barMs * 2) seedCache[sym] = e;
-            }
-          }
-          // Permafrost's full-universe PEC/VSG prefetch (Pre-Screening's "PEC/VSG Universe
-          // Weighing") runs in this same page instance and already covers every USDT ticker on
-          // the current bulk-ticker window — seed straight from it before touching the network,
-          // so this narrow path only ever fetches what that pass missed (a symbol outside the
-          // USDT set, a request that failed this cycle, or Universe Weighing being off).
-          // Gated on _pfPecUniverseFetchedAt matching the current bulk window rather than a
-          // scanMs recency check: the candle itself is only ever as fresh as the last completed
-          // bar either way, so what actually matters is whether this reading is from the current
-          // window or a stale prior one, not how many minutes ago it was fetched.
-          const uniCache = this._pfPecUniverseCache;
-          if (uniCache && this._pfPecUniverseFetchedAt === this._lastAllTickersAt) {
-            for (const sym of symbols) {
-              if (seedCache[sym]) continue;
-              const u = uniCache[sym];
-              if (u?.pec?.['6h'] != null) {
-                seedCache[sym] = { '6h': u.pec['6h'], '12h': u.pec['12h'], '24h': u.pec['24h'], vsg: u.vsg, pecIrr: u.pecIrr, vsgIrr: u.vsgIrr, candleStart: lastBarStart, ts: now };
-              }
-            }
-          }
-          if (!this._miwPecCache) this._miwPecCache = {};
-          Object.assign(this._miwPecCache, seedCache);
-          const toFetch = symbols.filter(sym => !seedCache[sym]);
-          // following — only use what's already shared, no own fetch, UNLESS allowOwnFetch (the
-          // pre-entry top-up's loophole — see _miwTopUpGeneralCriteria) and shared/universe cover
-          // was a genuine miss for these symbols.
-          if (this._lfIsFollowing?.() && !allowOwnFetch) return;
-          const CONC = 10;
-          for (let i = 0; i < toFetch.length; i += CONC) {
-            await Promise.all(toFetch.slice(i, i + CONC).map(async sym => {
-              try {
-                const r = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=${bybitInterval}&limit=${total + 1}`);
-                if (!r.ok) return;
-                const d = await r.json();
-                const list = d?.result?.list;
-                if (!list || list.length < 2) return;
-                // list[0] is the current, still-forming candle — drop it. Rest are completed,
-                // newest-first from Bybit; reverse to chronological (oldest -> newest).
-                const completed = list.slice(1).map(c => ({
-                  candleStart: parseInt(c[0]),
-                  open:  parseFloat(c[1]),
-                  high:  parseFloat(c[2]),
-                  low:   parseFloat(c[3]),
-                  close: parseFloat(c[4]),
-                  volume: parseFloat(c[5]),
-                })).reverse();
-                if (!completed.length) return;
-                const per6h  = Math.max(1, Math.round(360  / intervalMin));
-                const per12h = Math.max(1, Math.round(720  / intervalMin));
-                const per24h = Math.max(1, Math.round(1440 / intervalMin));
-                this._miwPecCache[sym] = {
-                  '6h':  this._miwCalcPecWindow(completed, per6h,  dampen),
-                  '12h': this._miwCalcPecWindow(completed, per12h, dampen),
-                  '24h': this._miwCalcPecWindow(completed, per24h, dampen),
-                  // VSG rides this same fetch/cache — no separate fetch path (see VSG.md).
-                  vsg: {
-                    '6h':  this._miwCalcVsgWindow(completed, per6h),
-                    '12h': this._miwCalcVsgWindow(completed, per12h),
-                    '24h': this._miwCalcVsgWindow(completed, per24h),
-                  },
-                  // Irregularity ("spikiness") rides the same fetch too — see
-                  // _miwCalcPriceIrregular/_miwCalcVolIrregular.
-                  pecIrr: {
-                    '6h':  this._miwCalcPriceIrregular(completed, per6h),
-                    '12h': this._miwCalcPriceIrregular(completed, per12h),
-                    '24h': this._miwCalcPriceIrregular(completed, per24h),
-                  },
-                  vsgIrr: {
-                    '6h':  this._miwCalcVolIrregular(completed, per6h),
-                    '12h': this._miwCalcVolIrregular(completed, per12h),
-                    '24h': this._miwCalcVolIrregular(completed, per24h),
-                  },
-                  candleStart: completed[completed.length - 1].candleStart,
-                  ts: now,
-                };
-              } catch (e) {}
-            }));
-          }
-          const patch = {};
-          for (const sym of toFetch) { if (this._miwPecCache[sym]) patch[sym] = this._miwPecCache[sym]; }
-          if (Object.keys(patch).length) this._sharedMerge(sharedKey, patch);
-        },
-
-        _miwGetPecSync(symbol) {
-          return this._miwPecCache?.[symbol] || null;
         },
 
       });
