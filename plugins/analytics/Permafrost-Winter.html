@@ -31,6 +31,12 @@
   'use strict';
 
     const VERSION        = '1.80.1'; // Fix: _pfScoreRead/_pfScoreTrim/_pfScoreWrite/_pfPartnerCounts were dropped from this file in the v1.80.0 cut-down while every call site kept calling them, so _pfExtremityBuild threw on every cycle and Permafrost never opened a position — restored, mirroring Ashfall's. Housekeeping: stale header/Mode-hint text corrected; dead KLINE_LOG_KEY/KLINE_LOG_BYTE_CAP consts dropped.
+    // v1.80.1 — Fixed the Lukewarm Scoring pill board (pfLukewarmScoreboard/_pfExtremityHtml)
+    // netting a two-pole family's '+' and '-' sides into one pill: bucketStats/bucketCount
+    // in _pfExtremityBuild were keyed by info.family alone instead of dk (family+pole), so
+    // e.g. fund+ and fund- occurrences (opposite signals) were combined into a single pill's
+    // total/W-L record. Now keyed by dk and rendered per-pole via pfCritEmoji(dialDisplayKey(...))
+    // instead of the old family-only famEmoji map, so each pole gets its own pill.
     // v1.80.0 — Major cut-down: Wave tab removed entirely (sampling bars, Collective FIO, Liquidation Surveillance/Prospect Pre-Screening/PEC-VSG Universe Weighing, and the whole structure/wave halt-bias engine — _pfFetchStructure/pfStatus/pfWave/pfKlineBar and the gaussian kernel model, all dead weight with no real consumers left). OC Surveillance moved into the Score tab. Cross Broadcast is now always-on (toggle removed); Switchover removed. Extremity Scorer's criteria universe trimmed to fund/V-A/IO-A/OCS/OCX (regime, PEC/VSG, live-liq/0-liq/Past-1, liqturnover/liqquiet all retired). Lukewarm Targeting replaced by Lukewarm Scoring: two buckets (Extreme/Lukewarm) each headlined by aggregate $, with per-criterion pills nested inside — see pfLukewarmScoreboard/_pfExtremityHtml.
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
@@ -900,23 +906,25 @@
                 mag = m2 ? Math.abs(parseInt(m2[1], 10)) : 0;
               }
               const pole = info.pole;
-              const cutoff = cutoffs[info.family + '|' + pole];
+              const dk = info.family + '|' + pole;
+              const cutoff = cutoffs[dk];
               const isExtreme = !Number.isFinite(mag) || (cutoff != null && mag >= cutoff);
 
-              // Lukewarm Scoring: every occurrence lands here, extreme or not.
+              // Lukewarm Scoring: every occurrence lands here, extreme or not. Keyed by dk
+              // (family+pole), not family alone — a two-pole family's '+' and '-' sides are
+              // opposite signals and must not be netted into one pill (see /versioning).
               const bucket = isExtreme ? 'extreme' : 'lukewarm';
               const bCount = bucketCount[bucket];
-              if ((bCount[info.family] = (bCount[info.family] ?? 0) + 1) <= quota) {
+              if ((bCount[dk] = (bCount[dk] ?? 0) + 1) <= quota) {
                 const bStats = bucketStats[bucket];
-                if (!bStats[info.family]) bStats[info.family] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0 };
-                const bs = bStats[info.family];
+                if (!bStats[dk]) bStats[dk] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0 };
+                const bs = bStats[dk];
                 if (counts) { bs.pnl += effectivePnl; if (effectivePnl > 0) bs.wins++; else bs.losses++; }
                 if (!isPartner) { bs.ownPnl += pnl; if (pnl > 0) bs.ownWins++; else bs.ownLosses++; }
               }
 
               if (!isExtreme) continue; // lukewarm — not scored into the blocking-facing dial below
 
-              const dk = info.family + '|' + pole;
               if ((dialCount[dk] = (dialCount[dk] ?? 0) + 1) > quota) continue;
               if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
               const stats = dialStats[dk];
@@ -961,10 +969,14 @@
           this.miwCollapsedCritStats = dispStats;
           this.pfScoreboard = Object.entries(dispStats).sort(([,a],[,b]) => b.pnl - a.pnl).map(([key, s]) => ({ key, ...s }));
           // Lukewarm Scoring display layer — two buckets (Extreme / Lukewarm), each with a
-          // per-family breakdown. See _pfExtremityHtml for the render.
+          // per-pole breakdown (dk = family+pole — see above). See _pfExtremityHtml for the render.
+          const _dkToLukewarmEntry = ([dk, s]) => {
+            const [family, pole] = dk.split('|');
+            return { family, pole, key: dialDisplayKey(family, pole), ...s };
+          };
           this.pfLukewarmScoreboard = {
-            extreme: Object.entries(bucketStats.extreme).sort(([,a],[,b]) => b.pnl - a.pnl).map(([family, s]) => ({ family, ...s })),
-            lukewarm: Object.entries(bucketStats.lukewarm).sort(([,a],[,b]) => b.pnl - a.pnl).map(([family, s]) => ({ family, ...s })),
+            extreme: Object.entries(bucketStats.extreme).sort(([,a],[,b]) => b.pnl - a.pnl).map(_dkToLukewarmEntry),
+            lukewarm: Object.entries(bucketStats.lukewarm).sort(([,a],[,b]) => b.pnl - a.pnl).map(_dkToLukewarmEntry),
           };
         },
         // Which side Lukewarm Scoring currently favors — whichever bucket's total $ (summed
@@ -1084,14 +1096,13 @@
           const val = s => own ? s.ownPnl : s.pnl;
           const wl  = s => own ? [s.ownWins, s.ownLosses] : [s.wins, s.losses];
           const fmt = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2);
-          const famEmoji = { fund: '💸', va: '🔊', ioa: '🎲', ocs: '🔭', ocx: '📡' };
           const smallPill = (s) => {
             const v = val(s);
-            const blocked = this._pfIsCritBlocked(s.family + '+') || this._pfIsCritBlocked(s.family + '-');
+            const blocked = this._pfIsCritBlocked(s.key);
             const color = blocked ? 'rgba(190,130,255,.95)' : v > 0 ? 'rgba(100,220,150,.9)' : v < 0 ? 'var(--short)' : 'var(--text-lo)';
             const [w, l] = wl(s);
-            return `<div title="${s.family}" style="display:flex;flex-direction:column;align-items:center;gap:1px;min-width:0;border:1px solid var(--border);border-radius:10px;background:var(--bg-raised);padding:3px 6px;font-family:var(--mono)">`
-              + `<div style="font-size:9px">${famEmoji[s.family] || s.family}</div>`
+            return `<div title="${s.key}" style="display:flex;flex-direction:column;align-items:center;gap:1px;min-width:0;border:1px solid var(--border);border-radius:10px;background:var(--bg-raised);padding:3px 6px;font-family:var(--mono)">`
+              + `<div style="font-size:9px">${pfCritEmoji(s.key)}</div>`
               + `<div style="font-size:7px;color:${color}"><b>${fmt(v)}</b></div>`
               + `<div style="font-size:5.5px;opacity:.5">${w}W ${l}L</div>`
               + `</div>`;
