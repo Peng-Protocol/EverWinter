@@ -30,7 +30,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '1.80.1'; // Fix: _pfScoreRead/_pfScoreTrim/_pfScoreWrite/_pfPartnerCounts were dropped from this file in the v1.80.0 cut-down while every call site kept calling them, so _pfExtremityBuild threw on every cycle and Permafrost never opened a position — restored, mirroring Ashfall's. Housekeeping: stale header/Mode-hint text corrected; dead KLINE_LOG_KEY/KLINE_LOG_BYTE_CAP consts dropped.
+    const VERSION        = '1.82.0'; // Extremity Scorer fully de-coupled from Ashfall (own-scores-only), reverting the whole v1.81.x combined-scoring line — repeated attempts to make the two sides' totals mirror (sign convention, then shared dial-pool cutoffs) kept surfacing new cross-bot sync issues, so cross-bot reading is removed entirely. EXTREMITY_KEY is now a private key (__ew_pf_extremity_v1, was the shared __everwinter_extremity_v1); _pfScoreRead does a one-time migration pulling this side's own ('winter') records out of the old shared key so existing history survives instead of resetting to empty — Ashfall does the same independently against the same legacy key for its own records, neither side touches the other's half. DIAL_POOL_KEY reverted to private per-side. BIAS_KEY/_pfGetBias and the extremityBias export/import field are gone — no bias, no sign flipping, no shared pool, no gating; each side just aggregates its own trades. CLEAR now zeroes the private key (setItem '[]', not removeItem — removeItem would re-trigger the legacy migration on next read).
     // v1.80.1 — Fixed the Lukewarm Scoring pill board (pfLukewarmScoreboard/_pfExtremityHtml)
     // netting a two-pole family's '+' and '-' sides into one pill: bucketStats/bucketCount
     // in _pfExtremityBuild were keyed by info.family alone instead of dk (family+pole), so
@@ -63,7 +63,6 @@
     pfExtremityEnabled: true,
     pfCoQualPenaltyEnabled: true,
     pfCoQualDepthPct: 10,
-    pfExtremityView: 'combined',
     pfExtremitySplitPct: 25,
     pfExtremityMinSamples: 3,
     pfLukewarmRatioPct: 70,
@@ -74,7 +73,6 @@
     pfExtremitySampleCap: 300,
     pfSpongeQuota: 30,
     pfStaleSlotDays: 7,
-    pfPartnerScoreMode: 'wins',
     pfOcEnabled: true,
     pfOcOrderLimit: 100,
     // Gains Continuation (GC): own rolling 6h PnL, stepped in increments of pfGcThresholdPct
@@ -130,14 +128,24 @@
   // dialInfo below), so the record SHAPE is actually unchanged — but starting clean
   // avoids mixing pre-Extremity history (recorded before any dial cutoff existed) into
   // cutoff math it was never sampled for.
-  const EXTREMITY_KEY  = '__everwinter_extremity_v1';
+  // Extremity records — now private to Permafrost (see /versioning: scorecards fully
+  // separated, own-scores-only, after cross-bot combined scoring proved unreliable in
+  // practice). LEGACY_SHARED_EXTREMITY_KEY is the old cross-bot-shared key from before
+  // this split; _pfScoreRead migrates this side's own records out of it once, below, so
+  // existing history survives instead of resetting to empty. Ashfall does the same
+  // independently against the same legacy key, filtering for its own 'chaser' records —
+  // reading it here never deletes or touches Ashfall's half.
+  const EXTREMITY_KEY  = '__ew_pf_extremity_v1';
+  const LEGACY_SHARED_EXTREMITY_KEY = '__everwinter_extremity_v1';
   const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
-  // pfDialSamplePool's own persistence key — deliberately per-side (not shared with Ashfall
-  // like EXTREMITY_KEY/CROSS_KEY), since the two sides' dial families are computed
-  // independently and have no reason to pool. See _pfLoadDialPool/_pfSaveDialPool.
+  // pfDialSamplePool's persistence key — per-side again (see /versioning): Extremity
+  // Scorer combined-scoring across Ashfall/Permafrost was tried and reverted (mirroring
+  // the two sides' independently-sampled cutoffs and independently-timed closes proved
+  // unreliable in practice), so each bot's dial pool only needs to serve its own cutoffs.
+  // See _pfLoadDialPool/_pfSaveDialPool.
   const DIAL_POOL_KEY = '__ew_pf_dialpool_v1';
   const pfCritEmoji = c => {
-    if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '💸' : '🤑') + s; }
+    if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '🤑' : '💸') + s; }
     if (/^vm/.test(c))   return '🔊' + c.slice(2);
     if (/^va/.test(c))   return '🔊' + c.slice(2);
     if (/^ioa/.test(c))  return '🎲' + c.slice(3);
@@ -381,11 +389,6 @@
                   <input type="number" min="1" step="1" x-model.number="cfg.pfStaleSlotDays" @change="_pfScoreTrim();_pfExtremityBuild();persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="pfr-hint">Slots with no new closes in this many days are fully removed from the scorecard.</div>
                 </div>
-                <div class="g" style="margin-top:8px">
-                  <div class="lbl">Partner Score Push</div>
-                  <button @click="cfg.pfPartnerScoreMode=cfg.pfPartnerScoreMode==='wins'?'losses':cfg.pfPartnerScoreMode==='losses'?'both':'wins';_pfExtremityBuild();persist()" style="font-family:var(--mono);font-size:10px;padding:4px 10px;border-radius:3px;border:1px solid rgba(96,210,255,.35);background:rgba(96,210,255,.08);color:rgba(96,210,255,.9);cursor:pointer;letter-spacing:.5px;margin-top:4px" x-text="cfg.pfPartnerScoreMode==='wins'?'Only Wins':cfg.pfPartnerScoreMode==='losses'?'Only Losses':'Wins/Losses'"></button>
-                  <div class="pfr-hint">Which partner outcomes move a criterion's score. Excluded outcomes still keep the criterion fresh.</div>
-                </div>
                 <label class="tog" style="margin-top:8px">
                   <div class="tog-t" :class="cfg.pfCoQualPenaltyEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.pfCoQualPenaltyEnabled=!cfg.pfCoQualPenaltyEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
@@ -465,16 +468,13 @@
                   <template x-if="c">
                     <span style="display:inline-flex;gap:3px;align-items:center">
                       <span style="font-family:var(--mono);font-size:7.5px;color:rgba(255,80,80,.8)">Sure?</span>
-                      <button @click="localStorage.removeItem('__everwinter_extremity_v1'); _pfExtremityBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
+                      <button @click="localStorage.setItem('__ew_pf_extremity_v1', '[]'); localStorage.removeItem('__ew_pf_dialpool_v1'); pfDialSamplePool={}; _pfExtremityBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
                       <button @click="c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
                     </span>
                   </template>
                 </span>
               </div>
               <div x-html="_pfExtremityHtml(open && cfg.pfExtremityEnabled && (cfg.miwEnabled && _miwPluginLoaded() || (cfg.bewEnabled && _bewPluginLoaded()) || (cfg.ldwEnabled && _ldwPluginLoaded())))" @click="const c=$event.target.closest('[data-slot]');if(c){pfScorecardExpanded=pfScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:6px"></div>
-              <div style="margin-top:5px;display:flex;justify-content:flex-end;gap:4px">
-                <button @click="cfg.pfExtremityView=cfg.pfExtremityView==='combined'?'own':'combined';pfScorecardExpanded=null;persist()" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(96,210,255,.3);background:rgba(96,210,255,.06);color:rgba(96,210,255,.8);cursor:pointer;letter-spacing:.5px" x-text="cfg.pfExtremityView==='own'?'Own':'Combined'"></button>
-              </div>
             </div>
             <div x-show="cfg.pfOcEnabled && (_pfOcCycleHistory||[]).length>0 && _ocChartViable()" style="margin-top:8px" @click.outside="_pfOcHighlightedCycleTs=null">
               <div style="border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
@@ -729,6 +729,17 @@
 
         _pfScoreRead() {
           try {
+            if (localStorage.getItem(EXTREMITY_KEY) === null) {
+              // One-time migration off the old shared key — see the comment on
+              // LEGACY_SHARED_EXTREMITY_KEY above. Runs once: after this, EXTREMITY_KEY
+              // exists (even as '[]') so this branch never fires again.
+              try {
+                const legacyRaw = localStorage.getItem(LEGACY_SHARED_EXTREMITY_KEY);
+                const legacy = legacyRaw ? JSON.parse(legacyRaw) : [];
+                const mine = Array.isArray(legacy) ? legacy.filter(r => r.source === 'winter') : [];
+                localStorage.setItem(EXTREMITY_KEY, JSON.stringify(mine));
+              } catch(_) { localStorage.setItem(EXTREMITY_KEY, '[]'); }
+            }
             const raw = localStorage.getItem(EXTREMITY_KEY);
             if (!raw) return [];
             const cut = Date.now() - SCORE_SAFETY_TTL;
@@ -791,16 +802,6 @@
             localStorage.setItem(EXTREMITY_KEY, JSON.stringify(byteCapped));
             return byteCapped;
           } catch(e) { return null; }
-        },
-        // Gates whether a partner-sourced record's PnL is allowed to move a criterion's score,
-        // per cfg.pfPartnerScoreMode. pnl here is the partner's own realized pnl (positive =
-        // partner won that trade) — not the inverted effectivePnl used downstream. Own-sourced
-        // records are never gated; this only concerns the seesaw between own and partner.
-        _pfPartnerCounts(pnl) {
-          const mode = this.cfg.pfPartnerScoreMode || 'wins';
-          if (mode === 'both') return true;
-          if (mode === 'losses') return pnl < 0;
-          return pnl > 0; // 'wins' (default)
         },
 
         // Feeds the Extremity Scorer's cutoff computation. Called from every criterion
@@ -872,7 +873,12 @@
           const quota = this.cfg.pfSpongeQuota;
           const minSamples = Math.max(3, this.cfg.pfExtremityMinSamples || 3);
           const splitPct = Math.min(0.49, Math.max(0.01, (this.cfg.pfExtremitySplitPct ?? 25) / 100));
-          const sortedRecords = [...records].sort((a, b) => b.ts - a.ts);
+          const sortedRecords = [...records].sort((a, b) => b.ts - a.ts).filter(r => r.source === 'winter');
+          // Scorecards fully separated per side (see /versioning) — Permafrost's Extremity
+          // Scorer only ever aggregates its own closed trades. No cross-bot reading, no
+          // sign flipping, no shared bias/pool needed: partner-sourced records in
+          // EXTREMITY_KEY (if any linger from before this change) are filtered out above
+          // and never reach dialStats/bucketStats/ranks below.
 
           const samplePool = (this.pfDialSamplePool ||= this._pfLoadDialPool());
           const cutoffs = {};
@@ -892,9 +898,7 @@
             const keptCrits = exclude.size ? r.criteria.filter(c => !exclude.has(c)) : r.criteria;
             if (!keptCrits.length) continue;
             const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
-            const isPartner = r.source !== 'winter';
-            const counts = !isPartner || this._pfPartnerCounts(pnl);
-            const effectivePnl = isPartner ? -pnl : pnl;
+            const effectivePnl = pnl; // own-only now (see sortedRecords filter above)
             for (const c of keptCrits) {
               const key = collapseCrit(c);
               const info = dialInfo(key);
@@ -917,30 +921,28 @@
               const bCount = bucketCount[bucket];
               if ((bCount[dk] = (bCount[dk] ?? 0) + 1) <= quota) {
                 const bStats = bucketStats[bucket];
-                if (!bStats[dk]) bStats[dk] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0 };
+                if (!bStats[dk]) bStats[dk] = { pnl: 0, wins: 0, losses: 0 };
                 const bs = bStats[dk];
-                if (counts) { bs.pnl += effectivePnl; if (effectivePnl > 0) bs.wins++; else bs.losses++; }
-                if (!isPartner) { bs.ownPnl += pnl; if (pnl > 0) bs.ownWins++; else bs.ownLosses++; }
+                bs.pnl += effectivePnl; if (effectivePnl > 0) bs.wins++; else bs.losses++;
               }
 
               if (!isExtreme) continue; // lukewarm — not scored into the blocking-facing dial below
 
               if ((dialCount[dk] = (dialCount[dk] ?? 0) + 1) > quota) continue;
-              if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
+              if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, hasHist: false, hasTrade: false };
               const stats = dialStats[dk];
-              if (counts) { stats.pnl += effectivePnl; if (effectivePnl > 0) stats.wins++; else stats.losses++; }
-              if (!isPartner) { stats.ownPnl += pnl; if (pnl > 0) stats.ownWins++; else stats.ownLosses++; }
+              stats.pnl += effectivePnl; if (effectivePnl > 0) stats.wins++; else stats.losses++;
               if (r.hist) stats.hasHist = true; else stats.hasTrade = true;
               const subtagKey = key;
               if (!subtagStats[subtagKey]) subtagStats[subtagKey] = { pnl: 0, wins: 0, losses: 0 };
               const ts = subtagStats[subtagKey];
-              if (counts) { ts.pnl += effectivePnl; if (effectivePnl > 0) ts.wins++; else ts.losses++; }
+              ts.pnl += effectivePnl; if (effectivePnl > 0) ts.wins++; else ts.losses++;
             }
           }
           // A dial can have a proven cutoff (samples exist) but zero closes yet — still needs
           // to show up (0 pnl, real sample count) rather than vanish from the panel/ranks.
           for (const dk of Object.keys(cutoffs)) {
-            if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, ownPnl: 0, ownWins: 0, ownLosses: 0, hasHist: false, hasTrade: false };
+            if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, hasHist: false, hasTrade: false };
           }
           for (const dk of Object.keys(dialStats)) {
             dialStats[dk].cutoff = cutoffs[dk] ?? null;
@@ -1092,9 +1094,8 @@
           if (!shown) return '';
           const board = this.pfLukewarmScoreboard || { extreme: [], lukewarm: [] };
           if (!board.extreme.length && !board.lukewarm.length) return `<span style="font-size:9px;color:var(--text-lo)">No Extremity closes recorded yet.</span>`;
-          const own = (this.cfg.pfExtremityView || 'combined') === 'own';
-          const val = s => own ? s.ownPnl : s.pnl;
-          const wl  = s => own ? [s.ownWins, s.ownLosses] : [s.wins, s.losses];
+          const val = s => s.pnl;
+          const wl  = s => [s.wins, s.losses];
           const fmt = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2);
           const smallPill = (s) => {
             const v = val(s);
