@@ -38,19 +38,19 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.81.1'; // Fix (see Ashfall-Chaser 1.83.1): runScan's per-scan position refresh call simplified — _afPositionCriteriaSample now does its own fresh per-symbol fetch instead of being handed a lookup built from the (potentially hours-stale, per cfg.bulkTickerCooldownHours) bulk allTickers snapshot. Prior: 1.81.0 — Open-Position Rolling-Average Criteria: runScan calls Ashfall's per-position refresh every cycle; positions opened via _micOpen now also store _micRawCriteria alongside _micCriteria so substitution's scoreOf can recompute a live composite score via _micLiveCompositeScore instead of the frozen _micCompositeScore.
+    const VERSION       = '1.82.0'; // Feature: LTA and LPA join the secondary criteria (Auto pool, exclude/blockable pickers, manual-slot gate panel, step chips, top-up); Auto minimum slider now 1-7. Fix: the raw criterion annotator now exists on the class (_micAnnotateCritRaw) — Ashfall's open-position sampler was calling it off `this` while it only lived as a local inside runScan, so no rolling-average sample was ever recorded and closes/Ext-Rvl/substitution silently kept using the frozen entry snapshot. Prior: 1.81.2 — Tweak: UI hints shortened to one line each; Substitution hint now notes the live rolling-average score. Prior: 1.81.1 — Fix (see Ashfall-Chaser 1.83.1): runScan's per-scan position refresh call simplified — _afPositionCriteriaSample now does its own fresh per-symbol fetch instead of being handed a lookup built from the (potentially hours-stale, per cfg.bulkTickerCooldownHours) bulk allTickers snapshot. Prior: 1.81.0 — Open-Position Rolling-Average Criteria: runScan calls Ashfall's per-position refresh every cycle; positions opened via _micOpen now also store _micRawCriteria alongside _micCriteria so substitution's scoreOf can recompute a live composite score via _micLiveCompositeScore instead of the frozen _micCompositeScore.
     // v1.80.0 — Major cut-down (see /versioning): liquidation is no longer the mandatory per-slot anchor — PEC/VSG shape-matching, the live liq-message entry path, closed-batch liq/regime/Past-1 reads, and the whole liq-anchor concept are gone. Slots (Auto or manual) now qualify on any N of the 5 remaining secondary criteria alone: fund, V/A, IO/A, OCS, OCX.
   const DEFAULT_SLOTS = [[]];
   const MIC_HIST_KEY  = '__mic_hist_batches';
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
   // Auto picker, and the Blockable Criteria picker, so all three stay in sync by construction.
-  const SECONDARY_CRITS = ['fund','va','ioa','ocs','ocx'];
+  const SECONDARY_CRITS = ['fund','va','ioa','ocs','ocx','lta','lpa'];
   // Pre-existing "Include Sign Tags" behavior, preserved as the default selection now that the
   // set is configurable — fund is deliberately NOT included by default (see _micIsEntryBlocked),
   // matching the old hardcoded behavior exactly. Opt fund in manually via the picker.
   // va/ioa are blockable by default (unlike the vm/iot/iom they replace, which never were) —
   // population-relative criteria are a much cleaner signal than the old own-ratio ones.
-  const DEFAULT_BLOCKABLE_CRITS = ['va','ioa','ocs','ocx'];
+  const DEFAULT_BLOCKABLE_CRITS = ['va','ioa','ocs','ocx','lta','lpa'];
 
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
@@ -92,13 +92,17 @@
     micIoaStep: 1,
     micOcsStep: 1,
     micOcxStep: 1,
+    // LTA step = % deviation of 1hr turnover from the ticker's own 24h/24 per tier; LPA step =
+    // percentage points of 1hr price change above/below the population mean per tier.
+    micLtaStep: 10,
+    micLpaStep: 0.25,
   });
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
   // -fund = shorts paying = good carry for longs (🤑), bad for shorts (💸).
   // +fund = longs paying = bad for longs (💸), good for shorts (🤑).
-  const CRIT_EMOJI = { 'fund': '💰', 'va': '🔊', 'vm': '🔊', 'ioa': '🎲', 'iot': '🎲', 'iom': '🧲', 'ocs': '🔭', 'ocx': '📡' };
-  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', 'va': 'V/A (volume vs. population sample-window average)', 'vm': 'V/M (vol/mcap ratio) — retired, replaced by V/A', 'ioa': 'IO/A (open interest vs. population sample-window average)', 'iot': 'IO/T (OI vs Turnover) — retired, replaced by IO/A', 'iom': 'IO/M (OI vs MCap) — retired, replaced by IO/A', 'ocs': 'OCS (buy/sell skew %)', 'ocx': 'OCX (% faster/slower than the full-window avg order interval)' };
+  const CRIT_EMOJI = { 'fund': '💰', 'va': '🔊', 'vm': '🔊', 'ioa': '🎲', 'iot': '🎲', 'iom': '🧲', 'ocs': '🔭', 'ocx': '📡', 'lta': '🕐', 'lpa': '💹' };
+  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', 'va': 'V/A (volume vs. population sample-window average)', 'vm': 'V/M (vol/mcap ratio) — retired, replaced by V/A', 'ioa': 'IO/A (open interest vs. population sample-window average)', 'iot': 'IO/T (OI vs Turnover) — retired, replaced by IO/A', 'iom': 'IO/M (OI vs MCap) — retired, replaced by IO/A', 'ocs': 'OCS (buy/sell skew %)', 'ocx': 'OCX (% faster/slower than the full-window avg order interval)', 'lta': 'LTA (1hr turnover vs. the ticker\'s own 24h/24 average)', 'lpa': 'LPA (1hr price change vs. every other ticker in the sample window)' };
   // PEC, VSG, liquidation anchors (S-Liq/B-Liq/mS-Liq/mB-Liq/0-Liq/Past-1), and Regime were all
   // retired in v1.80.0 (see /versioning) — liquidation is no longer fetched or required at all,
   // and PEC/VSG's kline-shape-matching pipeline went with it. Slots now qualify on any N of the
@@ -122,6 +126,8 @@
     if (/^iom/.test(c)) return '🧲' + c.slice(3);
     if (/^ocs/.test(c)) return '🔭' + c.slice(3);
     if (/^ocx/.test(c)) return '📡' + c.slice(3);
+    if (/^lta/.test(c)) return '🕐' + c.slice(3);
+    if (/^lpa/.test(c)) return '💹' + c.slice(3);
     if (/^liqturnover/.test(c)) return '🌊' + c.slice(11);
     if (/^liqquiet/.test(c)) return '🤫' + c.slice(8);
     if (/^pec/.test(c)) { const m = c.match(/^(pec[a-z]+)/); return (CRIT_EMOJI[m ? m[1] : c] || '') + c.replace(/^pec[a-z]+/, ''); }
@@ -175,6 +181,11 @@
     const ocT = c.match(/^(ocs|ocx)([+-]\d+)$/);
     if (ocT) return ocT[1].toUpperCase() + ' t' + ocT[2];
     if (c === 'ocs') return 'OCS'; if (c === 'ocx') return 'OCX';
+    const haM = c.match(/^(lta|lpa)([<>])(-?\d+)$/);
+    if (haM) return haM[1].toUpperCase() + ' ' + haM[2] + haM[3];
+    const haT = c.match(/^(lta|lpa)([+-]-?\d*)$/);
+    if (haT) return haT[1].toUpperCase() + ' t' + haT[2];
+    if (c === 'lta') return 'LTA'; if (c === 'lpa') return 'LPA';
     const PEC_LABEL = { pecob: 'PEC OB', pecos: 'PEC OS', pecalpha: 'PEC Red Mtn', pecdelta: 'PEC Grn Delta', pecmomup: 'PEC Bull-Mom', pecmomdn: 'PEC Bear-Mom', pecirr: 'PEC Irregular' };
     const pM = c.match(/^(pec[a-z]+)([+-]\d+)$/);
     if (pM && PEC_LABEL[pM[1]]) return PEC_LABEL[pM[1]] + ' t' + pM[2];
@@ -254,14 +265,14 @@
 
                   <!-- Auto slots controls -->
                   <div x-show="cfg.micAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(255,150,80,.04);border:1px solid rgba(255,150,80,.12);border-radius:3px">
-                    <div class="lbl">Minimum Criteria per Slot <b x-text="cfg.micAutoSlotSize"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.micAutoSlotSize;const excl=new Set(cfg.micAutoSlotExclude||[]);const secTotal=['fund','va','ioa','ocs','ocx'].filter(c=>!excl.has(c)).length;return 'qualifies on any '+n+' of '+secTotal+' secondary criteria — every one true gets scored, not capped at this minimum.'})()"></span></div>
-                    <input type="range" min="1" max="5" step="1" x-model.number="cfg.micAutoSlotSize" @change="persist()">
+                    <div class="lbl">Minimum Criteria per Slot <b x-text="cfg.micAutoSlotSize"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.micAutoSlotSize;const excl=new Set(cfg.micAutoSlotExclude||[]);const secTotal=['fund','va','ioa','ocs','ocx','lta','lpa'].filter(c=>!excl.has(c)).length;return 'qualifies on any '+n+' of '+secTotal+' secondary criteria — every one true gets scored, not capped at this minimum.'})()"></span></div>
+                    <input type="range" min="1" max="7" step="1" x-model.number="cfg.micAutoSlotSize" @change="persist()">
                     <div class="lbl" style="margin-top:5px;margin-bottom:3px">Exclude from Auto</div>
                     <div class="crit-pick" style="display:flex;flex-wrap:wrap;gap:3px">
-                      <template x-for="c in ['fund','va','ioa','ocs','ocx']" :key="c">
+                      <template x-for="c in ['fund','va','ioa','ocs','ocx','lta','lpa']" :key="c">
                         <button @click.prevent="if(!cfgLocked){ const ex=(cfg.micAutoSlotExclude||[]).slice(); const i=ex.indexOf(c); if(i>=0) ex.splice(i,1); else ex.push(c); cfg.micAutoSlotExclude=ex; persist(); }"
                                 :style="'font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;cursor:pointer;border:1px solid;' + ((cfg.micAutoSlotExclude||[]).includes(c) ? 'border-color:rgba(255,80,80,.5);background:rgba(255,80,80,.15);color:rgba(255,80,80,.8)' : 'border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)')"
-                                x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')">
+                                x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX').replace('lta','LTA').replace('lpa','LPA')">
                         </button>
                       </template>
                     </div>
@@ -270,7 +281,7 @@
                       <div class="tog-t" :class="cfg.micForceGeneralCriteria?'on':''" @click.prevent="if(!cfgLocked){cfg.micForceGeneralCriteria=!cfg.micForceGeneralCriteria;persist()}"><div class="tog-k"></div></div>
                       <div>
                         <div class="tog-l">Force-Evaluate General Criteria</div>
-                        <div class="mic-hint">Forces a fresh per-symbol check of Fund/OCS/OCX before each entry, appending newly-true ones — a few extra requests per open. V/A and IO/A read directly from ticker/population data.</div>
+                        <div class="mic-hint">Forces a fresh per-symbol Fund/OCS/OCX/LTA/LPA check before each entry, appending newly-true ones (a few extra requests).</div>
                       </div>
                     </label>
                   </div>
@@ -285,22 +296,22 @@
                          @click.outside="ratioFocus = null; gateFocus = null; ocFocus = null"
                          style="display:flex;gap:3px;flex-wrap:wrap;align-items:center;margin-bottom:7px;padding:6px 7px;background:rgba(255,255,255,.04);border-radius:3px;border:1px solid rgba(255,255,255,.08)">
                       <span style="font-size:9px;color:var(--text-lo);margin-right:2px">Slot <span x-text="(cfg.micActiveSlot)+1"></span>:</span>
-                      <template x-for="c in ['fund','va','ioa','ocs','ocx']" :key="c">
+                      <template x-for="c in ['fund','va','ioa','ocs','ocx','lta','lpa']" :key="c">
                         <button class="mic-opt"
                           @click.prevent="if(!cfgLocked){
                             if(c==='ioa'){
                               ratioFocus=(ratioFocus===c?null:c); gateFocus=null;
                               if(ratioFocus){ const ex=(cfg.micSlots?.[cfg.micActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^ioa([<>])(-?\d+)$/); if(m){ratioDir=m[1];ratioTier=parseInt(m[2],10)} } }
-                            } else if(c==='fund'||c==='va'){
+                            } else if(c==='fund'||c==='va'||c==='lta'||c==='lpa'){
                               gateFocus=(gateFocus===c?null:c); ratioFocus=null; ocFocus=null;
-                              if(gateFocus){ const ex=(cfg.micSlots?.[cfg.micActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:fund|va)([<>])(-?\d+)$/); if(m){gateDir=m[1];gateTier=parseInt(m[2],10)} } else { gateDir='>'; gateTier=c==='fund'?1:c==='va'?10:25; } }
+                              if(gateFocus){ const ex=(cfg.micSlots?.[cfg.micActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:fund|va|lta|lpa)([<>])(-?\d+)$/); if(m){gateDir=m[1];gateTier=parseInt(m[2],10)} } else { gateDir='>'; gateTier=c==='fund'?1:c==='va'?10:c==='lta'?5:c==='lpa'?2:25; } }
                             } else if(c==='ocs'||c==='ocx'){
                               ocFocus=(ocFocus===c?null:c); ratioFocus=null; gateFocus=null;
                               if(ocFocus){ const ex=(cfg.micSlots?.[cfg.micActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:ocs|ocx)([<>])(-?\d+)$/); if(m){ocDir=m[1];ocVal=parseInt(m[2],10)} } else { ocDir='>'; ocVal=c==='ocs'?50:1; } }
                             } else { ratioFocus=null; gateFocus=null; ocFocus=null; _micToggle(cfg.micActiveSlot, c) }
                           }"
-                          :style="(c==='ioa') ? (ratioFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='va') ? (gateFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ocs'||c==='ocx') ? (ocFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.micSlots?.[cfg.micActiveSlot]||[]).includes(c) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
-                          x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')">
+                          :style="(c==='ioa') ? (ratioFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='va'||c==='lta'||c==='lpa') ? (gateFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ocs'||c==='ocx') ? (ocFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.micSlots?.[cfg.micActiveSlot]||[]).includes(c) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
+                          x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX').replace('lta','LTA').replace('lpa','LPA')">
                         </button>
                       </template>
                       <!-- IO/A tier config panel -->
@@ -321,13 +332,13 @@
                       <!-- Fund/VM/Spike gate config panel -->
                       <div x-show="gateFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(255,150,80,.06);border:1px solid rgba(255,150,80,.2);border-radius:3px">
                         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                          <span style="font-size:9px;color:var(--text-lo)" x-text="({fund:'Fund',va:'V/A'})[gateFocus]||gateFocus"></span>
+                          <span style="font-size:9px;color:var(--text-lo)" x-text="({fund:'Fund',va:'V/A',lta:'LTA',lpa:'LPA'})[gateFocus]||gateFocus"></span>
                           <button @click.prevent="gateDir=(gateDir==='>'?'<':'>')"
                             style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(255,150,80,.1);border:1px solid rgba(255,150,80,.35);border-radius:2px;color:#ff9650;cursor:pointer"
                             x-text="gateDir"></button>
-                          <input type="range" :min="gateFocus==='fund'?-100:0" max="200" step="1" x-model.number="gateTier" style="flex:1;min-width:60px">
+                          <input type="range" :min="(gateFocus==='fund'||gateFocus==='lta'||gateFocus==='lpa')?-100:0" max="200" step="1" x-model.number="gateTier" style="flex:1;min-width:60px">
                           <span style="font-size:9px;color:#ff9650;min-width:52px;text-align:right"
-                            x-text="gateTier+' (≈'+(Math.abs(gateTier)*(gateFocus==='fund'?(cfg.micFundStep):(cfg.micVaStep))).toFixed(2)+'%)'"></span>
+                            x-text="gateTier+' (≈'+(Math.abs(gateTier)*({fund:cfg.micFundStep,va:cfg.micVaStep,lta:cfg.micLtaStep,lpa:cfg.micLpaStep})[gateFocus]).toFixed(2)+'%)'"></span>
                           <button @click.prevent="if(!cfgLocked&&gateFocus){ const slots=(cfg.micSlots||[]).map(s=>[...s]); const si=cfg.micActiveSlot; if(!slots[si]) return; const existIdx=slots[si].findIndex(x=>x.startsWith(gateFocus)); if(existIdx!==-1){ slots[si].splice(existIdx,1); } else { slots[si].push(gateFocus+gateDir+gateTier); } cfg.micSlots=slots; persist?.(); }"
                             :style="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(gateFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,150,80,.1);border:1px solid rgba(255,150,80,.35);color:#ff9650'"
                             x-text="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(gateFocus??'__')) ? 'Remove' : 'Add'">
@@ -359,7 +370,7 @@
                           <div style="font-size:8px;color:var(--text-lo)">Slot <span x-text="i+1"></span></div>
                           <div style="display:flex;flex-direction:column;gap:2px;min-height:14px">
                             <template x-for="c in slot" :key="c">
-                              <span class="mic-crit" x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')"></span>
+                              <span class="mic-crit" x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX').replace('lta','LTA').replace('lpa','LPA')"></span>
                             </template>
                             <span x-show="!slot.length" style="font-size:8px;color:var(--text-lo);font-style:italic">empty</span>
                           </div>
@@ -372,7 +383,7 @@
                         @click.prevent="_micAddSlot()"
                         style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(255,150,80,.06);border:1px dashed rgba(255,150,80,.3);border-radius:3px;color:#ff9650;cursor:pointer">+</button>
                     </div>
-                    <div class="mic-hint" style="margin-top:5px">Each slot is an AND-gate of every criterion listed in it; any matching slot qualifies the ticker. Full timing/data-source details are in the README.</div>
+                    <div class="mic-hint" style="margin-top:5px">A ticker qualifies when it matches every criterion in any one slot.</div>
                     <div class="mic-hint" style="margin-top:5px;line-height:1.8">Badge key: 💸/🤑 Fund · 🔊 V/A · 🎲 IO/A · 🔭 OCS · 📡 OCX — click any tiered criterion to configure gate</div>
                   </div><!-- end manual builder -->
                   <div class="g" style="margin-top:8px">
@@ -396,14 +407,14 @@
                       <div x-show="cfg.micSlotBlockTags" style="margin-top:5px;margin-left:2px">
                         <div class="lbl" style="margin-bottom:3px">Blockable Criteria</div>
                         <div class="crit-pick" style="display:flex;flex-wrap:wrap;gap:3px">
-                          <template x-for="c in ['fund','va','ioa','ocs','ocx']" :key="c">
+                          <template x-for="c in ['fund','va','ioa','ocs','ocx','lta','lpa']" :key="c">
                             <button @click.prevent="if(!cfgLocked){ const bl=(cfg.micSlotBlockCriteria||[]).slice(); const i=bl.indexOf(c); if(i>=0) bl.splice(i,1); else bl.push(c); cfg.micSlotBlockCriteria=bl; persist(); }"
                                     :style="'font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;cursor:pointer;border:1px solid;' + ((cfg.micSlotBlockCriteria||[]).includes(c) ? 'border-color:rgba(255,80,80,.5);background:rgba(255,80,80,.15);color:rgba(255,80,80,.8)' : 'border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)')"
-                                    x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX')">
+                                    x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('ocs','OCS').replace('ocx','OCX').replace('lta','LTA').replace('lpa','LPA')">
                             </button>
                           </template>
                         </div>
-                        <div class="mic-hint" style="margin-top:3px">Blocks entries once a selected criterion's own score crosses the threshold above. Fund is off by default.</div>
+                        <div class="mic-hint" style="margin-top:3px">Blocks once a selected criterion's score crosses the threshold above; Fund is off by default.</div>
                       </div>
                     </div>
                   </div>
@@ -412,7 +423,7 @@
                       <div class="tog-t" :class="cfg.micDeadSwitchEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micDeadSwitchEnabled=!cfg.micDeadSwitchEnabled;persist()}"><div class="tog-k"></div></div>
                       <div>
                         <div class="tog-l">Dead Switch</div>
-                        <div class="mic-hint">Triggers the Drawdown Throttle halt — and bails the open book, same as Drawdown Throttle's own bail — if MIC hasn't made a single new entry in <span x-text="cfg.micDeadSwitchHours ?? 1"></span>h. An idle-time trip, independent of PnL. Bail follows the host's Drawdown Bail toggle (Halt tab).</div>
+                        <div class="mic-hint">Halts entries after <span x-text="cfg.micDeadSwitchHours ?? 1"></span>h with no new MIC entry, and bails the open book if the host's Drawdown Bail is on.</div>
                       </div>
                     </label>
                     <div x-show="cfg.micDeadSwitchEnabled" style="margin-top:5px;margin-left:2px">
@@ -426,7 +437,7 @@
                       <button class="mic-tab" :class="(cfg.micReentryBlockMode)==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.micReentryBlockMode='both';persist()}">Winners + Losers</button>
                       <button class="mic-tab" :class="(cfg.micReentryBlockMode)==='losers'?'on':''" @click.prevent="if(!cfgLocked){cfg.micReentryBlockMode='losers';persist()}">Losers Only</button>
                     </div>
-                    <div class="mic-hint"><b>Winners + Losers</b>: cooldown after any close. <b>Losers Only</b>: winners re-trigger immediately, only losses cool down.</div>
+                    <div class="mic-hint"><b>Winners + Losers</b>: cooldown after any close; <b>Losers Only</b>: only losses cool down.</div>
                   </div>
                 </div><!-- end entry slots section -->
               </div><!-- end entry zone -->
@@ -461,14 +472,14 @@
                   <div class="tog-t" :class="cfg.micSubstitutionEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micSubstitutionEnabled=!cfg.micSubstitutionEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Substitution</div>
-                    <div class="mic-hint">Swaps the worst-scoring held position for a better candidate when no slot is free — needs Co-Qualifying Penalty on to compare scores.</div>
+                    <div class="mic-hint">When no slot is free, swaps the worst position (by live rolling-average score) for a better candidate; needs Co-Qualifying Penalty on.</div>
                   </div>
                 </label>
                 <div x-show="cfg.micSubstitutionEnabled" style="margin-top:8px">
                   <div class="g">
                     <div class="lbl">Margin <b x-text="(cfg.micSubstitutionMarginPct)+'% of base margin'"></b></div>
                     <input type="range" min="5" max="100" step="5" x-model.number="cfg.micSubstitutionMarginPct" @change="persist()">
-                    <div class="mic-hint">How much better (in scorecard $ terms, relative to base margin) the new candidate must score than the worst held position before a swap is made. Prevents thrashing on marginal differences.</div>
+                    <div class="mic-hint">Score edge, as % of base margin, a candidate needs over the worst held position to swap in.</div>
                   </div>
                   <div class="g" style="margin-top:8px">
                     <div class="lbl">Min Age <b x-text="(cfg.micSubstitutionMinAgeMins)+'m'"></b></div>
@@ -489,8 +500,10 @@
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="IO/A" x-text="'🎲 '+(cfg.micIoaStep)+'%'"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="OCS" x-text="'🔭 '+(cfg.micOcsStep)+'%'"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="OCX" x-text="'📡 '+(cfg.micOcxStep)+'%'"></span>
+                    <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="LTA" x-text="'🕐 '+(cfg.micLtaStep)+'%'"></span>
+                    <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="LPA (percentage points of 1hr change)" x-text="'💹 '+(cfg.micLpaStep)+'pp'"></span>
                   </div>
-                  <div class="mic-hint" style="margin-top:4px">One tier equals the listed percentage step. OCX/V-A/IO-A tiers measure percentage deviation from a full-window population average.</div>
+                  <div class="mic-hint" style="margin-top:4px">One tier = the listed step; V/A, IO/A, OCX and LPA measure against the population window, LTA against the ticker's own 24h/24.</div>
                 </div>
               </div><!-- end fetch zone -->
             </div>
@@ -872,6 +885,7 @@
             : [...new Set(slots.flat())];
           const needsVolIo = _critPool.some(c => /^(va|ioa)/.test(c));
           const needsOc    = _critPool.some(c => /^(ocs|ocx)/.test(c));
+          const needsHr    = _critPool.some(c => /^(lta|lpa)/.test(c));
           const scanSkip = {
             excluded: { nonUsdt: 0, btc: 0, lowPrice: 0, active: 0, banned: 0, reentry: 0, },
             unmatched: { criteria: 0 },
@@ -892,7 +906,7 @@
           // when a slot actually uses ocs/ocx. Stateless — no accumulation across cycles, no
           // cross-ticker mean required for OCX. A ticker missing from this sample simply fails
           // the ocs/ocx criterion in checkCrit — it no longer blocks the rest of the pool.
-          if ((needsOc || needsVolIo) && this.cfg.afOcEnabled) {
+          if ((needsOc || needsVolIo || needsHr) && this.cfg.afOcEnabled) {
             const ocCap = 25;
             let fillSyms = basePool.map(t => t.symbol);
             for (let i = fillSyms.length - 1; i > 0; i--) {
@@ -904,7 +918,7 @@
             // same tethered cycle history alongside OC (see _ocFetchBatch, Option A design).
             const volIoMap = {};
             for (const t of allTickers) volIoMap[t.symbol] = { vol: parseFloat(t.turnover24h || 0) || null, oi: parseFloat(t.openInterestValue || 0) || null };
-            await this._ocFetchBatch(ocSyms, volIoMap, needsOc);
+            await this._ocFetchBatch(ocSyms, volIoMap, needsOc, needsHr);
           }
           const _afOcResults = this.afOcResults || {};
 
@@ -926,14 +940,10 @@
             this._afDialSample?.(tag);
             return tag;
           };
-          const _micAnnotateCritRaw = (c, t) => {
-            if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._afVolIoWindowAvg?.('vol'); const step = this.cfg.micVaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
-            if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._afVolIoWindowAvg?.('oi'); const step = this.cfg.micIoaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
-            if (/^fund/.test(c)) { const step = this.cfg.micFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_ / step); return `fund${tier>=0?'+':''}${tier}`; }
-            if (/^ocs/.test(c)) { const _a = this._afOcAccumSkew?.(t.symbol); const _live = this.afOcResults?.[t.symbol]?.live ? this.afOcResults[t.symbol] : null; const bc=(_a?.bc||0)+(_live?.bc||0), sc=(_a?.sc||0)+(_live?.sc||0); const tot = bc+sc; const buyPct = tot ? bc/tot*100 : 50; const step = this.cfg.micOcsStep; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
-            if (/^ocx/.test(c)) { const _r = this.afOcResults?.[t.symbol]; const _w = this._afOcWindowAvgMs?.(); const step = this.cfg.micOcxStep; const tier = (_r?.avgMs!=null && _w) ? Math.floor(((_w - _r.avgMs) / _w * 100) / step) : 0; return `ocx${tier>=0?'+':''}${tier}`; }
-            return c;
-          };
+          // Delegates to the class-level _micAnnotateCritRaw (also called by Ashfall's open-position
+          // sampler, which reads it off `this`). Only lta/lpa can come back null (no 1hr candle yet) —
+          // by the time a criterion reaches here checkCrit already passed, so fall back to a neutral tier.
+          const _micAnnotateCritRaw = (c, t) => this._micAnnotateCritRaw(c, t) ?? (c + '+0');
           // Richness score for sort priority when Co-Qual is off — sum of each matched
           // criterion's own collapsed rank, so capacity still favors historically-stronger
           // tickers even without Co-Qual scoring turned on.
@@ -1040,7 +1050,7 @@
             const posFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 >= fundStep).length;
             const negFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 <= -fundStep).length;
             const volIoNote = needsVolIo ? ` va/ioa-window:${this._afVolIoWindowAvg?.('vol')!=null?'ready':'warming'}` : '';
-            this.log(`[MIC] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund}${volIoNote}`, 'info');
+            this.log(`[MIC] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund}${volIoNote}${needsHr ? ` lta/lpa-window:${this._afWindowStats?.('lpa')?.n ? 'ready' : 'warming'}` : ''}`, 'info');
             return;
           }
 
@@ -1083,14 +1093,7 @@
           if (this.cfg.micForceGeneralCriteria && this.cfg.micAutoSlots) {
             criteria = await this._micTopUpGeneralCriteria(t, criteria);
           }
-          const annotCrits = (criteria || []).map(c => {
-            if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._afVolIoWindowAvg?.('vol'); const step = this.cfg.micVaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
-            if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._afVolIoWindowAvg?.('oi'); const step = this.cfg.micIoaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
-            if (/^fund/.test(c)) { const step = this.cfg.micFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_/step); return `fund${tier>=0?'+':''}${tier}`; }
-            if (/^ocs/.test(c)) { const _a = this._afOcAccumSkew?.(t.symbol); const _live = this.afOcResults?.[t.symbol]?.live ? this.afOcResults[t.symbol] : null; const bc=(_a?.bc||0)+(_live?.bc||0), sc=(_a?.sc||0)+(_live?.sc||0); const tot = bc+sc; const buyPct = tot ? bc/tot*100 : 50; const step = this.cfg.micOcsStep; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
-            if (/^ocx/.test(c)) { const _r = this.afOcResults?.[t.symbol]; const _w = this._afOcWindowAvgMs?.(); const step = this.cfg.micOcxStep; const tier = (_r?.avgMs!=null && _w) ? Math.floor(((_w - _r.avgMs) / _w * 100) / step) : 0; return `ocx${tier>=0?'+':''}${tier}`; }
-            return c;
-          });
+          const annotCrits = (criteria || []).map(c => this._micAnnotateCritRaw(c, t) ?? (c + '+0'));
           // Feeds the Extremity Scorer's sample pool (see _afDialSample) — this is the
           // actual-open annotation path, not just scan-time pool building, so a position's
           // own qualifying readings count toward the cutoff too.
@@ -1151,7 +1154,7 @@
         async _micTopUpGeneralCriteria(t, criteria) {
           const sym = t.symbol;
           const have = new Set(criteria);
-          const GENERAL = ['fund', 'ocs', 'ocx', 'ioa'];
+          const GENERAL = ['fund', 'ocs', 'ocx', 'ioa', 'lta', 'lpa'];
           const exclude = new Set(this.cfg.micAutoSlotExclude || []);
           const missing = GENERAL.filter(c => !have.has(c) && !exclude.has(c));
           if (!missing.length) return criteria;
@@ -1167,6 +1170,11 @@
               if (r) { if (!this.afOcResults) this.afOcResults = {}; this.afOcResults[sym] = r; }
             })());
           }
+          // lta/lpa: same loophole as ocs/ocx above — only fetch this symbol's 1hr candle when
+          // nothing (own cache or the leader's shared batch) already has it.
+          if (missing.some(c => /^(lta|lpa)/.test(c)) && !this._afHourReading?.(sym)) {
+            jobs.push(this._afHourCandle?.(sym));
+          }
           // ioa needs no top-up fetch — the per-ticker value (t.openInterestValue) is already on
           // the ticker payload, and the population average it's compared against comes from the
           // tethered _pfOcCycleHistory/_afOcCycleHistory window, not a per-symbol lookup.
@@ -1177,6 +1185,38 @@
 
           const appended = missing.filter(c => this._micCheckCrit(c, fr, t, ocResultsMap));
           return appended.length ? [...criteria, ...appended] : criteria;
+        },
+
+        // Raw criterion annotation for one ticker — the single source for scan-time pool
+        // building, _micOpen, and Ashfall's per-scan open-position sampler (which calls it as
+        // this._micAnnotateCritRaw; until v1.82.0 it only existed as a local inside runScan, so
+        // that sampler's optional call quietly returned undefined and no rolling-average
+        // sample was ever recorded). Returns null only for lta/lpa when no 1hr candle is
+        // available for the ticker yet.
+        _micAnnotateCritRaw(c, t) {
+          if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._afVolIoWindowAvg?.('vol'); const step = this.cfg.micVaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
+          if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._afVolIoWindowAvg?.('oi'); const step = this.cfg.micIoaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
+          if (/^fund/.test(c)) { const step = this.cfg.micFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_ / step); return `fund${tier>=0?'+':''}${tier}`; }
+          if (/^ocs/.test(c)) { const _a = this._afOcAccumSkew?.(t.symbol); const _live = this.afOcResults?.[t.symbol]?.live ? this.afOcResults[t.symbol] : null; const bc=(_a?.bc||0)+(_live?.bc||0), sc=(_a?.sc||0)+(_live?.sc||0); const tot = bc+sc; const buyPct = tot ? bc/tot*100 : 50; const step = this.cfg.micOcsStep; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
+          if (/^ocx/.test(c)) { const _r = this.afOcResults?.[t.symbol]; const _w = this._afOcWindowAvgMs?.(); const step = this.cfg.micOcxStep; const tier = (_r?.avgMs!=null && _w) ? Math.floor(((_w - _r.avgMs) / _w * 100) / step) : 0; return `ocx${tier>=0?'+':''}${tier}`; }
+          if (/^lta/.test(c)) { const tier = this._micHourTier('lta', t); return tier == null ? null : `lta${tier>=0?'+':''}${tier}`; }
+          if (/^lpa/.test(c)) { const tier = this._micHourTier('lpa', t); return tier == null ? null : `lpa${tier>=0?'+':''}${tier}`; }
+          return c;
+        },
+        // LTA/LPA tier for one ticker, or null when its 1hr candle (or, for LPA, the window
+        // baseline) isn't available. LTA: % deviation of last-hour turnover from the ticker's own
+        // 24h/24, per micLtaStep. LPA: percentage-point gap between its 1hr price change and the
+        // mean of every other ticker in the window, per micLpaStep.
+        _micHourTier(kind, t) {
+          const hr = this._afHourReading?.(t.symbol);
+          if (!hr) return null;
+          if (kind === 'lta') {
+            const dev = this._afLtaDev?.(hr.ht, t.turnover24h);
+            return dev == null ? null : Math.floor(dev / this.cfg.micLtaStep);
+          }
+          const avg = this._afLpaWindowAvg?.(t.symbol);
+          if (avg == null || typeof hr.hc !== 'number') return null;
+          return Math.floor((hr.hc - avg) / this.cfg.micLpaStep);
         },
 
         _micCheckCrit(c, fr, t, ocResults) {
@@ -1258,6 +1298,13 @@
               const tier = Math.floor(pctDev / step);
               return dir === '>' ? tier >= val : tier <= val;
             }
+          }
+          if (/^(lta|lpa)/.test(c)) {
+            const tier = this._micHourTier(c.slice(0, 3), t);
+            if (tier == null) return false;
+            const m = c.match(/^(?:lta|lpa)([<>])(-?\d+)$/);
+            if (!m) return true;
+            return m[1] === '>' ? tier >= parseInt(m[2], 10) : tier <= parseInt(m[2], 10);
           }
           return false;
         },

@@ -17,7 +17,8 @@
   on the partner's winning streak (GC).
 
   Order Count Surveillance supplies the OC/volume/OI population samples that
-  MIC's ocs, ocx, va and ioa criteria are all measured against.
+  MIC's ocs, ocx, va, ioa, lta and lpa criteria are all measured against (lta/lpa read the
+  1hr candle fetched per sampled ticker, see _afHourCandle).
 
   The scorer is direction-agnostic: it only learns what realized PnL says
   about this installation — the same logic powers Permafrost on PseudoWinter.
@@ -30,7 +31,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '1.83.1'; // Fix: _afPositionCriteriaSample was reading fund/va/ioa off this._lastAllTickers, the bulk snapshot cached for cfg.bulkTickerCooldownHours (default 1h, user runs 3h) and reused across every scan in between — most "rolling average" samples were just the same stale number repeated, not real drift. Now does its own fresh per-symbol ticker fetch each scan (via _qFetch, still exempt from the follower no-own-fetch rule — same handful-of-symbols reasoning as the ocs/ocx fetch it already did this way). Prior: 1.83.0 — Open-Position Rolling-Average Criteria: replaces the frozen entry-time snapshot (_micCriteria/_becCriteria/_ldcCriteria) with a per-position rolling average, refreshed every scan (no new poller/timer), feeding close-time scoring, Extremity Re-Evaluation, and MIC substitution's live score; also fixed Re-Evaluation calling the never-defined _micAnnotateLiveCrit.
+    const VERSION        = '1.84.3'; // Tweak: OC chip styling now reads the chart's two measures separately — outline lights when the ticker's order interval is faster than the batch mean (same test as the bars), body fills when its skew leans to this bot's favored side. Previously every chip compared order COUNT to the batch mean, and since each ticker samples the same number of trades, nearly all chips lit up identically. Prior: 1.84.2 — Fix: the Total/Batch/avg readout lines used a string :style binding, which Alpine applies as the whole style attribute — it wiped their font-family/size/margin, so every chart's summary rendered large and bold. Now an object binding (colour only, merged with the static style). Prior: 1.84.1 — Tweak: OC chart cleanup — dropped the redundant order/ticker counts from the summary; OC mode now shows Total (whole-window skew + avg interval) above Batch; per-ticker pills show only the dominant side and a bare interval ("PROVE B77 4.4s"), full values on hover or tap. Prior: 1.84.0 — Feature: LTA (1hr turnover vs own 24h/24) and LPA (1hr price change vs population) criteria — last-completed-hour candle per sampled ticker, cached one fetch per ticker per hour; both join the Extremity Scorer. OC chart views now rotate through OC/Vol/IO/LTA/LPA with prev/next buttons named for the neighbouring view, signed (zero-line) axis for LTA/LPA, and a Total avg readout above the per-batch one. Ported _afWindowStats so V/A, IO/A, LPA and the readout share one deduped, memoized window read. Prior: 1.83.2 — Tweak: UI hints shortened to one line each; Extremity/Re-Eval/sample-floor/OC hints now describe the per-position rolling-average criteria (Re-Eval hint no longer claims 'no extra fetches'). Prior: 1.83.1 — Fix: _afPositionCriteriaSample was reading fund/va/ioa off this._lastAllTickers, the bulk snapshot cached for cfg.bulkTickerCooldownHours (default 1h, user runs 3h) and reused across every scan in between — most "rolling average" samples were just the same stale number repeated, not real drift. Now does its own fresh per-symbol ticker fetch each scan (via _qFetch, still exempt from the follower no-own-fetch rule — same handful-of-symbols reasoning as the ocs/ocx fetch it already did this way). Prior: 1.83.0 — Open-Position Rolling-Average Criteria: replaces the frozen entry-time snapshot (_micCriteria/_becCriteria/_ldcCriteria) with a per-position rolling average, refreshed every scan (no new poller/timer), feeding close-time scoring, Extremity Re-Evaluation, and MIC substitution's live score; also fixed Re-Evaluation calling the never-defined _micAnnotateLiveCrit.
     // v1.80.1 — Fixed the Lukewarm Scoring pill board (afLukewarmScoreboard/_afExtremityHtml)
     // netting a two-pole family's '+' and '-' sides into one pill: bucketStats/bucketCount
     // in _afExtremityBuild were keyed by info.family alone instead of dk (family+pole), so
@@ -142,6 +143,10 @@
   // unreliable in practice), so each bot's dial pool only needs to serve its own cutoffs.
   // See _afLoadDialPool/_afSaveDialPool.
   const DIAL_POOL_KEY = '__ew_af_dialpool_v1';
+  // Non-reactive on purpose: both are read from inside x-text/x-html renders, and writing
+  // reactive state from a render effect would re-trigger that same effect.
+  const WIN_MEMO   = {}; // field -> { key, val } — memo for _afWindowStats
+  const HOUR_CACHE = {}; // sym -> { start, ht, hc } — last-completed-hour candle, one fetch per ticker per hour
   const afCritEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '🤑' : '💸') + s; }
     if (/^vm/.test(c))   return '🔊' + c.slice(2);
@@ -160,6 +165,8 @@
     if (/^iom/.test(c))  return '🧲' + c.slice(3);
     if (/^ocs/.test(c))  return '🔭' + c.slice(3);
     if (/^ocx/.test(c))  return '📡' + c.slice(3);
+    if (/^lta/.test(c))  return '🕐' + c.slice(3);
+    if (/^lpa/.test(c))  return '💹' + c.slice(3);
     // pec+/pec-/vsg+/vsg- and other retired dial tags may still appear in old exports/history
     // — kept resolvable here purely for cosmetic backward-compat display, even though PEC/VSG
     // (and regime, live-liq/0-liq/Past-1, liqturnover/liqquiet) are no longer live criteria.
@@ -230,6 +237,9 @@
     'ioa+':  { family: 'ioa',  pole: 'pos' },       'ioa-':  { family: 'ioa',  pole: 'neg' },
     'ocs+':  { family: 'ocs',  pole: 'pos' },       'ocs-':  { family: 'ocs',  pole: 'neg' },
     'ocx+':  { family: 'ocx',  pole: 'pos' },       'ocx-':  { family: 'ocx',  pole: 'neg' },
+    // LTA/LPA (v1.84.0) — 1hr turnover vs own 24h/24, and 1hr price change vs the population's.
+    'lta+':  { family: 'lta',  pole: 'pos' },       'lta-':  { family: 'lta',  pole: 'neg' },
+    'lpa+':  { family: 'lpa',  pole: 'pos' },       'lpa-':  { family: 'lpa',  pole: 'neg' },
   };
   const BARE_DIAL_TAGS = {
     '+fund': { family: 'fund', pole: 'pos' }, '-fund': { family: 'fund', pole: 'neg' },
@@ -315,20 +325,20 @@
               <button class="ash-tab" :class="tS?'on':''" @click="tS=!tS">SCORE</button>
             </div>
             <div class="ash-zone" x-show="tC">
-              <div class="ash-hint" style="padding:2px 0">Cross Broadcast (Permafrost) — always on. Broadcasts cascade/sacrifice on close and DDH/gains-lock transitions to Permafrost.</div>
+              <div class="ash-hint" style="padding:2px 0">Always on: broadcasts cascade/sacrifice closes and DDH/gains-lock transitions to Permafrost.</div>
               <div style="margin-top:6px">
                 <label class="tog">
                   <div class="tog-t" :class="cfg.ashfallMutualDdLiftEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashfallMutualDdLiftEnabled=!cfg.ashfallMutualDdLiftEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Mutual DDH Lift</div>
-                    <div class="ash-hint">When Permafrost is also in drawdown halt, lifts this bot's halt. Checked every 15 s.</div>
+                    <div class="ash-hint">Lifts this bot's halt when Permafrost is also in drawdown halt (checked every 15 s).</div>
                   </div>
                 </label>
                 <label class="tog" style="margin-top:8px">
                   <div class="tog-t" :class="cfg.afGcEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afGcEnabled=!cfg.afGcEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Gains Continuation (GC)</div>
-                    <div class="ash-hint">Broadcasts each base-margin step of 6hr profit to Permafrost; if Permafrost also has GC on and the broadcast is fresh, it takes a full drawdown halt (and vice versa). Requires GC on both bots.</div>
+                    <div class="ash-hint">Broadcasts each base-margin step of 6hr profit; a partner with GC on halts on a fresh one, both ways.</div>
                   </div>
                 </label>
                 <div x-show="cfg.afGcEnabled" style="margin-top:8px">
@@ -353,36 +363,36 @@
                 <div class="tog-t" :class="cfg.afExtremityEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afExtremityEnabled=!cfg.afExtremityEnabled;_afExtremityBuild();persist()}"><div class="tog-k"></div></div>
                 <div>
                   <div class="tog-l">Extremity Scorer</div>
-                  <div class="ash-hint">Sorts each criterion's own sampled readings into extreme-high / lukewarm / extreme-low, scores which extreme end closed profitably, and vetoes a ticker once too much of what it shows is lukewarm. Partner closes are direction-inverted. Replaces the old Slot Scorecard entirely.</div>
+                  <div class="ash-hint">Scores closed trades on each position's 24h rolling-average criteria (entry snapshot until enough samples) and vetoes tickers on the less profitable side.</div>
                 </div>
               </label>
               <div x-show="cfg.afExtremityEnabled" style="margin-top:8px">
                 <div class="g">
                   <div class="lbl">Extreme Split <b x-text="cfg.afExtremitySplitPct"></b>%</div>
                   <input type="range" min="5" max="45" step="5" x-model.number="cfg.afExtremitySplitPct" @change="_afExtremityBuild();persist()">
-                  <div class="ash-hint">Top/bottom % of a criterion's own observed spread that counts as extreme. Everything in the middle is lukewarm.</div>
+                  <div class="ash-hint">Top and bottom share of a criterion's observed spread that counts as extreme; the middle is lukewarm.</div>
                 </div>
                 <div class="g" style="margin-top:8px">
                   <div class="lbl">Min Samples <b x-text="cfg.afExtremityMinSamples"></b></div>
                   <input type="range" min="3" max="30" step="1" x-model.number="cfg.afExtremityMinSamples" @change="_afExtremityBuild();persist()">
-                  <div class="ash-hint">A criterion needs at least this many sampled readings before it has a proven cutoff. Below it, every reading counts as lukewarm.</div>
+                  <div class="ash-hint">Readings a criterion needs before it gets a cutoff — and before a position's rolling average replaces its entry snapshot.</div>
                 </div>
                 <div class="g" style="margin-top:8px">
                   <div class="lbl">Lukewarm Veto <b x-text="cfg.afLukewarmRatioPct"></b>%</div>
                   <input type="range" min="30" max="100" step="5" x-model.number="cfg.afLukewarmRatioPct" @change="persist()">
-                  <div class="ash-hint">Lukewarm Scoring auto-picks which side to target — whichever of Extreme/Lukewarm below is currently in higher net profit — and vetoes a ticker once this share of its exhibited criteria come back on the other side. Currently favoring: <b :style="_afLukewarmFavoredSide()==='lukewarm'?'color:rgba(150,150,255,.9)':'color:#ff9650'" x-text="_afLukewarmFavoredSide()==='lukewarm'?'LUKEWARM':'EXTREME'"></b>.</div>
+                  <div class="ash-hint">Vetoes a ticker once this share of its criteria land on whichever side (Extreme/Lukewarm) is earning less. Currently favoring: <b :style="_afLukewarmFavoredSide()==='lukewarm'?'color:rgba(150,150,255,.9)':'color:#ff9650'" x-text="_afLukewarmFavoredSide()==='lukewarm'?'LUKEWARM':'EXTREME'"></b>.</div>
                 </div>
                 <label class="tog" style="margin-top:8px">
                   <div class="tog-t" :class="cfg.afExtremityReEvalEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afExtremityReEvalEnabled=!cfg.afExtremityReEvalEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Extremity Re-Evaluation</div>
-                    <div class="ash-hint">At the end of every scan, re-checks each open position's own qualifying criteria against the current cutoffs (using this cycle's already-fetched data — no extra fetches) and closes it once it crosses onto the non-favored side by the same veto ratio above.</div>
+                    <div class="ash-hint">Each scan, closes open positions whose rolling-average criteria have crossed onto the non-favored side by the veto ratio.</div>
                   </div>
                 </label>
                 <div class="g">
                   <div class="lbl">Sponge Quota <b x-text="cfg.afSpongeQuota"></b> closes/criterion</div>
                   <input type="range" min="10" max="200" step="10" x-model.number="cfg.afSpongeQuota" @change="_afExtremityBuild();persist()">
-                  <div class="ash-hint">Max recent closes per criterion used to compute scores and cutoffs. Older records beyond this count are ignored. Lower = faster adaptation.</div>
+                  <div class="ash-hint">Most recent closes counted per criterion when scoring; lower adapts faster.</div>
                 </div>
                 <div class="g" style="margin-top:8px">
                   <div class="lbl">Stale Purge <b x-text="cfg.afStaleSlotDays"></b> days</div>
@@ -393,26 +403,26 @@
                   <div class="tog-t" :class="cfg.afCoQualPenaltyEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afCoQualPenaltyEnabled=!cfg.afCoQualPenaltyEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Co-Qualifying Penalty</div>
-                    <div class="ash-hint">Tickers also matching slots with negative collapsed scores are ranked lower. Each additional bad co-qualifying slot deducts from the ticker's sort score.</div>
+                    <div class="ash-hint">Ranks a ticker lower for each extra co-qualifying slot with a negative score.</div>
                   </div>
                 </label>
                 <div class="g" x-show="cfg.afCoQualPenaltyEnabled" style="margin-top:8px">
                   <div class="lbl">Depth Multiplier <b x-text="(cfg.afCoQualDepthPct)+'%'"></b> per tier</div>
                   <input type="range" min="0" max="50" step="1" x-model.number="cfg.afCoQualDepthPct" @change="persist()">
-                  <div class="ash-hint">Scales a criterion's collapsed score by how deep the ticker qualifies at — a good score gets better with depth, a bad score gets worse. E.g. at 10%, a criterion scoring +$0.50 is applied as +$0.70 for a ticker qualifying 4 tiers deep.</div>
+                  <div class="ash-hint">Boosts a good score, or worsens a bad one, by this % per tier of qualifying depth.</div>
                 </div>
                 <label class="tog" style="margin-top:10px">
                   <div class="tog-t" :class="cfg.afOcEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afOcEnabled=!cfg.afOcEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Order Count Surveillance</div>
-                    <div class="ash-hint">Fetches recent trades for MIC's candidate tickers each scan cycle. Enables 📊 OCS/OCX criteria in MIC slots.</div>
+                    <div class="ash-hint">Fetches recent trades and a 1h candle per sampled ticker each scan; feeds OCS/OCX/LTA/LPA and the population averages.</div>
                   </div>
                 </label>
                 <div x-show="cfg.afOcEnabled" style="margin-top:8px">
                   <div class="g">
                     <div class="lbl">Order Limit <b x-text="(cfg.afOcOrderLimit)"></b> orders/ticker</div>
                     <input type="range" min="10" max="500" step="10" x-model.number="cfg.afOcOrderLimit" @change="persist()">
-                    <div class="ash-hint">Recent trades fetched per ticker per scan cycle. Buy/sell skew and average order interval are computed from this sample alone — no accumulation across cycles.</div>
+                    <div class="ash-hint">Trades fetched per ticker per scan — each reading uses only that sample; open positions average readings across scans.</div>
                   </div>
                   <div class="ash-hint" style="margin-top:4px" x-text="(()=>{ const last=_afOcLatestCycle(); if(!last) return 'no sample yet'; const ago=Math.round((Date.now()-last.ts)/60000)+'m ago'; const n=(last.results||[]).length; return n+' ticker'+(n!==1?'s':'')+' sampled · last: '+ago; })()"></div>
                 </div>
@@ -457,7 +467,7 @@
                     </span>
                   </template>
                 </span>
-                <div class="ash-hint" style="margin-top:4px">Wipes Ashfall's own data from browser storage — GC window and drawdown state. Also clears the storage key so no orphaned data lingers if the plugin is removed. Export first if you want to preserve the Extremity/OC profile.</div>
+                <div class="ash-hint" style="margin-top:4px">Wipes Ashfall's stored data (GC window, drawdown state); export first to keep the Extremity/OC profile.</div>
               </div>
             </div>
             <div x-show="cfg.afExtremityEnabled && (cfg.micEnabled && _micPluginLoaded() || (cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded()))" style="margin-top:8px;padding:6px 8px;background:rgba(255,150,80,.03);border:1px solid rgba(255,150,80,.1);border-radius:3px">
@@ -481,9 +491,8 @@
                 <div style="display:flex;align-items:center;justify-content:space-between;padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">
                   <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)" x-text="_afOcModeCfg().label"></div>
                   <div style="display:flex;gap:2px">
-                    <button type="button" class="ash-tab" :class="(_afOcViewMode||'oc')==='oc'?'on':''" @click.prevent="_afOcViewMode='oc'">OC</button>
-                    <button type="button" class="ash-tab" :class="_afOcViewMode==='vol'?'on':''" @click.prevent="_afOcViewMode='vol'">Vol</button>
-                    <button type="button" class="ash-tab" :class="_afOcViewMode==='io'?'on':''" @click.prevent="_afOcViewMode='io'">IO</button>
+                    <button type="button" class="ash-tab" @click.prevent="_afOcCycleView(-1)" x-text="'‹ '+_afOcViewName(-1)"></button>
+                    <button type="button" class="ash-tab" @click.prevent="_afOcCycleView(1)" x-text="_afOcViewName(1)+' ›'"></button>
                   </div>
                 </div>
                 <div style="position:relative" @click="const g=$event.target.closest('[data-oc-cycle-ts]');if(g)_afOcHighlightedCycleTs=Number(g.dataset.ocCycleTs)">
@@ -492,9 +501,10 @@
                 </div>
                 <div style="border-top:1px solid rgba(255,255,255,.06);padding:3px 8px 4px">
                   <div x-text="_afOcSummaryText(open && cfg.afOcEnabled)" style="font-family:var(--mono);font-size:8.5px;color:var(--text-lo)"></div>
-                  <div x-show="_afOcAvgIntervalSec(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;color:rgba(200,160,80,.85);margin-top:1px">Avg order interval: <b x-text="(_afOcAvgIntervalSec(open && cfg.afOcEnabled)||0).toFixed(1)+'s/order'"></b></div>
-                  <div x-show="_afOcAvgValueText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;color:rgba(190,130,230,.85);margin-top:1px" x-text="_afOcAvgValueText(open && cfg.afOcEnabled)"></div>
-                  <div x-html="_afOcInfoHtml(open && cfg.afOcEnabled)" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px"></div>
+                  <div x-show="_afOcTotalAvgText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcTotalAvgText(open && cfg.afOcEnabled)"></div>
+                  <div x-show="_afOcBatchLineText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcBatchLineText(open && cfg.afOcEnabled)"></div>
+                  <div x-show="_afOcAvgValueText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcAvgValueText(open && cfg.afOcEnabled)"></div>
+                  <div x-html="_afOcInfoHtml(open && cfg.afOcEnabled)" @click="const c=$event.target.closest('[data-oc-chip]'); if(c) _afOcExpandedSym = (_afOcExpandedSym===c.dataset.ocChip) ? null : c.dataset.ocChip" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px"></div>
                 </div>
               </div>
             </div>
@@ -554,7 +564,8 @@
         _afOcYAxisHtml: '',
         _afOcAvgYPx: null,
         _afOcHighlightedCycleTs: null, // ts of a clicked cycle in the ORDER INTERVAL SAMPLE chart; null = follow latest
-        _afOcViewMode: 'oc', // 'oc' | 'vol' | 'io' — which sample the tethered chart/summary/chips display
+        _afOcViewMode: 'oc', // 'oc' | 'vol' | 'io' | 'lta' | 'lpa' — which sample the tethered chart/summary/chips display
+        _afOcExpandedSym: null, // OC chip tapped open to its full values (hover title covers desktop; touch has no hover)
 
         async init() {
           await _origInit.call(this);
@@ -882,6 +893,7 @@
             if (/^(ocs|ocx)/.test(family) && this.cfg.afOcEnabled && !this.afOcResults?.[pos.symbol]) {
               try { const r = await this._ocFetchSingle?.(pos.symbol, true); if (r) { (this.afOcResults ||= {})[pos.symbol] = r; } } catch(e) {}
             }
+            if (/^(lta|lpa)/.test(family)) { try { await this._afHourCandle(pos.symbol); } catch(e) {} }
             const fresh = this._micAnnotateCritRaw?.(family, t);
             if (!fresh) continue;
             const m = fresh.match(/(-?\d+)$/);
@@ -1388,7 +1400,7 @@
         // skipped entirely and only vol/oi (free data) gets sampled into the same cycle entry —
         // tethered to the same history/chart/persistence as OC (see MIC's va/ioa criteria and
         // _afVolIoWindowAvg), just without paying for a fetch neither criterion needs.
-        async _ocFetchBatch(symbols, volIoMap, wantOc) {
+        async _ocFetchBatch(symbols, volIoMap, wantOc, wantHr) {
           if (!this.cfg.afOcEnabled || !symbols?.length) return;
           if (this._lfIsFollowing?.()) { this._ocSeedFromShared(); return; } // following — seed from partner's shared OC data instead of fetching our own
           // Guard against overlapping calls: if a slower fetch (e.g. from a re-triggered
@@ -1404,13 +1416,13 @@
             if (vio && (vio.vol != null || vio.oi != null)) return { vol: vio.vol ?? null, oi: vio.oi ?? null };
             return null;
           };
-          if (wantOc) {
+          if (wantOc || wantHr) {
             const limit = this.cfg.afOcOrderLimit;
             const CONC = 10;
             for (let i = 0; i < symbols.length; i += CONC) {
               await Promise.all(symbols.slice(i, i + CONC).map(async sym => {
                 let rec = seedVolIo(sym);
-                try {
+                if (wantOc) try {
                   const res = await this._qFetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
                   const js  = await res.json();
                   const trades = js?.result?.list || [];
@@ -1423,6 +1435,8 @@
                     rec = { ...(rec || {}), bc, sc, avgMs, n: trades.length };
                   }
                 } catch(_) {}
+                // LTA/LPA: last-completed-hour candle for every sampled ticker (cached per hour).
+                if (wantHr) { const h = await this._afHourCandle(sym); if (h) rec = { ...(rec || {}), ht: h.ht, hc: h.hc }; }
                 if (rec) results[sym] = rec;
               }));
             }
@@ -1448,6 +1462,8 @@
           const parts = [`${Object.keys(results).length}t`];
           if (withInterval.length) parts.push(`avg ${(withInterval.reduce((s,r)=>s+r.avgMs,0)/withInterval.length/1000).toFixed(1)}s/order`);
           if (withVolIo.length) parts.push(`${withVolIo.length}t vol/oi`);
+          const withHr = Object.values(results).filter(r => r.ht != null);
+          if (withHr.length) parts.push(`${withHr.length}t 1h`);
           this.log(`[ASH] 📊 Sample cycle — ${parts.join(' · ')}`, 'info');
           } finally { this._ocFetchRunning = false; }
         },
@@ -1527,7 +1543,8 @@
             .map(c => ({ ...c, results: c.results.filter(r => r && typeof r.sym === 'string' && (
               (typeof r.bc === 'number' && !isNaN(r.bc) && typeof r.sc === 'number' && !isNaN(r.sc)) ||
               (typeof r.vol === 'number' && !isNaN(r.vol)) ||
-              (typeof r.oi === 'number' && !isNaN(r.oi))
+              (typeof r.oi === 'number' && !isNaN(r.oi)) ||
+              (typeof r.ht === 'number' && !isNaN(r.ht))
             )) }))
             .filter(c => c.results.length > 0)
             .slice(-25);
@@ -1546,11 +1563,29 @@
         // handful of illiquid tickers don't stretch the axis) vs 'vol'/'io' (raw USDT value,
         // higher=busier, uncapped — there's no equivalent outlier problem since these are
         // already the population-relative criteria, not a per-ticker ratio).
+        // Chart views rotate in this order; the two header buttons are labelled with the
+        // previous/next view's name and wrap around at either end.
+        _afOcViewModes() { return ['oc', 'vol', 'io', 'lta', 'lpa']; },
+        _afOcViewName(step) {
+          const M = this._afOcViewModes();
+          const N = { oc: 'OC', vol: 'Vol', io: 'IO', lta: 'LTA', lpa: 'LPA' };
+          const i = Math.max(0, M.indexOf(this._afOcViewMode || 'oc'));
+          return N[M[(i + step + M.length) % M.length]];
+        },
+        _afOcCycleView(step) {
+          const M = this._afOcViewModes();
+          const i = Math.max(0, M.indexOf(this._afOcViewMode || 'oc'));
+          this._afOcViewMode = M[(i + step + M.length) % M.length];
+        },
         _afOcModeCfg() {
           const mode = this._afOcViewMode || 'oc';
           const fmtCompact = v => { if (v==null) return 'n/a'; const a=Math.abs(v); if (a>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if (a>=1e6) return '$'+(v/1e6).toFixed(2)+'M'; if (a>=1e3) return '$'+(v/1e3).toFixed(1)+'K'; return '$'+v.toFixed(0); };
           if (mode === 'vol') return { label: 'VOLUME SAMPLE', color: '96,210,255', cap: null, getVal: r => r.vol, fmt: fmtCompact, higherIsBusier: true, avgLabel: 'Avg volume' };
           if (mode === 'io')  return { label: 'OPEN INTEREST SAMPLE', color: '190,130,230', cap: null, getVal: r => r.oi, fmt: fmtCompact, higherIsBusier: true, avgLabel: 'Avg open interest' };
+          // Signed modes: values straddle zero (above/below its own / the population's average), so the
+          // chart gets a zero line and a symmetric axis instead of growing up from the floor.
+          if (mode === 'lta') return { label: 'LOCALIZED TURNOVER SAMPLE', color: '110,220,160', cap: null, signed: true, getVal: r => this._afLtaDev(r.ht, r.vol), fmt: v => (v >= 0 ? '+' : '') + v.toFixed(0) + '%', higherIsBusier: true, avgLabel: 'Avg 1h turnover vs own 24h/24' };
+          if (mode === 'lpa') return { label: 'LOCALIZED PRICE SAMPLE', color: '255,130,170', cap: null, signed: true, getVal: r => (typeof r.hc === 'number' && !isNaN(r.hc)) ? r.hc : null, fmt: v => (v >= 0 ? '+' : '') + v.toFixed(2) + '%', higherIsBusier: true, avgLabel: 'Avg 1h price change' };
           return { label: 'ORDER INTERVAL SAMPLE', color: '200,160,80', cap: 12, getVal: r => r.avgMs != null ? r.avgMs / 1000 : null, fmt: v => v >= 100 ? v.toFixed(0) + 's' : v.toFixed(1) + 's', higherIsBusier: false, avgLabel: 'Avg order interval' };
         },
         _afOcChartSvg(shown) {
@@ -1577,15 +1612,25 @@
           const allVals=history.flatMap(c=>c.results.filter(r=>r&&passesCap(mc.getVal(r))).map(r=>mc.getVal(r)));
           const avgRef=allVals.length?allVals.reduce((a,b)=>a+b,0)/allVals.length:0;
           // Plain value scale: 0 at the bottom, maxVal at the top — a higher value plots
-          // taller, same convention as every other bar chart in this panel.
-          const yVal=v=>padT+plotH-(v/maxVal)*plotH;
+          // taller, same convention as every other bar chart in this panel. Signed modes
+          // (lta/lpa) run -maxVal..+maxVal around a zero line; the axis is sized to the 95th
+          // percentile of |value| so one runaway ticker can't flatten everyone else (its bar
+          // just pins to the edge).
+          let lo=0;
+          if (mc.signed) {
+            const abs=allVals.map(v=>Math.abs(v)).sort((a,b)=>a-b);
+            const p95=abs.length?abs[Math.floor(0.95*(abs.length-1))]:0;
+            maxVal=(p95>0?p95:1)*1.3;
+            lo=-maxVal;
+          }
+          const yVal=v=>padT+plotH-((Math.max(lo,Math.min(maxVal,v))-lo)/(maxVal-lo))*plotH;
           const fmt = mc.fmt;
           const _ow=padL+6,_oh=H+8,_ax=padL+6;
           let _yAxis=`<svg width="${_ow}" height="${_oh}" style="display:block"><line x1="${_ax}" y1="${4+padT}" x2="${_ax}" y2="${4+padT+plotH}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`;
-          for (const f of [0,0.25,0.5,0.75,1]) { const v=maxVal*f; const y=(4+yVal(v)).toFixed(1); _yAxis+=`<text x="${_ax-3}" y="${(parseFloat(y)+3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${fmt(v)}</text>`; }
+          for (const f of [0,0.25,0.5,0.75,1]) { const v=lo+(maxVal-lo)*f; const y=(4+yVal(v)).toFixed(1); _yAxis+=`<text x="${_ax-3}" y="${(parseFloat(y)+3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${fmt(v)}</text>`; }
           this._afOcYAxisHtml = _yAxis+'</svg>';
           if (avgRef>maxVal*0.05&&avgRef<maxVal*0.95) this._afOcAvgYPx=4+yVal(avgRef); else this._afOcAvgYPx=null;
-          const grids=[0,0.25,0.5,0.75,1].map(f=>{const v=maxVal*f;const y=yVal(v).toFixed(1);return `<line x1="${padL}" y1="${y}" x2="${(W-padR).toFixed(1)}" y2="${y}" stroke="rgba(255,255,255,.05)" stroke-width="0.5"/>`;}).join('');
+          const grids=[0,0.25,0.5,0.75,1].map(f=>{const v=lo+(maxVal-lo)*f;const y=yVal(v).toFixed(1);return `<line x1="${padL}" y1="${y}" x2="${(W-padR).toFixed(1)}" y2="${y}" stroke="rgba(255,255,255,.05)" stroke-width="0.5"/>`;}).join('');
           const CLR=`rgba(${mc.color},`;
           // Highlighted cycle falls back to the actual latest cycle when nothing is pinned —
           // see the matching HIGHLIGHTED CYCLE section below, fed by _afOcDisplayedResults().
@@ -1606,10 +1651,11 @@
               // Direction of "busier"/more-notable flips per mode — lower interval = faster
               // order flow (oc), higher volume/OI = more notable (vol/io) — matching the same
               // above/below-average direction the va/ioa criteria themselves use.
-              const busier=cycleMean>0&&(mc.higherIsBusier?v>=cycleMean:v<=cycleMean);
+              const busier=(mc.signed||cycleMean>0)&&(mc.higherIsBusier?v>=cycleMean:v<=cycleMean);
               const alpha=busier?.85:.35;
-              const h=Math.max(1,(padT+plotH)-yVal(v));
-              const y=(padT+plotH)-h;
+              const y0=yVal(0), yv=yVal(v);
+              const h=Math.max(1,Math.abs(y0-yv));
+              const y=Math.min(y0,yv);
               bars+=`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${CLR}${alpha})"/>`;
             });
             if (ci>0 && localDay(history[ci].ts)!==localDay(history[ci-1].ts)) {
@@ -1625,7 +1671,7 @@
             bars+=`<text x="${(cx+cycleW/2).toFixed(1)}" y="${H-2}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="middle">${label}</text>`;
           });
           return `<svg width="${W}" height="${H}" style="display:block">`
-            + `<line x1="${padL}" y1="${(padT+plotH).toFixed(1)}" x2="${W-padR}" y2="${(padT+plotH).toFixed(1)}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`
+            + `<line x1="${padL}" y1="${yVal(0).toFixed(1)}" x2="${W-padR}" y2="${yVal(0).toFixed(1)}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`
             + grids + bars
             + `</svg>`;
         },
@@ -1668,33 +1714,103 @@
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
           if (mode !== 'oc') {
-            const field = mode === 'vol' ? 'vol' : 'oi';
-            const withField = results.filter(r => r[field] != null);
+            const mc = this._afOcModeCfg();
+            const withField = results.filter(r => mc.getVal(r) != null);
             if (!withField.length) return '';
             return `${withField.length} ticker${withField.length===1?'':'s'} sampled${this._afOcDisplayedCycleLabel()}`;
           }
-          const bc = results.reduce((s,r)=>s+(r.bc||0),0);
-          const sc = results.reduce((s,r)=>s+(r.sc||0),0);
-          const total = bc + sc;
-          if (!total) return '';
-          const buyPct = (bc/total*100).toFixed(0), sellPct = (sc/total*100).toFixed(0);
-          return `${total} order${total===1?'':'s'} sampled · ${buyPct}% buy / ${sellPct}% sell · ${results.length} ticker${results.length===1?'':'s'}${this._afOcDisplayedCycleLabel()}`;
+          // OC mode has no summary line of its own any more — order/ticker counts were redundant
+          // (the batch is always the same fixed sample size). Skew + interval now live in the
+          // Total and Batch readouts (_afOcTotalAvgText / _afOcBatchLineText).
+          return '';
         },
         // Full-window population average for MIC's va/ioa criteria — same dedup-to-latest-per-
         // symbol pattern as _afOcWindowAvgMs, over the same tethered _afOcCycleHistory, just
         // averaging 'vol' or 'oi' instead of 'avgMs'.
         _afVolIoWindowAvg(field) {
+          const st = this._afWindowStats(field);
+          return st.n ? st.sum / st.n : null;
+        },
+        // One deduped read of the retained sample window: each ticker's LATEST reading only,
+        // summed and counted. field: 'vol' | 'oi' | 'lta' | 'lpa'. V/A, IO/A, LPA and the
+        // chart's "Total avg" readout all come from this, so the number on screen is exactly
+        // the one the criteria measure against. Memoized per history state (scoring calls this
+        // once per candidate per criterion).
+        _afWindowStats(field) {
+          const hist = this._afOcCycleHistory || [];
+          let maxTs = 0;
+          for (const c of hist) if (c && typeof c.ts === 'number' && c.ts > maxTs) maxTs = c.ts;
+          const key = hist.length + '|' + maxTs;
+          const memo = WIN_MEMO[field];
+          if (memo && memo.key === key) return memo.val;
+          const val = field === 'lta' ? (r => this._afLtaDev(r.ht, r.vol))
+                    : field === 'lpa' ? (r => (typeof r.hc === 'number' && !isNaN(r.hc)) ? r.hc : null)
+                    : (r => r[field]);
           const bySym = {};
-          for (const cycle of (this._afOcCycleHistory || [])) {
+          for (const cycle of hist) {
             if (!cycle || !Array.isArray(cycle.results)) continue;
             for (const r of cycle.results) {
-              if (!r || typeof r.sym !== 'string' || r[field] == null) continue;
-              if (!bySym[r.sym] || cycle.ts > bySym[r.sym].ts) bySym[r.sym] = { val: r[field], ts: cycle.ts };
+              if (!r || typeof r.sym !== 'string') continue;
+              const v = val(r);
+              if (v == null) continue;
+              if (!bySym[r.sym] || cycle.ts > bySym[r.sym].ts) bySym[r.sym] = { v, ts: cycle.ts };
             }
           }
-          const vals = Object.values(bySym).map(v => v.val);
-          if (!vals.length) return null;
-          return vals.reduce((s, v) => s + v, 0) / vals.length;
+          const vals = {}; let sum = 0, n = 0;
+          for (const [sym, o] of Object.entries(bySym)) { vals[sym] = o.v; sum += o.v; n++; }
+          const out = { sum, n, vals };
+          WIN_MEMO[field] = { key, val: out };
+          return out;
+        },
+        // LTA: 1hr turnover against the ticker's own hourly average (24h turnover / 24), as a
+        // % deviation — above its own average is positive, below is negative.
+        _afLtaDev(ht, vol24) {
+          if (typeof ht !== 'number' || isNaN(ht)) return null;
+          const v = parseFloat(vol24);
+          if (!(v > 0)) return null;
+          const hourly = v / 24;
+          return (ht - hourly) / hourly * 100;
+        },
+        // LPA baseline: mean 1hr price change % of every OTHER ticker in the window (latest
+        // reading each), so a ticker is never measured against itself.
+        _afLpaWindowAvg(excludeSym) {
+          const st = this._afWindowStats('lpa');
+          const own = excludeSym != null ? st.vals[excludeSym] : undefined;
+          const n = st.n - (own != null ? 1 : 0);
+          if (n <= 0) return null;
+          return (st.sum - (own ?? 0)) / n;
+        },
+        // Start (ms) of the last COMPLETED hourly candle. The forming candle is never used —
+        // its turnover is a partial hour and would skew LTA negative early in each hour.
+        _afHourStart() { return Math.floor(Date.now() / 3600000) * 3600000 - 3600000; },
+        // One kline request per ticker per hour: the completed candle can't change, so a hit
+        // for the current hour is reused for every later scan (and by the open-position sampler).
+        async _afHourCandle(sym) {
+          const start = this._afHourStart();
+          const hit = HOUR_CACHE[sym];
+          if (hit && hit.start === start) return hit;
+          try {
+            const res = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=3`);
+            const js  = await res.json();
+            // Bybit list rows: [start, open, high, low, close, volume, turnover], newest first.
+            const row = (js?.result?.list || []).find(r => parseInt(r[0], 10) === start);
+            if (!row) return null;
+            const o = parseFloat(row[1]), c = parseFloat(row[4]), ht = parseFloat(row[6]);
+            if (!(o > 0) || isNaN(c) || isNaN(ht)) return null;
+            const rec = { start, ht, hc: (c - o) / o * 100 };
+            if (Object.keys(HOUR_CACHE).length > 500) for (const k of Object.keys(HOUR_CACHE)) if (HOUR_CACHE[k].start !== start) delete HOUR_CACHE[k];
+            HOUR_CACHE[sym] = rec;
+            return rec;
+          } catch (_) { return null; }
+        },
+        // Best available 1hr reading for a ticker: this hour's cached candle, else whatever the
+        // latest sample batch carried (what a follower gets from the leader's shared snapshot).
+        _afHourReading(sym) {
+          const hit = HOUR_CACHE[sym];
+          if (hit && hit.start === this._afHourStart()) return { ht: hit.ht, hc: hit.hc };
+          const r = this.afOcResults?.[sym];
+          if (r && typeof r.ht === 'number' && typeof r.hc === 'number') return { ht: r.ht, hc: r.hc };
+          return null;
         },
         // Accumulated buy/sell order-count skew for a single ticker across the ENTIRE retained
         // _afOcCycleHistory window (same 25-cycle cap as _afOcWindowAvgMs) — sums bc/sc from
@@ -1755,7 +1871,47 @@
           const withField = (last?.results || []).filter(r => r && mc.getVal(r) != null);
           if (!withField.length) return null;
           const avg = withField.reduce((s,r) => s + mc.getVal(r), 0) / withField.length;
-          return `${mc.avgLabel}: ${mc.fmt(avg)}`;
+          return `Batch ${mc.avgLabel.toLowerCase()}: ${mc.fmt(avg)}`;
+        },
+        // "Total" counterpart to the per-batch line above: the mean of every ticker's latest
+        // reading across the whole retained window — the same population number V/A, IO/A and
+        // LPA measure against (see _afWindowStats).
+        // Total-window buy/sell counts across every retained cycle — the same accumulation OCS
+        // reads per ticker (see _afOcAccumSkew), summed over the whole population.
+        _afOcWindowSkew() {
+          let bc = 0, sc = 0;
+          for (const cycle of (this._afOcCycleHistory || [])) {
+            if (!cycle || !Array.isArray(cycle.results)) continue;
+            for (const r of cycle.results) { if (!r) continue; bc += r.bc || 0; sc += r.sc || 0; }
+          }
+          return { bc, sc };
+        },
+        // "Total: 47% buy / 53% sell · 31.8s avg interval" — either half is dropped when it has
+        // no data; null when neither does. Sell % is derived (100 - buy) so the pair always sums.
+        _afOcLineText(skew, avgMs, label, suffix) {
+          const parts = [];
+          const t = skew ? skew.bc + skew.sc : 0;
+          if (t > 0) { const b = Math.round(skew.bc / t * 100); parts.push(`${b}% buy / ${100 - b}% sell`); }
+          if (avgMs != null) { const v = avgMs / 1000; parts.push(`${v >= 100 ? v.toFixed(0) : v.toFixed(1)}s avg interval`); }
+          return parts.length ? `${label}: ${parts.join(' · ')}${suffix || ''}` : null;
+        },
+        // Per-batch counterpart (the displayed/pinned cycle) — OC mode only.
+        _afOcBatchLineText(shown) {
+          if (!shown || (this._afOcViewMode || 'oc') !== 'oc') return null;
+          const results = (this._afOcDisplayedCycle()?.results || []).filter(r => r && typeof r.sym === 'string');
+          if (!results.length) return null;
+          const skew = { bc: results.reduce((s,r)=>s+(r.bc||0),0), sc: results.reduce((s,r)=>s+(r.sc||0),0) };
+          const sec = this._afOcAvgIntervalSec(shown);
+          return this._afOcLineText(skew, sec == null ? null : sec * 1000, 'Batch', this._afOcDisplayedCycleLabel());
+        },
+        _afOcTotalAvgText(shown) {
+          if (!shown) return null;
+          const mode = this._afOcViewMode || 'oc';
+          if (mode === 'oc') return this._afOcLineText(this._afOcWindowSkew(), this._afOcWindowAvgMs?.(), 'Total', '');
+          const mc = this._afOcModeCfg();
+          const st = this._afWindowStats(mode === 'io' ? 'oi' : mode);
+          if (!st.n) return null;
+          return `Total ${mc.avgLabel.toLowerCase()}: ${mc.fmt(st.sum / st.n)} · ${st.n} ticker${st.n === 1 ? '' : 's'} (window)`;
         },
         _afOcInfoHtml(shown) {
           if (!shown) return '';
@@ -1777,15 +1933,34 @@
               return `<span title="${r.sym}: ${mc.fmt(v)}" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${r.sym.replace('USDT','')} <span style="opacity:.65">${mc.fmt(v)}</span></span>`;
             }).join('');
           }
-          const mean=results.reduce((s,r)=>s+(r.bc||0)+(r.sc||0),0)/results.length;
+          // This chart measures two things, so each chip shows two independent reads: the OUTLINE
+          // lights up when the ticker's order interval is faster than the batch mean (same "busier"
+          // test the bars use — intervals past the chart's cap never qualify), and the BODY fills
+          // when its skew leans to this bot's favored side (buy on Chaser). Order count is no longer
+          // compared — every ticker samples the same number of trades, so it never differentiated.
+          const oc = this._afOcModeCfg();
+          const ivs = results.map(r => oc.getVal(r)).filter(v => v != null && (oc.cap == null || v <= oc.cap));
+          const ivMean = ivs.length ? ivs.reduce((a,b)=>a+b,0)/ivs.length : null;
           return results.map(r=>{
             const total=(r.bc||0)+(r.sc||0); if(!total) return '';
-            const aboveAvg=total>=mean;
-            const clr=aboveAvg?'rgba(255,150,80,.9)':'var(--text-lo)';
-            const bdr=aboveAvg?'rgba(255,150,80,.4)':'rgba(255,255,255,.1)';
-            const bg=aboveAvg?'rgba(255,150,80,.06)':'transparent';
+            const iv = oc.getVal(r);
+            const busy = ivMean != null && iv != null && (oc.cap == null || iv <= oc.cap) && iv <= ivMean;
+            const lean = (r.bc||0) > (r.sc||0);
+            const clr=(busy||lean)?'rgba(255,150,80,.9)':'var(--text-lo)';
+            const bdr=busy?'rgba(255,150,80,.75)':'rgba(255,255,255,.1)';
+            const bg=lean?'rgba(255,150,80,.22)':'transparent';
             const avgSec = r.avgMs!=null ? (r.avgMs/1000).toFixed(1)+'s/order' : 'n/a';
-            return `<span title="${r.sym}: ${r.bc||0} B-fills / ${r.sc||0} S-fills · ${avgSec}" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${r.sym.replace('USDT','')} <span style="opacity:.65">B${r.bc||0} S${r.sc||0}</span><span style="opacity:.4;font-size:7px"> ${avgSec}</span></span>`;
+            // Collapsed: only the dominant side (the other is implicit) and a bare interval —
+            // "PROVE B77 4.4s". The full counts stay in the hover title, and a tap/click on the
+            // pill expands it in place for touch screens.
+            const bc=r.bc||0, sc=r.sc||0;
+            const sec = r.avgMs!=null ? r.avgMs/1000 : null;
+            const shortIv = sec==null ? 'n/a' : (sec>=100 ? sec.toFixed(0) : sec.toFixed(1))+'s';
+            const expanded = this._afOcExpandedSym === r.sym;
+            const inner = expanded
+              ? `<span style="opacity:.65">B${bc} S${sc}</span><span style="opacity:.4;font-size:7px"> ${avgSec}</span>`
+              : `<span style="opacity:.65">${bc>=sc ? 'B'+bc : 'S'+sc}</span><span style="opacity:.4;font-size:7px"> ${shortIv}</span>`;
+            return `<span data-oc-chip="${r.sym}" title="${r.sym}: ${bc} B-fills / ${sc} S-fills · ${avgSec}" style="cursor:pointer;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${r.sym.replace('USDT','')} ${inner}</span>`;
           }).join('');
         },
 
