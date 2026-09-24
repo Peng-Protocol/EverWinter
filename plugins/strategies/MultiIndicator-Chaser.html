@@ -38,7 +38,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.80.2'; // Default-sync pass against MIW: micCascadePct 25→50, micSacrificePct 25→50, micSlotBlockEnabled true→false, micSlotBlockTags false→true (all matching live-tuned values), micActiveSlot confirmed at 6 to match MIW; DEFAULT_SLOTS []→[[]] (single empty slot, matching current usage on both sides). Prior: Housekeeping: Blockable Criteria default was documented as "nothing" in the header, the UI hint and _micIsEntryBlocked's comment, but DEFAULT_BLOCKABLE_CRITS seeds va/ioa/ocs/ocx — text corrected, no behavior change.
+    const VERSION       = '1.81.1'; // Fix (see Ashfall-Chaser 1.83.1): runScan's per-scan position refresh call simplified — _afPositionCriteriaSample now does its own fresh per-symbol fetch instead of being handed a lookup built from the (potentially hours-stale, per cfg.bulkTickerCooldownHours) bulk allTickers snapshot. Prior: 1.81.0 — Open-Position Rolling-Average Criteria: runScan calls Ashfall's per-position refresh every cycle; positions opened via _micOpen now also store _micRawCriteria alongside _micCriteria so substitution's scoreOf can recompute a live composite score via _micLiveCompositeScore instead of the frozen _micCompositeScore.
     // v1.80.0 — Major cut-down (see /versioning): liquidation is no longer the mandatory per-slot anchor — PEC/VSG shape-matching, the live liq-message entry path, closed-batch liq/regime/Past-1 reads, and the whole liq-anchor concept are gone. Slots (Auto or manual) now qualify on any N of the 5 remaining secondary criteria alone: fund, V/A, IO/A, OCS, OCX.
   const DEFAULT_SLOTS = [[]];
   const MIC_HIST_KEY  = '__mic_hist_batches';
@@ -748,7 +748,12 @@
           });
           if (!eligible.length) return false;
 
-          const scoreOf = p => p._mic ? (p._micCompositeScore ?? 0) : (p._micCompositeScore ?? -Infinity);
+          // Was comparing an existing position's frozen entry-time _micCompositeScore
+          // against a freshly-scanned candidate's live score — stale-vs-live mismatch.
+          // Now recomputes the existing position's score live from its rolling-average
+          // criteria (see _afPositionAvgCriteria/_afPositionCriteriaSample), same as the
+          // candidate's own score is computed fresh each scan.
+          const scoreOf = p => p._mic ? this._micLiveCompositeScore(p) : -Infinity;
           eligible.sort((a, b) => scoreOf(a) - scoreOf(b));
           const worst      = eligible[0];
           const worstScore = scoreOf(worst);
@@ -833,6 +838,18 @@
 
           // Rebuild block state from Extremity Scorer immediately before any slot or pool decisions
           this._afExtremityBuild?.();
+
+          // Open-Position Rolling-Average Criteria refresh (see Ashfall-Chaser's
+          // _afPositionCriteriaSample, which does its own fresh per-symbol fetch — the bulk
+          // allTickers snapshot here can be hours stale) — runs every cycle regardless of
+          // whether any entry slot is active, since positions can still be open with none
+          // configured. Only ever touches the handful of currently-open symbols, so it isn't
+          // gated behind the follower no-own-fetch rule the rest of this scan is subject to.
+          if (this.positions?.length) {
+            for (const pos of this.positions) {
+              await this._afPositionCriteriaSample?.(pos);
+            }
+          }
 
           // Entry slots — Auto mode has no generated slot list any more (see _micAutoQualify);
           // Manual mode keeps its exact combo list as before.
@@ -1108,6 +1125,8 @@
               _micSlotIdx: slotIdx ?? 0,
               _micCompositeScore: compositeScore ?? 0,
               _micCriteria: annotCrits,
+              _micRawCriteria: criteria, // kept alongside annotCrits so substitution can
+                                          // recompute a live score later (see _micLiveCompositeScore)
             });
             if (pos) {
               this._micLastEntryTs = Date.now(); // Dead Switch — see _micDeadSwitchCheck
@@ -1270,6 +1289,15 @@
           }
           const depthPct = (this.cfg.afCoQualDepthPct ?? 10) / 100;
           return base * (1 + depth * depthPct);
+        },
+        // Live version of the compositeScore frozen at open — used by substitution so an
+        // existing position is judged on where it stands NOW, not where it stood at entry.
+        // Falls back to the frozen score if raw criteria weren't stored (older positions
+        // opened before _micRawCriteria existed) or Co-Qual scoring is off.
+        _micLiveCompositeScore(pos) {
+          if (!pos._micRawCriteria?.length) return pos._micCompositeScore ?? 0;
+          const avgAnnot = this._afPositionAvgCriteria?.(pos) || pos._micCriteria || [];
+          return pos._micRawCriteria.reduce((s, c, i) => s + this._micScaledRank(c, avgAnnot[i]), 0);
         },
 
         // Shared collapsed-rank lookup (own + partner + historical PnL, see micCollapsedSlotRanks)

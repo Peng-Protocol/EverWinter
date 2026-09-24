@@ -38,7 +38,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.80.2'; // Default-sync pass against MIC: miwActiveSlot 5→6 (was mismatched at the code-default level, not just live config — now matches MIC), miwCascadePct 25→50, miwSacrificePct 25→50, miwSlotBlockEnabled true→false, miwSlotBlockTags false→true (all matching live-tuned values), miwSubstitutionMinAgeMins confirmed at 10 to match MIC; DEFAULT_SLOTS []→[[]] (single empty slot, matching current usage on both sides). Prior: Housekeeping: Blockable Criteria default was documented as "nothing" in the header, the UI hint and _miwIsEntryBlocked's comment, but DEFAULT_BLOCKABLE_CRITS seeds va/ioa/ocs/ocx — text corrected, no behavior change.
+    const VERSION       = '1.81.1'; // Fix (see Permafrost-Winter 1.83.1): runScan's per-scan position refresh call simplified — _pfPositionCriteriaSample now does its own fresh per-symbol fetch instead of being handed a lookup built from the (potentially hours-stale, per cfg.bulkTickerCooldownHours) bulk allTickers snapshot. Prior: 1.81.0 — Open-Position Rolling-Average Criteria: runScan calls Permafrost's per-position refresh every cycle; positions opened via the Path-A open call now also store _miwRawCriteria alongside _miwCriteria so substitution's scoreOf can recompute a live composite score via _miwLiveCompositeScore instead of the frozen _miwCompositeScore.
     // v1.80.0 — Major cut-down (see /versioning): liquidation is no longer the mandatory per-slot anchor — PEC/VSG shape-matching, the live liq-message entry path, closed-batch liq/regime/Past-1 reads, and the whole liq-anchor concept are gone. Slots (Auto or manual) now qualify on any N of the 5 remaining secondary criteria alone: fund, V/A, IO/A, OCS, OCX.
   const DEFAULT_SLOTS = [[]];
   const MIW_HIST_KEY  = '__miw_hist_batches';
@@ -747,7 +747,12 @@
           });
           if (!eligible.length) return false;
 
-          const scoreOf = p => p._miw ? (p._miwCompositeScore ?? 0) : (p._miwCompositeScore ?? -Infinity);
+          // Was comparing an existing position's frozen entry-time _miwCompositeScore
+          // against a freshly-scanned candidate's live score — stale-vs-live mismatch.
+          // Now recomputes the existing position's score live from its rolling-average
+          // criteria (see _pfPositionAvgCriteria/_pfPositionCriteriaSample), same as the
+          // candidate's own score is computed fresh each scan.
+          const scoreOf = p => p._miw ? this._miwLiveCompositeScore(p) : -Infinity;
           eligible.sort((a, b) => scoreOf(a) - scoreOf(b));
           const worst      = eligible[0];
           const worstScore = scoreOf(worst);
@@ -832,6 +837,18 @@
 
           // Rebuild block state from Extremity Scorer immediately before any slot or pool decisions
           this._pfExtremityBuild?.();
+
+          // Open-Position Rolling-Average Criteria refresh (see Permafrost-Winter's
+          // _pfPositionCriteriaSample, which does its own fresh per-symbol fetch — the bulk
+          // allTickers snapshot here can be hours stale) — runs every cycle regardless of
+          // whether any entry slot is active, since positions can still be open with none
+          // configured. Only ever touches the handful of currently-open symbols, so it isn't
+          // gated behind the follower no-own-fetch rule the rest of this scan is subject to.
+          if (this.positions?.length) {
+            for (const pos of this.positions) {
+              await this._pfPositionCriteriaSample?.(pos);
+            }
+          }
 
           // Entry slots — Auto mode has no generated slot list any more (see _miwAutoQualify);
           // Manual mode keeps its exact combo list as before.
@@ -1107,6 +1124,8 @@
               _miwSlotIdx: slotIdx ?? 0,
               _miwCompositeScore: compositeScore ?? 0,
               _miwCriteria: annotCrits,
+              _miwRawCriteria: criteria, // kept alongside annotCrits so substitution can
+                                          // recompute a live score later (see _miwLiveCompositeScore)
             });
             if (pos) {
               this._miwLastEntryTs = Date.now(); // Dead Switch — see _miwDeadSwitchCheck
@@ -1269,6 +1288,15 @@
           }
           const depthPct = (this.cfg.pfCoQualDepthPct ?? 10) / 100;
           return base * (1 + depth * depthPct);
+        },
+        // Live version of the compositeScore frozen at open — used by substitution so an
+        // existing position is judged on where it stands NOW, not where it stood at entry.
+        // Falls back to the frozen score if raw criteria weren't stored (older positions
+        // opened before _miwRawCriteria existed) or Co-Qual scoring is off.
+        _miwLiveCompositeScore(pos) {
+          if (!pos._miwRawCriteria?.length) return pos._miwCompositeScore ?? 0;
+          const avgAnnot = this._pfPositionAvgCriteria?.(pos) || pos._miwCriteria || [];
+          return pos._miwRawCriteria.reduce((s, c, i) => s + this._miwScaledRank(c, avgAnnot[i]), 0);
         },
 
         // Shared collapsed-rank lookup (own + partner + historical PnL, see miwCollapsedSlotRanks)

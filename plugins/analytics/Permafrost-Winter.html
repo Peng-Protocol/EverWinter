@@ -30,7 +30,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '1.82.1'; // Default-sync pass against Ashfall: pfGcThresholdPct 50→100 to match Ashfall's live-tuned value. Prior: Extremity Scorer fully de-coupled from Ashfall (own-scores-only), reverting the whole v1.81.x combined-scoring line — repeated attempts to make the two sides' totals mirror (sign convention, then shared dial-pool cutoffs) kept surfacing new cross-bot sync issues, so cross-bot reading is removed entirely. EXTREMITY_KEY is now a private key (__ew_pf_extremity_v1, was the shared __everwinter_extremity_v1); _pfScoreRead does a one-time migration pulling this side's own ('winter') records out of the old shared key so existing history survives instead of resetting to empty — Ashfall does the same independently against the same legacy key for its own records, neither side touches the other's half. DIAL_POOL_KEY reverted to private per-side. BIAS_KEY/_pfGetBias and the extremityBias export/import field are gone — no bias, no sign flipping, no shared pool, no gating; each side just aggregates its own trades. CLEAR now zeroes the private key (setItem '[]', not removeItem — removeItem would re-trigger the legacy migration on next read).
+    const VERSION        = '1.83.1'; // Fix: _pfPositionCriteriaSample was reading fund/va/ioa off this._lastAllTickers, the bulk snapshot cached for cfg.bulkTickerCooldownHours (default 1h, user runs 3h) and reused across every scan in between — most "rolling average" samples were just the same stale number repeated, not real drift. Now does its own fresh per-symbol ticker fetch each scan (via _qFetch, still exempt from the follower no-own-fetch rule — same handful-of-symbols reasoning as the ocs/ocx fetch it already did this way). Prior: 1.83.0 — Open-Position Rolling-Average Criteria: replaces the frozen entry-time snapshot (_miwCriteria/_bewCriteria/_ldwCriteria) with a per-position rolling average, refreshed every scan (no new poller/timer), feeding close-time scoring, Extremity Re-Evaluation, and MIW substitution's live score; also fixed Re-Evaluation calling the never-defined _miwAnnotateLiveCrit.
     // v1.80.1 — Fixed the Lukewarm Scoring pill board (pfLukewarmScoreboard/_pfExtremityHtml)
     // netting a two-pole family's '+' and '-' sides into one pill: bucketStats/bucketCount
     // in _pfExtremityBuild were keyed by info.family alone instead of dk (family+pole), so
@@ -845,6 +845,71 @@
           this._pfDialPoolLastWrite = now;
           try { localStorage.setItem(DIAL_POOL_KEY, JSON.stringify(this.pfDialSamplePool || {})); } catch (e) {}
         },
+        // ── Open-Position Rolling-Average Criteria (see /versioning) ─────────────────
+        //
+        // Replaces the single entry-time snapshot (_miwCriteria/_bewCriteria/_ldwCriteria,
+        // frozen once in *Open) as the source feeding close-time scoring, Extremity
+        // Re-Evaluation, and substitution's live score. No separate sample list and no new
+        // poller/timer — this rides the existing scan cycle: called once per open position
+        // per scan from MIW's runScan (_pfPositionCriteriaSample), exempt from the follower
+        // no-own-fetch rule since it only ever touches the handful of symbols currently
+        // open, not the full ticker universe (same loophole _miwTopUpGeneralCriteria
+        // already uses for ocs/ocx via _ocFetchSingle's allowOwnFetch flag).
+        //
+        // A position's locked criteria FAMILIES never change after entry — that's what
+        // defines its slot. Only the observed magnitude/tier of each is re-sampled, into a
+        // calendar-time window (default 24h) kept on the position itself.
+        POS_CRIT_WINDOW_MS: 24 * 3600 * 1000,
+        async _pfPositionCriteriaSample(pos) {
+          const crits = pos._miwCriteria || pos._bewCriteria || pos._ldwCriteria;
+          if (!crits?.length) return;
+          // Own fresh single-ticker fetch, not this._lastAllTickers — that bulk snapshot is
+          // cached for cfg.bulkTickerCooldownHours (default 1h, user-configurable up to 12h)
+          // and reused across many scans in between, so fund/va/ioa read off it would mostly
+          // resample the exact same stale number instead of tracking real drift. Still routed
+          // through _qFetch (rate/concurrency limited) — just not gated behind the follower
+          // no-own-fetch rule, same exemption as the ocs/ocx fetch below.
+          let t = null;
+          try {
+            const r = await this._qFetch(`${this.base}/v5/market/tickers?category=linear&symbol=${pos.symbol}`);
+            const d = await r.json();
+            t = d?.retCode === 0 ? d.result?.list?.[0] : null;
+          } catch(e) {}
+          if (!t) return;
+          const now = Date.now();
+          const buf = (pos._pfCritSamples ||= {});
+          for (const tag of crits) {
+            const family = tag.replace(/[+-]?\d+$/, '');
+            if (/^(ocs|ocx)/.test(family) && this.cfg.pfOcEnabled && !this.pfOcResults?.[pos.symbol]) {
+              try { const r = await this._ocFetchSingle?.(pos.symbol, true); if (r) { (this.pfOcResults ||= {})[pos.symbol] = r; } } catch(e) {}
+            }
+            const fresh = this._miwAnnotateCritRaw?.(family, t);
+            if (!fresh) continue;
+            const m = fresh.match(/(-?\d+)$/);
+            if (!m) continue;
+            const arr = (buf[family] ||= []);
+            arr.push({ tier: parseInt(m[1], 10), ts: now });
+            const cut = now - (this.POS_CRIT_WINDOW_MS || 24 * 3600 * 1000);
+            while (arr.length && arr[0].ts < cut) arr.shift();
+          }
+        },
+        // Reconstructs a position's criteria as averaged tags, in the same family+tier
+        // string format every other tag already uses (e.g. "fund+3"). Falls back to the
+        // frozen entry-time snapshot for any family with fewer than pfExtremityMinSamples
+        // readings — a position that closes fast simply hasn't had enough scans to average.
+        _pfPositionAvgCriteria(pos) {
+          const crits = pos._miwCriteria || pos._bewCriteria || pos._ldwCriteria;
+          if (!crits?.length) return crits;
+          const minSamples = Math.max(3, this.cfg.pfExtremityMinSamples || 3);
+          const buf = pos._pfCritSamples || {};
+          return crits.map(tag => {
+            const family = tag.replace(/[+-]?\d+$/, '');
+            const arr = buf[family];
+            if (!arr || arr.length < minSamples) return tag;
+            const avgTier = Math.round(arr.reduce((s, r) => s + r.tier, 0) / arr.length);
+            return `${family}${avgTier >= 0 ? '+' : ''}${avgTier}`;
+          });
+        },
         // ── Extremity Scorer / Lukewarm Scoring core build (v1.80.0 — see /versioning).
         //
         // Cutoffs are computed FIRST, from pfDialSamplePool (the observation stream — see
@@ -1037,12 +1102,11 @@
             if (!pos || !pos.symbol) continue;
             const crits = pos._miwCriteria || pos._bewCriteria || pos._ldwCriteria;
             if (!crits || !crits.length) continue;
-            const t = (this._lastAllTickers || []).find(x => x.symbol === pos.symbol);
-            if (!t) continue;
-            const liveCrits = crits.map(c => {
-              const base = collapseCrit(c).replace(/[+-]$/, '');
-              return this._miwAnnotateLiveCrit?.(base, t, null, 0, this.pfOcResults) ?? c;
-            });
+            // Was calling the never-defined _miwAnnotateLiveCrit — always fell through to
+            // `?? c`, so Re-Eval was silently comparing each position's frozen entry snapshot
+            // against itself and could never actually detect drift. Now reads the rolling
+            // average built each scan by _pfPositionCriteriaSample.
+            const liveCrits = this._pfPositionAvgCriteria(pos);
             if (this._pfExtremityVeto(liveCrits)) {
               await this.pseudoClosePosition(pos, 'Ext-Rvl');
               this.log(`[PF] ${pos.symbol} closed — Extremity Re-Evaluation: crossed onto the non-favored side.`, 'info');
@@ -1292,10 +1356,13 @@
           // Blind-Entry has no real filtering criteria (see docs/blind-entry-plan.md) — its
           // _bewCriteria are sign-only recording tags (+24h/-24h, +fund/-fund, +ocs/-ocs), never
           // used to gate entry, that exist purely so the scorecard has something to bucket.
-          const _scoreCriteria = (pos._miw && pos._miwCriteria?.length) ? pos._miwCriteria
-            : (pos._bew && pos._bewCriteria?.length) ? pos._bewCriteria
-            : (pos._ldw && pos._ldwCriteria?.length) ? pos._ldwCriteria
-            : null;
+          const _hasScoreCriteria = (pos._miw && pos._miwCriteria?.length)
+            || (pos._bew && pos._bewCriteria?.length)
+            || (pos._ldw && pos._ldwCriteria?.length);
+          // Rolling average (see _pfPositionAvgCriteria) instead of the frozen entry-time
+          // snapshot — falls back to that same snapshot per-family if too few samples
+          // accumulated before this close (fast-close case).
+          const _scoreCriteria = _hasScoreCriteria ? this._pfPositionAvgCriteria(pos) : null;
           if (this.cfg.pfExtremityEnabled && _scoreCriteria) {
             const _t = this.closedTrades?.[0];
             const _pnl = _t?.totalPnl ?? _t?.pnl;
