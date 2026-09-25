@@ -38,7 +38,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.82.0'; // Feature: LTA and LPA join the secondary criteria (Auto pool, exclude/blockable pickers, manual-slot gate panel, step chips, top-up); Auto minimum slider now 1-7. Fix: the raw criterion annotator now exists on the class (_miwAnnotateCritRaw) — Permafrost's open-position sampler was calling it off `this` while it only lived as a local inside runScan, so no rolling-average sample was ever recorded and closes/Ext-Rvl/substitution silently kept using the frozen entry snapshot. Prior: 1.81.2 — Tweak: UI hints shortened to one line each; Substitution hint now notes the live rolling-average score. Prior: 1.81.1 — Fix (see Permafrost-Winter 1.83.1): runScan's per-scan position refresh call simplified — _pfPositionCriteriaSample now does its own fresh per-symbol fetch instead of being handed a lookup built from the (potentially hours-stale, per cfg.bulkTickerCooldownHours) bulk allTickers snapshot. Prior: 1.81.0 — Open-Position Rolling-Average Criteria: runScan calls Permafrost's per-position refresh every cycle; positions opened via the Path-A open call now also store _miwRawCriteria alongside _miwCriteria so substitution's scoreOf can recompute a live composite score via _miwLiveCompositeScore instead of the frozen _miwCompositeScore.
+    const VERSION       = '1.83.0'; // Feature: scan-time LTA/LPA and OCX matching now uses Permafrost's widened window fallback (_pfHourReadingWide, _pfOcLatestAvgMs) instead of requiring this-cycle/this-hour freshness, so a not-yet-resampled ticker can still be scored on stale-but-real data; pre-entry top-up refetch is unaffected. Fix: va/ioa tier formula replaced with a symmetric log-ratio (Math.log(val/windowAvg)*100/step) — the old (val-avg)/avg*100 formula floored at exactly -100 for anything under ~1% of the window mean while the positive side was unbounded, so a skewed window average (a mean over a small, randomly-sampled per-cycle population) pinned most below-average tickers to an identical -100 tag regardless of how far below average they actually were. Prior: 1.82.0 — Feature: LTA and LPA join the secondary criteria (Auto pool, exclude/blockable pickers, manual-slot gate panel, step chips, top-up); Auto minimum slider now 1-7. Fix: the raw criterion annotator now exists on the class (_miwAnnotateCritRaw) — Permafrost's open-position sampler was calling it off `this` while it only lived as a local inside runScan, so no rolling-average sample was ever recorded and closes/Ext-Rvl/substitution silently kept using the frozen entry snapshot. Prior: 1.81.2 — Tweak: UI hints shortened to one line each; Substitution hint now notes the live rolling-average score. Prior: 1.81.1 — Fix (see Permafrost-Winter 1.83.1): runScan's per-scan position refresh call simplified — _pfPositionCriteriaSample now does its own fresh per-symbol fetch instead of being handed a lookup built from the (potentially hours-stale, per cfg.bulkTickerCooldownHours) bulk allTickers snapshot. Prior: 1.81.0 — Open-Position Rolling-Average Criteria: runScan calls Permafrost's per-position refresh every cycle; positions opened via the Path-A open call now also store _miwRawCriteria alongside _miwCriteria so substitution's scoreOf can recompute a live composite score via _miwLiveCompositeScore instead of the frozen _miwCompositeScore.
     // v1.80.0 — Major cut-down (see /versioning): liquidation is no longer the mandatory per-slot anchor — PEC/VSG shape-matching, the live liq-message entry path, closed-batch liq/regime/Past-1 reads, and the whole liq-anchor concept are gone. Slots (Auto or manual) now qualify on any N of the 5 remaining secondary criteria alone: fund, V/A, IO/A, OCS, OCX.
   const DEFAULT_SLOTS = [[]];
   const MIW_HIST_KEY  = '__miw_hist_batches';
@@ -1193,8 +1193,8 @@
         // sample was ever recorded). Returns null only for lta/lpa when no 1hr candle is
         // available for the ticker yet.
         _miwAnnotateCritRaw(c, t) {
-          if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._pfVolIoWindowAvg?.('vol'); const step = this.cfg.miwVaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
-          if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._pfVolIoWindowAvg?.('oi'); const step = this.cfg.miwIoaStep; const tier = (val && w) ? Math.floor(((val - w) / w * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
+          if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._pfVolIoWindowAvg?.('vol'); const step = this.cfg.miwVaStep; const tier = (val && w) ? Math.floor((Math.log(val / w) * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
+          if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._pfVolIoWindowAvg?.('oi'); const step = this.cfg.miwIoaStep; const tier = (val && w) ? Math.floor((Math.log(val / w) * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
           if (/^fund/.test(c)) { const step = this.cfg.miwFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.floor(fr_ / step); return `fund${tier>=0?'+':''}${tier}`; }
           if (/^ocs/.test(c)) { const _a = this._pfOcAccumSkew?.(t.symbol); const _live = this.pfOcResults?.[t.symbol]?.live ? this.pfOcResults[t.symbol] : null; const bc=(_a?.bc||0)+(_live?.bc||0), sc=(_a?.sc||0)+(_live?.sc||0); const tot = bc+sc; const buyPct = tot ? bc/tot*100 : 50; const step = this.cfg.miwOcsStep; const tier = Math.floor((buyPct-50)/step); return `ocs${tier>=0?'+':''}${tier}`; }
           if (/^ocx/.test(c)) { const _r = this.pfOcResults?.[t.symbol]; const _w = this._pfOcWindowAvgMs?.(); const step = this.cfg.miwOcxStep; const tier = (_r?.avgMs!=null && _w) ? Math.floor(((_w - _r.avgMs) / _w * 100) / step) : 0; return `ocx${tier>=0?'+':''}${tier}`; }
@@ -1207,7 +1207,7 @@
         // 24h/24, per miwLtaStep. LPA: percentage-point gap between its 1hr price change and the
         // mean of every other ticker in the window, per miwLpaStep.
         _miwHourTier(kind, t) {
-          const hr = this._pfHourReading?.(t.symbol);
+          const hr = this._pfHourReadingWide?.(t.symbol);
           if (!hr) return null;
           if (kind === 'lta') {
             const dev = this._pfLtaDev?.(hr.ht, t.turnover24h);
@@ -1245,7 +1245,7 @@
             const windowAvg = this._pfVolIoWindowAvg?.('vol');
             if (!val || !windowAvg) return false;
             const step = this.cfg.miwVaStep;
-            const tier = Math.floor(((val - windowAvg) / windowAvg * 100) / step);
+            const tier = Math.floor((Math.log(val / windowAvg) * 100) / step);
             const m = c.match(/^va([<>])(-?\d+)$/);
             if (!m) return true;
             return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
@@ -1255,7 +1255,7 @@
             const windowAvg = this._pfVolIoWindowAvg?.('oi');
             if (!val || !windowAvg) return false;
             const step = this.cfg.miwIoaStep;
-            const tier = Math.floor(((val - windowAvg) / windowAvg * 100) / step);
+            const tier = Math.floor((Math.log(val / windowAvg) * 100) / step);
             const m = c.match(/^ioa([<>])(-?\d+)$/);
             if (!m) return true;
             return m[1] === '>' ? tier >= parseInt(m[2], 10) : tier <= parseInt(m[2], 10);
@@ -1281,7 +1281,11 @@
               return dir === '>' ? tier >= val : tier <= val;
             }
             if (kind === 'ocx') {
-              if (!_ocR) return false;
+              // Falls back to this symbol's latest windowed avgMs when the current cycle's
+              // batch didn't happen to sample it — see _pfOcLatestAvgMs. The pre-entry top-up
+              // fetch (gated on pfOcResults directly, above) still refreshes it before entry.
+              const avgMsForSym = _ocR?.avgMs ?? this._pfOcLatestAvgMs?.(t.symbol);
+              if (avgMsForSym == null) return false;
               if (!m) return true;
               const [, , dir, valStr] = m; const val = parseInt(valStr, 10);
               // Percentage deviation from the full-window population average (see
@@ -1289,10 +1293,9 @@
               // faster than the window average, negative means slower. No minimum-ticker
               // floor on the window: a thin or cold-start window is intentionally left
               // unstable rather than gated off.
-              if (_ocR.avgMs == null) return false;
               const windowAvg = this._pfOcWindowAvgMs();
               if (windowAvg == null || windowAvg <= 0) return false;
-              const pctDev = (windowAvg - _ocR.avgMs) / windowAvg * 100;
+              const pctDev = (windowAvg - avgMsForSym) / windowAvg * 100;
               const step = this.cfg.miwOcxStep;
               const tier = Math.floor(pctDev / step);
               return dir === '>' ? tier >= val : tier <= val;

@@ -31,7 +31,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '1.84.3'; // Tweak: OC chip styling now reads the chart's two measures separately — outline lights when the ticker's order interval is faster than the batch mean (same test as the bars), body fills when its skew leans to this bot's favored side. Previously every chip compared order COUNT to the batch mean, and since each ticker samples the same number of trades, nearly all chips lit up identically. Prior: 1.84.2 — Fix: the Total/Batch/avg readout lines used a string :style binding, which Alpine applies as the whole style attribute — it wiped their font-family/size/margin, so every chart's summary rendered large and bold. Now an object binding (colour only, merged with the static style). Prior: 1.84.1 — Tweak: OC chart cleanup — dropped the redundant order/ticker counts from the summary; OC mode now shows Total (whole-window skew + avg interval) above Batch; per-ticker pills show only the dominant side and a bare interval ("PROVE B77 4.4s"), full values on hover or tap. Prior: 1.84.0 — Feature: LTA (1hr turnover vs own 24h/24) and LPA (1hr price change vs population) criteria — last-completed-hour candle per sampled ticker, cached one fetch per ticker per hour; both join the Extremity Scorer. OC chart views now rotate through OC/Vol/IO/LTA/LPA with prev/next buttons named for the neighbouring view, signed (zero-line) axis for LTA/LPA, and a Total avg readout above the per-batch one. Ported _pfWindowStats so V/A, IO/A, LPA and the readout share one deduped, memoized window read. Prior: 1.83.2 — Tweak: UI hints shortened to one line each; Extremity/Re-Eval/sample-floor/OC hints now describe the per-position rolling-average criteria (Re-Eval hint no longer claims 'no extra fetches'). Prior: 1.83.1 — Fix: _pfPositionCriteriaSample was reading fund/va/ioa off this._lastAllTickers, the bulk snapshot cached for cfg.bulkTickerCooldownHours (default 1h, user runs 3h) and reused across every scan in between — most "rolling average" samples were just the same stale number repeated, not real drift. Now does its own fresh per-symbol ticker fetch each scan (via _qFetch, still exempt from the follower no-own-fetch rule — same handful-of-symbols reasoning as the ocs/ocx fetch it already did this way). Prior: 1.83.0 — Open-Position Rolling-Average Criteria: replaces the frozen entry-time snapshot (_miwCriteria/_bewCriteria/_ldwCriteria) with a per-position rolling average, refreshed every scan (no new poller/timer), feeding close-time scoring, Extremity Re-Evaluation, and MIW substitution's live score; also fixed Re-Evaluation calling the never-defined _miwAnnotateLiveCrit.
+    const VERSION        = '1.85.0'; // Feature: OCX and LTA/LPA scan-time matching now falls back to this symbol's latest reading anywhere in the retained sample window (_pfOcLatestAvgMs, _pfHourReadingWide) when the current cycle/hour has no fresh data for it, instead of treating the ticker as unscoreable. The pre-entry top-up fetch (still keyed off strict _pfHourReading/pfOcResults freshness) is untouched and still refreshes the real value before an actual entry. Prior: 1.84.3 — Tweak: OC chip styling now reads the chart's two measures separately — outline lights when the ticker's order interval is faster than the batch mean (same test as the bars), body fills when its skew leans to this bot's favored side. Previously every chip compared order COUNT to the batch mean, and since each ticker samples the same number of trades, nearly all chips lit up identically. Prior: 1.84.2 — Fix: the Total/Batch/avg readout lines used a string :style binding, which Alpine applies as the whole style attribute — it wiped their font-family/size/margin, so every chart's summary rendered large and bold. Now an object binding (colour only, merged with the static style). Prior: 1.84.1 — Tweak: OC chart cleanup — dropped the redundant order/ticker counts from the summary; OC mode now shows Total (whole-window skew + avg interval) above Batch; per-ticker pills show only the dominant side and a bare interval ("PROVE B77 4.4s"), full values on hover or tap. Prior: 1.84.0 — Feature: LTA (1hr turnover vs own 24h/24) and LPA (1hr price change vs population) criteria — last-completed-hour candle per sampled ticker, cached one fetch per ticker per hour; both join the Extremity Scorer. OC chart views now rotate through OC/Vol/IO/LTA/LPA with prev/next buttons named for the neighbouring view, signed (zero-line) axis for LTA/LPA, and a Total avg readout above the per-batch one. Ported _pfWindowStats so V/A, IO/A, LPA and the readout share one deduped, memoized window read. Prior: 1.83.2 — Tweak: UI hints shortened to one line each; Extremity/Re-Eval/sample-floor/OC hints now describe the per-position rolling-average criteria (Re-Eval hint no longer claims 'no extra fetches'). Prior: 1.83.1 — Fix: _pfPositionCriteriaSample was reading fund/va/ioa off this._lastAllTickers, the bulk snapshot cached for cfg.bulkTickerCooldownHours (default 1h, user runs 3h) and reused across every scan in between — most "rolling average" samples were just the same stale number repeated, not real drift. Now does its own fresh per-symbol ticker fetch each scan (via _qFetch, still exempt from the follower no-own-fetch rule — same handful-of-symbols reasoning as the ocs/ocx fetch it already did this way). Prior: 1.83.0 — Open-Position Rolling-Average Criteria: replaces the frozen entry-time snapshot (_miwCriteria/_bewCriteria/_ldwCriteria) with a per-position rolling average, refreshed every scan (no new poller/timer), feeding close-time scoring, Extremity Re-Evaluation, and MIW substitution's live score; also fixed Re-Evaluation calling the never-defined _miwAnnotateLiveCrit.
     // v1.80.1 — Fixed the Lukewarm Scoring pill board (pfLukewarmScoreboard/_pfExtremityHtml)
     // netting a two-pole family's '+' and '-' sides into one pill: bucketStats/bucketCount
     // in _pfExtremityBuild were keyed by info.family alone instead of dk (family+pole), so
@@ -1763,6 +1763,20 @@
           if (!vals.length) return null;
           return vals.reduce((s, v) => s + v, 0) / vals.length;
         },
+        // Single-ticker counterpart to _pfOcWindowAvgMs: this symbol's own latest avgMs
+        // anywhere in the retained _pfOcCycleHistory, for when the current cycle's batch
+        // didn't happen to sample it. Used only as a scan-time fallback for OCX matching
+        // (stale-but-real beats no data at all) — the pre-entry top-up fetch still keys off
+        // pfOcResults directly and is unaffected by this.
+        _pfOcLatestAvgMs(sym) {
+          let latest = null, latestTs = -Infinity;
+          for (const cycle of (this._pfOcCycleHistory || [])) {
+            if (!cycle || !Array.isArray(cycle.results)) continue;
+            const r = cycle.results.find(x => x && x.sym === sym && typeof x.avgMs === 'number');
+            if (r && cycle.ts > latestTs) { latest = r.avgMs; latestTs = cycle.ts; }
+          }
+          return latest;
+        },
         // Full-window population average for MIW's va/ioa criteria — same dedup-to-latest-per-
         // symbol pattern as _pfOcWindowAvgMs, over the same tethered _pfOcCycleHistory, just
         // averaging 'vol' or 'oi' instead of 'avgMs'.
@@ -1850,6 +1864,23 @@
           const r = this.pfOcResults?.[sym];
           if (r && typeof r.ht === 'number' && typeof r.hc === 'number') return { ht: r.ht, hc: r.hc };
           return null;
+        },
+        // Widened counterpart to _pfHourReading, for scan-time LTA/LPA matching only — never
+        // for the top-up fetch gate (_miwTopUpGeneralCriteria), which must stay strict-fresh
+        // so the pre-entry refetch still fires. Falls back to this symbol's latest reading
+        // anywhere in the retained _pfOcCycleHistory window when nothing fresh (this hour's
+        // cache or the latest batch) exists yet, so a not-yet-resampled-this-hour ticker can
+        // still be scored on stale-but-real data instead of being treated as having none.
+        _pfHourReadingWide(sym) {
+          const fresh = this._pfHourReading(sym);
+          if (fresh) return fresh;
+          let latest = null, latestTs = -Infinity;
+          for (const cycle of (this._pfOcCycleHistory || [])) {
+            if (!cycle || !Array.isArray(cycle.results)) continue;
+            const r = cycle.results.find(x => x && x.sym === sym && typeof x.ht === 'number' && typeof x.hc === 'number');
+            if (r && cycle.ts > latestTs) { latest = { ht: r.ht, hc: r.hc }; latestTs = cycle.ts; }
+          }
+          return latest;
         },
         // Mean seconds/order across every ticker in the displayed cycle — moved here from the
         // old Volume History chart's OC overlay line, which got scrapped along with the rest

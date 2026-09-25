@@ -175,7 +175,7 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 
 ### Criteria
 
-See Strategy_book.md's **Market Reading** section for what each criterion (`fund`, `va`, `ioa`, `ocs`, `ocx`) means and when to use it; `lta` and `lpa` are defined under **LTA / LPA recording** below. This section covers only tiering, recording, and fetch/caching mechanics — operational detail Strategy_book intentionally leaves out.
+See Strategy_book.md's **Market Reading** section for what each criterion (`fund`, `va`, `ioa`, `ocs`, `ocx`, `lta`, `lpa`) means and when to use it. This section covers only tiering, recording, and fetch/caching mechanics — operational detail Strategy_book intentionally leaves out.
 
 **Tier gate**: every criterion computes an integer tier as `floor(value / step)` and compares it against N. Current step sizes are shown as read-only chips under **Tier Step Sizes** on the Fetch tab. The same tier is recorded on the position and used as the scorecard key — `fund>1` and `fund+7` are different tiers and scored separately.
 
