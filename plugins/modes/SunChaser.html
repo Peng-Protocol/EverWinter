@@ -18,10 +18,26 @@
     return { 'X-BAPI-API-KEY': key, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': recv, 'X-BAPI-SIGN': hex, 'Content-Type': 'application/json' };
   }
 
+  // Manual-estimate average entry: reconstructs the average we'd expect using the
+  // trigger prices we actually placed each DCA stage's conditional order at, rather
+  // than the exchange's reported avgPrice. Used as a fallback + sanity check for the
+  // exchange value, which has historically lagged briefly right after a fill.
+  function _dcaLocalAvg(pos, uptoStage) {
+    const stageQtys = pos._stageQtys || [];
+    let size     = stageQtys[0] || 0;
+    let notional = (pos.originalEntryPrice || pos.entryPrice) * size;
+    const conds  = (pos.orders || []).filter(o => o.type === 'cond');
+    for (let i = 0; i < uptoStage && i < conds.length; i++) {
+      notional += conds[i].price * conds[i].qty;
+      size     += conds[i].qty;
+    }
+    return size > 0 ? notional / size : (pos.originalEntryPrice || pos.entryPrice);
+  }
+
   window.__BotPlugin = {
     id:        'sunchaser',
     name:      'SunChaser',
-    version:   '1.1.0',
+    version:   '1.2.0',
     targetBot: 'pseudochaser',
     after:     [],
     before:    [],
@@ -308,6 +324,112 @@
           }
         },
 
+        async placeConditional(symbol, side, qty, tpPrice, triggerPrice) {
+          await this._scDelay();
+          const dp = this._scPriceDp(symbol);
+          const priceStr = triggerPrice.toFixed(dp);
+          const order = {
+            category: 'linear',
+            symbol,
+            side,
+            orderType: 'Limit',
+            qty: String(qty),
+            price: priceStr,
+            triggerPrice: priceStr,
+            triggerBy: 'LastPrice',
+            triggerDirection: side === 'Sell' ? 1 : 2, // Buy add: triggers on price falling to triggerPrice
+            timeInForce: 'GTC',
+            reduceOnly: false,
+          };
+          if (tpPrice) {
+            order.takeProfit  = tpPrice.toFixed(dp);
+            order.tpTriggerBy = 'LastPrice';
+          }
+          const b = JSON.stringify(order);
+          const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+          try {
+            const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
+            const d = await this._scSafeJson(r);
+            if (!d || d.retCode !== 0) { this.log(`[SC] placeConditional ${symbol}: ${d?.retMsg || 'no response'}`, 'warn'); return null; }
+            return d.result?.orderId || null;
+          } catch(e) { this.log(`[SC] placeConditional: ${e.message}`, 'error'); return null; }
+        },
+
+        async _scOrderStatus(symbol, orderId) {
+          await this._scDelay();
+          const qs = `category=linear&symbol=${symbol}&orderId=${orderId}`;
+          const h  = await _sign(this.creds.key, this.creds.secret, qs, this._tsOffset);
+          try {
+            const r = await fetch(`${this.base}/v5/order/realtime?${qs}`, { headers: h });
+            const d = await this._scSafeJson(r);
+            const rec = d?.result?.list?.[0];
+            return rec ? rec.orderStatus : null; // null: not in the open/realtime list (filled long ago, or truly gone)
+          } catch(e) { return null; }
+        },
+
+        // Detects and repairs a live position whose first-wind DCA orders are missing —
+        // either cancelled/expired/rejected on the exchange (bot restart, manual
+        // intervention, connectivity gap) or never successfully placed at open. Mirrors
+        // PseudoChaser's simulated _repairDcaStages, but re-places real conditional
+        // orders instead of local records. Anchored to originalEntryPrice so trigger
+        // percentages stay consistent with what was intended at open.
+        async _scRepairDcaStages(pos) {
+          if (pos._binary) return;
+          const expected = pos._stageCount || pos._firstWindStageCount || 0;
+          if (!expected) return;
+
+          const conds = (pos.orders || []).filter(o => o.type === 'cond' && !o._secondWind);
+          let repaired = 0;
+
+          // Re-verify any first-wind order we don't yet believe filled — it may have
+          // been cancelled or expired on the exchange without us hearing about it.
+          for (const o of conds) {
+            if (o.filled) continue;
+            const status = await this._scOrderStatus(pos.symbol, o.orderId);
+            if (status === 'Filled' || status === 'PartiallyFilled' || status === 'New' || status === 'Untriggered') continue; // still live, or stage-inference already caught the fill
+            const newId = await this.placeConditional(pos.symbol, 'Buy', o.qty, o.tpPrice, o.price);
+            if (newId) {
+              o.orderId = newId;
+              repaired++;
+              this.log(`[SC] ${pos.symbol}: re-placed missing ${o.label} (was ${status || 'not found'})`, 'warn');
+            } else {
+              this.log(`[SC] ${pos.symbol}: failed to re-place ${o.label} — will retry next cycle`, 'error');
+            }
+          }
+
+          // Fewer stages were ever placed than intended (e.g. a placement failed at
+          // open) — fill in the missing ones anchored to the original entry price.
+          if (conds.length < expected) {
+            const instr = await this.getInstrInfo(pos.symbol);
+            if (!instr) return;
+            const addPcts     = this._activeAddPcts();
+            const addNotional = this.cfg.addNotional || this.cfg.minNotional;
+            const anchor      = pos.originalEntryPrice || pos.entryPrice;
+            pos._stageQtys    = pos._stageQtys && pos._stageQtys.length ? pos._stageQtys : [pos.totalSize];
+            let runNotional = anchor * pos._stageQtys[0];
+            let runSize     = pos._stageQtys[0];
+            for (const o of conds) { runNotional += o.price * o.qty; runSize += o.qty; }
+
+            for (let i = conds.length; i < expected; i++) {
+              const addPrice = this.snapPrice(anchor * (1 - addPcts[i] / 100), instr); // LONG: add below anchor
+              if (!addPrice || addPrice <= 0) break;
+              const addQty = this.snapQty(addNotional / addPrice, instr);
+              if (addQty <= 0) continue;
+              const projNotional = runNotional + addPrice * addQty;
+              const projSize     = runSize + addQty;
+              const addTp = this.snapPrice((projNotional / projSize) * (1 + this._tpRoi(i + 1) / 100 / pos.leverage), instr); // LONG: TP above avg
+              const orderId = await this.placeConditional(pos.symbol, 'Buy', addQty, addTp, addPrice);
+              if (!orderId) break;
+              pos.orders.push({ label: `Add${i+1} -${addPcts[i]}%`, price: addPrice, qty: addQty, tpPrice: addTp, type: 'cond', filled: false, orderId });
+              pos._stageQtys.push(projSize);
+              runNotional = projNotional; runSize = projSize;
+              repaired++;
+            }
+          }
+
+          if (repaired > 0 && typeof this.persist === 'function') this.persist();
+        },
+
         async _scSyncPositions() {
           if (!this.creds.key || !this.creds.secret) return;
           try {
@@ -359,12 +481,79 @@
                 this.log(`[SC] ${pos.symbol}: exchange closed [${reason}] @ ${exitPrice}`, 'info');
                 await _origClose.call(this, pos, reason, exitPrice);
               } else {
-                const exAvg   = parseFloat(ep.avgPrice || ep.entryPrice || pos.entryPrice);
-                pos.markPrice = parseFloat(ep.markPrice || exAvg || pos.markPrice);
-                pos.totalSize = parseFloat(ep.size || pos.totalSize);
-                if (exAvg > 0) pos.entryPrice = exAvg;
+                const exAvg    = parseFloat(ep.avgPrice || ep.entryPrice || pos.entryPrice);
+                const prevEntry = pos.entryPrice;
+                pos.markPrice  = parseFloat(ep.markPrice || exAvg || pos.markPrice);
+                pos.totalSize  = parseFloat(ep.size || pos.totalSize);
+
+                if (!pos._binary) {
+                  try {
+                    await this._scRepairDcaStages(pos);
+                  } catch(e) {
+                    this.log(`[SC] ${pos.symbol}: DCA repair failed — ${e.message}`, 'error');
+                  }
+                }
+
+                // Infer DCA stage from realized position size vs. the cumulative qty
+                // thresholds recorded at open — Bybit fills the conditional add orders
+                // server-side, so size growth is the only signal needed (no per-order
+                // polling). Once every first-wind stage has filled, arm the native SL.
+                let stage = pos.dcaStage || 0;
+                if (!pos._binary && Array.isArray(pos._stageQtys) && pos._stageQtys.length > 1) {
+                  stage = 0;
+                  for (let i = 1; i < pos._stageQtys.length; i++) {
+                    if (pos.totalSize >= pos._stageQtys[i] * 0.999) stage = i;
+                  }
+                  if (stage > (pos.dcaStage || 0)) {
+                    pos.dcaStage = stage;
+                    pos.tpPct    = this._tpRoi(stage);
+                    const conds  = (pos.orders || []).filter(o => o.type === 'cond');
+                    for (let i = 0; i < stage && i < conds.length; i++) conds[i].filled = true;
+                    this.log(`[SC] ${pos.symbol}: DCA stage ${stage}/${pos._stageCount || conds.length} filled`, 'trade');
+                    if (typeof this.persist === 'function') this.persist();
+                  }
+                }
+
+                // Prefer the exchange avgPrice — it's what Bybit will actually use to
+                // compute realized P&L — but guard against a stale read right after a
+                // fill (a historical Bybit quirk): if it's barely moved from where it
+                // was despite a stage having just filled, fall back to our own
+                // manually-estimated average for this cycle and let the next sync
+                // retry. _scCheckTp's drift correction converges the native TP once
+                // the trusted average is in place.
+                if (stage > 0 && Array.isArray(pos._stageQtys)) {
+                  const localAvg     = _dcaLocalAvg(pos, stage);
+                  const expectedMove = Math.abs(localAvg - prevEntry);
+                  const actualMove   = Math.abs(exAvg - prevEntry);
+                  const staleLikely  = exAvg <= 0 || (expectedMove > 0 && actualMove < expectedMove * 0.25);
+                  if (staleLikely) {
+                    pos.entryPrice = localAvg;
+                    this.log(`[SC] ${pos.symbol}: exchange avgPrice hasn't caught up yet (${exAvg}) — using estimate ${localAvg.toFixed(6)} this cycle`, 'debug');
+                  } else {
+                    pos.entryPrice = exAvg;
+                  }
+                } else if (exAvg > 0) {
+                  pos.entryPrice = exAvg;
+                }
+
+                if (!pos._binary && Array.isArray(pos._stageQtys) && pos._stageQtys.length > 1) {
+                  const totalStages = pos._firstWindStageCount || pos._stageCount || 0;
+                  if (!pos.slSet && stage >= totalStages && totalStages > 0) {
+                    const slInstr = await this.getInstrInfo(pos.symbol);
+                    if (slInstr) {
+                      const dcaSlPct = this.cfg.dcaSlPct ?? 16;
+                      const slPrice  = this.snapPrice(pos.entryPrice * (1 - dcaSlPct / 100 / pos.leverage), slInstr); // LONG: SL below avg
+                      await this._scSetSL(pos.symbol, slPrice);
+                      pos.slPrice = slPrice;
+                      pos.slSet   = true;
+                      this.log(`[SC] ${pos.symbol}: all ${totalStages} DCA stage(s) filled — SL armed @ ${slPrice}`, 'warn');
+                      if (typeof this.persist === 'function') this.persist();
+                    }
+                  }
+                }
+
                 const exTp = parseFloat(ep.takeProfit || 0);
-                await this._scCheckTp(pos, exTp, exAvg || pos.entryPrice);
+                await this._scCheckTp(pos, exTp, pos.entryPrice);
               }
             }
             this._scLastSync = Date.now();
@@ -424,6 +613,36 @@
           const bSlPct  = this.cfg.binarySlPct ?? 18;
           const slPrice = binary ? this.snapPrice(fillPrice * (1 - bSlPct / 100 / lev), instr) : 0;  // LONG: SL below entry
 
+          // Non-binary: place real conditional DCA add orders below entry, each carrying
+          // its own take-profit so the exchange applies it the moment that stage fills.
+          // SL stays unset here — it's armed in _scSyncPositions once every stage placed
+          // below has actually filled on the exchange.
+          const dcaOrders = [];
+          const stageQtys = [qty];
+          if (!binary) {
+            const addPcts      = this._activeAddPcts();
+            const stages       = Math.min(this._dcaStageCount() || 1, addPcts.length);
+            const addNotional  = this.cfg.addNotional || this.cfg.minNotional;
+            let runNotional    = fillPrice * qty;
+            let runSize        = qty;
+            for (let i = 0; i < stages; i++) {
+              const addPrice = this.snapPrice(fillPrice * (1 - addPcts[i] / 100), instr); // LONG: add below entry
+              if (!addPrice || addPrice <= 0) { this.log(`[SC] ${symbol}: DCA Add${i+1} price invalid — stopping ladder at ${dcaOrders.length} stage(s)`, 'warn'); break; }
+              const addQty = this.snapQty(addNotional / addPrice, instr);
+              if (addQty <= 0) continue;
+              const projNotional = runNotional + addPrice * addQty;
+              const projSize     = runSize + addQty;
+              const expectedAvg  = projNotional / projSize;
+              const addTp = this.snapPrice(expectedAvg * (1 + this._tpRoi(i + 1) / 100 / lev), instr); // LONG: TP above avg
+              const orderId = await this.placeConditional(symbol, 'Buy', addQty, addTp, addPrice);
+              if (!orderId) { this.log(`[SC] ${symbol}: DCA Add${i+1} order rejected — stopping ladder at ${dcaOrders.length} stage(s)`, 'warn'); break; }
+              runNotional = projNotional;
+              runSize     = projSize;
+              dcaOrders.push({ label: `Add${i+1} -${addPcts[i]}%`, price: addPrice, qty: addQty, tpPrice: addTp, type: 'cond', filled: false, orderId });
+              stageQtys.push(runSize);
+            }
+          }
+
           const now = Date.now();
           const pos = {
             id:                  now + Math.random(),
@@ -437,7 +656,7 @@
             openedAt:            now,
             phase:               'normal',
             dcaStage:            0,
-            orders:              [],
+            orders:              dcaOrders,
             _pseudo:             false,
             _long:               true,
             _binary:             binary,
@@ -450,8 +669,9 @@
             rsi12,
             rsi24,
             fundingRate,
-            _stageCount:         0,
-            _firstWindStageCount: 0,
+            _stageCount:         binary ? 0 : dcaOrders.length,
+            _firstWindStageCount: binary ? 0 : dcaOrders.length,
+            _stageQtys:          stageQtys,
             _fundingHistory:     [],
             upnl:                0,
           };
@@ -466,7 +686,7 @@
           if (tpPrice > 0) await this._scSetTP(pos, tpPrice);
           if (slPrice > 0) await this._scSetSL(symbol, slPrice);
 
-          this.log(`☀ [SC] LONG ${symbol} @ ${fillPrice} | TP:${tpPrice}${slPrice ? ' SL:'+slPrice : ''}`, 'info');
+          this.log(`☀ [SC] LONG ${symbol} @ ${fillPrice} | TP:${tpPrice}${slPrice ? ' SL:'+slPrice : ''}${dcaOrders.length ? ' | '+dcaOrders.length+' DCA stage(s) armed' : ''}`, 'info');
 
           // Callers (e.g. MIC's own tagging step) need a direct reference to the position
           // they just opened rather than assuming it's the last array element — a

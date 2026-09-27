@@ -959,35 +959,36 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               </div>
             </div>
             <div data-plugin-slot="config-eda"></div>
-            <div x-show="cfg.binaryModeEnabled" style="margin-top:10px">
-              <div class="g">
-                <div class="lbl">Take Profit <b x-text="cfg.binaryTpPct+'%'"></b></div>
-                <input type="range" min="1" max="99" step="1" x-model.number="cfg.binaryTpPct" :disabled="bot.running" @change="persist()">
-                <div class="hint">Closes at slider% ROI; with held debt (EDa), target rises to cover bufferedEV plus the debt share.</div>
+            <!-- Mode config — binary by default; DCA mode unlocked via plugin.
+                 Binary TP/SL sits right after the toggle so it's visually part of the
+                 same either/or block as DCA mode's own TP/SL (rendered inside the slot). -->
+            <div class="g" class="mt-sep">
+              <div class="sec-ttl" style="margin-bottom:6px;font-size:9px">MODE</div>
+              <div data-plugin-slot="mode-config"></div>
+              <div x-show="cfg.binaryModeEnabled" style="margin-top:10px">
+                <div class="g">
+                  <div class="lbl">Take Profit <b x-text="cfg.binaryTpPct+'%'"></b></div>
+                  <input type="range" min="1" max="99" step="1" x-model.number="cfg.binaryTpPct" :disabled="bot.running" @change="persist()">
+                  <div class="hint">Closes at slider% ROI; with held debt (EDa), target rises to cover bufferedEV plus the debt share.</div>
+                </div>
+                <div class="g" style="margin-top:8px">
+                  <div class="lbl">Stop Loss <b x-text="cfg.binarySlPct+'%'"></b></div>
+                  <input type="range" min="1" max="99" step="1" x-model.number="cfg.binarySlPct" :disabled="bot.running" @change="persist()">
+                  <div class="hint">SL fires at this % loss (leverage-adjusted). At 18%: SL = entry × (1 + 18% / lev).</div>
+                </div>
               </div>
-              <div class="g" style="margin-top:8px">
-                <div class="lbl">Stop Loss <b x-text="cfg.binarySlPct+'%'"></b></div>
-                <input type="range" min="1" max="99" step="1" x-model.number="cfg.binarySlPct" :disabled="bot.running" @change="persist()">
-                <div class="hint">SL fires at this % loss (leverage-adjusted). At 18%: SL = entry × (1 + 18% / lev).</div>
+
+            <!-- Active Mode indicator -->
+            <div class="g" class="mt-sep">
+              <div style="font-family:var(--mono);font-size:10px;color:var(--ice)">
+                Mode:<span data-plugin-slot="mode-label-extra"></span>
               </div>
             </div>
+
+          </div>
           </div><!-- /SIZE zone -->
 
-          <!-- Mode config — binary by default; DCA mode unlocked via plugin -->
-          <div class="g" class="mt-sep">
-            <div class="sec-ttl" style="margin-bottom:6px;font-size:9px">MODE</div>
-            <div data-plugin-slot="mode-config"></div>
-
-          <!-- Active Mode indicator -->
-          <div class="g" class="mt-sep">
-            <div style="font-family:var(--mono);font-size:10px;color:var(--ice)">
-              Mode:<span data-plugin-slot="mode-label-extra"></span>
-            </div>
-          </div>
-
-
         </div>
-      </div>
 
       <div data-plugin-slot="strategy-accordions"></div>
 
@@ -1133,7 +1134,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
                   })()"></span>
                 </div>
               </div>
-              <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="(()=>{ const slRoi = p._slPctOverride ?? (cfg.binaryModeEnabled ? (cfg.binarySlPct??18) : 105); return '~−'+slRoi.toFixed(1)+'%  '+fmtP(p.slPrice); })()"></div></div>
+              <div class="ps" x-show="p.slSet"><div class="psl">Stop Loss</div><div class="psv" style="color:var(--short)" x-text="(()=>{ const slRoi = p._slPctOverride ?? (p._binary ? (cfg.binarySlPct??18) : (cfg.dcaSlPct??16)); return '~−'+slRoi.toFixed(1)+'%  '+fmtP(p.slPrice); })()"></div></div>
             </div>
             <!-- ── PRICE LADDER BAR ── -->
             <div x-data="{
@@ -1711,6 +1712,11 @@ const PSEUDOWINTER_DEFAULT_CFG = Object.freeze({
     restPollEnabled: true, restPollBaseSec: 5,
     entryTpRoi: 18,    // TP ROI % — the single TP target (bufferedEV basis), parallel with the SL %
     runtimeHours: 48,
+    dcaStages: 3,             // integer stage count; slider allows [3,6,7,...,18]; 4/5 not valid
+    dcaAddPct1: 3,            // DCA Add1 trigger — % above entry (n=3 stage layout only; n>=6 uses the built-in formula)
+    dcaAddPct2: 6,            // DCA Add2 trigger — % above entry
+    dcaAddPct3: 12,           // DCA Add3 trigger — % above entry
+    dcaSlPct: 16,             // DCA-mode SL — % loss (leverage-adjusted) once all first-wind stages have filled
     binaryModeEnabled: true,   // binary risk: TP + SL set at entry, no DCA orders
     binaryTpPct: 50,           // binary mode take-profit % (leverage-adjusted ROI)
     binarySlPct: 50,           // binary mode stop-loss % (leverage-adjusted ROI)
@@ -3513,11 +3519,13 @@ function pw() { return {
                 pos.currentTpPrice = _kl_tp;
                 pos.tpPct          = _kl_roi;
               }
-              if (pos.dcaStage >= 1 && !pos.slPrice && instr) {
-                pos.slPrice = this.cfg.binaryModeEnabled
-                  ? this._binarySLPrice(pos, instr)
-                  : this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), instr);
-                pos.slSet   = true;
+              {
+                const _gapFwFilled = pos.orders.filter(o => o.type === 'cond' && o.filled && !o._secondWind).length;
+                const _gapFwTotal  = pos._firstWindStageCount || this._posStageCount(pos);
+                if (!add._secondWind && _gapFwFilled >= _gapFwTotal && !pos.slPrice && instr) {
+                  pos.slPrice = pos._binary ? this._binarySLPrice(pos, instr) : this._dcaSLPrice(pos, instr);
+                  pos.slSet   = true;
+                }
               }
               this.log(`[GAP] ${this.themeEmoji} ${pos.symbol}: gap — ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI) (candle ${new Date(c.t).toTimeString().slice(0,8)})`, 'trade');
             }
@@ -3578,7 +3586,8 @@ function pw() { return {
             margin:           pos.margin,
             leverage:         pos.leverage,
             dcaStage:         pos.dcaStage || 0,
-            _stageCount:      1,
+            _binary:          pos._binary,
+            _stageCount:      pos._binary ? 1 : this._posStageCount(pos),
       _swStageCount:    ((pos.orders || []).filter(o => o.type === 'cond' && o._secondWind).length || 0),
             duration,
             closedAt,
@@ -3715,12 +3724,12 @@ function pw() { return {
       slSet   = true;
     } else {
       const effAddNotional = this.cfg.addNotional;
-      const effTpRoi       = [effTp0, this._tpRoi(1)];
       let runNotional_ps = price * this.snapQty(effMinNotional / price, instr);
       let runSize_ps     = this.snapQty(effMinNotional / price, instr);
       let invalidDcaPrice = false;
       const _psAddPcts = this._activeAddPcts();
-      for (let i = 0; i < this._dcaStageCount(); i++) {
+      const _psStages  = Math.min(this._dcaStageCount() || 1, _psAddPcts.length);
+      for (let i = 0; i < _psStages; i++) {
         const addPrice  = this.snapPrice(price * (1 + _psAddPcts[i]/100), instr);
         if (!addPrice || addPrice <= 0) {
           this.log(`[OPN] ${sym}: Pseudo DCA Add${i+1} price invalid (${addPrice}) — BLACKLISTED`, 'warn');
@@ -3735,7 +3744,7 @@ function pw() { return {
         runNotional_ps += addPrice * addQty;
         runSize_ps     += addQty;
         const expectedAvg = runSize_ps > 0 ? runNotional_ps / runSize_ps : addPrice;
-        const addTp = this.snapPrice(expectedAvg * (1 - (effTpRoi[i+1] / 100) / effectiveLev), instr);
+        const addTp = this.snapPrice(expectedAvg * (1 - (this._tpRoi(i + 1) / 100) / effectiveLev), instr);
         if (!addTp || addTp <= 0) {
           this.log(`[OPN] ${sym}: Pseudo DCA Add${i+1} TP invalid (${addTp}) — BLACKLISTED`, 'warn');
           this._banSymbol(sym, `Pseudo DCA Add${i+1} TP too low for API precision (${addTp})`);
@@ -3777,7 +3786,9 @@ function pw() { return {
       tpPct: effTp0,
       slPrice, slSet,
       dcaStage:0, orders,
-      _stageCount: binary ? 0 : this._dcaStageCount(),
+      _binary: binary,
+      _stageCount: binary ? 0 : orders.length,
+      _firstWindStageCount: binary ? 0 : orders.length,
       _pseudo:true, _lastSeenAt:Date.now(),
     };
     this.positions.push(newPos);
@@ -3989,6 +4000,13 @@ function pw() { return {
 
       const mark = pos.markPrice || pos.entryPrice;
 
+      // Repair any missing DCA stages before processing fills
+      try {
+        await this._repairDcaStages(pos);
+      } catch(e) {
+        this.log(`[PW-DCA-01] ${pos.symbol}: DCA repair failed — ${e.message}`, 'error');
+      }
+
       const pendingAdds = pos.orders.filter(o => o.type === 'cond' && !o.filled);
       for (const add of pendingAdds) {
         if (mark >= add.price) {
@@ -4016,14 +4034,15 @@ function pw() { return {
             pos.tpPct          = _sl_roi;
 
           }
-          if (pos.dcaStage >= 1 && !pos.slPrice) {
+          // SL fires when all first-wind DCA stages have filled — mirrors PseudoChaser.
+          const _slFirstWindFilled = pos.orders.filter(o => o.type === 'cond' && o.filled && !o._secondWind).length;
+          const _slFirstWindTotal  = pos._firstWindStageCount || this._posStageCount(pos);
+          if (!add._secondWind && _slFirstWindFilled >= _slFirstWindTotal && !pos.slPrice && !pos._binary) {
             const instr = await this.getInstrInfo(pos.symbol);
             if (instr) {
-              pos.slPrice = this.cfg.binaryModeEnabled
-                ? this._binarySLPrice(pos, instr)
-                : this.snapPrice(pos.entryPrice * (1 + 1.05 / pos.leverage), instr);
+              pos.slPrice = this._dcaSLPrice(pos, instr);
               pos.slSet   = true;
-              this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: stage ${1} — SL set @ ${fmtP(pos.slPrice)}${this.cfg.binaryModeEnabled ? ' [Binary]' : ''}`, 'warn');
+              this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: stage ${this._posStageCount(pos)} — SL set @ ${fmtP(pos.slPrice)}`, 'warn');
             }
           }
           this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: ${add.label} triggered @ ${fmtP(add.price)} | New avg: ${fmtP(pos.entryPrice)} | Stage ${pos.dcaStage} | TP → ${fmtP(pos.currentTpPrice)} (${pos.tpPct}% ROI)`, 'trade');
@@ -4032,17 +4051,21 @@ function pw() { return {
       }
       if (_closingIds.has(pos.id) || !this.positions.find(x => x.id === pos.id)) continue;
 
-      const _slGate = pos.slSet && pos.slPrice > 0 && (this.cfg.binaryModeEnabled || pos.dcaStage >= 1);
-      if (_slGate) {
-        const instr = await this.getInstrInfo(pos.symbol);
-        if (instr) {
-          const targetSl = this._binarySLPrice(pos, instr);
-          const bSlPct   = pos._slPctOverride ?? this.cfg.binarySlPct ?? 18;
-          const slTol    = (pos.originalEntryPrice || pos.entryPrice) * bSlPct / 100 / pos.leverage * 0.10;
-          if (Math.abs(pos.slPrice - targetSl) > slTol) {
-            pos.slPrice = targetSl;
-            this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: SL drift-corrected → ${fmtP(targetSl)} [Binary]`, 'warn');
-            this.persist();
+      if (pos.slSet && pos.slPrice > 0) {
+        const _slFwFilled = (pos.orders || []).filter(o => o.type === 'cond' && o.filled && !o._secondWind).length;
+        const _slFwTotal  = pos._firstWindStageCount || this._posStageCount(pos);
+        const _slGate     = pos._binary || _slFwFilled >= _slFwTotal;
+        if (_slGate) {
+          const instr = await this.getInstrInfo(pos.symbol);
+          if (instr) {
+            const targetSl = pos._binary ? this._binarySLPrice(pos, instr) : this._dcaSLPrice(pos, instr);
+            const pct      = pos._binary ? (pos._slPctOverride ?? this.cfg.binarySlPct ?? 18) : (this.cfg.dcaSlPct ?? 16);
+            const slTol    = (pos.originalEntryPrice || pos.entryPrice) * pct / 100 / pos.leverage * 0.10;
+            if (Math.abs(pos.slPrice - targetSl) > slTol) {
+              pos.slPrice = targetSl;
+              this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: SL drift-corrected → ${fmtP(targetSl)}${pos._binary ? ' [Binary]' : ''}`, 'warn');
+              this.persist();
+            }
           }
         }
       }
@@ -4334,7 +4357,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:5px">
               <div class="ps"><div class="psl">Entry</div><div class="psv">${fmtP(t.originalEntryPrice ?? t.entryPrice)}</div></div>
               <div class="ps"><div class="psl">Exit</div><div class="psv">${fmtP(t.exitPrice)}</div></div>
-              ${!t._binary ? `<div class="ps"><div class="psl">DCA Stage</div><div class="psv">${t.dcaStage ?? 0}/${stageTotal}${t.dcaStage ? ` <span style="font-size:8px;color:var(--text-lo)">(avg ${fmtP(t.entryPrice)})</span>` : ''}</div></div>` : ''}
+              <div class="ps"><div class="psl">DCA Stage</div><div class="psv">${t._binary ? 'Binary' : `${t.dcaStage ?? 0}/${stageTotal}${t.dcaStage ? ` <span style="font-size:8px;color:var(--text-lo)">(avg ${fmtP(t.entryPrice)})</span>` : ''}`}</div></div>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:5px">
               <div class="ps"><div class="psl">Margin</div><div class="psv">$${(t.margin ?? 0).toFixed(2)}</div></div>
@@ -4522,18 +4545,34 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   },
 
 
-  _dcaStageCount() { return 1; },
+  _dcaStageCount() { return this.cfg.dcaStages; },
   // Returns computed add-price trigger percentages array.
-  // N=3: hardcoded [3,9,15]; N>=6: [1.5, 3, 6, ..., 3*(N-1)]
-  _addPcts() { return [3]; },
-  _activeAddPcts() { return [3]; },
+  // N=3: configurable (cfg.dcaAddPct1/2/3, default [3,6,12]); N>=6: [1.5, 3, 6, ..., 3*(N-1)]
+  _addPcts() {
+    const n = this.cfg.dcaStages;
+    if (n === 3) return [this.cfg.dcaAddPct1 ?? 3, this.cfg.dcaAddPct2 ?? 6, this.cfg.dcaAddPct3 ?? 12];
+    return [1.5, ...Array.from({length: n - 1}, (_, k) => 3 * (k + 1))];
+  },
+  // Alias for backward compat with call sites using _activeAddPcts()
+  _activeAddPcts() { return this._addPcts(); },
   // Returns computed TP ROI % for stage s (stage 0=entry uses entryTpRoi).
   // max(entryTpRoi / (s+1), 3)
   _tpRoi(s) {
     return Math.max(this.cfg.entryTpRoi / (s + 1), 3);
   },
   // Returns the final DCA trigger percent (also the SL trigger).
-  _dcaFinalPct() { return 3; },
+  _dcaFinalPct() {
+    const n = this.cfg.dcaStages;
+    return n === 3 ? (this.cfg.dcaAddPct3 ?? 12) : 3 * (n - 1);
+  },
+  // Returns the DCA stage count for a specific position, regardless of current global config.
+  // Prefers the stamped _stageCount field; falls back to counting cond orders in the position.
+  _posStageCount(pos) {
+    if (pos._binary) return 0;
+    if (pos._stageCount != null) return pos._stageCount;
+    const condCount = (pos.orders || []).filter(o => o.type === 'cond').length;
+    return condCount > 0 ? condCount : this._dcaStageCount();
+  },
 
   // Binary mode SL: binarySlPct % above entry (leverage-adjusted). Uses originalEntryPrice.
   _binarySLPrice(pos, instr) {
@@ -4542,11 +4581,80 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     const raw    = base * (1 + bSlPct / 100 / pos.leverage);
     return instr ? this.snapPrice(raw, instr) : parseFloat(raw.toFixed(8));
   },
+  // DCA mode SL: cfg.dcaSlPct % above avg entry (leverage-adjusted) — SHORT mirror of
+  // PseudoChaser's formula. Armed once all first-wind stages have filled.
+  _dcaSLPrice(pos, instr) {
+    const dcaSlPct = this.cfg.dcaSlPct ?? 16;
+    const raw = pos.entryPrice * (1 + dcaSlPct / 100 / pos.leverage);
+    return instr ? this.snapPrice(raw, instr) : parseFloat(raw.toFixed(8));
+  },
 
   // Detects and silently repairs a position whose first-wind cond orders are fewer than
   // _stageCount. Rebuilds only the missing unfilled stages, anchored to the original entry
   // price so trigger percentages stay consistent with what was intended at open.
-  async _repairDcaStages(pos) { /* binary-mode: single DCA stage, no repair needed */ },
+  async _repairDcaStages(pos) {
+    if (pos._binary || this.cfg.binaryModeEnabled) return;
+    const expected  = pos._stageCount || this._dcaStageCount();
+    const firstWind = (pos.orders || []).filter(o => o.type === 'cond' && !o._secondWind);
+    if (firstWind.length >= expected) return; // nothing to repair
+
+    const sym  = pos.symbol;
+    const instr = await this.getInstrInfo(sym);
+    if (!instr) return;
+
+    const addPcts      = this._activeAddPcts();
+    const baseAdd       = this.cfg.addNotional;
+    const effectiveLev = pos.leverage;
+    const anchor       = pos.originalEntryPrice || pos.entryPrice;
+
+    let runNotional = anchor * pos.totalSize;
+    let runSize     = pos.totalSize;
+    for (const o of firstWind.filter(o => o.filled)) {
+      runNotional += (o.price || 0) * (o.qty || 0);
+      runSize     += (o.qty || 0);
+    }
+
+    const existingCount = firstWind.length;
+    const filledCount   = firstWind.filter(o => o.filled).length;
+    let prevPrice = firstWind.length > 0
+      ? Math.max(...firstWind.map(o => o.price || 0))
+      : anchor;
+    let rebuilt = 0;
+
+    for (let i = existingCount; i < expected; i++) {
+      const addPrice = this.snapPrice(anchor * (1 + addPcts[i] / 100), instr); // SHORT: add above anchor
+      if (!addPrice || addPrice <= prevPrice) { prevPrice = addPrice || prevPrice; continue; } // SHORT: must step up
+
+      const stageNotional = baseAdd;
+      const addQty = this.snapQty(stageNotional / addPrice, instr);
+      if (addQty <= 0) { prevPrice = addPrice; continue; }
+
+      runNotional += addPrice * addQty;
+      runSize     += addQty;
+      const expectedAvg = runNotional / runSize;
+      const tpRoi   = this._tpRoi(filledCount + i + 1);
+      const tpPrice = this.snapPrice(expectedAvg * (1 - tpRoi / 100 / effectiveLev), instr); // SHORT: TP below avg
+      if (!tpPrice || tpPrice <= 0) { prevPrice = addPrice; continue; }
+
+      pos.orders.push({
+        label:   `Add${i + 1} +${addPcts[i]}%`, // SHORT: plus sign
+        price:   addPrice,
+        qty:     addQty,
+        tpPrice,
+        type:    'cond',
+        filled:  false,
+        orderId: `repair-${Date.now()}-${i}`,
+      });
+      prevPrice = addPrice;
+      rebuilt++;
+    }
+
+    if (rebuilt > 0) {
+      pos._stageCount = expected;
+      this.log(`[WCH] 🔧 ${sym}: repaired ${rebuilt} missing DCA stage${rebuilt > 1 ? 's' : ''} (had ${existingCount}/${expected})`, 'warn');
+      this.persist();
+    }
+  },
 
   // Returns the effective slot weight for a position — mirrors the slot-cost logic used
   // throughout the bot (FUN uses its recorded funMult, SalF and FT cost 2, everything else 1).
@@ -4663,7 +4771,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       margin:           pos.margin,
       leverage:         pos.leverage,
       dcaStage:         pos.dcaStage || 0,
-      _stageCount:      1,
+      _binary:          pos._binary,
+      _stageCount:      pos._binary ? 1 : this._posStageCount(pos),
       _swStageCount:    ((pos.orders || []).filter(o => o.type === 'cond' && o._secondWind).length || 0),
       duration,
       closedAt,
