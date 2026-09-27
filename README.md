@@ -20,6 +20,8 @@
 | `plugins/strategies/MultiIndicator-Chaser.html` | Entry filter plugin for PseudoChaser |
 | `plugins/analytics/Permafrost-Winter.html` | Market climate plugin for PseudoWinter |
 | `plugins/analytics/Ashfall-Chaser.html` | Market climate plugin for PseudoChaser |
+| `plugins/modes/dca-long.html` | Unlocks multi-stage DCA Mode for PseudoChaser (host also supports Binary Mode natively — see Main Config) |
+| `plugins/modes/dca-short.html` | Unlocks multi-stage DCA Mode for PseudoWinter |
 
 ---
 
@@ -45,14 +47,14 @@ The UI has four views: **Market** (positions, scan controls, watchlist) plus thr
 
 **Mobile** (≤768px): a bottom tab bar (⚙ Config · 📊 Market · 📈 Stats · 📌 Trades) switches between the four views full-screen, one at a time. Unchanged from earlier builds.
 
-**Desktop**: Market is always the base view at full width. Config/Stats/Trades open as floating overlay panels on top of it via matching icon buttons (⚙ 📈 📌) in the topbar — no dedicated Market button, since it's never hidden. Config opens by default on launch; click its icon again (or any open overlay's icon) to dismiss it. The rest of Market dims behind whichever overlay(s) are open.
+**Desktop**: Market, Config, Stats and Trades all sit side by side in normal document flow at the same level — no overlay, no dimming, no shadow. Config/Stats/Trades open via matching icon buttons (⚙ 📈 📌) in the topbar — no dedicated Market button, since it's never hidden. Config opens by default on launch; click its icon again (or any open panel's icon) to dismiss it.
 
-Each open overlay takes a third of the screen, docked left or right. Slot assignment follows opening order, not menu identity:
-- First overlay opened → left slot. Second → right slot.
-- Once both slots are full, opening a third (currently-closed) overlay replaces the **left** slot's occupant.
+Market always gets twice the flex-grow of any open side panel, so with both sides open the split is exactly Market 2/4, left panel 1/4, right panel 1/4 (with only one side open, Market and that panel split roughly 2:1; with neither open, Market fills the row). Slot assignment follows opening order, not menu identity:
+- First panel opened → left slot. Second → right slot.
+- Once both slots are full, opening a third (currently-closed) panel replaces the **left** slot's occupant.
 - Opening a fourth replaces the **right** slot's occupant — and it keeps alternating left/right on every subsequent replacement from there.
 
-Two overlays can be open at once; a third click always bumps whichever slot is due next rather than stacking a third panel.
+Two panels can be open at once; a third click always bumps whichever slot is due next rather than stacking a third panel.
 
 ---
 
@@ -84,8 +86,10 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Max Positions** (`maxPos`) | Maximum simultaneously open positions. No new entries open once this is reached. |
 | **Leverage** (`leverage`) | Position leverage. Affects order size, TP/SL prices, and EDa thresholds. |
 | **Min Notional** (`minNotional`) | Base margin per position in USDT. Actual order size = minNotional × leverage. |
-| **TP %** (`tpPct`) | Take-profit target. When EDa is active this is the buffered target — the debt-free close happens at a lower percentage. |
-| **SL %** (`slPct`) | Stop-loss. Position closes immediately when mark price hits this level. |
+| **Entry TP** (`entryTpRoi`) | Take-profit ROI % target. When EDa is active this is the buffered target — the debt-free close happens at a lower percentage. In DCA Mode this is also the base the per-stage TP ladder scales down from (entry TP ÷ (stage+1), min 3%). |
+| **Binary Mode** (`binaryModeEnabled`) | On: TP + SL are both set at entry, no DCA adds (`binaryTpPct`/`binarySlPct`, default 50%/50%). Off: multi-stage DCA — add orders trigger below entry (PseudoChaser) or above entry (PseudoWinter), each at a lower TP ROI target; SL (`dcaSlPct`, default 16%) only arms once every first-wind DCA stage has filled. **Requires the `dca-long`/`dca-short` plugin** (`plugins/modes/`) to expose the DCA config controls — the underlying binary/DCA logic ships in the base bot either way. |
+| **DCA Stages** (`dcaStages`) | Number of DCA add orders. 3 stages uses the three configurable triggers below it (`dcaAddPct1`/`2`/`3`, % away from entry); any other value uses the built-in ladder (1.5%, then +3% per stage). Only 3, or 6 and above, are supported — 4 and 5 are not valid stage counts. |
+| **DCA Add Notional** (`addNotional`) | Margin (USDT) added per DCA stage — separate from **Min Notional**, which only sizes the initial entry. |
 | **Drawdown Throttle** (`drawdownThrottleEnabled`) | Halts new entries for a configurable duration (`drawdownHaltHours`, default 12h; free-entry field, no upper bound) when rolling 6h realized PnL drops below a loss threshold. The Halt tab shows a live readout of the current 6h rolling PnL and a **Clear 6hr Record** button (with confirmation) to zero the window manually — independent of any active halt. |
 | **Drawdown Factor** (`drawdownThrottleFactor`) | Loss threshold as a multiple of entry margin. At 0.5× with $1 margin, $0.50 of rolling losses triggers the halt. |
 | **Bail on Trigger** (`drawdownBailEnabled`, default on) | When on, triggering the Drawdown Throttle halt also immediately closes every open position at market (`bailAll()`) — the same sweep the Danger Zone's manual **Bail All Positions** button runs, and what the **BAIL** trade-card badge marks. MIW/MIC's Dead Switch (below) reuses this same toggle when it triggers the halt on its own idle-time condition. |
