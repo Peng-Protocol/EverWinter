@@ -1702,10 +1702,13 @@ const PSEUDOWINTER_DEFAULT_CFG = Object.freeze({
     restPollEnabled: true, restPollBaseSec: 5,
     entryTpRoi: 18,    // TP ROI % — the single TP target (bufferedEV basis), parallel with the SL %
     runtimeHours: 48,
-    dcaStages: 3,             // integer stage count; slider allows [3,6,7,...,18]; 4/5 not valid
-    dcaAddPct1: 3,            // DCA Add1 trigger — % above entry (n=3 stage layout only; n>=6 uses the built-in formula)
-    dcaAddPct2: 6,            // DCA Add2 trigger — % above entry
+    dcaStages: 3,             // integer stage count; plugin slider allows 1–6
+    dcaAddPct1: 3,            // DCA Add1 trigger — % above entry (each stage has its own trigger; only the first dcaStages are used)
+    dcaAddPct2: 6,            // DCA Add2 trigger — % above entry (always kept > Add1)
     dcaAddPct3: 12,           // DCA Add3 trigger — % above entry
+    dcaAddPct4: 18,           // DCA Add4 trigger — % above entry
+    dcaAddPct5: 24,           // DCA Add5 trigger — % above entry
+    dcaAddPct6: 30,           // DCA Add6 trigger — % above entry
     dcaSlPct: 16,             // DCA-mode SL — % loss (leverage-adjusted) once all first-wind stages have filled
     binaryModeEnabled: true,   // binary risk: TP + SL set at entry, no DCA orders
     binaryTpPct: 50,           // binary mode take-profit % (leverage-adjusted ROI)
@@ -2599,6 +2602,7 @@ function pw() { return {
         delete s.cfg.ftLsaEnabled;
         delete s.cfg.rodeoCreepPct;
         delete s.cfg.rodeoNotionalCreepPct;
+        this._seedLegacyAddPcts(s.cfg);
         Object.assign(this.cfg, defaultBotConfig(), s.cfg);
       }
       if (s.sess) Object.assign(this.sess, s.sess);
@@ -4492,6 +4496,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         if (d.cfg && typeof d.cfg === 'object') {
           // Retired keys are swept out by persist()'s call to _pruneRetiredCfg() right
           // after this, rather than hand-maintained per-key deletes here.
+          this._seedLegacyAddPcts(d.cfg);
           Object.assign(this.cfg, defaultBotConfig(), d.cfg);
         }
         this.persist();
@@ -4507,6 +4512,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
         if (d.cfg && typeof d.cfg === 'object') {
           // Retired keys are swept out by persist()'s call to _pruneRetiredCfg() right
           // after this, rather than hand-maintained per-key deletes here.
+          this._seedLegacyAddPcts(d.cfg);
           Object.assign(this.cfg, defaultBotConfig(), d.cfg);
         }
         if (d.session && typeof d.session === 'object') {
@@ -4536,12 +4542,33 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 
 
   _dcaStageCount() { return this.cfg.dcaStages; },
-  // Returns computed add-price trigger percentages array.
-  // N=3: configurable (cfg.dcaAddPct1/2/3, default [3,6,12]); N>=6: [1.5, 3, 6, ..., 3*(N-1)]
+  // Returns the add-price trigger percentages array — one independent trigger per stage.
+  // Stage i (0-based) reads cfg.dcaAddPct{i+1}; stages beyond the six configurable keys fall back to the default ladder.
   _addPcts() {
-    const n = this.cfg.dcaStages;
-    if (n === 3) return [this.cfg.dcaAddPct1 ?? 3, this.cfg.dcaAddPct2 ?? 6, this.cfg.dcaAddPct3 ?? 12];
-    return [1.5, ...Array.from({length: n - 1}, (_, k) => 3 * (k + 1))];
+    const n = Math.max(1, this.cfg.dcaStages || 1);
+    return Array.from({length: n}, (_, i) => this.cfg['dcaAddPct' + (i + 1)] ?? this._dcaDefaultAddPct(i));
+  },
+  // Default trigger for stage i (0-based): 3, 6, 12, 18, 24, 30, then +6 per stage.
+  _dcaDefaultAddPct(i) { return i < 2 ? 3 * (i + 1) : 12 + 6 * (i - 2); },
+  // Sets stage i's trigger, keeping the ladder strictly increasing (a non-monotonic ladder makes adds
+  // fill out of order / get the symbol banned): clamps to > previous stage, pushes later stages up if needed.
+  _setAddPct(i, v) {
+    const key = j => 'dcaAddPct' + (j + 1);
+    const get = j => this.cfg[key(j)] ?? this._dcaDefaultAddPct(j);
+    v = Math.round((+v || 0) * 2) / 2;
+    if (i > 0) v = Math.max(v, get(i - 1) + 0.5);
+    this.cfg[key(i)] = Math.min(90, Math.max(1, v));
+    for (let j = i + 1; j < 6; j++) if (get(j) < get(j - 1) + 0.5) this.cfg[key(j)] = Math.min(90, get(j - 1) + 0.5);
+  },
+  // Re-normalises the whole ladder (call after changing dcaStages or importing a config).
+  _normAddPcts() { for (let i = 0; i < 6; i++) this._setAddPct(i, this.cfg['dcaAddPct' + (i + 1)] ?? this._dcaDefaultAddPct(i)); },
+  // Configs saved before per-stage triggers only stored Add1–3 (used at exactly 3 stages); every other
+  // stage count ran the built-in ladder 1.5, 3, 6, 9… — seed those values so existing setups keep behaving the same.
+  _seedLegacyAddPcts(c) {
+    if (!c || c.dcaAddPct4 !== undefined) return;
+    const n = c.dcaStages;
+    if (n === undefined || n === 3) return;
+    for (let i = 0; i < Math.min(n, 6); i++) c['dcaAddPct' + (i + 1)] = i === 0 ? 1.5 : 3 * i;
   },
   // Alias for backward compat with call sites using _activeAddPcts()
   _activeAddPcts() { return this._addPcts(); },
@@ -4552,8 +4579,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   },
   // Returns the final DCA trigger percent (also the SL trigger).
   _dcaFinalPct() {
-    const n = this.cfg.dcaStages;
-    return n === 3 ? (this.cfg.dcaAddPct3 ?? 12) : 3 * (n - 1);
+    const p = this._addPcts();
+    return p[p.length - 1];
   },
   // Returns the DCA stage count for a specific position, regardless of current global config.
   // Prefers the stamped _stageCount field; falls back to counting cond orders in the position.
