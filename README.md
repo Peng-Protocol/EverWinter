@@ -255,6 +255,25 @@ Emoji for retired criteria are still resolvable in `critEmoji`/`afCritEmoji` so 
 
 There are no mutually-exclusive pairs left in the criteria set: each of the seven is an independent signed tier, so any subset can be true for the same ticker at once and each contributes to the qualifying count on its own.
 
+### Pre-Scorer (v1.85.0+)
+
+Off by default (**Pre-Scorer**, `miwPreScoreEnabled`/`micPreScoreEnabled`). Runs after qualification and Slot Blocking, in both Auto and Manual, independent of whether `lta`/`lpa` are excluded from Auto or used in a manual slot. It caps the already composite-score-ranked entry pool to its top 25 and re-ranks just that shortlist by a blended price + volume read of the last completed hour — the shortlist itself is unchanged, this only decides which of the 25 open first, so it never affects *whether* a ticker qualifies, only the order Picks are spent in.
+
+**Two halves, blended 50/50.** Each half independently prefers a scorecard-proven direction and falls back to a hard default when the scorecard doesn't have enough to say:
+
+- **Price** reads `lpa` — the 1h-change-vs-population-window gap already computed for the `lpa` criterion (`_pfLpaWindowAvg`/`_afLpaWindowAvg`), not the raw `hc`, once proven. Hard default direction: Winter favors falling price, Chaser favors rising price (raw `hc`, unshaped, when not proven).
+- **Volume** reads `lta` — the ticker's own last-hour turnover deviation from its hourly average (`_pfLtaDev`/`_afLtaDev`), the same metric `lta`'s tier is built from. Hard default direction: Winter favors low volume, Chaser favors high volume.
+
+**"Proven" requires both poles.** A family's direction only comes from the scorecard once *both* its `+` and `-` poles have reached **Min Samples** in `pfDialSampleCounts`/`afDialSampleCounts` (the same dial-pool proof Extremity Scorer uses elsewhere — see **Extremity Scorer** below); the pole with the higher collapsed PnL (`miwCollapsedCritStats`/`micCollapsedCritStats`) sets the direction. One proven pole and one still cold isn't enough on its own and falls back to the hard default the same as neither being proven.
+
+**Shape follows Lukewarm Scoring, but only once a direction is proven.** When Lukewarm Scoring's global favored side (`_pfLukewarmFavoredSide`/`_afLukewarmFavoredSide`) is currently **lukewarm**, a proven half rewards readings close to neutral over readings that run deep — extreme readings are the ones Lukewarm Scoring itself is currently finding less profitable. When the favored side is **extreme** (including the tied/no-data default), or when the half fell back to its hard default, scoring is a plain re-rank: bigger, in the favored direction, always wins. Either way, a reading on the wrong side of the direction always ranks behind every reading on the right side — shape only orders within the favored side, it never overrides direction.
+
+**Blending**: each half is min-max normalized across just the 25-ticker shortlist before being averaged 50/50, so a shaped score's range and an unshaped one's don't distort the split. A ticker with only one half's data (no 1h candle covering the other) is ranked on that half alone rather than penalized; a ticker with neither reading keeps its composite-ranked position, sorted in after every ticker that got a combined score.
+
+**Fetch**: reuses the same last-completed-hour candle (`_pfHourCandle`/`_afHourCandle`) the `lta`/`lpa` criteria already cache per symbol per hour — no dedicated fetch of its own, and nothing changes about the OC surveillance sample (still a random up-to-25 draw feeding `lpa`'s population baseline) to avoid biasing it. A following bot does no fetch here either, same as everywhere else — only whatever the leader's shared cache already has.
+
+**Stamped on the position**: `_miwPreHc`/`_micPreHc` (raw 1h price change %), `_miwPreVolDev`/`_micPreVolDev` (raw `lta` deviation %), `_miwPreBasis`/`_micPreBasis` (e.g. `price:scored,vol:fallback`, with `~lw` appended per half when Lukewarm shaping applied), and `_miwPreFrom`/`_micPreFrom` + `_miwPreTo`/`_micPreTo` (the ticker's rank in the composite-ordered shortlist before and after the re-rank). A scan-cycle log line (`🔭 Pre-Scorer`) reports which half scored vs. fell back, whether Lukewarm shaping applied, how many of the 25 got a combined score, how many moved, and the new top three.
+
 ---
 
 ## Permafrost / Ashfall Plugin
