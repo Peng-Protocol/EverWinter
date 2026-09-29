@@ -69,6 +69,18 @@ When drawdown reaches the configured threshold, or conversely, once a specific p
 
 ---
 
+#### Deferment & Ejection
+
+Drawdown throttling reacts to your own losses, which means it arrives after the damage. Deferment and ejection are its leading counterpart: they read the market as a whole and step aside when it is moving against your side, before the book has had to prove the point the hard way.
+
+The principle is simple: if everything around you is blowing up, stop trading. A short-side strategy has no business opening new shorts while the broad market is rising, and a long-side strategy has no business opening new longs while it is falling. However good an individual setup looks, it is fighting the same tape every other ticker is moving on. Deferment measures that tape directly. It takes the average price change over the last completed hour across the entire sampled population, not any single ticker, and when that average sits on the wrong side of zero for your direction, new entries stop entirely. There is no exception for a strong candidate, and no swapping one holding for another, because a swap is still a new entry. Scanning, data collection and scorecard tracking carry on as normal, and the pause lifts by itself once the average turns. It also waits until enough sample batches have accumulated to say something meaningful, so a thin early window never triggers it.
+
+Ejection is the second stage, and it only exists inside the first. While deferring, if the population's average hourly turnover, measured against each ticker's own norm, is running against your side, the weakest open position is closed every scan. The short side leans toward quiet and the long side toward busy by default, unless the scorecard has shown the opposite to be paying. Participation building against you while the price average is already hostile is not a dip to wait out; it is the regime. Shedding the worst holding one scan at a time bleeds exposure down for as long as conditions stay hostile, instead of waiting for the whole book to hit a loss threshold. Take away deferment and ejection goes with it: hostile volume alone, in a market that isn't otherwise moving against you, is no reason to sell anything.
+
+Both come with costs. Ejection realizes losses that might have recovered, and because it picks the lowest-PnL position, it will clip a winner if nothing is red. Ejected trades are still scored against the criteria that opened them, like any other close, and are tagged separately so they can be told apart. The aim is that the drawdown throttle is rarely, if ever, reached. Turnover averaged across the whole sampled population, against each name's own norm, is the best regime proxy the system has found so far, and both features exist to act on it.
+
+---
+
 #### Market Reading
 
 The entry gate is built from slots. Each slot is a set of criteria that must all be true simultaneously. A ticker qualifies for entry when it satisfies every criterion in any one slot. Each slot is a distinct thesis — "funding rate elevated and price rising" is a different case from "high participation confirming momentum." Both can be active at the same time; each runs on its own terms. A position opens when any slot is satisfied; when none are, the scan passes.

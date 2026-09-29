@@ -38,7 +38,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.85.0'; // Feature: Pre-Scorer (micPreScoreEnabled, default off) — after qualification and slot blocking, the top 25 of the entry pool are re-ranked by last-completed-hour price change (biggest riser first). Pure re-rank, reuses the per-hour 1hr candle cache, independent of LTA/LPA and of Auto/Manual; OC surveillance fetch path unchanged (LPA's population baseline stays a random sample). Each opened position records _micPreHc/_micPreFrom. // Feature: scan-time LTA/LPA and OCX matching now uses Ashfall's widened window fallback (_afHourReadingWide, _afOcLatestAvgMs) instead of requiring this-cycle/this-hour freshness, so a not-yet-resampled ticker can still be scored on stale-but-real data; pre-entry top-up refetch is unaffected. Fix: va/ioa tier formula replaced with a symmetric log-ratio (Math.log(val/windowAvg)*100/step) — the old (val-avg)/avg*100 formula floored at exactly -100 for anything under ~1% of the window mean while the positive side was unbounded, so a skewed window average (a mean over a small, randomly-sampled per-cycle population) pinned most below-average tickers to an identical -100 tag regardless of how far below average they actually were. Prior: 1.82.0 — Feature: LTA and LPA join the secondary criteria (Auto pool, exclude/blockable pickers, manual-slot gate panel, step chips, top-up); Auto minimum slider now 1-7. Fix: the raw criterion annotator now exists on the class (_micAnnotateCritRaw) — Ashfall's open-position sampler was calling it off `this` while it only lived as a local inside runScan, so no rolling-average sample was ever recorded and closes/Ext-Rvl/substitution silently kept using the frozen entry snapshot. Prior: 1.81.2 — Tweak: UI hints shortened to one line each; Substitution hint now notes the live rolling-average score. Prior: 1.81.1 — Fix (see Ashfall-Chaser 1.83.1): runScan's per-scan position refresh call simplified — _afPositionCriteriaSample now does its own fresh per-symbol fetch instead of being handed a lookup built from the (potentially hours-stale, per cfg.bulkTickerCooldownHours) bulk allTickers snapshot. Prior: 1.81.0 — Open-Position Rolling-Average Criteria: runScan calls Ashfall's per-position refresh every cycle; positions opened via _micOpen now also store _micRawCriteria alongside _micCriteria so substitution's scoreOf can recompute a live composite score via _micLiveCompositeScore instead of the frozen _micCompositeScore.
+    const VERSION       = '1.86.0'; // Feature: Deferment (micDefermentEnabled, default off) — regime proxy from Ashfall's sample window: while the total average LPA of the whole window is negative, no new entries at all (substitution and every other open path included; hist scoring continues), and it stays idle until at least 3 sample batches exist. Sub-toggle Ejection (micEjectionEnabled, default off, only acts while deferring): each scan closes the lowest-uPnL open position while the total average LTA is against MIC (scorecard direction via _micPoleDirection, else the Pre-Scorer default: high-volume favored). Ejection closes carry the 'ejection' reason (Eject). Topbar pill 'No Entry' while deferring. Prior: 1.85.0 — Feature: Pre-Scorer (micPreScoreEnabled, default off) — after qualification and slot blocking, the top 25 of the entry pool are re-ranked by last-completed-hour price change (biggest riser first). Pure re-rank, reuses the per-hour 1hr candle cache, independent of LTA/LPA and of Auto/Manual; OC surveillance fetch path unchanged (LPA's population baseline stays a random sample). Each opened position records _micPreHc/_micPreFrom. // Feature: scan-time LTA/LPA and OCX matching now uses Ashfall's widened window fallback (_afHourReadingWide, _afOcLatestAvgMs) instead of requiring this-cycle/this-hour freshness, so a not-yet-resampled ticker can still be scored on stale-but-real data; pre-entry top-up refetch is unaffected. Fix: va/ioa tier formula replaced with a symmetric log-ratio (Math.log(val/windowAvg)*100/step) — the old (val-avg)/avg*100 formula floored at exactly -100 for anything under ~1% of the window mean while the positive side was unbounded, so a skewed window average (a mean over a small, randomly-sampled per-cycle population) pinned most below-average tickers to an identical -100 tag regardless of how far below average they actually were. Prior: 1.82.0 — Feature: LTA and LPA join the secondary criteria (Auto pool, exclude/blockable pickers, manual-slot gate panel, step chips, top-up); Auto minimum slider now 1-7. Fix: the raw criterion annotator now exists on the class (_micAnnotateCritRaw) — Ashfall's open-position sampler was calling it off `this` while it only lived as a local inside runScan, so no rolling-average sample was ever recorded and closes/Ext-Rvl/substitution silently kept using the frozen entry snapshot. Prior: 1.81.2 — Tweak: UI hints shortened to one line each; Substitution hint now notes the live rolling-average score. Prior: 1.81.1 — Fix (see Ashfall-Chaser 1.83.1): runScan's per-scan position refresh call simplified — _afPositionCriteriaSample now does its own fresh per-symbol fetch instead of being handed a lookup built from the (potentially hours-stale, per cfg.bulkTickerCooldownHours) bulk allTickers snapshot. Prior: 1.81.0 — Open-Position Rolling-Average Criteria: runScan calls Ashfall's per-position refresh every cycle; positions opened via _micOpen now also store _micRawCriteria alongside _micCriteria so substitution's scoreOf can recompute a live composite score via _micLiveCompositeScore instead of the frozen _micCompositeScore.
     // v1.85.0: Feature: Pre-Scorer volume dimension — the re-rank now blends price (LPA-relative when both lpa+/lpa- poles are proven at afExtremityMinSamples, else raw 1hr change) with volume (LTA-relative 1hr turnover deviation, same proof rule, else the hard default direction: MIC favors rising price/high volume), 50/50, min-max normalized per shortlist. When a direction is scorecard-proven AND Lukewarm Scoring's global favored side is 'lukewarm', that half rewards closeness to neutral over depth instead of the plain monotonic re-rank.
     // v1.80.0 — Major cut-down (see /versioning): liquidation is no longer the mandatory per-slot anchor — PEC/VSG shape-matching, the live liq-message entry path, closed-batch liq/regime/Past-1 reads, and the whole liq-anchor concept are gone. Slots (Auto or manual) now qualify on any N of the 5 remaining secondary criteria alone: fund, V/A, IO/A, OCS, OCX.
   const DEFAULT_SLOTS = [[]];
@@ -83,6 +83,8 @@
     micSlotBlockTags: true,
     micDeadSwitchEnabled: false,
     micDeadSwitchHours: 1,
+    micDefermentEnabled: false, // Deferment: no new entries while the window's total avg LPA is against this bot
+    micEjectionEnabled: false,  // Ejection (sub-toggle of Deferment): close the lowest-uPnL position each scan while total avg LTA is against this bot
     micReentryBlockMode: 'both',
     micAutoSlots: true,
     micAutoSlotSize: 3,
@@ -442,6 +444,24 @@
                     </div>
                   </div>
                   <div class="g" style="margin-top:8px">
+                    <label class="tog">
+                      <div class="tog-t" :class="cfg.micDefermentEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micDefermentEnabled=!cfg.micDefermentEnabled;persist()}"><div class="tog-k"></div></div>
+                      <div>
+                        <div class="tog-l">Deferment</div>
+                        <div class="mic-hint">No new entries at all while the window's total average LPA is negative (market falling). Idle until 3 sample batches exist.</div>
+                      </div>
+                    </label>
+                    <div x-show="cfg.micDefermentEnabled" style="margin-top:5px;margin-left:2px">
+                      <label class="tog">
+                        <div class="tog-t" :class="cfg.micEjectionEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micEjectionEnabled=!cfg.micEjectionEnabled;persist()}"><div class="tog-k"></div></div>
+                        <div>
+                          <div class="tog-l">Ejection</div>
+                          <div class="mic-hint">While deferring, closes the lowest-uPnL position each scan if the window's total average LTA is against Chaser (scorecard direction, else high-volume favored).</div>
+                        </div>
+                      </label>
+                    </div>
+                  </div>
+                  <div class="g" style="margin-top:8px">
                     <div class="lbl" style="margin-bottom:4px">Re-entry Block Mode</div>
                     <div style="display:flex;flex-wrap:wrap;gap:4px">
                       <button class="mic-tab" :class="(cfg.micReentryBlockMode)==='both'?'on':''" @click.prevent="if(!cfgLocked){cfg.micReentryBlockMode='both';persist()}">Winners + Losers</button>
@@ -616,6 +636,7 @@
             return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)" title="${title}">${emoji || 'Multi'}</span>`;
           });
           this.registerCloseReason?.('substitution', 'Sub');
+          this.registerCloseReason?.('ejection', 'Eject');
           // Dead Switch baseline — counts idle time from whichever is more recent: the plugin's
           // own load (so a fresh session with zero entries yet doesn't immediately read as
           // "dead") or the last entry it actually made. See _micDeadSwitchCheck.
@@ -759,6 +780,7 @@
         // No path restriction on what it can close — cross-strategy, any held position, same as
         // Liquid-Diver's version. The swap is still score-gated, not automatic.
         async _micTrySubstitute(pool) {
+          if (this._micDefermentState().deferring) return false;
           if (!this.cfg.micSubstitutionEnabled || !pool?.length) return false;
           const now           = Date.now();
           const minAgeMs       = (this.cfg.micSubstitutionMinAgeMins) * 60000;
@@ -841,7 +863,59 @@
 
 
         _extraStatusPills() {
-          return [];
+          const d = this._micDefermentState();
+          if (!d.deferring) return [];
+          return [{
+            pip:        'warn',
+            pipStyle:   'background:rgba(255,160,0,.9)',
+            label:      'No Entry',
+            labelStyle: 'color:rgba(255,160,0,.9)',
+            border:     'border-color:rgba(255,160,0,.45);background:rgba(255,160,0,.06)',
+            title:      `MIC deferment — new entries blocked (window avg LPA ${d.lpaAvg >= 0 ? '+' : ''}${d.lpaAvg.toFixed(3)}%)${d.eject ? ' · ejecting worst position each scan' : ''}`,
+            action:     null,
+          }];
+        },
+
+        // Deferment — regime proxy. Reads the WHOLE retained sample window (Ashfall's
+        // _afWindowStats: each ticker's latest reading, summed) — a market-wide mean, not any
+        // one ticker's LPA/LTA. Does nothing until the window holds at least 3 sample batches.
+        // deferring: the window's total average LPA is negative (against MIC) -> no new entries.
+        // eject (only ever true while deferring, and only with the Ejection sub-toggle on): the
+        // window's total average LTA is against MIC — direction from the scorecard
+        // (_micPoleDirection), else the Pre-Scorer's hard default (high-volume favored).
+        _micDefermentState() {
+          const off = { deferring: false, eject: false };
+          if (!this.cfg.micDefermentEnabled) return off;
+          if (typeof this._afWindowStats !== 'function') return off;
+          if ((this._afOcCycleHistory || []).length < 3) return off;
+          const lpa = this._afWindowStats('lpa');
+          if (!lpa || !lpa.n) return off;
+          const lpaAvg = lpa.sum / lpa.n;
+          if (!(lpaAvg < 0)) return off;
+          const out = { deferring: true, eject: false, lpaAvg, ltaAvg: null, ltaDir: null };
+          if (this.cfg.micEjectionEnabled) {
+            const lta = this._afWindowStats('lta');
+            if (lta && lta.n) {
+              const dir = this._micPoleDirection('lta') ?? 'pos';
+              const ltaAvg = lta.sum / lta.n;
+              out.ltaAvg = ltaAvg; out.ltaDir = dir;
+              out.eject = dir === 'pos' ? ltaAvg < 0 : ltaAvg > 0;
+            }
+          }
+          return out;
+        },
+
+        // Ejection: close the single lowest-uPnL open position (any held position, same reach
+        // as substitution). Called once per scan while deferring + LTA against.
+        async _micEject(def) {
+          try {
+            const cands = (this.positions || []).filter(p => !p.isPending);
+            if (!cands.length) return;
+            cands.sort((a, b) => (a.upnl || 0) - (b.upnl || 0));
+            const worst = cands[0];
+            this.log(`[MIC] ⏏️ Ejection — closing ${worst.symbol} (uPnL ${(worst.upnl || 0).toFixed(4)}) — window avg LTA ${def.ltaAvg >= 0 ? '+' : ''}${def.ltaAvg.toFixed(1)}% against MIC (${def.ltaDir === 'pos' ? 'high' : 'low'}-volume favored)`, 'warn');
+            await this.pseudoClosePosition(worst, 'ejection');
+          } catch (e) { this.log(`[MIC] ⏏️ Ejection error: ${e.message}`, 'warn'); }
         },
 
         async _micRunScan() {
@@ -873,6 +947,12 @@
               await this._afPositionCriteriaSample?.(pos);
             }
           }
+
+          // Deferment/Ejection — every cycle, ahead of any slot logic so it still runs with no
+          // active entry slots. Ejection is downstream of deferment: no deferment, no ejection.
+          const _micDef = this._micDefermentState();
+          if (!_micDef.deferring) this._micDeferLogged = false;
+          else if (_micDef.eject) await this._micEject(_micDef);
 
           // Entry slots — Auto mode has no generated slot list any more (see _micAutoQualify);
           // Manual mode keeps its exact combo list as before.
@@ -1025,6 +1105,11 @@
           this.log(`[MIC] 💡 Scan skip summary — universe:${allTickers.length} pool:${basePool.length} qualified:${pool.length} entry:${entryPool.length} | excluded ${_micExcludedNote} | unmatched ${_micUnmatchedNote} | slot-blocked:${scanSkip.blocked}`, 'info');
 
           if (_micHalted) return;
+
+          if (_micDef.deferring) {
+            if (!this._micDeferLogged) { this.log(`[MIC] ⛔ Deferment — window avg LPA ${_micDef.lpaAvg >= 0 ? '+' : ''}${_micDef.lpaAvg.toFixed(3)}% is against MIC; no new entries until it flips`, 'info'); this._micDeferLogged = true; }
+            return;
+          }
 
           if (this.cfg.micPreScoreEnabled && entryPool.length) entryPool = await this._micPreScore(entryPool);
 
@@ -1205,6 +1290,7 @@
         // rendering the position badge as "Multi" (empty criteria) for one frame even though the
         // underlying data was always correct by the time anything read it again (e.g. on close).
         async _micOpen(t, criteria, slotIdx, compositeScore, preHc, preVolDev, preBasis, preFrom) {
+          if (this._micDefermentState().deferring) return false;
           const sym   = t.symbol;
           let price = parseFloat(t.lastPrice || 0);
           if (!price) return false;
