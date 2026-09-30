@@ -71,9 +71,9 @@ When drawdown reaches the configured threshold, or conversely, once a specific p
 
 #### Deferment & Ejection
 
-**Deferment** means opening nothing new while the broad market's average price move over the last hour is running against your side, no shorts into a rising tape and no longs into a falling one, and it lifts on its own once that average turns.
+**Deferment** means opening nothing new while the broad market's average price move over the last hour is running against your side, no shorts into a rising tape and no longs into a falling one, and it lifts on its own once that average turns. Since the bot's entries already lean toward the tickers the prevailing regime moves most, deferment is the other half of that stance: it targets the names the regime affects, then stands aside when the regime turns against it.
 
-**Ejection** is its second stage: while deferring, if market-wide participation is also building against your side, the weakest open position is closed each cycle, even a small winner if nothing is red.
+**Ejection** is its second stage: while deferring, if market-wide participation is also building against your side, the weakest open position is closed each cycle, even a small winner if nothing is red. Because it drops the weakest position regardless of age, ejection acts as a sharper cousin of substitution, a running discernment that culls the book's worst holding without waiting for a better candidate to take its place.
 
 ---
 
