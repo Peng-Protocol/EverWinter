@@ -76,9 +76,18 @@ When drawdown reaches the configured threshold, or conversely, once a specific p
 
 #### Deferment & Ejection
 
-**Deferment** means opening nothing new while the broad market's average price move over the last hour is running against your side, no shorts into a rising tape and no longs into a falling one, and it lifts on its own once that average turns. Since the bot's entries already lean toward the tickers the prevailing regime moves most, deferment is the other half of that stance: it targets the names the regime affects, then stands aside when the regime turns against it.
+> "Knowing what to enter is equally as important as knowing *when* to enter. The regime rules everything; it's statistically better to enter longs when the market overall is bullish, and vice versa. This system does not attempt to give you a crystal ball, but rather a probability engine."
 
-**Ejection** is its second stage: while deferring, if market-wide participation is also building against your side, the weakest open position is closed each cycle, even a small winner if nothing is red. Because it drops the weakest position regardless of age, ejection acts as a sharper cousin of substitution, a running discernment that culls the book's worst holding without waiting for a better candidate to take its place.
+**Deferment** is the bot standing aside when the market is against your side: no new shorts while the market is rising, no new longs while it is falling. It blocks every new entry, swaps included, and lifts on its own once the market turns back.
+
+It switches on when any one of these is true:
+
+- **The market is against you.** The average price move over the last hour, across the coins the bot samples, is going the wrong way for your side.
+- **The headline is negative.** On average, the sampled coins have been moving against your side.
+- **Both poles are red.** One of the signals is losing at both its high and low end, so there is no good place left to enter on.
+- **The targets are too small.** In a weak market, Target Halving shrinks the profit target. Once it is too small to cover trading fees, the bot stops entering.
+
+**Ejection** is the next step up. If two or more of those are true at the same time, the bot closes every open position, small winners included, instead of riding out the turn. Orders still waiting to fill are left alone. One warning sign can be noise; two at once means the regime has turned.
 
 ---
 
