@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.15.1 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.16.1 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -628,7 +628,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.15.0 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.16.1 · Long Only · No Real Orders</div>
     </div>
     <!-- ── PC-ONLY OVERLAY-MENU BUTTONS (hidden on mobile; mobile keeps its own tab bar below) ── -->
     <div class="topbar-menu-btns">
@@ -766,11 +766,13 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
             <!-- Scan Scheduling -->
             <div class="g" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
               <div class="lbl" style="margin-bottom:6px;letter-spacing:1px">Scan Scheduling</div>
-              <div style="font-size:9px;color:var(--text-lo);margin-bottom:6px;line-height:1.5">Queues background fetches instead of firing them all at once — prevents browser stalls during a scan.</div>
+              <div style="font-size:9px;color:var(--text-lo);margin-bottom:6px;line-height:1.5">Spaces out fetches and hands the browser back between scan steps — prevents stalls during a scan.</div>
               <div class="lbl">Dispatch Every <b x-text="(cfg.schedIntervalMs??150)+'ms'"></b></div>
               <input type="range" min="50" max="1000" step="50" x-model.number="cfg.schedIntervalMs" @change="persist()">
               <div class="lbl" style="margin-top:6px">Max Concurrent <b x-text="cfg.schedMaxConcurrent??4"></b></div>
               <input type="range" min="1" max="10" step="1" x-model.number="cfg.schedMaxConcurrent" @change="persist()">
+              <div class="lbl" style="margin-top:6px">Slice Budget <b x-text="(cfg.schedSliceMs??8)+'ms'"></b></div>
+              <input type="range" min="2" max="30" step="1" x-model.number="cfg.schedSliceMs" @change="persist()">
             </div>
 
             <!-- Leader/Follower -->
@@ -1718,6 +1720,16 @@ let _watchTimer       = null;
 let _refreshTimer     = null;
 let _audioTimer       = null;
 
+// Cooperative scan scheduler state — kept outside Alpine so checkpoints in hot loops never
+// go through reactive proxies. Slices are handed back via MessageChannel rather than
+// setTimeout: timers are clamped to >=1s in a backgrounded tab, which would turn a 40-slice
+// scan into a 40-second one; message tasks are not throttled.
+const _SCH = { sliceStart: 0, yields: 0, idle: new Map(), flushing: false };
+const _schMc = new MessageChannel();
+const _schWaiters = [];
+_schMc.port1.onmessage = () => { const r = _schWaiters.shift(); if (r) r(); };
+function _schMacroYield() { return new Promise(r => { _schWaiters.push(r); _schMc.port2.postMessage(0); }); }
+
 // ── Bybit public WebSocket ticker feed (stored outside Alpine to prevent proxy mutation) ──
 // Replaces the recurring full-ticker REST poll (~300 KB per call, every 15s) with delta
 // pushes (~100 bytes each) for only the symbols the watch loops care about.
@@ -1794,7 +1806,8 @@ function wsTicker(symbol, maxAgeMs = WS_FRESH_MS) {
 const PSEUDOCHASER_DEFAULT_CFG = Object.freeze({
     leverage:6, minNotional:6, addNotional:6,
     maxPos:5, scanMins:10, topN:25,
-    bulkTickerCooldownEnabled: true, bulkTickerCooldownHours: 1,
+    bulkTickerCooldownEnabled: true, bulkTickerCooldownHours: 12, // bulk list only says what exists; criteria data is fetched fresh per sampled ticker
+    schedSliceMs: 8,   // scan time-slice budget (ms) before yielding to the browser — see _scanCp
     restPollEnabled: true, restPollBaseSec: 5,
     entryTpRoi: 18,    // TP ROI % — the single TP target (bufferedEV basis), parallel with the SL %
     runtimeHours: 48,
@@ -2033,6 +2046,67 @@ function pw() { return {
     fetch(job.url, job.options)
       .then(r => { this._fetchActive--; job.resolve(r); })
       .catch(e => { this._fetchActive--; job.reject(e); });
+  },
+
+  // ─── Cooperative scan scheduler ──────────────────────────────────────────
+  // The scan is a pipeline of named stages (see _scanPipeline) that share one ctx object.
+  // Stages never block the page for long: loops call `if (this._scanDue()) await this._scanCp();`
+  // to hand the browser back once the slice budget (cfg.schedSliceMs, larger while the tab
+  // is hidden) is spent, then pick up exactly where they stopped — the async function's own
+  // frame is the cursor. Position watch, WS ticks, timers and clicks run in those gaps.
+  // Plugins add stages from transform() by appending { id, group, run } to _scanStageDefs
+  // (in load order); a stage that returns false skips the rest of its group this scan.
+  _scanStageDefs: [],
+  _schBudget() { return (typeof document !== 'undefined' && document.hidden) ? 40 : Math.max(2, this.cfg.schedSliceMs ?? 8); },
+  _scanDue() { return performance.now() - _SCH.sliceStart >= this._schBudget(); },
+  async _scanCp() {
+    if (!this._scanDue()) return;
+    _SCH.yields++;
+    await _schMacroYield();
+    _SCH.sliceStart = performance.now();
+  },
+  // Coalesced low-priority jobs (one per key, last writer wins). Flushed when the scan
+  // pipeline finishes, or on the next tick if queued while no scan is running.
+  _schIdle(key, fn) {
+    _SCH.idle.set(key, fn);
+    if (!this.ui.scanning && !_SCH.flushing) setTimeout(() => this._schFlushIdle(), 0);
+  },
+  _schIdleCancel(key) { _SCH.idle.delete(key); },
+  async _schFlushIdle() {
+    if (_SCH.flushing) return;
+    _SCH.flushing = true;
+    try {
+      while (_SCH.idle.size) {
+        const [key, fn] = _SCH.idle.entries().next().value;
+        _SCH.idle.delete(key);
+        try { await fn.call(this); } catch (e) { console.warn('[SCH] idle job ' + key + ' failed', e); }
+        await this._scanCp();
+      }
+    } finally { _SCH.flushing = false; }
+  },
+  async _scanPipeline(ctx) {
+    const stages = [{ id: 'tickers', run: this._scanFetchTickers }, ...(this._scanStageDefs || [])];
+    const ms = {}, stopped = new Set();
+    const t0 = performance.now(), y0 = _SCH.yields;
+    let longN = 0, longMax = 0, po = null;
+    const tally = e => { longN++; if (e.duration > longMax) longMax = e.duration; };
+    try { po = new PerformanceObserver(l => l.getEntries().forEach(tally)); po.observe({ entryTypes: ['longtask'] }); } catch (_) { po = null; }
+    for (const st of stages) {
+      if (st.group && stopped.has(st.group)) continue;
+      _SCH.sliceStart = performance.now();
+      const s0 = performance.now();
+      try {
+        if ((await st.run.call(this, ctx)) === false && st.group) stopped.add(st.group);
+      } catch (e) {
+        this.log('[SCH] Stage ' + st.id + ' failed: ' + (e.message || String(e)), 'warn');
+        if (st.group) stopped.add(st.group);
+      }
+      ms[st.id] = Math.round(performance.now() - s0);
+      await this._scanCp();
+    }
+    await this._schFlushIdle();
+    if (po) { try { po.takeRecords().forEach(tally); po.disconnect(); } catch (_) {} }
+    this.log(`[SCH] Scan ${Math.round(performance.now() - t0)}ms · ${_SCH.yields - y0} yields` + (po ? ` · long tasks ${longN}${longN ? ' (max ' + Math.round(longMax) + 'ms)' : ''}` : '') + ' · ' + Object.entries(ms).map(([k, v]) => k + ' ' + v).join(', '), 'info');
   },
 
   // ─── Leader/Follower (cross-bot scan coordination) ───────────────────────
@@ -3275,6 +3349,14 @@ function pw() { return {
     }
     this.ui.scanning = true;
     this.bot.lastScanAt = Date.now();
+    const ctx = { halted: _halted, tickersAtStart: this._lastAllTickersAt || 0 };
+    try { await this._scanPipeline(ctx); }
+    finally { this.ui.scanning = false; }
+  },
+
+  // Stage 'tickers' — the host's own scan work (bulk ticker fetch/seed). Plugin stages follow it.
+  async _scanFetchTickers(ctx) {
+    const _halted = ctx.halted;
     try {
       const _following      = this._lfIsFollowing();
       const _cooldownMs     = (this.cfg.bulkTickerCooldownHours ?? 1) * 3600 * 1000;
@@ -3311,7 +3393,6 @@ function pw() { return {
 
       await this.refreshBalance();
     } catch(e) { this.log('[E01] Scan error: '+e.message+' — '+((e.stack||'').split('\n')[1]||'').trim(), 'error'); }
-    finally { this.ui.scanning=false; }
   },
 
 
