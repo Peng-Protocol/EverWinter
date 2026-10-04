@@ -78,22 +78,22 @@ When drawdown reaches the configured threshold, or conversely, once a specific p
 
 > "Knowing what to enter is equally as important as knowing *when* to enter. The regime rules everything; it's statistically better to enter longs when the market overall is bullish, and vice versa. This system does not attempt to give you a crystal ball, but rather a probability engine."
 
-**Deferment** is the bot standing aside when the market is against your side: no new shorts while the market is rising, no new longs while it is falling. It blocks every new entry, swaps included, and lifts on its own once the market turns back.
+**Deferment** is the act of standing aside when the market is against you: no new shorts while the market is rising, no new longs while it is falling. You must block every new entry, swaps included, and lift only once the market turns back.
 
-It switches on when any one of these is true:
+You must do this under the following conditions;
 
-- **The market is against you.** The average price move over the last hour, across the coins the bot samples, is going the wrong way for your side.
+- **The market is against you.** The average price move over the last hour, across the coins the you sampled, is going the wrong way for your side.
 - **The headline is negative.** On average, the sampled coins have been moving against your side.
 - **Both poles are red.** One of the signals is losing at both its high and low end, so there is no good place left to enter on.
-- **The targets are too small.** In a weak market, Target Halving shrinks the profit target. Once it is too small to cover trading fees, the bot stops entering.
+- **The targets are too small.** A weak market shrinks the profit margin. Once it is too small to cover trading fees, you must stop entering.
 
-**Ejection** is the next step up. If two or more of those are true at the same time, the bot closes every open position, small winners included, instead of riding out the turn. Orders still waiting to fill are left alone. One warning sign can be noise; two at once means the regime has turned.
+**Ejection** is the next step up. If two or more of those are true at the same time, you must close every open position, small winners included, instead of riding out the turn. Orders still waiting to fill are left alone. One warning sign can be noise; two at once means the regime has turned.
 
 ---
 
 #### Market Reading
 
-The entry gate is built from slots. Each slot is a set of criteria that must all be true simultaneously. A ticker qualifies for entry when it satisfies every criterion in any one slot. Each slot is a distinct thesis — "funding rate elevated and price rising" is a different case from "high participation confirming momentum." Both can be active at the same time; each runs on its own terms. A position opens when any slot is satisfied; when none are, the scan passes.
+The entry gate is to be built from slots. Each slot is a set of criteria that must all be true simultaneously. A ticker qualifies for entry when it satisfies every criterion in any one slot. Each slot is a distinct thesis — "funding rate elevated and price rising" is a different case from "high participation confirming momentum." Both can be active at the same time; each runs on its own terms. A position opens when any slot is satisfied; when none are, the scan passes.
 
 **The criteria:**
 
@@ -109,7 +109,7 @@ The entry gate is built from slots. Each slot is a set of criteria that must all
 
 **Building slots**: A slot containing only "V/A>10" behaves like a bare participation filter — one condition, no confirmation. Adding "fund<-1" to it requires unusual participation and a funding premium to align before opening. Adding "OCS>5" on top demands order flow lean the same way too. Each addition narrows the filter from permissive to strict without changing the underlying logic. No single reading is privileged — a slot is whatever combination of conditions you are willing to open on, and a slot of one is a perfectly valid, if permissive, thesis.
 
-**Auto-slot builder**: Instead of building slots by hand, the system can generate the entry gate automatically from a chosen minimum: a ticker qualifies once it satisfies at least that many criteria — a floor, not a fixed count. A ticker satisfying more conditions than the minimum is credited for everything it actually exhibits, not sliced down to only the first few that happen to clear the floor — a ticker showing five genuine confirming conditions is scored on all five, not an arbitrary subset. Every criterion is tiered, so each one records the specific tier value the reading showed — at entry for a trade, at sampling time for a sampled ticker: a single qualifying condition can produce many distinct scorecard entries depending on how strong the reading was each time, and because a ticker's full exhibited set is scored rather than a fixed slice of it, the tracked variety reflects everything that was actually true at that moment. Combined with auto-correction, this creates a self-pruning strategy: every genuinely satisfied condition counts toward the scorecard, and the ones that consistently fail to pay are disabled without manual intervention. Because Buy/Sell Skew and Order Count Deviation are backed by data that is essentially always present, expect them to appear in a large share of matched positions once order flow tracking is turned on — that is expected behavior, not over-triggering.
+**Auto-slot builder**: Instead of building slots by hand, you can automate from a chosen minimum: a ticker qualifies once it satisfies at least that many criteria — a floor, not a fixed count. A ticker satisfying more conditions than the minimum is credited for everything it actually exhibits, not sliced down to only the first few that happen to clear the floor — a ticker showing five genuine confirming conditions is scored on all five, not an arbitrary subset. Every criterion is tiered, so each one records the specific tier value the reading showed — at entry for a trade, at sampling time for a sampled ticker: a single qualifying condition can produce many distinct scorecard entries depending on how strong the reading was each time, and because a ticker's full exhibited set is scored rather than a fixed slice of it, the tracked variety reflects everything that was actually true at that moment. Combined with auto-correction, this creates a self-pruning strategy: every genuinely satisfied condition counts toward the scorecard, and the ones that consistently fail to pay are disabled without manual intervention. Because Buy/Sell Skew and Order Count Deviation are backed by data that is essentially always present, expect them to appear in a large share of matched positions once order flow tracking is turned on — that is expected behavior.
 
 ---
 

@@ -10,18 +10,15 @@
 |---|---|
 | `PseudoWinter.html` | Shorts-only simulation bot |
 | `PseudoChaser.html` | Longs-only simulation bot |
-| `PsychoWinter1.0.html` | Reactive approach standalone bot |
+| `PsychoWinter.html` | Shorts-only reactive approach standalone bot |
+| `PsychoChaser.html` | Longs-only reactive approach standalone bot |
 | `ChartWinter.html` | Chart and market scan tool |
 | `plugins/modes/EverWinter.html` | Live trading plugin for PseudoWinter |
 | `plugins/modes/SunChaser.html` | Live trading plugin for PseudoChaser |
-| `plugins/modes/EDa-Winter.html` | EDa (Effective Debt Adjusted) plugin for PseudoWinter |
-| `plugins/modes/EDa-Chaser.html` | EDa plugin for PseudoChaser |
 | `plugins/strategies/MultiIndicator-Winter.html` | Entry filter plugin for PseudoWinter |
 | `plugins/strategies/MultiIndicator-Chaser.html` | Entry filter plugin for PseudoChaser |
 | `plugins/analytics/Permafrost-Winter.html` | Market climate plugin for PseudoWinter |
 | `plugins/analytics/Ashfall-Chaser.html` | Market climate plugin for PseudoChaser |
-| `plugins/modes/dca-long.html` | Unlocks multi-stage DCA Mode for PseudoChaser (host also supports Binary Mode natively — see Main Config) |
-| `plugins/modes/dca-short.html` | Unlocks multi-stage DCA Mode for PseudoWinter |
 
 ---
 
@@ -58,9 +55,7 @@ Two panels can be open at once; a third click always bumps whichever slot is due
 
 ## Plugins
 
-To load a plugin, open the **Plugin Manager** panel, click **Load Plugin**, and select the `.html` file. **A page reload is required after loading or removing any plugin** — the plugin pipeline runs once at page boot, so changes don't take effect until the next load.
-
-Load order matters: live trading plugins (EverWinter, SunChaser) must load before strategy plugins (MultiIndicator, Permafrost/Ashfall). The Plugin Manager shows the current load order and warns about conflicts.
+To load a plugin, open the **Plugin Manager** panel at the bottom of the config menu, click **Load Plugin**, and select the `.html` file. **A page reload is required after loading or removing any plugin** — the plugin pipeline runs once at page boot, so changes don't take effect until the next load.
 
 ---
 
@@ -70,7 +65,7 @@ EverWinter turns PseudoWinter into a live short-only Bybit bot; SunChaser does t
 
 - **Balance**: fetched automatically the moment a valid key/secret pair is saved in the credentials panel, not only at page load.
 - **Symbol banning**: a symbol is banned for a week if Bybit reports it as unsupported for trading, or blocked pending a required trading agreement (e.g. certain leveraged/inverse instruments) — either case needs the same manual action on Bybit's side before the symbol can trade again, so both are treated as a permanent block rather than retried every cycle.
-- **Post-bail re-check**: after a bail sweep (manual Danger Zone bail or an automatic Drawdown Throttle bail), the plugin queries the exchange directly for any position still open in its own direction (Sell for EverWinter, Buy for SunChaser) and force-flattens it with a direct reduceOnly market order. This catches positions a bail's own close order failed to fully fill. It confirms the position is flat — it does not retroactively correct the PnL already recorded for that trade from the first close attempt.
+- **Post-bail re-check**: after a bail sweep (manual Danger Zone bail or an automatic Drawdown Throttle bail), the plugin queries the exchange directly for any position still open in its own direction (Sell for EverWinter, Buy for SunChaser) and force-flattens it with a direct reduceOnly market order. This catches positions that failed to fully fill. 
 
 ---
 
@@ -160,7 +155,7 @@ The log is capped at 300 entries in memory and in localStorage. Oldest entries a
 
 ## Trades Menu
 
-The trades panel shows a card for each closed trade, newest first. Each card carries a close-reason badge — **TP**, **SL**, **FORCE** (runtime limit), **BAIL** (drawdown throttle bail — closes every open position immediately, both bots), **EDa** (laggard debt-free close), **Sub** (closed to free a slot for a higher-ranked candidate via MIW/MIC Substitution), or **Eject** (closed by MIW/MIC Ejection when two or more Deferment paths are active at once). Reasons introduced by other plugins show their own registered label, or the raw reason name if a plugin hasn't registered one. On EverWinter/SunChaser, a bail sweep is followed by a direct exchange re-check — see **EverWinter / SunChaser** below.
+The trades panel shows a card for each closed trade, newest first. Each card carries a close-reason badge — **TP**, **SL**, **FORCE** (runtime limit), **BAIL** (drawdown throttle bail — closes every open position immediately, both bots), **Sub** (closed to free a slot for a higher-ranked candidate via MIW/MIC Substitution), or **Eject** (closed by MIW/MIC Ejection when two or more Deferment paths are active at once). Reasons introduced by other plugins show their own registered label, or the raw reason name if a plugin hasn't registered one. On EverWinter/SunChaser, a bail sweep is followed by a direct exchange re-check.
 
 **Roll-up card**: when the closed trades list exceeds 50 entries, the oldest are compacted into a single roll-up card showing their net PnL, trade count, and the date range they cover. The roll-up is not a trade — it is a historical summary. In the PnL chart, the roll-up's net value acts as a baseline offset applied to every plotted point.
 
@@ -178,17 +173,11 @@ The Multi-Indicator plugin filters entries using configurable criteria combinati
 
 See StrategyBook's **Market Reading** section for what each criterion means and when to use it. This section covers tiering, recording, and fetch mechanics only.
 
-**Tier gate**: every criterion computes an integer tier as `floor(value / step)` and compares it against N (`fund` truncates toward zero instead, so a tiny negative rate lands on `fund-0`, mirroring `fund+0`, rather than flooring to `fund-1`). Current step sizes are shown as read-only chips under **Tier Step Sizes** on the Fetch tab. The same tier is recorded on the position and used as the scorecard key — `fund>40` and `fund+70` are different tiers and scored separately.
-
-**Bare-form exception — `fund`**: in Auto mode, a criterion named without a `>`/`<` comparison normally still requires a nonzero tier. `fund`'s bare form matches on any finite funding rate instead, exactly 0% included, since real Bybit funding rates mostly sit well under a single **Fund Step**. A near-zero rate is a real lukewarm reading (`fund+0`/`fund-0`), so it attaches and feeds the lukewarm chart. The tiered forms are unaffected.
-
-**Funding emoji**: position/trade badges show 🤑 or 💸 for a `fund` tier, and the emoji encodes whether that funding sign favors the bot's own direction — so Winter and Chaser show opposite emoji for the same raw sign. The Extremity Scorer's own pills use one fixed set on both bots (💸 positive, 🤑 negative).
-
 **Slot builder badge key**: the manual slot builder uses the same emoji set as position/trade badges.
 
 | Badge | Criterion |
 |---|---|
-| 🤑/💸 | Funding tier (direction-aware, see above). |
+| 🤑/💸 | Funding tier (direction-aware, see [Trivia](#trivia). |
 | 🔊 | V/A, volume versus the population sample-window average. |
 | 🎲 | IO/A, open interest versus the population sample-window average. |
 | 🔭 / 📡 | OCS / OCX. |
@@ -196,13 +185,8 @@ See StrategyBook's **Market Reading** section for what each criterion means and 
 | 💹 | LPA, last completed hour's price change versus every other ticker in the sample window. |
 
 **Recording**: every criterion is recorded as a signed tier on the position at entry.
-- `ocs` / `ocx`: buy/sell skew accumulated over the retained Order Count window, and average inter-fill gap versus the population average. The recent-trades fetch only runs when a slot uses either.
-- `va` / `ioa`: the ticker's 24h turnover / open interest versus the population average of the same window, read off the ticker fetched fresh for that symbol in this scan's batch.
-- `lta` / `lpa`: read from the last completed 1h candle — `lta` versus the ticker's own average hour, `lpa` versus the mean 1h price change of every other sampled ticker. One cached kline request per sampled ticker per hour.
 
-Each scan draws **Batch Size** tickers (default 250) at random from the candidate pool and fetches their data fresh; that batch is the entry pool, so a ticker outside it isn't a candidate that scan. See **Criteria Sampling Internals** in Trivia.
-
-**Entry veto**: every candidate's annotated criteria pass through Permafrost/Ashfall's Lukewarm Veto (`_pfExtremityVeto`/`_afExtremityVeto`) before the open goes through — see **Extremity Scorer** below.
+Each scan draws **Batch Size** tickers (default 50) at random from the candidate pool and fetches their data fresh; that batch is the entry pool, so a ticker outside it isn't a candidate that scan. See **Criteria Sampling Internals** in Trivia. This bottleneck greatly limits the bot's ability to find prospective tickers, but this is intentional, as fetching data for all seven criteria across 600+ tickers every Scan cycle (10 minutes) would be both computationally and bandwidth intensive. Nonetheless, increasing the batch size is an option (if you have the resources). 
 
 ### Config
 
@@ -217,13 +201,12 @@ Each scan draws **Batch Size** tickers (default 250) at random from the candidat
 | **Cascade %** (`miwCascadePct`/`micCascadePct`) | Collective uPnL trigger as a % of base margin (minNotional ÷ leverage). While **Target Halving** is on the slider is hidden and this value is the ceiling. |
 | **Sacrifice** (`miwSacrificeEnabled`/`micSacrificeEnabled`) | Closes every open position — any strategy's, not only MIW/MIC's own — when their collective unrealized loss hits a threshold. Caps group drawdown. Same continuous position-watcher check as Cascade. |
 | **Sacrifice %** (`miwSacrificePct`/`micSacrificePct`) | Collective uLoss trigger as a % of base margin (minNotional ÷ leverage). While **Target Halving** is on the slider is hidden and this value is the ceiling. |
-| **Target Halving** (`miwTargetHalvingEnabled`/`micTargetHalvingEnabled`, default off) | Sub-toggle on the **Exit** tab, only shown while Cascade or Sacrifice is on. Scales every new position's entry TP and SL, and the Cascade and Sacrifice %, by the Sample Scorer's headline relative to its recorded peak (see **Sample Scorer** below): full configured values at the peak, zero at $0 or below. The Cascade/Sacrifice sliders are hidden while it's on and act as ceilings. Also drives Deferment — see **Deferment & Ejection**. Needs Sample Scoring; with it off or no scorecard value or recorded peak yet it does nothing and the configured values apply. A read-only line under the toggle shows the live resolved targets. |
+| **Target Halving** (`miwTargetHalvingEnabled`/`micTargetHalvingEnabled`, default off) | Sub-toggle on the **Exit** tab, only shown while Cascade or Sacrifice is on. Scales every new position's entry TP and SL, and the Cascade and Sacrifice %, by the Sample Scorer's headline relative to its recorded peak (see **Sample Scorer** below): full configured values at the peak, zero at an even share or below. The Cascade/Sacrifice sliders are hidden while it's on and act as ceilings. Also drives Deferment. Needs Sample Scoring; with it off or no scorecard value or recorded peak yet it does nothing and the configured values apply. A read-only line under the toggle shows the live resolved targets. |
 | **Min Entry TP** (`miwMinEntryTp`/`micMinEntryTp`, default **6**) | Only shown while Target Halving is on. ROI % floor below which a position can't clear its entry and exit fees. If the resolved entry TP, or the resolved Cascade target while Cascade is on, falls under it, the market isn't worth trading and new entries are deferred. Cascade and Sacrifice also never fire below it (or below 1%). |
 | **Substitution** (`miwSubstitutionEnabled`/`micSubstitutionEnabled`) | When no entry slot is free (maxPos or Share Cap reached), closes the worst-scoring held position — any strategy's, not only MIW/MIC's own — and opens the best fresh candidate instead, but only if the candidate's collapsed score exceeds the held position's *current* score by the configured Margin. A held MIW/MIC position's own score (`_miwLiveCompositeScore`/`_micLiveCompositeScore`) is recomputed live from its rolling-average criteria (see **Position Rolling Average**) rather than the score frozen at entry — a position is judged on where it's actually drifted to, not where it stood when it opened. Requires Co-Qualifying Penalty (Permafrost/Ashfall) — without it, every score is 0 and Substitution never fires. Each candidate is pre-flighted through the Force-Evaluate top-up and entry vetoes before anything is closed; a blocked one falls through to the next. |
 | **Substitution Margin** (`miwSubstitutionMarginPct`/`micSubstitutionMarginPct`) | How much better the new candidate must score than the worst held position, as a % of base margin (minNotional ÷ leverage), before a swap happens. Prevents swapping on marginal score differences. |
 | **Substitution Min Age** (`miwSubstitutionMinAgeMins`/`micSubstitutionMinAgeMins`) | Minimum minutes a position must be held before it becomes eligible to be substituted out. |
-| **Deferment** (`miwDefermentEnabled`/`micDefermentEnabled`, default off) | Regime-proxy entry stop, set on the **Exit** tab (below Substitution, with its Negative Headline and Both Poles Red sub-toggles). Reads the whole retained sample window from Permafrost/Ashfall and blocks every new entry while the window's total average LPA is against the bot — positive for MIW, negative for MIC. Three optional scorecard clauses can also trigger it — **Negative Headline**, **Both Poles Red**, and the **Target Halving** floor. Two or more paths active at once trigger Ejection. See **Deferment & Ejection** below. |
-| **Negative Headline** (`miwDeferWeatherNegEnabled`/`micDeferWeatherNegEnabled`, default off) | Sub-toggle, first in the Deferment group, only shown while Deferment is on. Defers while the Sample Scorer headline is below zero — the favored side's mean raw 1h move in the bot's favor, in dollars. Needs Sample Scoring; does nothing until the scorecard has a headline value. The highest-priority deferment reason. |
+| **Deferment** (`miwDefermentEnabled`/`micDefermentEnabled`, default off) | Regime-proxy entry stop, set on the **Exit** tab (below Substitution, with its Both Poles Red sub-toggle). Blocks every new entry while the Sample Scorer headline is below zero (the favored side's mean raw 1h move in the bot's favor), or when a clause is in effect — **Both Poles Red** or the **Target Halving** floor. Needs Sample Scoring for the headline. Two or more paths active at once trigger Ejection. See **Deferment & Ejection** below. |
 | **Both Poles Red** (`miwDeferBothRedEnabled`/`micDeferBothRedEnabled`, default off) | Sub-toggle, only shown while Deferment is on. Defers while any criterion has both its `+` and `-` pole in the red on the scorecard side the chart shows — no good pole left to enter on. A pole under Min Samples doesn't count. Counts as one path toward Ejection. |
 | **Re-entry Block Mode** (`miwReentryBlockMode`/`micReentryBlockMode`) | Defaults to **Winners + Losers**, which blocks a symbol from re-triggering for one bulk-ticker cooldown window (12h by default) after any close, win or loss. **Losers Only** lets a symbol that just closed in profit re-trigger immediately, blocking only a symbol that closed at a loss. |
 | **Auto Slots** (`miwAutoSlots`/`micAutoSlots`) | Replaces the manual slot list with a minimum-gate qualifier: a ticker qualifies once it satisfies at least **Minimum Criteria per Slot** non-excluded criteria — not a fixed-size combination. Every criterion the ticker actually satisfies is captured and scored, not just enough to clear the floor. See `_miwAutoQualify`/`_micAutoQualify`. |
@@ -239,21 +222,6 @@ Each scan draws **Batch Size** tickers (default 250) at random from the candidat
 **Auto mode**: replaces the manual builder with a minimum-slider and an exclusion chip row. A ticker qualifies on at least the chosen minimum of non-excluded criteria — every criterion actually true is scored, not just enough to clear the floor. The hint under the slider states the current floor as "qualifies on any N of M secondary criteria."
 
 The seven criteria are independent signed tiers, so any subset can be true for the same ticker at once and each contributes to the qualifying count on its own.
-
-### Deferment & Ejection
-
-Both are off by default, and the LPA test does nothing until at least 3 sample batches exist. **Deferment** blocks every new entry, Substitution included, while the sampled window's average 1h price change runs against the bot (positive for MIW, negative for MIC); the topbar shows a **No Entry** pill until it turns. **Ejection** has no toggle: whenever two or more deferment paths are in effect at once, each scan closes every open position (pending excluded) rather than the worst one, and those closes carry the **Eject** badge.
-
-**Deferment paths.** Deferment can also be triggered from the Sample Scorer instead of the LPA window, by **Negative Headline** (headline below zero), **Both Poles Red** (any criterion with both poles in the red) or **Target Halving**'s floor (resolved entry TP or Cascade target under **Min Entry TP**). Each is evaluated independently: any one fires the stop, the pill and log name the first that applies in that order, and two or more together fire Ejection. While Target Halving is on and the scorecard has a value, its floor replaces the LPA test, so the two never count as separate paths; with Sample Scoring off or no value yet, the LPA test applies as before. Negative Headline and Both Poles Red need the Deferment toggle on; the Target Halving floor works without it.
-
-### Target Halving
-
-Scales this moment's targets by how the market looks on the Sample Scorer. With headline *W* (dollars) and *peak* = the highest headline recorded on the Sample Scorer, the factor is `clamp(W / peak, 0, 1)`: *W* at the peak gives the configured targets in full, *W* at $0 or below takes them to zero. With no recorded peak yet it stays inactive and the configured values apply. It applies to:
-
-- **Entry TP** and **SL** of each *new* position, set at open and kept for its life (the SL is floored at 1%). Open positions are untouched.
-- **Cascade %** and **Sacrifice %**, re-resolved continuously, never below Min Entry TP (or 1%).
-
-Whenever the resolved entry TP, or the Cascade target if Cascade is on, drops under **Min Entry TP** the bot defers. Sample Scoring has to be on, and the Cascade/Sacrifice sliders are hidden while it runs. PseudoWinter and PseudoChaser take the per-position TP and SL as overrides; a live host needs to read the same two candidate fields (`_tpPct`, `_slPct`) for them to take effect there.
 
 ---
 
@@ -273,8 +241,8 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. They provide two 
 | **Freshness Window** (`pfGcFreshnessMult`/`afGcFreshnessMult`) | How many Scan Intervals a broadcast GC step stays actionable on the partner side (default 2×). |
 | **Extremity Scorer** (`pfExtremityEnabled`/`afExtremityEnabled`) | The scoring engine. Sorts each criterion's own sampled readings into extreme-high / lukewarm / extreme-low, scores which end paid — by closed trades, or by how sampled tickers moved under **Sample Scoring** — and vetoes a candidate once too much of what it exhibits sits on the losing end. Criteria universe is `fund`, `va`, `ioa`, `ocs`, `ocx`, `lta`, `lpa` — see **Extremity Scorer** and **Sample Scoring** below. |
 | **Sample Scoring** (`pfSampleScoringEnabled`/`afSampleScoringEnabled`, **off by default**) | Proactive mode of the Extremity Scorer: scores each criterion by how the sampled tickers actually moved (LPA, in the bot's favor) instead of by closed-trade PnL, so it can learn before any entry. Same Extreme/Lukewarm buckets and veto. Hides the closed-trade settings (Position Rolling Average, Drift Credit, Sponge Quota, Stale Purge); Extreme Split and Min Samples still apply. The scorecard panel is renamed **Sample Scorer** and shows the scored-sample count. Forces the hour-candle fetch on, since LPA is its outcome. |
-| **Delayed Pairing** (`pfSampleDelayed`/`afSampleDelayed`, off by default) | Sub-toggle, only shown while Sample Scoring is on. Off: criteria and outcome come from the same sample moment (faster, less accurate). On: criteria are snapshotted at sample time and scored against the ticker's real forward 1h move, fetched an hour later, so scores lag about an hour. The panel lists each pending snapshot with its estimated fetch time. A snapshot not resolved within an hour plus max(10 min, scan interval) is dropped. |
-| **Extreme Split** (`pfExtremitySplitPct`/`afExtremitySplitPct`) | What share of a dial pole's sample, sorted by magnitude, counts as "extreme" (default 25%, range 5–45%). Lower = a stricter, more exclusive extreme band; higher = more readings qualify as extreme. The cutoff is recomputed per pole from its own sample. |
+| **Delayed Pairing** (`pfSampleDelayed`/`afSampleDelayed`, off by default) | Sub-toggle, only shown while Sample Scoring is on. Off: criteria and outcome come from the same sample moment (faster, less accurate). On: criteria are snapshotted at sample time and scored against the ticker's real forward 1h move, fetched an hour later, so scores lag about an hour. The panel lists each pending snapshot with its estimated fetch time. A snapshot not resolved within an hour plus twice max(10 min, scan interval) is dropped. |
+| **Extreme Split** (`pfExtremitySplitPct`/`afExtremitySplitPct`) | What share of a dial pole's sample, sorted by magnitude, counts as "extreme" (default 30%, range 5–45%). Lower = a stricter, more exclusive extreme band; higher = more readings qualify as extreme. The cutoff is recomputed per pole from its own sample. |
 | **Min Samples** (`pfExtremityMinSamples`/`afExtremityMinSamples`) | Minimum sampled readings a dial pole needs before its extreme cutoff is trusted (default 3, range 3–30). Below this the pole has no proven cutoff and every reading on it counts as lukewarm. Because the pool samples live annotations rather than closes, a pole usually clears this within the first scan or two. When **Position Rolling Average** is on, also the minimum per-family reading count the open-position rolling average requires before trusting a position's rolling average over its frozen entry-time snapshot. |
 | **Sample Cap** (`pfExtremitySampleCap`/`afExtremitySampleCap`) | Max retained magnitude readings per dial pole for cutoff computation (default 300). Oldest trimmed first. Config-only — no UI control. |
 | **Lukewarm Veto** (`pfLukewarmRatioPct`/`afLukewarmRatioPct`) | Share of a candidate's dial-eligible criteria that must land on the *non-favored* side before the candidate is vetoed outright (default 70%, range 30–100%). Which side is favored is decided by Lukewarm Scoring itself, not by a toggle — the hint under the slider names the side currently being targeted. An unproven dial (below Min Samples) always counts against the candidate. |
@@ -284,9 +252,9 @@ Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. They provide two 
 | **Stale Purge** (`pfStaleSlotDays`/`afStaleSlotDays`) | Slots with no new close in this many days are fully removed from the scorecard on the next trim. Plain number field, no upper bound. Freshness is per exact criteria combination. |
 | **Co-Qualifying Penalty** (`pfCoQualPenaltyEnabled`/`afCoQualPenaltyEnabled`) | Scores each candidate by summing its matched criteria's collapsed scores, so historically-losing criteria drag a ticker down the entry queue. In manual-slot mode it additionally deducts for every further slot the ticker qualifies for that carries a negative collapsed score (positive co-qualifying slots do not boost). In Auto mode there is only one canonical match set per ticker, so the sum over that set *is* the composite. Also required by MIW/MIC Substitution — without it every score is 0 and no swap ever fires. |
 | **Depth Multiplier** (`pfCoQualDepthPct`/`afCoQualDepthPct`) | Scales every criterion's collapsed score by how far past that slot's own gate threshold the ticker qualifies, not by the raw tier value. E.g. a criterion scoring +$0.50 historically is applied as +$0.70 for a ticker qualifying 4 tiers past its slot's threshold at 10%/tier. Works the same in reverse — a losing criterion is penalised harder the deeper past threshold the ticker qualifies. Depth is direction-aware: for a `<` gate (`va<N`, `ioa<N`, `ocx<N`) a *lower* measured value is the deeper match. Range 0–50%. |
+| **Batch Size** (`pfOcBatchSize`/`afOcBatchSize`) | Tickers fetched fresh per scan and used as the entry pool (default 50, 1–2500, number field). Each costs a ticker and a recent-trades request, plus a candle once an hour — about 1 MB uncompressed per 50 tickers — so bandwidth scales with batch size × scans per day. |
 | **Order Count Surveillance** (`pfOcEnabled`/`afOcEnabled`) | Samples **Batch Size** tickers from MIW/MIC's scan candidate pool each cycle. Recent trades are fetched when a slot needs `ocs`/`ocx`, and each ticker's last-completed 1h candle when a slot needs `lta`/`lpa`; the same cycle history carries the 24h-turnover and open-interest samples `va`/`ioa` compare against — with none of those needed, only the per-ticker ticker fetch runs. Each OC fetch is a fresh, independent snapshot. Published to the shared cross-bot registry each cycle, so a **Follow Partner Bot** instance (which runs no OC fetch of its own) seeds its own OC results and cycle history from the leader's latest sample instead of going without. With Order Count Surveillance off, tickers are still fetched fresh each scan; trades and candles are not. |
 | **OC Order Limit** (`pfOcOrderLimit`/`afOcOrderLimit`) | Recent trades fetched per ticker per scan cycle (10–500). Buy/sell skew and average order interval are both computed from this single sample. |
-| **Batch Size** (`pfOcBatchSize`/`afOcBatchSize`) | Tickers fetched fresh per scan and used as the entry pool (default 250, 1–2500, number field). Each costs a ticker and a recent-trades request, plus a candle once an hour — about 5 MB uncompressed per 250 tickers — so bandwidth scales with batch size × scans per day. |
 | **Megacap Exclusion** (`megacapExclude`) | Array of symbols excluded, alongside BTC, from every population average this plugin builds and from MIW/MIC's own scan pool. Default `BTCUSDT`/`ETHUSDT`/`SOLUSDT`/`BNBUSDT`/`XRPUSDT`/`DOGEUSDT`/`ADAUSDT`/`TRXUSDT`/`LINKUSDT`. Seeded on first load by whichever of the four plugins loads first — shared by key name so all stay consistent. Not editable from the UI — change via config import if the list needs to change. |
 
 ### Partner Feed
@@ -299,7 +267,7 @@ Useful for diagnosing Mutual DDH Lift and GC: if the feed shows a partner `ddh-s
 
 Below the Score tab's scoreboard, a per-ticker bar chart of the OC cycle history, scrollable through past cycles. Two header buttons step through the views **OC → Vol → IO → Fund → LTA → LPA** (each labelled with the view it goes to, wrapping at either end); the view resets to OC on reload. Only shown when Order Count Surveillance is on and at least one sample exists. Each cycle group is stamped with its sample time — click one to pin the summary and chips to that cycle, click elsewhere to return to the latest.
 
-- **OC**: bar height is average seconds between orders (quieter = taller). **Total** shows buy/sell skew over every retained cycle plus the population average interval `ocx` measures against; **Batch** shows the displayed cycle. Chips show dominant side and interval — outline when faster than the batch mean, filled when skew leans to the bot's own side (buy on Chaser, sell on Winter). Tickers averaging over 12s/order are left off the chart but stay eligible for criteria and the chip list.
+- **OC**: bar height is average seconds between orders (quieter = taller). **Total** shows buy/sell skew over every retained cycle plus the population average interval `ocx` measures against; **Batch** shows the displayed cycle. Chips show dominant side and interval — outline when faster than the batch mean, filled when skew leans to the bot's own side (buy on Chaser, sell on Winter). Tickers averaging over 12s/order are rare and completely flatten the chart, as such they are left off the chart but stay eligible for criteria and the chip list.
 - **Vol** / **IO**: the 24h-turnover and open-interest samples, with a **Total avg** (the number `va`/`ioa` measure against, plus ticker count) above a **Batch avg**. No outlier cap.
 - **Fund**: each sampled ticker's funding rate (%), signed, with a **Total avg** and **Batch avg** like Vol/IO. Funding rides in the sample records, read from each ticker's fresh fetch.
 - **LTA** / **LPA**: signed views (turnover deviation %, 1h price change %) drawn up or down from a zero line on a symmetric axis sized to 1.3× the 95th percentile of |value|. Only tickers with a candle reading in a cycle appear.
@@ -314,19 +282,7 @@ Each criterion is a **dial family** (`fund`, `va`, `ioa`, `ocs`, `ocx`, `lta`, `
 
 Under **Sample Scoring** the same chart is titled **Sample Scorer**, its bars are mean edge in pp (hover shows the average edge, ↑/↓ counts and n), and a status line above it shows the scored-sample count plus, with Delayed Pairing on, each snapshot awaiting its outcome with its estimated fetch time.
 
-**Headline & gauge**: the header number is absolute, not relative. It is the favored side's mean raw 1h move in the bot's favor, converted to dollars on one base position (notional × move %), and a gauge under it runs from −TP$ to +TP$, where TP$ is the entry TP in dollars (base margin × TP %). Hover for the sample count and the relative edge. The per-criterion bars stay relative (mean edge vs the sampled population). Beneath the gauge, **bottom** and **peak** show the lowest and highest headline recorded; they only update once the favored side has at least 10 raw samples (and at least Min Samples), are kept in pp of price move so changing notional or leverage doesn't distort them, and are cleared with the samples. The headline reads `—` until enough samples carry a raw move.
-
-### Sample Scoring
-
-The proactive mode of the Extremity Scorer. Instead of crediting each criterion with the PnL of trades already closed, it scores it by how the **sampled tickers** actually moved, so it learns from the market before any entry and needs no closed trade to start. Every sampled ticker contributes its criteria tiers, and the outcome is its LPA relative to the sampled population, taken in the bot's favor (MIC wants it up, MIW down). A criterion's score is the mean edge, in percentage points, of the readings that showed it. The Extreme/Lukewarm split, the favored-side veto, Co-Qualifying ranking and Re-Evaluation all work as before; only the numbers feeding them change. Extreme/Lukewarm cutoffs come from the sample window's own readings.
-
-The favored side compares each bucket's **mean** edge per reading rather than its total, since the extreme bucket is a quarter of readings by construction. It stays on Extreme until both buckets hold Min Samples readings.
-
-- **Delayed Pairing off**: criteria and outcome come from the same sample moment, using the last completed hour's LPA. Only each ticker's latest reading per clock hour counts, and LPA is not scored against itself. LTA is included even though it is concurrent with the outcome (see the TODO in the code about dropping it if it doesn't pan out).
-- **Delayed Pairing on**: criteria, including backward LPA and LTA as momentum, are snapshotted at sample time. Once the hour has passed, the bot fetches 1-minute candles pinned to the exact window after the snapshot and records each ticker's forward move relative to the batch mean, so a late fetch measures the same hour. Each ticker's forward hour is scored three ways, close, high and low of that window, and each counts as its own observation, so sample counts and Min Samples fill about three times faster (the three readings share one ticker and window, so a single ticker can satisfy Min Samples) and the headline, Target Halving and Deferment react more from scan to scan. A snapshot not resolved within an hour plus max(10 min, scan interval) is dropped with a log line, and a restart or lost connection inside that grace still resolves it.
-- **Followers**: a bot running **Follow Partner Bot** doesn't ingest or resolve samples itself. It adopts the leader's published scored store (including pending snapshots) and reads whichever pairing kind the leader runs.
-- **Charts**: the Sample Chart's views still show each batch's own tickers with their backward LPA/LTA. Forward outcomes live only in the Sample Scoring store.
-- **Raw move**: each observation also stores the undemeaned 1h move (`r`: the last completed hour with Delayed Pairing off, the real forward hour with it on). The headline is built from it, and with Delayed Pairing on it averages the close, high and low outcomes. Observations saved before this carry no raw move and are left out of the headline until fresh ones accumulate; the relative bars still use them.
+**Headline & gauge**: the header number is relative. It is the favored side's favorable share of raw 1h move — move in the bot's favor as a share of all raw move on that side, so 50% is even — and a gauge under it is scaled to the best share recorded. Hover for the sample count, the mean in dollars on one base position and the relative edge. The per-criterion bars stay relative (mean edge vs the sampled population). Beneath the gauge, **bottom** and **peak** show the lowest and highest share recorded; they only update once the favored side has at least 10 raw samples (and at least Min Samples) and are cleared with the samples. The headline reads `—` until enough samples carry a raw move.
 
 ## Randomized Outcomes
 
@@ -377,13 +333,18 @@ Developer-level detail with no operational consequence. Included for reference.
 | `__ew_af_extremity_v1` | Ashfall-Chaser's equivalent of `__ew_pf_extremity_v1`. Not read or written by Permafrost. |
 | `__ew_af_dialpool_v1` | Ashfall-Chaser's Extremity Scorer sample pool (`afDialSamplePool`): raw per-dial-family magnitude readings that cutoffs derive from, fed by every criterion annotation the scan produces. Separate from the closed-record store, not shared with Permafrost, capped per family, loaded explicitly in `init()`. |
 | `__ew_pf_dialpool_v1` | Permafrost-Winter's equivalent of `__ew_af_dialpool_v1` (`pfDialSamplePool`). |
-| `__ew_af_sampleobs_v1` | Ashfall-Chaser's Sample Scoring store: `obs` (scored observations — tier tags plus outcome edge, tagged now/forward) and `pending` (delayed snapshots awaiting their forward outcome), plus `wx` (peak/bottom of the headline, in pp). Each observation also carries the raw move `r`. Size-capped; wiped by the scorecard CLEAR. A following bot stores the leader's adopted copy here. |
+| `__ew_af_sampleobs_v1` | Ashfall-Chaser's Sample Scoring store: `obs` (scored observations — tier tags plus outcome edge, tagged now/forward) and `pending` (delayed snapshots awaiting their forward outcome), plus `wx` (peak/bottom of the headline, in pp, and of the favorable share). Each observation also carries the raw move `r`. Size-capped; wiped by the scorecard CLEAR. A following bot stores the leader's adopted copy here. |
 | `__ew_pf_sampleobs_v1` | Permafrost-Winter's equivalent of `__ew_af_sampleobs_v1`. |
 | `__ew_creds` | EverWinter live plugin API credentials |
 | `__sc_creds` | SunChaser live plugin API credentials |
 
 ### Criteria Sampling Internals
 
+- **Tier gate**: every criterion computes an integer tier as `floor(value / step)` and compares it against N (`fund` truncates toward zero instead, so a tiny negative rate lands on `fund-0`, mirroring `fund+0`, rather than flooring to `fund-1`). Current step sizes are shown as read-only chips under **Tier Step Sizes** on the Fetch tab. The same tier is recorded on the position and used as the scorecard key — `fund>40` and `fund+70` are different tiers and scored separately.
+
+- **Bare-form exception — `fund`**: in Auto mode, a criterion named without a `>`/`<` comparison normally still requires a nonzero tier. `fund`'s bare form matches on any finite funding rate instead, exactly 0% included, since real Bybit funding rates mostly sit well under a single **Fund Step**. A near-zero rate is a real lukewarm reading (`fund+0`/`fund-0`), so it attaches and feeds the lukewarm chart. The tiered forms are unaffected.
+
+- **Funding emoji**: position/trade badges show 🤑 or 💸 for a `fund` tier, and the emoji encodes whether that funding sign favors the bot's own direction — so Winter and Chaser show opposite emoji for the same raw sign. The Extremity Scorer's own pills use one fixed set on both bots (💸 positive, 🤑 negative).
 - **`ocs`**: signed deviation-from-parity tiers (`ocs+12` = 62% buy-dominant). It is an accumulated read: fill counts are summed per ticker across every retained OC cycle (up to 25, fewer once the 200KB history cap bites — about 5 at 250 per batch), and a live single-ticker sample (`_ocFetchSingle`) folds in exactly once.
 - **`ocx`**: `ocx+12` = average inter-fill gap faster than the population average by 12 tiers (12 × step%, default 1%). Reads only the latest batch's interval.
 - **OC population average**: `_pfOcWindowAvgMs`/`_afOcWindowAvgMs` flattens the retained cycles, keeps the latest reading per symbol, and averages.
@@ -399,16 +360,16 @@ Developer-level detail with no operational consequence. Included for reference.
 
 ### Deferment & Ejection Internals
 
-- **Deferment signal**: the figure is `sum / n` over the latest reading per ticker in the retained window (`_pfWindowStats`/`_afWindowStats`), used as-is with no deadband, trim, or cooldown. It is the raw 1h change, not the per-ticker `lpa` gap. Warm-up is 3 batches in `_pfOcCycleHistory`/`_afOcCycleHistory`.
+- **Deferment signal**: `_miwWeatherNeg`/`_micWeatherNeg` reads `_pfSampleWeather`/`_afSampleWeather(side)` on the favored side and defers while its dollar `value` is below zero, with no deadband, trim, or cooldown. It needs Sample Scoring and returns nothing until the scorecard has a headline.
 - **Deferment effect**: the scan returns before every open path, with guards inside `_miwTrySubstitute`/`_micTrySubstitute` and `_miwOpen`/`_micOpen`. Historical scoring still runs. One `⛔ Deferment` log line per streak.
 - **Ejection**: runs every scan ahead of slot logic (so it acts with no active slots) when the deferment state's `eject` is set, which needs two or more paths in `why`. `_miwEject`/`_micEject` closes every non-pending position of any strategy, each in its own try/catch, with one `⏏️ Ejection` log line naming the paths and close reason `ejection`. Each trade is scored against its opening criteria.
 
 ### Target Halving & Scorecard Deferment Internals
 
-- **Targets**: `_miwTargets`/`_micTargets` resolves the factor from `_pfSampleWeather`/`_afSampleWeather(side)` on the favored side. It returns the configured values untouched (`active:false`) when Target Halving is off, neither Cascade nor Sacrifice is on, Sample Scoring is off, or there's no headline value or recorded peak (`wx.hi`). The factor is `clamp(W / wx.hi, 0, 1)`, zero when the peak is at or below zero. `_miwEffCascadePct`/`_micEffCascadePct` and `_miwEffSacrificePct`/`_micEffSacrificePct` return the resolved % floored at Min Entry TP and 1%; `_miwTargetsText`/`_micTargetsText` feed the Exit-tab readout.
+- **Targets**: `_miwTargets`/`_micTargets` resolves the factor from `_pfSampleWeather`/`_afSampleWeather(side)` on the favored side. It returns the configured values untouched (`active:false`) when Target Halving is off, neither Cascade nor Sacrifice is on, Sample Scoring is off, or there's no headline share (`wx.s`) or recorded share peak (`wx.sHi`). The factor is `clamp(wx.s / wx.sHi, 0, 1)`, zero when the peak is at or below zero. `_miwEffCascadePct`/`_micEffCascadePct` and `_miwEffSacrificePct`/`_micEffSacrificePct` return the resolved % floored at Min Entry TP and 1%; `_miwTargetsText`/`_micTargetsText` feed the Exit-tab readout.
 - **Per-position overrides**: `_miwOpen`/`_micOpen` pass `_tpPct` and `_slPct` on the candidate. PseudoWinter/PseudoChaser use `_tpPct` for the entry TP, and `_slPct` for the binary-mode SL at open. It is also stored as `pos._slPctOverride`, which the DCA-mode SL arm, the SL drift check and the position card honor. Both candidate fields are excluded from the copy of candidate fields onto the position.
-- **Deferment layering**: `_miwDefermentState`/`_micDefermentState` wraps `…DefermentStateBase`. The wrapper evaluates Negative Headline, Both Poles Red and the base on their own and merges them, with `why` listing those that hold and `eject` set when there are two or more. The base holds the Target Halving floor test, else the LPA test. `_miwWeatherNeg`/`_micWeatherNeg` and `_miwBothPolesRed`/`_micBothPolesRed` are the two clause tests; the latter reads the favored side of `pfLukewarmScoreboard`/`afLukewarmScoreboard`.
-- **Headline source**: `_pfSampleBuild`/`_afSampleBuild` accumulates the raw edge per bucket into `pfSampleBucketMeans`/`afSampleBucketMeans` (`aE`/`aL`, counts `nAE`/`nAL`). `_pfSampleWeather`/`_afSampleWeather` converts it to dollars and adds the peak/bottom, which `_pfSampleTrackWx`/`_afSampleTrackWx` keeps in the sample store as `wx` and the leader shares with followers.
+- **Deferment layering**: `_miwDefermentState`/`_micDefermentState` wraps `…DefermentStateBase`. The wrapper evaluates the negative-headline test (on with Deferment), Both Poles Red and the base on their own and merges them, with `why` listing those that hold and `eject` set when there are two or more. The base holds only the Target Halving floor test. `_miwWeatherNeg`/`_micWeatherNeg` and `_miwBothPolesRed`/`_micBothPolesRed` are the two clause tests; the latter reads the favored side of `pfLukewarmScoreboard`/`afLukewarmScoreboard`.
+- **Headline source**: `_pfSampleBuild`/`_afSampleBuild` accumulates the raw edge per bucket into `pfSampleBucketMeans`/`afSampleBucketMeans` (`aE`/`aL`, counts `nAE`/`nAL`) and the signed favorable share `(P−Q)/(P+Q)` of those raw moves (`sE`/`sL`). `_pfSampleWeather`/`_afSampleWeather` returns the dollar `value`, the share (`s`, and `share` as 0–1) and the peak/bottom of each (`hi`/`lo`, `sHi`/`sLo`), which `_pfSampleTrackWx`/`_afSampleTrackWx` keeps in the sample store as `wx` and the leader shares with followers.
 
 ### Extremity Scorer Internals
 
@@ -444,6 +405,8 @@ pw()  →  plugin[0].transform(def)  →  plugin[1].transform(def)  →  ...  �
 ```
 
 Each plugin's `transform(def)` receives and returns the component definition. Load order matters for method wrapping — strategy plugins must declare `after: ['everwinter']` / `after: ['sunchaser']` so live-trading plugin wraps are innermost.
+
+Load order matters: live trading plugins (EverWinter, SunChaser) must load before strategy plugins (MultiIndicator, Permafrost/Ashfall). The Plugin Manager shows the current load order and warns about conflicts.
 
 ### Bybit API Endpoints Used
 
