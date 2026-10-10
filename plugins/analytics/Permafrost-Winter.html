@@ -28,7 +28,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '2.5.0'; // Change: removed Preemption (Concentration's rank-by-score sub-toggle) with its UI and ranking code — Concentration always re-samples queued movers, and the movers-only settings no longer hide. Prior: 2.4.1 — Tweak: trimmed the changelog and history-only comments.
+    const VERSION        = '2.6.2'; // Tweak: Distillation is now on by default and its default graylist time is 4 hours. Prior: 2.6.1 — Tweak: a graylisted ticker now stays graylisted for the full time; a favourable resolve no longer lifts it.
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -74,7 +74,11 @@
     pfConcTopOnly: false,          // only movers ranking in the top pfConcPct% of their resolved batch (off = any size)
     pfConcPct: 30,                 // top share of a resolved batch (by move size) used when pfConcTopOnly is on
     pfConcMaxPct: 100,             // most of the scan's batch Concentration may take; shuffled randoms fill the rest
-    pfConcHL: true,                // rank by the hour's high/low swing (off = close move)
+    pfConcHL: true,                // measure moves by the hour's average (high/low midpoint) instead of the close
+    pfDistEnabled: true,           // Distillation — Delayed Pairing sub-toggle: graylist tickers that moved against the bot over their resolved hour
+    pfDistMins: 240,               // how long a graylisted ticker stays out of sampling and trading
+    pfDistPastMean: false,         // graylist only movers worse than the resolved batch's mean (off = any unfavourable move)
+    pfDistHL: true,                // measure moves by the hour's average instead of the close
     pfSpongeQuota: 30,
     pfStaleSlotDays: 7,
     pfOcEnabled: true,
@@ -403,10 +407,41 @@
                   <label class="tog" style="margin-top:8px">
                     <div class="tog-t" :class="cfg.pfConcHL?'on':''" @click.prevent="if(!cfgLocked){cfg.pfConcHL=!cfg.pfConcHL;persist()}"><div class="tog-k"></div></div>
                     <div>
-                      <div class="tog-l">High/Low Swing</div>
-                      <div class="pfr-hint">Ranks movers by the hour's high or low swing instead of the close move.</div>
+                      <div class="tog-l">Hour Average</div>
+                      <div class="pfr-hint">Measures moves by the hour's average instead of the close.</div>
                     </div>
                   </label>
+                </div>
+              </div>
+              <div x-data="{ distOpen: false }" style="margin-left:36px" x-show="cfg.pfExtremityEnabled && cfg.pfSampleScoringEnabled && cfg.pfSampleDelayed">
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.pfDistEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.pfDistEnabled=!cfg.pfDistEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Distillation</div>
+                    <div class="pfr-hint">Graylists tickers that moved against the bot over their resolved hour, keeping them out of sampling and trading for a set time.</div>
+                  </div>
+                </label>
+                <button type="button" x-show="cfg.pfDistEnabled" @click.prevent="distOpen=!distOpen" style="margin-top:6px;font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:none;color:var(--text-lo);cursor:pointer"><span x-text="distOpen?'▾':'▸'"></span> Distillation settings</button>
+                <div x-show="cfg.pfDistEnabled && distOpen" style="margin-top:4px;margin-left:18px">
+                  <label class="tog" style="margin-top:4px">
+                    <div class="tog-t" :class="cfg.pfDistPastMean?'on':''" @click.prevent="if(!cfgLocked){cfg.pfDistPastMean=!cfg.pfDistPastMean;persist()}"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Past the Mean Only</div>
+                      <div class="pfr-hint">Only graylists movers worse than the resolved batch's mean.</div>
+                    </div>
+                  </label>
+                  <label class="tog" style="margin-top:8px">
+                    <div class="tog-t" :class="cfg.pfDistHL?'on':''" @click.prevent="if(!cfgLocked){cfg.pfDistHL=!cfg.pfDistHL;persist()}"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Hour Average</div>
+                      <div class="pfr-hint">Measures moves by the hour's average instead of the close.</div>
+                    </div>
+                  </label>
+                  <div style="margin-top:8px">
+                    <div class="lbl">Graylist <b x-text="cfg.pfDistMins"></b> min</div>
+                    <input type="number" min="1" max="1440" step="1" x-model.number="cfg.pfDistMins" :disabled="cfgLocked" @change="cfg.pfDistMins=Math.min(1440,Math.max(1,Math.round(+cfg.pfDistMins||240)));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                    <div class="pfr-hint">How long a graylisted ticker stays out of sampling and trading.</div>
+                  </div>
                 </div>
               </div>
               <label class="tog" style="margin-top:8px" x-show="!cfg.pfSampleScoringEnabled">
@@ -1276,7 +1311,7 @@
           try {
             const raw = localStorage.getItem(SAMPLE_OBS_KEY);
             const d = raw ? JSON.parse(raw) : null;
-            this._pfSampleStore = { obs: Array.isArray(d?.obs) ? d.obs : [], pending: Array.isArray(d?.pending) ? d.pending : [], ...(d?.leaderKind ? { leaderKind: d.leaderKind } : {}), ...(d?.wx ? { wx: d.wx } : {}), ...(d?.req && typeof d.req === 'object' ? { req: d.req } : {}) };
+            this._pfSampleStore = { obs: Array.isArray(d?.obs) ? d.obs : [], pending: Array.isArray(d?.pending) ? d.pending : [], ...(d?.leaderKind ? { leaderKind: d.leaderKind } : {}), ...(d?.wx ? { wx: d.wx } : {}), ...(d?.req && typeof d.req === 'object' ? { req: d.req } : {}), ...(d?.gray && typeof d.gray === 'object' ? { gray: d.gray } : {}) };
           } catch (_) { this._pfSampleStore = { obs: [], pending: [] }; }
         },
         _pfSampleSave() {
@@ -1311,6 +1346,7 @@
           const n = st.obs.filter(o => o.k === kind).length;
           let h = `<div>${n} scored sample${n === 1 ? '' : 's'}${this._pfFollowing() ? ' · from leader' : ''}</div>`;
           if (this.cfg.pfConcEnabled && !this._pfFollowing()) { const q = Object.keys(st.req || {}).length; h += `<div>${q} mover${q === 1 ? '' : 's'} queued for re-sampling</div>`; }
+          if (this.cfg.pfDistEnabled && !this._pfFollowing()) { const g = Object.keys(st.gray || {}).filter(k => this._pfGrayHas(k)).length; h += `<div>${g} ticker${g === 1 ? '' : 's'} graylisted</div>`; }
           return h;
         },
         // Delayed pairing: one line per snapshot awaiting its outcome, with the expected kline fetch time.
@@ -1325,26 +1361,44 @@
           return h;
         },
         _pfSamplePendingCount() { return ((this._pfSampleStore || {}).pending || []).length; },
-        // Concentration (Delayed Pairing only): when a snapshot resolves, its tickers that closed in the bot's favor (both directions
+        // Concentration (Delayed Pairing only): when a snapshot resolves, its tickers whose hour moved in the bot's favor (both directions
         // if pfConcBoth; only the top pfConcPct% by move size if pfConcTopOnly) are queued; _pfConcPick hands them to the next scan ahead of the random picks. Queue entries expire after 3h.
+        // The hour's move is its close move, or (Hour Average) the midpoint of its high and low moves.
         _pfConcQueue(done, now) {
           const st = this._pfSampleStore; if (!st) return;
           const c = this.cfg, dir = this._pfSampleDir(), hl = c.pfConcHL !== false;
           const ok = done.filter(r => typeof r.f === 'number' && typeof r.fh === 'number' && typeof r.fl === 'number');
           if (!ok.length) return;
-          // d: close move in the bot's favor (>0 = favorable); m: swing size; o: queue order (favorable-only ranks by the favorable swing)
-          let pool = ok.map(r => {
-            const m = hl ? Math.max(Math.abs(r.fh), Math.abs(r.fl)) : Math.abs(r.f);
-            const fav = hl ? (dir > 0 ? r.fh : -r.fl) : dir * r.f;
-            return { s: r.s, d: dir * r.f, m, o: c.pfConcBoth ? m : fav };
-          });
+          // d: the hour's move in the bot's favor (>0 = favorable); m: its size
+          let pool = ok.map(r => { const d = dir * (hl ? (r.fh + r.fl) / 2 : r.f); return { s: r.s, d, m: Math.abs(d) }; });
           if (c.pfConcTopOnly) {
             const pct = Math.min(100, Math.max(1, Number(c.pfConcPct) || 30));
             pool = pool.filter(x => x.m > 0).sort((a, b) => b.m - a.m).slice(0, Math.ceil(ok.length * pct / 100));
           }
           const req = (st.req ||= {});
-          for (const x of pool) if (x.o > 0 && (c.pfConcBoth ? x.d !== 0 : x.d > 0)) req[x.s] = { m: +x.o.toFixed(4), t: now };
+          for (const x of pool) if (c.pfConcBoth ? x.d !== 0 : x.d > 0) req[x.s] = { m: +x.m.toFixed(4), t: now };
           for (const k of Object.keys(req)) if (now - req[k].t > 3 * 3600000) delete req[k];
+        },
+        // Distillation (Delayed Pairing only): when a snapshot resolves, tickers whose hour moved against the bot (any unfavourable move,
+        // or only those worse than the batch mean if pfDistPastMean) are graylisted for pfDistMins, and only the time limit lifts it. _pfGrayHas is
+        // the check the MIC/MIW pool build uses, so graylisted tickers are neither sampled nor entered.
+        _pfDistQueue(done, now) {
+          const st = this._pfSampleStore; if (!st) return;
+          const c = this.cfg, dir = this._pfSampleDir(), hl = c.pfDistHL !== false;
+          const ok = done.filter(r => typeof r.f === 'number' && typeof r.fh === 'number' && typeof r.fl === 'number');
+          const gray = (st.gray ||= {});
+          if (ok.length) {
+            const mv = ok.map(r => ({ s: r.s, d: dir * (hl ? (r.fh + r.fl) / 2 : r.f) }));
+            const mean = c.pfDistPastMean ? mv.reduce((a, x) => a + x.d, 0) / mv.length : 0;
+            for (const x of mv) if (x.d < mean) { gray[x.s] = now; if (st.req) delete st.req[x.s]; }
+          }
+          const ttl = (Math.max(1, Number(c.pfDistMins) || 240)) * 60000;
+          for (const k of Object.keys(gray)) if (now - gray[k] > ttl) delete gray[k];
+        },
+        _pfGrayHas(sym) {
+          const c = this.cfg, t = this._pfSampleStore?.gray?.[sym];
+          return !!t && !!c.pfDistEnabled && !!c.pfSampleScoringEnabled && !!c.pfSampleDelayed && !this._pfFollowing()
+            && Date.now() - t <= (Math.max(1, Number(c.pfDistMins) || 240)) * 60000;
         },
         // Symbols to sample first this scan: queued movers still in the scan pool, biggest move first, at most pfConcMaxPct% of cap, and not
         // already sampled within the last hour (one sample per ticker per hour keeps the forward windows from overlapping).
@@ -1479,6 +1533,7 @@
                     for (const r of set) st.obs.push({ t: p.ts, s: r.s, k: 'f', y: +(r[key] - mean).toFixed(4), r: +r[key].toFixed(4), c: r.c });
                   }
                   if (this.cfg.pfConcEnabled) this._pfConcQueue(done, now);
+                  if (this.cfg.pfDistEnabled) this._pfDistQueue(done, now);
                 } else if (expired) {
                   this.log(`[PFR] Sample Scoring: snapshot from ${new Date(p.ts).toLocaleTimeString()} missed its ${Math.round(grace / 60000)}min resolve window and was dropped.`, 'warn');
                 }
