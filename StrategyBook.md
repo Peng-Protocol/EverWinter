@@ -255,7 +255,7 @@ Reactive scoring learns from outcomes: these are your own closed positions, cred
 
 ### Proactive Scoring
 
-Proactive scoring learns from the market by sampling price changes over a period, before any entry: each criterion is scored by how the tickers exhibiting it have been moving, with price movement as the grounding truth. Because this needs no closed trade to learn from, you get to recognize edge and adapt to a shift in regime much faster, and pick your targets before capital is committed. A more accurate way to apply this is to gather the criteria exhibited, then after a period of time compare the price change (averaging highs, lows and close), this directly tells you how the ticker behaved over the course of that time. 
+Proactive scoring learns from the market by sampling price changes over a period, before any entry: each criterion is scored by how the tickers exhibiting it have been moving, with price movement as the grounding truth. Because this needs no closed trade to learn from, you get to recognize edge and adapt to a shift in regime much faster, and pick your targets before capital is committed. A more accurate way to apply this is to gather the criteria exhibited, then after a period of time compare the price change (averaging highs, lows and close), this directly tells you how the ticker behaved over the course of that time. Liquidations add a second grounding truth: a ticker's forced liquidations over a period show which side was flushed out, and criteria are scored on both what price did and what liquidations did. Liquidation samples are rarer and count equally to a price sample.
 
 ### Reading the Scorecard
 
@@ -267,7 +267,7 @@ The same logic runs two levels down, per criterion. Every criterion carries its 
 
 The scorecard also remains highly useful for the explicit acts of substitution and ordering entries, as secondary, lesser indicators frequently prove to be valuable supplemental filters to refine your execution queue.
 
-Both sides use the same record, however it was learned. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, whether those outcomes are closed trades or sampled price moves, so consistently losing combinations are deprioritized from both directions rather than just one.
+Both sides use the same record, however it was learned. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, whether those outcomes are closed trades, sampled price moves or liquidations, so consistently losing combinations are deprioritized from both directions rather than just one.
 
 When one side enters gains quota and halts, the other halts as well. This is more psychological than functional, one side winning the session is an indicator both sides should take a break and prepare for regime change. 
 

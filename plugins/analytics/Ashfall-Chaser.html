@@ -29,7 +29,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '2.6.2'; // Tweak: Distillation is now on by default and its default graylist time is 4 hours. Prior: 2.6.1 — Tweak: a graylisted ticker now stays graylisted for the full time; a favourable resolve no longer lifts it.
+    const VERSION        = '2.7.0'; // Feature: Liquidation Surveillance (Score tab, off by default) watches a batch of tickers' liquidation feed each scan, graylists the quiet ones from the watch, and blends its outcomes into the price-based pole scores at half weight; adds the sparsity helpers MIC/MIW read. Prior: 2.6.2 — Tweak: Distillation is now on by default and its default graylist time is 4 hours.
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -80,6 +80,9 @@
     afDistMins: 240,               // how long a graylisted ticker stays out of sampling and trading
     afDistPastMean: false,         // graylist only movers worse than the resolved batch's mean (off = any unfavourable move)
     afDistHL: true,                // measure moves by the hour's average instead of the close
+    afLiqEnabled: false,          // Liquidation Surveillance — watch a batch of tickers' liquidation feed and score them on its turnover
+    afLiqWeight: 0.5,             // a liquidation sample counts this much relative to a price sample in a pole's score (no UI)
+    afSparsePct: 25,              // sparsity floor: no entry when a candidate's thinnest pole holds under this % of its bucket type's median sample count (no UI)
     afSpongeQuota: 30,
     afStaleSlotDays: 7,
     afOcEnabled: true,
@@ -142,6 +145,59 @@
   // reactive state from a render effect would re-trigger that same effect.
   const WIN_MEMO   = {}; // field -> { key, val } — memo for _afWindowStats
   const FRESH_TICKERS = {}; // sym -> raw ticker from this scan's per-symbol fetch (in-memory only)
+
+  // Liquidation feed (Bybit public linear WS, allLiquidation.<symbol>), kept outside the plugin object so Alpine never proxies it.
+  // LIQ_TALLY: per watched symbol, liquidated-short turnover (u), liquidated-long turnover (d) and event count (n) since its last snapshot.
+  const LIQ_HIST_KEY = '__af_liq_history';
+  const LIQ_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
+  const LIQ_TALLY = {};
+  let _liqConn = null, _liqPing = null, _liqRetry = null, _liqWant = new Set(), _liqSub = new Set();
+  function _liqSend(obj) { try { if (_liqConn && _liqConn.readyState === WebSocket.OPEN) _liqConn.send(JSON.stringify(obj)); } catch (_) {} }
+  function _liqResync() {
+    if (!_liqConn || _liqConn.readyState !== WebSocket.OPEN) return;
+    const sub = [..._liqWant].filter(t => !_liqSub.has(t)), unsub = [..._liqSub].filter(t => !_liqWant.has(t));
+    for (let i = 0; i < sub.length; i += 10) _liqSend({ op: 'subscribe', args: sub.slice(i, i + 10) });
+    for (let i = 0; i < unsub.length; i += 10) _liqSend({ op: 'unsubscribe', args: unsub.slice(i, i + 10) });
+    for (const t of sub) _liqSub.add(t);
+    for (const t of unsub) _liqSub.delete(t);
+  }
+  function _liqEnsureOpen() {
+    if (!_liqWant.size) return;
+    if (_liqConn && (_liqConn.readyState === WebSocket.CONNECTING || _liqConn.readyState === WebSocket.OPEN)) return;
+    if (_liqRetry) return;
+    let conn; try { conn = new WebSocket(LIQ_WS_URL); } catch (_) { return; }
+    _liqConn = conn;
+    conn.onopen = () => { _liqSub = new Set(); _liqResync(); clearInterval(_liqPing); _liqPing = setInterval(() => _liqSend({ op: 'ping' }), 20000); };
+    conn.onmessage = ev => {
+      let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+      if (!m || typeof m.topic !== 'string' || !m.topic.startsWith('allLiquidation.') || !Array.isArray(m.data)) return;
+      for (const d of m.data) {
+        const v = parseFloat(d.v) * parseFloat(d.p);
+        if (!d.s || !(v > 0)) continue;
+        const t = LIQ_TALLY[d.s] || (LIQ_TALLY[d.s] = { u: 0, d: 0, n: 0 });
+        // S is the liquidated position's side: Buy = a long was liquidated (down), Sell = a short was liquidated (up).
+        if (d.S === 'Buy') t.d += v; else t.u += v;
+        t.n++;
+      }
+    };
+    conn.onclose = () => {
+      if (_liqConn !== conn) return;
+      clearInterval(_liqPing); _liqPing = null; _liqConn = null; _liqSub = new Set();
+      if (_liqWant.size && !_liqRetry) _liqRetry = setTimeout(() => { _liqRetry = null; _liqEnsureOpen(); }, 5000);
+    };
+    conn.onerror = () => { try { conn.close(); } catch (_) {} };
+  }
+  // Align the subscriptions with the watch list; an empty list closes the connection.
+  function _liqWatchSymbols(syms) {
+    _liqWant = new Set((syms || []).map(s => 'allLiquidation.' + s));
+    for (const k of Object.keys(LIQ_TALLY)) if (!_liqWant.has('allLiquidation.' + k)) delete LIQ_TALLY[k];
+    if (!_liqWant.size) {
+      const c = _liqConn; _liqConn = null; clearInterval(_liqPing); _liqPing = null; _liqSub = new Set();
+      if (c) { try { c.close(); } catch (_) {} }
+      return;
+    }
+    _liqEnsureOpen(); _liqResync();
+  }
   const HOUR_CACHE = {}; // sym -> { start, ht, hc } — last-completed-hour candle, one fetch per ticker per hour
   const afCritEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '🤑' : '💸') + s; }
@@ -524,6 +580,13 @@
                     <div class="ash-hint">Trades fetched per ticker per scan — each reading uses only that sample; open positions average readings across scans only if Position Rolling Average is on.</div>
                   </div>
                   <div class="ash-hint" style="margin-top:4px" x-text="(()=>{ const last=_afOcLatestCycle(); if(!last) return 'no sample yet'; const ago=Math.round((Date.now()-last.ts)/60000)+'m ago'; const n=(last.results||[]).length; return n+' ticker'+(n!==1?'s':'')+' sampled · last: '+ago; })()"></div>
+                  <label class="tog" style="margin-top:8px">
+                    <div class="tog-t" :class="cfg.afLiqEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afLiqEnabled=!cfg.afLiqEnabled;persist();_afLiqStep().catch(()=>{});_afExtremityBuild()}"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Liquidation Surveillance</div>
+                      <div class="ash-hint">Watches a batch of tickers' liquidations each scan, adds a Liq view to the OC chart, and blends liquidation outcomes into the price-based scores at half weight.</div>
+                    </div>
+                  </label>
                 </div>
               </div>
             </div>
@@ -612,6 +675,7 @@
                   <div x-show="_afOcTotalAvgText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcTotalAvgText(open && cfg.afOcEnabled)"></div>
                   <div x-show="_afOcBatchLineText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcBatchLineText(open && cfg.afOcEnabled)"></div>
                   <div x-show="_afOcAvgValueText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcAvgValueText(open && cfg.afOcEnabled)"></div>
+                  <div x-show="_afOcLiqAvgText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcLiqAvgText(open && cfg.afOcEnabled)"></div>
                   <button type="button" @click.prevent="afOcPillsOpen=!afOcPillsOpen" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:none;color:var(--text-lo);cursor:pointer;letter-spacing:.5px;margin-top:3px"><span x-text="afOcPillsOpen?'▾':'▸'"></span> Tickers <span x-text="'('+((_afOcDisplayedCycle()?.results)||[]).length+')'"></span></button>
                   <div x-show="afOcPillsOpen">
                   <div x-html="_afOcInfoHtml(open && cfg.afOcEnabled && afOcPillsOpen)" @click="const c=$event.target.closest('[data-oc-chip]'); if(c) _afOcExpandedSym = (_afOcExpandedSym===c.dataset.ocChip) ? null : c.dataset.ocChip" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px"></div>
@@ -1310,7 +1374,7 @@
           try {
             const raw = localStorage.getItem(SAMPLE_OBS_KEY);
             const d = raw ? JSON.parse(raw) : null;
-            this._afSampleStore = { obs: Array.isArray(d?.obs) ? d.obs : [], pending: Array.isArray(d?.pending) ? d.pending : [], ...(d?.leaderKind ? { leaderKind: d.leaderKind } : {}), ...(d?.wx ? { wx: d.wx } : {}), ...(d?.req && typeof d.req === 'object' ? { req: d.req } : {}), ...(d?.gray && typeof d.gray === 'object' ? { gray: d.gray } : {}) };
+            this._afSampleStore = { obs: Array.isArray(d?.obs) ? d.obs : [], pending: Array.isArray(d?.pending) ? d.pending : [], ...(d?.leaderKind ? { leaderKind: d.leaderKind } : {}), ...(d?.wx ? { wx: d.wx } : {}), ...(d?.req && typeof d.req === 'object' ? { req: d.req } : {}), ...(d?.gray && typeof d.gray === 'object' ? { gray: d.gray } : {}), ...(d?.lgray && typeof d.lgray === 'object' ? { lgray: d.lgray } : {}) };
           } catch (_) { this._afSampleStore = { obs: [], pending: [] }; }
         },
         _afSampleSave() {
@@ -1346,6 +1410,7 @@
           let h = `<div>${n} scored sample${n === 1 ? '' : 's'}${this._afFollowing() ? ' · from leader' : ''}</div>`;
           if (this.cfg.afConcEnabled && !this._afFollowing()) { const q = Object.keys(st.req || {}).length; h += `<div>${q} mover${q === 1 ? '' : 's'} queued for re-sampling</div>`; }
           if (this.cfg.afDistEnabled && !this._afFollowing()) { const g = Object.keys(st.gray || {}).filter(k => this._afGrayHas(k)).length; h += `<div>${g} ticker${g === 1 ? '' : 's'} graylisted</div>`; }
+          if (this.cfg.afLiqEnabled) { const w = Object.keys(this._afLiqWatch || {}).length, g = Object.keys(st.lgray || {}).length; h += `<div>${w} ticker${w === 1 ? '' : 's'} on liquidation watch · ${g} quiet</div>`; }
           return h;
         },
         // Delayed pairing: one line per snapshot awaiting its outcome, with the expected kline fetch time.
@@ -1599,6 +1664,36 @@
           };
           const extreme = Object.entries(bucket.extreme).map(entryOf('extreme')).sort((a, b) => b.pnl - a.pnl);
           const lukewarm = Object.entries(bucket.lukewarm).map(entryOf('lukewarm')).sort((a, b) => b.pnl - a.pnl);
+          // Liquidation Surveillance blends into the price scores: each pole's pooled favorable share of liquidated turnover
+          // (k:'l' observations, same cutoffs, turnover-weighted so big tickers count more) is scaled by the typical size of a price pole
+          // score, then averaged with the price score with each liquidation sample counting afLiqWeight (0.5) of a price sample. Its
+          // samples also count toward the pole's n (see the sparsity rule).
+          if (this.cfg.afLiqEnabled) {
+            const lq = { extreme: {}, lukewarm: {} };
+            for (const o of st.obs) {
+              if (!o || o.k !== 'l' || !Array.isArray(o.c) || typeof o.y !== 'number' || !(o.w > 0)) continue;
+              for (const tag of o.c) {
+                const info = dialInfo(collapseCrit(tag));
+                if (!info) continue;
+                const m = tag.match(/(-?\d+)$/), mag = m ? Math.abs(parseInt(m[1], 10)) : 0, dk = info.family + '|' + info.pole;
+                const b = (cutoffs[dk] != null && mag >= cutoffs[dk]) ? 'extreme' : 'lukewarm';
+                const q = (lq[b][dk] ||= { sum: 0, ws: 0, n: 0 });
+                q.sum += dir * o.y * o.w; q.ws += o.w; q.n++;
+              }
+            }
+            const mags = [...extreme, ...lukewarm].filter(e => e.n >= minSamples && e.pnl !== 0).map(e => Math.abs(e.pnl));
+            const typical = mags.length ? mags.reduce((a, b) => a + b, 0) / mags.length : 0.25;
+            for (const [b, list] of [['extreme', extreme], ['lukewarm', lukewarm]]) {
+              for (const e of list) {
+                const q = lq[b][e.family + '|' + e.pole];
+                if (!q || !(q.ws > 0) || e.n + q.n < minSamples) continue;
+                const nP = e.n >= minSamples ? e.n : 0, wL = (this.cfg.afLiqWeight ?? 0.5) * q.n;
+                e.pnl = (nP * e.pnl + wL * (q.sum / q.ws) * typical) / (nP + wL);
+                e.n += q.n;
+              }
+              list.sort((a, b) => b.pnl - a.pnl);
+            }
+          }
           const ranks = {}, dispStats = {};
           for (const e of extreme) {
             ranks[e.key] = e.pnl;
@@ -1947,6 +2042,134 @@
 
         // Post-scan work. Runs as stage 'af-post' of the host's scan pipeline; on a host without
         // the pipeline the runScan wrap at the bottom of this plugin calls it right after the host's scan.
+        // ── Liquidation Surveillance ────────────────────────────────────────
+        // A batch (afOcBatchSize) of random tickers is watched on the liquidation feed for one scan interval. A ticker with no
+        // liquidation in that time is dropped and graylisted (afDistMins) from the watch only; one with events is scored (its criteria
+        // snapshot against that period's liquidated turnover, shorts up and longs down, as k:'l' observations) and re-snapshotted
+        // for the next period. Runs once per scan, after the scan stages. The OC chart's Liq view shows each period's turnover.
+        _afLiqHist() {
+          if (!this._afLiqHistory) {
+            try { const a = JSON.parse(localStorage.getItem(LIQ_HIST_KEY) || '[]'); this._afLiqHistory = Array.isArray(a) ? a : []; } catch (_) { this._afLiqHistory = []; }
+          }
+          return this._afLiqHistory;
+        },
+        _afLiqUniverse() {
+          const ex = new Set(this.cfg.megacapExclude || DEFAULT_MEGACAP_EXCLUDE);
+          return (this._lastAllTickers || []).filter(t => t?.symbol?.endsWith('USDT') && !ex.has(t.symbol) && parseFloat(t.lastPrice || 0) >= 0.001).map(t => t.symbol);
+        },
+        // Fresh criteria record per symbol (fund, vol/OI, order flow, hour candle) — the fields a sample-cycle record carries.
+        async _afLiqFetchRecs(syms) {
+          const out = {}, wantOc = !!this.cfg.afOcEnabled, limit = this.cfg.afOcOrderLimit;
+          for (let i = 0; i < syms.length; i += 10) {
+            await Promise.all(syms.slice(i, i + 10).map(async sym => {
+              let rec = await this._afFetchFreshTicker(sym);
+              if (!rec) return;
+              if (wantOc) {
+                try {
+                  const res = await this._qFetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=${limit}`);
+                  const trades = (await res.json())?.result?.list || [];
+                  if (trades.length >= 2) {
+                    let bc = 0, sc = 0;
+                    for (const t of trades) { if (t.side === 'Buy') bc++; else sc++; }
+                    const times = trades.map(t => parseInt(t.time, 10)).filter(n => !isNaN(n)).sort((a, b) => a - b);
+                    const span = times[times.length - 1] - times[0];
+                    rec = { ...rec, bc, sc, avgMs: times.length > 1 && span > 0 ? span / (times.length - 1) : null, n: trades.length };
+                  }
+                } catch (_) {}
+                const h = await this._afHourCandle(sym); if (h) rec = { ...rec, ht: h.ht, hc: h.hc };
+              }
+              out[sym] = rec;
+            }));
+          }
+          return out;
+        },
+        async _afLiqStep() {
+          if (this._afLiqRunning) return;
+          this._afLiqRunning = true;
+          try {
+            const c = this.cfg, watch = (this._afLiqWatch ||= {});
+            if (!c.afLiqEnabled || !c.afOcEnabled) {
+              if (Object.keys(watch).length) { for (const k of Object.keys(watch)) delete watch[k]; _liqWatchSymbols([]); }
+              return;
+            }
+            const st = (this._afSampleStore ||= { obs: [], pending: [] });
+            const now = Date.now(), gray = (st.lgray ||= {});
+            const ttl = Math.max(1, Number(c.afDistMins) || 240) * 60000;
+            for (const k of Object.keys(gray)) if (now - gray[k] > ttl) delete gray[k];
+            const cap = Math.max(1, Math.min(2500, Math.round(Number(c.afOcBatchSize) || 50)));
+            const minAge = Math.max(1, Number(c.scanMins) || 10) * 60000 * 0.6;
+            // Close the period: a ticker with liquidations is scored, a quiet one is dropped and graylisted. A ticker watched for
+            // less than most of a scan interval (an extra scan trigger) gets no verdict yet.
+            const rows = [];
+            for (const sym of Object.keys(watch)) {
+              const w = watch[sym];
+              if (now - w.since < minAge) continue;
+              const t = LIQ_TALLY[sym];
+              if (!t || !t.n) { delete watch[sym]; gray[sym] = now; continue; }
+              const tot = t.u + t.d;
+              st.obs.push({ t: now, s: sym, k: 'l', y: +((t.u - t.d) / tot).toFixed(4), r: Math.round(t.u - t.d), w: Math.round(tot), c: w.c });
+              rows.push({ sym, lu: Math.round(t.u), ld: Math.round(t.d) });
+              LIQ_TALLY[sym] = { u: 0, d: 0, n: 0 };
+            }
+            // Re-snapshot the retained tickers' criteria and fill the rest of the batch with random picks.
+            const refresh = rows.map(r => r.sym), have = new Set(Object.keys(watch));
+            const pool = this._afLiqUniverse().filter(s => !have.has(s) && !gray[s]);
+            for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+            const fresh = pool.slice(0, Math.max(0, cap - have.size));
+            const syms = [...refresh, ...fresh];
+            const recs = await this._afLiqFetchRecs(syms);
+            for (const sym of syms) {
+              const tags = recs[sym] ? this._afSampleTags({ sym, ...recs[sym] }, sym, true) : [];
+              if (!tags.length) { delete watch[sym]; delete LIQ_TALLY[sym]; continue; }
+              watch[sym] = { c: tags, since: Date.now() };
+              LIQ_TALLY[sym] = { u: 0, d: 0, n: 0 };
+            }
+            _liqWatchSymbols(Object.keys(watch));
+            const hist = this._afLiqHist();
+            hist.push({ id: ((hist[hist.length - 1]?.id || 0) % 99) + 1, ts: now, results: rows });
+            if (hist.length > 25) hist.splice(0, hist.length - 25);
+            try { localStorage.setItem(LIQ_HIST_KEY, JSON.stringify(hist)); } catch (_) {}
+            this._afSampleSaveSoon();
+            if (rows.length && this.cfg.afSampleScoringEnabled) this._afExtremityBuild();
+            this.log(`[ASH] 🔥 Liquidation watch — ${rows.length} scored, ${Object.keys(watch).length} watched, ${Object.keys(gray).length} quiet`, 'info');
+          } finally { this._afLiqRunning = false; }
+        },
+        // Sample count behind the pole bucket a tier tag lands in (Extreme or Lukewarm, by the dial's own cutoff), and the median
+        // count across that bucket type's poles. MIC/MIW read this for the sparsity rule. null when there is no scoreboard yet.
+        _afPoleData(annot) {
+          const key = collapseCrit(annot), info = dialInfo(key), board = this.afLukewarmScoreboard;
+          if (!info || !board) return null;
+          const cutoff = (this.afDialCutoffs || {})[info.family + '|' + info.pole];
+          const m = String(annot).match(/(-?\d+)$/);
+          const ext = !!BARE_DIAL_TAGS[key] || (cutoff != null && m != null && Math.abs(parseInt(m[1], 10)) >= cutoff);
+          const list = (ext ? board.extreme : board.lukewarm) || [];
+          const cnt = e => (typeof e.n === 'number' ? e.n : (e.wins || 0) + (e.losses || 0));
+          const ns = list.map(cnt).sort((a, b) => a - b);
+          if (!ns.length) return null;
+          const hit = list.find(e => e.family === info.family && e.pole === info.pole), mid = Math.floor(ns.length / 2);
+          return { n: hit ? cnt(hit) : 0, med: ns.length % 2 ? ns[mid] : (ns[mid - 1] + ns[mid]) / 2 };
+        },
+        // Sparsity of one tier tag: f = n/(n+minSamples) pulls a thinly-evidenced pole's score toward zero; ratio = n / median.
+        _afSparseOne(annot) {
+          const d = this._afPoleData(annot);
+          if (!d) return null;
+          const k = Math.max(3, this.cfg.afExtremityMinSamples || 3);
+          return { f: d.n / (d.n + k), ratio: d.med > 0 ? d.n / d.med : 1, n: d.n, med: d.med };
+        },
+        // Sparsity of a candidate's whole tag list: factor = its thinnest pole's f; block when that pole holds under afSparsePct% of
+        // its bucket type's median sample count (default 25). Not optional — there is no toggle.
+        _afSparse(annots) {
+          let factor = 1, worst = null;
+          for (const a of (annots || [])) {
+            const o = this._afSparseOne(a);
+            if (!o) continue;
+            if (o.f < factor) factor = o.f;
+            if (!worst || o.ratio < worst.ratio) worst = { ...o, tag: collapseCrit(a) };
+          }
+          const floor = Number.isFinite(+this.cfg.afSparsePct) ? +this.cfg.afSparsePct : 25;
+          return { factor, block: !!worst && worst.med > 0 && worst.ratio * 100 < floor, note: worst ? `${worst.tag} n=${worst.n} vs median ${Math.round(worst.med)}` : '' };
+        },
+
         async _afScanPost() {
           if (!this.cfg.ashfallEnabled) return;
           this._afCheckCross().catch(() => {});
@@ -1962,6 +2185,8 @@
           // every slider drag).
           this._afSampleAdopt?.();
           this._afSampleResolvePending().catch(() => {});
+          if (this._schIdle) this._schIdle('af-liq', () => { this._afLiqStep().catch(() => {}); });
+          else setTimeout(() => this._afLiqStep().catch(() => {}), 0);
           // Coalesced: MIC rebuilds right before it decides entries and cancels this one; when MIC doesn't run
           // this fires at the end of the scan instead.
           if (this._schIdle) this._schIdle('af-build', () => this._afExtremityBuild());
@@ -2254,10 +2479,10 @@
         // already the population-relative criteria, not a per-ticker ratio).
         // Chart views rotate in this order; the two header buttons are labelled with the
         // previous/next view's name and wrap around at either end.
-        _afOcViewModes() { return ['oc', 'vol', 'io', 'fund', 'lta', 'lpa']; },
+        _afOcViewModes() { const m = ['oc', 'vol', 'io', 'fund', 'lta', 'lpa']; if (this.cfg.afLiqEnabled) m.push('liq'); return m; },
         _afOcViewName(step) {
           const M = this._afOcViewModes();
-          const N = { oc: 'OC', vol: 'Vol', io: 'IO', fund: 'Fund', lta: 'LTA', lpa: 'LPA' };
+          const N = { oc: 'OC', vol: 'Vol', io: 'IO', fund: 'Fund', lta: 'LTA', lpa: 'LPA', liq: 'Liq' };
           const i = Math.max(0, M.indexOf(this._afOcViewMode || 'oc'));
           return N[M[(i + step + M.length) % M.length]];
         },
@@ -2269,6 +2494,7 @@
         _afOcModeCfg() {
           const mode = this._afOcViewMode || 'oc';
           const fmtCompact = v => { if (v==null) return 'n/a'; const a=Math.abs(v); if (a>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if (a>=1e6) return '$'+(v/1e6).toFixed(2)+'M'; if (a>=1e3) return '$'+(v/1e3).toFixed(1)+'K'; return '$'+v.toFixed(0); };
+          if (mode === 'liq') return { label: 'LIQUIDATION SAMPLE', color: '235,140,90', cap: null, signed: true, getVal: r => (r.lu || r.ld) ? (r.lu || 0) - (r.ld || 0) : null, pair: r => [r.lu || 0, -(r.ld || 0)], fmt: v => (v >= 0 ? '+' : '-') + fmtCompact(Math.abs(v)), higherIsBusier: true, avgLabel: 'Net liquidation turnover' };
           if (mode === 'vol') return { label: 'VOLUME SAMPLE', color: '96,210,255', cap: null, getVal: r => r.vol, fmt: fmtCompact, higherIsBusier: true, avgLabel: 'Avg volume' };
           if (mode === 'io')  return { label: 'OPEN INTEREST SAMPLE', color: '190,130,230', cap: null, getVal: r => r.oi, fmt: fmtCompact, higherIsBusier: true, avgLabel: 'Avg open interest' };
           // Signed modes: values straddle zero (above/below its own / the population's average), so the
@@ -2284,7 +2510,7 @@
           // Defensive: a stale/partial write (e.g. a crash mid-save) or leftover pre-redesign
           // entries in localStorage can leave a history array with malformed shapes. Filter to
           // well-formed entries only so one bad record can't corrupt the whole render.
-          const history = (this._afOcCycleHistory || []).filter(c => c && Array.isArray(c.results) && typeof c.ts === 'number' && !isNaN(c.ts)).sort((a,b)=>a.ts-b.ts);
+          const history = this._afOcHist().filter(c => c && Array.isArray(c.results) && typeof c.ts === 'number' && !isNaN(c.ts)).sort((a,b)=>a.ts-b.ts);
           if (!history.length) return '';
           const cycleW=28, dayGapW=38, H=80, padL=28, padB=16, padT=6, padR=4;
           const plotH = H - padT - padB;
@@ -2299,7 +2525,7 @@
           for (const c of history) for (const r of c.results) { const v = mc.getVal(r); if (!passesCap(v)) continue; maxVal=Math.max(maxVal,v); }
           if (maxVal<=0) maxVal=1;
           maxVal *= 1.3;
-          const allVals=history.flatMap(c=>c.results.filter(r=>r&&passesCap(mc.getVal(r))).map(r=>mc.getVal(r)));
+          const allVals=history.flatMap(c=>c.results.filter(r=>r&&passesCap(mc.getVal(r))).flatMap(r=>mc.pair?mc.pair(r):[mc.getVal(r)]));
           const avgRef=allVals.length?allVals.reduce((a,b)=>a+b,0)/allVals.length:0;
           // Plain value scale: 0 at the bottom, maxVal at the top — a higher value plots
           // taller, same convention as every other bar chart in this panel. Signed modes
@@ -2343,10 +2569,14 @@
               // above/below-average direction the va/ioa criteria themselves use.
               const busier=(mc.signed||cycleMean>0)&&(mc.higherIsBusier?v>=cycleMean:v<=cycleMean);
               const alpha=busier?.85:.35;
-              const y0=yVal(0), yv=yVal(v);
-              const h=Math.max(1,Math.abs(y0-yv));
-              const y=Math.min(y0,yv);
-              bars+=`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${CLR}${alpha})"/>`;
+              const y0=yVal(0);
+              // Liq view draws two bars per ticker: liquidated shorts up (green), liquidated longs down (red).
+              (mc.pair ? mc.pair(r) : [v]).forEach(pv=>{
+                if(!pv) return;
+                const yv=yVal(pv), h=Math.max(1,Math.abs(y0-yv)), y=Math.min(y0,yv);
+                const fill=mc.pair?(pv>0?'rgba(110,210,150,.85)':'rgba(235,105,105,.85)'):`${CLR}${alpha})`;
+                bars+=`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${fill}"/>`;
+              });
             });
             if (ci>0 && localDay(history[ci].ts)!==localDay(history[ci-1].ts)) {
               const gx=cx-dayGapW/2;
@@ -2369,8 +2599,10 @@
         // Picks the newest cycle by timestamp rather than array position — see the matching
         // comment in init() on why array-position ("last pushed") can go stale if two OC
         // fetches ever overlap.
+        // The history the chart and its cycle readouts show: the Liq view reads the liquidation watch's own periods, every other view the sample cycles.
+        _afOcHist() { return this._afOcViewMode === 'liq' ? this._afLiqHist() : (this._afOcCycleHistory || []); },
         _afOcLatestCycle() {
-          const hist = this._afOcCycleHistory || [];
+          const hist = this._afOcHist();
           return hist.reduce((a,c) => (!a || c.ts > a.ts) ? c : a, null);
         },
         // Resolves which cycle's results the chart's summary/chip list show — the pinned cycle
@@ -2378,7 +2610,7 @@
         // _liqDisplayedResults(); a pinned cycle can age out of _afOcCycleHistory (capped at 25)
         // without an explicit reset, so this falls back rather than showing a stale/empty list.
         _afOcDisplayedCycle() {
-          const hist = this._afOcCycleHistory || [];
+          const hist = this._afOcHist();
           const hi = this._afOcHighlightedCycleTs;
           if (hi != null) {
             const hit = hist.find(c => c.ts === hi);
@@ -2391,7 +2623,7 @@
           const hi = this._afOcHighlightedCycleTs;
           if (hi == null || !last) return '';
           if (hi === last.ts) return '';
-          const hist = this._afOcCycleHistory || [];
+          const hist = this._afOcHist();
           const hit = hist.find(c => c.ts === hi);
           if (!hit) return '';
           const d = new Date(hit.ts);
@@ -2580,6 +2812,15 @@
         },
         // Mode-aware counterpart for vol/io — mirrors _afOcAvgIntervalSec's role but formats
         // via _afOcModeCfg() instead of assuming seconds.
+        // Liq view: mean liquidated-short (up) and liquidated-long (down) turnover per ticker that had events in the displayed period.
+        _afOcLiqAvgText(shown) {
+          if (!shown || (this._afOcViewMode || 'oc') !== 'liq') return null;
+          const rows = (this._afOcDisplayedCycle()?.results || []).filter(r => r && (r.lu || r.ld));
+          if (!rows.length) return null;
+          const mc = this._afOcModeCfg(), n = rows.length;
+          const u = rows.reduce((s, r) => s + (r.lu || 0), 0) / n, d = rows.reduce((s, r) => s + (r.ld || 0), 0) / n;
+          return `Batch average liquidations: ↑ ${mc.fmt(u)} · ↓ ${mc.fmt(-d)} per ticker (${n})`;
+        },
         _afOcAvgValueText(shown) {
           if (!shown) return null;
           const mode = this._afOcViewMode || 'oc';
@@ -2588,6 +2829,7 @@
           const last = this._afOcDisplayedCycle();
           const withField = (last?.results || []).filter(r => r && mc.getVal(r) != null);
           if (!withField.length) return null;
+          if (mode === 'liq') return `Batch ${mc.avgLabel.toLowerCase()}: ${mc.fmt(withField.reduce((s,r) => s + mc.getVal(r), 0))}`;
           const avg = withField.reduce((s,r) => s + mc.getVal(r), 0) / withField.length;
           return `Batch ${mc.avgLabel.toLowerCase()}: ${mc.fmt(avg)}`;
         },
