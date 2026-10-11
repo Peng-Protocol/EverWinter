@@ -29,7 +29,10 @@
 (function () {
   'use strict';
 
-    const VERSION        = '2.9.0'; // Feature: Liquidation Surveillance watches the fastest-trading tickers first (shortest order interval, newest reading from any source) instead of random picks; a ticker found quiet is swapped for the next-fastest, and a new off-by-default Graylist Quiet sub-toggle also keeps it out of the watch for the Distillation graylist time. Prior: 2.8.0 — Feature: the Liq view's Total line now reads "Window net liquidations" — liquidated turnover over the whole window, net and split into shorts and longs (it was blank in that view).
+    const VERSION        = '2.11.0'; // Feature: the liquidation watch and its running tallies are saved as events arrive, so after a restart the first liquidation step scores what came in (restored tickers with no saved events are dropped, not marked quiet). Prior: 2.10.1 — Tweak: Liq chart's instability bar is now a stability bar (red 0-33, yellow 34-66, green 67-100) split bearish/bullish with the favored side striped; pills and readouts say bearish/bullish.
+
+
+
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
@@ -79,6 +82,7 @@
     afDistEnabled: true,           // Distillation — Delayed Pairing sub-toggle: graylist tickers that moved against the bot over their resolved hour
     afDistMins: 240,               // how long a graylisted ticker stays out of sampling and trading
     afDistPastMean: false,         // graylist only movers worse than the resolved batch's mean (off = any unfavourable move)
+    afDistInstab: false,           // Distillation sub-toggle: also graylist tickers 30%+ above the average liquidation instability (needs Liquidation Surveillance)
     afDistHL: true,                // measure moves by the hour's average instead of the close
     afLiqGray: false,            // Liquidation Surveillance sub-toggle: also keep tickers found quiet out of the watch for afDistMins
     afLiqEnabled: false,          // Liquidation Surveillance — watch a batch of tickers' liquidation feed and score them on its turnover
@@ -152,6 +156,20 @@
   const LIQ_HIST_KEY = '__af_liq_history';
   const LIQ_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
   const LIQ_TALLY = {};
+  const INSTAB_DRAG = 0.5; // share of a candidate's score lost at full instability (fixed, no UI)
+  // Liquidation watch and running tallies, saved as events arrive (throttled) and when the page hides, so a restart can score them.
+  const LIQ_PEND_KEY = '__af_liq_pending';
+  let _liqSaveT = null, _liqWatchRef = null;
+  function _liqPersist() {
+    if (!_liqWatchRef) return; // the first step after a restart has not restored the saved watch yet
+    try {
+      if (Object.keys(_liqWatchRef).length) localStorage.setItem(LIQ_PEND_KEY, JSON.stringify({ ts: Date.now(), watch: _liqWatchRef, tally: LIQ_TALLY }));
+      else localStorage.removeItem(LIQ_PEND_KEY);
+    } catch (_) {}
+  }
+  function _liqPersistSoon() { if (!_liqSaveT) _liqSaveT = setTimeout(() => { _liqSaveT = null; _liqPersist(); }, 3000); }
+  window.addEventListener('pagehide', _liqPersist);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') _liqPersist(); });
   let _liqConn = null, _liqPing = null, _liqRetry = null, _liqWant = new Set(), _liqSub = new Set();
   function _liqSend(obj) { try { if (_liqConn && _liqConn.readyState === WebSocket.OPEN) _liqConn.send(JSON.stringify(obj)); } catch (_) {} }
   function _liqResync() {
@@ -180,6 +198,7 @@
         if (d.S === 'Buy') t.d += v; else t.u += v;
         t.n++;
       }
+      _liqPersistSoon();
     };
     conn.onclose = () => {
       if (_liqConn !== conn) return;
@@ -494,6 +513,13 @@
                       <div class="ash-hint">Measures moves by the hour's average instead of the close.</div>
                     </div>
                   </label>
+                  <label class="tog" style="margin-top:8px">
+                    <div class="tog-t" :class="cfg.afDistInstab?'on':''" @click.prevent="if(!cfgLocked){cfg.afDistInstab=!cfg.afDistInstab;persist()}"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Instability</div>
+                      <div class="ash-hint">Graylists tickers 30%+ above average liquidation instability (needs Liquidation Surveillance).</div>
+                    </div>
+                  </label>
                   <div style="margin-top:8px">
                     <div class="lbl">Graylist <b x-text="cfg.afDistMins"></b> min</div>
                     <input type="number" min="1" max="1440" step="1" x-model.number="cfg.afDistMins" :disabled="cfgLocked" @change="cfg.afDistMins=Math.min(1440,Math.max(1,Math.round(+cfg.afDistMins||240)));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
@@ -679,6 +705,7 @@
                   <div x-ref="ocChartWrap" x-effect="tick; open; const h=_afOcHist(), k=_afOcViewMode+'|'+h.length+'|'+(h[h.length-1]?.ts||0); $nextTick(()=>{ const el=$refs.ocChartWrap; if(!el) return; if(!el.offsetParent){el._ocKey=undefined;return;} if(el._ocKey!==k){el._ocKey=k;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_afOcChartSvg(open && cfg.afOcEnabled)"></div></div>
                 </div>
                 <div style="border-top:1px solid rgba(255,255,255,.06);padding:3px 8px 4px">
+                  <div x-html="_afInstabBarHtml(open && cfg.afOcEnabled)"></div>
                   <div x-text="_afOcSummaryText(open && cfg.afOcEnabled)" style="font-family:var(--mono);font-size:8.5px;color:var(--text-lo)"></div>
                   <div x-show="_afOcTotalAvgText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcTotalAvgText(open && cfg.afOcEnabled)"></div>
                   <div x-show="_afOcBatchLineText(open && cfg.afOcEnabled)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcBatchLineText(open && cfg.afOcEnabled)"></div>
@@ -2057,6 +2084,8 @@
         // also graylists it for afDistMins); one with events is scored (its criteria
         // snapshot against that period's liquidated turnover, shorts up and longs down, as k:'l' observations) and re-snapshotted
         // for the next period. Runs once per scan, after the scan stages. The OC chart's Liq view shows each period's turnover.
+        // The watch and running tallies are saved as events arrive; the first step after a restart scores them at once (a restored ticker with
+        // no saved events is just dropped, since downtime events are unknown, not quiet).
         _afLiqHist() {
           if (!this._afLiqHistory) {
             try { const a = JSON.parse(localStorage.getItem(LIQ_HIST_KEY) || '[]'); this._afLiqHistory = Array.isArray(a) ? a : []; } catch (_) { this._afLiqHistory = []; }
@@ -2109,9 +2138,23 @@
             const c = this.cfg, watch = (this._afLiqWatch ||= {});
             if (!c.afLiqEnabled || !c.afOcEnabled) {
               if (Object.keys(watch).length) { for (const k of Object.keys(watch)) delete watch[k]; _liqWatchSymbols([]); }
+              try { localStorage.removeItem(LIQ_PEND_KEY); } catch (_) {}
               return;
             }
             const st = (this._afSampleStore ||= { obs: [], pending: [] });
+            if (!this._afLiqRestored) {
+              // First step after a restart: bring back the saved watch and tallies and score them now, whatever their age.
+              this._afLiqRestored = true; _liqWatchRef = watch;
+              try {
+                const p = JSON.parse(localStorage.getItem(LIQ_PEND_KEY) || 'null');
+                if (p && p.watch && !Object.keys(watch).length) {
+                  for (const [s, w] of Object.entries(p.watch)) if (w && Array.isArray(w.c)) watch[s] = { c: w.c, since: Number(w.since) || 0 };
+                  for (const [s, t] of Object.entries(p.tally || {})) if (watch[s] && t && t.n > 0) LIQ_TALLY[s] = { u: +t.u || 0, d: +t.d || 0, n: t.n | 0 };
+                  this._afLiqForce = new Set(Object.keys(watch));
+                }
+              } catch (_) {}
+            }
+            const forced = this._afLiqForce || new Set(); this._afLiqForce = null;
             const now = Date.now(), quiet = (st.lquiet ||= {}), gray = (st.lgray ||= {});
             const ttl = Math.max(1, Number(c.afDistMins) || 240) * 60000;
             for (const k of Object.keys(gray)) if (now - gray[k] > ttl) delete gray[k];
@@ -2123,18 +2166,24 @@
             const rows = [], skip = new Set(this._afLiqSkip || []);
             for (const sym of Object.keys(watch)) {
               const w = watch[sym];
-              if (now - w.since < minAge) continue;
+              if (!forced.has(sym) && now - w.since < minAge) continue;
               const t = LIQ_TALLY[sym];
-              if (!t || !t.n) { delete watch[sym]; quiet[sym] = 1; skip.add(sym); if (c.afLiqGray) gray[sym] = now; continue; }
+              if (!t || !t.n) { delete watch[sym]; if (!forced.has(sym)) { quiet[sym] = 1; skip.add(sym); if (c.afLiqGray) gray[sym] = now; } continue; }
               const tot = t.u + t.d;
               delete quiet[sym];
               st.obs.push({ t: now, s: sym, k: 'l', y: +((t.u - t.d) / tot).toFixed(4), r: Math.round(t.u - t.d), w: Math.round(tot), c: w.c });
-              rows.push({ sym, lu: Math.round(t.u), ld: Math.round(t.d) });
+              rows.push({ sym, lu: Math.round(t.u), ld: Math.round(t.d), ev: t.n });
               LIQ_TALLY[sym] = { u: 0, d: 0, n: 0 };
             }
+            const hist = this._afLiqHist();
+            hist.push({ id: ((hist[hist.length - 1]?.id || 0) % 99) + 1, ts: now, results: rows });
+            if (hist.length > 25) hist.splice(0, hist.length - 25);
+            try { localStorage.setItem(LIQ_HIST_KEY, JSON.stringify(hist)); } catch (_) {}
+            const ig = this._afInstabGray(rows, now);
+            for (const s of ig) delete watch[s];
             // Re-snapshot the retained tickers' criteria and fill the rest of the batch with the fastest unwatched tickers.
-            const refresh = rows.map(r => r.sym), have = new Set(Object.keys(watch));
-            const pool = this._afLiqUniverse().filter(s => !have.has(s) && !skip.has(s) && !(c.afLiqGray && gray[s]));
+            const refresh = rows.map(r => r.sym).filter(s => !ig.has(s)), have = new Set(Object.keys(watch));
+            const pool = this._afLiqUniverse().filter(s => !have.has(s) && !skip.has(s) && !gray[s]);
             for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
             const speed = this._afLiqSpeed();
             pool.sort((a, b) => { const x = speed[a] ?? Infinity, y = speed[b] ?? Infinity; return x === y ? 0 : x < y ? -1 : 1; });
@@ -2151,10 +2200,7 @@
             }
             this._afLiqSkip = noTag;
             _liqWatchSymbols(Object.keys(watch));
-            const hist = this._afLiqHist();
-            hist.push({ id: ((hist[hist.length - 1]?.id || 0) % 99) + 1, ts: now, results: rows });
-            if (hist.length > 25) hist.splice(0, hist.length - 25);
-            try { localStorage.setItem(LIQ_HIST_KEY, JSON.stringify(hist)); } catch (_) {}
+            _liqPersist();
             this._afSampleSaveSoon();
             if (rows.length && this.cfg.afSampleScoringEnabled) this._afExtremityBuild();
             this.log(`[ASH] 🔥 Liquidation watch — ${rows.length} scored, ${Object.keys(watch).length} watched, ${Object.keys(quiet).length} quiet`, 'info');
@@ -2194,6 +2240,85 @@
           }
           const floor = Number.isFinite(+this.cfg.afSparsePct) ? +this.cfg.afSparsePct : 25;
           return { factor, block: !!worst && worst.med > 0 && worst.ratio * 100 < floor, note: worst ? `${worst.tag} n=${worst.n} vs median ${Math.round(worst.med)}` : '' };
+        },
+
+        // ── Instability ─────────────────────────────────────────────────────
+        // How evenly a ticker's liquidations split between longs and shorts over the Liq window: 50/50 is peak, one-sided is zero. Pooled
+        // per ticker across the window's periods (new results stack on old until their period leaves the window) and shrunk by event
+        // count, e/(e+3), so a couple of dust fills read as little. A ticker never watched reads 0. Hidden from the scorecard: it only
+        // drags a candidate's score in MIC/MIW (_afInstabAdj).
+        _afInstabMap() {
+          const hist = this._afLiqHist(), last = hist[hist.length - 1];
+          const key = hist.length + '|' + (last?.ts || 0) + '|' + (last?.results?.length || 0);
+          if (this._afInstabCache?.key === key) return this._afInstabCache.map;
+          const acc = {};
+          for (const cyc of hist) for (const r of cyc?.results || []) {
+            if (!r || typeof r.sym !== 'string') continue;
+            const a = (acc[r.sym] ||= { u: 0, d: 0, ev: 0 });
+            a.u += r.lu || 0; a.d += r.ld || 0; a.ev += r.ev || 1;
+          }
+          const map = {};
+          for (const [sym, a] of Object.entries(acc)) {
+            const tot = a.u + a.d;
+            map[sym] = { u: a.u, d: a.d, i: tot > 0 ? (2 * Math.min(a.u, a.d) / tot) * (a.ev / (a.ev + 3)) : 0 };
+          }
+          this._afInstabCache = { key, map };
+          return map;
+        },
+        // Drags a candidate's score toward worse by INSTAB_DRAG of its size at full instability (works for negative scores too).
+        _afInstabAdj(sym, score) {
+          if (!this.cfg.afLiqEnabled || typeof score !== 'number') return score;
+          const i = this._afInstabMap()[sym]?.i || 0;
+          return i > 0 ? score - Math.abs(score) * INSTAB_DRAG * i : score;
+        },
+        // Window totals: pooled longs/shorts and the turnover-weighted mean ticker instability.
+        _afInstabTotal() {
+          let w = 0, s = 0, u = 0, d = 0;
+          for (const e of Object.values(this._afInstabMap())) { const t = e.u + e.d; w += t; s += t * e.i; u += e.u; d += e.d; }
+          return w > 0 ? { i: s / w, u, d } : null;
+        },
+        // Liq regime bar: window turnover split bearish (longs liquidated, left) / bullish (shorts liquidated, right), the side this bot
+        // favors drawn striped. Colour is the stability band (100% minus instability): red 0-33, yellow 34-66, green 67-100.
+        _afInstabBarHtml(shown) {
+          if (!shown || (this._afOcViewMode || 'oc') !== 'liq') return '';
+          const tot = this._afInstabTotal(); if (!tot) return '';
+          const bear = Math.round(tot.d / (tot.u + tot.d) * 100), bull = 100 - bear, stab = Math.round((1 - tot.i) * 100);
+          const col = stab <= 33 ? 'hsl(0,70%,55%)' : stab <= 66 ? 'hsl(48,85%,52%)' : 'hsl(135,60%,48%)';
+          const bullFav = this._afSampleDir() > 0;
+          const seg = (w, fav) => `<div style="width:${w}%;${fav ? `background:repeating-linear-gradient(135deg,${col} 0 3px,transparent 3px 6px)` : `background:${col};opacity:.9`}"></div>`;
+          return `<div title="Bearish: longs liquidated. Bullish: shorts liquidated. Stability falls as the two sides even out (red 0-33%, yellow 34-66%, green 67-100%). The striped side is the one this bot favors." style="margin-bottom:3px"><div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:8.5px;color:${col}"><span>bearish ${bear}%</span><span>stability ${stab}%</span><span>bullish ${bull}%</span></div><div style="display:flex;height:6px;border-radius:2px;overflow:hidden;background:rgba(255,255,255,.06)">${seg(bear, !bullFav)}${seg(bull, bullFav)}</div></div>`;
+        },
+        // Liq view ticker pills: outline only when the minority side holds 30% or more of the ticker's liquidations, filled otherwise.
+        _afInstabPills(results) {
+          const mc = this._afOcModeCfg(), money = v => mc.fmt(v).replace(/^\+/, '');
+          return results.map(r => {
+            const u = r.lu || 0, d = r.ld || 0, tot = u + d; if (!(tot > 0)) return '';
+            const b = Math.round(d / tot * 100), s = 100 - b, mixed = Math.min(d, u) / tot >= 0.3, longs = d > u;
+            const rgb = longs ? '255,120,110' : '110,220,160';
+            const inner = this._afOcExpandedSym === r.sym
+              ? `<span style="opacity:.65">bear ${b}% bull ${s}%</span><span style="opacity:.4;font-size:7px"> ${money(tot)}</span>`
+              : `<span style="opacity:.65">${longs ? 'bear ' + b : 'bull ' + s}%</span>`;
+            return `<span data-oc-chip="${r.sym}" title="${r.sym}: bearish ${b}% · bullish ${s}% · ${money(tot)}" style="cursor:pointer;font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid rgba(${rgb},.75);background:${mixed ? 'transparent' : `rgba(${rgb},.22)`};color:rgba(${rgb},.9);white-space:nowrap">${r.sym.replace('USDT', '')} ${inner}</span>`;
+          }).join('');
+        },
+        // Distillation sub-toggle: tickers sampled this period whose instability is 30% or more above the window average are graylisted
+        // for afDistMins on the Distillation list (sampling and trading) and the liquidation watch's own list.
+        _afInstabGray(rows, now) {
+          const c = this.cfg, st = this._afSampleStore, out = new Set();
+          if (!st || !rows.length || !c.afLiqEnabled || !c.afDistEnabled || !c.afDistInstab || !c.afSampleScoringEnabled || !c.afSampleDelayed || this._afFollowing()) return out;
+          const map = this._afInstabMap(), vals = Object.values(map).map(e => e.i);
+          const avg = vals.reduce((a, b) => a + b, 0) / (vals.length || 1);
+          if (!(avg > 0)) return out;
+          const gray = (st.gray ||= {}), lgray = (st.lgray ||= {}), ttl = Math.max(1, Number(c.afDistMins) || 240) * 60000;
+          for (const k of Object.keys(gray)) if (now - gray[k] > ttl) delete gray[k];
+          for (const r of rows) {
+            if ((map[r.sym]?.i || 0) < avg * 1.3 || lgray[r.sym]) continue;
+            if (!gray[r.sym]) gray[r.sym] = now;
+            lgray[r.sym] = now; out.add(r.sym);
+            if (st.req) delete st.req[r.sym];
+          }
+          if (out.size) this.log(`[ASH] 🌫 Instability graylist — ${[...out].slice(0, 5).map(s => s.replace('USDT', '')).join(', ')}${out.size > 5 ? ` +${out.size - 5}` : ''} 30%+ above the ${(avg * 100).toFixed(0)}% average, out for ${Math.round(ttl / 60000)} min`, 'info');
+          return out;
         },
 
         async _afScanPost() {
@@ -2845,7 +2970,7 @@
           if (!rows.length) return null;
           const mc = this._afOcModeCfg(), n = rows.length;
           const u = rows.reduce((s, r) => s + (r.lu || 0), 0) / n, d = rows.reduce((s, r) => s + (r.ld || 0), 0) / n;
-          return `Batch average liquidations: ↑ ${mc.fmt(u)} · ↓ ${mc.fmt(-d)} per ticker (${n})`;
+          return `Batch average: ↑ ${mc.fmt(u)} · ↓ ${mc.fmt(-d)} per ticker (${n})`;
         },
         _afOcAvgValueText(shown) {
           if (!shown) return null;
@@ -2855,7 +2980,7 @@
           const last = this._afOcDisplayedCycle();
           const withField = (last?.results || []).filter(r => r && mc.getVal(r) != null);
           if (!withField.length) return null;
-          if (mode === 'liq') return `Batch ${mc.avgLabel.toLowerCase()}: ${mc.fmt(withField.reduce((s,r) => s + mc.getVal(r), 0))}`;
+          if (mode === 'liq') return `Batch net: ${mc.fmt(withField.reduce((s,r) => s + mc.getVal(r), 0))}`;
           const avg = withField.reduce((s,r) => s + mc.getVal(r), 0) / withField.length;
           return `Batch ${mc.avgLabel.toLowerCase()}: ${mc.fmt(avg)}`;
         },
@@ -2899,7 +3024,7 @@
             for (const c of this._afLiqHist()) for (const r of c?.results || []) if (r) { u += r.lu || 0; d += r.ld || 0; }
             if (!u && !d) return null;
             const mc = this._afOcModeCfg();
-            return `Window net liquidations: ${mc.fmt(u - d)} · ↑ shorts ${mc.fmt(u)} · ↓ longs ${mc.fmt(-d)}`;
+            return `Window net: ${mc.fmt(u - d)} · ↑ ${mc.fmt(u)} · ↓ ${mc.fmt(-d)}`;
           }
           if (mode === 'oc') return this._afOcLineText(this._afOcWindowSkew(), this._afOcWindowAvgMs?.(), 'Total', '');
           const mc = this._afOcModeCfg();
@@ -2913,6 +3038,7 @@
           const last = this._afOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
+          if (mode === 'liq') return this._afInstabPills(results);
           if (mode !== 'oc') {
             const mc = this._afOcModeCfg();
             const withField = results.filter(r => mc.getVal(r) != null);
