@@ -29,7 +29,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '2.11.0'; // Feature: the liquidation watch and its running tallies are saved as events arrive, so after a restart the first liquidation step scores what came in (restored tickers with no saved events are dropped, not marked quiet). Prior: 2.10.1 — Tweak: Liq chart's instability bar is now a stability bar (red 0-33, yellow 34-66, green 67-100) split bearish/bullish with the favored side striped; pills and readouts say bearish/bullish.
+    const VERSION        = '2.12.0'; // Feature: Liquidation Surveillance orders its watch by a blend of OCX speed, LPA raw 1h price move size and LTA raw 1h turnover, each weighted by its scorecard score (mean of its two poles, negative inverts, equal weights with no samples); a ticker missing a reading ranks below real ones on it. Prior: 2.11.0 — Feature: the liquidation watch and its running tallies are saved as events arrive, so after a restart the first liquidation step scores what came in (restored tickers with no saved events are dropped, not marked quiet).
 
 
 
@@ -2078,8 +2078,9 @@
         // Post-scan work. Runs as stage 'af-post' of the host's scan pipeline; on a host without
         // the pipeline the runScan wrap at the bottom of this plugin calls it right after the host's scan.
         // ── Liquidation Surveillance ────────────────────────────────────────
-        // A batch (afOcBatchSize) of tickers is watched on the liquidation feed for one scan interval, fastest-trading first (shortest
-        // average order interval from the newest reading anywhere; tickers with none rank last, in random order). A ticker with no
+        // A batch (afOcBatchSize) of tickers is watched on the liquidation feed for one scan interval, highest-ranked first (a blend of three percentile
+        // ranks over the newest reading anywhere: OCX speed, LPA raw 1h price move size, LTA raw 1h turnover; each weighted by its
+        // scorecard score, so a negative score inverts that criterion; a ticker lacking a reading ranks below every real one on it). A ticker with no
         // liquidation in that time is dropped, counted quiet until a later watch sees one, and swapped for the next-fastest (afLiqGray
         // also graylists it for afDistMins); one with events is scored (its criteria
         // snapshot against that period's liquidated turnover, shorts up and longs down, as k:'l' observations) and re-snapshotted
@@ -2130,6 +2131,50 @@
           }
           for (const [sym, v] of Object.entries(this._afLiqSpeedSeen || {})) if (!(ts[sym] > v.ts)) out[sym] = v.ms;
           return out;
+        },
+        // Raw 1h reading per symbol (price change % and turnover), newest from the OC history or the watch's own fetches.
+        _afLiqHour() {
+          const out = {}, ts = {};
+          for (const cyc of this._afOcCycleHistory || []) for (const r of cyc?.results || []) {
+            if (r && typeof r.sym === 'string' && typeof r.hc === 'number' && typeof r.ht === 'number' && !(ts[r.sym] > cyc.ts)) { out[r.sym] = { hc: r.hc, ht: r.ht }; ts[r.sym] = cyc.ts; }
+          }
+          for (const [sym, v] of Object.entries(this._afLiqHourSeen || {})) if (!(ts[sym] > v.ts)) out[sym] = { hc: v.hc, ht: v.ht };
+          return out;
+        },
+        // Weight per ranking criterion: the mean of its two poles' scorecard scores on the favored side (signed). A criterion
+        // with no scored pole weighs 0; with none scored at all, all three weigh the same.
+        _afLiqWeights() {
+          const board = this.afLukewarmScoreboard || { extreme: [], lukewarm: [] };
+          const by = {}; for (const e of board[this._afLukewarmFavoredSide()] || []) by[e.key] = e.pnl;
+          const w = {}; let any = false;
+          for (const f of ['ocx', 'lpa', 'lta']) {
+            const v = [by[f + '+'], by[f + '-']].filter(x => typeof x === 'number' && !isNaN(x));
+            w[f] = v.length ? v.reduce((a, b) => a + b, 0) / v.length : 0;
+            if (v.length) any = true;
+          }
+          return any && Object.values(w).some(x => x !== 0) ? w : { ocx: 1, lpa: 1, lta: 1 };
+        },
+        // Orders symbols best first by the weighted blend of percentile ranks (0..1 per criterion, higher = faster / bigger move /
+        // bigger turnover); a missing reading counts -1 against its weight's size.
+        _afLiqOrder(syms) {
+          const speed = this._afLiqSpeed(), hour = this._afLiqHour(), w = this._afLiqWeights();
+          const val = {
+            ocx: s => (typeof speed[s] === 'number' ? -speed[s] : null),
+            lpa: s => (hour[s] ? Math.abs(hour[s].hc) : null),
+            lta: s => (hour[s] ? hour[s].ht : null),
+          };
+          const pct = {};
+          for (const f of ['ocx', 'lpa', 'lta']) {
+            const have = syms.filter(s => val[f](s) != null).sort((a, b) => val[f](a) - val[f](b));
+            pct[f] = {}; have.forEach((s, i) => { pct[f][s] = have.length > 1 ? i / (have.length - 1) : 1; });
+          }
+          const tot = Object.values(w).reduce((a, b) => a + Math.abs(b), 0) || 1, score = {};
+          for (const s of syms) {
+            let x = 0;
+            for (const f of ['ocx', 'lpa', 'lta']) x += pct[f][s] != null ? w[f] * pct[f][s] : -Math.abs(w[f]);
+            score[s] = x / tot;
+          }
+          return syms.slice().sort((a, b) => score[b] - score[a]);
         },
         async _afLiqStep() {
           if (this._afLiqRunning) return;
@@ -2185,14 +2230,13 @@
             const refresh = rows.map(r => r.sym).filter(s => !ig.has(s)), have = new Set(Object.keys(watch));
             const pool = this._afLiqUniverse().filter(s => !have.has(s) && !skip.has(s) && !gray[s]);
             for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
-            const speed = this._afLiqSpeed();
-            pool.sort((a, b) => { const x = speed[a] ?? Infinity, y = speed[b] ?? Infinity; return x === y ? 0 : x < y ? -1 : 1; });
-            const fresh = pool.slice(0, Math.max(0, cap - have.size));
+            const fresh = this._afLiqOrder(pool).slice(0, Math.max(0, cap - have.size));
             const syms = [...refresh, ...fresh];
             const recs = await this._afLiqFetchRecs(syms);
-            const noTag = new Set(), seen = (this._afLiqSpeedSeen ||= {});
+            const noTag = new Set(), seen = (this._afLiqSpeedSeen ||= {}), seenHr = (this._afLiqHourSeen ||= {});
             for (const sym of syms) {
               if (typeof recs[sym]?.avgMs === 'number' && recs[sym].avgMs > 0) seen[sym] = { ms: recs[sym].avgMs, ts: Date.now() };
+              if (typeof recs[sym]?.hc === 'number' && typeof recs[sym]?.ht === 'number') seenHr[sym] = { hc: recs[sym].hc, ht: recs[sym].ht, ts: Date.now() };
               const tags = recs[sym] ? this._afSampleTags({ sym, ...recs[sym] }, sym, true) : [];
               if (!tags.length) { delete watch[sym]; delete LIQ_TALLY[sym]; noTag.add(sym); continue; }
               watch[sym] = { c: tags, since: Date.now() };
