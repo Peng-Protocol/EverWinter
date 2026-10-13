@@ -29,7 +29,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '2.15.0'; // Feature: Liquidation Surveillance gets a Silence Penalty toggle — every null liquidation event (a watched ticker that saw none) pulls the poles its criteria sat in toward zero, in proportion to how strongly it expressed them; and the LPA dial is hidden on the Sample Scorer, which never scores it. Prior: 2.14.1 — Fix: the sparsity rule no longer blocks every entry on LPA — a family the scorecard does not score (LPA, now that Sample Scoring pairs against the last hour's move) is skipped instead of read as an empty pole. Prior: 2.14.0 — Removal: Delayed Pairing, Concentration and Distillation are gone — Sample Scoring always pairs criteria with the last completed hour's move; the Instability graylist stays as its own toggle; stored forward samples are dropped on load.
+    const VERSION        = '2.15.5'; // Change: the headline silence drag and the Liq bar's silence ratio are counted over the last 25 watch periods (the bar's own window) instead of the whole sample store; the per-pole silence cut still reads the whole store. Prior: 2.15.4 — Fix: the Liq bar's saturation is 100% minus the silence ratio (91% silence = 9% saturation) instead of scaling each band's own saturation down. Prior: 2.15.3 — Change: silence is counted against a 50-ticker batch (afSilenceBatch, no UI), not the 250-ticker Watch Size — per period, liquidated tickers fill the 50 first (capped at 50) and silent ones only the room left; the cap is re-applied on read so older records follow it. Prior: 2.15.2 — Feature: the Liq view's bullish/bearish bar shows the silence ratio — bars and labels desaturate toward gray as silence rises (fully gray at 100%), with a Silence # readout under the bar. Prior: 2.15.1 — Feature: Silence Penalty now also drags the Sample Scorer headline — silent tickers count as zero-liquidation turnover of average size (liquidated-ticker count over liquidated + silent, silent capped per period at Watch Size minus liquidated tickers, so a period with Watch Size or more liquidated tickers counts none), scaling the weather share/mean toward zero; the peak/bottom record stays on the raw values. Prior: 2.15.0 — Feature: Liquidation Surveillance gets a Silence Penalty toggle — every null liquidation event (a watched ticker that saw none) pulls the poles its criteria sat in toward zero, in proportion to how strongly it expressed them; and the LPA dial is hidden on the Sample Scorer, which never scores it. Prior: 2.14.1 — Fix: the sparsity rule no longer blocks every entry on LPA — a family the scorecard does not score (LPA, now that Sample Scoring pairs against the last hour's move) is skipped instead of read as an empty pole. Prior: 2.14.0 — Removal: Delayed Pairing, Concentration and Distillation are gone — Sample Scoring always pairs criteria with the last completed hour's move; the Instability graylist stays as its own toggle; stored forward samples are dropped on load.
 
 
 
@@ -76,6 +76,7 @@
     afDistInstab: false,           // Instability graylist: graylist tickers 30%+ above the average liquidation instability (needs Liquidation Surveillance)
     afLiqGray: false,            // Liquidation Surveillance sub-toggle: also keep tickers found quiet out of the watch for afDistMins
     afSilencePenalty: false,        // Liquidation Surveillance sub-toggle: a watched ticker that saw no liquidation drags the poles it was expressing toward zero
+    afSilenceBatch: 50,            // tickers per period the silence effects count (liquidated first, silent fill the rest) — separate from the Watch Size
     afSilenceWeight: 0.5,           // largest share of a pole's score its silent share can remove (no UI)
     afLiqEnabled: false,          // Liquidation Surveillance — watch a batch of tickers' liquidation feed and score them on its turnover
     afLiqBatchSize: 250,         // Liquidation Surveillance — tickers watched per scan (no longer the OC Batch Size)
@@ -1484,6 +1485,7 @@
           };
           const extreme = Object.entries(bucket.extreme).map(entryOf('extreme')).sort((a, b) => b.pnl - a.pnl);
           const lukewarm = Object.entries(bucket.lukewarm).map(entryOf('lukewarm')).sort((a, b) => b.pnl - a.pnl);
+          let wxDrag = 1; // headline silence drag, 1 = none (set below)
           // Liquidation Surveillance blends into the price scores: each pole's pooled favorable share of liquidated turnover
           // (k:'l' observations, same cutoffs, turnover-weighted so big tickers count more) is scaled by the typical size of a price pole
           // score, then averaged with the price score with each liquidation sample counting afLiqWeight (0.5) of a price sample. Its
@@ -1492,10 +1494,15 @@
             const lq = { extreme: {}, lukewarm: {} };
             // Silence Penalty: null liquidation events (k:'q') only ever act on the liquidation component of a pole, never its price score.
             const silOn = !!this.cfg.afSilencePenalty, sil = { extreme: {}, lukewarm: {} }, lex = { extreme: {}, lukewarm: {} };
+            let liqN = 0, silN = 0;
+            // Per-period batch of afSilenceBatch (50): liquidated tickers count first (capped at the batch), silent ones only the room left.
+            const silCap = Math.max(1, Math.round(Number(this.cfg.afSilenceBatch) || 50)), lc = new Map();
+            for (const o of st.obs) if (o && o.k === 'l' && Array.isArray(o.c) && typeof o.y === 'number' && o.w > 0) lc.set(o.t, (lc.get(o.t) || 0) + 1);
+            const win = new Set((this._afLiqHist() || []).map(h => h.ts)); // the Liq bar's window: the last 25 watch periods (headline drag only)
             const refOf = dk => Math.max(1, cutoffs[dk] ?? ((pool[dk] && pool[dk].length) ? pool[dk].reduce((a, b) => a + b, 0) / pool[dk].length : 1));
             const expr = (tag) => { const info = dialInfo(collapseCrit(tag)); if (!info) return null; const m = tag.match(/(-?\d+)$/), mag = m ? Math.abs(parseInt(m[1], 10)) : 0, dk = info.family + '|' + info.pole; return { dk, b: (cutoffs[dk] != null && mag >= cutoffs[dk]) ? 'extreme' : 'lukewarm', x: Math.min(3, mag / refOf(dk)) }; };
             for (const o of st.obs) {
-              if (silOn && o && o.k === 'q' && o.a && typeof o.a === 'object') { for (const [tag, cnt] of Object.entries(o.a)) { const e = expr(tag); if (e) sil[e.b][e.dk] = (sil[e.b][e.dk] || 0) + (Number(cnt) || 0) * e.x; } continue; }
+              if (silOn && o && o.k === 'q' && o.a && typeof o.a === 'object') { const qn = Number(o.n) > 0 ? Number(o.n) : Math.max(0, ...Object.values(o.a).map(Number).filter(Number.isFinite)), qf = qn > 0 ? Math.min(1, Math.max(0, silCap - Math.min(lc.get(o.t) || 0, silCap)) / qn) : 0; if (win.has(o.t)) silN += qn * qf; for (const [tag, cnt] of Object.entries(o.a)) { const e = expr(tag); if (e) sil[e.b][e.dk] = (sil[e.b][e.dk] || 0) + (Number(cnt) || 0) * e.x * qf; } continue; }
               if (!o || o.k !== 'l' || !Array.isArray(o.c) || typeof o.y !== 'number' || !(o.w > 0)) continue;
               for (const tag of o.c) {
                 const info = dialInfo(collapseCrit(tag));
@@ -1507,6 +1514,10 @@
                 if (silOn) lex[b][dk] = (lex[b][dk] || 0) + Math.min(3, mag / refOf(dk));
               }
             }
+            // Headline drag: a silent ticker is a zero-liquidation reading carrying the average liquidated turnover, so the liquidated share of
+            // (liquidated + silent) turnover reduces to the ticker-count ratio, counted over the last 25 watch periods (the Liq bar's window).
+            for (const [t, n] of lc) if (win.has(t)) liqN += Math.min(n, silCap);
+            if (silOn && silN > 0) wxDrag = liqN / (liqN + silN);
             const mags = [...extreme, ...lukewarm].filter(e => e.n >= minSamples && e.pnl !== 0).map(e => Math.abs(e.pnl));
             const typical = mags.length ? mags.reduce((a, b) => a + b, 0) / mags.length : 0.25;
             for (const [b, list] of [['extreme', extreme], ['lukewarm', lukewarm]]) {
@@ -1535,7 +1546,8 @@
           this.afLukewarmScoreboard = { extreme, lukewarm };
           const mean = t => (t.n ? t.sum / t.n : null);
           const share = t => (t.p + t.q > 0 ? (t.p - t.q) / (t.p + t.q) : null); // signed favorable share of raw move, -1..+1
-          this.afSampleBucketMeans = { extreme: mean(tot.extreme), lukewarm: mean(tot.lukewarm), nE: tot.extreme.n, nL: tot.lukewarm.n, aE: mean(totA.extreme), aL: mean(totA.lukewarm), nAE: totA.extreme.n, nAL: totA.lukewarm.n, sE: share(totA.extreme), sL: share(totA.lukewarm) };
+          const dg = v => (v == null ? null : v * wxDrag); // silence drag scales the weather headline only; bucket means (favored side) stay raw
+          this.afSampleBucketMeans = { extreme: mean(tot.extreme), lukewarm: mean(tot.lukewarm), nE: tot.extreme.n, nL: tot.lukewarm.n, aE: dg(mean(totA.extreme)), aL: dg(mean(totA.lukewarm)), aE0: mean(totA.extreme), aL0: mean(totA.lukewarm), nAE: totA.extreme.n, nAL: totA.lukewarm.n, sE: dg(share(totA.extreme)), sL: dg(share(totA.lukewarm)), sE0: share(totA.extreme), sL0: share(totA.lukewarm), wxDrag };
           this._afSampleTrackWx();
         },
         // Peak / bottom of the weather value (favored bucket's mean raw move in the bot's favor, stored in pp of price
@@ -1546,13 +1558,13 @@
           const m = this.afSampleBucketMeans, st = this._afSampleStore;
           if (!m || !st) return;
           const lw = this._afLukewarmFavoredSide() === 'lukewarm';
-          const a = lw ? m.aL : m.aE, n = lw ? m.nAL : m.nAE;
+          const a = lw ? (m.aL0 ?? m.aL) : (m.aE0 ?? m.aE), n = lw ? m.nAL : m.nAE;
           if (a == null || n < Math.max(10, this.cfg.afExtremityMinSamples || 3)) return;
           const w = st.wx || (st.wx = { hi: null, lo: null, hiT: 0, loT: 0, sHi: null, sLo: null });
           const now = Date.now();
           if (w.hi == null || a > w.hi) { w.hi = a; w.hiT = now; }
           if (w.lo == null || a < w.lo) { w.lo = a; w.loT = now; }
-          const sv = lw ? m.sL : m.sE;
+          const sv = lw ? (m.sL0 ?? m.sL) : (m.sE0 ?? m.sE);
           if (sv != null) { if (w.sHi == null || sv > w.sHi) w.sHi = sv; if (w.sLo == null || sv < w.sLo) w.sLo = sv; }
         },
         // Market weather (Sample Scorer headline): the favored bucket's mean ABSOLUTE edge — the raw 1hr move in this
@@ -1574,7 +1586,7 @@
           const min = Math.max(3, this.cfg.afExtremityMinSamples || 3);
           const w = this._afSampleStore?.wx;
           const ok = a != null && n >= min, sv = lw ? m.sL : m.sE;
-          return { s: (ok && sv != null) ? sv : null, share: (ok && sv != null) ? (1 + sv) / 2 : null, sHi: w?.sHi ?? null, sLo: w?.sLo ?? null, value: ok ? notional * a / 100 : null, cap, tpRoi, n, rel: m[side], hi: w?.hi != null ? notional * w.hi / 100 : null, lo: w?.lo != null ? notional * w.lo / 100 : null, hiT: w?.hiT || 0, loT: w?.loT || 0 };
+          return { drag: m.wxDrag ?? 1, s: (ok && sv != null) ? sv : null, share: (ok && sv != null) ? (1 + sv) / 2 : null, sHi: w?.sHi ?? null, sLo: w?.sLo ?? null, value: ok ? notional * a / 100 : null, cap, tpRoi, n, rel: m[side], hi: w?.hi != null ? notional * w.hi / 100 : null, lo: w?.lo != null ? notional * w.lo / 100 : null, hiT: w?.hiT || 0, loT: w?.loT || 0 };
         },
         // Threshold a criterion's rank must fall to for Slot Blocking: dollars of base margin for the
         // reactive scorer, percentage points of edge for Sample Scoring. MIC/MIW read this too.
@@ -1718,7 +1730,7 @@
           const headVal = wx ? wx.value : (entries.length ? total : null);
           const headColor = headVal == null ? 'var(--text-lo)' : headVal > 0 ? GREEN : headVal < 0 ? 'var(--short)' : 'var(--text-lo)';
           const headTxt = headVal == null ? '—' : (wx ? (wx.share != null ? (wx.share * 100).toFixed(1) + '%' : '—') : fmt(headVal));
-          const headTip = wx ? `Share of this side's raw 1hr move that went in the bot's favor (50% = even; gauge scaled to the best share recorded)${wx.value != null ? ' · mean ' + fmtUsd(wx.value) + ' on one base position' : ''}. n=${wx.n}${wx.rel != null ? ' · relative edge ' + fmt(wx.rel) : ''}${wx.value == null ? ' · waiting for samples with a raw move' : ''}` : '';
+          const headTip = wx ? `Share of this side's raw 1hr move that went in the bot's favor (50% = even; gauge scaled to the best share recorded)${wx.value != null ? ' · mean ' + fmtUsd(wx.value) + ' on one base position' : ''}. n=${wx.n}${wx.rel != null ? ' · relative edge ' + fmt(wx.rel) : ''}${wx.value == null ? ' · waiting for samples with a raw move' : ''}${wx.drag < 1 ? ' · silence drag ×' + wx.drag.toFixed(2) : ''}` : '';
           let gauge = '';
           if (wx) {
             const sc = Math.max(wx.sHi || 0, -(wx.sLo || 0)) || 1, P = v => (((1 + v) / 2) * 100).toFixed(0) + '%';
@@ -2001,12 +2013,12 @@
             // Close the period: a ticker with liquidations is scored, a quiet one is dropped and marked quiet. A ticker watched for
             // less than most of a scan interval (an extra scan trigger) gets no verdict yet.
             // Skip list for this refill: tickers just found quiet, plus last period's ones that came back with no tags.
-            const rows = [], sil = {}, skip = new Set(this._afLiqSkip || []);
+            let silN = 0; const rows = [], sil = {}, skip = new Set(this._afLiqSkip || []);
             for (const sym of Object.keys(watch)) {
               const w = watch[sym];
               if (!forced.has(sym) && now - w.since < minAge) continue;
               const t = LIQ_TALLY[sym];
-              if (!t || !t.n) { delete watch[sym]; if (!forced.has(sym)) { quiet[sym] = 1; skip.add(sym); if (c.afLiqGray) gray[sym] = now; if (c.afSilencePenalty && Array.isArray(w.c)) for (const tag of w.c) sil[tag] = (sil[tag] || 0) + 1; } continue; }
+              if (!t || !t.n) { delete watch[sym]; if (!forced.has(sym)) { quiet[sym] = 1; skip.add(sym); if (c.afLiqGray) gray[sym] = now; if (c.afSilencePenalty && Array.isArray(w.c)) { silN++; for (const tag of w.c) sil[tag] = (sil[tag] || 0) + 1; } } continue; }
               const tot = t.u + t.d;
               delete quiet[sym];
               st.obs.push({ t: now, s: sym, k: 'l', y: +((t.u - t.d) / tot).toFixed(4), r: Math.round(t.u - t.d), w: Math.round(tot), c: w.c });
@@ -2014,7 +2026,10 @@
               LIQ_TALLY[sym] = { u: 0, d: 0, n: 0 };
             }
             // Null liquidation events of this period, one compact record: criteria tag -> how many silent tickers were expressing it.
-            if (Object.keys(sil).length) st.obs.push({ t: now, k: 'q', a: sil });
+            // Silent tickers only count into the free room of a afSilenceBatch (50) batch: liquidated tickers take it first, silent ones fill what is left (none once liquidated ones fill it).
+            const silCap = Math.max(1, Math.round(Number(c.afSilenceBatch) || 50)), silF = silN > 0 ? Math.min(1, Math.max(0, silCap - rows.length) / silN) : 0;
+            for (const k of Object.keys(sil)) { if (silF > 0) sil[k] *= silF; else delete sil[k]; }
+            if (Object.keys(sil).length) st.obs.push({ t: now, k: 'q', a: sil, n: +(silN * silF).toFixed(3) });
             const hist = this._afLiqHist();
             hist.push({ id: ((hist[hist.length - 1]?.id || 0) % 99) + 1, ts: now, results: rows });
             if (hist.length > 25) hist.splice(0, hist.length - 25);
@@ -2122,12 +2137,20 @@
         // favors drawn striped. Colour is the stability band (100% minus instability): red 0-33, yellow 34-66, green 67-100.
         _afInstabBarHtml(shown) {
           if (!shown || (this._afOcViewMode || 'oc') !== 'liq') return '';
-          const tot = this._afInstabTotal(); if (!tot) return '';
+          // Silence ratio = the headline drag's silent share (1 - drag): scales the bar's saturation down to full gray, read out under the bar.
+          const sm = this.afSampleBucketMeans, silOn = !!(this.cfg.afSilencePenalty && this.cfg.afLiqEnabled && sm && sm.wxDrag != null);
+          const sil = silOn ? Math.max(0, Math.min(1, 1 - sm.wxDrag)) : 0, hsl = (h, s, l) => `hsl(${h},${((1 - sil) * 100).toFixed(0)}%,${l}%)`; // saturation = 100% minus silence (91% silence = 9%)
+          const silTip = silOn ? ' Silence: the share of watched liquidation turnover that came from tickers with no liquidations; bars and text gray out as it rises.' : '';
+          const tot = this._afInstabTotal();
+          if (!tot) {
+            if (!(sil > 0)) return '';
+            return `<div title="No liquidations in the window.${silTip}" style="margin-bottom:3px"><div style="height:6px;border-radius:2px;background:rgba(255,255,255,.06)"></div><div style="font-family:var(--mono);font-size:8.5px;text-align:center;color:hsl(0,0%,55%)">Silence ${Math.round(sil * 100)}%</div></div>`;
+          }
           const bear = Math.round(tot.d / (tot.u + tot.d) * 100), bull = 100 - bear, stab = Math.round((1 - tot.i) * 100);
-          const col = stab <= 33 ? 'hsl(0,70%,55%)' : stab <= 66 ? 'hsl(48,85%,52%)' : 'hsl(135,60%,48%)';
+          const col = stab <= 33 ? hsl(0, 70, 55) : stab <= 66 ? hsl(48, 85, 52) : hsl(135, 60, 48);
           const bullFav = this._afSampleDir() > 0;
           const seg = (w, fav) => `<div style="width:${w}%;${fav ? `background:repeating-linear-gradient(135deg,${col} 0 3px,transparent 3px 6px)` : `background:${col};opacity:.9`}"></div>`;
-          return `<div title="Bearish: longs liquidated. Bullish: shorts liquidated. Stability falls as the two sides even out (red 0-33%, yellow 34-66%, green 67-100%). The striped side is the one this bot favors." style="margin-bottom:3px"><div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:8.5px;color:${col}"><span>bearish ${bear}%</span><span>stability ${stab}%</span><span>bullish ${bull}%</span></div><div style="display:flex;height:6px;border-radius:2px;overflow:hidden;background:rgba(255,255,255,.06)">${seg(bear, !bullFav)}${seg(bull, bullFav)}</div></div>`;
+          return `<div title="Bearish: longs liquidated. Bullish: shorts liquidated. Stability falls as the two sides even out (red 0-33%, yellow 34-66%, green 67-100%). The striped side is the one this bot favors.${silTip}" style="margin-bottom:3px"><div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:8.5px;color:${col}"><span>bearish ${bear}%</span><span>stability ${stab}%</span><span>bullish ${bull}%</span></div><div style="display:flex;height:6px;border-radius:2px;overflow:hidden;background:rgba(255,255,255,.06)">${seg(bear, !bullFav)}${seg(bull, bullFav)}</div>${silOn ? `<div style="font-family:var(--mono);font-size:8.5px;text-align:center;color:${col}">Silence ${Math.round(sil * 100)}%</div>` : ''}</div>`;
         },
         // Liq view ticker pills: outline only when the minority side holds 30% or more of the ticker's liquidations, filled otherwise.
         _afInstabPills(results) {
