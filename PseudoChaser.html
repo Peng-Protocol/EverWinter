@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.16.2 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.19.2 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -628,7 +628,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.16.2 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.19.2 · Long Only · No Real Orders</div>
     </div>
     <!-- ── PC-ONLY OVERLAY-MENU BUTTONS (hidden on mobile; mobile keeps its own tab bar below) ── -->
     <div class="topbar-menu-btns">
@@ -1390,6 +1390,22 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
           </span>
           <div x-show="showPowerUsage" x-html="_powerUsageHtml(showPowerUsage)" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6"></div>
         </div>
+        <div style="margin-top:6px">
+          <span @click="showDataUsage=!showDataUsage" style="font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;user-select:none">
+            <span x-text="showDataUsage?'▾':'▸'"></span> Data usage
+          </span>
+          <span x-show="showDataUsage" @click="_exportDataUsage()" title="Download the full breakdown as a text file" style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;text-decoration:underline;user-select:none">⤓ Export</span>
+          <span x-show="showDataUsage" @click="_resetDataUsage()" title="Clear all Data usage counts and start over" style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--text-lo);cursor:pointer;text-decoration:underline;user-select:none">✕ Reset</span>
+          <div x-show="showDataUsage" style="margin-top:4px;padding:4px 7px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;font-family:var(--mono);font-size:9px;line-height:1.6">
+            <div x-html="_dataUsageHtml(showDataUsage)"></div>
+            <div style="display:flex;gap:10px;margin:4px 0 2px;padding-top:3px;border-top:1px solid rgba(255,255,255,.08)">
+              <template x-for="v in [['today','Today'],['week','7 days'],['month','Month']]" :key="v[0]">
+                <span @click="duView=v[0]" x-text="v[1]" :style="duView===v[0]?'cursor:pointer;color:var(--ice);border-bottom:1px solid var(--ice);user-select:none':'cursor:pointer;color:var(--text-lo);user-select:none'"></span>
+              </template>
+            </div>
+            <div x-html="_dataUsageBreakdownHtml(showDataUsage, duView)"></div>
+          </div>
+        </div>
         <button class="btn btn-ghost" style="margin-top:8px;font-size:10px;padding:5px;letter-spacing:1px"
           @click="showDangerZone=!showDangerZone"
           :style="showDangerZone?'color:var(--warn);border-color:rgba(240,192,96,.4)':''">
@@ -1580,6 +1596,187 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
        3. Alpine CDN — must come LAST so it finds pw() already defined
 ══════════════════════════════════════════════════════════ -->
 <script>
+// ─── Data usage meter ────────────────────────────────────────────────────
+// Counts payload bytes for every fetch() and WebSocket on this page (core bot + all loaded
+// plugins, since they share the page's globals), bucketed per local day in localStorage.
+// Each day stores totals plus two minimal maps — bytes per calling function (s) and bytes per
+// endpoint (e), top 25 each, one number per key — so the panel can rank sources/endpoints for
+// Today / 7 days / Month. Days older than 35 roll into monthly totals (12 months kept).
+// In-page on purpose: works on file:// where extensions / PerformanceResourceTiming can't.
+// Counts response bodies (decoded), request URL + body, and WS frames — not headers, TLS or
+// the one-off CDN script loads. Writes are batched (15s) and merged read-modify-write so a
+// duplicate tab can't clobber the totals. Everything is wrapped so a failure here can't
+// affect the bot.
+const DU_KEY = '__pc_datausage_v1';
+const _DU = (() => {
+  const pend = {};            // dayKey → {r: REST bytes in, w: WS bytes in, u: bytes out, n: REST requests, s: {caller: bytes}, e: {endpoint: bytes}}
+  let timer = null, cache = null;
+  const pair = {};            // session-only 'caller → endpoint' tally, used for the export's rates
+  let t0 = Date.now();
+  const self = { ctx: null };
+  const pad = n => String(n).padStart(2, '0');
+  const dayKey = (t) => { const d = t ? new Date(t) : new Date(); return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); };
+  const blank = () => ({ r: 0, w: 0, u: 0, n: 0 });
+  const mergeMap = (a, b) => { for (const k in b) a[k] = (a[k] || 0) + b[k]; };
+  const addTo = (a, b) => {
+    a.r += b.r || 0; a.w += b.w || 0; a.u += b.u || 0; a.n += b.n || 0;
+    if (b.s) mergeMap(a.s || (a.s = {}), b.s);
+    if (b.e) mergeMap(a.e || (a.e = {}), b.e);
+    return a;
+  };
+  const trim = (m, keep) => {
+    const ks = Object.keys(m);
+    if (ks.length <= keep) return;
+    ks.sort((x, y) => m[y] - m[x]);
+    let rest = 0;
+    for (const k of ks.slice(keep)) { rest += m[k]; delete m[k]; }
+    m['(other)'] = (m['(other)'] || 0) + rest;
+  };
+  const trimBucket = b => { if (b.s) trim(b.s, 25); if (b.e) trim(b.e, 25); };
+  const load = () => {
+    try { const s = JSON.parse(localStorage.getItem(DU_KEY) || 'null'); if (s && typeof s.days === 'object') return { days: s.days, months: s.months || {} }; } catch (e) {}
+    return { days: {}, months: {} };
+  };
+  function flush() {
+    timer = null;
+    const keys = Object.keys(pend);
+    if (!keys.length) return;
+    try {
+      const st = load();
+      for (const k of keys) { const d = st.days[k] || (st.days[k] = blank()); addTo(d, pend[k]); trimBucket(d); }
+      const cutoff = dayKey(Date.now() - 35 * 864e5);
+      for (const k of Object.keys(st.days)) {
+        if (k < cutoff) {
+          const mk = k.slice(0, 7), m = st.months[mk] || (st.months[mk] = blank());
+          addTo(m, st.days[k]); trimBucket(m); delete st.days[k];
+        }
+      }
+      const mks = Object.keys(st.months).sort();
+      while (mks.length > 12) delete st.months[mks.shift()];
+      localStorage.setItem(DU_KEY, JSON.stringify(st));
+      for (const k of keys) delete pend[k];
+      cache = st;
+    } catch (e) {}
+  }
+  function add(field, bytes, reqs, label, who) {
+    try {
+      const k = dayKey(), nb = bytes || 0;
+      const b = pend[k] || (pend[k] = { r: 0, w: 0, u: 0, n: 0, s: {}, e: {} });
+      b[field] += nb;
+      if (reqs) b.n += reqs;
+      if (label) b.e[label] = (b.e[label] || 0) + nb;
+      if (who) {
+        b.s[who] = (b.s[who] || 0) + nb;
+        const pk = (pair[who + ' → ' + (label || '?')] || Object.keys(pair).length < 300) ? who + ' → ' + (label || '?') : '(other)';
+        const e = pair[pk] || (pair[pk] = { n: 0, r: 0, u: 0 });
+        e[field === 'u' ? 'u' : 'r'] += nb; if (reqs) e.n += reqs;
+      }
+      if (!timer) timer = setTimeout(flush, 15000);
+    } catch (e) {}
+  }
+  function summary() {
+    if (!cache) cache = load();
+    const days = {};
+    for (const k of Object.keys(cache.days)) days[k] = addTo(blank(), cache.days[k]);
+    for (const k of Object.keys(pend)) addTo(days[k] || (days[k] = blank()), pend[k]);
+    const now = new Date();
+    const today = dayKey(), wk = dayKey(Date.now() - 6 * 864e5);
+    const thisM = today.slice(0, 7);
+    const lm = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastM = lm.getFullYear() + '-' + pad(lm.getMonth() + 1);
+    const out = { today: blank(), week: blank(), month: blank(), lastMonth: blank(), since: null };
+    for (const k of Object.keys(days).sort()) {
+      if (!out.since) out.since = k;
+      if (k === today) addTo(out.today, days[k]);
+      if (k >= wk) addTo(out.week, days[k]);
+      if (k.slice(0, 7) === thisM) addTo(out.month, days[k]);
+      if (k.slice(0, 7) === lastM) addTo(out.lastMonth, days[k]);
+    }
+    if (cache.months[lastM]) addTo(out.lastMonth, cache.months[lastM]);
+    if (cache.months[thisM]) addTo(out.month, cache.months[thisM]);
+    const mk = Object.keys(cache.months).sort();
+    if (mk.length && (!out.since || mk[0] + '-01' < out.since)) out.since = mk[0];
+    const lst = m => Object.keys(m || {}).map(l => ({ label: l, b: m[l] })).sort((a, b) => b.b - a.b);
+    for (const p of [out.today, out.week, out.month, out.lastMonth]) { p.srcList = lst(p.s); p.epList = lst(p.e); }
+    out.pairs = Object.keys(pair).map(l => ({ label: l, n: pair[l].n, r: pair[l].r, u: pair[l].u })).sort((a, b) => (b.r + b.u) - (a.r + a.u));
+    out.days = Object.keys(days).sort().map(k => ({ day: k, r: days[k].r, w: days[k].w, u: days[k].u, n: days[k].n }));
+    out.months = Object.keys(cache.months).sort().map(k => ({ month: k, r: cache.months[k].r, w: cache.months[k].w, u: cache.months[k].u, n: cache.months[k].n }));
+    out.upMin = Math.max(1 / 60, (Date.now() - t0) / 60000);
+    return out;
+  }
+  // Name of the function that called fetch() — first stack frame that isn't this meter, the
+  // fetch queue or Promise plumbing. _qFetch stashes it at enqueue time (the queue's own timer
+  // would otherwise hide the real caller) and _qDrain hands it back through self.ctx.
+  const SKIP_FN = /^(Error|eval|map|forEach|filter|reduce|some|every|all|allSettled|race|then|catch|finally)$/;
+  function caller() {
+    try {
+      const lines = (new Error().stack || '').split('\n');
+      for (let i = 1; i < lines.length; i++) {
+        const L = lines[i];
+        if (/_qFetch|_qDrain|_DU|caller|_epLabel|window\.fetch|_MeteredWS|new Promise|Promise\./.test(L)) continue;
+        const m = /^\s*(?:at\s+)?(?:async\s+)?(?:new\s+)?(?:[\w$<>\[\] ]+\.)?([\w$]+)(?:\s+\(|@)/.exec(L);
+        if (m && !SKIP_FN.test(m[1])) return m[1]; // anonymous code run via eval() (plugins) shows as 'eval' — keep walking to the named method
+      }
+    } catch (e) {}
+    return 'unknown';
+  }
+  try { addEventListener('pagehide', flush); addEventListener('visibilitychange', () => { if (document.hidden) flush(); }); } catch (e) {}
+  // Wipes every stored and pending count (totals, sources, endpoints, session pairs) and restarts the session clock.
+  function reset() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    for (const k of Object.keys(pend)) delete pend[k];
+    for (const k of Object.keys(pair)) delete pair[k];
+    cache = { days: {}, months: {} };
+    t0 = Date.now();
+    try { localStorage.removeItem(DU_KEY); } catch (e) {}
+  }
+  self.reset = reset; self.add = add; self.summary = summary; self.flush = flush; self.caller = caller;
+  return self;
+})();
+try {
+  const _bytesOf = d => (typeof d === 'string') ? d.length : ((d && (d.byteLength || d.size)) || 0);
+  const _epLabel = (url) => {
+    try {
+      const u = new URL(url, location.href); let p = u.pathname;
+      if (p.indexOf('/v5/market/tickers') === 0) p += u.searchParams.has('symbol') ? ' (single)' : ' (bulk)';
+      else if (p.indexOf('/v5/market/kline') === 0 && u.searchParams.get('interval')) p += ' ' + u.searchParams.get('interval') + 'm';
+      return /bybit\.com$/.test(u.hostname) ? p : u.hostname + p;
+    } catch (e) { return 'other'; }
+  };
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    let label = null, who = _DU.ctx; _DU.ctx = null;
+    if (!who) who = _DU.caller();
+    try {
+      const url = typeof input === 'string' ? input : ((input && input.url) || String(input));
+      label = _epLabel(url);
+      _DU.add('u', url.length + _bytesOf(init && init.body), 1, label, who);
+    } catch (e) {}
+    return _origFetch(input, init).then(res => {
+      try {
+        const c = res.clone();
+        if (c.body && c.body.getReader) {
+          const rd = c.body.getReader(); let n = 0;
+          (function pump() { return rd.read().then(({ done, value }) => { if (done) { _DU.add('r', n, 0, label, who); return; } n += value.byteLength; return pump(); }); })().catch(() => {});
+        } else c.arrayBuffer().then(b => _DU.add('r', b.byteLength, 0, label, who)).catch(() => {});
+      } catch (e) {}
+      return res;
+    });
+  };
+  const _OrigWS = window.WebSocket;
+  function _MeteredWS(url, protocols) {
+    const ws = protocols === undefined ? new _OrigWS(url) : new _OrigWS(url, protocols);
+    try {
+      ws.addEventListener('message', ev => { const d = ev.data; const m = typeof d === 'string' ? /^\{"topic":"([A-Za-z]+)/.exec(d.slice(0, 40)) : null; _DU.add('w', _bytesOf(d), 0, 'WS ' + (m ? m[1] : 'other'), 'WebSocket'); });
+      const _send = ws.send.bind(ws);
+      ws.send = function (d) { _DU.add('u', _bytesOf(d), 0, 'WS out', 'WebSocket'); return _send(d); };
+    } catch (e) {}
+    return ws;
+  }
+  _MeteredWS.prototype = _OrigWS.prototype;
+  ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => { _MeteredWS[k] = _OrigWS[k]; });
+  window.WebSocket = _MeteredWS;
+} catch (e) {}
 function showApp() {
   document.getElementById('pw-app').style.visibility = 'visible';
   const l = document.getElementById('pw-loading');
@@ -1889,6 +2086,8 @@ function pw() { return {
   showDangerZone: false,    // toggle for destructive action buttons in Persistence section
   showStorageBreakdown: false, // toggle for the localStorage usage-by-plugin readout
   showPowerUsage: false,    // toggle for the main-thread tick-cost readout
+  showDataUsage: false,     // toggle for the daily/weekly/monthly network payload readout
+  duView: 'today',          // period shown in the Data usage source/endpoint breakdown (today | week | month)
   _tickCostSamples: [],     // rolling window of ms spent per 1s tick (incl. reactive re-render), for Power usage
   showImportConfirm: false, // toggle for import data confirmation modal
   showExportMenu: false,    // toggle for export type selection popup
@@ -2024,8 +2223,9 @@ function pw() { return {
   _fetchActive: 0,
   _fetchTimer: null,
   _qFetch(url, options) {
+    const caller = _DU.caller(); // real caller, for the Data usage source breakdown (the queue timer hides it)
     return new Promise((resolve, reject) => {
-      this._fetchQueue.push({ url, options, resolve, reject });
+      this._fetchQueue.push({ url, options, resolve, reject, caller });
       this._qEnsureTimer();
     });
   },
@@ -2043,6 +2243,7 @@ function pw() { return {
     if (this._fetchActive >= maxConc) return;
     const job = this._fetchQueue.shift();
     this._fetchActive++;
+    _DU.ctx = job.caller;
     fetch(job.url, job.options)
       .then(r => { this._fetchActive--; job.resolve(r); })
       .catch(e => { this._fetchActive--; job.reject(e); });
@@ -2475,6 +2676,7 @@ function pw() { return {
       [LS_KEY]:                    'This Bot (PseudoChaser): core state',
       'pc_v1_log':                 'This Bot (PseudoChaser): activity log',
       '__pc_plugins_v1':           'This Bot (PseudoChaser): plugin config',
+      [DU_KEY]:                    'This Bot (PseudoChaser): data usage',
       '__ash_liq_batches':         'Ashfall (this bot\u2019s plugin): liq batches (in-progress)',
       '__ash_liq_history':         'Ashfall (this bot\u2019s plugin): liquidation samples',
       '__ash_liq_sequester':       'Ashfall (this bot\u2019s plugin): liq sequester',
@@ -2495,7 +2697,7 @@ function pw() { return {
     // gives every script here one shared quota. Skipped entirely (not even folded into
     // 'Other') so neither the row list nor this bot's own total includes them.
     const PARTNER_EXCLUSIVE_KEYS = new Set([
-      'pw_v1', 'pw_v1_log', '__pw_plugins_v1',
+      'pw_v1', 'pw_v1_log', '__pw_plugins_v1', '__pw_datausage_v1',
       '__pf_liq_batches', '__pf_liq_history', '__pf_liq_sequester', '__pf_oc_history',
       '__miw_hist_batches', '__permafrost_winter_v1', '__ew_pf_dialpool_v1',
     ]);
@@ -2630,6 +2832,78 @@ function pw() { return {
     return `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--text-lo)">Avg main-thread work / tick</span><span style="color:${clr}">${avg.toFixed(1)} ms</span></div>`
       + `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--text-lo)">Peak (last ${samples.length} ticks)</span><span style="color:${max>50?'var(--short)':'var(--ice)'}">${max.toFixed(1)} ms</span></div>`
       + `<div style="color:var(--text-lo);font-size:8.5px;margin-top:3px;line-height:1.5">Wall-clock time from each 1s tick to every reactive update it triggers finishing — mostly plugin chart/panel rebuilds. Rising values usually mean a plugin panel left open is redrawing more than it needs to.</div>`;
+  },
+
+  // Data usage readout — daily / 7-day / monthly payload totals from the _DU meter at the top of
+  // the script (fetch + WebSocket, core bot and plugins). Re-evaluates each 1s tick while open.
+  _dataUsageHtml(shown) {
+    if (!shown) return '';
+    void this.tick;
+    const s = _DU.summary();
+    const f = b => this._storageFmtBytes(Math.round(b));
+    const row = (label, b) =>
+      `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--text-lo)">${label}</span><span style="color:var(--ice)">↓ ${f(b.r + b.w)} <span style="color:var(--text-lo)">·</span> ↑ ${f(b.u)}</span></div>`
+      + `<div style="color:var(--text-lo);font-size:8.5px;text-align:right;margin-bottom:3px">REST ${f(b.r)} · WS ${f(b.w)} · ${b.n.toLocaleString()} req</div>`;
+    let h = row('Today', s.today) + row('Last 7 days', s.week) + row('This month', s.month);
+    if (s.lastMonth.r + s.lastMonth.w + s.lastMonth.u > 0) h += row('Last month', s.lastMonth);
+    return h;
+  },
+  // Top sources (calling function) and endpoints for the period picked with the Today / 7 days /
+  // Month switcher (duView). Persisted per day as one byte count per key — see the _DU meter.
+  _dataUsageBreakdownHtml(shown, view) {
+    if (!shown) return '';
+    void this.tick;
+    const s = _DU.summary();
+    const p = view === 'week' ? s.week : view === 'month' ? s.month : s.today;
+    const f = b => this._storageFmtBytes(Math.round(b));
+    const total = (p.r + p.w + p.u) || 1;
+    const sect = (title, arr) => {
+      let o = `<div style="margin-top:4px;padding-top:3px;border-top:1px solid rgba(255,255,255,.08);color:var(--text-lo)">${title}</div>`;
+      if (!arr.length) return o + `<div style="color:var(--text-lo);font-size:8.5px">no data yet for this period</div>`;
+      for (const e of arr.slice(0, 10)) {
+        o += `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:var(--text-lo);word-break:break-all">${e.label}</span><span style="color:var(--ice);white-space:nowrap">${f(e.b)} <span style="color:var(--text-lo)">${Math.round(e.b / total * 100)}%</span></span></div>`;
+      }
+      return o;
+    };
+    return sect('Top sources — calling function', p.srcList) + sect('Top endpoints', p.epList)
+      + `<div style="color:var(--text-lo);font-size:8.5px;margin-top:3px;line-height:1.5">Payload bytes only (response bodies, request URLs/bodies, WS frames) across the bot and its plugins — no headers/TLS/CDN script loads, so treat as approximate. Source/endpoint breakdown is tracked from when it was added. Days roll over at local midnight${s.since ? '; tracking since ' + s.since : ''}.</div>`;
+  },
+  // Clears all Data usage counts (stored + pending) after a confirmation — for restarting the tally on equal footing.
+  _resetDataUsage() {
+    if (!confirm('Reset all Data usage counts (daily/weekly/monthly totals, sources and endpoints)? This can\'t be undone.')) return;
+    _DU.reset();
+  },
+  // Dumps the full Data usage picture to a text file — totals, per-period source/endpoint
+  // rankings, daily history, this session's source→endpoint pairs, plus the config values that drive polling.
+  _exportDataUsage() {
+    const s = _DU.summary(), c = this.cfg || {};
+    const f = b => this._storageFmtBytes(Math.round(b)).padStart(10);
+    const tot = b => `↓ ${f(b.r + b.w)}  ↑ ${f(b.u)}  (REST ${f(b.r).trim()} · WS ${f(b.w).trim()} · ${b.n} req)`;
+    const lst = (arr, p) => arr.length ? arr.map(e => `${f(e.b)}  ${String(Math.round(e.b / ((p.r + p.w + p.u) || 1) * 100)).padStart(3)}%  ${e.label}`) : ['(none)'];
+    const per = (name, p) => ['-- ' + name + ' --', tot(p), 'Sources:', ...lst(p.srcList, p), 'Endpoints:', ...lst(p.epList, p), ''];
+    const ses = s.pairs.length ? s.pairs.map(e => `${f(e.r + e.u)}  ${String(e.n).padStart(6)} req  ${((e.r + e.u) / s.upMin / 1024).toFixed(1).padStart(8)} KB/min  ${(e.n / s.upMin).toFixed(1).padStart(6)} req/min  ${e.label}`) : ['(none)'];
+    const keys = ['restPollEnabled', 'restPollBaseSec', 'mktWatchEnabled', 'mktWatchSize', 'scanMins', 'bulkTickerCooldownHours', 'schedIntervalMs', 'schedMaxConcurrent', 'lfFollowPartner', 'pfOcEnabled', 'pfOcBatchSize', 'pfOcOrderLimit', 'pfSampleScoringEnabled', 'pfLiqEnabled', 'pfLiqBatchSize', 'afOcEnabled', 'afOcBatchSize', 'afOcOrderLimit', 'afSampleScoringEnabled', 'afLiqEnabled', 'afLiqBatchSize'];
+    const lines = [
+      `EverWinter data usage — PseudoChaser — ${new Date().toISOString()}`,
+      `Open positions: ${(this.positions || []).length}`,
+      `Config: ` + keys.map(k => `${k}=${c[k]}`).join(', '),
+      '',
+      '== BY PERIOD (persisted) ==',
+      ...per('Today', s.today), ...per('Last 7 days', s.week), ...per('This month', s.month), ...per('Last month', s.lastMonth),
+      `== THIS SESSION: SOURCE → ENDPOINT (${s.upMin.toFixed(1)} min, not persisted) ==`, ...ses,
+      '',
+      '== DAILY HISTORY ==', ...(s.days.length ? s.days.map(d => `${d.day}  ${tot(d)}`) : ['(none)']),
+      ...(s.months.length ? ['', '== MONTHLY (rolled up) ==', ...s.months.map(d => `${d.month}  ${tot(d)}`)] : []),
+    ];
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `pseudochaser-datausage-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   },
 
   // PERSISTENCE
