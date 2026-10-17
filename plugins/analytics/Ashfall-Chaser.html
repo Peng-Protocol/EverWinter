@@ -29,7 +29,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '2.20.0'; // UI: Score tab decluttered — only the Sample Scoring and Liquidation Surveillance toggles show on open; Silence Amplifier, Instability and all other settings sit behind dropdowns (open state remembered); the Extremity Scorer toggle is gone (always on with Ashfall); defaults now match the active config (Liquidation Surveillance and Silence Amplifier on) | previous: Feature: Silence Amplifier (optional toggle, sub of Sample Scoring) — a noisy ticker's (LPA distance 70% above the window average) price/liquidation outcome is boosted by 25% (headline included); non-liquidation sample batches reserve up to a % (default 100) for re-sampling tickers whose LPA noise is 70% above average (noisiest first, new completed candle only, max 4 re-fetches, then left out until fully out of the window) | previous: Feature: Instability returns — a ticker's liquidated-short and liquidated-long turnover is kept per watch and summed over the window; tickers whose instability (how mixed, 0-100%) sits 30%+ above the window average are skipped for entry (sub-toggle of Liquidation Surveillance, % editable). Liq view: pills only for tickers with liquidation events, drawn favorable = fill+outline, mixed favorable = fill, mixed unfavorable = outline, unfavorable = neither; new 'Window avg liquidation lean' readout above the batch average | previous: Feature: Liquidation Surveillance is back (toggle, off by default): the sample batch's own liquidation feed is watched over a public WS (no extra fetches), tickers with liquidations stay in the batch, quiet ones are graylisted and replaced, and each liquidated ticker is scored in pp, 50/50 with price, into the poles, the favored side and the headline; a reload keeps the watch and the next scan finalizes it | previous: Change: bandwidth cut — OCS/OCX, the recent-trade fetches and Liquidation Surveillance (with its WS feed, Silence Penalty and Instability graylist) are removed; the hour candle (LPA/LTA) is fetched with every sample batch; LPA/LTA views gain a Silence bar (spikiness vs the window average, between its historical bottom and peak); following is live — the follower adopts the leader's sample batch and scored store.
+    const VERSION        = '2.21.0'; // Feature: Period Scorer (optional sub-toggle of Sample Scoring) — every sample batch's averages (fund, volume, OI, LTA, LPA) are kept in a longer store (default 300 batches); each slice (default 6 batches) projects the next one, the projection is scored forward like price (1/3 weight, separate setting) and graded as its batches close, and it stands down below the accuracy floor (default 70%); new Period chart view with estimate-vs-actual bars and window/batch accuracy readouts. Change: the Silence bar is replaced by a text readout in the LPA view (batch and window silence; the Silence Amplifier is unchanged) | previous: UI: Score tab decluttered — only the Sample Scoring and Liquidation Surveillance toggles show on open; Silence Amplifier, Instability and all other settings sit behind dropdowns (open state remembered); the Extremity Scorer toggle is gone (always on with Ashfall); defaults now match the active config (Liquidation Surveillance and Silence Amplifier on) | previous: Feature: Silence Amplifier (optional toggle, sub of Sample Scoring) — a noisy ticker's (LPA distance 70% above the window average) price/liquidation outcome is boosted by 25% (headline included); non-liquidation sample batches reserve up to a % (default 100) for re-sampling tickers whose LPA noise is 70% above average (noisiest first, new completed candle only, max 4 re-fetches, then left out until fully out of the window) | previous: Feature: Instability returns — a ticker's liquidated-short and liquidated-long turnover is kept per watch and summed over the window; tickers whose instability (how mixed, 0-100%) sits 30%+ above the window average are skipped for entry (sub-toggle of Liquidation Surveillance, % editable). Liq view: pills only for tickers with liquidation events, drawn favorable = fill+outline, mixed favorable = fill, mixed unfavorable = outline, unfavorable = neither; new 'Window avg liquidation lean' readout above the batch average | previous: Feature: Liquidation Surveillance is back (toggle, off by default): the sample batch's own liquidation feed is watched over a public WS (no extra fetches), tickers with liquidations stay in the batch, quiet ones are graylisted and replaced, and each liquidated ticker is scored in pp, 50/50 with price, into the poles, the favored side and the headline; a reload keeps the watch and the next scan finalizes it | previous: Change: bandwidth cut — OCS/OCX, the recent-trade fetches and Liquidation Surveillance (with its WS feed, Silence Penalty and Instability graylist) are removed; the hour candle (LPA/LTA) is fetched with every sample batch; LPA/LTA views gain a Silence bar (spikiness vs the window average, between its historical bottom and peak); following is live — the follower adopts the leader's sample batch and scored store.
 
 
 
@@ -80,6 +80,11 @@
     afMixedPct: 30,                // pill presentation: a watch is 'mixed' when the minority side holds more than this % of its liquidated turnover
     afSilAmpEnabled: true,         // Silence Amplifier (optional, needs Sample Scoring): a noisy ticker's scored outcome (price or liquidation) is boosted by afSilAmpPct %, and noisy tickers are re-sampled first
     afSilAmpPct: 25,              // Silence Amplifier: boost (%) applied to a noisy ticker's outcome (noisy = afResNoisePct % above the window's average distance)
+    afPeriodEnabled: false,       // Period Scorer (optional, sub-toggle of Sample Scoring): a forward-looking third dimension — batch averages projected one slice ahead and scored like price
+    afPeriodRecords: 300,         // Period Scorer: batch averages kept (the sample window itself only keeps 25 batches)
+    afPeriodSlice: 6,             // Period Scorer: batches per slice, and how many batches ahead each forecast looks
+    afPeriodWeight: 33,           // Period Scorer: share (%) of a score/headline it carries when live (1/3 paradigm); 0 = no effect
+    afPeriodMinAcc: 70,           // Period Scorer: window accuracy (%) under which it stops contributing
     afResPct: 100,                // Re-sampling: up to this % of each (non-liquidation) sample batch is reserved for noisy tickers; 0 = no re-sampling
     afResNoisePct: 70,            // Re-sampling: a ticker is noisy when its LPA distance from the window average is this % above the window's average distance
     afResMax: 4,                  // Re-sampling: max re-fetches per ticker; at the max it is not fetched again until it has fully left the sample window
@@ -145,6 +150,8 @@
   // Non-reactive on purpose: both are read from inside x-text/x-html renders, and writing
   // reactive state from a render effect would re-trigger that same effect.
   const SPIKE_KEY = '__ew_af_spike_v1'; // Silence bar: { lpa:{lo,hi}, lta:{lo,hi} } historical bottom/peak spikiness
+  const PERIOD_KEY = '__ew_af_period_v1'; // Period Scorer: { recs:[{t,v:[fund,va,ioa,lta,lpa]}], fc, grades }
+  const PER_T = ['fund', 'va', 'ioa', 'lta', 'lpa']; // Period Scorer data types, in record order
   const SPIKE_ST = {};
   const WIN_MEMO   = {}; // field -> { key, val } — memo for _afWindowStats
   const FRESH_TICKERS = {}; // sym -> raw ticker from this scan's per-symbol fetch (in-memory only)
@@ -366,7 +373,7 @@
                   <div>
                     <div class="tog-l">Sample Scoring</div>
                     <div class="ash-hint">Scores criteria by how the sampled tickers actually moved (LPA) instead of closed-trade PnL. Same Extreme/Lukewarm buckets and veto.</div>
-                    <div class="ash-hint" x-show="cfg.afSampleScoringEnabled && !sc.sample" x-text="'Silence Amplifier '+(cfg.afSilAmpEnabled?cfg.afSilAmpPct+'%':'off')"></div>
+                    <div class="ash-hint" x-show="cfg.afSampleScoringEnabled && !sc.sample" x-text="'Silence Amplifier '+(cfg.afSilAmpEnabled?cfg.afSilAmpPct+'%':'off')+(cfg.afPeriodEnabled?' · Period '+_afPeriodShort():'')"></div>
                   </div>
                 </label>
                 <button x-show="cfg.afSampleScoringEnabled" @click="flip('sample')" style="font-family:var(--mono);font-size:9px;padding:2px 7px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:none;color:var(--text-lo);cursor:pointer" x-text="sc.sample?'▾':'▸'"></button>
@@ -388,6 +395,24 @@
                   <input type="number" min="0" max="500" step="5" x-model.number="cfg.afResNoisePct" :disabled="cfgLocked" @change="persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Max re-fetches per ticker</div>
                   <input type="number" min="0" max="50" step="1" x-model.number="cfg.afResMax" :disabled="cfgLocked" @change="persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                </div>
+                <label class="tog" style="margin-top:8px" x-data="{h:false}">
+                  <div class="tog-t" :class="cfg.afPeriodEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.afPeriodEnabled=!cfg.afPeriodEnabled;if(!cfg.afPeriodEnabled&&_afOcViewMode==='per')_afOcViewMode='vol';_afPeriodToggle()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Period Scorer <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
+                    <div class="ash-hint" x-show="h">Projects the next slice from stored batch averages and scores it forward as a third dimension. Stands down under the accuracy floor.</div>
+                    <div class="ash-hint" x-show="cfg.afPeriodEnabled" x-text="_afPeriodHint()"></div>
+                  </div>
+                </label>
+                <div style="margin-top:6px" x-show="cfg.afPeriodEnabled">
+                  <div class="lbl">Records kept (batches)</div>
+                  <input type="number" min="30" max="1000" step="10" x-model.number="cfg.afPeriodRecords" :disabled="cfgLocked" @change="_afPeriodCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Slice (batches)</div>
+                  <input type="number" min="2" max="24" step="1" x-model.number="cfg.afPeriodSlice" :disabled="cfgLocked" @change="_afPeriodCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Weight (%)</div>
+                  <input type="number" min="0" max="90" step="1" x-model.number="cfg.afPeriodWeight" :disabled="cfgLocked" @change="_afExtremityBuild();persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Min accuracy (%)</div>
+                  <input type="number" min="0" max="100" step="5" x-model.number="cfg.afPeriodMinAcc" :disabled="cfgLocked" @change="_afExtremityBuild();persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                 </div>
               </div>
 
@@ -564,17 +589,19 @@
                     <button type="button" class="ash-tab" @click.prevent="_afOcCycleView(1)" x-text="_afOcViewName(1)+' ›'"></button>
                   </div>
                 </div>
-                <div style="position:relative" @click="const g=$event.target.closest('[data-oc-cycle-ts]');if(g)_afOcHighlightedCycleTs=Number(g.dataset.ocCycleTs)">
+                <div style="position:relative" @click="const g=$event.target.closest('[data-oc-cycle-ts]');if(g)_afOcHighlightedCycleTs=Number(g.dataset.ocCycleTs);const ps=$event.target.closest('[data-per-slot]');if(ps)_afPeriodSel=ps.dataset.perSlot">
                   <div x-html="_afOcYAxisHtml||''" style="position:absolute;left:0;top:0;pointer-events:none;z-index:2"></div>
                   <div x-ref="ocChartWrap" x-effect="tick; open; const h=_afOcHist(), k=_afOcViewMode+'|'+h.length+'|'+(h[h.length-1]?.ts||0); $nextTick(()=>{ const el=$refs.ocChartWrap; if(!el) return; if(!el.offsetParent){el._ocKey=undefined;return;} if(el._ocKey!==k){el._ocKey=k;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_afOcChartSvg(open)"></div></div>
                 </div>
                 <div style="border-top:1px solid rgba(255,255,255,.06);padding:3px 8px 4px">
-                  <div x-html="_afSilenceBarHtml(open)"></div>
                   <div x-text="_afOcSummaryText(open)" style="font-family:var(--mono);font-size:8.5px;color:var(--text-lo)"></div>
                   <div x-show="_afOcTotalAvgText(open)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcTotalAvgText(open)"></div>
                   <div x-show="_afOcAvgValueText(open)!=null" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afOcAvgValueText(open)"></div>
-                  <button type="button" @click.prevent="afOcPillsOpen=!afOcPillsOpen" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:none;color:var(--text-lo);cursor:pointer;letter-spacing:.5px;margin-top:3px"><span x-text="afOcPillsOpen?'▾':'▸'"></span> Tickers <span x-text="'('+(((_afOcDisplayedCycle()?.results)||[]).filter(r=>_afOcViewMode!=='liq'||_afLiqHas(r))).length+')'"></span></button>
-                  <div x-show="afOcPillsOpen">
+                  <div x-show="_afOcViewMode==='lpa' && _afSilenceText(open)" style="font-family:var(--mono);font-size:8.5px;margin-top:1px" :style="{ color: 'rgba('+_afOcModeCfg().color+',.85)' }" x-text="_afSilenceText(open)"></div>
+                  <button type="button" x-show="_afOcViewMode==='per'" @click.prevent="afPerOpen=!afPerOpen" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:none;color:var(--text-lo);cursor:pointer;letter-spacing:.5px;margin-top:3px"><span x-text="afPerOpen?'▾':'▸'"></span> Criteria</button>
+                  <div x-show="afPerOpen && _afOcViewMode==='per'" x-html="_afPeriodBreakdownHtml(open && afPerOpen)"></div>
+                  <button type="button" x-show="_afOcViewMode!=='per'" @click.prevent="afOcPillsOpen=!afOcPillsOpen" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:none;color:var(--text-lo);cursor:pointer;letter-spacing:.5px;margin-top:3px"><span x-text="afOcPillsOpen?'▾':'▸'"></span> Tickers <span x-text="'('+(((_afOcDisplayedCycle()?.results)||[]).filter(r=>_afOcViewMode!=='liq'||_afLiqHas(r))).length+')'"></span></button>
+                  <div x-show="afOcPillsOpen && _afOcViewMode!=='per'">
                   <div x-html="_afOcInfoHtml(open && afOcPillsOpen)" @click="const c=$event.target.closest('[data-oc-chip]'); if(c) _afOcExpandedSym = (_afOcExpandedSym===c.dataset.ocChip) ? null : c.dataset.ocChip" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px"></div>
                   </div>
                 </div>
@@ -617,6 +644,8 @@
         afDialSampleCounts: {},        // {[family|pole]: n} — for the "unproven, still lukewarm by default" badge
         afSampleBucketMeans: null, // Sample Scoring: overall mean edge per bucket, decides the favored side
         _afSampleStore: { obs: [] },
+        _afPeriod: { recs: [], fc: null, grades: [] }, // Period Scorer store (see _afPeriodLoad)
+        _afPeriodSel: null, // Period chart: the clicked batch ('forecastTs|k') the summary breaks down
         afCrossEvents: [],
         // Gains Continuation (GC) — own rolling 6h closed-trade PnL log, independent of the
         // host's Gains Lock window (that one only populates when cfg.gainsLockEnabled is on;
@@ -641,6 +670,7 @@
         _afOcHighlightedCycleTs: null, // ts of a clicked cycle in the ORDER INTERVAL SAMPLE chart; null = follow latest
         _afOcViewMode: 'vol', // 'vol' | 'io' | 'fund' | 'lta' | 'lpa' — which sample the tethered chart/summary/chips display
         afOcPillsOpen: false,    // sample results chart: per-batch ticker pills shown?
+        afPerOpen: false,        // period chart: criteria table shown?
         _afOcExpandedSym: null, // OC chip tapped open to its full values (hover title covers desktop; touch has no hover)
 
         async init() {
@@ -730,6 +760,7 @@
           // for real here, before the first _afExtremityBuild() call below.
           this.afDialSamplePool = this._afLoadDialPool();
           this._afSampleLoad();
+          this._afPeriodLoad();
           this._afScoreTrim();
           this._afExtremityBuild();
           try {
@@ -1495,6 +1526,7 @@
         },
         _afSampleClear() {
           this._afSampleStore = { obs: [] };
+          this._afPeriodClear();
           LIQ.closing = null; LIQ.tally = {}; this._afLiqPersist();
           try { localStorage.removeItem(SAMPLE_OBS_KEY); } catch (_) {}
         },
@@ -1789,6 +1821,9 @@
           }
           // A pole is the 50/50 mean of its price edge and its liquidation edge when both have enough samples; whichever has
           // enough stands alone; with neither on its own, the pooled mean once the two together reach the minimum.
+          // Period Scorer (live only while its window accuracy clears the floor): its forward-scored poles / bucket means carry afPeriodWeight.
+          const _per = this._afPeriodOn() ? this._afPeriodScore() : null, _pw = _per ? this._afPeriodWeight() : 0;
+          const perKeys = b => ((_per && _pw > 0) ? Object.keys(_per.entries).filter(k => _per.entries[k][b].n > 0) : []);
           const entryOf = b => dk => {
             const [family, pole] = dk.split('|');
             const ps = bucket[b][dk], ls = bucketL[b][dk];
@@ -1800,9 +1835,11 @@
             else if (pm != null) pnl = pm;
             else if (lm != null) pnl = lm;
             else if (n >= minSamples) pnl = ((ps ? ps.sum : 0) + (ls && ls.w > 0 ? ls.sum / ls.w * ls.n : 0)) / n;
+            const pr = (_per && _pw > 0) ? _per.entries[dk]?.[b] : null;
+            if (pr && pr.n > 0) pnl = (pm != null || lm != null || n >= minSamples) ? (1 - _pw) * pnl + _pw * (pr.sum / pr.n) : _pw * (pr.sum / pr.n);
             return { family, pole, key: dialDisplayKey(family, pole), pnl, wins: (ps ? ps.wins : 0) + (ls ? ls.wins : 0), losses: (ps ? ps.losses : 0) + (ls ? ls.losses : 0), n, hasHist: true, hasTrade: false };
           };
-          const keysOf = b => [...new Set([...Object.keys(bucket[b]), ...Object.keys(bucketL[b])])];
+          const keysOf = b => [...new Set([...Object.keys(bucket[b]), ...Object.keys(bucketL[b]), ...perKeys(b)])];
           const extreme = keysOf('extreme').map(entryOf('extreme')).sort((a, b) => b.pnl - a.pnl);
           const lukewarm = keysOf('lukewarm').map(entryOf('lukewarm')).sort((a, b) => b.pnl - a.pnl);
           let wxDrag = 1; // headline silence drag, 1 = none (set below)
@@ -1826,9 +1863,11 @@
           const mixP = (a, b) => (a != null && b != null) ? (a + b) / 2 : (a ?? b);
           const lMean = t => (t.n >= minSamples && t.w > 0 ? t.sum / t.w : null);
           const lShare = t => (t.n >= minSamples && t.p + t.q > 0 ? (t.p - t.q) / (t.p + t.q) : null);
-          const mm = b => mixP(mean(tot[b]), lMean(totL[b]));
-          const aa = b => mixP(mean(totA[b]), lMean(totL[b]));
-          const ss = b => mixP(share(totA[b]), lShare(totL[b]));
+          const mixW = (base, per, w) => ((base == null || per == null || !(w > 0)) ? base : (1 - w) * base + w * per); // the period dimension only shifts a figure that already exists
+          const pT = b => ((_per && _pw > 0) ? _per.tot[b] : null);
+          const mm = b => mixW(mixP(mean(tot[b]), lMean(totL[b])), pT(b)?.n ? pT(b).sum / pT(b).n : null, _pw);
+          const aa = b => mixW(mixP(mean(totA[b]), lMean(totL[b])), pT(b)?.rn ? pT(b).rs / pT(b).rn : null, _pw);
+          const ss = b => mixW(mixP(share(totA[b]), lShare(totL[b])), (pT(b) && pT(b).p + pT(b).q > 0) ? (pT(b).p - pT(b).q) / (pT(b).p + pT(b).q) : null, _pw);
           this.afSampleBucketMeans = { extreme: mm('extreme'), lukewarm: mm('lukewarm'), nE: tot.extreme.n + totL.extreme.n, nL: tot.lukewarm.n + totL.lukewarm.n, aE: dg(aa('extreme')), aL: dg(aa('lukewarm')), aE0: aa('extreme'), aL0: aa('lukewarm'), nAE: totA.extreme.n + totL.extreme.n, nAL: totA.lukewarm.n + totL.lukewarm.n, sE: dg(ss('extreme')), sL: dg(ss('lukewarm')), sE0: ss('extreme'), sL0: ss('lukewarm'), nlE: totL.extreme.n, nlL: totL.lukewarm.n, wxDrag };
           this._afSampleTrackWx();
         },
@@ -2228,6 +2267,7 @@
           // the next close. Once per scan is cheap enough (same call the toggles above make on
           // every slider drag).
           this._afSampleAdopt?.();
+          this._afPeriodAdopt?.();
           // Coalesced: MIC rebuilds right before it decides entries and cancels this one; when MIC doesn't run
           // this fires at the end of the scan instead.
           if (this._schIdle) this._schIdle('af-build', () => this._afExtremityBuild());
@@ -2348,6 +2388,7 @@
           entry.pub = this._sharedRead?.('ocResults')?.ts; // the ts a follower files this cycle under (see _afLiqIngest/_afLiqAdopt)
           await this._scanCp?.();
           this._afSampleIngest?.(entry);
+          this._afPeriodIngest?.(entry);
           const withInterval = Object.values(results).filter(r => r.avgMs != null);
           const withVolIo = Object.values(results).filter(r => r.vol != null || r.oi != null);
           const parts = [`${Object.keys(results).length}t`];
@@ -2418,6 +2459,7 @@
         // pushed into history twice across repeated calls within the same scan.
         _ocSeedFromShared() {
           this._afSampleAdopt?.();
+          this._afPeriodAdopt?.();
           const shared = this._sharedRead?.('ocResults');
           if (!shared?.data) return;
           this.afOcResults = shared.data;
@@ -2427,6 +2469,7 @@
             const histEntry = { id: (this._afOcCycleCounter = (this._afOcCycleCounter % 99) + 1), ts: shared.ts, results: Object.entries(shared.data).map(([sym, r]) => ({ sym, ...r })) };
             this._afOcCycleHistory.push(histEntry);
             this._afSampleIngest?.(histEntry);
+            this._afPeriodIngest?.(histEntry);
             this._afSpikeUpdate();
             if (this._afOcCycleHistory.length > 25) this._afOcCycleHistory = this._afOcCycleHistory.slice(-25);
             this._ocPersistHistory();
@@ -2470,10 +2513,10 @@
         // already the population-relative criteria, not a per-ticker ratio).
         // Chart views rotate in this order; the two header buttons are labelled with the
         // previous/next view's name and wrap around at either end.
-        _afOcViewModes() { return this.cfg.afLiqEnabled ? ['vol', 'io', 'fund', 'lta', 'lpa', 'liq'] : ['vol', 'io', 'fund', 'lta', 'lpa']; },
+        _afOcViewModes() { const m = this.cfg.afLiqEnabled ? ['vol', 'io', 'fund', 'lta', 'lpa', 'liq'] : ['vol', 'io', 'fund', 'lta', 'lpa']; if (this._afPeriodOn()) m.push('per'); return m; },
         _afOcViewName(step) {
           const M = this._afOcViewModes();
-          const N = { vol: 'Vol', io: 'IO', fund: 'Fund', lta: 'LTA', lpa: 'LPA', liq: 'Liq' };
+          const N = { vol: 'Vol', io: 'IO', fund: 'Fund', lta: 'LTA', lpa: 'LPA', liq: 'Liq', per: 'Per' };
           const i = Math.max(0, M.indexOf(this._afOcViewMode || 'vol'));
           return N[M[(i + step + M.length) % M.length]];
         },
@@ -2485,6 +2528,7 @@
         _afOcModeCfg() {
           const mode = this._afOcViewMode || 'vol';
           const fmtCompact = v => { if (v==null) return 'n/a'; const a=Math.abs(v); if (a>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if (a>=1e6) return '$'+(v/1e6).toFixed(2)+'M'; if (a>=1e3) return '$'+(v/1e3).toFixed(1)+'K'; return '$'+v.toFixed(0); };
+          if (mode === 'per') return { label: 'PERIOD FORECAST', color: '120,200,255', cap: null, signed: true, getVal: () => null, fmt: v => (v >= 0 ? '+' : '') + v.toFixed(2) + '%', higherIsBusier: true, avgLabel: 'Period' };
           if (mode === 'vol') return { label: 'VOLUME SAMPLE', color: '96,210,255', cap: null, getVal: r => r.vol, fmt: fmtCompact, higherIsBusier: true, avgLabel: 'Avg volume' };
           if (mode === 'io')  return { label: 'OPEN INTEREST SAMPLE', color: '190,130,230', cap: null, getVal: r => r.oi, fmt: fmtCompact, higherIsBusier: true, avgLabel: 'Avg open interest' };
           // Signed modes: values straddle zero (above/below its own / the population's average), so the
@@ -2497,6 +2541,7 @@
         },
         _afOcChartSvg(shown) {
           if (!shown) return '';
+          if (this._afOcViewMode === 'per') return this._afPeriodChartSvg();
           const mc = this._afOcModeCfg();
           // Defensive: a stale/partial write (e.g. a crash mid-save) or leftover pre-redesign
           // entries in localStorage can leave a history array with malformed shapes. Filter to
@@ -2592,11 +2637,12 @@
         // fetches ever overlap.
         // The history the chart and its cycle readouts show: the Liq view reads the liquidation watch's own periods, every other view the sample cycles.
 
-        // ── Spikiness / Silence (LPA, LTA) ───────────────────────────────────
-        // Spikiness of a sample cycle = mean absolute deviation of its tickers' readings from the WINDOW rolling average (the
-        // same population average the "Total avg" readout shows). More spiky = more noise. The historical bottom and peak of
-        // that number are kept per view (SPIKE_ST, persisted); Silence = how far the current spikiness sits below the peak,
-        // 0% at the peak and 100% at the bottom. Display only: it does not feed any score.
+        // ── Silence readout (LPA) ─────────────────────────────────────────────
+        // Spikiness of a sample cycle = mean absolute deviation of its tickers' readings from the WINDOW rolling average (the same
+        // population average the "Total avg" readout shows). More spiky = more noise. The historical bottom and peak of that number
+        // are kept per view (SPIKE_ST, persisted); Silence = how far spikiness sits below the peak, 0% at the peak and 100% at the
+        // bottom. Shown as text in the LPA view for the displayed batch and for the whole window (the mean spikiness of its batches).
+        // Display only: it does not feed any score.
         _afSpikeVal(mode) { return mode === 'lta' ? (r => this._afLtaDev(r.ht, r.vol)) : (r => (typeof r.hc === 'number' && !isNaN(r.hc)) ? r.hc : null); },
         _afSpikeOf(cycle, mode, avg) {
           if (!cycle || !Array.isArray(cycle.results) || avg == null) return null;
@@ -2620,23 +2666,380 @@
             localStorage.setItem(SPIKE_KEY, JSON.stringify({ lpa: SPIKE_ST.lpa, lta: SPIKE_ST.lta }));
           } catch (_) {}
         },
-        _afSilenceBarHtml(shown) {
-          const mode = this._afOcViewMode || 'vol';
-          if (!shown || (mode !== 'lpa' && mode !== 'lta')) return '';
-          const ser = this._afSpikeSeries(mode), rg = SPIKE_ST[mode];
+        _afSilenceText(shown) {
+          if (!shown || (this._afOcViewMode || 'vol') !== 'lpa') return '';
+          const ser = this._afSpikeSeries('lpa'), rg = SPIKE_ST.lpa;
           if (!ser.length) return '';
           const lo = rg?.lo, hi = rg?.hi, span = (hi != null && lo != null) ? hi - lo : 0;
-          const mc = this._afOcModeCfg(), cur = this._afOcDisplayedCycle(), unit = mode === 'lta' ? '%' : 'pp';
-          const sil = s => (span > 0 ? Math.max(0, Math.min(1, (hi - s) / span)) : null);
-          const bars = ser.map(x => {
-            const v = sil(x.s), h = v == null ? 3 : Math.max(2, Math.round(v * 24)), on = cur && x.ts === cur.ts;
-            return `<div title="${new Date(x.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · spikiness ${x.s.toFixed(2)}${unit}${v == null ? '' : ' · silence ' + Math.round(v * 100) + '%'}" style="flex:1 1 0;min-width:3px;max-width:14px;height:${h}px;background:rgba(${mc.color},${on ? .95 : .4});border-radius:1px"></div>`;
-          }).join('');
-          const now = ser.find(x => cur && x.ts === cur.ts) || ser[ser.length - 1], v = sil(now.s);
-          const txt = span > 0
-            ? `Silence ${Math.round(v * 100)}% · spikiness ${now.s.toFixed(2)}${unit} (bottom ${lo.toFixed(2)} · peak ${hi.toFixed(2)})`
-            : `Spikiness ${now.s.toFixed(2)}${unit} · building the bottom/peak range`;
-          return `<div title="Silence: how far this cycle's spikiness (average distance of its tickers from the window average) sits below the historical peak. 100% = as quiet as it has ever been, 0% = as noisy." style="margin-bottom:3px"><div style="display:flex;align-items:flex-end;gap:1px;height:26px;border-bottom:1px solid rgba(255,255,255,.12)">${bars}</div><div style="font-family:var(--mono);font-size:8.5px;margin-top:2px;color:rgba(${mc.color},.85)">${txt}</div></div>`;
+          const cur = this._afOcDisplayedCycle(), now = ser.find(x => cur && x.ts === cur.ts) || ser[ser.length - 1];
+          const win = ser.reduce((a, x) => a + x.s, 0) / ser.length;
+          if (!(span > 0)) return `Silence: building the bottom/peak range · spikiness ${now.s.toFixed(2)}pp`;
+          const sil = v => Math.round(Math.max(0, Math.min(1, (hi - v) / span)) * 100);
+          return `Silence: batch ${sil(now.s)}% · window ${sil(win)}% (spikiness ${now.s.toFixed(2)} / ${win.toFixed(2)}pp · bottom ${lo.toFixed(2)} · peak ${hi.toFixed(2)})`;
+        },
+        // ── Period Scorer ────────────────────────────────────────────────────
+        // Optional sub-toggle of Sample Scoring: a third, forward-looking scoring dimension. Every sample batch is reduced to its
+        // AVERAGES (funding, volume, open interest, LTA, LPA) and kept in a longer rolling store (afPeriodRecords, default 300) than
+        // the 25-cycle sample window. Every afPeriodSlice batches (default 6) the latest slice is used to project the NEXT slice
+        // batch by batch: for each data type and each step ahead, the slice-average that has historically correlated best with that
+        // value (OLS, shrunk toward the mean while pairs are few) gives the estimate. The projection is then scored exactly as
+        // price scoring scores a sample, only forward: each projected criterion average (pole + extreme/lukewarm by its own history)
+        // against the projected average price change, averaged over the slice's batches. The projected batches are graded as they
+        // close (accuracy = 1 - |estimate - actual| / (2 x the type's typical swing), so just guessing the window average scores
+        // about 50% and an exact call 100%). The dimension only moves the scores and the headline while the window's accuracy is at or above
+        // afPeriodMinAcc and has enough graded batches; below that it stands down on its own.
+        _afPeriodOn() { return !!(this.cfg.afSampleScoringEnabled && this.cfg.afPeriodEnabled); },
+        _afPeriodN() { const v = Math.round(Number(this.cfg.afPeriodRecords)); return Math.max(30, Math.min(1000, isFinite(v) && v > 0 ? v : 300)); },
+        _afPeriodS() { const v = Math.round(Number(this.cfg.afPeriodSlice)); return Math.max(2, Math.min(24, Math.floor(this._afPeriodN() / 4), isFinite(v) && v > 0 ? v : 6)); },
+        _afPeriodWeight() { const v = Number(this.cfg.afPeriodWeight); return Math.max(0, Math.min(0.9, (isFinite(v) ? v : 33) / 100)); },
+        _afPeriodMinAcc() { const v = Number(this.cfg.afPeriodMinAcc); return Math.max(0, Math.min(1, (isFinite(v) ? v : 70) / 100)); },
+        _afPeriodSanitize(d) {
+          const num = v => (typeof v === 'number' && isFinite(v)) ? v : null;
+          const recs = Array.isArray(d?.recs) ? d.recs.filter(r => r && typeof r.t === 'number' && Array.isArray(r.v) && r.v.length === PER_T.length).map(r => ({ t: r.t, v: r.v.map(num) })).filter(r => r.v[4] != null).sort((a, b) => a.t - b.t) : [];
+          const grades = Array.isArray(d?.grades) ? d.grades.filter(g => g && typeof g.t === 'number' && typeof g.a === 'number' && Array.isArray(g.ta)).map(g => ({ t: g.t, k: g.k | 0, f: g.f, a: g.a, ta: g.ta.map(num), e: num(g.e), v: num(g.v), es: (Array.isArray(g.es) && g.es.length === PER_T.length) ? g.es.map(num) : null, av: (Array.isArray(g.av) && g.av.length === PER_T.length) ? g.av.map(num) : null })).sort((a, b) => a.t - b.t) : [];
+          let fc = null;
+          const f = d?.fc;
+          if (f && typeof f.t === 'number' && Array.isArray(f.est) && f.est.length >= 2 && f.est.every(e => Array.isArray(e) && e.length === PER_T.length)) fc = { t: f.t, S: (f.S | 0) || f.est.length, est: f.est.map(e => e.map(num)) };
+          return { recs, fc, grades };
+        },
+        _afPeriodLoad() {
+          try { this._afPeriod = this._afPeriodSanitize(JSON.parse(localStorage.getItem(PERIOD_KEY) || 'null')); }
+          catch (_) { this._afPeriod = { recs: [], fc: null, grades: [] }; }
+          this._afPeriodSeed();
+        },
+        _afPeriodSave() {
+          try {
+            const p = this._afPeriod, N = this._afPeriodN();
+            p.recs = p.recs.slice(-N); p.grades = p.grades.slice(-N);
+            localStorage.setItem(PERIOD_KEY, JSON.stringify(p));
+            if (!this._afFollowing()) this._sharedWrite?.('periodScore', p); // a following partner adopts it (batch averages are direction-neutral)
+          } catch (_) {}
+        },
+        _afPeriodClear() {
+          this._afPeriod = { recs: [], fc: null, grades: [] };
+          try { localStorage.removeItem(PERIOD_KEY); } catch (_) {}
+        },
+        // Backfill from the retained sample cycles (on enable / load); already-stored batches are skipped by timestamp.
+        _afPeriodSeed() {
+          if (!this._afPeriodOn() || this._afFollowing()) return;
+          const hist = (this._afOcCycleHistory || []).filter(c => c && typeof c.ts === 'number' && Array.isArray(c.results)).slice().sort((a, b) => a.ts - b.ts);
+          for (const c of hist) this._afPeriodIngest(c);
+        },
+        _afPeriodToggle() { if (this.cfg.afPeriodEnabled) this._afPeriodSeed(); this._afExtremityBuild(); this.persist?.(); },
+        _afPeriodCfgChanged() {
+          const p = this._afPeriod;
+          if (p) { const N = this._afPeriodN(); p.recs = p.recs.slice(-N); p.grades = p.grades.slice(-N); if (!this._afFollowing()) { this._afPeriodForecastIfDue(); this._afPeriodSave(); } }
+          this._afExtremityBuild(); this.persist?.();
+        },
+        _afPeriodAdopt() {
+          if (!this._afPeriodOn() || !this._afFollowing()) return false;
+          const sh = this._sharedRead?.('periodScore');
+          if (!sh?.data || !Array.isArray(sh.data.recs)) return false;
+          if (sh.ts && sh.ts === this._afPeriodLastSharedTs) return false;
+          this._afPeriodLastSharedTs = sh.ts;
+          this._afPeriod = this._afPeriodSanitize(sh.data);
+          try { localStorage.setItem(PERIOD_KEY, JSON.stringify(this._afPeriod)); } catch (_) {}
+          return true;
+        },
+        // One batch -> its average per data type, [fund, va (volume), ioa (open interest), lta, lpa]; a type needs 3+ readings.
+        _afPeriodBatchVals(entry) {
+          const acc = PER_T.map(() => ({ s: 0, n: 0 }));
+          for (const r of entry.results) {
+            if (!r) continue;
+            const vals = [
+              (typeof r.fr === 'number' && isFinite(r.fr)) ? r.fr : null,
+              Number(r.vol) > 0 ? Number(r.vol) : null,
+              Number(r.oi) > 0 ? Number(r.oi) : null,
+              this._afLtaDev(r.ht, r.vol),
+              (typeof r.hc === 'number' && isFinite(r.hc)) ? r.hc : null,
+            ];
+            vals.forEach((v, i) => { if (v != null && isFinite(v)) { acc[i].s += v; acc[i].n++; } });
+          }
+          const out = acc.map(a => (a.n >= 3 ? +(a.s / a.n).toFixed(6) : null));
+          return out[4] == null ? null : out; // no price average, no record (price is what everything is scored against)
+        },
+        // Called with every new sample batch (leader only; a follower adopts the leader's store).
+        _afPeriodIngest(entry) {
+          if (!this._afPeriodOn() || !entry || !Array.isArray(entry.results)) return;
+          if (this._afFollowing()) return;
+          const p = (this._afPeriod ||= { recs: [], fc: null, grades: [] });
+          if (p.recs.length && p.recs[p.recs.length - 1].t >= entry.ts) return;
+          const v = this._afPeriodBatchVals(entry);
+          if (!v) return;
+          p.recs.push({ t: entry.ts, v });
+          const N = this._afPeriodN();
+          if (p.recs.length > N) p.recs = p.recs.slice(-N);
+          this._afPeriodGrade();
+          this._afPeriodForecastIfDue();
+          this._afPeriodSave();
+        },
+        // Per data type over the stored records: mean, spread (sd) and typical swing (mean absolute deviation; twice it is the accuracy yardstick).
+        _afPeriodStats(recs) {
+          return PER_T.map((_, i) => {
+            const a = recs.map(r => r.v[i]).filter(v => v != null);
+            if (a.length < 3) return null;
+            const mu = a.reduce((s, v) => s + v, 0) / a.length;
+            const sd = Math.sqrt(a.reduce((s, v) => s + (v - mu) * (v - mu), 0) / a.length);
+            const mad = a.reduce((s, v) => s + Math.abs(v - mu), 0) / a.length;
+            const tiny = Math.max(1e-9, Math.abs(mu) * 1e-6);
+            return { mu, sd: Math.max(sd, tiny), mad: Math.max(mad, tiny) };
+          });
+        },
+        // Grade the live forecast's batches as they close: accuracy = 1 - |estimate - actual| / (2 x typical swing), floored at 0
+        // (50% is what guessing the window average would score; being off by two typical swings or more is 0%).
+        _afPeriodGrade() {
+          const p = this._afPeriod, fc = p.fc;
+          if (!fc) return;
+          const recs = p.recs, iMade = recs.findIndex(r => r.t === fc.t);
+          if (iMade < 0) { p.fc = null; return; }
+          const st = this._afPeriodStats(recs), have = new Set(p.grades.map(g => g.t));
+          const step = Math.max(1, Number(this.cfg.scanMins) || 10) * 60000;
+          for (let j = iMade + 1; j < recs.length && j - iMade <= fc.S; j++) {
+            const r = recs[j], k = j - iMade;
+            if (r.t - fc.t > k * 3 * step) { p.fc = null; return; } // a long gap (page closed): the forecast is stale, drop it
+            if (have.has(r.t)) continue;
+            const est = fc.est[k - 1];
+            const ta = PER_T.map((_, i) => (est[i] == null || r.v[i] == null || !st[i]) ? null : Math.max(0, 1 - Math.abs(est[i] - r.v[i]) / (2 * st[i].mad)));
+            const ok = ta.filter(x => x != null);
+            if (!ok.length) continue;
+            p.grades.push({ t: r.t, k, f: fc.t, a: +(ok.reduce((s, x) => s + x, 0) / ok.length).toFixed(4), ta: ta.map(x => (x == null ? null : +x.toFixed(4))), e: est[4], v: r.v[4], es: est.slice(), av: r.v.slice() });
+          }
+          p.grades.sort((a, b) => a.t - b.t);
+        },
+        // A new forecast is made once the previous one's slice has fully closed (every S batches), and only with 4 slices of history.
+        _afPeriodForecastIfDue() {
+          const p = this._afPeriod, S = this._afPeriodS(), L = p.recs.length;
+          if (L < 4 * S) return;
+          if (p.fc) {
+            const iMade = p.recs.findIndex(r => r.t === p.fc.t);
+            if (iMade >= 0 && p.fc.S === S && L - 1 - iMade < S) return;
+          }
+          const f = this._afPeriodForecast(S);
+          if (f) p.fc = f;
+        },
+        // The projection: for each data type t and step k ahead, the slice-average f whose past values best predicted t's value k
+        // batches after the slice (largest |r| over the stored history; no look-ahead, only realized pairs), by OLS, shrunk toward the
+        // mean by n/(n+10). A type with no usable predictor is projected at its window average. Works in z-units, returns raw units.
+        _afPeriodForecast(S) {
+          const recs = this._afPeriod.recs, L = recs.length, T = PER_T.length;
+          const st = this._afPeriodStats(recs);
+          if (!st[4]) return null;
+          const z = PER_T.map((_, i) => recs.map(r => (st[i] && r.v[i] != null) ? (r.v[i] - st[i].mu) / st[i].sd : null));
+          const m = z.map(zs => zs.map((_, i) => {
+            if (i < S - 1) return null;
+            let s = 0, n = 0;
+            for (let j = i - S + 1; j <= i; j++) if (zs[j] != null) { s += zs[j]; n++; }
+            return n >= Math.ceil(S / 2) ? s / n : null;
+          }));
+          const est = [];
+          for (let k = 1; k <= S; k++) {
+            const row = [];
+            for (let t = 0; t < T; t++) {
+              if (!st[t]) { row.push(null); continue; }
+              let best = null;
+              for (let f = 0; f < T; f++) {
+                if (m[f][L - 1] == null) continue;
+                let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+                for (let i = S - 1; i + k <= L - 1; i++) {
+                  const x = m[f][i], y = z[t][i + k];
+                  if (x == null || y == null) continue;
+                  n++; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+                }
+                if (n < 8) continue;
+                const vx = sxx - sx * sx / n, vy = syy - sy * sy / n, cv = sxy - sx * sy / n;
+                if (!(vx > 1e-12) || !(vy > 1e-12)) continue;
+                const r = cv / Math.sqrt(vx * vy);
+                if (!best || Math.abs(r) > Math.abs(best.r)) best = { f, r, b: cv / vx, n, mx: sx / n, my: sy / n };
+              }
+              if (!best) { row.push(+st[t].mu.toFixed(6)); continue; }
+              const zh = best.my + (best.n / (best.n + 10)) * best.b * (m[best.f][L - 1] - best.mx);
+              row.push(+(st[t].mu + st[t].sd * zh).toFixed(6));
+            }
+            est.push(row);
+          }
+          return { t: recs[L - 1].t, S, est };
+        },
+        // Window accuracy over every retained graded batch, overall and per data type.
+        _afPeriodAcc() {
+          const g = this._afPeriod?.grades || [];
+          if (!g.length) return { n: 0, a: null, ta: PER_T.map(() => null) };
+          const ta = PER_T.map((_, i) => { const x = g.map(q => q.ta[i]).filter(v => v != null); return x.length ? x.reduce((s, v) => s + v, 0) / x.length : null; });
+          return { n: g.length, a: g.reduce((s, q) => s + q.a, 0) / g.length, ta };
+        },
+        _afPeriodStatus() {
+          if (!this._afPeriodOn()) return { state: 'off' };
+          const p = this._afPeriod || { recs: [], fc: null, grades: [] }, S = this._afPeriodS();
+          const acc = this._afPeriodAcc(), min = this._afPeriodMinAcc(), need = 2 * S;
+          if (!p.fc) return { state: 'building', recs: p.recs.length, need: 4 * S, acc, min };
+          if (acc.n < need) return { state: 'grading', graded: acc.n, need, acc, min };
+          if (acc.a < min) return { state: 'gated', acc, min };
+          return { state: 'live', acc, min };
+        },
+        _afPeriodShort() {
+          const s = this._afPeriodStatus();
+          return s.state === 'live' ? 'live ' + Math.round(s.acc.a * 100) + '%' : s.state === 'gated' ? 'standing down' : s.state === 'off' ? 'off' : s.state;
+        },
+        _afPeriodHint() {
+          const s = this._afPeriodStatus();
+          if (s.state === 'building') return `Building: ${s.recs}/${s.need} batches before the first forecast.`;
+          if (s.state === 'grading') return `Forecasting: ${s.graded}/${s.need} batches graded before accuracy counts.`;
+          if (s.state === 'gated') return `Standing down: accuracy ${Math.round(s.acc.a * 100)}% is under the ${Math.round(s.min * 100)}% floor.`;
+          if (s.state === 'live') return `Live: accuracy ${Math.round(s.acc.a * 100)}% (floor ${Math.round(s.min * 100)}%), weight ${Math.round(this._afPeriodWeight() * 100)}%.`;
+          return '';
+        },
+        // The forward scoring: price-based scoring run on the projection. Per projected batch and per family (fund, V/A, IO/A, LTA):
+        // the family's projected average sets the pole (fund/LTA around 0, V/A and IO/A around the window average) and the bucket
+        // (extreme when its distance is within the top split % of that family's own projected distances, graded history plus this forecast); the batch's score is the
+        // projected average price change in the bot's favor, demeaned against the window's average price change (as a sample's is).
+        // Poles are the mean over the slice's batches that landed there. Returns null unless the dimension is live.
+        _afPeriodScore() {
+          if (this._afPeriodStatus().state !== 'live') return null;
+          const p = this._afPeriod, fc = p.fc, st = this._afPeriodStats(p.recs);
+          if (!fc || !st[4]) return null;
+          const dir = this._afSampleDir();
+          const split = Math.min(0.49, Math.max(0.01, (this.cfg.afExtremitySplitPct ?? 30) / 100));
+          const FAM = [['fund', 0, true], ['va', 1, false], ['ioa', 2, false], ['lta', 3, true]];
+          const dev = (i, zero, v) => (zero ? v : v - st[i].mu);
+          const cut = {};
+          for (const [f, i, zero] of FAM) {
+            if (!st[i]) continue;
+            // cut on the PROJECTED scale (the graded estimates plus this forecast): projections are shrunk toward the mean, so a
+            // cutoff taken from realized values would almost never be reached and everything would read as lukewarm
+            const a = p.grades.map(g => g.es).filter(e => e && e[i] != null).concat(fc.est.filter(e => e[i] != null)).map(e => Math.abs(dev(i, zero, e[i]))).sort((x, y) => x - y);
+            if (a.length >= 8) cut[f] = a[Math.min(a.length - 1, Math.floor(a.length * (1 - split)))];
+          }
+          const entries = {}, tot = { extreme: { sum: 0, n: 0, rs: 0, rn: 0, p: 0, q: 0 }, lukewarm: { sum: 0, n: 0, rs: 0, rn: 0, p: 0, q: 0 } };
+          const mu = st[4].mu;
+          for (const row of fc.est) {
+            if (row[4] == null) continue;
+            const edge = dir * (row[4] - mu), raw = dir * row[4];
+            for (const [f, i, zero] of FAM) {
+              if (row[i] == null || !st[i] || cut[f] == null) continue;
+              const d = dev(i, zero, row[i]), b = Math.abs(d) >= cut[f] ? 'extreme' : 'lukewarm';
+              const e = (entries[f + '|' + (d >= 0 ? 'pos' : 'neg')] ||= { extreme: { sum: 0, n: 0 }, lukewarm: { sum: 0, n: 0 } })[b];
+              e.sum += edge; e.n++;
+              const t = tot[b];
+              t.sum += edge; t.n++; t.rs += raw; t.rn++;
+              if (raw > 0) t.p += raw; else t.q -= raw;
+            }
+          }
+          return { entries, tot };
+        },
+        // ── Period chart (view 'per') ─────────────────────────────────────────
+        // One column per projected batch with one bar per data type in that type's own colour (same colours as the other views).
+        // Each type is drawn in its own units of spread (distance from its window average, in standard deviations, +/-3 shown) so
+        // funding, volume, OI, LTA and price can share one axis. Closed batches: filled bar = what actually happened, white tick =
+        // what was estimated (green/amber is shown in the summary, not here). Batches that have not closed yet are the forecast
+        // itself: desaturated bars at the estimate. This is the one view that is not aligned in time with the others: its newest
+        // column always sits a full slice of batches ahead of them. Click a column to see its breakdown in the summary.
+        _afPeriodTypes() {
+          return [
+            { n: 'Fund', c: '255,205,90' }, { n: 'Vol', c: '96,210,255' }, { n: 'IO', c: '190,130,230' },
+            { n: 'LTA', c: '110,220,160' }, { n: 'LPA', c: '255,130,170' },
+          ];
+        },
+        _afPeriodFmt(i, v) {
+          if (v == null || !isFinite(v)) return 'n/a';
+          const sg = v >= 0 ? '+' : '-', a = Math.abs(v);
+          if (i === 1 || i === 2) return a >= 1e9 ? '$' + (v / 1e9).toFixed(2) + 'B' : a >= 1e6 ? '$' + (v / 1e6).toFixed(2) + 'M' : a >= 1e3 ? '$' + (v / 1e3).toFixed(1) + 'K' : '$' + v.toFixed(0);
+          if (i === 0) return sg + a.toFixed(4) + '%';
+          if (i === 3) return sg + a.toFixed(0) + '%';
+          return sg + a.toFixed(2) + '%';
+        },
+        _afPeriodSlots() {
+          const p = this._afPeriod;
+          if (!p) return [];
+          const byF = new Map();
+          for (const g of p.grades) { if (!byF.has(g.f)) byF.set(g.f, []); byF.get(g.f).push({ f: g.f, k: g.k, t: g.t, es: g.es, av: g.av, a: g.a, ta: g.ta }); }
+          if (p.fc) {
+            let arr = byF.get(p.fc.t);
+            if (!arr) { arr = []; byF.set(p.fc.t, arr); }
+            for (let k = 1; k <= p.fc.est.length; k++) if (!arr.some(x => x.k === k)) arr.push({ f: p.fc.t, k, t: null, es: p.fc.est[k - 1], av: null, a: null, ta: null });
+          }
+          return [...byF.entries()].sort((a, b) => a[0] - b[0]).slice(-4).map(([f, arr]) => arr.sort((a, b) => a.k - b.k));
+        },
+        // The batch the summary describes: the clicked one, else the latest batch that has closed, else the first projected one.
+        _afPeriodSelSlot(groups) {
+          const all = groups.flat();
+          if (!all.length) return null;
+          const hit = this._afPeriodSel && all.find(s => s.f + '|' + s.k === this._afPeriodSel);
+          if (hit) return hit;
+          const closed = all.filter(s => s.av);
+          return closed.length ? closed[closed.length - 1] : all[0];
+        },
+        _afPeriodChartSvg() {
+          this._afOcYAxisHtml = ''; this._afOcAvgYPx = null;
+          const note = t => `<div style="font-family:var(--mono);font-size:9px;color:var(--text-lo);padding:14px 8px;white-space:normal;min-width:220px">${t}</div>`;
+          const p = this._afPeriod, stt = this._afPeriodStatus();
+          if (!p || (!p.fc && !p.grades.length)) return note(stt.state === 'building' ? `Building history: ${stt.recs || 0}/${stt.need || 0} batches before the first forecast.` : 'No forecast yet.');
+          const groups = this._afPeriodSlots(), sel = this._afPeriodSelSlot(groups), TI = this._afPeriodTypes(), st = this._afPeriodStats(p.recs);
+          const grey = c => { const [r, g, b] = c.split(',').map(Number), l = .3 * r + .59 * g + .11 * b, m = .25; return [r, g, b].map(v => Math.round(l + (v - l) * m)).join(','); }; // desaturated for batches still to come
+          const cw = 32, gap = 12, H = 92, padT = 6, padB = 16, padL = 34, padR = 6, plotH = H - padT - padB, nT = TI.length, bw = 4.6, bg = .8;
+          const zOf = (i, v) => (v == null || !st[i]) ? null : Math.max(-3, Math.min(3, (v - st[i].mu) / st[i].sd));
+          const y = z => padT + plotH / 2 - z / 3 * plotH / 2, zy = y(0);
+          const hhmm = ts => { const d = new Date(ts); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); };
+          let x = padL, out = '';
+          groups.forEach((g, gi) => {
+            if (gi > 0) { x += gap; out += `<line x1="${(x - gap / 2).toFixed(1)}" y1="${padT}" x2="${(x - gap / 2).toFixed(1)}" y2="${padT + plotH}" stroke="rgba(255,255,255,.18)" stroke-dasharray="2 2"/>`; }
+            for (const s of g) {
+              const closed = !!s.av, key = s.f + '|' + s.k, isSel = sel && key === sel.f + '|' + sel.k;
+              const x0 = x + (cw - (nT * bw + (nT - 1) * bg)) / 2;
+              let el = isSel ? `<rect x="${x}" y="${padT}" width="${cw}" height="${plotH}" fill="rgba(255,255,255,.07)"/>` : '';
+              TI.forEach((ty, i) => {
+                const bx = x0 + i * (bw + bg), ze = zOf(i, s.es ? s.es[i] : null), za = closed ? zOf(i, s.av[i]) : null;
+                const zb = closed ? za : ze; // closed: the actual; still to come: the estimate
+                if (zb != null) {
+                  const y1 = y(zb);
+                  el += `<rect x="${bx.toFixed(1)}" y="${Math.min(zy, y1).toFixed(1)}" width="${bw}" height="${Math.max(1, Math.abs(zy - y1)).toFixed(1)}" fill="${closed ? `rgba(${ty.c},.9)` : `rgba(${grey(ty.c)},.55)`}"/>`;
+                }
+                if (closed && ze != null) el += `<line x1="${(bx - 1).toFixed(1)}" x2="${(bx + bw + 1).toFixed(1)}" y1="${y(ze).toFixed(1)}" y2="${y(ze).toFixed(1)}" stroke="rgba(255,255,255,.95)" stroke-width="1.2"/>`;
+              });
+              const tip = `${s.t ? hhmm(s.t) : 'batch +' + s.k}${closed ? ' · accuracy ' + Math.round(s.a * 100) + '%' : ' · not closed yet'} — ` + TI.map((ty, i) => `${ty.n} est ${this._afPeriodFmt(i, s.es ? s.es[i] : null)}${closed ? ' / act ' + this._afPeriodFmt(i, s.av[i]) : ''}`).join(' · ');
+              el += `<text x="${(x + cw / 2).toFixed(1)}" y="${H - 3}" fill="rgba(255,255,255,${closed ? .3 : .45})" font-size="6.5" font-family="monospace" text-anchor="middle">${s.t ? hhmm(s.t) : '+' + s.k}</text>`;
+              out += `<g data-per-slot="${key}" style="cursor:pointer"><title>${tip}</title><rect x="${x}" y="${padT}" width="${cw}" height="${plotH + 10}" fill="transparent"/>${el}</g>`;
+              x += cw;
+            }
+          });
+          const lab = (v, yy) => `<text x="${padL - 4}" y="${(yy + 2.5).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${v}</text>`;
+          return `<svg width="${x + padR}" height="${H}" style="display:block">`
+            + lab('+3σ', padT) + lab('0', zy) + lab('-3σ', padT + plotH) + out
+            + `<line x1="${padL}" y1="${zy.toFixed(1)}" x2="${x}" y2="${zy.toFixed(1)}" stroke="rgba(255,255,255,.45)" stroke-width="1" pointer-events="none"/>` + `</svg>`;
+        },
+        // Selected batch as a table: criteria across the caption, Est / Actual down the stub (shown behind the Criteria pill).
+        _afPeriodBreakdownHtml(shown) {
+          if (!shown || this._afOcViewMode !== 'per') return '';
+          const sl = this._afPeriodSelSlot(this._afPeriodSlots());
+          if (!sl) return '';
+          const TI = this._afPeriodTypes(), closed = !!sl.av;
+          const th = TI.map(ty => `<th style="text-align:right;font-weight:normal;padding:1px 0 1px 10px;color:rgba(${ty.c},.9)">${ty.n}</th>`).join('');
+          const row = (label, vals, op) => `<tr><th style="text-align:left;font-weight:normal;padding:1px 0;color:var(--text-lo)">${label}</th>` + TI.map((ty, i) => `<td style="text-align:right;padding:1px 0 1px 10px;color:rgba(${ty.c},${op})">${vals[i]}</td>`).join('') + '</tr>';
+          const est = TI.map((_, i) => this._afPeriodFmt(i, sl.es ? sl.es[i] : null));
+          const act = TI.map((_, i) => closed ? this._afPeriodFmt(i, sl.av[i]) : '—');
+          return `<table style="border-collapse:collapse;font-family:var(--mono);font-size:8.5px;margin-top:3px"><thead><tr><th></th>${th}</tr></thead><tbody>${row('Est', est, closed ? .9 : .5)}${row('Actual', act, .9)}</tbody></table>`;
+        },
+        _afPeriodSummaryText() {
+          const s = this._afPeriodStatus(), p = this._afPeriod;
+          const base = `${p ? p.recs.length : 0}/${this._afPeriodN()} batches stored · slice ${this._afPeriodS()}`;
+          if (s.state === 'building') return `${base} · building (${s.recs}/${s.need} before the first forecast)`;
+          if (s.state === 'grading') return `${base} · grading (${s.graded}/${s.need} batches before accuracy counts)`;
+          if (s.state === 'gated') return `${base} · under the ${Math.round(s.min * 100)}% floor, not scoring`;
+          if (s.state === 'live') return `${base} · scoring at ${Math.round(this._afPeriodWeight() * 100)}% weight`;
+          return base;
+        },
+        _afPeriodWindowText() {
+          const a = this._afPeriodAcc();
+          if (!a || !a.n) return null;
+          const NM = ['fund', 'volume', 'OI', 'LTA', 'price'];
+          const parts = a.ta.map((v, i) => (v == null ? null : NM[i] + ' ' + Math.round(v * 100) + '%')).filter(Boolean);
+          return `Window accuracy: ${Math.round(a.a * 100)}% over ${a.n} batch${a.n === 1 ? '' : 'es'} · ${parts.join(' · ')}`;
+        },
+        _afPeriodBatchText() {
+          const sl = this._afPeriodSelSlot(this._afPeriodSlots());
+          if (!sl) return null;
+          if (!sl.av) return 'Batch accuracy: pending (not closed yet)';
+          const NM = ['fund', 'volume', 'OI', 'LTA', 'price'];
+          const parts = (sl.ta || []).map((v, i) => (v == null ? null : NM[i] + ' ' + Math.round(v * 100) + '%')).filter(Boolean);
+          return `Batch accuracy: ${Math.round(sl.a * 100)}%` + (parts.length ? ' · ' + parts.join(' · ') : '');
         },
         _afOcHist() { return this._afOcCycleHistory || []; },
         _afOcLatestCycle() {
@@ -2670,6 +3073,7 @@
         _afOcSummaryText(shown) {
           if (!shown) return '';
           const mode = this._afOcViewMode || 'vol';
+          if (mode === 'per') return this._afPeriodSummaryText();
           const last = this._afOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
@@ -2797,6 +3201,7 @@
         _afOcAvgValueText(shown) {
           if (!shown) return null;
           const mode = this._afOcViewMode || 'vol';
+          if (mode === 'per') return this._afPeriodBatchText();
           const mc = this._afOcModeCfg();
           const last = this._afOcDisplayedCycle();
           const withField = (last?.results || []).filter(r => r && mc.getVal(r) != null);
@@ -2810,6 +3215,7 @@
         _afOcTotalAvgText(shown) {
           if (!shown) return null;
           const mode = this._afOcViewMode || 'vol';
+          if (mode === 'per') return this._afPeriodWindowText();
           const mc = this._afOcModeCfg();
           const st = this._afWindowStats(mode === 'io' ? 'oi' : mode === 'fund' ? 'fr' : mode);
           if (!st.n) return null;
@@ -2819,6 +3225,7 @@
         _afOcInfoHtml(shown) {
           if (!shown) return '';
           const mode = this._afOcViewMode || 'vol';
+          if (mode === 'per') return '';
           const last = this._afOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
