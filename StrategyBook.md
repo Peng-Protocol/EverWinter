@@ -38,7 +38,7 @@ The best proxy for regime is a pooled sample of price-change over a period of ti
 
 **Reactive**: Design budget spent in the exit system — this asks what techniques are best to use to exit a ticker that is not cooperating.
 
-The split reaches into how the system learns: scoring can draw on what has already happened or on what is happening now (see Market Intelligence).
+The split reaches into how the trader is expected to learn: scoring can draw on what has already happened or on what is happening now (see Market Intelligence).
 
 Neither is strictly better. Proactive suits tighter risk tolerance and cleaner books. Reactive suits traders comfortable with simultaneous multi-stage drawdown and wider capital headroom in exchange for higher throughput.
 
@@ -255,6 +255,9 @@ Reactive scoring learns from outcomes: these are your own closed positions, cred
 
 Proactive scoring learns from the market by sampling price changes over a period, before any entry: each criterion is scored by how the tickers exhibiting it have been moving, with price movement as the grounding truth. Because this needs no closed trade to learn from, you get to recognize edge and adapt to a shift in regime much faster, and pick your targets before capital is committed. A more accurate way to apply this is to gather the criteria exhibited, then after a period of time compare the price change (averaging highs, lows and close), this directly tells you how the ticker behaved over the course of that time. Liquidations add a second grounding truth: a ticker's forced liquidations over a period show which side was flushed out, and criteria are scored on both what price did and what liquidations did. Liquidation samples count equally to a price sample, but they are rarer: liquidation events don't happen regularly, so gathering them takes time, and a score derived from them is slow to move. Expect liquidation-driven readings to firm up over many hours, not minutes, and the rarest corners of the scorecard to lag the rest. Liquidations also show how orderly a ticker is: one whose liquidations keep arriving on both sides, longs and shorts flushed alike across the window, is unstable, and an unstable ticker is passed over for entry once it is well above the average for the market.
 
+Forecasting adds a third grounding truth, one that looks ahead instead of back. Market behavior shifts through the day as liquidity comes and goes, so the trader ought to keep a longer memory of how each kind of reading averaged, batch by batch, over a day or two. Prioritize the most recent stretch of that memory to project the stretch that follows, then score the forecast criteria the way you would with retroactive price driven data, that is: what the projected readings would have paid against the forecasted price move. 
+A forecast should not be taken at face-value. Every projected batch should be graded against what actually happened, and the forecast should only move the scores and the headline while its accuracy over the window stays above a set floor percent; below it, you should avoid using the forecast data and focus on whatever price and liquidations say. forecasts should not influence more than one-third of the scoring weight. A forecast needs about a day or more of history before quality shows, and it will be better at some readings than others. Price in particular can only be updated once an hour (if fetching 1hr k-lines), so a projection that repeats the current hour can score well without any foresight.
+
 ### Reading the Scorecard
 
 Every criterion you watch is to be sorted continuously into three bands against recent history: an extreme high end, an extreme low end, and a lukewarm middle. This isn't a ranking of which band is more trustworthy — it's just where a reading currently sits relative to where it's recently been. Which band is actually paying is a live question with a live answer, not a fixed assumption baked into the system.
@@ -265,7 +268,7 @@ The same logic runs two levels down, per criterion. Every criterion carries its 
 
 The scorecard also remains highly useful for the explicit acts of substitution and ordering entries, as secondary, lesser indicators frequently prove to be valuable supplemental filters to refine your execution queue.
 
-Both sides use the same record, however it was learned. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, whether those outcomes are closed trades, sampled price moves or liquidations, so consistently losing combinations are deprioritized from both directions rather than just one.
+Both sides use the same record, however it was learned. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, whether those outcomes are closed trades, sampled price moves, liquidations or forecasts, so consistently losing combinations are deprioritized from both directions rather than just one.
 
 When one side enters gains quota and halts, the other halts as well. This is more psychological than functional, one side winning the session is an indicator both sides should take a break and prepare for regime change. 
 
