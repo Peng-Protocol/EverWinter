@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'everwinter',
     name:      'EverWinter',
-    version:   '1.2.0',
+    version:   '1.3.0',
     targetBot: 'pseudowinter',
     after:     [],
     before:    [],
@@ -95,6 +95,7 @@
         _ewLive:        true,
         _ewLastSync:    0,
         _ewNeedsSync:   false,
+        _ewFillCooldown: {},
         _ewClosing:     {},
         _ewOpposite:    {},  // opposite-direction (Buy) exchange positions, noted but not managed
 
@@ -199,7 +200,7 @@
         },
 
         async waitForPosition(symbol, orderId = null) {
-          const POLL = 2500, TIMEOUT = 30000;
+          const POLL = 1500, TIMEOUT = this.cfg.ewFillTimeoutMs ?? 10000; // was 2.5s/30s: a thin book that doesn't fill in 10s won't in 30s, and every timeout stalls the whole scan
           const end  = Date.now() + TIMEOUT;
           const check = async () => {
             await this._ewDelay();
@@ -565,13 +566,18 @@
             return;
           }
           const sym = candidate.symbol;
-          if (this._symbolBanlist?.[sym]) return;
+          if (typeof this._isSymbolBanned === 'function' ? this._isSymbolBanned(sym) : this._symbolBanlist?.[sym]) return;
+          { const cd = this._ewFillCooldown?.[sym]; if (cd && Date.now() < cd) return; } // recent fill timeout -- don't retry every cycle
           if (this._ewOpposite?.[sym]) {
             this.log(`[EW] ${sym}: skipped — opposite (long) position open on exchange`, 'warn');
             return;
           }
           if (this.positions.find(p => p.symbol === sym)) return;
           if (this.positions.length >= this.cfg.maxPos) return;
+          if (typeof this._lfPartnerHasSymbol === 'function' && this._lfPartnerHasSymbol(sym)) {
+            this.log(`[EW] ${sym}: entry blocked -- leader already holds a position on this ticker`, 'warn');
+            return;
+          }
 
           const instr = await this.getInstrInfo(sym);
           if (!instr) { this.log(`[EW] ${sym}: instrument info unavailable`, 'warn'); return; }
@@ -602,18 +608,23 @@
           }
 
           const binary = this.cfg.binaryModeEnabled;
-          const tpPct  = binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
+          // candidate._tpPct / _slPct: per-position targets from MIW/MIC Target Halving (host honours them the same way)
+          const tpPct  = (candidate._tpPct > 0) ? candidate._tpPct : (binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
 
           if (!await this._ewSetLeverage(sym, lev)) return;
+          if ((typeof this._isDrawdownHalted === 'function' && this._isDrawdownHalted()) || (typeof this._isGainsLocked === 'function' && this._isGainsLocked())) {
+            this.log(`[EW] ${sym}: entry halted mid-flight -- aborting`, 'warn');
+            return;
+          }
           this.log(`[EW] Placing SELL ${sym} qty=${qty} @ ~${price}…`, 'info');
           const oid = await this.placeOrder(sym, 'Sell', 'Market', qty, price);
           if (!oid || oid === 'NOT_LIVE') { if (oid === 'NOT_LIVE') { this.log(`[EW] ${sym}: blocked by exchange — banned for 1 week`, 'warn'); this._banSymbol?.(sym, 'blocked by exchange (unsupported or agreement required)'); } return; }
 
           const fillPrice = await this.waitForPosition(sym, oid);
-          if (!fillPrice) return;
+          if (!fillPrice) { (this._ewFillCooldown ||= {})[sym] = Date.now() + (this.cfg.ewFillCooldownMs ?? 15 * 60000); return; }
 
           const tpPrice = this.snapPrice(fillPrice * (1 - tpPct / 100 / lev), instr);
-          const bSlPct  = this.cfg.binarySlPct ?? 18;
+          const bSlPct  = (candidate._slPct > 0) ? candidate._slPct : (this.cfg.binarySlPct ?? 18);
           const slPrice = binary ? this.snapPrice(fillPrice * (1 + bSlPct / 100 / lev), instr) : 0;
 
           // Non-binary: place real conditional DCA add orders above entry, each carrying
@@ -677,13 +688,15 @@
             _pseudo:            false,
             _lastSeenAt:        Date.now(),
             _binary:            binary,
+            _slPctOverride:     (candidate._slPct > 0) ? candidate._slPct : undefined, // honoured by _dcaSLPrice/_binarySLPrice
           };
 
           this.positions.push(pos);
+          this._lfPublishPositions?.();
           // Pass through any caller-supplied tagging fields (e.g. MIW's _miw/_miwCriteria)
           // so a registered _roleBadgeProviders entry can claim this position's badge
           // instead of falling back to the plain GAINER/LOSER default.
-          { const _openSkip = new Set(['_pseudo','_lastSeenAt','_stageCount','_swStageCount','_binary','_slPctOverride','_fundingIntervalMs','_funIntervalMs','_fundingAccrued']); for (const [k,v] of Object.entries(candidate)) { if (k.startsWith('_') && !_openSkip.has(k)) pos[k] = v; } }
+          { const _openSkip = new Set(['_tpPct','_slPct','_pseudo','_lastSeenAt','_stageCount','_swStageCount','_binary','_slPctOverride','_fundingIntervalMs','_funIntervalMs','_fundingAccrued']); for (const [k,v] of Object.entries(candidate)) { if (k.startsWith('_') && !_openSkip.has(k)) pos[k] = v; } }
           if (typeof this.persist === 'function') this.persist();
 
           if (tpPrice > 0) await this.setTP(pos, tpPrice);

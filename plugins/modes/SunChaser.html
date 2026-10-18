@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'sunchaser',
     name:      'SunChaser',
-    version:   '1.2.0',
+    version:   '1.3.0',
     targetBot: 'pseudochaser',
     after:     [],
     before:    [],
@@ -96,6 +96,7 @@
         _scLive:       true,
         _scLastSync:   0,
         _scNeedsSync:  false,
+        _scFillCooldown: {},
         _scClosing:    {},
         _scOpposite:   {},  // opposite-direction (Sell) exchange positions, noted but not managed
 
@@ -200,7 +201,7 @@
         },
 
         async _scWaitFill(symbol, orderId = null) {
-          const POLL = 2500, TIMEOUT = 30000;
+          const POLL = 1500, TIMEOUT = this.cfg.scFillTimeoutMs ?? 10000; // was 2.5s/30s: a thin book that doesn't fill in 10s won't in 30s, and every timeout stalls the whole scan
           const end  = Date.now() + TIMEOUT;
           const check = async () => {
             await this._scDelay();
@@ -566,13 +567,18 @@
             return;
           }
           const { symbol, price, change=0, rsi6=null, rsi12=null, rsi24=null, fundingRate=null } = candidate;
-          if (this._symbolBanlist?.[symbol]) return;
+          if (typeof this._isSymbolBanned === 'function' ? this._isSymbolBanned(symbol) : this._symbolBanlist?.[symbol]) return;
+          { const cd = this._scFillCooldown?.[symbol]; if (cd && Date.now() < cd) return; } // recent fill timeout -- don't retry every cycle
           if (this._scOpposite?.[symbol]) {
             this.log(`[SC] ${symbol}: skipped — opposite (short) position open on exchange`, 'warn');
             return;
           }
           if (this.positions.find(p => p.symbol === symbol)) return;
           if (this.positions.length >= this.cfg.maxPos) return;
+          if (typeof this._lfPartnerHasSymbol === 'function' && this._lfPartnerHasSymbol(symbol)) {
+            this.log(`[SC] ${symbol}: entry blocked -- leader already holds a position on this ticker`, 'warn');
+            return;
+          }
 
           const instr = await this.getInstrInfo(symbol);
           if (!instr) { this.log(`[SC] ${symbol}: instrument info unavailable`, 'warn'); return; }
@@ -599,18 +605,23 @@
           }
 
           const binary = this._binaryMode ? this._binaryMode() : this.cfg.binaryModeEnabled;
-          const tpPct  = binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi;
+          // candidate._tpPct / _slPct: per-position targets from MIC Target Halving (host honours them the same way)
+          const tpPct  = (candidate._tpPct > 0) ? candidate._tpPct : (binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
 
           if (!await this._scSetLeverage(symbol, lev)) return;
+          if ((typeof this._isDrawdownHalted === 'function' && this._isDrawdownHalted()) || (typeof this._isGainsLocked === 'function' && this._isGainsLocked())) {
+            this.log(`[SC] ${symbol}: entry halted mid-flight -- aborting`, 'warn');
+            return;
+          }
           this.log(`[SC] Placing BUY ${symbol} qty=${qty} @ ~${price}…`, 'info');
           const oid = await this._scPlaceOrder(symbol, 'Buy', qty, price);
           if (!oid || oid === 'NOT_LIVE') { if (oid === 'NOT_LIVE') { this.log(`[SC] ${symbol}: blocked by exchange — banned for 1 week`, 'warn'); this._banSymbol?.(symbol, 'blocked by exchange (unsupported or agreement required)'); } return; }
 
           const fillPrice = await this._scWaitFill(symbol, oid);
-          if (!fillPrice) return;
+          if (!fillPrice) { (this._scFillCooldown ||= {})[symbol] = Date.now() + (this.cfg.scFillCooldownMs ?? 15 * 60000); return; }
 
           const tpPrice = this.snapPrice(fillPrice * (1 + tpPct / 100 / lev), instr);  // LONG: TP above entry
-          const bSlPct  = this.cfg.binarySlPct ?? 18;
+          const bSlPct  = (candidate._slPct > 0) ? candidate._slPct : (this.cfg.binarySlPct ?? 18);
           const slPrice = binary ? this.snapPrice(fillPrice * (1 - bSlPct / 100 / lev), instr) : 0;  // LONG: SL below entry
 
           // Non-binary: place real conditional DCA add orders below entry, each carrying
@@ -660,6 +671,7 @@
             _pseudo:             false,
             _long:               true,
             _binary:             binary,
+            _slPctOverride:      (candidate._slPct > 0) ? candidate._slPct : undefined, // honoured by the host's SL helpers
             tpPct,
             currentTpPrice:      tpPrice,
             slPrice,
@@ -677,10 +689,11 @@
           };
 
           this.positions.push(pos);
+          this._lfPublishPositions?.();
           // Pass through any caller-supplied tagging fields (e.g. MIC's _mic/_micCriteria)
           // so a registered _roleBadgeProviders entry can claim this position's badge
           // instead of falling back to the plain default.
-          { const _openSkip = new Set(['_pseudo','_long','_binary','_stageCount','_firstWindStageCount','_fundingHistory','_lastSeenAt','_slPctOverride','_fundingIntervalMs','_funIntervalMs','_fundingAccrued','_swStageCount']); for (const [k,v] of Object.entries(candidate)) { if (k.startsWith('_') && !_openSkip.has(k)) pos[k] = v; } }
+          { const _openSkip = new Set(['_tpPct','_slPct','_pseudo','_long','_binary','_stageCount','_firstWindStageCount','_fundingHistory','_lastSeenAt','_slPctOverride','_fundingIntervalMs','_funIntervalMs','_fundingAccrued','_swStageCount']); for (const [k,v] of Object.entries(candidate)) { if (k.startsWith('_') && !_openSkip.has(k)) pos[k] = v; } }
           if (typeof this.persist === 'function') this.persist();
 
           if (tpPrice > 0) await this._scSetTP(pos, tpPrice);
