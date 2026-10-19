@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'everwinter',
     name:      'EverWinter',
-    version:   '1.3.0',
+    version:   '1.4.0',
     targetBot: 'pseudowinter',
     after:     [],
     before:    [],
@@ -463,6 +463,7 @@
             }
             this._ewOpposite = opp;
             for (const pos of [...this.positions]) {
+              if (this._ewClosing?.[pos.id]) continue; // retry-limit close in flight — it finalises the position itself
               const ep = exMap.get(pos.symbol);
               if (!ep) {
                 // Gone on exchange — fetch closed PnL for exit price
@@ -715,6 +716,7 @@
         },
 
         async pseudoClosePosition(pos, reason = 'manual', fillPrice = null) {
+          if (this._ewClosing?.[pos.id]) return; // a retry-limit close is already running for this position
           if (this.creds.key && this.creds.secret && !this._ewClosing?.[pos.id]) {
             if (!this._ewClosing) this._ewClosing = {};
             this._ewClosing[pos.id] = true;
@@ -732,47 +734,8 @@
                   if (rec) fillPrice = parseFloat(rec.avgExitPrice || rec.exitPrice || ref);
                 } catch(e) {}
               } else {
-                // Manual/force close — place order, then always fetch real fill regardless of outcome
-                await this._ewDelay();
-                const dp = this._ewPriceDp(pos.symbol);
-                let body;
-                if (reason === 'bail') {
-                  // Bail must close immediately — market IOC guarantees fill, no GTC limit that may not execute
-                  body = { category: 'linear', symbol: pos.symbol, side: 'Buy', orderType: 'Market', qty: String(pos.totalSize), timeInForce: 'IOC', reduceOnly: true };
-                } else if (ref > 0) {
-                  const lim = parseFloat((ref * 1.003).toFixed(dp));
-                  body = { category: 'linear', symbol: pos.symbol, side: 'Buy', orderType: 'Limit', qty: String(pos.totalSize), price: String(lim), timeInForce: 'GTC', reduceOnly: true };
-                } else {
-                  body = { category: 'linear', symbol: pos.symbol, side: 'Buy', orderType: 'Market', qty: String(pos.totalSize), timeInForce: 'IOC', reduceOnly: true };
-                }
-                const b = JSON.stringify(body);
-                const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
-                const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
-                const d = await this._ewSafeJson(r);
-                if (d?.retCode !== 0) this.log(`[EW] close attempt ${pos.symbol}: ${d?.retMsg || 'no response'}`, 'warn');
-                await new Promise(res => setTimeout(res, 2000));
-                // Verify the exchange position is actually gone; retry once with a market order
-                // if not. A GTC limit order (the non-bail path above) has no fill guarantee — on
-                // a fast-moving ticker it can sit unfilled, and without this check the position
-                // would still be removed locally below while the real exchange exposure remains
-                // open and untracked, since the periodic sync only reconciles symbols already in
-                // this.positions. Every close reason needs this, not just bail.
-                try {
-                  await this._ewDelay();
-                  const vp = `category=linear&symbol=${pos.symbol}`;
-                  const vh = await _sign(this.creds.key, this.creds.secret, vp, this._tsOffset);
-                  const vr = await fetch(`${this.base}/v5/position/list?${vp}`, { headers: vh });
-                  const vd = await this._ewSafeJson(vr);
-                  const still = (vd?.result?.list || []).find(x => x.symbol === pos.symbol && x.side === 'Sell' && parseFloat(x.size) > 0);
-                  if (still) {
-                    this.log(`[EW] close verify ${pos.symbol}: position still open — retrying market close`, 'warn');
-                    await this._ewDelay();
-                    const rb = JSON.stringify({ category: 'linear', symbol: pos.symbol, side: 'Buy', orderType: 'Market', qty: String(parseFloat(still.size)), timeInForce: 'IOC', reduceOnly: true });
-                    const rh = await _sign(this.creds.key, this.creds.secret, rb, this._tsOffset);
-                    await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: rh, body: rb });
-                    await new Promise(res => setTimeout(res, 2000));
-                  }
-                } catch(e) { this.log(`[EW] close verify error ${pos.symbol}: ${e.message}`, 'warn'); }
+                // Manual/force close — limit at last ±0.1%, repriced every 10s until flat, then fetch real fill
+                await this._ewLimitClose(pos.symbol, ref);
                 try {
                   await this._ewDelay();
                   const pp = `category=linear&symbol=${pos.symbol}&limit=1`;
@@ -798,15 +761,72 @@
           return _origCycle.call(this);
         },
 
-        async _ewForceFlatten(symbol, qty) {
+        // Sized from the exchange (not pos.totalSize) so partial fills carry into the next attempt.
+        // Returns null when the lookup fails, so a failed lookup never reads as "flat".
+        async _ewPosSize(symbol) {
           try {
             await this._ewDelay();
-            const body = JSON.stringify({ category: 'linear', symbol, side: 'Buy', orderType: 'Market', qty: String(qty), reduceOnly: true, timeInForce: 'IOC' });
-            const h = await _sign(this.creds.key, this.creds.secret, body, this._tsOffset);
-            const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body });
+            const q = `category=linear&symbol=${symbol}`;
+            const h = await _sign(this.creds.key, this.creds.secret, q, this._tsOffset);
+            const r = await fetch(`${this.base}/v5/position/list?${q}`, { headers: h });
             const d = await this._ewSafeJson(r);
-            if (!d || d.retCode !== 0) this.log(`[BAIL-ERR] ${symbol} — ${d?.retMsg || 'flatten order failed'}`, 'warn');
-          } catch(e) { this.log(`[BAIL-ERR] ${symbol} — ${e.message}`, 'warn'); }
+            if (!d || d.retCode !== 0) return null;
+            const e = (d.result?.list || []).find(x => x.side === 'Sell' && parseFloat(x.size) > 0);
+            return e ? parseFloat(e.size) : 0;
+          } catch(e) { return null; }
+        },
+
+        // Closes the whole exchange position with a reduce-only limit at last price +0.1%,
+        // cancelling and repricing every ewCloseRetryMs (default 10s) until the position is flat.
+        // Used by every close except exchange-native TP/SL. Retries until filled.
+        async _ewLimitClose(symbol, ref) {
+          const EVERY = this.cfg.ewCloseRetryMs ?? 10000, POLL = 2000;
+          let oid = null, n = 0;
+          for (;;) {
+            if (oid) {
+              try {
+                await this._ewDelay();
+                const cb = JSON.stringify({ category: 'linear', symbol, orderId: oid });
+                const ch = await _sign(this.creds.key, this.creds.secret, cb, this._tsOffset);
+                await fetch(`${this.base}/v5/order/cancel`, { method: 'POST', headers: ch, body: cb });
+              } catch(e) {}
+              oid = null;
+            }
+            const size = await this._ewPosSize(symbol);
+            if (size === 0) return;
+            if (size != null) {
+              let last = ref;
+              try {
+                const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${symbol}`);
+                const td = await tr.json();
+                const lp = parseFloat(td?.result?.list?.[0]?.lastPrice);
+                if (lp > 0) last = lp;
+              } catch(e) {}
+              if (last > 0) {
+                n++;
+                const lim = parseFloat((last * 1.001).toFixed(this._ewPriceDp(symbol)));
+                try {
+                  await this._ewDelay();
+                  const b = JSON.stringify({ category: 'linear', symbol, side: 'Buy', orderType: 'Limit', qty: String(size), price: String(lim), timeInForce: 'GTC', reduceOnly: true });
+                  const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+                  const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
+                  const d = await this._ewSafeJson(r);
+                  if (d?.retCode === 0) { oid = d.result?.orderId || null; if (n > 1) this.log(`[EW] close ${symbol}: repriced limit @ ${lim} (try ${n})`, 'info'); }
+                  else this.log(`[EW] close ${symbol}: ${d?.retMsg || 'no response'} (try ${n})`, 'warn');
+                } catch(e) { this.log(`[EW] close ${symbol}: ${e.message} (try ${n})`, 'warn'); }
+              }
+            }
+            const end = Date.now() + EVERY;
+            while (Date.now() < end) {
+              await new Promise(res => setTimeout(res, POLL));
+              if (await this._ewPosSize(symbol) === 0) return;
+            }
+          }
+        },
+
+        async _ewForceFlatten(symbol, mark = 0) {
+          try { await this._ewLimitClose(symbol, mark); }
+          catch(e) { this.log(`[BAIL-ERR] ${symbol} — ${e.message}`, 'warn'); }
         },
 
         async bailAll() {
@@ -824,7 +844,7 @@
             const lingering = (d?.retCode === 0 ? (d.result?.list || []) : []).filter(e => e.side === 'Sell' && parseFloat(e.size) > 0);
             if (lingering.length) {
               this.log(`[BSC] ⚡ Bail re-check: ${lingering.length} short(s) still open — flattening directly…`, 'warn');
-              for (const e of lingering) await this._ewForceFlatten(e.symbol, e.size);
+              await Promise.all(lingering.map(e => this._ewForceFlatten(e.symbol, parseFloat(e.markPrice || 0))));
               this.log(`[BSC] ⚡ Bail re-check complete.`, 'warn');
             }
           } catch(e) { this.log(`[BAIL-ERR] re-check failed — ${e.message}`, 'warn'); }
