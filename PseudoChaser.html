@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.19.2 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.20.0 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -628,7 +628,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.19.2 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.20.0 · Long Only · No Real Orders</div>
     </div>
     <!-- ── PC-ONLY OVERLAY-MENU BUTTONS (hidden on mobile; mobile keeps its own tab bar below) ── -->
     <div class="topbar-menu-btns">
@@ -1855,6 +1855,7 @@ const SHARED_KEY = '__ew_shared_v1';
 let _sharedChannel = null;
 try { _sharedChannel = new BroadcastChannel('ew_shared'); } catch(_) {}
 const BANLIST_TTL_MS = 7 * 24 * 3600 * 1000;
+const FEE_MAKER_PCT = 0.02, FEE_TAKER_PCT = 0.055; // Bybit base-tier linear perp rates (%)
 
 // The shared registry accumulates several independent per-symbol caches (klines_1h,
 // klines_1h_last, watchTickers, mcap, cpSupply, dsMcap, liqResults, ...) inside one blob,
@@ -4535,23 +4536,13 @@ function pw() { return {
       const pnlCol  = pnl >= 0 ? 'var(--profit)' : 'var(--short)';
       const netCol  = net >= 0 ? 'var(--profit)' : 'var(--short)';
       const feeCol  = fee >= 0 ? 'var(--profit)' : 'var(--short)';
-      const fundingRow = fee !== 0 ? `
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:5px">
-          <div class="ps">
-            <div class="psl">Funding${t.fundingRate != null ? ' (' + (t.fundingRate ?? 0).toFixed(4) + '% × ' + (t.fundingIntervals ?? 1) + ')' : ''}</div>
-            <div class="psv" style="color:${feeCol}">${fee >= 0 ? '+' : ''}${fee.toFixed(3)} USDT</div>
-          </div>
-          <div class="ps">
-            <div class="psl">Net PnL</div>
-            <div class="psv" style="font-weight:600;color:${netCol}">${net >= 0 ? '+' : ''}${net.toFixed(2)} USDT</div>
-          </div>
-        </div>` : `
-        <div style="margin-bottom:5px">
-          <div class="ps">
-            <div class="psl">Net PnL</div>
-            <div class="psv" style="font-weight:600;color:${netCol}">${net >= 0 ? '+' : ''}${net.toFixed(2)} USDT</div>
-          </div>
-        </div>`;
+      const tfee    = t.tradeFee ?? 0;
+      const _cells  = [];
+      if (fee !== 0) _cells.push(`<div class="ps"><div class="psl">Funding${t.fundingRate != null ? ' (' + (t.fundingRate ?? 0).toFixed(4) + '% × ' + (t.fundingIntervals ?? 1) + ')' : ''}</div><div class="psv" style="color:${feeCol}">${fee >= 0 ? '+' : ''}${fee.toFixed(3)} USDT</div></div>`);
+      if (tfee > 0) _cells.push(`<div class="ps"><div class="psl">Fees (est.)</div><div class="psv" style="color:var(--short)">-${tfee.toFixed(3)} USDT</div></div>`);
+      _cells.push(`<div class="ps"><div class="psl">Net PnL</div><div class="psv" style="font-weight:600;color:${netCol}">${net >= 0 ? '+' : ''}${net.toFixed(2)} USDT</div></div>`);
+      const fundingRow = `
+        <div style="display:grid;grid-template-columns:repeat(${_cells.length},1fr);gap:5px;margin-bottom:5px">${_cells.join('')}</div>`;
       return `
         <div style="background:var(--bg-raised);border:1px solid var(--border);border-left:3px solid ${accentCol};border-radius:3px;overflow:hidden;">
           <div style="padding:6px 9px;display:flex;align-items:center;justify-content:space-between;background:${accentBg}">
@@ -4884,6 +4875,14 @@ function pw() { return {
   },
 
 
+  // Estimated trade fees: entry side maker (limit and conditional DCA fills), exit side taker (market close).
+  // Live positions (_pseudo === false) are skipped — the exchange charges the real fee.
+  _estTradeFee(pos, exitPrice) {
+    if (pos._pseudo === false) return 0;
+    const size = pos.totalSize || 0;
+    return (pos.entryPrice * size * FEE_MAKER_PCT + exitPrice * size * FEE_TAKER_PCT) / 100;
+  },
+
   async pseudoClosePosition(pos, reason='manual', fillPrice=null) {
     if (_closingIds.has(pos.id)) return; // module-level guard — survives object reference replacement
     _closingIds.add(pos.id);
@@ -4909,7 +4908,8 @@ function pw() { return {
       fundingIntervals = ff.fundingIntervals;
     } catch(e) { this.log(`[PC-CLOSE-01] ${pos.symbol}: funding fee calc failed — ${e.message}`, 'warn'); }
 
-    const totalPnl   = pnl + fundingFee;
+    const tradeFee   = this._estTradeFee(pos, exitPrice);
+    const totalPnl   = pnl + fundingFee - tradeFee;
     const isWin      = totalPnl > 0;
     this.sess.trades++;
     if (isWin) { this.sess.wins++; this.sess.winPnlSum += totalPnl; } else { this.sess.losses++; this.sess.lossPnlSum += Math.abs(totalPnl); }
@@ -4937,6 +4937,7 @@ function pw() { return {
       fundingFee,
       fundingRate,
       fundingIntervals,
+      tradeFee,
       totalPnl,
       isWin,
       reason,
@@ -4970,7 +4971,7 @@ function pw() { return {
     this.recordDrawdownPnl(totalPnl);
     this.recordGainsPnl(totalPnl);
 
-    const feeStr = fundingFee !== 0 ? ` | Funding ${fundingFee>=0?'+':''}${fundingFee.toFixed(3)} USDT` : '';
+    const feeStr = (fundingFee !== 0 ? ` | Funding ${fundingFee>=0?'+':''}${fundingFee.toFixed(3)} USDT` : '') + (tradeFee > 0 ? ` | Fees -${tradeFee.toFixed(3)} USDT` : '');
     this.log(
       `[CLZ] ${this.themeEmoji} ${pos.symbol}: closed [${reason}] entry ${fmtP(pos.entryPrice)} → exit ${fmtP(exitPrice)} | PnL ${pnl>=0?'+':''}${pnl.toFixed(2)} USDT (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)${feeStr} | Net ${totalPnl>=0?'+':''}${totalPnl.toFixed(2)} USDT [${isWin?'WIN':'LOSS'}]`,
       isWin ? 'success' : 'warn'
