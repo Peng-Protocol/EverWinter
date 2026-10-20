@@ -61,7 +61,36 @@ EverWinter turns PseudoWinter into a live short-only Bybit bot; SunChaser does t
 
 - **Balance**: fetched automatically the moment a valid key/secret pair is saved in the credentials panel, not only at page load.
 - **Symbol banning**: a symbol is banned for a week when Bybit reports it can't be traded, or when it's blocked until a trading agreement is signed (for example some leveraged or inverse instruments). Both cases need a manual fix on Bybit's side, so the ban is treated as long-term instead of retrying every cycle.
-- **Post-bail re-check**: after a bail sweep (manual Danger Zone bail or an automatic Drawdown Throttle bail), the plugin queries the exchange directly for any position still open in its own direction (Sell for EverWinter, Buy for SunChaser) and force-flattens it with a direct reduceOnly market order. This catches positions that failed to fully fill. 
+- **Post-bail re-check**: after a bail sweep (manual Danger Zone bail or an automatic Drawdown Throttle bail), the plugin queries the exchange directly for any position still open in its own direction (Sell for EverWinter, Buy for SunChaser) and force-flattens it with a reduce-only close that follows the **Close** tab settings (see below). This catches positions that failed to fully fill.
+
+### Order Handling (Open / Close tabs)
+
+The plugin's accordion has three tabs: **API** (credentials), **Open** and **Close**. The tab buttons always work; every control from **Order type** down is locked while Config Lock is on (it locks automatically while the bot runs). Settings are saved in the bot's config, so they persist and travel with Export / Import. Keys use the `ew` prefix on EverWinter and `sc` on SunChaser.
+
+**Limit** here means a limit priced through the last price by the **Limit offset** (default 0.1%: entries sell below / buy above, closes buy above / sell below), so it normally fills like a taker. A negative offset makes it passive. **Market** sends a market order (IOC for entries, reduce-only IOC for closes). A **try** is one limit order: it waits for a fill, then is cancelled and repriced off a fresh last price.
+
+**Open tab**
+
+| Setting | What it does |
+|---|---|
+| **Order type** (`ewOpenType`/`scOpenType`, default Limit) | Limit or Market entry. |
+| **Limit offset** (`…OpenOffsetPct`, default 0.1) | Distance through last price, in %. |
+| **Limit tries** (`…OpenTries`, default **1**, 1–20) | Limit attempts before the fallback (or giving up). |
+| **Fall back to market** (`…OpenFallback`, default **on**) | After the limit tries go unfilled, send one market order. Off: give up and put the symbol on cooldown. |
+| **Fill timeout per try** (`…FillTimeoutMs`, default 10 s) | How long each limit try waits for a fill before it's cancelled. |
+| **Cooldown after failed open** (`…FillCooldownMs`, default 15 min) | How long a symbol is skipped after an entry that placed an order but never filled. A rejected order doesn't trigger it. |
+
+**Close tab** (applies to every bot-initiated close: manual, runtime, cascade/sacrifice, bail sweeps and the post-bail re-check. Exchange-native TP/SL closes are filled by the exchange and aren't affected)
+
+| Setting | What it does |
+|---|---|
+| **Order type** (`…CloseType`, default Limit) | Limit or Market (reduce-only) close. |
+| **Limit offset** (`…CloseOffsetPct`, default 0.1) | Distance through last price, in %. |
+| **Limit tries** (`…CloseTries`, default **10**, 1–100) | Reduce-only limit attempts before the fallback. |
+| **Fall back to market** (`…CloseFallback`, default **on**) | After the limit tries go unfilled, close with a reduce-only market order, repeated until flat. Off: keeps repricing the limit until the position is flat; a close never gives up. |
+| **Reprice interval** (`…CloseRetryMs`, default 10 s) | Time between close tries. After the fallback, market closes repeat at most every 4 s. |
+
+With the defaults, an entry that doesn't fill on its first limit goes to market, and a close that hasn't filled after ten limit tries (about 100 s) goes to market.
 
 ---
 
@@ -98,7 +127,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Max Concurrent** (`schedMaxConcurrent`) | Hard cap (default 4) on background fetches in flight at once, regardless of how many subsystems have work queued. |
 | **Slice Budget** (`schedSliceMs`) | How long (ms, default 8, 2–30) a scan stage runs before handing the browser back; a hidden tab uses 40 ms. Lower = smoother page, slightly slower scans. |
 | **Follow Partner Bot** (`lfFollowPartner`) | When on, this bot stops fetching bulk tickers itself and uses the partner's shared cache. If the partner hasn't shared a bulk ticker list (or it has been evicted from the shared registry), it reuses its own cached list while that is still within **Ticker Cooldown**, and otherwise fetches one bulk list itself rather than sitting idle with no tickers (for example right after a page reload). Everything else it fetches stays on the leader. The partner needs no toggle: it acts as leader while its heartbeat (written once per completed scan cycle) is fresh, meaning newer than 2× **Scan Interval**. If the partner goes stale, this bot resumes scanning on its own, and it steps back down as soon as the partner returns. It also won't open a position on any ticker the leader already holds, checked at entry before any instrument or price lookups. Permafrost/Ashfall ignore this setting and always sample independently. |
-| **Config Lock** (`cfgLocked`) | Locks all config controls to prevent accidental changes while the bot is running. |
+| **Config Lock** (`cfgLocked`) | Locks all config controls to prevent accidental changes; it engages automatically while the bot is running. On EverWinter/SunChaser it also locks the Open and Close tab controls (the tabs themselves stay navigable). |
 
 ---
 
