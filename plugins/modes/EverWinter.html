@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'everwinter',
     name:      'EverWinter',
-    version:   '1.5.0',
+    version:   '1.5.1',
     targetBot: 'pseudowinter',
     after:     [],
     before:    [],
@@ -148,7 +148,6 @@
         _lastSignedAt:  0,
         _ewLive:        true,
         _ewLastSync:    0,
-        _ewNeedsSync:   false,
         _ewFillCooldown: {},
         _ewClosing:     {},
         _ewOpposite:    {},  // opposite-direction (Buy) exchange positions, noted but not managed
@@ -526,7 +525,7 @@
           if (repaired > 0 && typeof this.persist === 'function') this.persist();
         },
 
-        async _ewSyncPositions() {
+        async _ewSyncPositions(opts = {}) {
           if (!this.creds.key || !this.creds.secret) return;
           try {
             await this._ewDelay();
@@ -584,7 +583,9 @@
                 pos.markPrice  = parseFloat(ep.markPrice || exAvg || pos.markPrice);
                 pos.totalSize  = parseFloat(ep.size || pos.totalSize);
 
-                if (!pos._binary) {
+                // DCA repair: only on the post-scan sync, only for non-binary positions that actually have DCA orders,
+                // and not for positions opened in the last 2 min (order/realtime can lag a fresh placement — would re-place it)
+                if (opts.repair && !pos._binary && (Date.now() - (pos.openedAt || 0)) > 120000 && (pos.orders || []).some(o => o.type === 'cond')) {
                   try {
                     await this._ewRepairDcaStages(pos);
                   } catch(e) {
@@ -665,6 +666,16 @@
           const sym = candidate.symbol;
           if (typeof this._isSymbolBanned === 'function' ? this._isSymbolBanned(sym) : this._symbolBanlist?.[sym]) return;
           { const cd = this._ewFillCooldown?.[sym]; if (cd && Date.now() < cd) return; } // recent fill timeout -- don't retry every cycle
+          // Before the entry: symbol-scoped exchange check — never stack a new order on an untracked position
+          try {
+            await this._ewDelay();
+            const _q = `category=linear&symbol=${sym}`;
+            const _h = await _sign(this.creds.key, this.creds.secret, _q, this._tsOffset);
+            const _d = await this._ewSafeJson(await fetch(`${this.base}/v5/position/list?${_q}`, { headers: _h }));
+            if (_d?.retCode === 0 && (_d.result?.list || []).some(e => parseFloat(e.size) > 0)) {
+              this.log(`[EW] ${sym}: position already open on exchange — skipping entry`, 'warn'); return;
+            }
+          } catch(e) {}
           if (this._ewOpposite?.[sym]) {
             this.log(`[EW] ${sym}: skipped — opposite (long) position open on exchange`, 'warn');
             return;
@@ -847,13 +858,15 @@
               delete this._ewClosing[pos.id];
             }
           }
-          if ((reason === 'sl' || reason === 'tp') && this.creds.key && this.creds.secret) this._ewNeedsSync = true;
           return _origClose.call(this, pos, reason, fillPrice || pos.markPrice || pos.entryPrice);
         },
 
         async runScheduledCycle() {
-          if (this.creds.key && this.creds.secret) await this._ewSyncPositions();
-          return _origCycle.call(this);
+          const _live = this.creds.key && this.creds.secret;
+          if (_live) await this._ewSyncPositions();                  // before the scan loop
+          const _r = await _origCycle.call(this);
+          if (_live) await this._ewSyncPositions({ repair: true });  // after it — the only place DCA repair runs
+          return _r;
         },
 
         // Sized from the exchange (not pos.totalSize) so partial fills carry into the next attempt.
@@ -948,25 +961,38 @@
         },
 
         async pseudoWatchPositions() {
-          if (this.creds.key && this.creds.secret && this._ewNeedsSync) {
-            this._ewNeedsSync = false;
-            await this._ewSyncPositions();
-          }
-          // Update markPrice for live positions using public ticker (base watch skips _pseudo=false)
+          // Update markPrice for live positions (base watch skips _pseudo=false). Prefers the host's WS ticker
+          // feed when it has a read; otherwise one throttled REST fetch per symbol with adaptive backoff
+          // (base interval, doubling while price is flat, 60s cap) — was an unconditional REST fetch per
+          // position on every 5s tick.
           const live = this.positions.filter(p => !p._pseudo);
+          const _now = Date.now(), _baseMs = (this.cfg.restPollBaseSec ?? 5) * 1000;
+          const _st = (this._ewPxState = this._ewPxState || {});
           for (const pos of live) {
-            try {
-              const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${pos.symbol}`);
-              const td = await tr.json();
-              const t  = td?.retCode === 0 ? td.result?.list?.[0] : null;
-              if (t) {
-                const mp = parseFloat(t.lastPrice || t.markPrice || 0);
-                if (mp > 0) {
-                  pos.markPrice = mp;
-                  pos.upnl = (pos.entryPrice - mp) / pos.entryPrice * pos.leverage * pos.margin;
-                }
+            let mp = 0;
+            if (typeof wsTicker === 'function') { try { const wt = wsTicker(pos.symbol); if (wt) mp = parseFloat(wt.lastPrice) || 0; } catch {} }
+            if (!(mp > 0)) {
+              const st = (_st[pos.symbol] = _st[pos.symbol] || { last: 0, next: 0, every: _baseMs });
+              if (_now >= st.next) {
+                try {
+                  const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${pos.symbol}`);
+                  const td = await tr.json();
+                  const t  = td?.retCode === 0 ? td.result?.list?.[0] : null;
+                  const lp = t ? parseFloat(t.lastPrice || t.markPrice || 0) : 0;
+                  if (lp > 0) {
+                    const moved = st.last > 0 && Math.abs(lp - st.last) / st.last >= 0.001;
+                    st.every = (st.last > 0 && !moved) ? Math.min(st.every * 2, 60000) : _baseMs;
+                    st.last = lp;
+                  }
+                } catch {}
+                st.next = _now + st.every;
               }
-            } catch {}
+              mp = st.last;
+            }
+            if (mp > 0) {
+              pos.markPrice = mp;
+                  pos.upnl = (pos.entryPrice - mp) / pos.entryPrice * pos.leverage * pos.margin;
+            }
           }
           if (live.length) this.acct.upnl = this.positions.reduce((s, p) => s + (Number.isFinite(p.upnl) ? p.upnl : 0), 0);
           // TP drift correction runs every watch tick; 60s lock prevents excess setTP calls

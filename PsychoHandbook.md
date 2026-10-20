@@ -62,7 +62,41 @@ This is the entry logic: what the bot looks for and how often it looks.
 | Scan Interval | How often a new scan cycle runs. |
 | Re-entry Cooldown | How long a symbol stays off-limits after one of its positions closes. |
 | Ticker Cache | Reuses the last full market fetch instead of re-pulling everything every cycle — safe to leave on since the change threshold doesn't need fresh-to-the-second data. |
-| REST Polling | Fetches position prices over REST instead of the live price feed. Useful as a fallback if prices look wrong. |
+| REST Polling | Fetches position prices over REST instead of the live price feed. **Off by default**: prices come from the WebSocket feed alone, which costs almost no bandwidth. Only one source runs at a time: turning this on closes the WebSocket, turning it off stops the REST calls. Turn it on if WS prices look wrong. While it's on, each symbol is polled at the base interval and backs off (up to 60 s) while its price is flat. Configs saved before v1.9.1 / v1.12.1 are switched off once on first load. |
+| WS fallback | Not a setting. If the WebSocket hasn't updated a symbol for 60 s (quiet tickers can go that long), that symbol is fetched over REST, at most one round per 60 s. |
+
+### Order Execution
+
+Controls how live orders are sent. It only matters in live mode; pseudo mode ignores it. Find it in the Config menu between Psycho Scan and DCA, and it follows Config Lock like every other section. Winter sells to open and buys to close; Chaser mirrors that.
+
+**Limit** here means a limit order priced *through* the last price by an offset, so it normally fills like a market order. A positive offset is through the price (marketable); a negative offset sits passively inside it. **Market** sends a market order. A **try** is one limit order: it waits for a fill, then gets cancelled and re-sent at a fresh last price.
+
+**Open**
+
+| Setting | What it does |
+|---|---|
+| Limit entry / Market entry | Toggle. Default Limit. |
+| Limit offset | Distance through last price, in %. Default 0.1, range −2 to 5. |
+| Limit tries | Limit orders to attempt before the fallback (or giving up). Default 1, range 1–20. |
+| Fill timeout per try | How long each try waits for a fill before it's cancelled. Default 10 s, range 2–120 s. |
+| Fall back to market | After the limit tries go unfilled, send one market order. Default on. Off: give up on the entry. |
+| Cooldown after failed open | How long a symbol is skipped after an entry that placed an order but never filled. Default 15 min, 0–240. A rejected order doesn't trigger it. |
+
+An entry also checks the exchange first. If Bybit already shows a position on that symbol, the entry is skipped and logged, so the app never stacks an order on a position it isn't tracking.
+
+**Close**
+
+Applies to full closes the bot sends itself: manual, force close, cascade, sacrifice and similar. It doesn't apply to exchange-native TP and SL fills, which Bybit fills on its own, or to partial trims such as Loss Absorption and Outlier Deceleration, which stay market orders. **Bail All always closes at market**, whatever these are set to.
+
+| Setting | What it does |
+|---|---|
+| Limit close / Market close | Toggle. Default Limit (reduce-only). |
+| Limit offset | Distance through last price, in %. Default 0.1, range −2 to 5. |
+| Limit tries | Reduce-only limit orders before the fallback. Default 10, range 1–100. |
+| Reprice interval | Time between tries. Default 10 s, range 2–120 s. After the fallback, market closes repeat at most every 4 s. |
+| Fall back to market | After the limit tries go unfilled, close with a reduce-only market order, repeated until flat. Default on. Off: keeps repricing the limit until the position is flat. |
+
+With the defaults, a close that hasn't filled after ten limit tries (about 100 s) goes to market. Each close is sized from what the exchange actually holds, so a partial fill carries over to the next try. If the exchange rejects five close orders in a row, the close gives up with an error in the log and the position stays open. A long repricing close also holds up the position-watch loop while it runs, which is a reason to keep Close tries modest.
 
 ### DCA
 
@@ -81,6 +115,13 @@ orders rather than being watched for locally — the exchange enforces the
 add and fires it even if this tab is closed or your connection drops. The
 CONDITIONALS panel (see the Log Menu section) still shows the same
 information either way.
+
+Because the exchange fires those orders, the app only has to notice that
+one filled. It does that by checking Bybit's execution history, and it only
+asks once price has reached that stage's trigger. After every scan loop it
+also checks every pending stage once, to catch a wick that touched a
+trigger and came back between position-watch ticks. Binary-style positions
+with no DCA or AMa orders make no such checks at all.
 
 **Operational Balance Cap** — an optional ceiling on DCA escalation, **on by
 default** ($500). The DCA ladder normally grows exponentially (each stage some
@@ -110,36 +151,55 @@ The **TP Schedule** table shows the target ROI and price-move percentage for eve
 
 ### Risk
 
-This is the largest section — it holds the safety nets that manage a book once positions start losing.
+This is the largest section — it holds the safety nets that manage a book once positions start losing. It's split below by mechanism.
 
-**Force Close** — a hard time limit. Any position still open past this many hours gets closed regardless of anything else. Usually the Laggard mechanism fires first.
+**Force Close**
 
-**Laggard Check** — designates one open position at a time as "the laggard": the one responsible for absorbing the book's collective drawdown. It closes once its own numbers clear.
-- *Age Mode* — picks the laggard by which position is oldest, instead of which has DCA'd the most.
-- *Profit Offset* — how patient the laggard's exit target is. Positive numbers widen it, negative numbers make it trigger-happy.
-- *Laggard Absorption* — if the laggard's numbers hit zero but it's still net negative, this bleeds the position down gradually instead of force-closing it outright, buying time for a reversal. The laggard is picked and checked every 5s alongside the rest of the position watch loop, but a cut only fires once every 5 minutes, each one trimming 5% of the laggard's remaining size until it's fully drained. 
+| Setting | What it does |
+|---|---|
+| Force Close | A hard time limit. Any position still open past this many hours gets closed regardless of anything else. Usually the Laggard mechanism fires first. |
 
-**Cascade Trigger** — when the whole book's floating profit crosses a threshold, this locks some of it in by closing a couple of winning positions, seeding a payback chain toward the laggard.
-- *Cascade Trigger Threshold* — how large that collective profit needs to be, expressed as a multiple of entry margin. This same number also governs Position Cascade Trigger below — one dial, two triggers.
+**Laggard Check**
 
-**Position Cascade Trigger** — the individual-position version: any single position that's lost more than the threshold amount forces a profit-take from winners to help offset it. Each time it fires without fully catching up, it escalates — closing more positions than the last time — via the *PPC Escalation Multiplier*.
+| Setting | What it does |
+|---|---|
+| Laggard Check | Designates one open position at a time as "the laggard": the one responsible for absorbing the book's collective drawdown. It closes once its own numbers clear. |
+| Age Mode | Picks the laggard by which position is oldest, instead of which has DCA'd the most. |
+| Profit Offset | How patient the laggard's exit target is. Positive numbers widen it, negative numbers make it trigger-happy. |
+| Laggard Absorption | If the laggard's numbers hit zero but it's still net negative, this bleeds the position down gradually instead of force-closing it outright, buying time for a reversal. The laggard is picked and checked every 5s alongside the rest of the position watch loop, but a cut only fires once every 5 minutes, each one trimming 5% of the laggard's remaining size until it's fully drained. |
 
-**Cascade Close Min ROI** — the profit floor a position must clear before either cascade mechanism is allowed to use it as a target.
+**Cascade**
 
-**Loss Absorption** — trims the worst-losing position at market at a regular interval, which shortens every time it fires (and resets if the position recovers). Paused while a DCA add is in flight, since that add might fix the problem on its own.
-- *Absorption Trigger Threshold* — how deep a loss needs to be (as a multiple of base margin) to count as "deep enough" to trim. Numeric input field (0.05× steps, max 10×).
-- *Outlier Acceleration* — if a position's margin or loss stands out from the rest of the book, absorption locks to its fastest interval and defers any cut too large to digest cleanly in one go.
-- *Outlier Threshold* — how far a position has to stand out from the average of everything else to count as an outlier.
-- *Outlier Deceleration* — nudges an outlier's margin up gradually each cycle, sizing it toward the book average. In live mode, this places a real market order and updates average entry from the exchange-confirmed fill (price and quantity), the same way DCA and AMa adds do — not from a pre-order price estimate. Each add still gets a short settling window afterward before another one is considered on the same position, since the exchange needs a moment to catch up before the next margin check.
-- *Exhumation* — a position that's had losses absorbed off it gets a personalized recovery target instead of its original take-profit, so it isn't forced to reach the original ROI to close in the green.
-- *Second Wind* — if the final DCA stage fills but absorption has already shrunk the position below where it "should" be at that stage, the stop-loss is delayed and the stage count is recalibrated so new adds can still queue from the current price.
-- *Accelerated Absorption* — speeds up the absorption interval progressively through the first few DCA stages, then resets and re-accelerates after a Second Wind event.
+| Setting | What it does |
+|---|---|
+| Cascade Trigger | When the whole book's floating profit crosses a threshold, this locks some of it in by closing a couple of winning positions, seeding a payback chain toward the laggard. |
+| Cascade Trigger Threshold | How large that collective profit needs to be, expressed as a multiple of entry margin. This same number also governs Position Cascade Trigger below — one dial, two triggers. |
+| Position Cascade Trigger | The individual-position version: any single position that's lost more than the threshold amount forces a profit-take from winners to help offset it. Each time it fires without fully catching up, it escalates — closing more positions than the last time — via the PPC Escalation Multiplier. |
+| PPC Escalation Multiplier | How much more aggressive each consecutive Position Cascade Trigger firing is than the last, when it fires without fully catching up. |
+| Cascade Close Min ROI | The profit floor a position must clear before either cascade mechanism is allowed to use it as a target. |
 
-**Sacrifice** — when too much of your total capital is tied up, this closes the single best eligible position each cycle until margin usage cools back down.
-- *Sacrifice Trigger Threshold* — the allocation ceiling, expressed as a multiple of one slot's margin times your max positions. Numeric input field (0.25× steps, max 100×).
-- *Position Floor* — Sacrifice won't close positions if doing so would drop you below this many open at once.
-- *Retraction* — a second, independent tripwire: if the book's combined floating loss crosses a threshold, Sacrifice fires regardless of how much margin is actually in use.
-- *Retraction Threshold* — how deep that combined loss needs to be, as a multiple of base margin.
+**Loss Absorption**
+
+| Setting | What it does |
+|---|---|
+| Loss Absorption | Trims the worst-losing position at market at a regular interval, which shortens every time it fires (and resets if the position recovers). Paused while a DCA add is in flight, since that add might fix the problem on its own. |
+| Absorption Trigger Threshold | How deep a loss needs to be (as a multiple of base margin) to count as "deep enough" to trim. Numeric input field (0.05× steps, max 10×). |
+| Outlier Acceleration | If a position's margin or loss stands out from the rest of the book, absorption locks to its fastest interval and defers any cut too large to digest cleanly in one go. |
+| Outlier Threshold | How far a position has to stand out from the average of everything else to count as an outlier. |
+| Outlier Deceleration | Nudges an outlier's margin up gradually each cycle, sizing it toward the book average. In live mode, this places a real market order and updates average entry from the exchange-confirmed fill (price and quantity), the same way DCA and AMa adds do — not from a pre-order price estimate. Each add still gets a short settling window afterward before another one is considered on the same position, since the exchange needs a moment to catch up before the next margin check. |
+| Exhumation | A position that's had losses absorbed off it gets a personalized recovery target instead of its original take-profit, so it isn't forced to reach the original ROI to close in the green. |
+| Second Wind | If the final DCA stage fills but absorption has already shrunk the position below where it "should" be at that stage, the stop-loss is delayed and the stage count is recalibrated so new adds can still queue from the current price. |
+| Accelerated Absorption | Speeds up the absorption interval progressively through the first few DCA stages, then resets and re-accelerates after a Second Wind event. |
+
+**Sacrifice**
+
+| Setting | What it does |
+|---|---|
+| Sacrifice | When too much of your total capital is tied up, this closes the single best eligible position each cycle until margin usage cools back down. |
+| Sacrifice Trigger Threshold | The allocation ceiling, expressed as a multiple of one slot's margin times your max positions. Numeric input field (0.25× steps, max 100×). |
+| Position Floor | Sacrifice won't close positions if doing so would drop you below this many open at once. |
+| Retraction | A second, independent tripwire: if the book's combined floating loss crosses a threshold, Sacrifice fires regardless of how much margin is actually in use. |
+| Retraction Threshold | How deep that combined loss needs to be, as a multiple of base margin. |
 
 ### Bot Controls
 
@@ -207,7 +267,8 @@ Sits above the Activity Log so it's never scrolled out of view when opened.
 - **Import State** — loads a previously exported Config or Positions file back in.
 - **Clear Stats** — wipes session stats and trade history. Peak Allocation is left untouched, since it's meant to be a durable record.
 - **CLEAR ALL** — a full wipe: positions, trades, stats, logs, and the peak-allocation record. Cannot be undone.
-- **BAIL ALL POSITIONS** — closes every open position immediately at current mark price, for profit or loss. Only appears when you have positions open.
+- **Reset Config** — restores every setting to its default and saves it. Live Trading, Testnet and your API key and secret are kept, so a reset can't strand you in the wrong mode or wipe your credentials. Positions, trades and stats are untouched (that's Clear Stats and CLEAR ALL). Disabled while the scan is running.
+- **BAIL ALL POSITIONS** — closes every open position immediately at market, for profit or loss, ignoring the Order Execution close settings. Only appears when you have positions open.
 
 ---
 
@@ -243,9 +304,10 @@ The funding countdown shown on each position card is only as fresh as the last t
 
 ### A "margin mismatch" warning in the log isn't necessarily a bug
 
-Live mode periodically compares what Bybit actually holds for each open
-position against what the app's own bookkeeping expects, and logs a
-warning if they drift apart by more than a few percent. This is a
+Each time live mode syncs with Bybit (before and after every scan loop), it
+compares what Bybit actually holds for each open position against what the
+app's own bookkeeping expects, and logs a warning if they drift apart by
+more than a few percent. This is a
 detection mechanism, not an auto-corrector — nothing gets changed
 automatically when it fires. Most of the time this means a fill landed at
 a slightly different size or price than assumed and is worth a look; it's
@@ -253,6 +315,12 @@ not itself an indication that anything urgent went wrong. It deliberately
 skips checking a position for a few seconds right after Outlier
 Deceleration adds to it, since the exchange needs a moment to catch up
 and would otherwise be flagged as "drifted" when it's actually just lagging.
+
+### Exchange-side fills show up at scan boundaries
+
+In live mode the app reads the whole book from Bybit twice per scan cycle: once just before the scan and once just after it. It does not poll in between. Take-profits, stop-losses and DCA fills that happen on the exchange are therefore reconciled at the next boundary, at most one Scan Interval later. In the meantime the position card can show stale size or entry, and the closed trade appears when the sync catches it. Closes the app sends itself, and DCA/AMa fills once price reaches the trigger, are noticed immediately.
+
+If the scan is stopped, no sync runs at all, so anything that happens on the exchange while the bot is stopped is picked up the next time you start it.
 
 ### Absorbed Loss' impact on net PnL
 

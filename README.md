@@ -62,6 +62,10 @@ EverWinter turns PseudoWinter into a live short-only Bybit bot; SunChaser does t
 - **Balance**: fetched automatically the moment a valid key/secret pair is saved in the credentials panel, not only at page load.
 - **Symbol banning**: a symbol is banned for a week when Bybit reports it can't be traded, or when it's blocked until a trading agreement is signed (for example some leveraged or inverse instruments). Both cases need a manual fix on Bybit's side, so the ban is treated as long-term instead of retrying every cycle.
 - **Post-bail re-check**: after a bail sweep (manual Danger Zone bail or an automatic Drawdown Throttle bail), the plugin queries the exchange directly for any position still open in its own direction (Sell for EverWinter, Buy for SunChaser) and force-flattens it with a reduce-only close that follows the **Close** tab settings (see below). This catches positions that failed to fully fill.
+- **Exchange sync cadence** (v1.5.1): the full-book `GET /v5/position/list` sync runs once before and once after each scan loop, and nowhere else. It no longer fires after an SL/TP close, so exchange-native TP/SL fills and DCA fills are picked up at the next scan boundary, at most one Scan Interval later. Entries and closes still confirm their own fills with single-symbol `position/list` calls while they are in flight.
+- **Pre-entry check**: before each entry the plugin asks the exchange for that one symbol and skips the entry if any position is already open on it, so a new order is never stacked on a position the bot isn't tracking.
+- **DCA repair**: re-places missing DCA conditional orders, and runs only in the post-scan sync. It is skipped in binary mode, for positions with no DCA orders, and for positions opened in the last 2 minutes, because order status can lag a fresh placement and would trigger a duplicate.
+- **Live position prices**: the base bot's watcher skips live positions, so the plugin prices them itself. It reads the host's WebSocket ticker when the host has one for the symbol; otherwise it makes one REST ticker call per symbol on a throttle: the **Price Poll Interval** base (default 5 s), doubling while price moves less than 0.1% and capped at 60 s. This replaces a REST call per position on every 5 s tick.
 
 ### Order Handling (Open / Close tabs)
 
@@ -92,6 +96,10 @@ The plugin's accordion has three tabs: **API** (credentials), **Open** and **Clo
 
 With the defaults, an entry that doesn't fill on its first limit goes to market, and a close that hasn't filled after ten limit tries (about 100 s) goes to market.
 
+### Psycho bots
+
+`PsychoWinter` and `PsychoChaser` have live trading built in, so they take no plugin: turn on **Live Trading** in the Mode section. They carry the same Open and Close settings in an **Order Execution** accordion, with the same behavior and defaults as the table above. The config keys have no `ew`/`sc` prefix: `openType`, `openOffsetPct`, `openTries`, `openFallback`, `openFillTimeoutSec` (seconds), `openCooldownMin` (minutes), `closeType`, `closeOffsetPct`, `closeTries`, `closeFallback` and `closeRetrySec` (seconds). Bail All always closes at market. The Psycho bots also have a **Reset Config** button in the Danger Zone, and their live sync cadence matches the plugins' (before and after each scan loop). See the Psycho Handbook for both.
+
 ---
 
 ## Main Config
@@ -121,7 +129,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **Whiplash Proximity** (`whiplashProximityPct`) | How close (%) to TP price triggers the kline audit. |
 | **Runtime Limit** (`runtimeHours`) | Maximum position age. Forces a close at the deadline if TP hasn't been hit. |
 | **Symbol Banlist** (`banlistEnabled`) | When on, symbols on the ban list are excluded from all scans. Entries expire after 7 days. |
-| **Position Price Feed** (`restPollEnabled`) | When on, replaces the WebSocket price stream for open positions with periodic REST API calls. Use if the WS feed returns stale or incorrect prices. |
+| **Position Price Feed** (`restPollEnabled`) | When on, replaces the WebSocket price stream for open positions with periodic REST API calls. Use if the WS feed returns stale or incorrect prices. Exactly one source runs at a time: turning it on closes the WebSocket stream, and turning it off stops the REST calls. Pseudo bots default to on. Psycho bots default to off (WebSocket only), and a saved Psycho config is switched off once on first load of PsychoChaser v1.9.1 / PsychoWinter v1.12.1; turn it back on if WS prices look wrong. |
 | **Price Poll Interval** (`restPollBaseSec`) | Base polling interval in seconds for REST mode. The interval doubles automatically when price moves less than 0.1% between ticks and resets to base on any meaningful move. |
 | **Dispatch Every** (`schedIntervalMs`) | Minimum gap (ms, default 150) between successive background fetches dispatched from the scheduling queue. Lower = faster background data turnover, at the cost of more simultaneous requests. |
 | **Max Concurrent** (`schedMaxConcurrent`) | Hard cap (default 4) on background fetches in flight at once, regardless of how many subsystems have work queued. |
@@ -488,7 +496,9 @@ Each plugin's `transform(def)` receives and returns the component definition, so
 
 ### Bybit API Endpoints Used
 
-**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for criteria data), `GET /v5/market/recent-trade`, `GET /v5/market/kline`, `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live plugins only)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`. Signing: HMAC-SHA-256 via `crypto.subtle.sign`; 250ms minimum gap between signed requests.
+**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for criteria data), `GET /v5/market/recent-trade`, `GET /v5/market/kline`, `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots (DCA/AMa ladder fill checks). Signing: HMAC-SHA-256 via `crypto.subtle.sign`; 250ms minimum gap between signed requests (plugins).
+
+**Call cadence**: the full-book `position/list` runs only before and after each scan loop. Single-symbol `position/list` calls happen around an entry (once before it, then polling for the fill) and while a close is repricing. On the Psycho bots, `execution/list` is called for a pending DCA/AMa stage only once price has reached that stage's trigger, plus one sweep of every pending stage after each scan loop to catch a wick through a trigger.
 
 
 ---

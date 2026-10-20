@@ -1,6 +1,35 @@
 <!--
-PsychoChaser v1.8.1
+PsychoChaser v1.9.1
 Copyleft 2026 Peng Protocol — PsychoChaser fork of PsychoWinter
+
+v1.9.1 — Live REST bandwidth cuts.
+/v5/position/list full sync no longer polls every 12s: it runs only before and
+after each scan loop (runScheduledCycle). Per-open, a symbol-scoped
+position/list check runs before the entry (blocks stacking on an untracked
+position); the fill confirmation after it was already symbol-scoped. The
+_pwNeedsSync flag (extra sync after every SL/TP close) is gone. DCA/AMa ladder
+fill checks (/v5/execution/list, per pending stage per position, every 5s watch
+tick) now only fire once price has reached the stage trigger, plus one full
+sweep per scan loop to catch wicks. Position price feed: REST polling is now
+OFF by default (WS-only; a one-time migration turns it off in saved configs —
+re-enable it under Scan if WS prices look wrong), WS staleness window and the
+per-symbol REST fallback throttle raised from 15s to 60s so quiet tickers
+don't trigger REST.
+
+v1.9.0 — Native live Open/Close settings (ported from SunChaser/EverWinter v1.5.0).
+New ORDER EXECUTION accordion: Open = market or limit entry (offset through
+last, tries, fill timeout per try, optional market fallback, cooldown after an
+unfilled entry); Close = market or reduce-only limit (offset, tries, reprice
+interval, optional market fallback), sized from the exchange so partial fills
+carry over. Bail All always closes at market. Defaults match the plugins (limit
+0.1%, open 1 try / close 10 tries, fallback on). Also fixed: the live close
+used an IOC limit priced on the wrong side of the book (sell at mark +0.1%), so
+it almost never filled and always fell through to the 2s verify + market retry.
+Fixed: WS and REST position pricing ran at once — the WS stream stayed
+subscribed while REST polling was the price source; now exactly one runs (WS
+dropped when REST polling is on). New Reset Config button (Danger Zone):
+restores every cfg key to its code default, keeps mode/testnet/API
+credentials, blocked while the bot is running.
 
 v1.8.1 — Fix: the position card's TP row showed "$0.0000" with no percent
 while an AMa position sat at stage 0 or mid-ladder, since currentTpPrice is
@@ -598,17 +627,67 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
         <div class="g" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
           <div class="lbl" style="margin-bottom:6px;letter-spacing:1px">Position Price Feed</div>
           <label class="tog" @click.prevent="if(!cfgLocked){cfg.restPollEnabled=!cfg.restPollEnabled;persist()}">
-            <div class="tog-t" :class="(cfg.restPollEnabled??true)?'on':''"><div class="tog-k"></div></div>
+            <div class="tog-t" :class="(cfg.restPollEnabled??false)?'on':''"><div class="tog-k"></div></div>
             <div>
               <div class="tog-l">REST Polling</div>
               <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Fetch position prices via REST instead of WebSocket. Use if WS prices appear incorrect.</div>
             </div>
           </label>
-          <div x-show="cfg.restPollEnabled??true" style="margin-top:8px">
+          <div x-show="cfg.restPollEnabled??false" style="margin-top:8px">
             <div class="lbl">Base Interval <b x-text="(cfg.restPollBaseSec??5)+'s'"></b></div>
             <input type="range" min="5" max="30" step="5" x-model.number="cfg.restPollBaseSec" :disabled="cfgLocked" @change="persist()">
             <div style="font-size:9px;color:var(--text-lo);margin-top:3px;line-height:1.5">Doubles per symbol when price moves &lt;0.1% between ticks, up to 60s max.</div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ORDER EXECUTION (live mode) -->
+    <div class="sec">
+      <button class="acc-hd" :class="cfgOpen.exec?'open':''" @click="cfgOpen.exec=!cfgOpen.exec">
+        <span>ORDER EXECUTION</span>
+        <span class="acc-arrow" :class="cfgOpen.exec?'open':''">▶</span>
+      </button>
+      <div x-show="cfgOpen.exec" class="acc-body">
+        <div class="hint" style="margin-bottom:8px">Live mode only. Applies to the entry order and to full-position closes. Bail All always closes at market. Offset: positive = through last price (marketable), negative = passive.</div>
+        <div class="lbl" style="letter-spacing:1px;margin-bottom:6px">Open</div>
+        <label class="tog" @click.prevent="if(!cfgLocked){cfg.openType=(cfg.openType==='market'?'limit':'market');persist()}">
+          <div class="tog-t" :class="cfg.openType!=='market'?'on':''"><div class="tog-k"></div></div>
+          <span class="tog-l" x-text="cfg.openType!=='market' ? 'Limit entry' : 'Market entry'"></span>
+        </label>
+        <div x-show="cfg.openType!=='market'" style="margin-top:8px">
+          <div class="g"><div class="lbl">Limit offset <b x-text="(cfg.openOffsetPct??0.1)+'%'"></b></div>
+            <input type="number" min="-2" max="5" step="0.05" x-model.number="cfg.openOffsetPct" :disabled="cfgLocked" @change="cfg.openOffsetPct=Math.min(5,Math.max(-2,cfg.openOffsetPct||0));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px"></div>
+          <div class="g"><div class="lbl">Limit tries <b x-text="cfg.openTries??1"></b></div>
+            <input type="number" min="1" max="20" step="1" x-model.number="cfg.openTries" :disabled="cfgLocked" @change="cfg.openTries=Math.min(20,Math.max(1,Math.round(cfg.openTries||1)));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px"></div>
+          <div class="g"><div class="lbl">Fill timeout per try <b x-text="(cfg.openFillTimeoutSec??10)+'s'"></b></div>
+            <input type="number" min="2" max="120" step="1" x-model.number="cfg.openFillTimeoutSec" :disabled="cfgLocked" @change="cfg.openFillTimeoutSec=Math.min(120,Math.max(2,Math.round(cfg.openFillTimeoutSec||10)));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px"></div>
+          <label class="tog" @click.prevent="if(!cfgLocked){cfg.openFallback=(cfg.openFallback===false);persist()}">
+            <div class="tog-t" :class="cfg.openFallback!==false?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Fall back to market</span>
+          </label>
+          <div class="hint" style="margin-top:4px" x-text="cfg.openFallback!==false ? 'After the limit tries go unfilled, send a market order.' : 'After the limit tries go unfilled, give up and cool the symbol down.'"></div>
+        </div>
+        <div class="g" style="margin-top:8px"><div class="lbl">Cooldown after failed open <b x-text="(cfg.openCooldownMin??15)+'m'"></b></div>
+          <input type="number" min="0" max="240" step="1" x-model.number="cfg.openCooldownMin" :disabled="cfgLocked" @change="cfg.openCooldownMin=Math.min(240,Math.max(0,Math.round(cfg.openCooldownMin??15)));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px">
+          <div class="hint">Skips a symbol for this long after an entry that placed orders but never filled.</div></div>
+        <div class="lbl" style="letter-spacing:1px;margin:12px 0 6px;padding-top:10px;border-top:1px solid var(--border)">Close</div>
+        <label class="tog" @click.prevent="if(!cfgLocked){cfg.closeType=(cfg.closeType==='market'?'limit':'market');persist()}">
+          <div class="tog-t" :class="cfg.closeType!=='market'?'on':''"><div class="tog-k"></div></div>
+          <span class="tog-l" x-text="cfg.closeType!=='market' ? 'Limit close (reduce-only)' : 'Market close'"></span>
+        </label>
+        <div x-show="cfg.closeType!=='market'" style="margin-top:8px">
+          <div class="g"><div class="lbl">Limit offset <b x-text="(cfg.closeOffsetPct??0.1)+'%'"></b></div>
+            <input type="number" min="-2" max="5" step="0.05" x-model.number="cfg.closeOffsetPct" :disabled="cfgLocked" @change="cfg.closeOffsetPct=Math.min(5,Math.max(-2,cfg.closeOffsetPct||0));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px"></div>
+          <div class="g"><div class="lbl">Limit tries <b x-text="cfg.closeTries??10"></b></div>
+            <input type="number" min="1" max="100" step="1" x-model.number="cfg.closeTries" :disabled="cfgLocked" @change="cfg.closeTries=Math.min(100,Math.max(1,Math.round(cfg.closeTries||10)));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px"></div>
+          <div class="g"><div class="lbl">Reprice interval <b x-text="(cfg.closeRetrySec??10)+'s'"></b></div>
+            <input type="number" min="2" max="120" step="1" x-model.number="cfg.closeRetrySec" :disabled="cfgLocked" @change="cfg.closeRetrySec=Math.min(120,Math.max(2,Math.round(cfg.closeRetrySec||10)));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px"></div>
+          <label class="tog" @click.prevent="if(!cfgLocked){cfg.closeFallback=(cfg.closeFallback===false);persist()}">
+            <div class="tog-t" :class="cfg.closeFallback!==false?'on':''"><div class="tog-k"></div></div>
+            <span class="tog-l">Fall back to market</span>
+          </label>
+          <div class="hint" style="margin-top:4px" x-text="cfg.closeFallback!==false ? 'After the limit tries go unfilled, close with a reduce-only market order.' : 'No fallback: keeps repricing the limit until the position is flat.'"></div>
         </div>
       </div>
     </div>
@@ -1514,6 +1593,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
         </div>
         <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:center">
           <button class="btn-ghost btn" @click="clearStats()" style="font-size:9px">Clear Stats</button>
+          <button class="btn-ghost btn" :disabled="bot.running" @click="if(confirm('Reset all config to defaults? Mode and API credentials are kept.'))resetConfig()" style="font-size:9px">Reset Config</button>
           <button class="btn-danger btn" @click="if(confirm('Clear all state?'))clearSaved()">CLEAR ALL</button>
         </div>
         <div x-show="positions.length>0" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:2px;justify-content:center">
@@ -1539,7 +1619,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
 </div><!-- end .main -->
 
 <script>
-const VERSION = '1.7.2'; // x=production-only, y=significant additions/subtractions, z=tweaks
+const VERSION = '1.9.1'; // x=production-only, y=significant additions/subtractions, z=tweaks
 
 // ── HMAC-SHA256 signing ──
 async function hmac(secret, msg) {
@@ -1581,7 +1661,7 @@ let _audioTimer = null;
 // Replaces the recurring full-ticker REST poll (~300 KB per call, every 15s) with delta
 // pushes (~100 bytes each) for only the symbols the watch loops care about.
 let _wsUrl        = 'wss://stream.bybit.com/v5/public/linear'; // swapped for the testnet stream when cfg.testnet is on
-const WS_FRESH_MS = 15000; // ticker older than this is considered stale → REST fallback
+const WS_FRESH_MS = 60000; // ticker older than this is considered stale → REST fallback
 let _wsConn           = null;
 let _wsPingTimer      = null;
 let _wsReconnectTimer = null;
@@ -1675,7 +1755,7 @@ function psycho() { return {
   posSearch: '',
   posFilter: '',
   audioState: 'off',
-  cfgOpen: { mode:true, sizing:false, scan:false, dca:false, tp:false, risk:false, ctrl:false, danger:false },
+  cfgOpen: { mode:true, sizing:false, scan:false, exec:false, dca:false, tp:false, risk:false, ctrl:false, danger:false },
 
   cfg: {
     liveMode:         false,
@@ -1699,11 +1779,22 @@ function psycho() { return {
     retractionThresholdMult: 2.5,
     cascadeThresholdMult: 2.5,
     scanMins:             15,
-    restPollEnabled:      true,
+    restPollEnabled:      false,
     restPollBaseSec:      5,
     reentryCooldownHrs:   1,
     bulkTickerCooldownEnabled: true,
     bulkTickerCooldownHours:   24,
+    openType:           'limit',
+    openOffsetPct:      0.1,
+    openTries:          1,
+    openFallback:       true,
+    openFillTimeoutSec: 10,
+    openCooldownMin:    15,
+    closeType:          'limit',
+    closeOffsetPct:     0.1,
+    closeTries:         10,
+    closeFallback:      true,
+    closeRetrySec:      10,
     whiplashProximityPct: 20,
     dcaStages:        7,
     dcaMultiplier:    2,
@@ -1745,8 +1836,10 @@ function psycho() { return {
   _lastLiveSync:  0,
   liveBalance:    null,
   _lastSignedAt:  0,
-  _pwNeedsSync:   false,
   _lastTickerFetch: 0, // timestamp of last per-symbol REST ticker fallback round in watchPositions
+  _ladderSweepDue: false, _ladderSweepNow: false, // one full ladder-fill sweep per scan loop (watchPositions)
+  _liveFillCooldown: {}, // symbol → epoch ms until which a failed live entry won't be retried
+  _cfgDefaults:     null, // pristine cfg snapshot taken in init() before saved config merges in (resetConfig)
   _restPollState:   null, // per-symbol adaptive REST polling state when cfg.restPollEnabled is on
   _lastAllTickers:   null,
   _lastAllTickersAt: 0,
@@ -1850,12 +1943,15 @@ function psycho() { return {
   },
 
   async init() {
+    this._cfgDefaults = JSON.parse(JSON.stringify(this.cfg));
     try {
       const cfgRaw = localStorage.getItem(LS_CFG_KEY);
       if (cfgRaw) { const s = JSON.parse(cfgRaw); if (s.cfg) Object.assign(this.cfg, s.cfg); }
       this._migrateLegacy();
       this._loadModeState();
     } catch(e) {}
+    // One-time: WS is the position price feed now; REST polling was the default and ate bandwidth.
+    if (!this.cfg._feedMigratedV1) { this.cfg.restPollEnabled = false; this.cfg._feedMigratedV1 = true; this.persist(); }
     await Promise.resolve();
     this._renderLogs();
     this.log('🐂 PsychoChaser ready.', 'success');
@@ -1996,6 +2092,8 @@ function psycho() { return {
     await this.liveSyncPositions();
     await this.liveFetchBalance();
     try { await this.runPsychoScan(); } catch(e) { this.bot.scanning = false; this.log('Scan error: '+e.message, 'error'); }
+    await this.liveSyncPositions();   // after the scan loop (the call at the top is the 'before')
+    this._ladderSweepDue = true;      // next watch tick checks every pending ladder stage once
   },
 
   // ── Psycho Scan ──
@@ -2258,6 +2356,12 @@ function psycho() { return {
     const sym   = candidate.symbol;
     const price = candidate.price;
     if (this._symbolBanlist[sym]) { this.log(`${sym}: banned — skipping`, 'warn'); return; }
+    { const cd = this._liveFillCooldown?.[sym]; if (cd && Date.now() < cd) return; } // recent unfilled entry — don't retry every cycle
+    // Before the entry: symbol-scoped exchange check — never stack a new order on a position the bot isn't tracking
+    try {
+      const _pre = await this.liveApiCall('/v5/position/list', { category:'linear', symbol:sym });
+      if ((_pre?.list || []).some(e => parseFloat(e.size) > 0)) { this.log(`${sym}: position already open on exchange — skipping entry`, 'warn'); return; }
+    } catch(e) {}
     if (this._wouldTripSacrifice()) { this.log(`${sym}: skipped — opening would immediately trip Sacrifice`, 'warn'); return; }
 
     const instr = await this.getInstrInfo(sym);
@@ -2302,14 +2406,17 @@ function psycho() { return {
 
     // Place market long, then confirm the real fill via position/list rather
     // than trusting a single early read — order/realtime can lag the actual fill.
-    let fillPrice = price, orderId = null;
-    try {
-      const res = await this.livePlaceOrder({ symbol:sym, side:'Buy', orderType:'Market', qty:qty.toString(), timeInForce:'IOC', reduceOnly:false });
-      orderId   = res.orderId;
-    } catch(e) { this.log(`${sym}: entry order failed — ${e.message}`, 'error'); return; }
-    const confirmedFill = await this.liveWaitForFill(sym, 'Buy', orderId);
-    if (!confirmedFill) { this.log(`${sym}: entry fill not confirmed — aborting open`, 'error'); return; }
-    fillPrice = confirmedFill;
+    let fillPrice = price;
+    const ent = await this._liveEnter(sym, qty, price, instr);
+    if (ent.banned) {
+      this._symbolBanlist[sym] = 'blocked by exchange (unsupported or agreement required)';
+      this.log(`${sym}: blocked by exchange — banned`, 'warn'); this.persist(); return;
+    }
+    if (!ent.fill) {
+      if (ent.placed) this._liveFillCooldown[sym] = Date.now() + (this.cfg.openCooldownMin ?? 15) * 60000;
+      this.log(`${sym}: entry fill not confirmed — aborting open`, 'error'); return;
+    }
+    fillPrice = ent.fill;
 
     const actualNotional = qty * fillPrice;
     const margin         = actualNotional / lev;
@@ -2424,23 +2531,19 @@ function psycho() { return {
   async watchPositions() {
     if (this.positions.length === 0) { wsWatchSymbols([]); return; } // drop the WS stream when nothing is held
     const now = Date.now();
-    if (this._pwNeedsSync) {
-      this._pwNeedsSync = false;
-      await this.liveSyncPositions();
-    } else if (this.cfg.liveMode && this.positions.some(p => p._live) && (now - (this._lastLiveSync || 0)) >= 12000) {
-      // Native SL/TP fills happen exchange-side without the bot calling closePosition,
-      // so this can't rely solely on the _pwNeedsSync flag — poll periodically instead.
-      this._lastLiveSync = now;
-      await this.liveSyncPositions();
-    }
+    // No periodic position/list here: full syncs run only around scan loops (runScheduledCycle).
+    // The post-scan sync arms a one-tick ladder sweep so wicked-through DCA/AMa stages are still noticed.
+    this._ladderSweepNow = !!this._ladderSweepDue; this._ladderSweepDue = false;
 
-    // Keep the WS ticker subscriptions aligned with the held position symbols
-    wsWatchSymbols(this.positions.map(p => p.symbol),
+    // Keep the WS ticker subscriptions aligned with the held position symbols — but only when WS is the
+    // price source. With REST polling on, the stream used to stay subscribed and push deltas nobody read.
+    if (this.cfg.restPollEnabled ?? false) wsWatchSymbols([]);
+    else wsWatchSymbols(this.positions.map(p => p.symbol),
       this.cfg.testnet ? 'wss://stream-testnet.bybit.com/v5/public/linear' : 'wss://stream.bybit.com/v5/public/linear');
 
     // Build mark prices — either adaptive REST polling or the WS ticker feed
     let tickerMap = {};
-    if (this.cfg.restPollEnabled ?? true) {
+    if (this.cfg.restPollEnabled ?? false) {
       if (!this._restPollState) this._restPollState = {};
       const _baseMs = (this.cfg.restPollBaseSec ?? 5) * 1000;
       const _maxMs  = 60000;
@@ -2481,7 +2584,7 @@ function psycho() { return {
       }
       // REST fallback: per-symbol tickers (~700 B each) for anything the WS hasn't covered yet,
       // throttled to at most one fallback round per 15s
-      const TICKER_THROTTLE_MS = 15000;
+      const TICKER_THROTTLE_MS = 60000;
       if (missing.length && (now - (this._lastTickerFetch || 0)) >= TICKER_THROTTLE_MS) {
         this._lastTickerFetch = now;
         for (const sym of missing) {
@@ -2567,6 +2670,7 @@ function psycho() { return {
             if (_ok) await this.livePlaceLadderConditional(pos, add);
             continue;
           }
+          if (!this._ladderSweepNow && mark > add.price) continue; // trigger not reached — nothing to ask the exchange
           const fill = await this.liveCheckLadderFill(pos, add);
           if (!fill) continue;
           fillPrice = fill.price;
@@ -2674,6 +2778,7 @@ function psycho() { return {
 
           if (pos._live) {
             if (!ama._orderLinkId) { await this.livePlaceLadderConditional(pos, ama, 1); continue; }
+            if (!this._ladderSweepNow && mark < ama.price) continue; // trigger not reached
             const fill = await this.liveCheckLadderFill(pos, ama);
             if (!fill) continue;
             fillPrice = fill.price;
@@ -2997,15 +3102,15 @@ function psycho() { return {
       for (const _a of _pendingAma) { await this.liveCancelLadderConditional(pos, _a); }
     }
 
-    // Place market close
+    // Configurable close (ORDER EXECUTION → Close). Bail always goes market.
     let exitPrice = fillPrice || pos.markPrice || pos.entryPrice;
+    let _driverFlat = false;
     try {
-      const mark = pos.markPrice;
-      const closePrice = mark ? this.snapPrice(mark * 1.001, await this.getInstrInfo(pos.symbol)) : null;
-      const res = closePrice
-        ? await this.livePlaceOrder({ symbol:pos.symbol, side:'Sell', orderType:'Limit', qty:pos.totalSize.toString(), price:closePrice.toString(), timeInForce:'IOC', reduceOnly:true })
-        : await this.livePlaceOrder({ symbol:pos.symbol, side:'Sell', orderType:'Market', qty:pos.totalSize.toString(), timeInForce:'IOC', reduceOnly:true });
-      exitPrice = parseFloat(res.avgPrice || res.price || exitPrice) || exitPrice;
+      const _instr = await this.getInstrInfo(pos.symbol);
+      const _r = await this._liveCloseDriver(pos, _instr, exitPrice, reason === 'bail');
+      if (!_r.flat) { this.log(`${pos.symbol}: close failed — exchange rejected repeated close orders`, 'error'); _closingIds.delete(pos.id); return; }
+      _driverFlat = true;
+      if (_r.price > 0) exitPrice = _r.price;
     } catch(e) {
       this.log(`${pos.symbol}: close order failed — ${e.message}`, 'error');
       _closingIds.delete(pos.id);
@@ -3016,7 +3121,7 @@ function psycho() { return {
     // fill guarantee — on a fast-moving ticker it can miss, and without this
     // check the position would be dropped from local state below while real
     // exposure remains open and untracked on the exchange.
-    try {
+    if (!_driverFlat) try {
       await new Promise(r => setTimeout(r, 2000));
       const vResult = await this.liveApiCall('/v5/position/list', { category:'linear', symbol:pos.symbol });
       const still = (vResult?.list || []).find(x => x.symbol === pos.symbol && x.side === 'Buy' && parseFloat(x.size) > 0);
@@ -3073,7 +3178,6 @@ function psycho() { return {
     } else {
       this._logCloseBatch(pos.symbol, totalPnl, pnlPct, reason, isWin);
     }
-    if (reason === 'sl' || reason === 'tp') this._pwNeedsSync = true;
     _closingIds.delete(pos.id);
     this.liveFetchBalance();
     this.persist();
@@ -4614,8 +4718,99 @@ function psycho() { return {
   // Polls position/list until a real fill is visible, rather than trusting a
   // single early read of order/realtime. On timeout, cancels the order and
   // checks once more before giving up.
-  async liveWaitForFill(symbol, side, orderId = null) {
-    const POLL = 2500, TIMEOUT = 30000;
+  // ── Configurable live Open/Close (ported from SunChaser/EverWinter v1.5.0 into the native live path) ──
+  // Open: market, or limit through last price by offsetPct, up to `tries` repriced attempts (each waits
+  // the fill timeout, then cancels), then optional market fallback. Close: reduce-only, same shape, repriced
+  // every closeRetrySec until flat. Bail All always closes at market.
+  _liveOrderCfg(kind) {
+    const c = this.cfg, num = (v, d, lo, hi) => { v = parseFloat(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+    if (kind === 'open') return {
+      type: c.openType === 'market' ? 'market' : 'limit', offsetPct: num(c.openOffsetPct, 0.1, -2, 5),
+      fallback: c.openFallback !== false, tries: Math.round(num(c.openTries, 1, 1, 20)),
+      timeoutMs: num(c.openFillTimeoutSec, 10, 2, 120) * 1000,
+    };
+    return {
+      type: c.closeType === 'market' ? 'market' : 'limit', offsetPct: num(c.closeOffsetPct, 0.1, -2, 5),
+      fallback: c.closeFallback !== false, tries: Math.round(num(c.closeTries, 10, 1, 100)),
+      retryMs: num(c.closeRetrySec, 10, 2, 120) * 1000,
+    };
+  },
+
+  // Returns { fill, placed, banned }. placed = at least one order reached the exchange (drives the open cooldown).
+  async _liveEnter(sym, qty, price, instr) {
+    const C = this._liveOrderCfg('open'), out = { fill:null, placed:false, banned:false };
+    const total = C.type === 'market' ? 1 : (C.fallback ? C.tries + 1 : C.tries);
+    for (let n = 1; n <= total; n++) {
+      const asMkt = C.type === 'market' || n > C.tries;
+      let ref = price;
+      if (!asMkt && n > 1) { const fp = await this._fetchFreshPrice(sym); if (fp) ref = fp; }
+      if (asMkt && C.type !== 'market') this.log(`${sym}: ${C.tries} limit ${C.tries === 1 ? 'try' : 'tries'} unfilled — falling back to market`, 'warn');
+      else if (n > 1) this.log(`${sym}: repricing entry limit (try ${n}/${C.tries})`, 'info');
+      let orderId = null;
+      try {
+        const lim = this.snapPrice(ref * (1 + C.offsetPct / 100), instr);
+        const res = await this.livePlaceOrder(asMkt
+          ? { symbol:sym, side:'Buy', orderType:'Market', qty:String(qty), timeInForce:'IOC', reduceOnly:false }
+          : { symbol:sym, side:'Buy', orderType:'Limit',  qty:String(qty), price:String(lim), timeInForce:'GTC', reduceOnly:false });
+        orderId = res.orderId;
+      } catch(e) {
+        this.log(`${sym}: entry order failed — ${e.message}`, 'error');
+        const m = (e.message || '').toLowerCase();
+        if (m.includes('not supported') || m.includes('sign the required agreement')) { out.banned = true; return out; }
+        continue;
+      }
+      out.placed = true;
+      const fp = await this.liveWaitForFill(sym, 'Buy', orderId, asMkt ? 30000 : C.timeoutMs);
+      if (fp) { out.fill = fp; return out; }
+    }
+    return out;
+  },
+
+  // Closes the whole exchange position (sized from the exchange, so partial fills carry over).
+  // Resolves { flat:true, price } once flat, or { flat:false, failed:true } after 5 consecutive order rejections.
+  async _liveCloseDriver(pos, instr, ref, forceMarket = false) {
+    const C = this._liveOrderCfg('close'), sym = pos.symbol;
+    const exSize = async () => {
+      try {
+        const r = await this.liveApiCall('/v5/position/list', { category:'linear', symbol:sym });
+        const e = (r?.list || []).find(x => x.symbol === sym && x.side === 'Buy' && parseFloat(x.size) > 0);
+        return e ? parseFloat(e.size) : 0;
+      } catch(e) { return null; } // a failed lookup must never read as "flat"
+    };
+    let oid = null, n = 0, fails = 0, lastPx = ref;
+    for (;;) {
+      if (oid) { try { await this.liveCancelOrder(sym, oid); } catch(e) {} oid = null; }
+      const sz = await exSize();
+      if (sz === 0) return { flat:true, price:lastPx };
+      let asMkt = false;
+      if (sz != null) {
+        const last = (await this._fetchFreshPrice(sym)) || ref;
+        n++;
+        asMkt = forceMarket || C.type === 'market' || (C.fallback && n > C.tries);
+        if (asMkt && !forceMarket && C.type !== 'market' && n === C.tries + 1) this.log(`${sym}: ${C.tries} close limit ${C.tries === 1 ? 'try' : 'tries'} unfilled — falling back to market`, 'warn');
+        const lim = this.snapPrice(last * (1 - C.offsetPct / 100), instr);
+        try {
+          const res = await this.livePlaceOrder(asMkt
+            ? { symbol:sym, side:'Sell', orderType:'Market', qty:String(sz), timeInForce:'IOC', reduceOnly:true }
+            : { symbol:sym, side:'Sell', orderType:'Limit',  qty:String(sz), price:String(lim), timeInForce:'GTC', reduceOnly:true });
+          oid = res.orderId || null; fails = 0;
+          lastPx = parseFloat(res.avgPrice) || (asMkt ? last : lim) || lastPx;
+          if (n > 1) this.log(`${sym}: close ${asMkt ? 'market order' : 'repriced limit @ ' + lim} (try ${n})`, 'info');
+        } catch(e) {
+          this.log(`${sym}: close order failed — ${e.message} (try ${n})`, 'warn');
+          if (++fails >= 5) return { flat:false, failed:true };
+        }
+      }
+      const end = Date.now() + (asMkt ? Math.min(C.retryMs, 4000) : C.retryMs);
+      while (Date.now() < end) {
+        await new Promise(r => setTimeout(r, 2000));
+        if (await exSize() === 0) return { flat:true, price:lastPx };
+      }
+    }
+  },
+
+  async liveWaitForFill(symbol, side, orderId = null, timeoutMs = 30000) {
+    const TIMEOUT = timeoutMs, POLL = TIMEOUT < 30000 ? 1500 : 2500;
     const end  = Date.now() + TIMEOUT;
     const check = async () => {
       const result = await this.liveApiCall('/v5/position/list', { category:'linear', symbol });
@@ -5077,6 +5272,19 @@ function psycho() { return {
     this.logs = [];
     this.persist();
     this.log('🗑️ Stats and trade history cleared.', 'warn');
+  },
+
+  // Restores every cfg key to its code default (snapshotted in init() before the saved config is merged in).
+  // Keeps liveMode / testnet / API credentials so a reset can't strand the session in the wrong mode or wipe keys.
+  resetConfig() {
+    if (this.bot.running) { this.log('Stop the bot before resetting config.', 'warn'); return; }
+    if (!this._cfgDefaults) { this.log('Config defaults snapshot unavailable — reset aborted.', 'error'); return; }
+    const keep  = { liveMode: this.cfg.liveMode, testnet: this.cfg.testnet, apiKey: this.cfg.apiKey, apiSecret: this.cfg.apiSecret, _feedMigratedV1: true };
+    const fresh = JSON.parse(JSON.stringify(this._cfgDefaults));
+    for (const k of Object.keys(this.cfg)) if (!(k in fresh)) delete this.cfg[k]; // drop stale/orphaned keys
+    Object.assign(this.cfg, fresh, keep);
+    this.persist();
+    this.log('♻️ Config reset to defaults (mode and API credentials kept).', 'warn');
   },
 
   exportConfig() {
