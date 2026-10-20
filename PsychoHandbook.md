@@ -96,6 +96,12 @@ Applies to full closes the bot sends itself: manual, force close, cascade, sacri
 | Reprice interval | Time between tries. Default 10 s, range 2–120 s. After the fallback, market closes repeat at most every 4 s. |
 | Fall back to market | After the limit tries go unfilled, close with a reduce-only market order, repeated until flat. Default on. Off: keeps repricing the limit until the position is flat. |
 
+**Group closes**
+
+| Setting | What it does |
+|---|---|
+| Batch size | Bail All, Cascade and Position Cascade close this many positions at once, then the next batch. Default 5, range 1–20. 1 closes strictly one at a time. A close that fails is logged and doesn't stop the rest of its batch. |
+
 With the defaults, a close that hasn't filled after ten limit tries (about 100 s) goes to market. Each close is sized from what the exchange actually holds, so a partial fill carries over to the next try. If the exchange rejects five close orders in a row, the close gives up with an error in the log and the position stays open. A long repricing close also holds up the position-watch loop while it runs, which is a reason to keep Close tries modest.
 
 ### DCA

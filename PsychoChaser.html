@@ -1,6 +1,12 @@
 <!--
-PsychoChaser v1.9.1
+PsychoChaser v1.9.2
 Copyleft 2026 Peng Protocol — PsychoChaser fork of PsychoWinter
+
+v1.9.2 — Group closes run in concurrent batches.
+Bail All, Cascade and Position Cascade now close positions in parallel batches
+(new Order Execution > Group closes > Batch size, default 5, 1 = one at a time)
+instead of strictly one after another. A failed close is logged and doesn't
+stop the rest of its batch.
 
 v1.9.1 — Live REST bandwidth cuts.
 /v5/position/list full sync no longer polls every 12s: it runs only before and
@@ -689,6 +695,10 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
           </label>
           <div class="hint" style="margin-top:4px" x-text="cfg.closeFallback!==false ? 'After the limit tries go unfilled, close with a reduce-only market order.' : 'No fallback: keeps repricing the limit until the position is flat.'"></div>
         </div>
+        <div class="lbl" style="letter-spacing:1px;margin:12px 0 6px;padding-top:10px;border-top:1px solid var(--border)">Group closes</div>
+        <div class="g"><div class="lbl">Batch size <b x-text="cfg.groupCloseBatch??5"></b></div>
+          <input type="number" min="1" max="20" step="1" x-model.number="cfg.groupCloseBatch" :disabled="cfgLocked" @change="cfg.groupCloseBatch=Math.min(20,Math.max(1,Math.round(cfg.groupCloseBatch||5)));persist()" style="background:var(--bg-raised);color:#fff;border:1px solid var(--border-hi);border-radius:3px;padding:4px 7px;font-family:var(--mono);font-size:12px;width:80px">
+          <div class="hint">Bail All, Cascade and Position Cascade close this many positions at once, then the next batch. 1 = one at a time.</div></div>
       </div>
     </div>
 
@@ -1619,7 +1629,7 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(0,229,160,.4
 </div><!-- end .main -->
 
 <script>
-const VERSION = '1.9.1'; // x=production-only, y=significant additions/subtractions, z=tweaks
+const VERSION = '1.9.2'; // x=production-only, y=significant additions/subtractions, z=tweaks
 
 // ── HMAC-SHA256 signing ──
 async function hmac(secret, msg) {
@@ -1795,6 +1805,7 @@ function psycho() { return {
     closeTries:         10,
     closeFallback:      true,
     closeRetrySec:      10,
+    groupCloseBatch:    5,
     whiplashProximityPct: 20,
     dcaStages:        7,
     dcaMultiplier:    2,
@@ -3597,11 +3608,11 @@ function psycho() { return {
     this._lastCascadeFired = now;
     const toClose = profitable.slice(0, 2);
     this.log(`🌊 Cascade trigger — total uPnL $${(this.acct.upnl||0).toFixed(2)} ≥ $${threshold.toFixed(2)} — closing ${toClose.map(p => p.symbol.replace('USDT','')).join(' + ')} to seed cascade`, 'warn');
-    for (const pos of toClose) {
+    await this._closeGroup(toClose, async pos => {
       if (this.positions.find(x => x.id === pos.id)) {
         await this.closePosition(pos, 'cascade', pos.markPrice);
       }
-    }
+    });
     if (this.bot.running) {
       this.log('⚡ Collective cascade — triggering immediate scan', 'scan');
       try { await this.runPsychoScan(); } catch(e) { this.log('Post-cascade scan error: '+e.message, 'error'); }
@@ -3645,11 +3656,11 @@ function psycho() { return {
     this._lastPosCascadeFired = now;
     const toClose = profitable.slice(0, closeN);
     this.log(`🌊 Position cascade ×${closeN} — ${trigger.symbol.replace('USDT','')} uPnL $${(trigger.upnl||0).toFixed(2)} ≤ -$${threshold.toFixed(2)} — closing ${toClose.map(p => p.symbol.replace('USDT','')).join(' + ')}`, 'warn');
-    for (const pos of toClose) {
+    await this._closeGroup(toClose, async pos => {
       if (this.positions.find(x => x.id === pos.id)) {
         await this.closePosition(pos, 'cascade', pos.markPrice);
       }
-    }
+    });
     if (this.bot.running) {
       this.log('⚡ Position cascade — triggering immediate scan', 'scan');
       try { await this.runPsychoScan(); } catch(e) { this.log('Post-cascade scan error: '+e.message, 'error'); }
@@ -4718,6 +4729,19 @@ function psycho() { return {
   // Polls position/list until a real fill is visible, rather than trusting a
   // single early read of order/realtime. On timeout, cancels the order and
   // checks once more before giving up.
+  // Group closes (Bail All, Cascade, Position Cascade) run in concurrent batches of cfg.groupCloseBatch
+  // (default 5, 1 = strictly one at a time). A batch is awaited whole before the next starts; one failure
+  // is logged and never aborts its siblings. liveApiCall reserves its 200ms slots synchronously, so
+  // concurrent closes stay spaced, and close bookkeeping filters positions by id, so order doesn't matter.
+  async _closeGroup(list, fn) {
+    const n = Math.max(1, Math.min(20, Math.round(parseFloat(this.cfg.groupCloseBatch) || 5)));
+    for (let i = 0; i < list.length; i += n) {
+      await Promise.all(list.slice(i, i + n).map(async p => {
+        try { await fn(p); } catch(e) { this.log(`${p.symbol}: group close failed — ${e.message}`, 'warn'); }
+      }));
+    }
+  },
+
   // ── Configurable live Open/Close (ported from SunChaser/EverWinter v1.5.0 into the native live path) ──
   // Open: market, or limit through last price by offsetPct, up to `tries` repriced attempts (each waits
   // the fill timeout, then cancels), then optional market fallback. Close: reduce-only, same shape, repriced
@@ -5221,10 +5245,10 @@ function psycho() { return {
     const snap = [...this.positions];
     if (!snap.length) { this.log('[PW] Bail: no active positions.', 'warn'); return; }
     this.log(`[PW] Bail: closing ${snap.length} position(s) at mark price…`, 'warn');
-    for (const pos of snap) {
+    await this._closeGroup(snap, async pos => {
       try { await this.closePosition(pos, 'bail', pos.markPrice || pos.entryPrice); }
       catch(e) { this.log(`[BAIL-ERR] ${pos.symbol} — ${e.message}`, 'warn'); }
-    }
+    });
     this.log('[PW] Bail complete.', 'warn');
     await this._bailFlattenLingering();
   },

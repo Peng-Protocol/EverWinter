@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.103.1'; // Change: defaults match the active config (Both Poles Red on, Pole Blocking off) | previous: Feature: the batch picker calls the host's Silence Amplifier re-sampling (_pfResamplePick) when Liquidation Surveillance isn't picking | previous: Feature: the batch picker calls Liquidation Surveillance's pick (kept liquidated tickers first, quiet ones graylisted and replaced) when that toggle is on | previous: Feature: entry candidates are ranked by how much sample data their criteria have — a thinly-evidenced pole's score is pulled toward zero, and a candidate whose thinnest pole holds under 25% of its bucket type's median sample count is not entered (no toggle). Prior: 1.100.4 — Tweak: graylisted tickers (AF/PF Distillation) are left out of the scan pool, so they are neither sampled nor entered.
+    const VERSION       = '1.103.2'; // Fix: Cascade, Sacrifice and Ejection close their positions concurrently (Promise.all) instead of one at a time, so live fill waits no longer stack | previous: Change: defaults match the active config (Both Poles Red on, Pole Blocking off) | previous: Feature: the batch picker calls the host's Silence Amplifier re-sampling (_pfResamplePick) when Liquidation Surveillance isn't picking | previous: Feature: the batch picker calls Liquidation Surveillance's pick (kept liquidated tickers first, quiet ones graylisted and replaced) when that toggle is on | previous: Feature: entry candidates are ranked by how much sample data their criteria have — a thinly-evidenced pole's score is pulled toward zero, and a candidate whose thinnest pole holds under 25% of its bucket type's median sample count is not entered (no toggle). Prior: 1.100.4 — Tweak: graylisted tickers (AF/PF Distillation) are left out of the scan pool, so they are neither sampled nor entered.
   const DEFAULT_SLOTS = [[]];
   const MIW_HIST_KEY  = '__miw_hist_batches';
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
@@ -646,9 +646,12 @@
             }
             this._logBatchBegin?.();
             try {
-              for (const pos of allPositions) {
-                await this.pseudoClosePosition(pos, 'cascade');
-              }
+              // Concurrent: a live close waits on its exchange fill (reprice/retry loop), so closing one by
+              // one stacked those waits end to end. Local bookkeeping per close is unchanged.
+              await Promise.all([...allPositions].map(async pos => {
+                try { await this.pseudoClosePosition(pos, 'cascade'); }
+                catch (e) { this.log(`[MIW] 🌊 Cascade close error (${pos.symbol}): ${e.message}`, 'warn'); }
+              }));
             } finally { this._logBatchEnd?.('[MIW] 🌊 Cascade roll-up'); }
           }
         },
@@ -668,9 +671,12 @@
             }
             this._logBatchBegin?.();
             try {
-              for (const pos of allPositions) {
-                await this.pseudoClosePosition(pos, 'sacrifice');
-              }
+              // Concurrent: a live close waits on its exchange fill (reprice/retry loop), so closing one by
+              // one stacked those waits end to end. Local bookkeeping per close is unchanged.
+              await Promise.all([...allPositions].map(async pos => {
+                try { await this.pseudoClosePosition(pos, 'sacrifice'); }
+                catch (e) { this.log(`[MIW] 🩸 Sacrifice close error (${pos.symbol}): ${e.message}`, 'warn'); }
+              }));
             } finally { this._logBatchEnd?.('[MIW] 🩸 Sacrifice roll-up'); }
           }
         },
@@ -884,10 +890,11 @@
           const cands = (this.positions || []).filter(p => !p.isPending);
           if (!cands.length) return;
           this.log(`[MIW] ⏏️ Ejection — ${def.why.length} deferment paths in effect (${def.why.join(' + ')}); closing all ${cands.length} position${cands.length === 1 ? '' : 's'}`, 'warn');
-          for (const p of cands) {
+          // Concurrent — see Cascade/Sacrifice: sequential live closes stacked their fill waits.
+          await Promise.all(cands.map(async p => {
             try { await this.pseudoClosePosition(p, 'ejection'); }
             catch (e) { this.log(`[MIW] ⏏️ Ejection error (${p.symbol}): ${e.message}`, 'warn'); }
-          }
+          }));
         },
 
 
