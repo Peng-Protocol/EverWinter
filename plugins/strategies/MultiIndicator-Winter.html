@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.103.2'; // Fix: Cascade, Sacrifice and Ejection close their positions concurrently (Promise.all) instead of one at a time, so live fill waits no longer stack | previous: Change: defaults match the active config (Both Poles Red on, Pole Blocking off) | previous: Feature: the batch picker calls the host's Silence Amplifier re-sampling (_pfResamplePick) when Liquidation Surveillance isn't picking | previous: Feature: the batch picker calls Liquidation Surveillance's pick (kept liquidated tickers first, quiet ones graylisted and replaced) when that toggle is on | previous: Feature: entry candidates are ranked by how much sample data their criteria have — a thinly-evidenced pole's score is pulled toward zero, and a candidate whose thinnest pole holds under 25% of its bucket type's median sample count is not entered (no toggle). Prior: 1.100.4 — Tweak: graylisted tickers (AF/PF Distillation) are left out of the scan pool, so they are neither sampled nor entered.
+    const VERSION       = '1.104.2'; // Removed: the batch picker no longer calls the host's Silence Amplifier re-sampling (removed in AF/PF 2.30.0) | previous: // Change: Relative Target reads only the latest N sample batches (default 6, Window slider) | previous: 1.104.0 — Change: Target Halving replaced by Relative Target — entry TP / SL are the LPA window's average down / up 1hr move x leverage, Cascade = entry TP, Sacrifice = SL (fixes Cascade/Sacrifice drifting from the adjusted TP/SL); Min Entry TP still floors them and defers entries; no longer needs Sample Scoring | previous: // Fix: Cascade, Sacrifice and Ejection close their positions concurrently (Promise.all) instead of one at a time, so live fill waits no longer stack | previous: Change: defaults match the active config (Both Poles Red on, Pole Blocking off) | previous: Feature: the batch picker calls the host's Silence Amplifier re-sampling (_pfResamplePick) when Liquidation Surveillance isn't picking | previous: Feature: the batch picker calls Liquidation Surveillance's pick (kept liquidated tickers first, quiet ones graylisted and replaced) when that toggle is on | previous: Feature: entry candidates are ranked by how much sample data their criteria have — a thinly-evidenced pole's score is pulled toward zero, and a candidate whose thinnest pole holds under 25% of its bucket type's median sample count is not entered (no toggle). Prior: 1.100.4 — Tweak: graylisted tickers (AF/PF Distillation) are left out of the scan pool, so they are neither sampled nor entered.
   const DEFAULT_SLOTS = [[]];
   const MIW_HIST_KEY  = '__miw_hist_batches';
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
@@ -58,8 +58,9 @@
     miwSubstitutionMarginPct: 5,
     miwSubstitutionMinAgeMins: 35,
     miwDefermentEnabled: true, // Deferment: no new entries while the Sample Scorer headline is negative. Needs Sample Scoring.
-    miwTargetHalvingEnabled: true, // Target Halving: the Sample Scorer's relative headline (favorable share of raw move) scales each new position's entry TP, the Cascade % and the Sacrifice % (recorded peak = full, even share = zero) and defers entries under the Min Entry TP floor. Needs Sample Scoring.
-    miwMinEntryTp: 6,               // Target Halving floor, ROI %: below this a position can't clear its entry+exit fees, so a resolved entry TP or Cascade target under it = market not worth trading -> defer
+    miwRelativeTargetEnabled: true, // Relative Target: each new position's entry TP and SL, and the Cascade / Sacrifice %, follow what the market is paying — the average down and up 1hr move in the PF LPA sample window x leverage. Replaces Relative Target. Needs no Sample Scoring; Cascade or Sacrifice must be on.
+    miwMinEntryTp: 6,               // Relative Target floor, ROI %: below this a position can't clear its entry+exit fees, so a resolved entry TP or Cascade target under it = market not worth trading -> defer
+    miwRelBatches: 6,               // Relative Target: how many of the latest PF sample batches the average up / down move is taken from (older batches are ignored)
     miwDeferBothRedEnabled: true,  // Both-poles-red (sub-toggle of Deferment): also defer while any criterion has BOTH its + and - pole in the red on the scorecard
     miwPoleBlockEnabled: false,    // Pole Blocking (Sample Scoring only): block a pole trailing its positive partner pole's scorecard edge by the threshold or more
     miwPoleBlockPct: 200,           // Pole Blocking threshold, % of the partner pole's edge: blocked when (partner - pole) / partner >= this
@@ -382,7 +383,7 @@
                     <div class="miw-hint">Bails all MIW positions when their collective unrealized profit reaches a % of total base margin.</div>
                   </div>
                 </label>
-                <div class="g" x-show="cfg.miwCascadeEnabled && !cfg.miwTargetHalvingEnabled" style="margin-top:8px">
+                <div class="g" x-show="cfg.miwCascadeEnabled && !cfg.miwRelativeTargetEnabled" style="margin-top:8px">
                   <div class="lbl">Trigger at <b x-text="(cfg.miwCascadePct)+'% of base margin'"></b></div>
                   <input type="range" min="5" max="200" step="5" x-model.number="cfg.miwCascadePct" @change="persist()">
                 </div>
@@ -394,23 +395,26 @@
                     <div class="miw-hint">Bails all MIW positions when their collective unrealized loss reaches a % of avg base margin.</div>
                   </div>
                 </label>
-                <div class="g" x-show="cfg.miwSacrificeEnabled && !cfg.miwTargetHalvingEnabled" style="margin-top:8px">
+                <div class="g" x-show="cfg.miwSacrificeEnabled && !cfg.miwRelativeTargetEnabled" style="margin-top:8px">
                   <div class="lbl">Trigger at <b x-text="'-'+(cfg.miwSacrificePct)+'% of base margin'"></b></div>
                   <input type="range" min="5" max="200" step="5" x-model.number="cfg.miwSacrificePct" @change="persist()">
                 </div>
 
                 <div x-show="cfg.miwCascadeEnabled || cfg.miwSacrificeEnabled" style="margin-top:10px;margin-left:18px">
                   <label class="tog">
-                    <div class="tog-t" :class="cfg.miwTargetHalvingEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.miwTargetHalvingEnabled=!cfg.miwTargetHalvingEnabled;persist()}"><div class="tog-k"></div></div>
+                    <div class="tog-t" :class="cfg.miwRelativeTargetEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.miwRelativeTargetEnabled=!cfg.miwRelativeTargetEnabled;persist()}"><div class="tog-k"></div></div>
                     <div>
-                      <div class="tog-l">Target Halving</div>
-                      <div class="miw-hint">Scorecard weather scales entry TP, SL and Cascade/Sacrifice. Sliders become ceilings.</div>
+                      <div class="tog-l">Relative Target</div>
+                      <div class="miw-hint">Entry TP, SL, Cascade and Sacrifice follow the window's average down/up 1hr move × leverage. Sliders are unused.</div>
                     </div>
                   </label>
-                  <div x-show="cfg.miwTargetHalvingEnabled" style="margin-top:8px">
+                  <div x-show="cfg.miwRelativeTargetEnabled" style="margin-top:8px">
                     <div class="lbl">Min Entry TP <b x-text="cfg.miwMinEntryTp+'%'"></b></div>
                     <input type="range" min="1" max="30" step="0.5" x-model.number="cfg.miwMinEntryTp" @change="persist()">
-                    <div class="miw-hint">Fee break-even. Resolved entry TP or Cascade below this defers entries.</div>
+                    <div class="miw-hint">Fee break-even. Entry TP below this defers entries.</div>
+                    <div class="lbl" style="margin-top:8px">Window <b x-text="cfg.miwRelBatches+(cfg.miwRelBatches==1?' batch':' batches')"></b></div>
+                    <input type="range" min="1" max="25" step="1" x-model.number="cfg.miwRelBatches" @change="persist()">
+                    <div class="miw-hint">Only the latest batches feed the average moves; older readings are ignored.</div>
                     <div class="miw-hint" x-text="_miwTargetsText()"></div>
                   </div>
                 </div>
@@ -529,6 +533,11 @@
           // Single source of truth for all other MIW scalar defaults — see MIW_DEFAULT_CFG above.
           // Call sites read this.cfg.<key> directly with no inline fallback, since this
           // guarantees every key below is present after init runs once.
+          // Target Halving was replaced by Relative Target: carry the old on/off choice across once.
+          if (this.cfg.miwTargetHalvingEnabled !== undefined) {
+            if (this.cfg.miwRelativeTargetEnabled === undefined) this.cfg.miwRelativeTargetEnabled = !!this.cfg.miwTargetHalvingEnabled;
+            delete this.cfg.miwTargetHalvingEnabled;
+          }
           for (const [k, v] of Object.entries(MIW_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : v;
           }
@@ -795,32 +804,42 @@
             label:      'No Entry',
             labelStyle: 'color:rgba(255,160,0,.9)',
             border:     'border-color:rgba(255,160,0,.45);background:rgba(255,160,0,.06)',
-            title:      (d.weatherNeg != null ? `MIW deferment — new entries blocked (scorecard headline ${d.weatherNeg.toFixed(3)} < 0)` : d.bothRed ? `MIW deferment — new entries blocked (both poles of ${d.bothRed} are red)` : `MIW deferment — new entries blocked (scorecard: lowest resolved target ${d.low.toFixed(1)}% < min entry TP ${d.minTp}%)`) + (d.eject ? ' · ejecting all positions' : ''),
+            title:      (d.weatherNeg != null ? `MIW deferment — new entries blocked (scorecard headline ${d.weatherNeg.toFixed(3)} < 0)` : d.bothRed ? `MIW deferment — new entries blocked (both poles of ${d.bothRed} are red)` : `MIW deferment — new entries blocked (relative target ${d.low.toFixed(1)}% < min entry TP ${d.minTp}%)`) + (d.eject ? ' · ejecting all positions' : ''),
             action:     null,
           }];
         },
 
-        // Target Halving — resolves this moment's targets from the Sample Scorer's relative headline S (signed favorable
-        // share of raw move, see _pfSampleWeather) against the recorded peak of S: factor = clamp(S / peak, 0, 1),
-        // i.e. S at the peak -> the configured targets in full, S at an even share or below -> zero (a peak <= 0 -> zero). The configured Cascade %,
-        // Sacrifice % and entry TP are therefore ceilings. Returns the configured targets untouched (active:false) when
-        // Target Halving is off, Sample Scoring is off, or the scorecard has no usable value or peak yet — callers then behave
-        // exactly as before (and Deferment's floor path is off).
+        // Relative Target — resolves this moment's targets from what the market is actually paying: the LPA sample window
+        // (PF's latest 1hr price change % per ticker, from the last cfg.miwRelBatches batches only). The average down move (the side this bot profits from) x leverage is the
+        // entry TP; the average up move x leverage is the SL. Cascade is the entry TP and Sacrifice is the SL, so the four always agree.
+        // Price move % x leverage = ROI %, the unit the host's TP / SL use. Returns the configured targets untouched (active:false) when
+        // Relative Target is off, neither Cascade nor Sacrifice is on, or either side of the window holds too few readings —
+        // callers then behave as before (and Deferment's floor path is off).
+        _miwRelMoves() {
+          const hist = this._pfOcCycleHistory;
+          if (!Array.isArray(hist)) return null;
+          const min = Math.max(3, this.cfg.pfExtremityMinSamples || 3), nb = Math.max(1, Math.round(Number(this.cfg.miwRelBatches) || 6));
+          // Latest nb batches (by time), then each ticker's latest reading within them — the same one-reading-per-ticker rule as the window stats.
+          const cycles = hist.filter(c => c && typeof c.ts === 'number' && Array.isArray(c.results)).sort((x, y) => x.ts - y.ts).slice(-nb);
+          const last = {};
+          for (const c of cycles) for (const r of c.results) if (r && typeof r.sym === 'string' && typeof r.hc === 'number' && isFinite(r.hc)) last[r.sym] = r.hc;
+          let up = 0, nUp = 0, dn = 0, nDn = 0;
+          for (const v of Object.values(last)) {
+            if (v > 0) { up += v; nUp++; } else if (v < 0) { dn -= v; nDn++; }
+          }
+          if (nUp < min || nDn < min) return null;
+          return { up: up / nUp, dn: dn / nDn, nUp, nDn, nb: cycles.length };
+        },
         _miwTargets() {
           const baseTp = Number(this.cfg.binaryModeEnabled ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi) || 18;
-          const out = { active: false, factor: 1, slPct: null, entryTp: baseTp, cascadePct: this.cfg.miwCascadePct, sacrificePct: this.cfg.miwSacrificePct, minTp: Math.max(0, Number(this.cfg.miwMinEntryTp) || 0), wx: null };
-          if (!this.cfg.miwTargetHalvingEnabled || !(this.cfg.miwCascadeEnabled || this.cfg.miwSacrificeEnabled) || !this.cfg.pfSampleScoringEnabled) return out;
-          if (typeof this._pfSampleWeather !== 'function' || typeof this._pfLukewarmFavoredSide !== 'function') return out;
-          const wx = this._pfSampleWeather(this._pfLukewarmFavoredSide());
-          if (!wx || wx.s == null || wx.sHi == null) return out;
-          const f = wx.sHi > 0 ? Math.max(0, Math.min(1, wx.s / wx.sHi)) : 0;
-          out.active = true; out.factor = f; out.wx = wx;
-          out.entryTp = baseTp * f;
-          // New positions' SL scales the same way (tighter in a poor market), off whichever SL the host is using (binary or DCA), never under 1%.
-          const baseSl = Number(this.cfg.binaryModeEnabled ? (this.cfg.binarySlPct ?? 18) : (this.cfg.dcaSlPct ?? 16)) || 16;
-          out.slPct = Math.max(1, baseSl * f);
-          out.cascadePct = this.cfg.miwCascadePct * f;
-          out.sacrificePct = this.cfg.miwSacrificePct * f;
+          const out = { active: false, slPct: null, entryTp: baseTp, cascadePct: this.cfg.miwCascadePct, sacrificePct: this.cfg.miwSacrificePct, minTp: Math.max(0, Number(this.cfg.miwMinEntryTp) || 0), mv: null, lev: Number(this.cfg.leverage) || 6 };
+          if (!this.cfg.miwRelativeTargetEnabled || !(this.cfg.miwCascadeEnabled || this.cfg.miwSacrificeEnabled)) return out;
+          const mv = this._miwRelMoves();
+          if (!mv) return out;
+          const tp = mv.dn * out.lev, sl = Math.max(1, mv.up * out.lev); // SL never under 1%
+          out.active = true; out.mv = mv;
+          out.entryTp = tp; out.slPct = sl;
+          out.cascadePct = tp; out.sacrificePct = sl;
           return out;
         },
         // What Cascade / Sacrifice actually fire at: the resolved value, but never below the Min Entry TP floor (and never
@@ -829,19 +848,17 @@
         _miwEffSacrificePct() { const t = this._miwTargets(); return t.active ? Math.max(t.minTp, 1, t.sacrificePct) : this.cfg.miwSacrificePct; },
         // One-line readout for the Exit tab.
         _miwTargetsText() {
-          if (!this.cfg.miwTargetHalvingEnabled || !(this.cfg.miwCascadeEnabled || this.cfg.miwSacrificeEnabled)) return '';
-          if (!this.cfg.pfSampleScoringEnabled) return 'Inactive — turn Sample Scoring on (Permafrost) to feed it.';
+          if (!this.cfg.miwRelativeTargetEnabled || !(this.cfg.miwCascadeEnabled || this.cfg.miwSacrificeEnabled)) return '';
           const t = this._miwTargets();
-          if (!t.active) return 'Waiting for a scorecard value and peak (needs 10+ samples carrying a raw move).';
-          const low = Math.min(t.entryTp, this.cfg.miwCascadeEnabled ? t.cascadePct : Infinity);
-          return `Now: share ${(t.wx.share * 100).toFixed(1)}% (×${t.factor.toFixed(2)}) · entry TP ${t.entryTp.toFixed(1)}% · SL ${t.slPct.toFixed(1)}% · cascade ${t.cascadePct.toFixed(1)}% · sacrifice ${t.sacrificePct.toFixed(1)}%` + (low < t.minTp ? ' — below floor: deferring' : '');
+          if (!t.active) return 'Waiting for the LPA window — needs 3+ readings on each side of zero in the latest batches.';
+          return `Now: avg down ${t.mv.dn.toFixed(2)}% · avg up ${t.mv.up.toFixed(2)}% (×${t.lev}, ${t.mv.nb} batch${t.mv.nb===1?'':'es'}, ${t.mv.nUp + t.mv.nDn} tickers) · entry TP ${t.entryTp.toFixed(1)}% · SL ${t.slPct.toFixed(1)}% · cascade ${this._miwEffCascadePct().toFixed(1)}% · sacrifice ${this._miwEffSacrificePct().toFixed(1)}%` + (t.entryTp < t.minTp ? ' — below floor: deferring' : '');
         },
 
-        // Deferment — regime proxy. Defers (no new entries) while the Sample Scorer headline is negative; the Target Halving
-        // floor is its own separate stop. Both need Sample Scoring.
+        // Deferment — regime proxy. Defers (no new entries) while the Sample Scorer headline is negative (needs Sample Scoring); the Relative Target
+        // floor is its own separate stop (needs only the LPA window).
         // eject: two or more deferment paths in effect at once -> Ejection bails every open position.
         // Both-poles-red: the first criterion (dial family) whose + and - poles are BOTH proven and negative on the
-        // scorecard side the chart shows (same favored side as Target Halving). No entry pole to favor = no good entry.
+        // scorecard side the chart shows. No entry pole to favor = no good entry.
         _miwBothPolesRed() {
           if (typeof this._pfLukewarmFavoredSide !== 'function') return null;
           const list = (this.pfLukewarmScoreboard || {})[this._pfLukewarmFavoredSide()] || [];
@@ -872,14 +889,14 @@
         },
         _miwDefermentStateBase() {
           const off = { deferring: false, eject: false };
-          // Target Halving (scorecard) mode — whenever it has a usable scorecard value: defer while
-          // the resolved entry TP, or the resolved Cascade target (if Cascade is on), is under the Min Entry TP floor.
-          // Independent of the Deferment toggle itself (the floor is Target Halving's own stop).
+          // Relative Target mode — whenever it has a usable LPA window: defer while the resolved entry TP
+          // (Cascade is the same number) is under the Min Entry TP floor.
+          // Independent of the Deferment toggle itself (the floor is Relative Target's own stop).
           const tg = this._miwTargets();
           if (tg.active) {
-            const low = Math.min(tg.entryTp, this.cfg.miwCascadeEnabled ? tg.cascadePct : Infinity);
+            const low = tg.entryTp;
             if (!(low < tg.minTp)) return off;
-            return { deferring: true, eject: false, scorecard: true, low, minTp: tg.minTp, wx: tg.wx };
+            return { deferring: true, eject: false, scorecard: true, low, minTp: tg.minTp, mv: tg.mv };
           }
           return off;
         },
@@ -990,7 +1007,6 @@
           // graylisted and replaced, and the batch is always filled to the cap (_pfLiqPick). null = off / following: the random batch stands.
           const liqBatch = this._pfLiqPick?.(fillSyms, cap);
           if (liqBatch && liqBatch.length) fillSyms = liqBatch;
-          else { const rsBatch = this._pfResamplePick?.(fillSyms, cap); if (rsBatch && rsBatch.length) fillSyms = rsBatch; } // Silence Amplifier: noisy tickers first, capped ones left out (non-liquidation batches)
           await this._ocFetchBatch(fillSyms.slice(0, cap), null, false, needsHr);
           const ocResults = this.pfOcResults || {};
           const freshAt = this._pfOcResultsAt || 0;
@@ -1121,7 +1137,7 @@
           if (_miwHalted) return;
 
           if (_miwDef.deferring) {
-            if (!this._miwDeferLogged) { this.log(_miwDef.weatherNeg != null ? `[MIW] ⛔ Deferment — scorecard headline is negative (${_miwDef.weatherNeg.toFixed(3)}); no new entries until it turns positive` : _miwDef.bothRed ? `[MIW] ⛔ Deferment — both poles of ${_miwDef.bothRed} are red on the scorecard; no new entries until one turns` : `[MIW] ⛔ Deferment — scorecard resolves a ${_miwDef.low.toFixed(1)}% target, under the ${_miwDef.minTp}% min entry TP (weather ${_miwDef.wx.value >= 0 ? '+' : '-'}$${Math.abs(_miwDef.wx.value).toFixed(3)}); no new entries until it recovers`, 'info'); this._miwDeferLogged = true; }
+            if (!this._miwDeferLogged) { this.log(_miwDef.weatherNeg != null ? `[MIW] ⛔ Deferment — scorecard headline is negative (${_miwDef.weatherNeg.toFixed(3)}); no new entries until it turns positive` : _miwDef.bothRed ? `[MIW] ⛔ Deferment — both poles of ${_miwDef.bothRed} are red on the scorecard; no new entries until one turns` : `[MIW] ⛔ Deferment — relative target resolves ${_miwDef.low.toFixed(1)}%, under the ${_miwDef.minTp}% min entry TP (avg down ${_miwDef.mv.dn.toFixed(2)}% × ${Number(this.cfg.leverage) || 6}); no new entries until it recovers`, 'info'); this._miwDeferLogged = true; }
             return;
           }
 
@@ -1262,7 +1278,7 @@
             const pos = await this.pseudoOpenShort({
               symbol: sym, price, change, fundingRate: fr,
               _tpPct: _tg.active ? +_tg.entryTp.toFixed(2) : undefined,
-              _slPct: _tg.active ? +_tg.slPct.toFixed(2) : undefined, // Target Halving: this position's own SL (host honours it via _slPctOverride) // Target Halving: this position's own entry TP (host honours it, see pseudoOpenShort)
+              _slPct: _tg.active ? +_tg.slPct.toFixed(2) : undefined, // Relative Target: this position's own SL (host honours it via _slPctOverride) and entry TP (host honours it, see pseudoOpenShort)
               _miw: true,
               _miwPathA: true, // runScan's entryPool only ever contains 0-liq (closed-cycle) matches
               _miwSlotIdx: slotIdx ?? 0,
