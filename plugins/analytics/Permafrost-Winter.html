@@ -28,7 +28,7 @@
 (function () {
   'use strict';
 
-    const VERSION        = '2.34.1'; // Change: Forecast Grader's actual move is measured from the forecast price to the typical price (high + low + close) / 3 of the hour candle already fetched for the revisit, not the last price alone (falls back to the last price when that candle is missing); the hour candle now also keeps its typical price | previous: 2.34.0 - Change: Forecast Grader grades the raw price move in the bot's favor (was the move less its start batch's mean), so Actual pp now matches the price direction; Future Awareness pole scores and weights learn from the same raw move; older graded forecasts are read the same way from their stored raw move
+    const VERSION        = '2.36.0'; // Change: the sample batch now reads 5-minute candles (merged into the hour candle LTA/LPA already use) and Bybit's long/short ratio; IO/A is replaced by IO/L and IO/S (long / short share of open interest vs its window average); the forecast grader grades the move less its batch mean over the last ~10 minutes and logs the path, a wide snapshot, batch context and alternative projections in the export; sparsity block and shrink are off while Future Awareness is on | previous: 2.35.1 - Change: Stablecoin Filter gate is now absolute, not relative to the universe mean (which graylisted most tickers): a ticker whose hour candle open, high, low, close and current price span less than the set % (default 0.01) is graylisted; the mean range, its 20-reading minimum and the megacap skip are gone
 
 
 
@@ -80,6 +80,9 @@
     pfIlqEnabled: false,           // Illiquidity Filter (option): each sample batch measures tickers whose last reading is older than pfIlqRefreshDays (one 3-trade fetch each); a ticker whose trades average slower than pfIlqSlowSecs between them is left out of samples and entries until its reading expires
     pfIlqSlowSecs: 12,             // Illiquidity Filter: average seconds between a ticker's last 3 trades above which it counts as illiquid
     pfIlqRefreshDays: 7,           // Illiquidity Filter: days a measurement stays valid before the ticker is measured again (in the next batch it appears in)
+    pfStbEnabled: true,            // Stablecoin Filter: a ticker whose hour candle (open/high/low/close + current price) spans less than pfStbMinPct % is graylisted for pfStbHours hours
+    pfStbMinPct: 0.01,             // Stablecoin Filter: absolute range (% of the open) below which a ticker counts as a stablecoin
+    pfStbHours: 12,                // Stablecoin Filter: hours a stablecoin verdict keeps the ticker out before it is re-evaluated
     pfMixedPct: 30,                // pill presentation: a watch is 'mixed' when the minority side holds more than this % of its liquidated turnover
     pfFcEnabled: true,            // Forecast Grader (sub-toggle of Sample Scoring): freezes each sampled ticker's score as a price forecast and grades it at a revisit a few batches later; measurement only, touches no score
     pfFcShare: 50,                // Forecast Grader: share (%) of each sample batch's slots taken by revisits (planned before Liquidation Surveillance fills the rest)
@@ -158,13 +161,18 @@
   // watch in progress, the watched set, and the closed watch waiting for its end-of-watch criteria (see _pfLiqPick/_pfLiqIngest).
   const LIQ = { ws: null, subs: new Set(), want: new Set(), tally: {}, ping: null, retry: null, watch: null, closing: null, restored: false, pt: null };
   const LIQ_KEY = '__pf_liq_pending'; // the watch in progress (+ any closed watch not yet scored), so a reload finalizes it at the next scan
-  const HOUR_CACHE = {}; // sym -> { start, ht, hc } — last-completed-hour candle, one fetch per ticker per hour
+  const HOUR_CACHE = {}; // sym -> { start, ht, hc, htp } — last-completed-hour candle merged from 5-minute candles (batch fetches skip the cache)
   const ILQ_KEY = '__ew_pf_ilq_v1'; // Illiquidity Filter: { SYM: { t: ms measured, g: avg ms between the last 3 trades } }
   const ILQ = { rec: {}, loaded: false }; // non-reactive (read from render paths)
+  const STB_KEY = '__ew_pf_stb_v1'; // Stablecoin Filter: { SYM: ms the verdict was made }
+  const STB = { rec: {}, loaded: false }; // non-reactive (read from render paths)
+  const CAND5 = {}; // sym -> { at, c: [5-minute candles, ascending] } from this batch's fetch; memory only, read by the grader right after the batch
   const pfCritEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '🤑' : '💸') + s; }
     if (/^vm/.test(c))   return '🔊' + c.slice(2);
     if (/^va/.test(c))   return '🔊' + c.slice(2);
+    if (/^iol/.test(c))  return '🐂' + c.slice(3);
+    if (/^ios/.test(c))  return '🐻' + c.slice(3);
     if (/^ioa/.test(c))  return '🎲' + c.slice(3);
     // Retired (see VSG.md) — kept resolvable so old scorecard entries still render.
     if (/^lsa/.test(c))  return '🟥' + c.slice(3);
@@ -244,6 +252,9 @@
     'fund+': { family: 'fund', pole: 'pos' },       'fund-': { family: 'fund', pole: 'neg' },
     'va+':   { family: 'va',   pole: 'pos' },       'va-':   { family: 'va',   pole: 'neg' },
     'ioa+':  { family: 'ioa',  pole: 'pos' },       'ioa-':  { family: 'ioa',  pole: 'neg' },
+    // IO/L and IO/S replace IO/A in the sample scorer and forecast: the long / short share of open interest (oi x Bybit's long/short ratio) against its window average. IO/A stays resolvable for old entries.
+    'iol+':  { family: 'iol',  pole: 'pos' },       'iol-':  { family: 'iol',  pole: 'neg' },
+    'ios+':  { family: 'ios',  pole: 'pos' },       'ios-':  { family: 'ios',  pole: 'neg' },
     // LTA/LPA — 1hr turnover vs own 24h/24, and 1hr price change vs the population's.
     'lta+':  { family: 'lta',  pole: 'pos' },       'lta-':  { family: 'lta',  pole: 'neg' },
     'lpa+':  { family: 'lpa',  pole: 'pos' },       'lpa-':  { family: 'lpa',  pole: 'neg' },
@@ -497,6 +508,20 @@
                     <div class="lbl" style="margin-top:6px">Measure again after (days)</div>
                     <input type="number" min="1" max="60" step="1" x-model.number="cfg.pfIlqRefreshDays" :disabled="cfgLocked" @change="cfg.pfIlqRefreshDays=Math.min(60,Math.max(1,Math.round(+cfg.pfIlqRefreshDays||7)));persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                     <div class="pfr-hint" x-text="(()=>{ const q=_pfIlqStats(); return q.slow+' illiquid · '+q.n+' measured'+(q.worst?' · slowest '+(q.worst/1000).toFixed(1)+'s':''); })()"></div>
+                  </div>
+                  <label class="tog" style="margin-top:10px" x-data="{h:false}">
+                    <div class="tog-t" :class="cfg.pfStbEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.pfStbEnabled=!cfg.pfStbEnabled;persist()}"><div class="tog-k"></div></div>
+                    <div>
+                      <div class="tog-l">Stablecoin Filter <span class="pfr-i" @click.prevent.stop="h=!h">ⓘ</span></div>
+                      <div class="pfr-hint" x-show="h">Compares each hour candle's open, high, low, close and the current price (no extra fetch). A ticker spanning less than the set % is graylisted from samples and entries for the set hours, then re-evaluated.</div>
+                    </div>
+                  </label>
+                  <div style="margin-top:6px" x-show="cfg.pfStbEnabled">
+                    <div class="lbl">Stablecoin when hour range is under (% of price)</div>
+                    <input type="number" min="0.001" max="5" step="0.001" x-model.number="cfg.pfStbMinPct" :disabled="cfgLocked" @change="cfg.pfStbMinPct=Math.min(5,Math.max(0.001,+cfg.pfStbMinPct||0.01));persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                    <div class="lbl" style="margin-top:6px">Graylist for (hours)</div>
+                    <input type="number" min="1" max="720" step="1" x-model.number="cfg.pfStbHours" :disabled="cfgLocked" @change="cfg.pfStbHours=Math.min(720,Math.max(1,Math.round(+cfg.pfStbHours||12)));persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                    <div class="pfr-hint" x-text="_pfStbStats().n+' graylisted'"></div>
                   </div>
                   <div class="pfr-hint" style="margin-top:8px" x-text="(()=>{ const last=_pfOcLatestCycle(); if(!last) return 'no sample yet'; const ago=Math.round((Date.now()-last.ts)/60000)+'m ago'; const n=(last.results||[]).length; return n+' ticker'+(n!==1?'s':'')+' sampled · last: '+ago; })()"></div>
                   <div x-show="!cfg.pfSampleScoringEnabled" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06)">
@@ -772,6 +797,7 @@
           this.pfDialSamplePool = this._pfLoadDialPool();
           this._pfSampleLoad();
           this._pfIlqLoad();
+          this._pfStbLoad();
           try { localStorage.removeItem('__ew_pf_rs_v1'); } catch (_) {} // retired Silence Amplifier re-sample counters
           this._pfFcLoad();
           this._pfScoreTrim();
@@ -1293,7 +1319,7 @@
         _pfFollowing() { return !!this._lfIsFollowing?.(); },
         _pfSampleDir() { return -1; },
         _pfSampleStep(fam) {
-          const D = { fund: 0.0025, va: 1, ioa: 1, lta: 10, lpa: 0.25 };
+          const D = { fund: 0.0025, va: 1, ioa: 1, iol: 1, ios: 1, lta: 10, lpa: 0.25 };
           const k = 'miw' + fam.charAt(0).toUpperCase() + fam.slice(1) + 'Step';
           const v = Number(this.cfg[k]);
           return v > 0 ? v : D[fam];
@@ -1614,12 +1640,74 @@
           return { n, slow, worst };
         },
 
+        // -- Stablecoin Filter ----------------------------------------------------------------------------------------
+        // Passive: rides on the hour-candle fetch the sample batch already makes (limit=3 also returns the forming candle, whose close is
+        // the current price). A ticker's range = (highest - lowest of the completed candle's open/high/low/close and the current price) / open.
+        // Under pfStbMinPct % (default 0.01) = stablecoin: graylisted for pfStbHours (default 12) hours, out of samples and entries
+        // (MIC/MIW's pool via pfGrayHas), then measured again the next batch it appears in. The leader judges and publishes; a follower adopts.
+        _pfStbLoad() {
+          try {
+            const d = JSON.parse(localStorage.getItem(STB_KEY) || 'null');
+            STB.rec = (d && typeof d === 'object' && !Array.isArray(d)) ? d : {};
+          } catch (_) { STB.rec = {}; }
+          STB.loaded = true;
+        },
+        _pfStbMaxAgeMs() { return Math.max(1, Number(this.cfg.pfStbHours) || 12) * 3600000; },
+        _pfStbIs(sym) {
+          if (!this.cfg.pfStbEnabled) return false;
+          if (!STB.loaded) this._pfStbLoad();
+          const t = STB.rec[sym];
+          return typeof t === 'number' && Date.now() - t < this._pfStbMaxAgeMs();
+        },
+        _pfStbSave() {
+          const cut = Date.now() - this._pfStbMaxAgeMs();
+          for (const k of Object.keys(STB.rec)) if (!(STB.rec[k] >= cut)) delete STB.rec[k];
+          try { localStorage.setItem(STB_KEY, JSON.stringify(STB.rec)); } catch (_) {}
+          if (!this._pfFollowing()) this._sharedWrite?.('stb', { ...STB.rec });
+        },
+        _pfStbAdopt() {
+          if (!this.cfg.pfStbEnabled || !this._pfFollowing()) return;
+          const sh = this._sharedRead?.('stb');
+          if (!sh?.data || sh.ts === this._pfStbLastTs) return;
+          this._pfStbLastTs = sh.ts;
+          if (!STB.loaded) this._pfStbLoad();
+          let any = false;
+          for (const [k, v] of Object.entries(sh.data)) {
+            if (!(v > 0)) continue;
+            if (!(STB.rec[k] >= v)) { STB.rec[k] = v; any = true; }
+          }
+          if (any) try { localStorage.setItem(STB_KEY, JSON.stringify(STB.rec)); } catch (_) {}
+        },
+        // Called with every freshly fetched hour candle (list = the kline rows, newest first).
+        _pfStbJudge(sym, start, o, hi, lo, c, list) {
+          if (!this.cfg.pfStbEnabled || this._pfFollowing()) return;
+          const vals = [o, hi, lo, c];
+          const fr = (list || []).find(r => parseInt(r[0], 10) > start);
+          const cur = fr ? parseFloat(fr[4]) : NaN;
+          if (cur > 0) vals.push(cur);
+          if (vals.some(v => !(v > 0))) return;
+          const r = (Math.max(...vals) - Math.min(...vals)) / o * 100;
+          if (r < (Number(this.cfg.pfStbMinPct) || 0.01) && !this._pfStbIs(sym)) {
+            if (!STB.loaded) this._pfStbLoad();
+            STB.rec[sym] = Date.now();
+            this._pfStbSave();
+          }
+        },
+        // Readout number: tickers graylisted now.
+        _pfStbStats() {
+          if (!STB.loaded) this._pfStbLoad();
+          const maxAge = this._pfStbMaxAgeMs(); let n = 0;
+          for (const k of Object.keys(STB.rec)) if (Date.now() - STB.rec[k] < maxAge) n++;
+          return { n };
+        },
+
         // Scorecard readout: scored-sample count, graylisted tickers and the liquidation watch.
         _pfSampleStatusHtml() {
           const st = this._pfSampleStore || { obs: [] };
           const kind = this._pfSampleKind();
           const n = this._pfObsLive().filter(o => o.k === kind).length;
           let h = `<div>${n} scored sample${n === 1 ? '' : 's'}${this._pfFollowing() ? ' · from leader' : ''}</div>`;
+          if (this.cfg.pfStbEnabled) { const q = this._pfStbStats(); h += `<div>${q.n} stablecoin${q.n === 1 ? '' : 's'} graylisted</div>`; }
           if (this.cfg.pfIlqEnabled) { const q = this._pfIlqStats(); h += `<div>${q.slow} illiquid (&gt;${Number(this.cfg.pfIlqSlowSecs) || 12}s) · ${q.n} measured${q.worst ? ' · slowest ' + (q.worst / 1000).toFixed(1) + 's' : ''}</div>`; }
           if (this.cfg.pfLiqEnabled) {
             const nl = this._pfObsLive().filter(o => o.k === 'l').length, q = Object.keys(st.lgray || {}).length;
@@ -1670,6 +1758,7 @@
         // The check the MIC/MIW pool build uses: the unstable set (works for a follower too — the split rides on the adopted history),
         // plus the legacy time-based graylist (st.gray) for the leader.
         _pfGrayHas(sym) {
+          if (this._pfStbIs(sym)) return true; // Stablecoin Filter
           if (this._pfIlqIs(sym)) return true; // Illiquidity Filter: measured slow, reading still live
           if (this._pfInstabOn() && this._pfInstabStats().gray.has(sym)) return true;
           const c = this.cfg, t = this._pfSampleStore?.gray?.[sym];
@@ -1719,7 +1808,13 @@
           }
           const wv = this._pfVolIoWindowAvg?.('vol'), wo = this._pfVolIoWindowAvg?.('oi');
           if (vol > 0 && wv > 0) tags.push('va' + sgn(Math.floor((Math.log(vol / wv) * 100) / this._pfSampleStep('va'))));
-          if (oi > 0 && wo > 0) tags.push('ioa' + sgn(Math.floor((Math.log(oi / wo) * 100) / this._pfSampleStep('ioa'))));
+          // IO/L, IO/S: the long / short share of open interest (oi x long share, oi x short share) against that share's window average, same log-tier as V/A. Needs the batch's long/short ratio (bl) and 10+ readings in the window.
+          if (oi > 0 && Number(r.bl) > 0 && Number(r.bl) < 1) {
+            for (const [fam, long] of [['iol', 1], ['ios', 0]]) {
+              const st = this._pfWindowStats(long ? 'oil' : 'ois'), v = this._pfLsOi(r, long);
+              if (st.n >= 10 && v > 0) tags.push(fam + sgn(Math.floor((Math.log(v / (st.sum / st.n)) * 100) / this._pfSampleStep(fam))));
+            }
+          }
           if (typeof r.ht === 'number') {
             const dev = this._pfLtaDev(r.ht, r.vol);
             if (dev != null) tags.push('lta' + sgn(Math.floor(dev / this._pfSampleStep('lta'))));
@@ -2052,7 +2147,7 @@
           const side = this._pfLukewarmFavoredSide();
           const entries = board[side] || [];
           const accent = side === 'lukewarm' ? 'rgba(150,150,160,.45)' : 'rgba(96,210,255,.45)';
-          const FAMS = ['fund', 'va', 'ioa', 'lta', 'lpa'].filter(f => !(this.cfg.pfSampleScoringEnabled && !this.cfg.pfLiqEnabled && f === 'lpa')); // Sample Scoring never scores LPA (it is the outcome), so its dial stays hidden
+          const FAMS = ['fund', 'va', 'iol', 'ios', 'lta', 'lpa'].filter(f => !(this.cfg.pfSampleScoringEnabled && !this.cfg.pfLiqEnabled && f === 'lpa')); // Sample Scoring never scores LPA (it is the outcome), so its dial stays hidden
           const byKey = {};
           for (const s of entries) byKey[s.key] = s;
           const sm = !!this.cfg.pfSampleScoringEnabled;
@@ -2418,6 +2513,7 @@
         // Sparsity of a candidate's whole tag list: factor = its thinnest pole's f; block when that pole holds under pfSparsePct% of
         // its bucket type's median sample count (default 25). Not optional — there is no toggle.
         _pfSparse(annots) {
+          if (this._pfFcAwareOn()) return { factor: 1, block: false, note: '' }; // Future Awareness learns from forward outcomes: the thin-pole shrink and the block are both off
           let factor = 1, worst = null;
           for (const a of (annots || [])) {
             const o = this._pfSparseOne(a);
@@ -2545,11 +2641,12 @@
           const results = {};
           let ilqNew = 0, ilqCut = 0; // Illiquidity Filter: tickers measured this batch / found illiquid and left out
           for (const k of Object.keys(FRESH_TICKERS)) delete FRESH_TICKERS[k];
+          for (const k of Object.keys(CAND5)) delete CAND5[k];
           {
             const CONC = 10;
             for (let i = 0; i < symbols.length; i += CONC) {
               await Promise.all(symbols.slice(i, i + CONC).map(async sym => {
-                if (this._pfIlqIs(sym)) return; // Illiquidity Filter: measured slow and the reading is still live — not sampled
+                if (this._pfIlqIs(sym) || this._pfStbIs(sym)) return; // Illiquidity Filter: measured slow and the reading is still live — not sampled
                 let rec = await this._pfFetchFreshTicker(sym);
                 if (!rec) return;
                 // Illiquidity Filter: one 3-trade measurement per ticker per refresh window, taken the first batch it appears in after expiry.
@@ -2562,7 +2659,9 @@
                 }
                 
                 // LTA/LPA: last-completed-hour candle for every sampled ticker (cached per hour).
-                if (wantHr) { const h = await this._pfHourCandle(sym); if (h) rec = { ...(rec || {}), ht: h.ht, hc: h.hc, ...(h.htp > 0 ? { htp: h.htp } : {}) }; }
+                { const bl = await this._pfLsRatio(sym); if (bl != null) rec = { ...(rec || {}), bl: +bl.toFixed(4) }; } // long/short account ratio: the long share, for IO/L and IO/S
+                if (wantHr) { const h = await this._pfHourCandle(sym, true); if (h) rec = { ...(rec || {}), ht: h.ht, hc: h.hc, ...(h.htp > 0 ? { htp: h.htp } : {}) }; }
+                if (this._pfStbIs(sym)) { delete FRESH_TICKERS[sym]; return; } // Stablecoin Filter: this hour's candle just flagged it
                 results[sym] = rec;
               }));
             }
@@ -2659,6 +2758,7 @@
         _ocSeedFromShared() {
           this._pfSampleAdopt?.();
           this._pfIlqAdopt?.();
+          this._pfStbAdopt?.();
           this._pfFcAdopt?.();
           const shared = this._sharedRead?.('ocResults');
           if (!shared?.data) return;
@@ -2845,11 +2945,11 @@
         //     scores: pp against the field, in the bot's favor) and that projection is frozen together with the price from the same fetch.
         //   2nd appearance, the revisit: MIC/MIW's batch builder asks _pfFcPlan for the tickers whose turn it is BEFORE Liquidation
         //     Surveillance fills the rest (revisits take pfFcShare % of the slots; liquidation only sees the remainder and never the
-        //     revisits). The fresh price against the frozen one is the actual (the raw move, in the bot's favor when read); projected vs actual is graded.
+        //     revisits). The fresh price against the frozen one, less its start batch's mean move, is the actual (in the bot's favor when read); projected vs actual is graded.
         // Due is a batch NUMBER (a persisted counter), never a timer, so a plugin reload does not misalign it. Each forecast keeps its real
         // elapsed time; one that sat past 1.5x the expected lead (downtime) is voided, not graded. A due ticker that is not in the batch
         // (illiquid by now, fetch failed) is retried for two more batches, then voided.
-        // Measurement only unless Future Awareness is on (it then rewrites pole scores, not the headline). Stored direction-neutral (raw moves; the bot's favor is applied
+        // Measurement only unless Future Awareness is on (it then rewrites pole scores, not the headline). Stored direction-neutral (batch-relative moves; the bot's favor is applied
         // when read) so a following partner of the other direction can adopt the leader's store.
         // Accuracy (0-100) at which a forecast counts as a useful reading: the chart's up / down split and the ticker table's colors.
         _pfFcPass() { return 70; },
@@ -2857,19 +2957,20 @@
         _pfFcShare() { const v = Number(this.cfg.pfFcShare); return Math.max(5, Math.min(90, isFinite(v) && v > 0 ? v : 50)) / 100; },
         _pfFcLead() { const v = Math.round(Number(this.cfg.pfFcLead)); return Math.max(2, Math.min(24, isFinite(v) && v > 0 ? v : 6)); },
         _pfFcKeep() { const v = Math.round(Number(this.cfg.pfFcKeep)); return Math.max(60, Math.min(3000, isFinite(v) && v > 0 ? v : 600)); },
-        _pfFcNew() { return { seq: 0, ts: 0, pend: [], done: [], voids: { gone: 0, late: 0, thin: 0 }, nof: 0 }; },
+        _pfFcNew() { return { seq: 0, ts: 0, pend: [], done: [], voids: { gone: 0, late: 0, thin: 0 }, nof: 0, ctx: {} }; },
         _pfFcStore() { return (this._pfFc ||= this._pfFcNew()); },
         _pfFcSanW(w) { if (!w || typeof w !== 'object') return null; const o = {}; for (const k of Object.keys(w)) if (typeof w[k] === 'number' && isFinite(w[k])) o[k] = w[k]; return Object.keys(o).length ? o : null; },
         _pfFcSanitize(d) {
           const num = v => (typeof v === 'number' && isFinite(v)) ? v : null, o = this._pfFcNew();
           if (!d || typeof d !== 'object') return o;
           o.seq = Math.max(0, d.seq | 0); o.ts = num(d.ts) || 0; o.nof = Math.max(0, d.nof | 0);
+          if (d.ctx && typeof d.ctx === 'object') for (const k of Object.keys(d.ctx)) { const w = this._pfFcSanW(d.ctx[k]); if (w) o.ctx[k] = w; }
           const v = d.voids || {};
           o.voids = { gone: v.gone | 0, late: v.late | 0, thin: v.thin | 0 };
           if (Array.isArray(d.pend)) o.pend = d.pend.filter(f => f && typeof f.s === 'string' && num(f.a) != null && num(f.d) != null && num(f.t) != null && num(f.p) > 0 && num(f.e) != null)
-            .map(f => ({ s: f.s, a: f.a | 0, d: f.d | 0, t: f.t, p: f.p, e: f.e, c: typeof f.c === 'string' ? f.c : '', w: this._pfFcSanW(f.w) }));
+            .map(f => ({ s: f.s, a: f.a | 0, d: f.d | 0, t: f.t, p: f.p, p0: num(f.p0), e: f.e, c: typeof f.c === 'string' ? f.c : '', w: this._pfFcSanW(f.w), ep: this._pfFcSanW(f.ep), sn: this._pfFcSanW(f.sn) }));
           if (Array.isArray(d.done)) o.done = d.done.filter(r => r && typeof r.s === 'string' && num(r.a) != null && num(r.e) != null && num(r.y) != null)
-            .map(r => ({ s: r.s, a: r.a | 0, d: r.d | 0, t: num(r.t) || 0, u: num(r.u) || 0, e: r.e, y: num(r.m) != null ? r.m : r.y, m: num(r.m), k: num(r.k), c: typeof r.c === 'string' ? r.c : '', w: this._pfFcSanW(r.w) }));
+            .map(r => ({ s: r.s, a: r.a | 0, d: r.d | 0, t: num(r.t) || 0, u: num(r.u) || 0, e: r.e, y: (num(r.m) != null && num(r.k) != null) ? +(r.m - r.k).toFixed(4) : r.y, m: num(r.m), k: num(r.k), mu: num(r.mu), md: num(r.md), c: typeof r.c === 'string' ? r.c : '', w: this._pfFcSanW(r.w), ep: this._pfFcSanW(r.ep), sn: this._pfFcSanW(r.sn) }));
           return o;
         },
         _pfFcLoad() {
@@ -2916,17 +3017,17 @@
           const sb = this.pfLukewarmScoreboard;
           if (!sb || !Array.isArray(tags)) return null;
           const cut = this.pfDialCutoffs || {}, minS = Math.max(3, this.cfg.pfExtremityMinSamples || 3);
-          let s = 0, n = 0; const w = {};
+          let s = 0, n = 0, mx = 0; const w = {};
           for (const tag of tags) {
             const info = dialInfo(collapseCrit(tag));
             if (!info || info.family === 'lpa') continue;
             const m = tag.match(/(-?\d+)$/), mag = m ? Math.abs(parseInt(m[1], 10)) : 0, c = cut[info.family + '|' + info.pole];
             const ent = ((c != null && mag >= c) ? sb.extreme : sb.lukewarm || []).find(e => e.family === info.family && e.pole === info.pole);
-            if (ent && ent.n >= minS && isFinite(ent.pnl)) { s += ent.pnl; n++; w[info.family] = (w[info.family] || 0) + ent.pnl; }
+            if (ent && ent.n >= minS && isFinite(ent.pnl)) { s += ent.pnl; n++; w[info.family] = (w[info.family] || 0) + ent.pnl; if (Math.abs(ent.pnl) > Math.abs(mx)) mx = ent.pnl; }
           }
           if (!n) return null;
           for (const k of Object.keys(w)) w[k] /= n;
-          return { e: s / n, w };
+          return { e: s / n, w, sum: s, max: mx }; // e = the mean of the poles (the graded projection); sum and max (strongest single pole) ride along for the export
         },
         // Called from the batch builder (MIC/MIW) before the batch is fetched: the revisits whose turn it is, oldest first, up to their
         // share of the slots. null = off / following (the batch builder then proceeds as before).
@@ -2936,7 +3037,7 @@
           const rev = [], seen = new Set();
           for (const f of fc.pend.filter(x => x.d <= seq).sort((a, b) => a.d - b.d || a.t - b.t)) {
             if (rev.length >= slots) break;
-            if (seen.has(f.s) || this._pfIlqIs(f.s)) continue; // an illiquid one is left to void out in the ingest
+            if (seen.has(f.s) || this._pfIlqIs(f.s) || this._pfStbIs(f.s)) continue; // an illiquid one is left to void out in the ingest
             seen.add(f.s); rev.push(f.s);
           }
           this._pfFcPlanned = { seq, cap, rev: new Set(rev) };
@@ -2955,23 +3056,28 @@
           const seq = fc.seq, maxMs = 1.5 * lead * this._pfFcStepMs();
           const pl = (this._pfFcPlanned && this._pfFcPlanned.seq === seq) ? this._pfFcPlanned : null;
           const cap = pl ? pl.cap : Math.max(1, Math.min(2500, Math.round(Number(this.cfg.pfOcBatchSize) || 250)));
-          // 1. Grade what is due. The actual is the raw move since the forecast: from the frozen price to the revisit's typical price ((high + low + close) / 3 of its hour candle; the last price when the batch has no candle). The start batch's mean move is kept as k, for the export only.
+          // 1. Grade what is due. The actual is the move since the forecast, from the frozen price (the typical price of its last ~10 minutes) to the revisit's typical price over the last ~10 minutes (5-minute candles; the hour candle's typical price, then the last price, when the ticker traded nothing that recently). y = that move less the start batch's mean move (the grade reads selection, not the market); the raw move m and the path (mu / md: highest and lowest point since the forecast, in %) are kept too.
           const groups = new Map(), still = [];
           for (const f of fc.pend) {
             if (f.d > seq) { still.push(f); continue; }
             const r = by[f.s], px = r ? Number(r.px) : 0;
             if (!(px > 0)) { if (seq - f.d >= 2) fc.voids.gone++; else still.push(f); continue; }
             if (entry.ts - f.t > maxMs) { fc.voids.late++; continue; }
-            const m = ((r.htp > 0 ? r.htp : px) / f.p - 1) * 100; // typical price (high + low + close) / 3 of the hour candle when the batch carries it, else the last price
+            const cs = CAND5[f.s]?.c, t10 = this._pfTyp10(cs, entry.ts), base = t10 > 0 ? t10 : (r.htp > 0 ? r.htp : px);
+            const m = (base / f.p - 1) * 100;
             if (!isFinite(m)) { fc.voids.gone++; continue; }
+            let mu = null, md = null; // the path since the forecast: highest and lowest point over the 5-minute candles from then on, % of the frozen price
+            if (cs && cs.length) { const w = cs.filter(x => x.s + 300000 > f.t); if (w.length) { mu = (Math.max(...w.map(x => x.h)) / f.p - 1) * 100; md = (Math.min(...w.map(x => x.l)) / f.p - 1) * 100; } }
             if (!groups.has(f.a)) groups.set(f.a, []);
-            groups.get(f.a).push({ f, m });
+            groups.get(f.a).push({ f, m, mu, md });
           }
           for (const [a, arr] of groups) {
             if (arr.length < 3) { fc.voids.thin += arr.length; continue; }
             const M = arr.reduce((s, x) => s + x.m, 0) / arr.length;
-            for (const { f, m } of arr) fc.done.push({ s: f.s, a, d: seq, t: f.t, u: entry.ts, e: f.e, y: +m.toFixed(4), m: +m.toFixed(4), k: +M.toFixed(4), c: f.c, w: f.w || null });
+            for (const { f, m, mu, md } of arr) fc.done.push({ s: f.s, a, d: seq, t: f.t, u: entry.ts, e: f.e, y: +(m - M).toFixed(4), m: +m.toFixed(4), k: +M.toFixed(4), mu: mu == null ? null : +mu.toFixed(4), md: md == null ? null : +md.toFixed(4), c: f.c, w: f.w || null, ep: f.ep || null, sn: f.sn || null });
           }
+          fc.ctx = fc.ctx || {}; fc.ctx[seq] = this._pfFcCtx(entry); // the market around this batch, for the export
+          { const ks = Object.keys(fc.ctx).map(Number).sort((x, y) => x - y); for (const k of ks.slice(0, Math.max(0, ks.length - 120))) delete fc.ctx[k]; }
           // 2. Start forecasts from the fresh half of the batch (never from a revisit), at most the revisit share, so the two halves balance.
           const slots = Math.max(1, Math.floor(cap * this._pfFcShare()));
           const room = Math.max(0, Math.min(slots, slots * (lead + 3) - still.length));
@@ -2981,7 +3087,8 @@
             const tags = this._pfSampleTags(r, r.sym, false);
             const pr = tags.length ? this._pfFcParts(tags) : null;
             if (!pr) { fc.nof++; continue; }
-            cand.push({ s: r.sym, a: seq, d: seq + lead, t: entry.ts, p: Number(r.px), e: +(this._pfSampleDir() * pr.e).toFixed(4), c: tags.join(' '), w: Object.fromEntries(Object.entries(pr.w).map(([k, v]) => [k, +(this._pfSampleDir() * v).toFixed(4)])) });
+            const dir = this._pfSampleDir(), cd0 = CAND5[r.sym], tp = cd0 ? this._pfTyp10(cd0.c, entry.ts) : 0; // the frozen price is the typical price of the last ~10 minutes, like the revisit's
+            cand.push({ s: r.sym, a: seq, d: seq + lead, t: entry.ts, p: tp > 0 ? tp : Number(r.px), p0: Number(r.px), e: +(dir * pr.e).toFixed(4), c: tags.join(' '), w: Object.fromEntries(Object.entries(pr.w).map(([k, v]) => [k, +(dir * v).toFixed(4)])), ep: { sum: +(dir * pr.sum).toFixed(4), max: +(dir * pr.max).toFixed(4) }, sn: this._pfFcSnap(r, FRESH_TICKERS[r.sym], cd0, entry.ts) });
           }
           for (let i = cand.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [cand[i], cand[j]] = [cand[j], cand[i]]; }
           fc.pend = still.concat(cand.slice(0, room));
@@ -2991,7 +3098,7 @@
         },
         // ── Future Awareness ──
         // Rebuilds pole scores from forward outcomes: every graded forecast's frozen tags land in their poles (bucketed by the Sample Scorer's own
-        // cutoffs) and the pole's score = the mean actual move (raw, in the bot's favor) of the tickers that carried it, times a
+        // cutoffs) and the pole's score = the mean actual move (batch-relative, in the bot's favor) of the tickers that carried it, times a
         // learned weight for its criterion family. A pole with fewer than Min graded forecasts keeps the Sample Scorer score (price + liquidation).
         // Weight: for each forecast and each criterion that carried at least half an average share of its projection, did the criterion's own
         // sign match the real move? hit rate / the mean hit rate of the criteria with enough data, clamped to 0.25x-2x (1x with too little data).
@@ -3091,7 +3198,7 @@
         },
         _pfFcFmt(st) {
           if (!st || !st.n || st.n < 5 || st.acc == null) return null;
-          const L = { fund: 'Fund', va: 'V/A', ioa: 'IO/A', lta: 'LTA' };
+          const L = { fund: 'Fund', va: 'V/A', ioa: 'IO/A', iol: 'IO/L', ios: 'IO/S', lta: 'LTA' };
           return `accuracy ${Math.round(st.acc)}%` + (st.infl ? ` · influence ${st.infl.map(x => `${L[x.f] || x.f.toUpperCase()} ${Math.round(x.pct)}%`).join(' · ')}` : '');
         },
         // The last ten graded start batches (one column each) and the batches still to come (pending forecasts grouped by the batch they fall due in).
@@ -3111,7 +3218,7 @@
         },
         _pfFcHint() {
           const fc = this._pfFcStore(), f = this._pfFcFmt(this._pfFcStats(fc.done));
-          const ai = this.pfFcAwareInfo, L = { fund: 'Fund', va: 'V/A', ioa: 'IO/A', lta: 'LTA' };
+          const ai = this.pfFcAwareInfo, L = { fund: 'Fund', va: 'V/A', ioa: 'IO/A', iol: 'IO/L', ios: 'IO/S', lta: 'LTA' };
           const fa = (this._pfFcAwareOn() && ai) ? ` · Future Awareness: ${ai.poles} pole${ai.poles === 1 ? '' : 's'}` + (Object.keys(ai.w).length ? ', weight ' + Object.keys(ai.w).map(k => `${L[k] || k.toUpperCase()} x${ai.w[k].toFixed(2)}`).join(' · ') : '') : '';
           return `${fc.pend.length} pending · ${fc.done.length} graded` + (f ? ' · ' + f : ' · too few graded to read yet') + fa;
         },
@@ -3183,15 +3290,18 @@
           for (const r of fc.done) { if (!byA.has(r.a)) byA.set(r.a, []); byA.get(r.a).push(r); }
           const batches = [...byA.entries()].sort((x, y) => x[0] - y[0]).map(([a, recs]) => ({ startBatch: a, gradedAt: new Date(recs[0].u).toISOString(), n: recs.length, batchMeanMovePct: r2(recs[0].k), grade: this._pfFcStats(recs) }));
           return { forecast: {
-            about: 'Each ticker is scored by the scorecard on its non-price readings at its first sample appearance (projectedPp: pp against the field in the bot\'s favor), then graded at its revisit: actualPp = the raw price move in the bot\'s favor. Void = the ticker was gone / late / in a cohort of fewer than 3. accuracyPct = 50-100 when the direction was right (by size match), 0-50 when wrong; contributionPp = each criterion family\'s share of projectedPp.',
+            about: 'Each ticker is scored by the scorecard on its non-price readings at its first sample appearance (projectedPp: pp against the field in the bot\'s favor), then graded at its revisit: actualPp = the price move less its start batch\'s mean move, in the bot\'s favor (rawMovePct = the move itself; maxUpPct / maxDownPct = the highest / lowest point since the forecast; projections = the sum of the poles and the strongest single pole, projectedPp being their mean; snapshot = the readings at forecast time; batchContext = the market around each start batch). Void = the ticker was gone / late / in a cohort of fewer than 3. accuracyPct = 50-100 when the direction was right (by size match), 0-50 when wrong; contributionPp = each criterion family\'s share of projectedPp.',
             botFavorDir: d,
             settings: { revisitSharePct: Math.round(this._pfFcShare() * 100), leadBatches: this._pfFcLead(), keep: this._pfFcKeep(), batchSize: Math.max(1, Math.min(2500, Math.round(Number(this.cfg.pfOcBatchSize) || 250))), scanStepMs: this._pfFcStepMs() },
             futureAwareness: { enabled: this._pfFcAwareOn(), minGradedPerPole: this._pfFcAwareMin(), polesOverwritten: this.pfFcAwareInfo?.poles ?? 0, criterionWeight: this.pfFcAwareInfo?.w ?? {}, criterionHitRate: this.pfFcAwareInfo?.rel ?? {} },
             batchCounter: fc.seq, voids: fc.voids, noScoredPole: fc.nof,
             window: this._pfFcStats(fc.done), batches,
+            windowRaw: (() => { const x = this._pfFcStats(fc.done.map(r => ({ ...r, y: r.m != null ? r.m : r.y }))); delete x.infl; return x; })(), // the same grade on the raw move, market included
+            projectionTest: Object.fromEntries([['mean', r => r.e], ['sum', r => r.ep && r.ep.sum], ['max', r => r.ep && r.ep.max]].map(([k, f]) => { const x = this._pfFcStats(fc.done.map(r => ({ e: f(r), y: r.y })).filter(r => typeof r.e === 'number' && isFinite(r.e))); delete x.infl; return [k, x]; })),
+            batchContext: fc.ctx || {},
             graded: fc.done.map(r => ({ symbol: r.s, startBatch: r.a, gradedInBatch: r.d, forecastAt: new Date(r.t).toISOString(), gradedAt: new Date(r.u).toISOString(), elapsedMin: +((r.u - r.t) / 60000).toFixed(1),
-              projectedPp: r2(d * r.e), actualPp: r2(d * r.y), rawMovePct: r2(r.m), batchMeanMovePct: r2(r.k), accuracyPct: r2(this._pfFcAcc(r.e, r.y)), contributionPp: r.w || null, criteria: r.c })),
-            pending: fc.pend.map(f => ({ symbol: f.s, startBatch: f.a, dueBatch: f.d, forecastAt: new Date(f.t).toISOString(), priceAtForecast: f.p, projectedPp: r2(d * f.e), criteria: f.c })),
+              projectedPp: r2(d * r.e), actualPp: r2(d * r.y), rawMovePct: r2(r.m), batchMeanMovePct: r2(r.k), accuracyPct: r2(this._pfFcAcc(r.e, r.y)), contributionPp: r.w || null, relMovePct: r2(r.y), maxUpPct: r2(r.mu), maxDownPct: r2(r.md), projections: r.ep || null, snapshot: r.sn || null, criteria: r.c })),
+            pending: fc.pend.map(f => ({ symbol: f.s, startBatch: f.a, dueBatch: f.d, forecastAt: new Date(f.t).toISOString(), priceAtForecast: f.p, rawPriceAtForecast: f.p0 ?? null, projectedPp: r2(d * f.e), projections: f.ep || null, snapshot: f.sn || null, criteria: f.c })),
             store: fc } };
         },
         _pfOcHist() { return this._pfOcCycleHistory || []; },
@@ -3264,6 +3374,8 @@
           if (field !== 'liq' && memo && memo.key === key) return memo.val;
           const val = field === 'liq' ? (r => (this._pfLiqHas(r) && typeof r.lq === 'number' && !isNaN(r.lq)) ? r.lq : null) // events only: a watched-but-quiet ticker (lq 0, no turnover) is not a reading
                     : field === 'lta' ? (r => this._pfLtaDev(r.ht, r.vol))
+                    : field === 'oil' ? (r => this._pfLsOi(r, 1))
+                    : field === 'ois' ? (r => this._pfLsOi(r, 0))
                     : field === 'lpa' ? (r => (typeof r.hc === 'number' && !isNaN(r.hc)) ? r.hc : null)
                     : (r => r[field]);
           const bySym = {};
@@ -3303,26 +3415,116 @@
         // Start (ms) of the last COMPLETED hourly candle. The forming candle is never used —
         // its turnover is a partial hour and would skew LTA negative early in each hour.
         _pfHourStart() { return Math.floor(Date.now() / 3600000) * 3600000 - 3600000; },
-        // One kline request per ticker per hour: the completed candle can't change, so a hit
-        // for the current hour is reused for every later scan (and by the open-position sampler).
-        async _pfHourCandle(sym) {
+        // One kline request per ticker: 5-minute candles (limit 26 = 130 min, covering the last completed hour and the revisit's 60-minute path). The completed
+        // hour is merged from the candles inside it (so ht/hc/htp keep their meaning); a minute with no trade can leave it a little short. The candles are kept in
+        // memory for the batch (CAND5) so the grader reads the price over the last ~10 minutes and the path since the forecast. fresh = skip the per-hour cache.
+        async _pfHourCandle(sym, fresh) {
           const start = this._pfHourStart();
           const hit = HOUR_CACHE[sym];
-          if (hit && hit.start === start) return hit;
+          if (!fresh && hit && hit.start === start) return hit;
           try {
-            const res = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=3`);
+            const res = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=5&limit=26`);
             const js  = await res.json();
             // Bybit list rows: [start, open, high, low, close, volume, turnover], newest first.
-            const row = (js?.result?.list || []).find(r => parseInt(r[0], 10) === start);
-            if (!row) return null;
-            const o = parseFloat(row[1]), hi = parseFloat(row[2]), lo = parseFloat(row[3]), c = parseFloat(row[4]), ht = parseFloat(row[6]);
-            if (!(o > 0) || isNaN(c) || isNaN(ht)) return null;
-            const rec = { start, ht, hc: (c - o) / o * 100, ...(hi > 0 && lo > 0 && c > 0 ? { htp: (hi + lo + c) / 3 } : {}) };
+            const cs = this._pfC5Parse(js?.result?.list);
+            const inH = cs.filter(x => x.s >= start && x.s < start + 3600000);
+            if (!inH.length) return null;
+            const o = inH[0].o, c = inH[inH.length - 1].c, hi = Math.max(...inH.map(x => x.h)), lo = Math.min(...inH.map(x => x.l)), ht = inH.reduce((s, x) => s + x.v, 0);
+            if (!(o > 0) || isNaN(c) || !(ht >= 0)) return null;
+            const rec = { start, ht, hc: (c - o) / o * 100, htp: (hi + lo + c) / 3 };
+            CAND5[sym] = { at: Date.now(), c: cs };
             if (Object.keys(HOUR_CACHE).length > 500) for (const k of Object.keys(HOUR_CACHE)) if (HOUR_CACHE[k].start !== start) delete HOUR_CACHE[k];
             HOUR_CACHE[sym] = rec;
+            this._pfStbJudge(sym, start, o, hi, lo, c, js?.result?.list);
             return rec;
           } catch (_) { return null; }
         },
+        // -- 5-minute candles, long/short split, wide snapshot --
+        // Bybit rows (newest first) -> ascending [{ s, o, h, l, c, v (turnover) }].
+        _pfC5Parse(list) {
+          const out = [];
+          for (const r of (list || [])) {
+            const s = parseInt(r[0], 10), o = parseFloat(r[1]), h = parseFloat(r[2]), l = parseFloat(r[3]), c = parseFloat(r[4]), v = parseFloat(r[6]);
+            if (s > 0 && o > 0 && h > 0 && l > 0 && c > 0) out.push({ s, o, h, l, c, v: isFinite(v) ? v : 0 });
+          }
+          return out.sort((a, b) => a.s - b.s);
+        },
+        // Typical price of the last ~10 minutes: the two newest candles started within 15 minutes of now (the forming one included),
+        // (highest high + lowest low + last close) / 3. 0 when the ticker traded nothing that recently.
+        _pfTyp10(cs, now) {
+          if (!cs || !cs.length) return 0;
+          const t = cs.filter(x => x.s >= (now || Date.now()) - 900000).slice(-2);
+          if (!t.length) return 0;
+          return (Math.max(...t.map(x => x.h)) + Math.min(...t.map(x => x.l)) + t[t.length - 1].c) / 3;
+        },
+        // % move from the close of the candle that ended m minutes before the latest 5-minute boundary to the newest close; null when not there.
+        _pfC5Ret(cs, now, m) {
+          if (!cs || !cs.length) return null;
+          const nowS = Math.floor(now / 300000) * 300000, cur = cs[cs.length - 1];
+          if (cur.s < nowS - 300000) return null;
+          const b = cs.find(x => x.s === nowS - m * 60000 - 300000);
+          return b ? (cur.c / b.c - 1) * 100 : null;
+        },
+        // Bybit's long/short ACCOUNT ratio (latest 5-minute reading): the long share of accounts, 0-1; null when the call fails or has no row.
+        async _pfLsRatio(sym) {
+          try {
+            const res = await this._qFetch(`${this.base}/v5/market/account-ratio?category=linear&symbol=${sym}&period=5min&limit=1`);
+            const row = (await res.json())?.result?.list?.[0];
+            const b = parseFloat(row?.buyRatio), s = parseFloat(row?.sellRatio);
+            return (b > 0 && s > 0 && isFinite(b + s)) ? b / (b + s) : null;
+          } catch (_) { return null; }
+        },
+        // The long (or short) share of a record's open interest: oi x long share (x short share), null without both.
+        _pfLsOi(r, long) { const oi = Number(r.oi), b = Number(r.bl); return (oi > 0 && b > 0 && b < 1) ? oi * (long ? b : 1 - b) : null; },
+        // One forecast's wide snapshot for the export (rounded, short keys). Logging only -- nothing here is scored. r = the sample record,
+        // t = Bybit's own ticker payload for the batch, cd = its 5-minute candles ({ c: [...] }), now = the batch time.
+        _pfFcSnap(r, t, cd, now) {
+          const q = (v, d = 4) => (typeof v === 'number' && isFinite(v)) ? +v.toFixed(d) : undefined, o = {};
+          const N = k => { const v = parseFloat(t?.[k]); return isFinite(v) && v !== 0 ? v : null; };
+          o.vol = q(r.vol, 0); o.oi = q(r.oi, 0); o.fr = q(r.fr, 5); o.bl = q(r.bl, 4); o.ch = q(r.ch != null ? r.ch * 100 : null, 3);
+          o.hc = q(r.hc, 3); o.ht = q(r.ht, 0); o.lta = q(this._pfLtaDev(r.ht, r.vol), 1);
+          const mk = N('markPrice'), ix = N('indexPrice'), bid = N('bid1Price'), ask = N('ask1Price'), hi24 = N('highPrice24h'), lo24 = N('lowPrice24h'), p1h = N('prevPrice1h'), px = Number(r.px);
+          if (mk && ix) o.prem = q((mk - ix) / ix * 100, 4);
+          if (bid && ask && ask >= bid) o.spr = q((ask - bid) / ((ask + bid) / 2) * 100, 4);
+          if (hi24 && lo24 && hi24 > lo24 && px > 0) o.pos24 = q((px - lo24) / (hi24 - lo24), 3);
+          if (p1h && px > 0) o.p1h = q((px / p1h - 1) * 100, 3);
+          const nf = parseInt(t?.nextFundingTime, 10); if (nf > 0) o.nf = q((nf - now) / 60000, 0);
+          const cs = cd && cd.c;
+          if (cs && cs.length) {
+            const nowS = Math.floor(now / 300000) * 300000, cur = cs[cs.length - 1];
+            for (const m of [10, 30, 60, 120]) o['r' + m] = q(this._pfC5Ret(cs, now, m), 3);
+            const h12 = cs.filter(x => x.s >= nowS - 3600000);
+            o.c60 = h12.length;
+            if (h12.length) o.rng60 = q((Math.max(...h12.map(x => x.h)) - Math.min(...h12.map(x => x.l))) / cur.c * 100, 3);
+            if (h12.length > 2) {
+              const rs = []; for (let i = 1; i < h12.length; i++) rs.push(Math.log(h12[i].c / h12[i - 1].c));
+              const mu = rs.reduce((a, b) => a + b, 0) / rs.length;
+              o.rv = q(Math.sqrt(rs.reduce((a, b) => a + (b - mu) * (b - mu), 0) / rs.length) * 100, 4);
+            }
+            const v10 = cs.filter(x => x.s >= nowS - 300000).reduce((a, x) => a + x.v, 0), vp = cs.filter(x => x.s < nowS - 300000 && x.s >= nowS - 3900000).reduce((a, x) => a + x.v, 0) / 6;
+            if (vp > 0) o.vr = q(v10 / vp, 2);
+          }
+          for (const k of Object.keys(o)) if (o[k] === undefined) delete o[k];
+          return o;
+        },
+        // The market around one batch, logged once per batch: breadth of the 1hr change, funding, long share, and the 10/60-minute moves (BTC apart).
+        _pfFcCtx(entry) {
+          const q = (v, d = 3) => (typeof v === 'number' && isFinite(v)) ? +v.toFixed(d) : undefined;
+          const mean = a => a.length ? a.reduce((s, v) => s + v, 0) / a.length : null;
+          const hc = [], fr = [], bl = [], r10 = [], r60 = [];
+          for (const r of entry.results) {
+            if (typeof r.hc === 'number') hc.push(r.hc);
+            if (typeof r.fr === 'number') fr.push(r.fr);
+            if (r.bl > 0) bl.push(r.bl);
+            const cs = CAND5[r.sym]?.c, a = this._pfC5Ret(cs, entry.ts, 10), b = this._pfC5Ret(cs, entry.ts, 60);
+            if (a != null) r10.push(a); if (b != null) r60.push(b);
+          }
+          const bc = CAND5['BTCUSDT']?.c, o = { n: entry.results.length, hc: q(mean(hc)), fr: q(mean(fr), 5), bl: q(mean(bl), 4), r10: q(mean(r10)), r60: q(mean(r60)) };
+          if (bc) { o.btc10 = q(this._pfC5Ret(bc, entry.ts, 10)); o.btc60 = q(this._pfC5Ret(bc, entry.ts, 60)); }
+          for (const k of Object.keys(o)) if (o[k] === undefined) delete o[k];
+          return o;
+        },
+
         // Best available 1hr reading for a ticker: this hour's cached candle, else whatever the
         // latest sample batch carried (what a follower gets from the leader's shared snapshot).
         _pfHourReading(sym) {

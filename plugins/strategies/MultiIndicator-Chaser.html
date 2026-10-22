@@ -2,7 +2,7 @@
   Multi-Indicator Strategy Plugin for PseudoChaser
   Slot-based entry filter. A slot (Auto-generated or manually built) qualifies once a ticker
   exhibits at least micAutoSlotSize (Auto) or all of its own criteria (manual) from the
-  secondary criteria set: fund, V/A, IO/A, LTA, LPA. No criterion is mandatory.
+  secondary criteria set: fund, V/A, IO/L, IO/S, LTA, LPA. No criterion is mandatory.
 
   Auto Slots evaluates every non-excluded secondary criterion against each ticker and keeps
   every one that's true — not sliced down to a fixed count. Manual slots keep the existing
@@ -26,12 +26,12 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.105.0'; // Change: the batch builder asks AF/PF's Forecast Grader (_afFcPlan) for its revisits first - they take their share of the batch's slots, Liquidation Surveillance fills only the rest and never sees them (no-op without AF/PF 2.31.0) | previous: 1.104.2 - Removed: the batch picker no longer calls the host's Silence Amplifier re-sampling (removed in AF/PF 2.30.0) | previous: // Change: Relative Target reads only the latest N sample batches (default 6, Window slider) | previous: 1.104.0 — Change: Target Halving replaced by Relative Target — entry TP / SL are the LPA window's average up / down 1hr move x leverage, Cascade = entry TP, Sacrifice = SL (fixes Cascade/Sacrifice drifting from the adjusted TP/SL); Min Entry TP still floors them and defers entries; no longer needs Sample Scoring | previous: // Fix: Cascade, Sacrifice and Ejection close their positions concurrently (Promise.all) instead of one at a time, so live fill waits no longer stack | previous: Change: defaults match the active config (Both Poles Red on, Pole Blocking off) | previous: Feature: the batch picker calls the host's Silence Amplifier re-sampling (_afResamplePick) when Liquidation Surveillance isn't picking | previous: Feature: the batch picker calls Liquidation Surveillance's pick (kept liquidated tickers first, quiet ones graylisted and replaced) when that toggle is on | previous: Feature: entry candidates are ranked by how much sample data their criteria have — a thinly-evidenced pole's score is pulled toward zero, and a candidate whose thinnest pole holds under 25% of its bucket type's median sample count is not entered (no toggle). Prior: 1.100.4 — Tweak: graylisted tickers (AF/PF Distillation) are left out of the scan pool, so they are neither sampled nor entered.
+    const VERSION       = '1.106.0'; // Change: IO/L and IO/S (long / short share of open interest vs its window average) replace the open-interest criterion in slots, Auto, scoring and badges; each needs the ticker's long share from AF/PF 2.37.0 (batch reading, else one fresh read before entry) and wait for 10 readings in their window; saved manual slots still using the old criterion are flagged as retired | previous: 1.105.0 - Change: the batch builder asks AF/PF's Forecast Grader (_afFcPlan) for its revisits first - they take their share of the batch's slots, Liquidation Surveillance fills only the rest and never sees them (no-op without AF/PF 2.31.0)
   const DEFAULT_SLOTS = [[]];
   const MIC_HIST_KEY  = '__mic_hist_batches';
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
   // Auto picker, so both stay in sync by construction.
-  const SECONDARY_CRITS = ['fund','va','ioa','lta','lpa'];
+  const SECONDARY_CRITS = ['fund','va','iol','ios','lta','lpa'];
 
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
@@ -72,7 +72,8 @@
     micForceGeneralCriteria: true,
     micFundStep: 0.0025,
     micVaStep: 1,
-    micIoaStep: 1,
+    micIolStep: 1,
+    micIosStep: 1,
     
     
     // LTA step = % deviation of 1hr turnover from the ticker's own 24h/24 per tier; LPA step =
@@ -84,9 +85,9 @@
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
   // -fund = shorts paying = good carry for longs (🤑), bad for shorts (💸).
   // +fund = longs paying = bad for longs (💸), good for shorts (🤑).
-  const CRIT_EMOJI = { 'fund': '💰', 'va': '🔊', 'vm': '🔊', 'ioa': '🎲', 'iot': '🎲', 'iom': '🧲', 'lta': '🕐', 'lpa': '💹' };
-  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', 'va': 'V/A (volume vs. population sample-window average)', 'vm': 'V/M (vol/mcap ratio) — retired, replaced by V/A', 'ioa': 'IO/A (open interest vs. population sample-window average)', 'iot': 'IO/T (OI vs Turnover) — retired, replaced by IO/A', 'iom': 'IO/M (OI vs MCap) — retired, replaced by IO/A', 'lta': 'LTA (1hr turnover vs. the ticker\'s own 24h/24 average)', 'lpa': 'LPA (1hr price change vs. every other ticker in the sample window)' };
-  // Slots qualify on any N of the 5 secondary criteria (fund, V/A, IO/A, LTA, LPA) alone — see _micAutoQualify.
+  const CRIT_EMOJI = { 'fund': '💰', 'va': '🔊', 'vm': '🔊', 'iol': '🐂', 'ios': '🐻', 'iot': '🎲', 'iom': '🧲', 'lta': '🕐', 'lpa': '💹' };
+  const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', 'va': 'V/A (volume vs. population sample-window average)', 'vm': 'V/M (vol/mcap ratio) — retired, replaced by V/A', 'iol': 'IO/L (long open interest vs. population sample-window average)', 'ios': 'IO/S (short open interest vs. population sample-window average)', 'iot': 'IO/T (OI vs Turnover) — retired, replaced by IO/L and IO/S', 'iom': 'IO/M (OI vs MCap) — retired, replaced by IO/L and IO/S', 'lta': 'LTA (1hr turnover vs. the ticker\'s own 24h/24 average)', 'lpa': 'LPA (1hr price change vs. every other ticker in the sample window)' };
+  // Slots qualify on any N of the 6 secondary criteria (fund, V/A, IO/L, IO/S, LTA, LPA) alone — see _micAutoQualify.
 
   const critEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const num = parseFloat(s.replace(/^[<>]/,'')); return ((num < 0 || /^-/.test(s)) ? '🤑' : '💸') + s; }
@@ -101,7 +102,8 @@
     if (/^mbliq/.test(c)) return '🧊' + c.slice(5);
     if (/^sliq/.test(c)) return '🥵' + c.slice(4);
     if (/^bliq/.test(c)) return '🥶' + c.slice(4);
-    if (/^ioa/.test(c)) return '🎲' + c.slice(3);
+    if (/^iol/.test(c)) return '🐂' + c.slice(3);
+    if (/^ios/.test(c)) return '🐻' + c.slice(3);
     if (/^iot/.test(c)) return '🎲' + c.slice(3);
     if (/^iom/.test(c)) return '🧲' + c.slice(3);
     if (/^ocs/.test(c)) return '🔭' + c.slice(3);
@@ -146,11 +148,11 @@
     if (c === 'sliq') return 'S-Liq'; if (c === 'bliq') return 'B-Liq';
     if (c === 'msliq') return 'mS-Liq'; if (c === 'mbliq') return 'mB-Liq';
     if (c === '0liq') return '0-Liq';
-    const ioaM = c.match(/^ioa([<>])(-?\d+)$/);
-    if (ioaM) return 'IO/A ' + ioaM[1] + ioaM[2];
-    const ioaA = c.match(/^ioa([+-]-?\d*)$/);
-    if (ioaA) return 'IO/A t' + ioaA[1];
-    if (c === 'ioa') return 'IO/A';
+    const ioM = c.match(/^(iol|ios)([<>])(-?\d+)$/);
+    if (ioM) return (ioM[1] === 'iol' ? 'IO/L ' : 'IO/S ') + ioM[2] + ioM[3];
+    const ioA = c.match(/^(iol|ios)([+-]-?\d*)$/);
+    if (ioA) return (ioA[1] === 'iol' ? 'IO/L t' : 'IO/S t') + ioA[2];
+    if (c === 'iol') return 'IO/L'; if (c === 'ios') return 'IO/S';
     const o = c.match(/^(iot|iom)([<>])(\d+)$/);
     if (o) return (o[1] === 'iot' ? 'IO/T' : 'IO/M') + ' ' + o[2] + o[3];
     const p = c.match(/^(iot|iom)([+-]\d+)$/);
@@ -245,14 +247,14 @@
 
                   <!-- Auto slots controls -->
                   <div x-show="cfg.micAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(255,150,80,.04);border:1px solid rgba(255,150,80,.12);border-radius:3px">
-                    <div class="lbl">Minimum Criteria per Slot <b x-text="cfg.micAutoSlotSize"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.micAutoSlotSize;const excl=new Set(cfg.micAutoSlotExclude||[]);const secTotal=['fund','va','ioa','lta','lpa'].filter(c=>!excl.has(c)).length;return 'qualifies on any '+n+' of '+secTotal+' secondary criteria — every one true gets scored, not capped at this minimum.'})()"></span></div>
-                    <input type="range" min="1" max="5" step="1" x-model.number="cfg.micAutoSlotSize" @change="persist()">
+                    <div class="lbl">Minimum Criteria per Slot <b x-text="cfg.micAutoSlotSize"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.micAutoSlotSize;const excl=new Set(cfg.micAutoSlotExclude||[]);const secTotal=['fund','va','iol','ios','lta','lpa'].filter(c=>!excl.has(c)).length;return 'qualifies on any '+n+' of '+secTotal+' secondary criteria — every one true gets scored, not capped at this minimum.'})()"></span></div>
+                    <input type="range" min="1" max="6" step="1" x-model.number="cfg.micAutoSlotSize" @change="persist()">
                     <div class="lbl" style="margin-top:5px;margin-bottom:3px">Exclude from Auto</div>
                     <div class="crit-pick" style="display:flex;flex-wrap:wrap;gap:3px">
-                      <template x-for="c in ['fund','va','ioa','lta','lpa']" :key="c">
+                      <template x-for="c in ['fund','va','iol','ios','lta','lpa']" :key="c">
                         <button @click.prevent="if(!cfgLocked){ const ex=(cfg.micAutoSlotExclude||[]).slice(); const i=ex.indexOf(c); if(i>=0) ex.splice(i,1); else ex.push(c); cfg.micAutoSlotExclude=ex; persist(); }"
                                 :style="'font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;cursor:pointer;border:1px solid;' + ((cfg.micAutoSlotExclude||[]).includes(c) ? 'border-color:rgba(255,80,80,.5);background:rgba(255,80,80,.15);color:rgba(255,80,80,.8)' : 'border-color:rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)')"
-                                x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('lta','LTA').replace('lpa','LPA')">
+                                x-text="c.replace('fund','Fund').replace('va','V/A').replace('iol','IO/L').replace('ios','IO/S').replace('lta','LTA').replace('lpa','LPA')">
                         </button>
                       </template>
                     </div>
@@ -291,30 +293,30 @@
                          @click.outside="ratioFocus = null; gateFocus = null; ocFocus = null"
                          style="display:flex;gap:3px;flex-wrap:wrap;align-items:center;margin-bottom:7px;padding:6px 7px;background:rgba(255,255,255,.04);border-radius:3px;border:1px solid rgba(255,255,255,.08)">
                       <span style="font-size:9px;color:var(--text-lo);margin-right:2px">Slot <span x-text="(cfg.micActiveSlot)+1"></span>:</span>
-                      <template x-for="c in ['fund','va','ioa','lta','lpa']" :key="c">
+                      <template x-for="c in ['fund','va','iol','ios','lta','lpa']" :key="c">
                         <button class="mic-opt"
                           @click.prevent="if(!cfgLocked){
-                            if(c==='ioa'){
+                            if(c==='iol'||c==='ios'){
                               ratioFocus=(ratioFocus===c?null:c); gateFocus=null;
-                              if(ratioFocus){ const ex=(cfg.micSlots?.[cfg.micActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^ioa([<>])(-?\d+)$/); if(m){ratioDir=m[1];ratioTier=parseInt(m[2],10)} } }
+                              if(ratioFocus){ const ex=(cfg.micSlots?.[cfg.micActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:iol|ios)([<>])(-?\d+)$/); if(m){ratioDir=m[1];ratioTier=parseInt(m[2],10)} } }
                             } else if(c==='fund'||c==='va'||c==='lta'||c==='lpa'){
                               gateFocus=(gateFocus===c?null:c); ratioFocus=null; ocFocus=null;
                               if(gateFocus){ const ex=(cfg.micSlots?.[cfg.micActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:fund|va|lta|lpa)([<>])(-?\d+)$/); if(m){gateDir=m[1];gateTier=parseInt(m[2],10)} } else { gateDir='>'; gateTier=c==='fund'?1:c==='va'?10:c==='lta'?5:c==='lpa'?2:25; } }
                             } else { ratioFocus=null; gateFocus=null; ocFocus=null; _micToggle(cfg.micActiveSlot, c) }
                           }"
-                          :style="(c==='ioa') ? (ratioFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='va'||c==='lta'||c==='lpa') ? (gateFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ocs'||c==='ocx') ? (ocFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.micSlots?.[cfg.micActiveSlot]||[]).includes(c) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
-                          x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('lta','LTA').replace('lpa','LPA')">
+                          :style="(c==='iol'||c==='ios') ? (ratioFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='va'||c==='lta'||c==='lpa') ? (gateFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ocs'||c==='ocx') ? (ocFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.micSlots?.[cfg.micActiveSlot]||[]).includes(c) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
+                          x-text="c.replace('fund','Fund').replace('va','V/A').replace('iol','IO/L').replace('ios','IO/S').replace('lta','LTA').replace('lpa','LPA')">
                         </button>
                       </template>
-                      <!-- IO/A tier config panel -->
+                      <!-- IO/L, IO/S tier config panel -->
                       <div x-show="ratioFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(255,150,80,.06);border:1px solid rgba(255,150,80,.2);border-radius:3px">
                         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                          <span style="font-size:9px;color:var(--text-lo)" x-text="'IO/A tier'"></span>
+                          <span style="font-size:9px;color:var(--text-lo)" x-text="(ratioFocus==='iol'?'IO/L':'IO/S')+' tier'"></span>
                           <button @click.prevent="ratioDir=(ratioDir==='>'?'<':'>')"
                             style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(255,150,80,.1);border:1px solid rgba(255,150,80,.35);border-radius:2px;color:#ff9650;cursor:pointer"
                             x-text="ratioDir"></button>
                           <input type="range" min="0" max="500" step="1" x-model.number="ratioTier" style="flex:1;min-width:60px">
-                          <span style="font-size:9px;color:#ff9650;min-width:52px;text-align:right" x-text="ratioTier+' (≈'+(ratioTier*(cfg.micIoaStep)/100).toFixed(2)+')'"></span>
+                          <span style="font-size:9px;color:#ff9650;min-width:52px;text-align:right" x-text="ratioTier+' (≈'+(ratioTier*(ratioFocus==='iol'?cfg.micIolStep:cfg.micIosStep)/100).toFixed(2)+')'"></span>
                           <button @click.prevent="if(!cfgLocked&&ratioFocus){ const slots=(cfg.micSlots||[]).map(s=>[...s]); const si=cfg.micActiveSlot; if(!slots[si]) return; const existIdx=slots[si].findIndex(x=>x.startsWith(ratioFocus)); if(existIdx!==-1){ slots[si].splice(existIdx,1); } else { slots[si].push(ratioFocus+ratioDir+ratioTier); } cfg.micSlots=slots; persist?.(); }"
                             :style="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(ratioFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,150,80,.1);border:1px solid rgba(255,150,80,.35);color:#ff9650'"
                             x-text="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(ratioFocus??'__')) ? 'Remove' : 'Add'">
@@ -348,7 +350,7 @@
                           <div style="font-size:8px;color:var(--text-lo)">Slot <span x-text="i+1"></span></div>
                           <div style="display:flex;flex-direction:column;gap:2px;min-height:14px">
                             <template x-for="c in slot" :key="c">
-                              <span class="mic-crit" x-text="c.replace('fund','Fund').replace('va','V/A').replace('ioa','IO/A').replace('lta','LTA').replace('lpa','LPA')"></span>
+                              <span class="mic-crit" x-text="c.replace('fund','Fund').replace('va','V/A').replace('iol','IO/L').replace('ios','IO/S').replace('lta','LTA').replace('lpa','LPA')"></span>
                             </template>
                             <span x-show="!slot.length" style="font-size:8px;color:var(--text-lo);font-style:italic">empty</span>
                           </div>
@@ -362,7 +364,7 @@
                         style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(255,150,80,.06);border:1px dashed rgba(255,150,80,.3);border-radius:3px;color:#ff9650;cursor:pointer">+</button>
                     </div>
                     <div class="mic-hint" style="margin-top:5px">A ticker qualifies when it matches every criterion in any one slot.</div>
-                    <div class="mic-hint" style="margin-top:5px;line-height:1.8">Badge key: 💸/🤑 Fund · 🔊 V/A · 🎲 IO/A · 🕐 LTA · 💹 LPA — click any tiered criterion to configure gate</div>
+                    <div class="mic-hint" style="margin-top:5px;line-height:1.8">Badge key: 💸/🤑 Fund · 🔊 V/A · 🐂 IO/L · 🐻 IO/S · 🕐 LTA · 💹 LPA — click any tiered criterion to configure gate</div>
                   </div><!-- end manual builder -->
                   <div class="g" style="margin-top:8px">
                     <div class="lbl" style="margin-bottom:4px">Re-entry Block Mode</div>
@@ -468,11 +470,12 @@
                   <div style="display:flex;flex-wrap:wrap;gap:4px">
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="Fund" x-text="'💰 '+(cfg.micFundStep)+'%'"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="V/A" x-text="'🔊 '+(cfg.micVaStep)+'%'"></span>
-                    <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="IO/A" x-text="'🎲 '+(cfg.micIoaStep)+'%'"></span>
+                    <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="IO/L" x-text="'🎲 '+(cfg.micIolStep)+'%'"></span>
+                    <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="IO/S" x-text="'🎲 '+(cfg.micIosStep)+'%'"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="LTA" x-text="'🕐 '+(cfg.micLtaStep)+'%'"></span>
                     <span style="font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:2px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:var(--text-lo)" title="LPA (percentage points of 1hr change)" x-text="'💹 '+(cfg.micLpaStep)+'pp'"></span>
                   </div>
-                  <div class="mic-hint" style="margin-top:4px">One tier = the listed step; V/A, IO/A and LPA measure against the population window, LTA against the ticker's own 24h/24.</div>
+                  <div class="mic-hint" style="margin-top:4px">One tier = the listed step; V/A, IO/L, IO/S and LPA measure against the population window, LTA against the ticker's own 24h/24.</div>
                 </div>
               </div><!-- end fetch zone -->
             </div>
@@ -524,7 +527,7 @@
           if (!this.micCollapsedSlotRanks) this.micCollapsedSlotRanks = {};
           if (!this.micCollapsedCritStats) this.micCollapsedCritStats = {};
           if (!Array.isArray(this.cfg.micSlots)) this.cfg.micSlots = DEFAULT_SLOTS.map(s => [...s]);
-          // V/M, IO/T, IO/M retired in favor of population-relative V/A and IO/A (see
+          // V/M, IO/T, IO/M retired in favor of population-relative V/A, IO/L and IO/S (see
           // _afVolIoWindowAvg) — no mcap fetch machinery to init anymore. One-time cleanup of
           // saved config: strip the retired keys from the exclude list.
           if (Array.isArray(this.cfg.micAutoSlotExclude) && this.cfg.micAutoSlotExclude.some(c => c==='vm'||c==='iot'||c==='iom')) {
@@ -579,12 +582,12 @@
           }
           // V/M, IO/T, IO/M, and every retired liquidation/PEC/VSG/regime tag no longer match
           // anything (see the migration above) — a manual slot still
-          // referencing one will never qualify. Not auto-rewritten (va/ioa isn't a 1:1 semantic
+          // referencing one will never qualify. Not auto-rewritten (va/iol/ios isn't a 1:1 semantic
           // substitution), just flagged once so it doesn't silently go dead.
           {
-            const _retiredIn = s => s.filter(c => /^(vm|iot|iom|ocs|ocx|pec|vsg|regime|liqturnover|liqquiet|sliq|bliq|msliq|mbliq|0liq|past1)/.test(c));
+            const _retiredIn = s => s.filter(c => /^(vm|iot|iom|ioa|ocs|ocx|pec|vsg|regime|liqturnover|liqquiet|sliq|bliq|msliq|mbliq|0liq|past1)/.test(c));
             const _retiredSlots = (this.cfg.micSlots || []).map((s,i) => ({ i, crits: _retiredIn(s) })).filter(x => x.crits.length);
-            if (_retiredSlots.length) this.log(`[MIC] ⚠️ ${_retiredSlots.length} manual slot(s) reference retired criteria and will never match — slot(s) ${_retiredSlots.map(x=>x.i+1).join(', ')}. Replace with fund / V/A / IO/A / OCS / OCX.`, 'warn');
+            if (_retiredSlots.length) this.log(`[MIC] ⚠️ ${_retiredSlots.length} manual slot(s) reference retired criteria and will never match — slot(s) ${_retiredSlots.map(x=>x.i+1).join(', ')}. Replace with fund / V/A / IO/L / IO/S / LTA / LPA.`, 'warn');
           }
           this.registerRoleBadge?.(item => {
             if (!item || !item._mic) return null;
@@ -974,7 +977,7 @@
           const _critPool = autoMode
             ? SECONDARY_CRITS.filter(c => !(new Set(this.cfg.micAutoSlotExclude || [])).has(c))
             : [...new Set(slots.flat())];
-          const needsVolIo = _critPool.some(c => /^(va|ioa)/.test(c));
+          const needsVolIo = _critPool.some(c => /^(va|iol|ios)/.test(c));
           const needsHr    = _critPool.some(c => /^(lta|lpa)/.test(c));
           const scanSkip = {
             excluded: { nonUsdt: 0, btc: 0, lowPrice: 0, active: 0, banned: 0, reentry: 0, gray: 0, },
@@ -1182,7 +1185,7 @@
             const fundStep = this.cfg.micFundStep;
             const posFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 >= fundStep).length;
             const negFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 <= -fundStep).length;
-            const volIoNote = needsVolIo ? ` va/ioa-window:${this._afVolIoWindowAvg?.('vol')!=null?'ready':'warming'}` : '';
+            const volIoNote = needsVolIo ? ` va/iol/ios-window:${this._afVolIoWindowAvg?.('vol')!=null?'ready':'warming'}` : '';
             this.log(`[MIC] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund}${volIoNote}${needsHr ? ` lta/lpa-window:${this._afWindowStats?.('lpa')?.n ? 'ready' : 'warming'}` : ''}`, 'info');
             return;
           }
@@ -1307,7 +1310,7 @@
 
         // Force-Evaluate General Criteria (see the toggle in the Auto slots panel). Scan-time's
         // pool build only ever sees whatever OC data that cycle's capped bulk prefetch covered —
-        // fund and one side each of OCS/OCX/IO/A are expected to resolve for virtually any ticker
+        // fund and one side each of OCS/OCX/IO/L/IO/S are expected to resolve for virtually any ticker
         // once real data exists, so a match can end up missing several of them purely because the
         // fetch hadn't happened yet, not because they're actually false. Re-checks exactly those,
         // forced and uncapped, for this one symbol — cheap here since _micOpen only ever runs for
@@ -1317,7 +1320,7 @@
         async _micTopUpGeneralCriteria(t, criteria) {
           const sym = t.symbol;
           const have = new Set(criteria);
-          const GENERAL = ['fund', 'ioa', 'lta', 'lpa'];
+          const GENERAL = ['fund', 'iol', 'ios', 'lta', 'lpa'];
           const exclude = new Set(this.cfg.micAutoSlotExclude || []);
           const missing = GENERAL.filter(c => !have.has(c) && !exclude.has(c));
           if (!missing.length) return criteria;
@@ -1333,9 +1336,8 @@
           if (missing.some(c => /^(lta|lpa)/.test(c)) && !this._afHourReading?.(sym)) {
             jobs.push(this._afHourCandle?.(sym));
           }
-          // ioa needs no top-up fetch — the per-ticker value (t.openInterestValue) is already on
-          // the ticker payload, and the population average it's compared against comes from the
-          // tethered _pfOcCycleHistory/_afOcCycleHistory window, not a per-symbol lookup.
+          // iol/ios: the long share isn't on the ticker payload -- one fresh read when neither the payload, a recent fresh read nor a stored sample has it.
+          if (missing.some(c => /^(iol|ios)/.test(c)) && this._afLsShare?.(t) == null) jobs.push(this._afLsFetch?.(sym));
           if (jobs.length) await Promise.all(jobs);
 
           const fr           = parseFloat(t.fundingRate || 0) * 100;
@@ -1351,7 +1353,7 @@
         // available for the ticker yet.
         _micAnnotateCritRaw(c, t) {
           if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._afVolIoWindowAvg?.('vol'); const step = this.cfg.micVaStep; const tier = (val && w) ? Math.floor((Math.log(val / w) * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
-          if (/^ioa/.test(c)) { const val = parseFloat(t.openInterestValue || 0); const w = this._afVolIoWindowAvg?.('oi'); const step = this.cfg.micIoaStep; const tier = (val && w) ? Math.floor((Math.log(val / w) * 100) / step) : 0; return `ioa${tier>=0?'+':''}${tier}`; }
+          if (/^(iol|ios)/.test(c)) { const long = /^iol/.test(c), bl = this._afLsShare?.(t), oi = parseFloat(t.openInterestValue || 0), val = (bl > 0 && bl < 1 && oi > 0) ? oi * (long ? bl : 1 - bl) : 0, w = this._afVolIoWindowAvg?.(long ? 'oil' : 'ois'); if (!(val > 0 && w > 0)) return null; const step = long ? this.cfg.micIolStep : this.cfg.micIosStep; const tier = Math.floor((Math.log(val / w) * 100) / step); return `${long ? 'iol' : 'ios'}${tier>=0?'+':''}${tier}`; }
           if (/^fund/.test(c)) { const step = this.cfg.micFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.trunc(fr_ / step); return `fund${fr_<0?'-':'+'}${Math.abs(tier)}`; }
           
           
@@ -1397,13 +1399,14 @@
             if (!m) return true;
             return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
           }
-          if (/^ioa/.test(c)) {
-            const val = parseFloat(t.openInterestValue || 0);
-            const windowAvg = this._afVolIoWindowAvg?.('oi');
+          if (/^(iol|ios)/.test(c)) {
+            const long = /^iol/.test(c), bl = this._afLsShare?.(t), oi = parseFloat(t.openInterestValue || 0);
+            const val = (bl > 0 && bl < 1 && oi > 0) ? oi * (long ? bl : 1 - bl) : 0;
+            const windowAvg = this._afVolIoWindowAvg?.(long ? 'oil' : 'ois');
             if (!val || !windowAvg) return false;
-            const step = this.cfg.micIoaStep;
+            const step = long ? this.cfg.micIolStep : this.cfg.micIosStep;
             const tier = Math.floor((Math.log(val / windowAvg) * 100) / step);
-            const m = c.match(/^ioa([<>])(-?\d+)$/);
+            const m = c.match(/^(?:iol|ios)([<>])(-?\d+)$/);
             if (!m) return true;
             return m[1] === '>' ? tier >= parseInt(m[2], 10) : tier <= parseInt(m[2], 10);
           }
@@ -1491,7 +1494,7 @@
           const edge = {};
           for (const e of list) if (e && typeof e.n === 'number' && e.n >= min && typeof e.pnl === 'number') (edge[e.family] ||= {})[e.pole] = e.pnl;
           for (const c of (annotCrits || [])) {
-            let fam, sign, m = String(c).match(/^(fund|va|ioa|lta|lpa)([+-])\d*$/);
+            let fam, sign, m = String(c).match(/^(fund|va|iol|ios|lta|lpa)([+-])\d*$/);
             if (m) { fam = m[1]; sign = m[2]; }
             else if ((m = String(c).match(/^([+-])(fund)$/))) { sign = m[1]; fam = m[2]; }
             else continue;
