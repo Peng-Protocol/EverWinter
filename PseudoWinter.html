@@ -1761,6 +1761,26 @@ const SHARED_KEY = '__ew_shared_v1';
 let _sharedChannel = null;
 try { _sharedChannel = new BroadcastChannel('ew_shared'); } catch(_) {}
 
+// ─── Cross-bot corridor ─────────────────────────────────────────────────────────────────────────────
+// The corridor is a handover lane, not storage. The big datasets (bulk tickers, forecast grading, sample
+// scoring, OC batch, liq lean, illiquidity, stablecoin) are cut into packets; only a short window of them
+// (XFER_WINDOW) sits in localStorage at any moment. The partner copies each packet into memory and confirms it
+// (a cumulative count in an ack key); the publisher deletes confirmed packets and releases the next. When the
+// last packet is confirmed the manifest goes too, so the lane is empty between handovers. The receiver
+// reassembles in memory, verifies size + checksum and exposes the result through _sharedRead — consumers then
+// overwrite their own stored data from it, as before. Nothing is kept for later: a bot that reloads simply gets
+// the next publish. Small cache-style shares (heartbeat, positions, klines_1h, watchTickers) stay in the registry.
+const XFER_TYPES = new Set(['bulkTickers', 'fcGrade', 'sampleScore', 'ocResults', 'liqLean', 'ilq', 'stb']);
+const XFER_PKT = 40000;          // chars per packet
+const XFER_WINDOW = 4;           // unconfirmed packets allowed in the lane at once
+const XFER_STALL_MS = 120000;    // no confirmation for this long -> abandon the handover
+const _xmKey = (t, by) => '__ew_xm_' + t + '_' + by;         // manifest (written by the publisher)
+const _xpKey = (t, by, i) => '__ew_xp_' + t + '_' + by + '_' + i; // packet i
+const _xaKey = (t, by) => '__ew_xa_' + t + '_' + by;         // ack (written by the receiver)
+const SHARE_META_KEY = '__ew_share_meta_v1';
+const _X = { out: {}, asm: {}, inb: {}, done: {}, pub: {}, busy: false }; // in-memory only (publisher outbox, receiver assembly, delivered buckets)
+function _xSum(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36); }
+
 // The shared registry accumulates several independent per-symbol caches (klines_1h,
 // klines_1h_last, watchTickers, mcap, cpSupply, dsMcap, liqResults, ...) inside one blob,
 // merged in by _sharedMerge with no eviction — every symbol either bot has ever touched
@@ -2018,16 +2038,26 @@ function pw() { return {
   },
 
   _sharedRead(type) {
-    try { return (JSON.parse(localStorage.getItem(SHARED_KEY) || '{}'))[type] ?? null; } catch(_) { return null; }
+    try {
+      if (XFER_TYPES.has(type)) return _X.inb[type] || null;   // what the partner last handed over (in memory)
+      return (JSON.parse(localStorage.getItem(SHARED_KEY) || '{}'))[type] ?? null;
+    } catch(_) { return null; }
   },
   _sharedWrite(type, data) {
+    if (XFER_TYPES.has(type)) return this._xPublish(type, data);
     try {
+      const ts = Date.now();
       let reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
-      reg[type] = { data, ts: Date.now(), by: BOT_ID };
+      reg[type] = { data, ts, by: BOT_ID };
       reg = _trimSharedRegistry(reg);
       localStorage.setItem(SHARED_KEY, JSON.stringify(reg));
-      _sharedChannel?.postMessage({ type, ts: Date.now(), by: BOT_ID });
-    } catch(_) {}
+      if (reg[type]) this._shareNoteTx(type, null, null);
+      else this._shareNoteErr(type, 'dropped on write (shared registry over its cap)');
+      _sharedChannel?.postMessage({ type, ts, by: BOT_ID });
+      return ts;
+    } catch(e) {
+      this._shareNoteErr(type, e && e.name === 'QuotaExceededError' ? 'localStorage full' : ((e && e.message) || 'write failed'));
+    }
   },
   _sharedMerge(type, patch, extra) {
     try {
@@ -2036,7 +2066,190 @@ function pw() { return {
       reg = _trimSharedRegistry(reg);
       localStorage.setItem(SHARED_KEY, JSON.stringify(reg));
       _sharedChannel?.postMessage({ type, ts: Date.now(), by: BOT_ID });
+      const L = this._shareTxAt || (this._shareTxAt = {});
+      if (Date.now() - (L[type] || 0) > 15000) { L[type] = Date.now(); this._shareNoteTx(type, null, null); }
+    } catch(e) {
+      this._shareNoteErr(type, e && e.name === 'QuotaExceededError' ? 'localStorage full' : ((e && e.message) || 'write failed'));
+    }
+  },
+  // ── Corridor: publisher side
+  // ts the partner will file this dataset under (the publisher's own copy is never read back through _sharedRead).
+  _sharedPubTs(type) { return _X.pub[type] || null; },
+  _xPublish(type, data) {
+    const ts = Date.now();
+    _X.pub[type] = ts;
+    try {
+      if (!this._lfPartnerAlive()) { this._shareNoteSkip(type, 'partner not running (heartbeat stale)'); return ts; }
+      const json = JSON.stringify({ data, ts, by: BOT_ID });
+      const n = Math.max(1, Math.ceil(json.length / XFER_PKT));
+      const chunks = [];
+      for (let i = 0; i < n; i++) chunks.push(json.slice(i * XFER_PKT, (i + 1) * XFER_PKT));
+      this._xAbort(type, null);                                   // supersede an unfinished handover of this type
+      const id = ts + '-' + Math.random().toString(36).slice(2, 7);
+      _X.out[type] = { id, ts, n, chunks, sent: 0, acked: 0, bytes: json.length, last: ts, t0: ts, restarts: 0 };
+      localStorage.setItem(_xmKey(type, BOT_ID), JSON.stringify({ id, ts, by: BOT_ID, n, bytes: json.length, sum: _xSum(json) }));
+      this._shareNoteTx(type, json.length, n);
+      this._xPump();
+    } catch(e) {
+      this._xAbort(type, e && e.name === 'QuotaExceededError' ? 'localStorage full' : ((e && e.message) || 'publish failed'));
+    }
+    return ts;
+  },
+  // Tear down this bot's handover of a type: unconfirmed packets, manifest, outbox. `why` set -> record + log the failure.
+  _xAbort(type, why) {
+    const ob = _X.out[type];
+    try {
+      if (ob) for (let i = ob.acked; i < ob.sent; i++) localStorage.removeItem(_xpKey(type, BOT_ID, i));
+      localStorage.removeItem(_xmKey(type, BOT_ID));
     } catch(_) {}
+    delete _X.out[type];
+    if (why) this._shareNoteErr(type, why);
+  },
+  _xPumpOut() {
+    for (const type of Object.keys(_X.out)) {
+      const ob = _X.out[type], now = Date.now();
+      let ack = null;
+      try { ack = JSON.parse(localStorage.getItem(_xaKey(type, BOT_ID)) || 'null'); } catch(_) {}
+      if (ack && ack.id === ob.id) {
+        if (ack.restart) {                       // receiver lost its place (reloaded) or failed the checksum: resend from packet 0
+          for (let i = ob.acked; i < ob.sent; i++) localStorage.removeItem(_xpKey(type, BOT_ID, i));
+          ob.sent = 0; ob.acked = 0; ob.last = now; ob.restarts++;
+          localStorage.removeItem(_xaKey(type, BOT_ID));
+          if (ob.restarts > 3) { this._xAbort(type, 'partner kept asking for a resend'); continue; }
+        } else if (ack.upto > ob.acked) {
+          const upto = Math.min(ack.upto, ob.sent);
+          for (let i = ob.acked; i < upto; i++) localStorage.removeItem(_xpKey(type, BOT_ID, i));
+          if (upto > ob.acked) { ob.acked = upto; ob.last = now; }
+        }
+      }
+      if (ob.acked >= ob.n) { this._xFinish(type, ob); continue; }
+      if (ob.sent === 0) ob.last = now;          // queued behind another handover: the stall clock starts when it first sends
+      if (now - ob.last > XFER_STALL_MS) { this._xAbort(type, `partner stopped confirming packets (${ob.acked}/${ob.n})`); continue; }
+      try {
+        // XFER_WINDOW is a lane-wide cap, shared by every dataset in flight, so the corridor never holds more than one window at a time
+        while (ob.sent < ob.n && Object.values(_X.out).reduce((a, o) => a + o.sent - o.acked, 0) < XFER_WINDOW) {
+          localStorage.setItem(_xpKey(type, BOT_ID, ob.sent), ob.chunks[ob.sent]);
+          ob.sent++;
+        }
+      } catch(e) { this._xAbort(type, e && e.name === 'QuotaExceededError' ? 'localStorage full (no room for a packet)' : ((e && e.message) || 'packet write failed')); }
+    }
+  },
+  _xFinish(type, ob) {
+    try { localStorage.removeItem(_xmKey(type, BOT_ID)); localStorage.removeItem(_xaKey(type, BOT_ID)); } catch(_) {}
+    delete _X.out[type];
+    const ms = Date.now() - ob.t0;
+    this._shareNoteDone(type, ms);
+    this.log(`[SHR] ✓ ${type} handed over: ${ob.n} packet${ob.n > 1 ? 's' : ''}, ${Math.round(ob.bytes / 1024)} KB, ${ms} ms`, 'scan');
+  },
+  // ── Corridor: receiver side
+  _xPumpIn() {
+    const partner = this._partnerBotId();
+    for (const type of XFER_TYPES) {
+      let man = null;
+      try { man = JSON.parse(localStorage.getItem(_xmKey(type, partner)) || 'null'); } catch(_) {}
+      if (!man) { delete _X.asm[type]; continue; }
+      if (_X.done[type] === man.id) continue;                   // already delivered; the publisher is about to clear the manifest
+      const now = Date.now();
+      let asm = _X.asm[type];
+      if (!asm || asm.id !== man.id) asm = _X.asm[type] = { id: man.id, parts: [], next: 0, t0: now, asked: 0 };
+      let moved = false;
+      while (asm.next < man.n) {
+        const raw = localStorage.getItem(_xpKey(type, partner, asm.next));
+        if (raw == null) break;
+        asm.parts.push(raw); asm.next++; moved = true;
+      }
+      if (moved) localStorage.setItem(_xaKey(type, partner), JSON.stringify({ id: man.id, by: BOT_ID, upto: asm.next }));
+      if (asm.next < man.n) {
+        // Joined mid-handover (this bot reloaded): the early packets are already gone, so ask for a resend from packet 0.
+        if (asm.next === 0 && now - man.ts > 3000 && now - asm.asked > 10000) {
+          asm.asked = now;
+          localStorage.setItem(_xaKey(type, partner), JSON.stringify({ id: man.id, by: BOT_ID, upto: 0, restart: true }));
+        }
+        continue;
+      }
+      const json = asm.parts.join('');
+      delete _X.asm[type];
+      if (json.length !== man.bytes || _xSum(json) !== man.sum) {
+        this._shareNoteErr(type, 'received handover failed its size/checksum check (resend requested)');
+        localStorage.setItem(_xaKey(type, partner), JSON.stringify({ id: man.id, by: BOT_ID, upto: 0, restart: true }));
+        continue;
+      }
+      _X.inb[type] = JSON.parse(json);
+      _X.done[type] = man.id;
+      this._shareNoteRx(type, _X.inb[type].ts, man.n, now - asm.t0);
+    }
+  },
+  _xPump() {
+    if (_X.busy) return;
+    _X.busy = true;
+    try { this._xPumpOut(); this._xPumpIn(); } catch(_) {} finally { _X.busy = false; }
+  },
+  // Once at init: clear whatever a previous session of this bot left in the lane, drop keys from earlier builds, wire the triggers.
+  _xBoot() {
+    try {
+      const partner = this._partnerBotId(), drop = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k) continue;
+        if (k.startsWith('__ew_xm_') && k.endsWith('_' + BOT_ID)) drop.push(k);
+        else if (k.startsWith('__ew_xp_') && k.includes('_' + BOT_ID + '_')) drop.push(k);
+        else if (k.startsWith('__ew_xa_') && k.endsWith('_' + partner)) drop.push(k);
+        else if (/^__ew_sh_.+_v1$/.test(k)) drop.push(k);
+      }
+      drop.forEach(k => localStorage.removeItem(k));
+      let reg = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}'), dirty = false;
+      for (const t of XFER_TYPES) if (reg[t]) { delete reg[t]; dirty = true; }
+      if (dirty) localStorage.setItem(SHARED_KEY, JSON.stringify(reg));
+    } catch(_) {}
+    window.addEventListener('storage', e => { if (e.key && e.key.startsWith('__ew_x')) this._xPump(); });
+    setInterval(() => this._xPump(), 1000);
+  },
+  // ── Ledger: per dataset — tx (last publish), rx[bot] (last handover received), skip, err
+  _shareMetaRead() { try { return JSON.parse(localStorage.getItem(SHARE_META_KEY) || '{}') || {}; } catch(_) { return {}; } },
+  _shareMetaWrite(m) { try { localStorage.setItem(SHARE_META_KEY, JSON.stringify(m)); } catch(_) {} },
+  _shareNoteTx(type, bytes, n) {
+    if (/^(hb_|pos_)/.test(type)) return;
+    const m = this._shareMetaRead(), e = m[type] || (m[type] = {});
+    e.tx = { by: BOT_ID, ts: Date.now(), bytes: bytes != null ? bytes : ((e.tx && e.tx.bytes) || null), n, done: n ? null : Date.now() };
+    delete e.err; delete e.skip;
+    this._shareMetaWrite(m);
+  },
+  _shareNoteDone(type, ms) {
+    const m = this._shareMetaRead(), e = m[type];
+    if (!e || !e.tx || e.tx.by !== BOT_ID) return;
+    e.tx.done = Date.now(); e.tx.ms = ms;
+    this._shareMetaWrite(m);
+  },
+  _shareNoteRx(type, ts, n, ms) {
+    const m = this._shareMetaRead(), e = m[type] || (m[type] = {});
+    (e.rx || (e.rx = {}))[BOT_ID] = { ts, at: Date.now(), n, ms };
+    this._shareMetaWrite(m);
+  },
+  _shareNoteSkip(type, why) {
+    const m = this._shareMetaRead(), e = m[type] || (m[type] = {});
+    e.skip = { by: BOT_ID, at: Date.now(), why };
+    this._shareMetaWrite(m);
+  },
+  _shareNoteErr(type, msg) {
+    try {
+      const m = this._shareMetaRead(), e = m[type] || (m[type] = {});
+      e.err = { by: BOT_ID, at: Date.now(), msg };
+      this._shareMetaWrite(m);
+      const L = this._shareErrLogAt || (this._shareErrLogAt = {});
+      if (Date.now() - (L[type] || 0) > 30 * 60 * 1000) { L[type] = Date.now(); this.log(`[SHR] ⚠ Share of "${type}" failed: ${msg}`, 'warn'); }
+    } catch(_) {}
+  },
+  // live progress for the CROSS tab readout
+  _shareProgress(type) { const o = _X.out[type]; return o ? { acked: o.acked, n: o.n } : null; },
+  _shareIncoming(type) { const a = _X.asm[type]; return a ? { got: a.next } : null; },
+  // Bytes held in each part of the cross-bot store right now.
+  _shareUsage() {
+    const sz = k => { try { const v = localStorage.getItem(k); return v ? new Blob([v]).size : 0; } catch(_) { return 0; } };
+    let lane = 0;
+    for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && /^__ew_x[mpa]_/.test(k)) lane += sz(k); }
+    const rows = [{ id: 'corridor', bytes: lane, cap: XFER_WINDOW * XFER_PKT * 2 + 4096 }, { id: 'registry', bytes: sz(SHARED_KEY), cap: SHARED_REGISTRY_BYTE_CAP },
+      { id: 'events', bytes: sz('__everwinter_cross_v1') }, { id: 'samples', bytes: sz('__ew_sample_state_v1') }, { id: 'ledger', bytes: sz(SHARE_META_KEY) }];
+    return { rows, total: rows.reduce((a, r) => a + r.bytes, 0) };
   },
   // plugins push (msg)=>void here to react to a partner tab's live BroadcastChannel push — see
   // _sharedBroadcast. Wired up in init() as _sharedChannel.onmessage.
@@ -2207,7 +2420,7 @@ function pw() { return {
   // moment the partner's heartbeat is fresh again it silently steps back
   // down to following — no manual re-arming needed either direction.
   _partnerBotId() { return BOT_ID === 'chaser' ? 'winter' : 'chaser'; },
-  _lfHeartbeat() { this._sharedWrite('hb_' + BOT_ID, true); this._lfPublishPositions(); },
+  _lfHeartbeat() { this._sharedWrite('hb_' + BOT_ID, true); this._lfPublishPositions(); this._xPump(); },
   _lfPartnerAlive() {
     // Heartbeat only updates once per completed cycle, so "stale" has to be judged
     // against the scan cadence itself, not a fixed wall-clock number — otherwise a
@@ -2236,6 +2449,7 @@ function pw() { return {
     if (this._initDone) return;
     this._initDone = true;
     this._pluginInit();
+    this._xBoot();
     if (_sharedChannel) {
       _sharedChannel.onmessage = (ev) => {
         if (!ev?.data || ev.data.by === BOT_ID) return; // ignore our own echo
@@ -2587,6 +2801,7 @@ function pw() { return {
       '__everwinter_kline_log_v1': 'Cross-Bot: kline log',
       '__ew_sample_state_v1':      'Cross-Bot: sample state (incl. shared liq backfill)',
       '__ew_shared_v1':            'Cross-Bot: shared registry',
+      [SHARE_META_KEY]:            'Cross-Bot: share ledger',
       '__cgCoinList':              'Market Cap Cache: CoinGecko',
       '__cpCoinList':              'Market Cap Cache: CoinPaprika',
     };
@@ -2641,8 +2856,9 @@ function pw() { return {
         if (overhead > 0) addRow(`${blob.prefix}: structure overhead`, overhead);
         continue;
       }
-      addRow(singleKeyMap[k] || 'Other', bytes, singleKeyMap[k] ? { key: k } : null);
+      addRow(singleKeyMap[k] || (/^__ew_x[mpa]_/.test(k) ? 'Cross-Bot: corridor (in-flight packets)' : 'Other'), bytes, singleKeyMap[k] ? { key: k } : null);
     }
+    try { const pm = JSON.parse(localStorage.getItem(window.__pluginSystem?.KEY) || '[]'); const b = pm.reduce((a, e) => a + (e.idb ? (e.srcBytes || 0) : 0), 0); if (b) addRow('Plugin sources (IndexedDB, outside the localStorage quota)', b); } catch(e) {}
     return { rows, targets, grand };
   },
   _storageFmtBytes(b) {
@@ -3383,9 +3599,10 @@ function pw() { return {
           this._lastAllTickersAt = _shared.ts;
           this._seedFromTickers(_shared.data);
           this.log(`[SCN] 🤝 Bulk tickers from ${_shared.by} (${Math.round((Date.now()-_shared.ts)/60000)}m ago)`, 'scan');
-        } else if (_following && this._lastAllTickers?.length > 0 && (Date.now() - (this._lastAllTickersAt || 0)) < _cooldownMs) {
-          // Following, no shared snapshot, but our own in-memory copy is still within the cooldown — reuse it.
-          this.log('[SCN] 👥 Following partner — no shared bulk tickers, reusing own cached copy', 'info');
+        } else if (_following && this._lastAllTickers?.length > 0 && (Date.now() - (this._lastAllTickersAt || 0)) < _cooldownMs + Math.round(Math.max(1, this.cfg.scanMins ?? 10) * 90000)) {
+          // Following, nothing newer handed over yet, but our own in-memory copy is still within the cooldown (plus 1.5 scans of
+          // grace, so the partner's refresh at the cooldown boundary isn't beaten by a self-fetch) — reuse it.
+          this.log('[SCN] 👥 Following partner — no newer bulk tickers handed over, reusing current copy', 'info');
         } else {
           if (_following) this.log('[SCN] 👥 Following partner — no shared bulk tickers (and no fresh own copy); fetching one bulk list myself', 'warn');
           const tr=await this._qFetch(`${this.base}/v5/market/tickers?category=linear`);
@@ -4771,7 +4988,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       data = {
         exportType:  'configs',
         exportedAt:  new Date().toISOString(),
-        version:     '1.6.5',
+        version:     '1.6.7',
         cfg:         this.cfg,
       };
       suffix = 'configs';
@@ -4779,7 +4996,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       data = {
         exportType:   'positions',
         exportedAt:   new Date().toISOString(),
-        version:      '1.6.5',
+        version:      '1.6.7',
         session:      this.sess,
         closedTrades: this.closedTrades,
         positions:    this.positions.map(p => ({ ...p })),
@@ -4791,7 +5008,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       data = {
         exportType:  'log',
         exportedAt:  new Date().toISOString(),
-        version:     '1.6.5',
+        version:     '1.6.7',
         logs:        this.logs,
       };
       suffix = 'log';
@@ -5249,8 +5466,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           requires: plug.requires || [],
           touches: plug.touches || [],
           suppresses: plug.suppresses || [],
-          css: plug.css || '',
-          slots: plug.slots || {},
+          css: '',   // rebuilt from src at boot — the source already contains both, so storing them again was pure duplication
+          slots: {},
           src: _pluginCode,
         };
         const existing = this._pluginList.findIndex(p => p.id === entry.id);
@@ -5289,9 +5506,91 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   const _PS_KEY = '__pw_plugins_v1';
   const _PS_BOT = 'pseudowinter';
 
-  function _psLoad() {
-    try { return JSON.parse(localStorage.getItem(_PS_KEY) || '[]'); }
-    catch(e) { return []; }
+  // ── Plugin source storage ──────────────────────────────────────────────────────────────────────────
+  // A plugin's full source (hundreds of KB each) used to be stored verbatim in this localStorage key — most of the
+  // origin's quota. localStorage now keeps only a small manifest per plugin (id, name, version, wiring metadata,
+  // size); the sources live in IndexedDB (one database per bot), are read once at boot and are held in memory.
+  // Entries an older build stored whole are migrated on first boot — the manifest is slimmed only after the
+  // IndexedDB copy has been read back identical on a later boot (so persistence is proven in this browser, not
+  // assumed), and without IndexedDB — or if it hangs — everything falls back to the old whole-entry storage.
+  const _PS_DB = '__ew_plugins_' + _PS_BOT, _PS_STORE = 'src';
+  const _srcMem = {};       // id -> source (in memory)
+  const _srcVerified = {};  // id -> source that IndexedDB returned at boot, i.e. proven to survive a reload
+  const _srcPut = {};       // id -> source written to IndexedDB this session
+  let _idbBroken = !window.indexedDB;
+  function _psRaw() { try { return JSON.parse(localStorage.getItem(_PS_KEY) || '[]'); } catch(e) { return []; } }
+  function _psLoad() { return _psRaw().map(e => (e.src || !(e.id in _srcMem)) ? e : { ...e, src: _srcMem[e.id] }); }
+  function _slim(p) {
+    return { id: p.id, name: p.name, version: p.version, targetBot: p.targetBot, after: p.after, before: p.before,
+             conflicts: p.conflicts, requires: p.requires, touches: p.touches, suppresses: p.suppresses, idb: true, srcBytes: p.src.length };
+  }
+  function _idbOpen() {
+    return new Promise((res, rej) => {
+      if (!window.indexedDB) return rej(new Error('no IndexedDB'));
+      const rq = window.indexedDB.open(_PS_DB, 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore(_PS_STORE);
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+      rq.onblocked = () => rej(new Error('blocked'));
+    });
+  }
+  function _idbDo(db, mode, fn) {
+    return new Promise((res, rej) => {
+      const tx = db.transaction(_PS_STORE, mode);
+      let rq;
+      try { rq = fn(tx.objectStore(_PS_STORE)); } catch(e) { rej(e); return; }
+      tx.oncomplete = () => res(rq ? rq.result : undefined);
+      tx.onerror = () => rej(tx.error);
+      tx.onabort = () => rej(tx.error || new Error('aborted'));
+    });
+  }
+  // A source only leaves the localStorage manifest after IndexedDB has handed it back identical on a LATER boot —
+  // proof it persists in this browser/origin (file:// handling varies), not just that it worked within one session.
+  // Until then an entry stays whole (flagged idbPut); an IndexedDB that never persists simply never shrinks it.
+  async function _psSourcesInner() {
+    const raw = _psRaw();
+    for (const e of raw) if (e.src) _srcMem[e.id] = e.src;
+    if (!raw.length) return;
+    let db;
+    try { db = await _idbOpen(); }
+    catch (e) { _idbBroken = true; console.warn('[Plugin] IndexedDB unavailable — plugin sources stay in localStorage:', e); return; }
+    const next = []; let rewrite = false;
+    for (const e of raw) {
+      let v;
+      try { v = await _idbDo(db, 'readonly', st => st.get(e.id)); } catch (err) { console.error('[Plugin] reading "' + e.id + '" from IndexedDB failed:', err); }
+      if (!e.src) {                                                  // slim entry: the source lives only in IndexedDB
+        if (typeof v === 'string' && v) { _srcMem[e.id] = v; _srcVerified[e.id] = v; }
+        else console.error('[Plugin] "' + e.id + '" source is missing from IndexedDB — re-load its plugin file');
+        next.push(e); continue;
+      }
+      if (v === e.src) { _srcVerified[e.id] = e.src; next.push(_slim(e)); rewrite = true; }
+      else {
+        try { await _idbDo(db, 'readwrite', st => st.put(e.src, e.id)); _srcPut[e.id] = e.src; }
+        catch (err) { console.warn('[Plugin] writing "' + e.id + '" to IndexedDB failed — it stays whole in localStorage:', err); }
+        if (!e.idbPut) { rewrite = true; next.push({ ...e, idbPut: true }); } else next.push(e);
+      }
+    }
+    if (rewrite) { try { localStorage.setItem(_PS_KEY, JSON.stringify(next)); } catch(_) {} }
+  }
+  // IndexedDB must never be able to stop the app from starting: if it doesn't answer, carry on without it.
+  function _psSources() {
+    let done = false;
+    const work = _psSourcesInner().catch(e => { _idbBroken = true; console.warn('[Plugin] IndexedDB step failed:', e); }).then(() => { done = true; });
+    const timeout = new Promise(res => setTimeout(() => { if (!done) { _idbBroken = true; console.warn('[Plugin] IndexedDB did not answer within 4 s — continuing without it'); } res(); }, 4000));
+    return Promise.race([work, timeout]);
+  }
+  async function _psSync(plugins) {
+    try {
+      const db = await _idbOpen();
+      for (const p of plugins) if (p.src && _srcPut[p.id] !== p.src && _srcVerified[p.id] !== p.src) { await _idbDo(db, 'readwrite', st => st.put(p.src, p.id)); _srcPut[p.id] = p.src; }
+      const keys = await _idbDo(db, 'readonly', st => st.getAllKeys());
+      const live = new Set(plugins.map(p => p.id));
+      for (const k of keys) if (!live.has(k)) { await _idbDo(db, 'readwrite', st => st.delete(k)); delete _srcPut[k]; delete _srcVerified[k]; }
+      localStorage.setItem(_PS_KEY, JSON.stringify(plugins.map(p => (p.src && _srcVerified[p.id] === p.src) ? _slim(p) : (p.src && _srcPut[p.id] === p.src ? { ...p, idbPut: true } : p))));
+    } catch (err) {
+      _idbBroken = true;
+      console.warn('[Plugin] saving plugin sources to IndexedDB failed — kept whole in localStorage:', err);
+    }
   }
 
   function _psSort(plugins) {
@@ -5330,8 +5629,13 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
     // back an in-memory add that never actually persisted, or warn on a remove that
     // still doesn't fit.
     save(plugins) {
-      try { localStorage.setItem(_PS_KEY, JSON.stringify(plugins)); return true; }
+      for (const p of plugins) if (p.src) _srcMem[p.id] = p.src;
+      // A source stays whole in the manifest until IndexedDB has returned it on a later boot (see _psSourcesInner), so nothing depends on it before then.
+      const manifest = _idbBroken ? plugins : plugins.map(p => (p.src && _srcVerified[p.id] === p.src) ? _slim(p) : p);
+      try { localStorage.setItem(_PS_KEY, JSON.stringify(manifest)); }
       catch (e) { return false; }
+      if (!_idbBroken) _psSync(plugins.slice());
+      return true;
     },
     checkConflicts(plugins) {
       const warns = [];
@@ -5344,6 +5648,7 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
           if (suppressedBy[fn]) warns.push(`"${p.name}" and "${suppressedBy[fn]}" both suppress "${fn}" — last loaded wins`);
           else suppressedBy[fn] = p.name;
         }
+        if (!p.src && p.idb) warns.push(`"${p.name}" source is missing from IndexedDB and is inactive — re-load its plugin file`);
         if (!p.src && p.transformSrc) warns.push(`"${p.name}" was saved by an older loader and is inactive — re-load its plugin file`);
       }
       return warns;
@@ -5363,6 +5668,16 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   };
   if (document.currentScript) _scanCfgKeys(document.currentScript.textContent);
 
+  const _origPw = pw;
+  window.pw = function() {
+    let def = _origPw();
+    def._knownCfgKeys = _knownCfgKeys;
+    return def;
+  };
+
+  // Everything below needs the plugin sources, which now come from IndexedDB — so it runs once they're loaded, and Alpine
+  // itself is loaded only after that (see the loader at the bottom of the page).
+  function _psBoot() {
   // Skip plugins saved for a different bot (the two bots may share an origin)
   const stored = _psLoad().filter(p => {
     if (p.targetBot && p.targetBot.toLowerCase() !== _PS_BOT) {
@@ -5373,16 +5688,21 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
   });
   for (const p of stored) { if (p.src) _scanCfgKeys(p.src); }
 
-  const _origPw = pw;
-  window.pw = function() {
-    let def = _origPw();
-    def._knownCfgKeys = _knownCfgKeys;
-    return def;
-  };
-
   if (!stored.length) return;
 
   const sorted = _psSort(stored);
+
+  // css and slot markup aren't stored (they are inside the source) — rebuild both by running it once.
+  for (const p of sorted) {
+    if (!p.src) continue;
+    try {
+      delete window.__BotPlugin;
+      new Function(p.src)();
+      const live = window.__BotPlugin;
+      delete window.__BotPlugin;
+      if (live && live.id === p.id) { p.css = live.css || p.css || ''; p.slots = live.slots || p.slots || {}; }
+    } catch(e) { console.error('[Plugin] "' + p.id + '" css/slots rebuild failed:', e); }
+  }
 
   for (const p of sorted) {
     if (!p.css) continue;
@@ -5429,6 +5749,8 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
       fill(document);
     }
   }
+  }
+  window.__pluginReady = _psSources().then(_psBoot).catch(e => console.error('[Plugin] boot failed:', e));
 })();
 </script>
 
@@ -5492,10 +5814,14 @@ const forceMs  = this.cfg.runtimeHours * 3600000;
 </div><!-- #pw-app -->
 
 <!--
-  Alpine CDN — loaded LAST, AFTER pw() is defined above.
-  No defer, no async. Synchronous load ensures Alpine finds
-  the component function immediately when it scans the DOM.
+  Alpine CDN — loaded LAST, AFTER pw() is defined above AND after the plugin sources have been read from
+  IndexedDB and applied (window.__pluginReady), so Alpine finds the final component function when it scans the DOM.
 -->
-<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+<script>
+  (function () {
+    const go = () => { const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js'; document.body.appendChild(s); };
+    Promise.resolve(window.__pluginReady).then(go, go);
+  })();
+</script>
 </body>
 </html>
