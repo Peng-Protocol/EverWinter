@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'everwinter',
     name:      'EverWinter',
-    version:   '1.5.1',
+    version:   '1.5.4',
     targetBot: 'pseudowinter',
     after:     [],
     before:    [],
@@ -261,8 +261,8 @@
                 if (lp > 0) ref = lp;
               } catch(e) {}
             }
-            if (asMkt && C.type !== 'market') this.log(`[EW] ${sym}: ${C.tries} limit ${C.tries === 1 ? 'try' : 'tries'} unfilled — falling back to market`, 'warn');
-            else if (n > 1) this.log(`[EW] ${sym}: repricing limit (try ${n}/${C.tries})`, 'info');
+            if (asMkt && C.type !== 'market') this.log(`[EW] ${sym}: ${C.tries} limit ${C.tries === 1 ? 'try' : 'tries'} unfilled — falling back to market`, 'warn', true);
+            else if (n > 1) this.log(`[EW] ${sym}: repricing limit (try ${n}/${C.tries})`, 'info', true);
             const oid = await this.placeOrder(sym, 'Sell', asMkt ? 'Market' : 'Limit', qty, asMkt ? 0 : ref, C.offsetPct);
             if (oid === 'NOT_LIVE') { out.banned = true; return out; }
             if (!oid) continue; // rejected by exchange — no order resting, move to next try
@@ -321,7 +321,7 @@
             } catch(e) {}
             try { const fp = await check(); if (fp) return fp; } catch(e) {}
           }
-          this.log(`[EW] ${symbol}: fill timeout — aborted.`, 'warn');
+          this.log(`[EW] ${symbol}: fill timeout — aborted.`, 'warn', true);
           return null;
         },
 
@@ -580,7 +580,7 @@
               } else {
                 const exAvg    = parseFloat(ep.avgPrice || ep.entryPrice || pos.entryPrice);
                 const prevEntry = pos.entryPrice;
-                pos.markPrice  = parseFloat(ep.markPrice || exAvg || pos.markPrice);
+                if (!(pos.markPrice > 0)) pos.markPrice = parseFloat(ep.markPrice || exAvg || 0); // the watcher owns markPrice (last price) — overwriting it here made prices jump toward entry during scans
                 pos.totalSize  = parseFloat(ep.size || pos.totalSize);
 
                 // DCA repair: only on the post-scan sync, only for non-binary positions that actually have DCA orders,
@@ -862,11 +862,17 @@
         },
 
         async runScheduledCycle() {
-          const _live = this.creds.key && this.creds.secret;
-          if (_live) await this._ewSyncPositions();                  // before the scan loop
-          const _r = await _origCycle.call(this);
-          if (_live) await this._ewSyncPositions({ repair: true });  // after it — the only place DCA repair runs
-          return _r;
+          // Concurrent closes each schedule a cycle ~500ms after finishing; the host guards the scan itself
+          // (_cycleRunning) but not these pre/post position syncs, so N closes meant N syncs. One at a time.
+          if (this._cycleRunning || this._cycleWrapBusy) return;
+          this._cycleWrapBusy = true;
+          try {
+            const _live = this.creds.key && this.creds.secret;
+            if (_live) await this._ewSyncPositions();                  // before the scan loop
+            const _r = await _origCycle.call(this);
+            if (_live) await this._ewSyncPositions({ repair: true });  // after it — the only place DCA repair runs
+            return _r;
+          } finally { this._cycleWrapBusy = false; }
         },
 
         // Sized from the exchange (not pos.totalSize) so partial fills carry into the next attempt.
@@ -913,7 +919,7 @@
               if (last > 0) {
                 n++;
                 const asMkt = C.type === 'market' || (C.fallback && n > C.tries);
-                if (asMkt && C.type !== 'market' && n === C.tries + 1) this.log(`[EW] close ${symbol}: ${C.tries} limit ${C.tries === 1 ? 'try' : 'tries'} unfilled — falling back to market`, 'warn');
+                if (asMkt && C.type !== 'market' && n === C.tries + 1) this.log(`[EW] close ${symbol}: ${C.tries} limit ${C.tries === 1 ? 'try' : 'tries'} unfilled — falling back to market`, 'warn', true);
                 const lim = parseFloat((last * (1 + C.offsetPct / 100)).toFixed(this._ewPriceDp(symbol)));
                 try {
                   await this._ewDelay();
@@ -921,9 +927,9 @@
                   const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
                   const r = await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b });
                   const d = await this._ewSafeJson(r);
-                  if (d?.retCode === 0) { oid = d.result?.orderId || null; if (n > 1) this.log(`[EW] close ${symbol}: ${asMkt ? 'market order' : 'repriced limit @ ' + lim} (try ${n})`, 'info'); }
-                  else this.log(`[EW] close ${symbol}: ${d?.retMsg || 'no response'} (try ${n})`, 'warn');
-                } catch(e) { this.log(`[EW] close ${symbol}: ${e.message} (try ${n})`, 'warn'); }
+                  if (d?.retCode === 0) { oid = d.result?.orderId || null; if (n > 1) this.log(`[EW] close ${symbol}: ${asMkt ? 'market order' : 'repriced limit @ ' + lim} (try ${n})`, 'info', true); }
+                  else this.log(`[EW] close ${symbol}: ${d?.retMsg || 'no response'} (try ${n})`, 'warn', true);
+                } catch(e) { this.log(`[EW] close ${symbol}: ${e.message} (try ${n})`, 'warn', true); }
               }
             }
             const end = Date.now() + ((C.type === 'market' || (C.fallback && n > C.tries)) ? Math.min(EVERY, 4000) : EVERY);

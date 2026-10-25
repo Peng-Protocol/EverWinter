@@ -3480,9 +3480,9 @@ function pw() { return {
     this.log('[SES] Session stats, trade history, and 6hr drawdown/gains records cleared.', 'warn');
   },
 
-  log(m, type='info') {
-    // Batched bulk operation in progress — buffer everything but errors for one rolled-up entry
-    if ((this._logBatchDepth || 0) > 0 && type !== 'error') { this._logBatchBuf.push({ m, type }); return; }
+  log(m, type='info', live=false) {
+    // Batched bulk operation in progress — buffer everything but errors (and `live` progress lines, e.g. close retries) for one rolled-up entry
+    if ((this._logBatchDepth || 0) > 0 && type !== 'error' && !live) { this._logBatchBuf.push({ m, type }); return; }
     // `ts` (epoch ms) is the unambiguous absolute time for correlating a log entry against
     // exported positions/configs (which timestamp in UTC epoch). `t` stays as the local
     // HH:MM:SS display string the activity-log UI already renders — unchanged so the UI
@@ -4491,6 +4491,51 @@ function pw() { return {
           }, 5 * 60 * 1000);
         }
       }
+
+      // ── Whiplash audit for SL — same proximity rule and 5min kline re-check as the TP audit above ──
+      if (pos.slSet && pos.slPrice > 0 && !pos._whiplashSlScheduled) {
+        const _slGap  = pos.entryPrice - pos.slPrice; // long: SL sits below entry
+        const _slProx = pos.entryPrice - mark; // price distance already covered toward SL
+        const _wpSlPct = this.cfg.whiplashProximityPct ?? 20;
+        if (_slGap > 0 && _slProx >= _slGap * (1 - _wpSlPct / 100)) {
+          pos._whiplashSlScheduled = true;
+          const _snapSl = pos.slPrice;
+          this.log(`[WCH] ${this.themeEmoji} ${pos.symbol}: price within ${_wpSlPct}% of SL (${fmtP(mark)} → SL ${fmtP(_snapSl)}) — whiplash audit in 5min`, 'info');
+          const posId = pos.id;
+          setTimeout(async () => {
+            const livePos = this.positions.find(p => p.id === posId);
+            if (!livePos) return;
+            livePos._whiplashSlScheduled = false; // allow rescheduling if still open
+            if (_closingIds.has(posId)) return;
+            // Abort if the SL moved or was cleared since scheduling — watcher owns the new price.
+            if (!(livePos.slSet && livePos.slPrice === _snapSl)) return;
+            _closingIds.add(posId);
+            try {
+              const auditFrom = Date.now() - 6 * 60 * 1000;
+              const auditTo   = Date.now();
+              const candles   = await this.pseudoFetchKlines(livePos.symbol, auditFrom, auditTo);
+              if (!candles.length) { _closingIds.delete(posId); return; }
+              let whiplashHit = false;
+              for (const c of candles) {
+                if (_snapSl > 0 && c.l <= _snapSl) { // LONG: SL hit when candle low reaches SL
+                  whiplashHit = true; break;
+                }
+              }
+              if (whiplashHit) {
+                this.log(`[WPL] ${this.themeEmoji} ${livePos.symbol}: whiplash audit — SL confirmed in klines — closing`, 'warn');
+                _closingIds.delete(posId);
+                await this.pseudoClosePosition(livePos, 'sl', _snapSl);
+              } else {
+                this.log(`[WPL] ${this.themeEmoji} ${livePos.symbol}: whiplash audit — SL not hit in klines — still open`, 'info');
+                _closingIds.delete(posId);
+              }
+            } catch(e) {
+              this.log(`[E05] ${this.themeEmoji} ${livePos.symbol}: whiplash SL audit error — ${e.message}`, 'warn');
+              _closingIds.delete(posId);
+            }
+          }, 5 * 60 * 1000);
+        }
+      }
     }
 
     } catch(e) {
@@ -4826,7 +4871,7 @@ function pw() { return {
       data = {
         exportType:  'configs',
         exportedAt:  new Date().toISOString(),
-        version:     '1.6.8',
+        version:     '1.6.9',
         cfg:         this.cfg,
       };
       suffix = 'configs';
@@ -4834,7 +4879,7 @@ function pw() { return {
       data = {
         exportType:   'positions',
         exportedAt:   new Date().toISOString(),
-        version:      '1.6.8',
+        version:      '1.6.9',
         session:      this.sess,
         closedTrades: this.closedTrades,
         positions:    this.positions.map(p => ({ ...p })),
@@ -4844,7 +4889,7 @@ function pw() { return {
       data = {
         exportType:  'log',
         exportedAt:  new Date().toISOString(),
-        version:     '1.6.8',
+        version:     '1.6.9',
         logs:        this.logs,
       };
       suffix = 'log';
