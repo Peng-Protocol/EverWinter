@@ -351,3 +351,7 @@ While an AMa position is mid-ladder (any stage before the last one fills), there
 ### DAMa's idle-reset check is lazy, not a timer
 
 The 6-hour (configurable) reset isn't a background countdown — it's checked once per tick and once whenever a position opens. In practice this means the reset fires within a few seconds of the window elapsing during normal operation, but if the scan loop itself is stopped (not just idle — actually stopped), the check doesn't run at all until you start it again, so the score can sit stale past the configured window while the bot isn't running.
+
+### Illiquidity and Stablecoin filter 
+
+The 24-hour price change restriction in the scan loop (governing the gainer/loser pool qualification threshold via `psychoChangePct`) is **3%**. This is a hardcoded value with no config UI, it works well enough for filtering out illiquid tickers and stablecoins, though if the former prove troublesome in live mode then an additional order-count filter will be required. 
