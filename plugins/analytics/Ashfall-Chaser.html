@@ -29,7 +29,7 @@
 (function () {
   'use strict';
 
-    const VERSION = '2.50.3'; // Change: The grader's net profit readouts are back to dollars only (the simulation behind them stays in the background): no pick count / leverage / TP / SL text, no TP / SL / held breakdown and no per-batch average. Previous: Change: The grader's batch and window net profit now run as a miniature trade simulation: the host's leverage, TP and SL (binary or DCA mode), the recorded path since each forecast decides TP / SL / liquidation exits, and the readouts show how many ended each way. Previous: Change: Range Fit's weight is now managed by the bot (it backs off to the raw projection when the full fit is doing worse on the graded window, like the readings do; no more 'Soften' setting), and a ticker needs 12 hours of past moves instead of 24 (peers still need 24 shared hours to be correlated). Previous: Change: Range Fit now fits each ticker to its OWN range: the hourly moves it has made (kept in a longer, persisted past-moves store, no extra fetch) pooled with those of the tickers that track it closest, instead of one market-state range for the whole batch; volatility sizing, rank tilt and market-state history are gone, and the old 'Range fit (% of projection)' setting is now an optional "Soften with raw score" toggle (default off). Previous: Forecast net profit takes the host's Max Concurrent Positions instead of a fixed 3 (3 if the host has none). Previous: Forecast Grader chart gains net profit lines (batch and window): the batch's top 3 forecasts by projected pp in the bot's favor (only those projected in its favor), each a base-notional position held to grading, summed in $ from the recorded raw moves (no fees); the influence text is hidden. Previous: Liquidation pp now scales with the event's size against other liquidation events: the net liquidated $ of a ticker's watch is compared with the median of every liquidation event kept in a long history (default 24h, never shorter than the Score Horizon), pp = side x typical move x size / median, capped at the history's peak / median; the history starts working from the first event, the old turnover weight is dropped, and the history is shown, exported, imported and cleared with the sample store.
+    const VERSION = '2.51.0'; // Change: Forecast Focus (new, on by default): the Forecast Grader builds each batch first, up to 50 new forecasts plus their due revisits, and the host fetches that batch for everything else; a forecast that grades under 51% joins a retry queue and its ticker is forecast again, worst latest grade first (up to a share of each batch, default 60%), until one grade reaches 70%; exports gain attempt on grades and pending rows, retryQueue in the Summary and retries in the start log. Observation only, nothing is corrected from it yet. Previous: Change: The grader's net profit readouts are back to dollars only (the simulation behind them stays in the background): no pick count / leverage / TP / SL text, no TP / SL / held breakdown and no per-batch average. Previous: Change: The grader's batch and window net profit now run as a miniature trade simulation: the host's leverage, TP and SL (binary or DCA mode), the recorded path since each forecast decides TP / SL / liquidation exits, and the readouts show how many ended each way. Previous: Change: Range Fit's weight is now managed by the bot (it backs off to the raw projection when the full fit is doing worse on the graded window, like the readings do; no more 'Soften' setting), and a ticker needs 12 hours of past moves instead of 24 (peers still need 24 shared hours to be correlated). Previous: Change: Range Fit now fits each ticker to its OWN range: the hourly moves it has made (kept in a longer, persisted past-moves store, no extra fetch) pooled with those of the tickers that track it closest, instead of one market-state range for the whole batch; volatility sizing, rank tilt and market-state history are gone, and the old 'Range fit (% of projection)' setting is now an optional "Soften with raw score" toggle (default off). Previous: Forecast net profit takes the host's Max Concurrent Positions instead of a fixed 3 (3 if the host has none). Previous: Forecast Grader chart gains net profit lines (batch and window): the batch's top 3 forecasts by projected pp in the bot's favor (only those projected in its favor), each a base-notional position held to grading, summed in $ from the recorded raw moves (no fees); the influence text is hidden. Previous: Liquidation pp now scales with the event's size against other liquidation events: the net liquidated $ of a ticker's watch is compared with the median of every liquidation event kept in a long history (default 24h, never shorter than the Score Horizon), pp = side x typical move x size / median, capped at the history's peak / median; the history starts working from the first event, the old turnover weight is dropped, and the history is shown, exported, imported and cleared with the sample store.
 
 
 
@@ -87,6 +87,9 @@
     afFcEnabled: true,            // Forecast Grader (sub-toggle of Sample Scoring): freezes each sampled ticker's score as a price forecast and grades it at a revisit a few batches later; measurement only, touches no score
     afFcShare: 50,                // Forecast Grader: share (%) of each sample batch's slots taken by revisits (planned before Liquidation Surveillance fills the rest)
     afFcLead: 6,                  // Forecast Grader: batches between a forecast and its grading
+    afFcFocus: true,             // Forecast Focus (sub-toggle of Forecast Grader): the forecast batch is built first and everything else is fetched from it; tickers that grade under 51% are queued and forecast again until a grade reaches 70%
+    afFcFocusN: 50,              // Forecast Focus: new forecasts started per batch (max 50); their due revisits are fetched on top
+    afFcRetryShare: 60,          // Forecast Focus: share (%) of those forecasts that go to the retry queue (worst latest grade first); the rest stay fresh tickers
     afFcRange: true,             // Range Fit (sub-toggle of Forecast Grader): forecasts are laid onto the range each ticker has shown it can move (its own past hourly moves + the closest-tracking tickers')
     afFcPmHours: 168,           // Range Fit: hours of past hourly moves kept per ticker
     afFcPmPeers: 8,             // Range Fit: most correlated tickers pooled with a ticker's own history
@@ -432,6 +435,19 @@
                   <input type="number" min="2" max="24" step="1" x-model.number="cfg.afFcLead" :disabled="cfgLocked" @change="_afFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Graded forecasts kept</div>
                   <input type="number" min="60" max="6000" step="60" x-model.number="cfg.afFcKeep" :disabled="cfgLocked" @change="_afFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                <label class="tog" style="margin-top:8px" x-data="{h:false}" x-show="cfg.afFcEnabled">
+                  <div class="tog-t" :class="cfg.afFcFocus!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.afFcFocus=!(cfg.afFcFocus!==false);_afFcCfgChanged()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Forecast Focus <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
+                    <div class="ash-hint" x-show="h">The forecast batch is built first (new forecasts plus their due revisits) and everything else is fetched from it. A ticker whose forecast grades under 51% joins a retry queue, worst grade first, and is forecast again until one grade reaches 70%. Observation only: touches no score. While on, the revisit share above is not used.</div>
+                  </div>
+                </label>
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.afFcEnabled && cfg.afFcFocus!==false">
+                  <div class="lbl">New forecasts per batch (max 50)</div>
+                  <input type="number" min="5" max="50" step="5" x-model.number="cfg.afFcFocusN" :disabled="cfgLocked" @change="_afFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Retries (% of those)</div>
+                  <input type="number" min="0" max="100" step="10" x-model.number="cfg.afFcRetryShare" :disabled="cfgLocked" @change="_afFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                </div>
                 <label class="tog" style="margin-top:8px" x-data="{h:false}" x-show="cfg.afFcEnabled">
                   <div class="tog-t" :class="cfg.afFcRange?'on':''" @click.prevent="if(!cfgLocked){cfg.afFcRange=!cfg.afFcRange;_afFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
@@ -3133,7 +3149,13 @@
         _afFcShare() { const v = Number(this.cfg.afFcShare); return Math.max(5, Math.min(90, isFinite(v) && v > 0 ? v : 50)) / 100; },
         _afFcLead() { const v = Math.round(Number(this.cfg.afFcLead)); return Math.max(2, Math.min(24, isFinite(v) && v > 0 ? v : 6)); },
         _afFcKeep() { const v = Math.round(Number(this.cfg.afFcKeep)); return Math.max(60, Math.min(6000, isFinite(v) && v > 0 ? v : 3000)); },
-        _afFcNew() { return { seq: 0, ts: 0, pend: [], done: [], voids: { gone: 0, late: 0, thin: 0 }, nof: 0, ctx: {}, rsv: {}, rsvC: {}, sl: [] }; },
+        // Forecast Focus: the grader builds the batch first (up to FocusN new forecasts + their due revisits, retries first by worst latest grade) and the host
+        // fetches that batch for everything else. A forecast that grades under RtyLow joins the retry queue and stays until one of its grades reaches the pass line (latest grade only, no attempt cap).
+        _afFcFocusOn() { return this._afFcOn() && this.cfg.afFcFocus !== false; },
+        _afFcFocusN() { const v = Math.round(Number(this.cfg.afFcFocusN)); return Math.max(5, Math.min(50, isFinite(v) && v > 0 ? v : 50)); },
+        _afFcRtyShare() { const v = Number(this.cfg.afFcRetryShare); return Math.max(0, Math.min(100, isFinite(v) && v >= 0 ? v : 60)) / 100; },
+        _afFcRtyLow() { return 51; },
+        _afFcNew() { return { seq: 0, ts: 0, pend: [], done: [], voids: { gone: 0, late: 0, thin: 0 }, nof: 0, ctx: {}, rsv: {}, rsvC: {}, sl: [], rty: {}, rtyG: 0, rtyL: [] }; },
         _afFcStore() { return (this._afFc ||= this._afFcNew()); },
         _afFcSanW(w) { if (!w || typeof w !== 'object') return null; const o = {}; for (const k of Object.keys(w)) if (k !== 'ioa' && typeof w[k] === 'number' && isFinite(w[k])) o[k] = w[k]; return Object.keys(o).length ? o : null; }, // IO/A (retired) is dropped from every saved forecast
         _afFcSanC(c) { return typeof c === 'string' ? c.split(' ').filter(t => !/^ioa/.test(t)).join(' ') : ''; },
@@ -3142,14 +3164,17 @@
           if (!d || typeof d !== 'object') return o;
           o.seq = Math.max(0, d.seq | 0); o.ts = num(d.ts) || 0; o.nof = Math.max(0, d.nof | 0);
           for (const k of ['rsv', 'rsvC']) if (d[k] && typeof d[k] === 'object') for (const x of Object.keys(d[k]).slice(0, 500)) { const t = num(d[k][x]); if (t && t > 0) o[k][x] = t; } // liquidation reservations (ticker -> event ts) and what was already released
-          if (Array.isArray(d.sl)) o.sl = d.sl.filter(e => e && num(e.a) != null).map(e => ({ a: e.a | 0, r: e.r | 0, v: e.v | 0, h: e.h | 0, p: e.p | 0, n: e.n | 0, c: e.c | 0, m: e.m | 0, k: e.k | 0, q: e.q | 0 })).slice(-120); // start log
+          if (d.rty && typeof d.rty === 'object') for (const x of Object.keys(d.rty).slice(0, 2000)) { const q = d.rty[x]; if (q && num(q.a) != null && num(q.t) > 0) o.rty[x] = { n: Math.max(1, q.n | 0), a: q.a, t: q.t, f: num(q.f) || q.t }; } // retry queue: ticker -> attempts so far, latest accuracy, last graded ts, first miss ts
+          o.rtyG = Math.max(0, d.rtyG | 0);
+          if (Array.isArray(d.rtyL)) o.rtyL = d.rtyL.filter(e => e && typeof e.s === 'string' && num(e.u) != null).map(e => ({ s: e.s, n: e.n | 0, f: num(e.f) || 0, u: e.u, a: num(e.a) })).slice(-200);
+          if (Array.isArray(d.sl)) o.sl = d.sl.filter(e => e && num(e.a) != null).map(e => ({ a: e.a | 0, r: e.r | 0, v: e.v | 0, h: e.h | 0, p: e.p | 0, n: e.n | 0, c: e.c | 0, m: e.m | 0, k: e.k | 0, q: e.q | 0, y: e.y | 0 })).slice(-120); // start log
           if (d.ctx && typeof d.ctx === 'object') for (const k of Object.keys(d.ctx)) { const w = this._afFcSanW(d.ctx[k]); if (w) o.ctx[k] = w; }
           const v = d.voids || {};
           o.voids = { gone: v.gone | 0, late: v.late | 0, thin: v.thin | 0 };
           if (Array.isArray(d.pend)) o.pend = d.pend.filter(f => f && typeof f.s === 'string' && num(f.a) != null && num(f.d) != null && num(f.t) != null && num(f.p) > 0 && num(f.e) != null)
-            .map(f => ({ s: f.s, a: f.a | 0, d: f.d | 0, t: f.t, p: f.p, p0: num(f.p0), e: f.e, e0: num(f.e0), ef: num(f.ef), c: this._afFcSanC(f.c), w: this._afFcSanW(f.w), ep: this._afFcSanW(f.ep), sn: this._afFcSanW(f.sn), bg: this._afFcSanW(f.bg) }));
+            .map(f => ({ s: f.s, a: f.a | 0, d: f.d | 0, t: f.t, p: f.p, p0: num(f.p0), e: f.e, e0: num(f.e0), ef: num(f.ef), rt: num(f.rt), c: this._afFcSanC(f.c), w: this._afFcSanW(f.w), ep: this._afFcSanW(f.ep), sn: this._afFcSanW(f.sn), bg: this._afFcSanW(f.bg) }));
           if (Array.isArray(d.done)) o.done = d.done.filter(r => r && typeof r.s === 'string' && num(r.a) != null && num(r.e) != null && num(r.y) != null)
-            .map(r => ({ s: r.s, a: r.a | 0, d: r.d | 0, t: num(r.t) || 0, u: num(r.u) || 0, e: r.e, e0: num(r.e0), ef: num(r.ef), y: (num(r.m) != null && num(r.k) != null) ? +(r.m - r.k).toFixed(4) : r.y, m: num(r.m), k: num(r.k), mu: num(r.mu), md: num(r.md), c: this._afFcSanC(r.c), w: this._afFcSanW(r.w), ep: this._afFcSanW(r.ep), sn: this._afFcSanW(r.sn), bg: this._afFcSanW(r.bg) }));
+            .map(r => ({ s: r.s, a: r.a | 0, d: r.d | 0, t: num(r.t) || 0, u: num(r.u) || 0, e: r.e, e0: num(r.e0), ef: num(r.ef), rt: num(r.rt), y: (num(r.m) != null && num(r.k) != null) ? +(r.m - r.k).toFixed(4) : r.y, m: num(r.m), k: num(r.k), mu: num(r.mu), md: num(r.md), c: this._afFcSanC(r.c), w: this._afFcSanW(r.w), ep: this._afFcSanW(r.ep), sn: this._afFcSanW(r.sn), bg: this._afFcSanW(r.bg) }));
           return o;
         },
         _afFcLoad() {
@@ -3285,9 +3310,26 @@
           for (const k of Object.keys(rsv)) if (now - rsv[k] >= drop) delete rsv[k];
           for (const k of Object.keys(rsvC)) if (now - rsvC[k] >= keepC) delete rsvC[k];
         },
+        _afFcRtyNote(fc, sym, acc, ts) {
+          if (!this._afFcFocusOn() || !isFinite(acc)) return;
+          const rq = (fc.rty ||= {}), q = rq[sym];
+          if (acc >= this._afFcPass()) { // the latest grade reached the pass line: out of the queue
+            if (q) { fc.rtyG = (fc.rtyG || 0) + 1; (fc.rtyL ||= []).push({ s: sym, n: q.n + 1, f: q.f, u: ts, a: +acc.toFixed(1) }); if (fc.rtyL.length > 200) fc.rtyL.splice(0, fc.rtyL.length - 200); delete rq[sym]; }
+            return;
+          }
+          if (q) { q.n++; q.a = acc; q.t = ts; } // stays queued until a grade reaches the pass line, whatever it scores in between
+          else if (acc < this._afFcRtyLow()) rq[sym] = { n: 1, a: acc, t: ts, f: ts };
+        },
+        _afFcRtyExport(fc) {
+          const rq = fc.rty || {}, r1 = v => Math.round(v * 10) / 10, iso = v => v > 0 ? new Date(v).toISOString() : null;
+          return { enabled: this._afFcFocusOn(), note: 'tickers whose forecast graded under retryBelowPct are queued (worst latest grade first, then the longest waiting) and forecast again, up to retrySharePct of each batch of new forecasts, until one grade reaches retryPassPct (the latest grade alone decides, no attempt cap); attempts = forecasts graded on the ticker since its first miss; observation only, nothing is corrected from it yet',
+            waiting: Object.keys(rq).length, passed: fc.rtyG || 0,
+            queue: Object.keys(rq).sort((a, b) => rq[a].a - rq[b].a || rq[a].t - rq[b].t).slice(0, 400).map(s => ({ symbol: s, attempts: rq[s].n, latestAccuracyPct: r1(rq[s].a), firstMissAt: iso(rq[s].f), lastGradedAt: iso(rq[s].t) })),
+            passedLog: (fc.rtyL || []).map(e => ({ symbol: e.s, attempts: e.n, passedAccuracyPct: e.a == null ? null : r1(e.a), firstMissAt: iso(e.f), passedAt: iso(e.u) })) };
+        },
         _afFcPlan(pool, cap) {
           if (!this._afFcOn() || this._afFollowing()) { this._afFcPlanned = null; return null; }
-          const fc = this._afFcStore(), seq = fc.seq + 1, slots = Math.max(1, Math.floor(cap * this._afFcShare()));
+          const fc = this._afFcStore(), seq = fc.seq + 1, foc = this._afFcFocusOn(), fcN = this._afFcFocusN(), slots = foc ? fcN : Math.max(1, Math.floor(cap * this._afFcShare()));
           const rev = [], seen = new Set();
           for (const f of fc.pend.filter(x => x.d <= seq).sort((a, b) => a.d - b.d || a.t - b.t)) {
             if (rev.length >= slots) break;
@@ -3301,8 +3343,19 @@
             if (seen.has(s) || pendSet.has(s) || !poolSet.has(s) || now - fc.rsv[s] >= dropMs || this._afIlqIs(s) || this._afStbIs(s)) continue;
             rsvList.push(s);
           }
-          this._afFcPlanned = { seq, cap, rev: new Set(rev), rsv: new Set(rsvList) };
-          return { revisit: rev.concat(rsvList) };
+          const rtyList = [];
+          if (foc) { // Forecast Focus: the retry queue, worst latest grade first (then the longest waiting), pulled into the batch like the liquidation reservations
+            const rq = (fc.rty ||= {}), rMax = Math.floor(fcN * this._afFcRtyShare());
+            for (const k of Object.keys(rq)) if (now - rq[k].t > 14 * 86400000) delete rq[k]; // idle two weeks (delisted, gone): dropped
+            for (const s of Object.keys(rq).sort((a, b) => rq[a].a - rq[b].a || rq[a].t - rq[b].t)) {
+              if (rtyList.length >= rMax) break;
+              if (seen.has(s) || pendSet.has(s) || rsvList.includes(s) || !poolSet.has(s) || this._afIlqIs(s) || this._afStbIs(s)) continue;
+              rtyList.push(s);
+            }
+          }
+          const capEff = foc ? rev.length + Math.ceil(fcN * 11 / 10) : cap; // Focus: the due revisits + the new forecasts (a tenth of slack for tickers that turn out unusable); the host fetches this many
+          this._afFcPlanned = { seq, cap: capEff, rev: new Set(rev), rsv: new Set(rsvList) };
+          return foc ? { revisit: rev.concat(rsvList, rtyList), cap: capEff } : { revisit: rev.concat(rsvList) };
         },
         // Called with every new sample batch (leader only; a follower adopts the leader's store): grade what is due, then start new forecasts.
         _afFcIngest(entry) {
@@ -3335,12 +3388,12 @@
           for (const [a, arr] of groups) {
             if (arr.length < 3) { fc.voids.thin += arr.length; continue; }
             const M = arr.reduce((s, x) => s + x.m, 0) / arr.length;
-            for (const { f, m, mu, md } of arr) fc.done.push({ s: f.s, a, d: seq, t: f.t, u: entry.ts, e: f.e, e0: f.e0 ?? null, ef: f.ef ?? null, y: +(m - M).toFixed(4), m: +m.toFixed(4), k: +M.toFixed(4), mu: mu == null ? null : +mu.toFixed(4), md: md == null ? null : +md.toFixed(4), c: f.c, w: f.w || null, ep: f.ep || null, sn: f.sn || null, bg: this._afBgSeal(f) });
+            for (const { f, m, mu, md } of arr) { fc.done.push({ rt: f.rt || null, s: f.s, a, d: seq, t: f.t, u: entry.ts, e: f.e, e0: f.e0 ?? null, ef: f.ef ?? null, y: +(m - M).toFixed(4), m: +m.toFixed(4), k: +M.toFixed(4), mu: mu == null ? null : +mu.toFixed(4), md: md == null ? null : +md.toFixed(4), c: f.c, w: f.w || null, ep: f.ep || null, sn: f.sn || null, bg: this._afBgSeal(f) }); this._afFcRtyNote(fc, f.s, this._afFcAcc(f.e, +(m - M).toFixed(4)), entry.ts); }
           }
           fc.ctx = fc.ctx || {}; fc.ctx[seq] = this._afFcCtx(entry); // the market around this batch, for the export
           { const ks = Object.keys(fc.ctx).map(Number).sort((x, y) => x - y); for (const k of ks.slice(0, Math.max(0, ks.length - 120))) delete fc.ctx[k]; }
           // 2. Start forecasts from the fresh half of the batch (never from a revisit), at most the revisit share, so the two halves balance.
-          const slots = Math.max(1, Math.floor(cap * this._afFcShare()));
+          const slots = this._afFcFocusOn() ? this._afFcFocusN() : Math.max(1, Math.floor(cap * this._afFcShare()));
           const room = Math.max(0, Math.min(slots, slots * (lead + 3) - still.length));
           const have = new Set(still.map(f => f.s)), rev = pl ? pl.rev : new Set(), cand = []; let xRev = 0, xHave = 0, xPx = 0, xNof = 0; // why tickers of this batch did not start a forecast (logged in the start log)
           for (const r of entry.results) {
@@ -3355,11 +3408,12 @@
             cand.push({ s: r.sym, a: seq, d: seq + lead, t: entry.ts, p: tp > 0 ? tp : Number(r.px), p0: Number(r.px), e: +(dir * pr.e).toFixed(4), c: tags.join(' '), w: Object.fromEntries(Object.entries(pr.w).map(([k, v]) => [k, +(dir * v).toFixed(4)])), ep: { sum: +(dir * pr.sum).toFixed(4), max: +(dir * pr.max).toFixed(4), sc: +(dir * pr.e).toFixed(4) }, sn: this._afFcSnap(r, FRESH_TICKERS[r.sym], cd0, entry.ts) });
           }
           this._afFcReserve(fc, entry.ts);
-          const rsv = fc.rsv, rsvC = fc.rsvC, isR = s => rsv[s] != null, rc = cand.filter(x => isR(x.s)).sort((x, y) => rsv[y.s] - rsv[x.s]), oc = cand.filter(x => !isR(x.s));
+          const foc = this._afFcFocusOn(), rq = fc.rty || {}, rsv = fc.rsv, rsvC = fc.rsvC, isR = s => rsv[s] != null, rc = cand.filter(x => isR(x.s)).sort((x, y) => rsv[y.s] - rsv[x.s]), rtc = foc ? cand.filter(x => !isR(x.s) && rq[x.s] != null).sort((x, y) => rq[x.s].a - rq[y.s].a || rq[x.s].t - rq[y.s].t).slice(0, Math.floor(slots * this._afFcRtyShare())) : [], rtS = new Set(rtc.map(x => x.s)), oc = cand.filter(x => !isR(x.s) && !rtS.has(x.s));
           for (let i = oc.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [oc[i], oc[j]] = [oc[j], oc[i]]; }
-          const pick = rc.concat(oc).slice(0, room), rvp = new Set(pick.filter(f => isR(f.s)).map(f => f.s)); // reserved tickers first (newest event first), the rest drawn at random
+          const pick = rc.concat(rtc, oc).slice(0, room), rvp = new Set(pick.filter(f => isR(f.s)).map(f => f.s)); // reserved tickers first (newest event first), the rest drawn at random
           for (const s of rvp) { rsvC[s] = entry.ts - 1; delete rsv[s]; } // released; an event on this very cycle (seen later) still reserves it again
-          (fc.sl ||= []).push({ a: seq, r: entry.results.length, v: xRev, h: xHave, p: xPx, n: xNof, c: cand.length, m: room, k: pick.length, q: rvp.size });
+          let nRty = 0; for (const f of pick) { const q = foc ? rq[f.s] : null; if (q) { f.rt = q.n + 1; nRty++; } } // attempt number of a retry (a first forecast carries none)
+          (fc.sl ||= []).push({ a: seq, r: entry.results.length, v: xRev, h: xHave, p: xPx, n: xNof, c: cand.length, m: room, k: pick.length, q: rvp.size, y: nRty });
           if (fc.sl.length > 120) fc.sl.splice(0, fc.sl.length - 120);
           if (this._afBgOn()) for (const f of pick) f.bg = this._afBgFree(by[f.s], FRESH_TICKERS[f.s], CAND5[f.s] && CAND5[f.s].c, entry.ts, f.sn); // background readings that need nothing fetched
           if (rvp.size && this._afBgOn()) for (const f of pick) if (rvp.has(f.s)) (f.bg ||= {})._rv = 1; // started from a liquidation reservation
@@ -4200,7 +4254,7 @@
         },
         _afFcSummaryText() {
           const fc = this._afFcStore(), v = fc.voids.gone + fc.voids.late + fc.voids.thin;
-          return `${fc.done.length}/${this._afFcKeep()} graded · ${fc.pend.length} pending · lead ${this._afFcLead()} batches · revisits ${Math.round(this._afFcShare() * 100)}% of each batch` + (v ? ` · ${v} void` : '');
+          return `${fc.done.length}/${this._afFcKeep()} graded · ${fc.pend.length} pending · lead ${this._afFcLead()} batches · ${this._afFcFocusOn() ? `${this._afFcFocusN()} new forecasts per batch · ${Object.keys(this._afFcStore().rty || {}).length} in retry · ${this._afFcStore().rtyG || 0} passed` : `revisits ${Math.round(this._afFcShare() * 100)}% of each batch`}` + (v ? ` · ${v} void` : '');
         },
         _afFcWindowText() {
           const fc = this._afFcStore(), st = this._afFcStats(fc.done), f = this._afFcFmt(st);
@@ -4278,25 +4332,25 @@
           for (const [a, recs] of byA) { medY.set(a, medOf(recs.map(r => r.y))); const vs = recs.map(r => r.sn && r.sn.rng60).filter(v => typeof v === 'number' && v > 0); medV.set(a, vs.length ? medOf(vs) : null); }
           const batches = [...byA.entries()].sort((x, y) => x[0] - y[0]).map(([a, recs]) => ({ startBatch: a, gradedAt: new Date(recs[0].u).toISOString(), n: recs.length, batchMeanMovePct: r2(recs[0].k), grade: this._afFcStats(recs) }));
           const F = {
-            about: 'Each ticker is scored by the scorecard on its non-price readings at its first sample appearance (projectedPp: pp against the field in the bot\'s favor), then graded at its revisit: actualPp = the price move less its start batch\'s mean move, in the bot\'s favor (rawMovePct = the move itself; maxUpPct / maxDownPct = the highest / lowest point since the forecast; projections = the sum of the poles and the strongest single pole, projectedPp being their mean, then laid onto the expected range when Range Fit is on (rawProjectedPp = the mean before the fit); snapshot = the readings at forecast time; batchContext = the market around each start batch). Void = the ticker was gone / late / in a cohort of fewer than 3. accuracyPct = 50-100 when the direction was right (by size match), 0-50 when wrong; contributionPp = each criterion family\'s share of projectedPp. Every pp field (projectedPp, actualPp, contributionPp, projections) shares one sign: in the bot\'s favor (botFavorDir 1 = Chaser: + is price up; -1 = Winter: + is price down); the % fields (rawMovePct, relMovePct, batchMeanMovePct, maxUpPct, maxDownPct) are price moves, + is price up for either bot. actualVsBatchMedianPp = actualPp less its batch\'s median (the skew-free target); volRatio = the ticker\'s 60-minute range over its batch\'s median; featureIC = per snapshot feature, the mean per-batch rank correlation with the move (direction, in the bot\'s favor) and with its size (magnitude), and t over batches. readings (the Readings part) = the wide readings logged with each forecast (s.* snapshot, b.* background; the indicator forecast uses a few of them, see indicatorForecast); b.x_lqw / x_lqu / x_lqd / x_lql = liquidations in the 10 minutes AFTER the forecast started (watched flag, 0 = no reading; shorts $; longs $; lean pp) and x_lqs / x_lqg = seconds the watch listened / seconds it was blind, diagnostics only and never inputs. b.lqa / b.lqt = liquidation samples from before the forecast, age-weighted to the dropoff (lean -1..1 with liquidated shorts +; log10 of the weighted liquidated turnover), no reading when the ticker had none.',
+            about: 'Each ticker is scored by the scorecard on its non-price readings at its first sample appearance (projectedPp: pp against the field in the bot\'s favor), then graded at its revisit: actualPp = the price move less its start batch\'s mean move, in the bot\'s favor (rawMovePct = the move itself; maxUpPct / maxDownPct = the highest / lowest point since the forecast; projections = the sum of the poles and the strongest single pole, projectedPp being their mean, then laid onto the expected range when Range Fit is on (rawProjectedPp = the mean before the fit); snapshot = the readings at forecast time; batchContext = the market around each start batch). Void = the ticker was gone / late / in a cohort of fewer than 3. attempt = 1 for a first forecast on a ticker, 2 or more for a retry of a ticker that graded under 51% (Forecast Focus, see retryQueue in the Summary). accuracyPct = 50-100 when the direction was right (by size match), 0-50 when wrong; contributionPp = each criterion family\'s share of projectedPp. Every pp field (projectedPp, actualPp, contributionPp, projections) shares one sign: in the bot\'s favor (botFavorDir 1 = Chaser: + is price up; -1 = Winter: + is price down); the % fields (rawMovePct, relMovePct, batchMeanMovePct, maxUpPct, maxDownPct) are price moves, + is price up for either bot. actualVsBatchMedianPp = actualPp less its batch\'s median (the skew-free target); volRatio = the ticker\'s 60-minute range over its batch\'s median; featureIC = per snapshot feature, the mean per-batch rank correlation with the move (direction, in the bot\'s favor) and with its size (magnitude), and t over batches. readings (the Readings part) = the wide readings logged with each forecast (s.* snapshot, b.* background; the indicator forecast uses a few of them, see indicatorForecast); b.x_lqw / x_lqu / x_lqd / x_lql = liquidations in the 10 minutes AFTER the forecast started (watched flag, 0 = no reading; shorts $; longs $; lean pp) and x_lqs / x_lqg = seconds the watch listened / seconds it was blind, diagnostics only and never inputs. b.lqa / b.lqt = liquidation samples from before the forecast, age-weighted to the dropoff (lean -1..1 with liquidated shorts +; log10 of the weighted liquidated turnover), no reading when the ticker had none.',
             botFavorDir: d,
             parts: 'The Forecast Grader export comes in parts (Export Data menu): Summary (this file), Grades (one row per graded forecast), Readings (snapshot + background readings as compact columns, join on symbol + startBatch), Pending, Range Fit Past Moves.',
-            settings: { revisitSharePct: Math.round(this._afFcShare() * 100), leadBatches: this._afFcLead(), keep: this._afFcKeep(), batchSize: Math.max(1, Math.min(2500, Math.round(Number(this.cfg.afOcBatchSize) || 250))), scanStepMs: this._afFcStepMs() },
+            settings: { forecastFocus: this._afFcFocusOn(), forecastsPerBatch: this._afFcFocusN(), retrySharePct: Math.round(this._afFcRtyShare() * 100), retryBelowPct: this._afFcRtyLow(), retryPassPct: this._afFcPass(), revisitSharePct: Math.round(this._afFcShare() * 100), leadBatches: this._afFcLead(), keep: this._afFcKeep(), batchSize: Math.max(1, Math.min(2500, Math.round(Number(this.cfg.afOcBatchSize) || 250))), scanStepMs: this._afFcStepMs() },
             rangeFit: { enabled: this._afFcRangeOn(), weight: this._afFcRangeBlendInfo(), pastMoves: { hoursKeptPerTicker: this._afPmHours(), tickers: Object.keys(PM.s).length, peersMax: this._afPmPeers(), minCorrelation: this._afPmCorr(), ownSharePct: Math.round(this._afPmOwn() * 100) }, lastFit: this.afFcRangeInfo || null,
               about: 'Each forecast ticker is laid onto its OWN expected range: its past hourly moves (market-relative, scaled to the forecast horizon by the square root of time) pooled with those of the tickers whose market-relative hourly moves track it closest (each scaled to this ticker\'s volatility, weighted by correlation squared; ownSharePct of the weight stays with its own history). The batch is ranked by score and each ticker takes its own range\'s quantile at its rank (fittedPct, price direction, % points; the weight of the fit against the raw projection is the bot own call, see weight). lastFit.rows = the last batch: the peers used (correlation, shared hours) and the range\'s p10 / p50 / p90. A ticker under 12 hours of history is skipped and keeps its raw projection. The weight of the fit is tested on the graded window and backs off toward the raw projection when it does worse. The Range Fit Past Moves export part also holds the stored hourly moves.',
               store: part !== 'ranges' ? undefined : this._afPmExport() },
             candleDivination: this._afDivExport(),
             indicatorForecast: { enabled: this._afFcIndOn(), directionBlendPct: Math.round(this._afFcIndBlend() * 100), directionFeatures: this._afFcIndSelect().feats.map(x => (x.o > 0 ? '+' : '-') + x.k), directionTest: (() => { const q = this._afFcIndSelect(); return { windowHours: Math.round(this._afFcIndWinMs() / 360000) / 10, batches: q.batches, forecasts: q.rows, minBatches: FC_IND_MINB, minAbsRankIC: FC_IND_FLOOR, ensembleRankIC: q.ic, note: 'rankIC = mean per-batch rank correlation of the reading with the price move (price direction, + = price up); h1 / h2 = the same over the first / second half of the window; in = used (with the sign shown by rankIC)', readings: q.table }; })(), liquidationDropoffHours: Math.round(this._afFcLiqDropMs() / 360000) / 10, sizeFeatures: VOL_FEATS.map(x => x[0]), note: 'projectedPp ranks tickers by an equal-weight rank average of the direction features picked from the graded window (each reading used the way its own sign shows, kept only while it does not pull the ensemble down; none picked yet = the scorecard score stands; see directionTest), sized by the geometric mean of the size features against the batch median; the scorecard score is kept in projections.sc and graded as projectionTest.scorecard; background._dc and _vi are the per-ticker indicator direction score (price direction, -0.5 to 0.5) and size index', historyStorage: (this._afFcIdb && !this._afFcIdbBroken) ? { indexedDb: true, rows: this._afFcIdb.w.size, provenOnReload: this._afFcIdb.proven } : { indexedDb: false } },
-            batchCounter: fc.seq, voids: fc.voids, noScoredPole: fc.nof, liquidationReservation: { waiting: Object.keys(fc.rsv || {}).length, dropoffHours: Math.round(this._afFcLiqDropMs() / 360000) / 10, note: 'tickers with a liquidation event younger than the dropoff that have not started a forecast since; bg._rv = 1 marks forecasts started from a reservation' }, startLog: { note: 'per batch: results = tickers in the batch; revisits = taken by due revisits; pending = skipped because the ticker already has a forecast in flight; noPrice = no usable price; noScoredPole = nothing the scorecard could score; candidates = left to choose from; room = forecasts allowed to start; started = forecasts started; reserved = of those, started from a liquidation reservation. started under room = the batch ran out of candidates. Graded cohorts can still shrink later (void gone / late / thin)', rows: (fc.sl || []).map(e => ({ startBatch: e.a, results: e.r, revisits: e.v, pending: e.h, noPrice: e.p, noScoredPole: e.n, candidates: e.c, room: e.m, started: e.k, reserved: e.q })) },
+            batchCounter: fc.seq, voids: fc.voids, noScoredPole: fc.nof, retryQueue: this._afFcRtyExport(fc), liquidationReservation: { waiting: Object.keys(fc.rsv || {}).length, dropoffHours: Math.round(this._afFcLiqDropMs() / 360000) / 10, note: 'tickers with a liquidation event younger than the dropoff that have not started a forecast since; bg._rv = 1 marks forecasts started from a reservation' }, startLog: { note: 'per batch: results = tickers in the batch; revisits = taken by due revisits; pending = skipped because the ticker already has a forecast in flight; noPrice = no usable price; noScoredPole = nothing the scorecard could score; candidates = left to choose from; room = forecasts allowed to start; started = forecasts started; reserved = of those, started from a liquidation reservation; retries = of those, started on a ticker in the retry queue (attempt 2 or later). started under room = the batch ran out of candidates. Graded cohorts can still shrink later (void gone / late / thin)', rows: (fc.sl || []).map(e => ({ startBatch: e.a, results: e.r, revisits: e.v, pending: e.h, noPrice: e.p, noScoredPole: e.n, candidates: e.c, room: e.m, started: e.k, reserved: e.q, retries: e.y })) },
             window: this._afFcStats(fc.done), featureIC: this._afFcFeatureIC(byA, d), batches,
             windowRaw: (() => { const x = this._afFcStats(fc.done.map(r => ({ ...r, y: r.m != null ? r.m : r.y }))); delete x.infl; return x; })(), // the same grade on the raw move, market included
             projectionTest: Object.fromEntries([['mean', r => r.e], ['raw', r => (r.e0 != null ? r.e0 : r.e)], ['sum', r => r.ep && r.ep.sum], ['max', r => r.ep && r.ep.max], ['scorecard', r => r.ep && r.ep.sc]].map(([k, f]) => { const x = this._afFcStats(fc.done.map(r => ({ e: f(r), y: r.y })).filter(r => typeof r.e === 'number' && isFinite(r.e))); delete x.infl; return [k, x]; })),
             batchContext: fc.ctx || {},
             batchContext: fc.ctx || {},
           };
-          const gradeRow = r => ({ symbol: r.s, startBatch: r.a, gradedInBatch: r.d, forecastAt: new Date(r.t).toISOString(), gradedAt: new Date(r.u).toISOString(), elapsedMin: +((r.u - r.t) / 60000).toFixed(1),
+          const gradeRow = r => ({ symbol: r.s, startBatch: r.a, attempt: r.rt || 1, gradedInBatch: r.d, forecastAt: new Date(r.t).toISOString(), gradedAt: new Date(r.u).toISOString(), elapsedMin: +((r.u - r.t) / 60000).toFixed(1),
               projectedPp: r2(d * r.e), rawProjectedPp: r.e0 == null ? null : r2(d * r.e0), actualPp: r2(d * r.y), rawMovePct: r2(r.m), batchMeanMovePct: r2(r.k), accuracyPct: r2(this._afFcAcc(r.e, r.y)), contributionPp: fav(r.w), relMovePct: r2(r.y), actualVsBatchMedianPp: r2(d * (r.y - (medY.get(r.a) ?? 0))), volRatio: (r.sn && r.sn.rng60 > 0 && medV.get(r.a)) ? r2(r.sn.rng60 / medV.get(r.a)) : null, maxUpPct: r2(r.mu), maxDownPct: r2(r.md), projections: fav(r.ep), indDirScore: (r.bg && r.bg._dc != null) ? r2(d * r.bg._dc) : null, sizeIndex: (r.bg && r.bg._vi != null) ? r2(r.bg._vi) : null, criteria: r.c });
-          const pendRow = f => ({ symbol: f.s, startBatch: f.a, dueBatch: f.d, forecastAt: new Date(f.t).toISOString(), priceAtForecast: f.p, rawPriceAtForecast: f.p0 ?? null, projectedPp: r2(d * f.e), rawProjectedPp: f.e0 == null ? null : r2(d * f.e0), contributionPp: fav(f.w), projections: fav(f.ep), criteria: f.c });
+          const pendRow = f => ({ symbol: f.s, startBatch: f.a, attempt: f.rt || 1, dueBatch: f.d, forecastAt: new Date(f.t).toISOString(), priceAtForecast: f.p, rawPriceAtForecast: f.p0 ?? null, projectedPp: r2(d * f.e), rawProjectedPp: f.e0 == null ? null : r2(d * f.e0), contributionPp: fav(f.w), projections: fav(f.ep), criteria: f.c });
           // The readings behind each forecast as compact columns (the key names were repeated in every row): columns = symbol, startBatch, then s.* (snapshot) and b.* (background); rows follow that order, null = no reading.
           const columns = items => {
             const keys = [], seen = new Set();
