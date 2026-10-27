@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '1.108.0'; // Change: Forecast Focus: the batch is sized by the Forecast Grader (its new forecasts plus their due revisits) instead of the fixed batch size when the grader's Forecast Focus is on | previous: 1.107.0 - Change: Targets readout moved out of the Exit tab into the main body as a two-sided gauge (SL + Sacrifice left, TP + Cascade right, green / red by viability); entries are vetoed when the ticker's projected pp (Forecast Grader scorecard projection) is negative (pool, refetch and substitution) | previous: 1.106.0 - Change: IO/L and IO/S (long / short share of open interest vs its window average) replace the open-interest criterion in slots, Auto, scoring and badges; each needs the ticker's long share from AF/PF 2.37.0 (batch reading, else one fresh read before entry) and wait for 10 readings in their window; saved manual slots still using the old criterion are flagged as retired
+    const VERSION       = '1.108.1'; // Change: Forecast Focus now REPLACES the batch instead of adding to it: the planner names every ticker of the batch (due revisits, liquidation reservations, retries, then its own draw of fresh tickers, FocusN in all, revisits first) and the host fetches only those for every sampler | previous: Change: Forecast Focus: the batch is sized by the Forecast Grader (its new forecasts plus their due revisits) instead of the fixed batch size when the grader's Forecast Focus is on | previous: 1.107.0 - Change: Targets readout moved out of the Exit tab into the main body as a two-sided gauge (SL + Sacrifice left, TP + Cascade right, green / red by viability); entries are vetoed when the ticker's projected pp (Forecast Grader scorecard projection) is negative (pool, refetch and substitution) | previous: 1.106.0 - Change: IO/L and IO/S (long / short share of open interest vs its window average) replace the open-interest criterion in slots, Auto, scoring and badges; each needs the ticker's long share from AF/PF 2.37.0 (batch reading, else one fresh read before entry) and wait for 10 readings in their window; saved manual slots still using the old criterion are flagged as retired
   const DEFAULT_SLOTS = [[]];
   const MIC_HIST_KEY  = '__mic_hist_batches';
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
@@ -1099,12 +1099,23 @@
           // Forecast Grader (AF/PF): the revisits whose turn it is take their share of the slots first, planned before Liquidation Surveillance
           // fills the rest, and are taken out of the pool so the liquidation watch never sees them. null = off / following.
           const fcPlan = this._afFcPlan?.(fillSyms, cap0);
-          const cap = (fcPlan && fcPlan.cap > 0) ? fcPlan.cap : cap0; // Forecast Focus: the grader sizes the batch (its new forecasts + their due revisits) and the rest is fetched from it
-          const fcRev = (fcPlan && fcPlan.revisit) || [];
-          if (fcRev.length) { const fcSet = new Set(fcRev); fillSyms = fillSyms.filter(s => !fcSet.has(s)); }
-          const liqBatch = this._afLiqPick?.(fillSyms, cap - fcRev.length);
-          if (liqBatch && liqBatch.length) fillSyms = liqBatch;
-          await this._ocFetchBatch([...new Set([...fcRev, ...fillSyms])].slice(0, cap), null, false, needsHr);
+          let cap = cap0, batch;
+          if (fcPlan && fcPlan.batch && fcPlan.batch.length) {
+            // Forecast Focus: the grader's batch REPLACES the host's own draw, so every sampler (hour candles, liquidation watch, readings) uses exactly its tickers.
+            // The liquidation watch is opened on that same list (pool = cap = the list, so it neither adds nor drops anything).
+            const liqSet = this._afLiqPick?.(fcPlan.batch, fcPlan.batch.length);
+            batch = (liqSet && liqSet.length) ? liqSet : fcPlan.batch;
+            cap = batch.length;
+          } else {
+            // Forecast Grader (non-Focus): the revisits whose turn it is take their share of the slots, the host fills the rest.
+            cap = (fcPlan && fcPlan.cap > 0) ? fcPlan.cap : cap0;
+            const fcRev = (fcPlan && fcPlan.revisit) || [];
+            if (fcRev.length) { const fcSet = new Set(fcRev); fillSyms = fillSyms.filter(s => !fcSet.has(s)); }
+            const liqBatch = this._afLiqPick?.(fillSyms, cap - fcRev.length);
+            if (liqBatch && liqBatch.length) fillSyms = liqBatch;
+            batch = [...new Set([...fcRev, ...fillSyms])].slice(0, cap);
+          }
+          await this._ocFetchBatch(batch, null, false, needsHr);
           const ocResults = this.afOcResults || {};
           const freshAt = this._afOcResultsAt || 0;
           // Same batch as last scan (fetch skipped or failed, or the leader hasn't published a new one): nothing new to act on.
@@ -1122,7 +1133,7 @@
             rankPool.push(t); rankOc[sym] = live || hit.rec;
           }
           ctx.mic.ocResults = rankOc; ctx.mic.freshAt = freshAt; ctx.mic.basePool = rankPool;
-          ctx.mic.batchSyms = new Set(Object.keys(ocResults)); ctx.mic.verifyLeft = cap;
+          ctx.mic.batchSyms = new Set(Object.keys(ocResults)); ctx.mic.verifyLeft = Math.max(cap, cap0);
         },
         async _micScanPool(ctx) {
           const { allTickers, freshAt, autoMode, slots, scanSkip, basePool } = ctx.mic;
