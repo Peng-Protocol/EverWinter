@@ -28,7 +28,7 @@
 (function () {
   'use strict';
 
-    const VERSION = '2.52.0'; // Change: Weight Profiles (new, sub-toggle of Forecast Focus, on by default): a forecast that grades under 51% gets a profile (its readings ranked inside its batch, matched to the nearest profile or a new one when none is near enough); its ticker is retried on trial weights that diverge from the general ones (scorecard family multipliers, indicator blend, divination share, Range Fit blend) until a grade reaches 70%, and those become the profile's proven weights, which every later forecast matching the profile starts on; proven weights that fail send the profile back to learning; profiles, grades and exports carry the weight set used. Also: a Forecast Focus batch that comes up under its size (most of the pool already has a forecast in flight) is now filled up, first with more of the retry queue, then with tickers whose forecast is in flight (sampled only), so it no longer ends up as retries and revisits alone. | previous: Change: Forecast Focus now REPLACES the batch instead of adding to it: the planner names every ticker of the batch (due revisits, liquidation reservations, retries, then its own draw of fresh tickers, FocusN in all, revisits first) and the host fetches only those for every sampler Previous: Change: Forecast Focus (new, on by default): the Forecast Grader builds each batch first, up to 50 new forecasts plus their due revisits, and the host fetches that batch for everything else; a forecast that grades under 51% joins a retry queue and its ticker is forecast again, worst latest grade first (up to a share of each batch, default 60%), until one grade reaches 70%; exports gain attempt on grades and pending rows, retryQueue in the Summary and retries in the start log. Observation only, nothing is corrected from it yet. Previous: Change: The grader's net profit readouts are back to dollars only (the simulation behind them stays in the background): no pick count / leverage / TP / SL text, no TP / SL / held breakdown and no per-batch average. Previous: Change: The grader's batch and window net profit now run as a miniature trade simulation: the host's leverage, TP and SL (binary or DCA mode), the recorded path since each forecast decides TP / SL / liquidation exits, and the readouts show how many ended each way. Previous: Change: Range Fit's weight is now managed by the bot (it backs off to the raw projection when the full fit is doing worse on the graded window, like the readings do; no more 'Soften' setting), and a ticker needs 12 hours of past moves instead of 24 (peers still need 24 shared hours to be correlated). Previous: Change: Range Fit now fits each ticker to its OWN range: the hourly moves it has made (kept in a longer, persisted past-moves store, no extra fetch) pooled with those of the tickers that track it closest, instead of one market-state range for the whole batch; volatility sizing, rank tilt and market-state history are gone, and the old 'Range fit (% of projection)' setting is now an optional "Soften with raw score" toggle (default off). Previous: Forecast net profit takes the host's Max Concurrent Positions instead of a fixed 3 (3 if the host has none). Previous: Forecast Grader chart gains net profit lines (batch and window): the batch's top 3 forecasts by projected pp in the bot's favor (only those projected in its favor), each a base-notional position held to grading, summed in $ from the recorded raw moves (no fees); the influence text is hidden. Previous: Liquidation pp now scales with the event's size against other liquidation events: the net liquidated $ of a ticker's watch is compared with the median of every liquidation event kept in a long history (default 24h, never shorter than the Score Horizon), pp = side x typical move x size / median, capped at the history's peak / median; the history starts working from the first event, the old turnover weight is dropped, and the history is shown, exported, imported and cleared with the sample store.
+    const VERSION = '2.54.1'; // Change: Regime caution now manages its own weight like the Crab layer: graded forecasts its shift changed are replayed at 100 / 75 / 50 / 25 / 0% of the shift on the raw move, overall and per profile (aligned / diverging up / diverging down), and the best wins, so a shift that hurts is backed off to nothing (under 6 graded batches or 30 shifted forecasts it stands in full); rows carry the weight used (rg.bw), the full shift stays in rg.ad, the export has a weight section and the panel shows the weight. | previous: Change: Regime caution (new, sub-toggle of Indicator forecast, on by default, nothing reads it yet): every forecast gets a second score beside the scorecard's (er, shown as projectedPpWithRegime in the export; the score and its grade are untouched). The market's regime is read from the 1-hour candles already kept, on configurable windows (default 2, 6, 12, 24, 48 and 96 hours, up to 99): how green or red it is against its own typical highs and lows, and each ticker's position and green share against it. Where a ticker sits (market red or green, ticker with it or against it) files it into buckets, and a ticker moving against the market is its own profile, so whether that is bullish or bearish is read from what such tickers did, not assumed. The second score = the score + the market's expected move at its level (red leans pessimistic, green optimistic until graded cohorts say otherwise; flips for Winter since it is read in price direction) scaled by how far that kind of ticker follows the market + the usual miss of tickers in its buckets (actual relative move less score); favourable shifts are kept at 50%. Learning fades with a 72-hour half-life; the grader panel shows the market now and the tickers against it, the export carries the buckets and a test of marked-down against left-alone forecasts on the raw move.
 
 
 
@@ -89,7 +89,6 @@
     pfFcLead: 6,                  // Forecast Grader: batches between a forecast and its grading
     pfFcFocus: true,             // Forecast Focus (sub-toggle of Forecast Grader): the forecast batch is built first and everything else is fetched from it; tickers that grade under 51% are queued and forecast again until a grade reaches 70%
     pfFcFocusN: 50,              // Forecast Focus: batch size (max 50): due revisits first, new forecasts fill the rest
-    pfFcRetryShare: 60,          // Forecast Focus: share (%) of those forecasts that go to the retry queue (worst latest grade first); the rest stay fresh tickers
     pfFcProf: true,             // Weight Profiles (sub-toggle of Forecast Focus): a forecast under 51% gets a profile, its ticker is retried on diverging weights until a grade reaches 70%, later tickers matching the profile start on the weights that worked
     pfFcProfDist: 25,           // Weight Profiles: how close (%, RMS of the ranked readings) a ticker must be to a profile to match it
     pfFcRange: true,             // Range Fit (sub-toggle of Forecast Grader): forecasts are laid onto the range each ticker has shown it can move (its own past hourly moves + the closest-tracking tickers')
@@ -106,6 +105,11 @@
     pfFcDivK: 64,                 // divination: shapes (prototypes) per library, applies on rebuild
     pfFcDivMin: 3,                // divination: a shape needs this many matches before it gives a reading
     pfFcDivFar: 2,                // divination: no reading when the nearest shape is farther than this x the typical distance
+    pfFcCrab: true,               // Indicator forecast sub-toggle: Crab layer (tickers moving along a range lean toward a snap back to its middle; a ticker that broke its range is left alone)
+    pfFcCrabMin: 70,              // Crab layer: crab score (%) a 96-hour range must reach to count (shorter windows need more)
+    pfFcCrabEdge: 15,             // Crab layer: a close this far (% of the range) beyond an edge is a break
+    pfFcRegime: true,             // Indicator forecast sub-toggle: Regime caution (a second score beside each forecast, shifted by the market's regime and how tickers in the same spot did before)
+    pfFcRegimeWins: '2,6,12,24,48,96', // Regime caution: windows in hours (comma separated, 1 to 99)
     pfFcLiqDrop: 3,                // Indicator forecast: liquidation samples fade from full weight (fresh) to none at this age, in hours (the chart history holds about 4)
                  // a liquidation sample counts this much relative to a price sample in a pole's score (no UI)
     pfSparsePct: 25,              // sparsity floor: no entry when a candidate's thinnest pole holds under this % of its bucket type's median sample count (no UI)
@@ -183,10 +187,16 @@
   const BG_SKIP = k => k.charAt(0) === '_' || k.indexOf('x_') === 0 || k === 'c60'; // predictions, post-start diagnostics and a data-quality count are never model inputs
   const FC_IND_MINB = 6, FC_IND_FLOOR = 0.02; // Indicator forecast, direction: fewest graded batches the readings are tested on (fewer = the scorecard's own score stands), and the weakest rank correlation worth integrating
   const FC_PROF_TRAITS = ['vol', 'oi', 'fr', 'spr', 'rng60', 'pos24', 'lta'], FC_PROF_MAX = 60; // Weight Profiles: the snapshot readings a ticker is profiled on (ranked inside its batch), and the most profiles kept
-  const FC_PROF_FAM = ['fund', 'va', 'iol', 'ios', 'lta'], FC_PROF_ALL = FC_PROF_FAM.concat(['ind', 'div', 'rng']), FC_PROF_LIM = { fund: [-1, 2], va: [-1, 2], iol: [-1, 2], ios: [-1, 2], lta: [-1, 2], ind: [0, 1], div: [0, 2], rng: [0, 1] }; // the weights a profile can set: scorecard family multipliers, indicator blend, divination share, Range Fit blend
+  const FC_PROF_FAM = ['fund', 'va', 'iol', 'ios', 'lta'], FC_PROF_ALL = FC_PROF_FAM.concat(['ind', 'div', 'rng', 'crb']), FC_PROF_LIM = { fund: [-1, 2], va: [-1, 2], iol: [-1, 2], ios: [-1, 2], lta: [-1, 2], ind: [0, 1], div: [0, 2], rng: [0, 1], crb: [0, 1] }; // the weights a profile can set: scorecard family multipliers, indicator blend, divination share, Range Fit blend, crab layer weight
   const VOL_FEATS = [['rng60', 'sn'], ['gk60', 'bg'], ['atr14', 'bg']]; // Indicator forecast, size: geometric mean of own / batch-median ratios (each clamped 0.25 to 4)
   const FC_IDB = '__ew_pf_fcdb_v1', FC_IDB_STORE = 'done', FC_LS_TAIL = 120; // graded forecasts live in IndexedDB; localStorage keeps this many of the newest once IndexedDB has proven itself
   const BG_KEY = '__ew_pf_bg1h_v1', BG_PERSIST_MAX = 600; // persisted 1-hour candle state (compact), newest-used tickers kept
+  const CRAB_KEY = '__ew_pf_crab_v1', CRAB_W = [6, 12, 24, 48, 72, 96], CRAB_H = 6, CRAB_PRIOR = 30, CRAB_P0 = 0.15, CRAB_SAMPLE = 6000; // Crab layer: breaker-library storage, range windows (hours of completed candles), hours ahead a break is looked for, the library's prior weight (crabs) and the break chance it starts from, past candles sampled when it is built
+  const CRAB = { loaded: false, dirty: false, cells: {}, last: {} }; // memory: breaker library (cell -> { n: crabs seen, u: broke up, d: broke down within CRAB_H hours }), per ticker the last hour learned
+  const RG_WIN_MAX = 99, RG_MIN_N = 20, RG_FRESH_MS = 2 * 3600000, RG_K = 30, RG_N0 = 6, RG_BN = 30, RG_HL_MS = 72 * 3600000, RG_UP = 0.5, RG_CAP = 3; // Regime caution: longest window in hours (the candle cache holds 100), fewest fresh tickers for a market reading, how far behind a ticker's last hour candle may be and still count, prior weight (forecasts per bucket / cohorts per market level / forecasts per profile), half-life of what it learned, share of a favourable shift kept, cap on a shift (pp)
+  const RG_LVL = ['deep red', 'red', 'flat', 'green', 'deep green'], RG_CLS = ['aligned with the market or no divergence', 'diverging up (green against a red market)', 'diverging down (red against a green market)'], RG_REL = ['market flat', 'market red, ticker red or flat', 'market red, ticker green', 'market green, ticker green or flat', 'market green, ticker red'], RG_ZL = ['deep down', 'down', 'flat', 'up', 'deep up'], RG_GL = ['fewer green hours than the market', 'about as many as the market', 'more green hours than the market'];
+  const RGM = { key: '', v: null }; // memory: the market's reading per window, cached per hour
+  const CRAB_RX = /^c[bp]/; // crab readings (cb*, cp*): logged and exported, never fed to the indicator ensemble (the crab layer applies them itself)
 
   // Liquidation Surveillance (non-reactive, module-level): the WS connection, per-symbol liquidated-turnover tally for the
   // watch in progress, the watched set, and the closed watch waiting for its end-of-watch criteria (see _pfLiqPick/_pfLiqIngest).
@@ -444,14 +454,12 @@
                   <div class="tog-t" :class="cfg.pfFcFocus!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.pfFcFocus=!(cfg.pfFcFocus!==false);_pfFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Forecast Focus <span class="pfr-i" @click.prevent.stop="h=!h">ⓘ</span></div>
-                    <div class="pfr-hint" x-show="h">The forecast batch IS the batch: its due revisits, retries and new forecasts are the only tickers fetched, for every sampler (hour candles, liquidation watch, readings). Revisits come first; new forecasts fill the rest. A ticker whose forecast grades under 51% joins a retry queue, worst grade first, and is forecast again until one grade reaches 70%. While on, the revisit share above is not used.</div>
+                    <div class="pfr-hint" x-show="h">The forecast batch IS the batch: its due revisits, retries and new forecasts are the only tickers fetched, for every sampler (hour candles, liquidation watch, readings). Revisits come first; new forecasts fill the rest. A ticker whose forecast grades under 51% joins a retry pool; once the pool fills a whole batch of new forecasts they are forecast again together (longest waiting first) until one grade reaches 70%. While on, the revisit share above is not used.</div>
                   </div>
                 </label>
                 <div style="margin-top:6px;margin-left:14px" x-show="cfg.pfFcEnabled && cfg.pfFcFocus!==false">
                   <div class="lbl">Tickers per batch (max 50)</div>
                   <input type="number" min="5" max="50" step="5" x-model.number="cfg.pfFcFocusN" :disabled="cfgLocked" @change="_pfFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
-                  <div class="lbl" style="margin-top:6px">Retries (% of the new)</div>
-                  <input type="number" min="0" max="100" step="10" x-model.number="cfg.pfFcRetryShare" :disabled="cfgLocked" @change="_pfFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                 </div>
                 <label class="tog" style="margin-top:8px" x-data="{h:false}" x-show="cfg.pfFcEnabled && cfg.pfFcFocus!==false">
                   <div class="tog-t" :class="cfg.pfFcProf!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.pfFcProf=!(cfg.pfFcProf!==false);_pfFcCfgChanged()}"><div class="tog-k"></div></div>
@@ -500,6 +508,39 @@
                   <div style="margin-top:6px;display:flex;gap:6px">
                     <button class="btn btn-ghost" :disabled="cfgLocked" @click="_pfDivReset(true);t++">Rebuild from candle cache</button>
                     <button class="btn btn-ghost" :disabled="cfgLocked" @click="_pfDivReset(false);t++">Clear library</button>
+                  </div>
+                </div>
+                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}" x-show="cfg.pfFcEnabled && cfg.pfFcInd!==false">
+                  <div class="tog-t" :class="cfg.pfFcCrab!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.pfFcCrab=!(cfg.pfFcCrab!==false);_pfFcCfgChanged()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Crab layer <span class="pfr-i" @click.prevent.stop="h=!h">ⓘ</span></div>
+                    <div class="pfr-hint" x-show="h">Finds tickers moving along a range (6 to 96 hours of 1-hour candles, longer ranges win) and leans their forecast toward a snap back: up near the bottom, down near the top, unless history says that setup tends to break. Its weight is tested on the graded window and backs off when it hurts.</div>
+                  </div>
+                </label>
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.pfFcEnabled && cfg.pfFcInd!==false && cfg.pfFcCrab!==false" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
+                  <div class="lbl">Crab score to count (% at 96h, shorter windows need more)</div>
+                  <input type="number" min="40" max="90" step="5" x-model.number="cfg.pfFcCrabMin" :disabled="cfgLocked" @change="_pfFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Break margin (% of the range)</div>
+                  <input type="number" min="5" max="40" step="5" x-model.number="cfg.pfFcCrabEdge" :disabled="cfgLocked" @change="_pfFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div style="margin-top:6px" x-html="t>=0 && _pfCrabPanel()"></div>
+                  <div style="margin-top:6px;display:flex;gap:6px">
+                    <button class="btn btn-ghost" :disabled="cfgLocked" @click="_pfCrabReset(true);t++">Rebuild from candle cache</button>
+                    <button class="btn btn-ghost" :disabled="cfgLocked" @click="_pfCrabReset(false);t++">Clear library</button>
+                  </div>
+                </div>
+                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}" x-show="cfg.pfFcEnabled && cfg.pfFcInd!==false">
+                  <div class="tog-t" :class="cfg.pfFcRegime!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.pfFcRegime=!(cfg.pfFcRegime!==false);_pfFcCfgChanged()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Regime caution <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
+                    <div class="ash-hint" x-show="h">Keeps a second score beside each forecast, shifted by how the market's regime and tickers in the same spot did before; a ticker moving against the market is its own profile.</div>
+                  </div>
+                </label>
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.pfFcEnabled && cfg.pfFcInd!==false && cfg.pfFcRegime!==false" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
+                  <div class="lbl">Windows (hours, comma separated, 1 to 99)</div>
+                  <input type="text" x-model="cfg.pfFcRegimeWins" :disabled="cfgLocked" @change="_pfFcCfgChanged()" style="width:140px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div style="margin-top:6px" x-html="t>=0 && _pfRgPanel()"></div>
+                  <div style="margin-top:6px;display:flex;gap:6px">
+                    <button class="btn btn-ghost" :disabled="cfgLocked" @click="_pfFcRgReset();t++">Clear what it learned</button>
                   </div>
                 </div>
                 <div style="margin-top:6px" x-show="cfg.pfFcEnabled && cfg.pfFcInd!==false">
@@ -738,7 +779,7 @@
                 </div>
                 <div style="position:relative" @click="const g=$event.target.closest('[data-oc-cycle-ts]');if(g)_pfOcHighlightedCycleTs=Number(g.dataset.ocCycleTs);const ps=$event.target.closest('[data-fc-slot]');if(ps)_pfFcSel=ps.dataset.fcSlot">
                   <div x-html="_pfOcYAxisHtml||''" style="position:absolute;left:0;top:0;pointer-events:none;z-index:2"></div>
-                  <div x-ref="ocChartWrap" x-effect="tick; open; const h=_pfOcHist(), k=_pfOcViewMode+'|'+h.length+'|'+(h[h.length-1]?.ts||0); $nextTick(()=>{ const el=$refs.ocChartWrap; if(!el) return; if(!el.offsetParent){el._ocKey=undefined;return;} if(el._ocKey!==k){el._ocKey=k;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_pfOcChartSvg(open)"></div></div>
+                  <div x-ref="ocChartWrap" x-effect="tick; open; const h=_pfOcHist(), k=_pfOcViewMode+'|'+h.length+'|'+(h[h.length-1]?.ts||0)+(_pfOcViewMode==='fc'?'|'+_pfFcStore().done.length+'|'+_pfFcStore().pend.length:''); $nextTick(()=>{ const el=$refs.ocChartWrap; if(!el) return; if(!el.offsetParent){el._ocKey=undefined;return;} if(el._ocKey!==k){el._ocKey=k;el.scrollLeft=el.scrollWidth;} })" style="overflow-x:auto;padding:4px 6px"><div x-html="_pfOcChartSvg(open)"></div></div>
                 </div>
                 <div style="border-top:1px solid rgba(255,255,255,.06);padding:3px 8px 4px">
                   <div x-text="_pfOcSummaryText(open)" style="font-family:var(--mono);font-size:8.5px;color:var(--text-lo)"></div>
@@ -3170,9 +3211,8 @@
         // fetches that batch for everything else. A forecast that grades under RtyLow joins the retry queue and stays until one of its grades reaches the pass line (latest grade only, no attempt cap).
         _pfFcFocusOn() { return this._pfFcOn() && this.cfg.pfFcFocus !== false; },
         _pfFcFocusN() { const v = Math.round(Number(this.cfg.pfFcFocusN)); return Math.max(5, Math.min(50, isFinite(v) && v > 0 ? v : 50)); },
-        _pfFcRtyShare() { const v = Number(this.cfg.pfFcRetryShare); return Math.max(0, Math.min(100, isFinite(v) && v >= 0 ? v : 60)) / 100; },
         _pfFcRtyLow() { return 51; },
-        _pfFcNew() { return { seq: 0, ts: 0, pend: [], done: [], voids: { gone: 0, late: 0, thin: 0 }, nof: 0, ctx: {}, rsv: {}, rsvC: {}, sl: [], rty: {}, rtyG: 0, rtyL: [], prof: [], profN: 0 }; },
+        _pfFcNew() { return { seq: 0, ts: 0, pend: [], done: [], voids: { gone: 0, late: 0, thin: 0 }, nof: 0, ctx: {}, rsv: {}, rsvC: {}, sl: [], rty: {}, rtyG: 0, rtyL: [], prof: [], profN: 0, rg: this._pfFcRgNew() }; },
         _pfFcStore() { return (this._pfFc ||= this._pfFcNew()); },
         _pfFcSanW(w) { if (!w || typeof w !== 'object') return null; const o = {}; for (const k of Object.keys(w)) if (k !== 'ioa' && typeof w[k] === 'number' && isFinite(w[k])) o[k] = w[k]; return Object.keys(o).length ? o : null; }, // IO/A (retired) is dropped from every saved forecast
         _pfFcSanC(c) { return typeof c === 'string' ? c.split(' ').filter(t => !/^ioa/.test(t)).join(' ') : ''; },
@@ -3181,19 +3221,20 @@
           if (!d || typeof d !== 'object') return o;
           o.seq = Math.max(0, d.seq | 0); o.ts = num(d.ts) || 0; o.nof = Math.max(0, d.nof | 0);
           for (const k of ['rsv', 'rsvC']) if (d[k] && typeof d[k] === 'object') for (const x of Object.keys(d[k]).slice(0, 500)) { const t = num(d[k][x]); if (t && t > 0) o[k][x] = t; } // liquidation reservations (ticker -> event ts) and what was already released
-          if (d.rty && typeof d.rty === 'object') for (const x of Object.keys(d.rty).slice(0, 2000)) { const q = d.rty[x]; if (q && num(q.a) != null && num(q.t) > 0) o.rty[x] = { n: Math.max(1, q.n | 0), a: q.a, t: q.t, f: num(q.f) || q.t, p: num(q.p) }; } // retry queue: ticker -> attempts so far, latest accuracy, last graded ts, first miss ts
+          if (d.rty && typeof d.rty === 'object') for (const x of Object.keys(d.rty).slice(0, 2000)) { const q = d.rty[x]; if (q && num(q.a) != null && num(q.t) > 0) o.rty[x] = { n: Math.max(1, q.n | 0), a: q.a, t: q.t, f: num(q.f) || q.t, p: num(q.p), cb: num(q.cb) }; } // retry queue: ticker -> attempts so far, latest accuracy, last graded ts, first miss ts
           o.rtyG = Math.max(0, d.rtyG | 0);
           if (Array.isArray(d.prof)) { const sw = w => this._pfFcProfSanW(w); o.prof = d.prof.filter(p => p && num(p.id) > 0 && Array.isArray(p.c)).slice(0, FC_PROF_MAX).map(p => ({ id: p.id | 0, c: p.c.slice(0, FC_PROF_TRAITS.length).map(num), n: p.n | 0, tn: p.tn | 0, st: p.st === 'p' ? 'p' : 'l', w: sw(p.w), wa: num(p.wa), cand: sw(p.cand), ci: p.ci | 0, tr: (Array.isArray(p.tr) ? p.tr : []).filter(t => t && num(t.a) != null && sw(t.w)).slice(-30).map(t => ({ w: sw(t.w), a: t.a, s: typeof t.s === 'string' ? t.s : '' })), fw: (Array.isArray(p.fw) ? p.fw : []).filter(t => t && sw(t.w)).slice(-8).map(t => ({ w: sw(t.w), a: num(t.a) })), rs: p.rs | 0, ok: p.ok | 0, ko: p.ko | 0, t: num(p.t) || 0, u: num(p.u) || 0, ms: (Array.isArray(p.ms) ? p.ms : []).filter(x => typeof x === 'string').slice(-8) })); }
           o.profN = Math.max(d.profN | 0, ...o.prof.map(p => p.id), 0);
+          o.rg = this._pfFcRgSanStore(d.rg);
           if (Array.isArray(d.rtyL)) o.rtyL = d.rtyL.filter(e => e && typeof e.s === 'string' && num(e.u) != null).map(e => ({ s: e.s, n: e.n | 0, f: num(e.f) || 0, u: e.u, a: num(e.a) })).slice(-200);
           if (Array.isArray(d.sl)) o.sl = d.sl.filter(e => e && num(e.a) != null).map(e => ({ a: e.a | 0, r: e.r | 0, v: e.v | 0, h: e.h | 0, p: e.p | 0, n: e.n | 0, c: e.c | 0, m: e.m | 0, k: e.k | 0, q: e.q | 0, y: e.y | 0 })).slice(-120); // start log
           if (d.ctx && typeof d.ctx === 'object') for (const k of Object.keys(d.ctx)) { const w = this._pfFcSanW(d.ctx[k]); if (w) o.ctx[k] = w; }
           const v = d.voids || {};
           o.voids = { gone: v.gone | 0, late: v.late | 0, thin: v.thin | 0 };
           if (Array.isArray(d.pend)) o.pend = d.pend.filter(f => f && typeof f.s === 'string' && num(f.a) != null && num(f.d) != null && num(f.t) != null && num(f.p) > 0 && num(f.e) != null)
-            .map(f => ({ s: f.s, a: f.a | 0, d: f.d | 0, t: f.t, p: f.p, p0: num(f.p0), e: f.e, e0: num(f.e0), ef: num(f.ef), rt: num(f.rt), c: this._pfFcSanC(f.c), w: this._pfFcSanW(f.w), ep: this._pfFcSanW(f.ep), sn: this._pfFcSanW(f.sn), bg: this._pfFcSanW(f.bg), pf: num(f.pf), pk: (f.pk === 'g' || f.pk === 'p' || f.pk === 't') ? f.pk : null, pc: num(f.pc), pt: Array.isArray(f.pt) ? f.pt.map(num) : null, pwt: this._pfFcProfSanW(f.pwt) }));
+            .map(f => ({ s: f.s, a: f.a | 0, d: f.d | 0, t: f.t, p: f.p, p0: num(f.p0), e: f.e, e0: num(f.e0), ef: num(f.ef), ec0: num(f.ec0), ecf: num(f.ecf), rt: num(f.rt), c: this._pfFcSanC(f.c), w: this._pfFcSanW(f.w), ep: this._pfFcSanW(f.ep), sn: this._pfFcSanW(f.sn), bg: this._pfFcSanW(f.bg), pf: num(f.pf), pk: (f.pk === 'g' || f.pk === 'p' || f.pk === 't') ? f.pk : null, pc: num(f.pc), pt: Array.isArray(f.pt) ? f.pt.map(num) : null, pwt: this._pfFcProfSanW(f.pwt), er: num(f.er), rg: this._pfFcRgSan(f.rg) }));
           if (Array.isArray(d.done)) o.done = d.done.filter(r => r && typeof r.s === 'string' && num(r.a) != null && num(r.e) != null && num(r.y) != null)
-            .map(r => ({ s: r.s, a: r.a | 0, d: r.d | 0, t: num(r.t) || 0, u: num(r.u) || 0, e: r.e, e0: num(r.e0), ef: num(r.ef), rt: num(r.rt), y: (num(r.m) != null && num(r.k) != null) ? +(r.m - r.k).toFixed(4) : r.y, m: num(r.m), k: num(r.k), mu: num(r.mu), md: num(r.md), c: this._pfFcSanC(r.c), w: this._pfFcSanW(r.w), ep: this._pfFcSanW(r.ep), sn: this._pfFcSanW(r.sn), bg: this._pfFcSanW(r.bg), pf: num(r.pf), pk: (r.pk === 'g' || r.pk === 'p' || r.pk === 't') ? r.pk : null, pc: num(r.pc), pt: Array.isArray(r.pt) ? r.pt.map(num) : null, pwt: this._pfFcProfSanW(r.pwt) }));
+            .map(r => ({ s: r.s, a: r.a | 0, d: r.d | 0, t: num(r.t) || 0, u: num(r.u) || 0, e: r.e, e0: num(r.e0), ef: num(r.ef), ec0: num(r.ec0), ecf: num(r.ecf), rt: num(r.rt), y: (num(r.m) != null && num(r.k) != null) ? +(r.m - r.k).toFixed(4) : r.y, m: num(r.m), k: num(r.k), mu: num(r.mu), md: num(r.md), c: this._pfFcSanC(r.c), w: this._pfFcSanW(r.w), ep: this._pfFcSanW(r.ep), sn: this._pfFcSanW(r.sn), bg: this._pfFcSanW(r.bg), pf: num(r.pf), pk: (r.pk === 'g' || r.pk === 'p' || r.pk === 't') ? r.pk : null, pc: num(r.pc), pt: Array.isArray(r.pt) ? r.pt.map(num) : null, pwt: this._pfFcProfSanW(r.pwt), er: num(r.er), rg: this._pfFcRgSan(r.rg) }));
           return o;
         },
         _pfFcLoad() {
@@ -3329,21 +3370,21 @@
           for (const k of Object.keys(rsv)) if (now - rsv[k] >= drop) delete rsv[k];
           for (const k of Object.keys(rsvC)) if (now - rsvC[k] >= keepC) delete rsvC[k];
         },
-        _pfFcRtyNote(fc, sym, acc, ts) {
+        _pfFcRtyNote(fc, sym, acc, ts, cb) {
           if (!this._pfFcFocusOn() || !isFinite(acc)) return;
           const rq = (fc.rty ||= {}), q = rq[sym];
           if (acc >= this._pfFcPass()) { // the latest grade reached the pass line: out of the queue
             if (q) { fc.rtyG = (fc.rtyG || 0) + 1; (fc.rtyL ||= []).push({ s: sym, n: q.n + 1, f: q.f, u: ts, a: +acc.toFixed(1) }); if (fc.rtyL.length > 200) fc.rtyL.splice(0, fc.rtyL.length - 200); delete rq[sym]; }
             return;
           }
-          if (q) { q.n++; q.a = acc; q.t = ts; } // stays queued until a grade reaches the pass line, whatever it scores in between
-          else if (acc < this._pfFcRtyLow()) rq[sym] = { n: 1, a: acc, t: ts, f: ts };
+          if (q) { q.n++; q.a = acc; q.t = ts; q.cb = typeof cb === 'number' ? cb : q.cb; } // stays queued until a grade reaches the pass line, whatever it scores in between
+          else if (acc < this._pfFcRtyLow()) rq[sym] = { n: 1, a: acc, t: ts, f: ts, cb: typeof cb === 'number' ? cb : null };
         },
         _pfFcRtyExport(fc) {
           const rq = fc.rty || {}, r1 = v => Math.round(v * 10) / 10, iso = v => v > 0 ? new Date(v).toISOString() : null;
-          return { enabled: this._pfFcFocusOn(), note: 'tickers whose forecast graded under retryBelowPct are queued (worst latest grade first, then the longest waiting) and forecast again, up to retrySharePct of each batch of new forecasts, until one grade reaches retryPassPct (the latest grade alone decides, no attempt cap); attempts = forecasts graded on the ticker since its first miss; with Weight Profiles on, a retry starts on the trial weights of its ticker\'s profile (see weightProfiles)',
-            waiting: Object.keys(rq).length, passed: fc.rtyG || 0,
-            queue: Object.keys(rq).sort((a, b) => rq[a].a - rq[b].a || rq[a].t - rq[b].t).slice(0, 400).map(s => ({ symbol: s, attempts: rq[s].n, latestAccuracyPct: r1(rq[s].a), firstMissAt: iso(rq[s].f), lastGradedAt: iso(rq[s].t), profile: rq[s].p == null ? null : rq[s].p })),
+          return { enabled: this._pfFcFocusOn(), note: 'tickers whose forecast graded under retryBelowPct are pooled and held out of fresh batches until the pool fills a whole batch of new forecasts, then that cohort (longest waiting first) is forecast together, repeating until one grade reaches retryPassPct (the latest grade alone decides, no attempt cap); attempts = forecasts graded on the ticker since its first miss; with Weight Profiles on, a retry starts on the trial weights of its ticker\'s profile (see weightProfiles)',
+            waiting: Object.keys(rq).length, crabbing: Object.keys(rq).filter(s => rq[s].cb > 0).length, passed: fc.rtyG || 0,
+            queue: Object.keys(rq).sort((a, b) => rq[a].a - rq[b].a || rq[a].t - rq[b].t).slice(0, 400).map(s => ({ symbol: s, attempts: rq[s].n, latestAccuracyPct: r1(rq[s].a), firstMissAt: iso(rq[s].f), lastGradedAt: iso(rq[s].t), profile: rq[s].p == null ? null : rq[s].p, crabStrength: rq[s].cb == null ? null : Math.round(rq[s].cb * 100) / 100 })),
             passedLog: (fc.rtyL || []).map(e => ({ symbol: e.s, attempts: e.n, passedAccuracyPct: e.a == null ? null : r1(e.a), firstMissAt: iso(e.f), passedAt: iso(e.u) })) };
         },
         // ── Weight Profiles ──
@@ -3356,8 +3397,8 @@
         // member nudges its profile's centre. Tickers matching a profile that is still learning (and not queued) stay on the general weights as the control.
         _pfFcProfOn() { return this._pfFcFocusOn() && this.cfg.pfFcProf !== false; },
         _pfFcProfDist() { const v = Number(this.cfg.pfFcProfDist); return Math.max(5, Math.min(60, isFinite(v) && v > 0 ? v : 25)) / 100; },
-        _pfFcProfKeys() { const k = FC_PROF_FAM.slice(); if (this._pfFcIndOn()) { k.push('ind'); if (this._pfDivOn()) k.push('div'); } if (this._pfFcRangeOn()) k.push('rng'); return k; },
-        _pfFcProfGeneral() { const g = { ind: this._pfFcIndBlend(), div: 1, rng: this._pfFcRangeBlend() }; for (const k of FC_PROF_FAM) g[k] = 1; return g; },
+        _pfFcProfKeys() { const k = FC_PROF_FAM.slice(); if (this._pfFcIndOn()) { k.push('ind'); if (this._pfDivOn()) k.push('div'); } if (this._pfFcRangeOn()) k.push('rng'); if (this._pfCrabOn()) k.push('crb'); return k; },
+        _pfFcProfGeneral() { const g = { ind: this._pfFcIndBlend(), div: 1, rng: this._pfFcRangeBlend(), crb: this._pfFcCrabBlend(0) }; for (const k of FC_PROF_FAM) g[k] = 1; return g; },
         _pfFcProfSanW(w) { if (!w || typeof w !== 'object') return null; const o = {}; for (const k of FC_PROF_ALL) if (typeof w[k] === 'number' && isFinite(w[k])) o[k] = w[k]; return Object.keys(o).length ? o : null; },
         _pfFcProfWts(f) { return (this._pfFcProfOn() && f && f.pwt) ? f.pwt : null; },
         _pfFcProfW(f, k, dflt) { const m = this._pfFcProfWts(f); return (m && typeof m[k] === 'number') ? m[k] : dflt; },
@@ -3400,7 +3441,7 @@
           let c = null;
           for (let i = 0; i < 12; i++) {
             const x = Object.assign({}, gen);
-            for (const k of keys) { const lim = FC_PROF_LIM[k], sd = (k === 'ind' || k === 'rng') ? sg * 0.6 : sg; x[k] = Math.max(lim[0], Math.min(lim[1], base[k] + gs() * sd)); }
+            for (const k of keys) { const lim = FC_PROF_LIM[k], sd = (k === 'ind' || k === 'rng' || k === 'crb') ? sg * 0.6 : sg; x[k] = Math.max(lim[0], Math.min(lim[1], base[k] + gs() * sd)); }
             c = x;
             if (dist(x, gen) >= 0.25 && !avoid.some(a => dist(x, a) < 0.12)) break;
           }
@@ -3452,7 +3493,7 @@
           const P = (fc.prof || []).slice().sort((a, b) => (b.n || 0) - (a.n || 0)), iso = v => v > 0 ? new Date(v).toISOString() : null, r1 = v => v == null ? null : Math.round(v * 10) / 10;
           return { enabled: this._pfFcProfOn(), matchDistancePct: Math.round(this._pfFcProfDist() * 100), maxProfiles: FC_PROF_MAX, traits: FC_PROF_TRAITS, generalWeights: this._pfFcProfGeneral(), activeWeights: this._pfFcProfKeys(),
             learning: P.filter(p => p.st !== 'p').length, proven: P.filter(p => p.st === 'p').length,
-            note: 'a forecast under retryBelowPct gets a profile (traitRanks = its readings ranked inside its batch, -0.5..0.5, in the traits order; centroid = the profile centre, which follows its members); its ticker is retried on trial weights until one grade reaches retryPassPct, which become the proven weights; later forecasts matching a proven profile start on its weights, and a failure sends the profile back to learning (restarts; failedProvenWeights are avoided). Weights: fund / va / iol / ios / lta multiply that scorecard family\'s contribution (1 = general), ind = the indicator blend, div = the candle-divination share, rng = the Range Fit blend (0..1). weightSet on the grades: general / trial / proven',
+            note: 'a forecast under retryBelowPct gets a profile (traitRanks = its readings ranked inside its batch, -0.5..0.5, in the traits order; centroid = the profile centre, which follows its members); its ticker is retried on trial weights until one grade reaches retryPassPct, which become the proven weights; later forecasts matching a proven profile start on its weights, and a failure sends the profile back to learning (restarts; failedProvenWeights are avoided). Weights: fund / va / iol / ios / lta multiply that scorecard family\'s contribution (1 = general), ind = the indicator blend, div = the candle-divination share, rng = the Range Fit blend (0..1), crb = the crab layer\'s weight (0..1). weightSet on the grades: general / trial / proven',
             profiles: P.map(p => ({ id: p.id, status: p.st === 'p' ? 'proven' : 'learning', members: p.n || 0, recentTickers: p.ms || [], centroid: p.c, provenWeights: p.w || null, provenAccuracyPct: r1(p.wa), gradesOnProvenPassed: p.ok || 0, gradesOnProvenFailed: p.ko || 0, restarts: p.rs || 0, trialsThisRound: (p.tr || []).length, trialsTotal: p.tn || 0, bestTrialAccuracyPct: (p.tr || []).length ? r1(Math.max(...p.tr.map(t => t.a))) : null, currentTrial: p.cand || null, failedProvenWeights: p.fw || [], createdAt: iso(p.t), updatedAt: iso(p.u) })) };
         },
         _pfFcPlan(pool, cap) {
@@ -3471,33 +3512,24 @@
             if (seen.has(s) || pendSet.has(s) || !poolSet.has(s) || now - fc.rsv[s] >= dropMs || this._pfIlqIs(s) || this._pfStbIs(s)) continue;
             rsvList.push(s);
           }
-          const rtyList = [];
-          if (foc) { // Forecast Focus: the retry queue, worst latest grade first (then the longest waiting), pulled into the batch like the liquidation reservations
-            const rq = (fc.rty ||= {}), rMax = Math.floor(newRoom * this._pfFcRtyShare());
+          const rtyList = [], rq = (fc.rty ||= {}); let rtyCohort = false;
+          if (foc) { // Forecast Focus: failed tickers wait in the retry pool, held out of fresh batches, until the pool fills a whole batch of new forecasts; then that cohort starts together (longest waiting first, so a big pool rotates instead of re-forecasting the latest failures)
             for (const k of Object.keys(rq)) if (now - rq[k].t > 14 * 86400000) delete rq[k]; // idle two weeks (delisted, gone): dropped
-            for (const s of Object.keys(rq).sort((a, b) => rq[a].a - rq[b].a || rq[a].t - rq[b].t)) {
-              if (rtyList.length >= rMax || rsvList.length + rtyList.length >= newRoom) break;
-              if (seen.has(s) || pendSet.has(s) || rsvList.includes(s) || !poolSet.has(s) || this._pfIlqIs(s) || this._pfStbIs(s)) continue;
-              rtyList.push(s);
-            }
+            const rRoom = newRoom - rsvList.length, elig = Object.keys(rq).filter(s => !seen.has(s) && !pendSet.has(s) && !rsvList.includes(s) && poolSet.has(s) && !this._pfIlqIs(s) && !this._pfStbIs(s)).sort((a, b) => rq[a].t - rq[b].t || rq[a].a - rq[b].a);
+            if (rRoom > 0 && elig.length >= rRoom) { rtyCohort = true; for (const s of elig.slice(0, rRoom)) rtyList.push(s); }
           }
           const extraList = [], freshList = []; // Forecast Focus: the rest of the batch is the grader's own draw from the pool (the pool is already shuffled), so the host fetches no tickers of its own
           if (foc) {
             const taken = new Set([...rev, ...rsvList, ...rtyList]);
             for (const s of (pool || [])) {
               if (rev.length + rsvList.length + rtyList.length + freshList.length >= fcN) break;
-              if (taken.has(s) || pendSet.has(s) || this._pfIlqIs(s) || this._pfStbIs(s)) continue;
+              if (taken.has(s) || pendSet.has(s) || rq[s] != null || this._pfIlqIs(s) || this._pfStbIs(s)) continue; // pooled retries wait for their own cohort
               freshList.push(s);
             }
-            // A batch still under FocusN (the fresh supply ran out: most of the pool already has a forecast in flight) is filled up: first the rest of the retry queue (beyond its share),
-            // then tickers whose forecast is in flight, which the samplers read but no second forecast starts on.
+            // A batch still under FocusN (the fresh supply ran out: most of the pool already has a forecast in flight) is filled up with tickers the samplers read
+            // but no forecast starts on (in flight, or waiting in the retry pool).
             for (const s of freshList) taken.add(s);
-            const left = () => fcN - (rev.length + rsvList.length + rtyList.length + freshList.length + extraList.length), rq2 = fc.rty || {};
-            for (const s of Object.keys(rq2).sort((a, b) => rq2[a].a - rq2[b].a || rq2[a].t - rq2[b].t)) {
-              if (left() <= 0) break;
-              if (taken.has(s) || pendSet.has(s) || !poolSet.has(s) || this._pfIlqIs(s) || this._pfStbIs(s)) continue;
-              extraList.push(s); taken.add(s);
-            }
+            const left = () => fcN - (rev.length + rsvList.length + rtyList.length + freshList.length + extraList.length);
             for (const s of (pool || [])) {
               if (left() <= 0) break;
               if (taken.has(s) || this._pfIlqIs(s) || this._pfStbIs(s)) continue;
@@ -3506,7 +3538,7 @@
           }
           const batch = foc ? rev.concat(rsvList, rtyList, freshList, extraList) : null; // Focus: the whole batch = due revisits + liquidation reservations + retries + fresh tickers, at most FocusN in all
           const capEff = foc ? batch.length : cap;
-          this._pfFcPlanned = { seq, cap: capEff, rev: new Set(rev), rsv: new Set(rsvList) };
+          this._pfFcPlanned = { seq, cap: capEff, rev: new Set(rev), rsv: new Set(rsvList), rty: rtyCohort };
           return foc ? { revisit: rev.concat(rsvList, rtyList), batch, cap: capEff } : { revisit: rev.concat(rsvList) };
         },
         // Called with every new sample batch (leader only; a follower adopts the leader's store): grade what is due, then start new forecasts.
@@ -3540,7 +3572,8 @@
           for (const [a, arr] of groups) {
             if (arr.length < 3) { fc.voids.thin += arr.length; continue; }
             const M = arr.reduce((s, x) => s + x.m, 0) / arr.length;
-            for (const { f, m, mu, md } of arr) { fc.done.push({ rt: f.rt || null, s: f.s, a, d: seq, t: f.t, u: entry.ts, e: f.e, e0: f.e0 ?? null, ef: f.ef ?? null, y: +(m - M).toFixed(4), m: +m.toFixed(4), k: +M.toFixed(4), mu: mu == null ? null : +mu.toFixed(4), md: md == null ? null : +md.toFixed(4), c: f.c, w: f.w || null, ep: f.ep || null, sn: f.sn || null, bg: this._pfBgSeal(f), pf: f.pf == null ? null : f.pf, pk: f.pk || null, pc: f.pc == null ? null : f.pc, pt: f.pt || null, pwt: (f.pk && f.pk !== 'g') ? (f.pwt || null) : null }); const ac = this._pfFcAcc(f.e, +(m - M).toFixed(4)); this._pfFcRtyNote(fc, f.s, ac, entry.ts); this._pfFcProfGrade(fc, f, ac, entry.ts); }
+            for (const { f, m, mu, md } of arr) { fc.done.push({ rt: f.rt || null, s: f.s, a, d: seq, t: f.t, u: entry.ts, e: f.e, e0: f.e0 ?? null, ef: f.ef ?? null, ec0: f.ec0 ?? null, ecf: f.ecf ?? null, y: +(m - M).toFixed(4), m: +m.toFixed(4), k: +M.toFixed(4), mu: mu == null ? null : +mu.toFixed(4), md: md == null ? null : +md.toFixed(4), c: f.c, w: f.w || null, ep: f.ep || null, sn: f.sn || null, bg: this._pfBgSeal(f), pf: f.pf == null ? null : f.pf, pk: f.pk || null, pc: f.pc == null ? null : f.pc, pt: f.pt || null, pwt: (f.pk && f.pk !== 'g') ? (f.pwt || null) : null, er: f.er == null ? null : f.er, rg: f.rg || null }); const ac = this._pfFcAcc(f.e, +(m - M).toFixed(4)); this._pfFcRtyNote(fc, f.s, ac, entry.ts, f.bg && f.bg.cbu); this._pfFcProfGrade(fc, f, ac, entry.ts); this._pfFcRgLearn(fc, f, m, +(m - M).toFixed(4), M, entry.ts); }
+            this._pfFcRgCohort(fc, arr, M, entry.ts);
           }
           fc.ctx = fc.ctx || {}; fc.ctx[seq] = this._pfFcCtx(entry); // the market around this batch, for the export
           { const ks = Object.keys(fc.ctx).map(Number).sort((x, y) => x - y); for (const k of ks.slice(0, Math.max(0, ks.length - 120))) delete fc.ctx[k]; }
@@ -3560,7 +3593,7 @@
             cand.push({ s: r.sym, a: seq, d: seq + lead, t: entry.ts, p: tp > 0 ? tp : Number(r.px), p0: Number(r.px), e: +(dir * pr.e).toFixed(4), c: tags.join(' '), w: Object.fromEntries(Object.entries(pr.w).map(([k, v]) => [k, +(dir * v).toFixed(4)])), ep: { sum: +(dir * pr.sum).toFixed(4), max: +(dir * pr.max).toFixed(4), sc: +(dir * pr.e).toFixed(4) }, sn: this._pfFcSnap(r, FRESH_TICKERS[r.sym], cd0, entry.ts) });
           }
           this._pfFcReserve(fc, entry.ts);
-          const foc = this._pfFcFocusOn(), rq = fc.rty || {}, rsv = fc.rsv, rsvC = fc.rsvC, isR = s => rsv[s] != null, rc = cand.filter(x => isR(x.s)).sort((x, y) => rsv[y.s] - rsv[x.s]), rtc = foc ? cand.filter(x => !isR(x.s) && rq[x.s] != null).sort((x, y) => rq[x.s].a - rq[y.s].a || rq[x.s].t - rq[y.s].t).slice(0, Math.floor(slots * this._pfFcRtyShare())) : [], rtS = new Set(rtc.map(x => x.s)), oc = cand.filter(x => !isR(x.s) && !rtS.has(x.s));
+          const foc = this._pfFcFocusOn(), rq = fc.rty || {}, rsv = fc.rsv, rsvC = fc.rsvC, isR = s => rsv[s] != null, rc = cand.filter(x => isR(x.s)).sort((x, y) => rsv[y.s] - rsv[x.s]), rtc = (foc && pl && pl.rty) ? cand.filter(x => !isR(x.s) && rq[x.s] != null).sort((x, y) => rq[x.s].t - rq[y.s].t || rq[x.s].a - rq[y.s].a) : [], oc = cand.filter(x => !isR(x.s) && !(foc && rq[x.s] != null)); // the retry cohort starts only on a planned cohort batch; pooled retries are otherwise held out of the draw
           for (let i = oc.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [oc[i], oc[j]] = [oc[j], oc[i]]; }
           const pick = rc.concat(rtc, oc).slice(0, room), rvp = new Set(pick.filter(f => isR(f.s)).map(f => f.s)); // reserved tickers first (newest event first), the rest drawn at random
           for (const s of rvp) { rsvC[s] = entry.ts - 1; delete rsv[s]; } // released; an event on this very cycle (seen later) still reserves it again
@@ -3634,6 +3667,7 @@
           if (PM.dirty) this._pfPmSave();
           if (this._pfBgDirtyC) { clearTimeout(this._pfBgPt); this._pfBgPersist(); }
           if (DIV.dirty) { clearTimeout(this._pfDivPt); this._pfDivSave(); }
+          if (CRAB.dirty) { clearTimeout(this._pfCrabPt); this._pfCrabSave(); }
           if (this._pfBgDirty) { this._pfBgDirty = false; this._pfFcSave(); }
         },
         // Closing a forecast: no liquidation reading at all (surveillance off, ticker not watched, window unusable) is an explicit 0, never a silent blank.
@@ -3714,6 +3748,7 @@
             if (sA > 0) o.vreg = q(sd(lr.slice(-24)) / sA);
           }
           if (this._pfDivOn()) try { Object.assign(o, this._pfDivRead(st)); } catch (_) {}
+          if (this._pfCrabOn()) try { Object.assign(o, this._pfCrabRead(st, px)); } catch (_) {}
           for (const k of Object.keys(o)) if (o[k] === undefined) delete o[k];
           return o;
         },
@@ -3730,6 +3765,7 @@
               if (warm) st = BG1H[sym] = { t: 0, c: [], h: [], l: [], rs: {}, r12: [], v: [] };
               for (const x of cs) if (x.s > st.t) { const pc = st.c.length ? st.c[st.c.length - 1] : 0, pt = st.t; this._pfBgFeed(st, x); if (pc > 0 && x.s - pt === 3600000) this._pfPmPush(sym, x.s, x.c / pc - 1); } // each consecutive completed hour also files its return into the past-moves store
               if (this._pfDivOn()) try { this._pfDivLearn(sym, st); } catch (_) {}
+              if (this._pfCrabOn()) try { this._pfCrabLearn(sym, st); } catch (_) {}
             }
           } catch (_) { return null; }
           if (st) st.u = Date.now();
@@ -4058,7 +4094,7 @@
             if (keep < 1 && Math.random() > keep) continue;
             const f = this._pfDivVec(st, i); if (!f) continue;
             const path = i + DIV_SL < n ? Array.from({ length: DIV_SL }, (_, j) => cl((c[i + 1 + j] - c[i]) / c[i] / f.s)) : null;
-            out.push({ x: f.x, y: f.y, m1: cl((c[i + 1] - c[i]) / c[i] / f.s), path });
+            out.push({ x: f.x, y: f.y, m1: cl((c[i + 1] - c[i]) / c[i] / f.s), path, cu: this._pfCrabOn() && this._pfCrabAt(st, i).u > 0 ? 1 : 0 });
           }
           return out;
         },
@@ -4066,6 +4102,7 @@
         _pfDivTake(q, p, drift) {
           const r = 1 / Math.min(++q.n, DIV_CAP);
           q.m1 += (p.m1 - q.m1) * r; q.up += ((p.m1 > 0 ? 1 : 0) - q.up) * r;
+          if (p.cu) { const rc = 1 / Math.min(q.cn = (q.cn || 0) + 1, DIV_CAP); q.cm = (q.cm || 0) + (p.m1 - (q.cm || 0)) * rc; } // what the shape did next while its ticker was crabbing
           if (p.path) { const r6 = 1 / Math.min(++q.n6, DIV_CAP); q.m6 += (p.path[DIV_SL - 1] - q.m6) * r6; for (let j = 0; j < DIV_SL; j++) q.np[j] += (p.path[j] - q.np[j]) * r6; }
           if (drift) for (let i = 0; i < q.c.length; i++) q.c[i] += (p.v[i] - q.c[i]) * r;
         },
@@ -4110,7 +4147,7 @@
         },
         _pfDivLearn(sym, st) {
           this._pfDivEnsure(); const vol = this._pfDivCfg().vol;
-          for (const p of this._pfDivPairs(st, (DIV.last[sym] || 0) * 3600000, 1)) { this._pfDivFeed('p', { v: p.x, m1: p.m1, path: p.path }); if (vol && p.y) this._pfDivFeed('w', { v: p.x.concat(p.y), m1: p.m1, path: p.path }); }
+          for (const p of this._pfDivPairs(st, (DIV.last[sym] || 0) * 3600000, 1)) { this._pfDivFeed('p', { v: p.x, m1: p.m1, path: p.path, cu: p.cu }); if (vol && p.y) this._pfDivFeed('w', { v: p.x.concat(p.y), m1: p.m1, path: p.path, cu: p.cu }); }
           DIV.last[sym] = Math.floor(st.t / 3600000); DIV.dirty = true;
         },
         // Library from the candle cache already in memory (no fetch): a random sample of up to DIV_SAMPLE pairs over every cached ticker, for each library that does not exist yet.
@@ -4121,8 +4158,8 @@
           DIV.buf.p = []; DIV.buf.w = [];
           for (const s of syms) {
             for (const p of this._pfDivPairs(BG1H[s], 0, keep)) {
-              if (needP) DIV.buf.p.push({ v: p.x, m1: p.m1, path: p.path });
-              if (needW && p.y) DIV.buf.w.push({ v: p.x.concat(p.y), m1: p.m1, path: p.path });
+              if (needP) DIV.buf.p.push({ v: p.x, m1: p.m1, path: p.path, cu: p.cu });
+              if (needW && p.y) DIV.buf.w.push({ v: p.x.concat(p.y), m1: p.m1, path: p.path, cu: p.cu });
             }
             DIV.last[s] = Math.max(DIV.last[s] || 0, Math.floor(BG1H[s].t / 3600000));
           }
@@ -4132,14 +4169,14 @@
           if (DIV.loaded) return; DIV.loaded = true;
           try {
             const d = JSON.parse(localStorage.getItem(DIV_KEY) || 'null');
-            if (d && d.v === 1) { DIV.last = d.last || {}; for (const kd of ['p', 'w']) { const L = d[kd]; if (L && Array.isArray(L.k) && L.k.length) DIV.libs[kd] = { rad: L.rad > 0 ? L.rad : 1, g: L.g || 0, rp: L.rp || 0, k: L.k.map(a => ({ c: a[0], n: a[1], m1: a[2], up: a[3], m6: a[4], n6: a[5], np: a[6], b: a[7] || 0 })) }; } }
+            if (d && d.v === 1) { DIV.last = d.last || {}; for (const kd of ['p', 'w']) { const L = d[kd]; if (L && Array.isArray(L.k) && L.k.length) DIV.libs[kd] = { rad: L.rad > 0 ? L.rad : 1, g: L.g || 0, rp: L.rp || 0, k: L.k.map(a => ({ c: a[0], n: a[1], m1: a[2], up: a[3], m6: a[4], n6: a[5], np: a[6], b: a[7] || 0, cn: a[8] || 0, cm: a[9] || 0 })) }; } }
           } catch (_) {}
           this._pfDivBoot();
         },
         _pfDivSaveSoon() { clearTimeout(this._pfDivPt); this._pfDivPt = setTimeout(() => this._pfDivSave(), 20000); },
         _pfDivSave() {
           if (!DIV.loaded) return; DIV.dirty = false;
-          const r = (x, d = 3) => +x.toFixed(d), ser = L => L ? { rad: r(L.rad, 4), g: L.g || 0, rp: L.rp || 0, k: L.k.map(q => [q.c.map(x => r(x)), q.n, r(q.m1, 4), r(q.up, 4), r(q.m6, 4), q.n6, q.np.map(x => r(x)), q.b || 0]) } : null;
+          const r = (x, d = 3) => +x.toFixed(d), ser = L => L ? { rad: r(L.rad, 4), g: L.g || 0, rp: L.rp || 0, k: L.k.map(q => [q.c.map(x => r(x)), q.n, r(q.m1, 4), r(q.up, 4), r(q.m6, 4), q.n6, q.np.map(x => r(x)), q.b || 0, q.cn || 0, r(q.cm || 0, 4)]) } : null;
           try { localStorage.setItem(DIV_KEY, JSON.stringify({ v: 1, at: Date.now(), last: DIV.last, p: ser(DIV.libs.p), w: ser(DIV.libs.w) })); } catch (_) {}
         },
         _pfDivReset(rebuild) {
@@ -4149,11 +4186,12 @@
         },
         _pfDivRead(st) {
           this._pfDivEnsure(); const o = {}, cfg = this._pfDivCfg(), f = this._pfDivVec(st, st.c.length - 1); if (!f) return o;
+          const ca = this._pfCrabOn() ? this._pfCrabAt(st, st.c.length - 1) : null, inCrab = !!(ca && ca.u > 0); // a crabbing ticker reads what the shape did next while crabbing (once it has the matches)
           const one = (kd, v, key, idk) => {
             const lib = DIV.libs[kd]; if (!lib) return;
             const [j, d] = this._pfDivNear(lib, v), q = lib.k[j], r = d / (lib.rad || 1);
             if (q.n < cfg.min || r > cfg.far) return;
-            o[key] = +q.m1.toFixed(4); o[idk] = j; if (kd === 'p') o.x_dvd = +r.toFixed(2);
+            const useC = inCrab && q.cn >= cfg.min; o[key] = +(useC ? q.cm : q.m1).toFixed(4); if (useC) o.x_dvc = 1; o[idk] = j; if (kd === 'p') o.x_dvd = +r.toFixed(2);
           };
           one('p', f.x, 'dvp', 'x_dvi'); if (cfg.vol && f.y) one('w', f.x.concat(f.y), 'dvv', 'x_dvj');
           return o;
@@ -4192,8 +4230,184 @@
         },
         _pfDivExport() {
           this._pfDivEnsure(); const cfg = this._pfDivCfg(), r = (x, d = 3) => +x.toFixed(d);
-          const lib = L => L ? { shapes: L.k.length, replaced: L.rp || 0, pairs: L.k.reduce((s, q) => s + q.n, 0), typicalDistance: r(L.rad), prototypes: L.k.map((q, i) => ({ id: i, n: q.n, next1hMeanATR: r(q.m1), shareUp: r(q.up), next6hMeanATR: r(q.m6), n6: q.n6, slicePathATR: this._pfDivPath(q).map(x => r(x, 2)), next6hPathATR: q.np.map(x => r(x, 2)) })).sort((a, b) => b.n - a.n) } : null;
+          const lib = L => L ? { shapes: L.k.length, replaced: L.rp || 0, pairs: L.k.reduce((s, q) => s + q.n, 0), typicalDistance: r(L.rad), prototypes: L.k.map((q, i) => ({ id: i, n: q.n, next1hMeanATR: r(q.m1), shareUp: r(q.up), next6hMeanATR: r(q.m6), n6: q.n6, crabMatches: q.cn || 0, next1hMeanATRWhenCrabbing: r(q.cm || 0, 4), slicePathATR: this._pfDivPath(q).map(x => r(x, 2)), next6hPathATR: q.np.map(x => r(x, 2)) })).sort((a, b) => b.n - a.n) } : null;
           return { enabled: this._pfDivOn(), settings: { shapes: cfg.k, minMatches: cfg.min, abstainBeyondTypicalDistanceX: cfg.far, volume: cfg.vol, sliceHours: DIV_SL }, note: 'a pair that matches no shape (beyond the abstain distance) takes over the shape with the fewest matches among those at least ' + DIV_GRACE + ' pairs old, at most once per ' + DIV_SPACE + ' pairs (replaced = how often); dvp / dvv = the move (in units of the ticker\'s own average hourly range, + = price up) the nearest learned shape saw in the following hour; dvp from the price shape alone, dvv from price + volume. x_dvd = distance to the nearest shape vs typical, x_dvi / x_dvj = which shape matched. Until the graded test has a verdict on a reading it works live at sign +1; see indicatorForecast.directionTest. Shapes: slicePathATR = cumulative closes over the 6 hours, next6hPathATR = the mean path of the following 6 hours', priceLibrary: lib(DIV.libs.p), priceVolumeLibrary: lib(DIV.libs.w) };
+        },
+        // ── Crab layer ──
+        // Some tickers do not trend, they crab: they fluctuate along a range, up, then down, back and forth. A forecast that expects a decisive move from one fails when the move never comes.
+        // From the 1-hour candles the Indicator forecast already keeps (no extra fetch) every ticker is read over CRAB_W windows (6, 12, 24, 48, 72, 96 hours) at once. Per window the
+        // range is the highest high to the lowest low (from 12 hours up the 2nd-highest / 2nd-lowest, so one spike wick does not stretch it) and the window is scored as a crab by four
+        // tests, geometric mean: (1) the range stops growing with time (range over 1.6 x hourly volatility x sqrt(hours): a random walk reads about 0.9, a bounded one far less),
+        // (2) little net progress (net move over the range), (3) the middle is crossed back and forth, (4) both edges are tested, again and again on longer windows. A price outside
+        // the range is no crab. A short window cannot be told from noise as well as a long one, so a window needs a higher score the shorter it is (the strength setting is the bar at
+        // 96 hours, +6 points per halving) and the longest crabbing window rules the range shown; the snap-back reading blends every crabbing window, weighted by hours x strength.
+        // snap z = +1 at the bottom of the range (expect up), -1 at the top, 0 in the middle (price direction). The forecast keeps crabbing as the default: its expected move is
+        // (1 - pb) x snap + pb x break tilt, where pb / tilt come from the breaker library: every past crab in the candle cache, filed by where in its range the price sat, whether the
+        // last hour's volume was 2x its median and whether the last 6 hours had squeezed to under 40% of the range, with what happened in the next CRAB_H hours (held / broke up / broke
+        // down, a break = a close beyond an edge by the break margin). The crab's weight against the forecast it replaces is the bot's own call (_pfFcCrabBlendCalc).
+        _pfCrabOn() { return this._pfBgOn() && this.cfg.pfFcCrab !== false; },
+        _pfCrabCfg() { const c = this.cfg, n = (v, d, lo, hi) => { v = Number(v); return Math.max(lo, Math.min(hi, isFinite(v) && v > 0 ? v : d)); }; return { min: n(c.pfFcCrabMin, 65, 40, 90) / 100, edge: n(c.pfFcCrabEdge, 15, 5, 40) / 100 }; },
+        _pfCrabLevel(c, h, l, i, W, px) {
+          if (i < W || i >= c.length) return null;
+          const j0 = i - W + 1, k = W >= 12 ? 1 : 0, now = px > 0 ? px : c[i];
+          const hs = h.slice(j0, i + 1).sort((a, b) => b - a), ls = l.slice(j0, i + 1).sort((a, b) => a - b), hi = hs[k], lo = ls[k], rg = hi - lo;
+          if (!(rg > 0) || !(now > 0) || !(c[i - W] > 0)) return null;
+          const mid = (hi + lo) / 2, eff = Math.abs(now - c[i - W]) / rg;
+          let sum = 0, sq = 0, x = 0, side = 0, tz = 0, bz = 0, pt = false, pb = false;
+          for (let j = j0; j <= i; j++) {
+            const r = Math.log(c[j] / c[j - 1]); sum += r; sq += r * r;
+            const d = (c[j] - mid) / rg, sd = d > 0.1 ? 1 : d < -0.1 ? -1 : 0; // a dead band of 10% of the range around the middle
+            if (sd !== 0) { if (side !== 0 && sd !== side) x++; side = sd; }
+            const t = h[j] >= hi - 0.2 * rg, b = l[j] <= lo + 0.2 * rg; // a visit to an edge zone (the outer 20%) counts once per stay
+            if (t && !pt) tz++; if (b && !pb) bz++; pt = t; pb = b;
+          }
+          const sdv = Math.sqrt(Math.max(0, sq / W - (sum / W) * (sum / W))), R = sdv > 0 ? (rg / now) / (1.6 * sdv * Math.sqrt(W)) : 9;
+          const sR = Math.max(0, Math.min(1, (0.85 - R) / 0.40)), sE = Math.max(0, Math.min(1, (0.45 - eff) / 0.35)), sX = Math.min(1, x / Math.max(1, W / 8)), sZ = Math.min(1, Math.min(tz, bz)) * Math.min(1, (tz + bz) / (W / 12 + 1));
+          const inside = now >= lo && now <= hi, s = inside ? Math.pow(sR * sE * sX * sZ, 0.25) : 0;
+          return { W, lo, hi, mid, rg, w: rg / now * 100, pos: (now - lo) / rg, z: Math.max(-1, Math.min(1, 2 * (mid - now) / rg)), s, tau: 0, u: 0 };
+        },
+        // Every window at candle i (px = the live price, else the candle's close): the crabbing ones (score over their bar), the longest of them (dom), the strongest strength (u) and the blended snap (z).
+        _pfCrabAt(st, i, px) {
+          const cfg = this._pfCrabCfg(), lv = []; let U = 0, sw = 0, sz = 0, dom = null;
+          for (const w of CRAB_W) {
+            const L = this._pfCrabLevel(st.c, st.h, st.l, i, w, px); if (!L) continue;
+            L.tau = Math.min(0.95, cfg.min + 0.06 * Math.log2(96 / w)); L.u = L.s >= L.tau ? (L.s - L.tau) / (1 - L.tau) : 0; lv.push(L);
+            if (L.u > 0) { U = Math.max(U, L.u); sw += L.u * w; sz += L.u * w * L.z; dom = L; } // windows run short to long, so the last crabbing one is the longest
+          }
+          return { lv, dom, u: U, z: sw > 0 ? sz / sw : 0 };
+        },
+        _pfCrabOutcome(c, i, dom, edge) { const d = edge * dom.rg; for (let j = i + 1; j <= i + CRAB_H && j < c.length; j++) { if (c[j] > dom.hi + d) return 1; if (c[j] < dom.lo - d) return -1; } return 0; },
+        _pfCrabCell(st, i, dom) {
+          const v = st.v; let vs = 0, sq = 0;
+          if (v && v.length === st.c.length && v[i] > 0) { const a = v.slice(Math.max(0, i - 24), i).filter(x => x > 0).sort((p, q) => p - q); if (a.length >= 12 && v[i] >= 2 * a[a.length >> 1]) vs = 1; }
+          let hi6 = -Infinity, lo6 = Infinity; for (let j = Math.max(0, i - 5); j <= i; j++) { if (st.h[j] > hi6) hi6 = st.h[j]; if (st.l[j] < lo6) lo6 = st.l[j]; }
+          if (hi6 > lo6 && (hi6 - lo6) / dom.rg < 0.4) sq = 1;
+          return (dom.pos < 0.2 ? 'b' : dom.pos > 0.8 ? 't' : 'm') + vs + sq;
+        },
+        _pfCrabBreakP(cell) { const q = CRAB.cells[cell] || { n: 0, u: 0, d: 0 }, p0 = CRAB_P0 / 2, pu = (q.u + CRAB_PRIOR * p0) / (q.n + CRAB_PRIOR), pd = (q.d + CRAB_PRIOR * p0) / (q.n + CRAB_PRIOR), pb = pu + pd; return { pb, tilt: pb > 0 ? (pu - pd) / pb : 0, n: q.n }; },
+        _pfCrabCount(st, i, cfg) { // one past crab (candle i) and what followed, into the breaker library
+          const a = this._pfCrabAt(st, i); if (!a.dom) return;
+          const cell = this._pfCrabCell(st, i, a.dom), q = (CRAB.cells[cell] ||= { n: 0, u: 0, d: 0 }), o = this._pfCrabOutcome(st.c, i, a.dom, cfg.edge);
+          q.n++; if (o > 0) q.u++; else if (o < 0) q.d++; CRAB.dirty = true;
+        },
+        _pfCrabLearn(sym, st) { // every candle of a ticker whose following CRAB_H hours are in and that was not counted before
+          this._pfCrabEnsure(); const n = st.c.length, cfg = this._pfCrabCfg(), hr = i => Math.floor((st.t - (n - 1 - i) * 3600000) / 3600000), from = CRAB.last[sym] || 0; let done = from;
+          for (let i = 24; i + CRAB_H <= n - 1; i++) { const h = hr(i); if (h <= from) continue; this._pfCrabCount(st, i, cfg); done = Math.max(done, h); }
+          if (done > from) { CRAB.last[sym] = done; CRAB.dirty = true; }
+          if (CRAB.dirty) this._pfCrabSaveSoon();
+        },
+        _pfCrabBoot() { // library from the candle cache already in memory (no fetch): a random sample of up to CRAB_SAMPLE past candles over every cached ticker
+          const syms = Object.keys(BG1H); if (!syms.length) return; const cfg = this._pfCrabCfg(); let tot = 0;
+          for (const s of syms) tot += Math.max(0, BG1H[s].c.length - CRAB_H - 24);
+          const keep = Math.min(1, CRAB_SAMPLE / Math.max(1, tot));
+          for (const s of syms) {
+            const st = BG1H[s], n = st.c.length; if (n < 24 + CRAB_H + 1 || CRAB.last[s]) continue;
+            for (let i = 24; i + CRAB_H <= n - 1; i++) { if (keep < 1 && Math.random() > keep) continue; this._pfCrabCount(st, i, cfg); }
+            CRAB.last[s] = Math.floor((st.t - CRAB_H * 3600000) / 3600000); CRAB.dirty = true;
+          }
+          if (CRAB.dirty) this._pfCrabSaveSoon();
+        },
+        _pfCrabEnsure() {
+          if (CRAB.loaded) return; CRAB.loaded = true;
+          try { const d = JSON.parse(localStorage.getItem(CRAB_KEY) || 'null'); if (d && d.v === 1) { CRAB.last = d.last || {}; for (const k of Object.keys(d.cells || {})) { const q = d.cells[k]; if (q && q.n >= 0) CRAB.cells[k] = { n: q.n | 0, u: q.u | 0, d: q.d | 0 }; } } } catch (_) {}
+          if (!Object.keys(CRAB.cells).length) { CRAB.last = {}; this._pfCrabBoot(); }
+        },
+        _pfCrabSaveSoon() { clearTimeout(this._pfCrabPt); this._pfCrabPt = setTimeout(() => this._pfCrabSave(), 20000); },
+        _pfCrabSave() { if (!CRAB.loaded) return; CRAB.dirty = false; try { localStorage.setItem(CRAB_KEY, JSON.stringify({ v: 1, at: Date.now(), last: CRAB.last, cells: CRAB.cells })); } catch (_) {} },
+        _pfCrabReset(rebuild) {
+          clearTimeout(this._pfCrabPt); CRAB.cells = {}; CRAB.last = {}; CRAB.loaded = true; CRAB.dirty = false;
+          try { localStorage.removeItem(CRAB_KEY); } catch (_) {}
+          if (rebuild) { this._pfCrabBoot(); this._pfCrabSave(); }
+        },
+        // The readings one ticker's candle state gives (logged on every forecast, exported, never fed to the indicator ensemble): cb<W> = the window's crab score, cp<W> = where the price sits in
+        // its range (0 = bottom, 1 = top); cbu = strength of the strongest crabbing window (0..1, 0 = none), cbw = the longest crabbing window in hours (0 = none), cbz = blended snap
+        // (price direction), cbp / cbr = position in and width (%) of the longest crab's range, cbl / cbh = its low / high as % from the price, cbb / cbd = break probability and tilt (+ = up) from the
+        // breaker library, cbk = +1 / -1 when a crab broke out upward / downward in the last CRAB_H hours (the crab layer steps aside for it: a break is no time to lean against the move).
+        _pfCrabRead(st, px) {
+          this._pfCrabEnsure(); const o = {}, i = st.c.length - 1, cfg = this._pfCrabCfg(), q = (v, d = 3) => +v.toFixed(d), now = px > 0 ? px : st.c[i];
+          const a = this._pfCrabAt(st, i, px); if (!a.lv.length) return o;
+          for (const L of a.lv) { o['cb' + L.W] = q(L.s, 2); o['cp' + L.W] = q(L.pos, 2); }
+          o.cbu = q(a.u); o.cbw = a.dom ? a.dom.W : 0;
+          if (a.dom) {
+            const d = a.dom, bp = this._pfCrabBreakP(this._pfCrabCell(st, i, d));
+            o.cbz = q(a.z); o.cbp = q(d.pos); o.cbr = q(d.w, 2); o.cbl = q((d.lo / now - 1) * 100, 2); o.cbh = q((d.hi / now - 1) * 100, 2); o.cbb = q(bp.pb); o.cbd = q(bp.tilt);
+          }
+          let k = 0;
+          for (let b = 1; b <= CRAB_H && !k; b++) {
+            const p = this._pfCrabAt(st, i - b); if (!p.dom) continue; const dl = cfg.edge * p.dom.rg;
+            for (let j = i - b + 1; j <= i; j++) { if (st.c[j] > p.dom.hi + dl) { k = 1; break; } if (st.c[j] < p.dom.lo - dl) { k = -1; break; } }
+          }
+          o.cbk = k;
+          return o;
+        },
+        // The crab layer's weight is the bot's own call, like Range Fit's: every graded forecast the layer changed (pre-crab score ec0, full-crab score ecf, both kept) is replayed at weights
+        // 1 / .75 / .5 / .25 / 0 and the best accuracy wins (a lower weight must beat the one above by more than 0.1 points). Judged overall and per longest crabbing window (30+ rows
+        // each); a window with no verdict yet uses the overall one. Under FC_IND_MINB graded batches or 30 changed forecasts the layer stands in full.
+        _pfFcCrabBlendCalc() {
+          const fc = this._pfFcStore(), done = fc.done, n = done.length, last = n ? done[n - 1].u : 0, win = this._pfFcIndWinMs(), key = n + ':' + last + ':' + win;
+          if (this._pfFcCrabBl && this._pfFcCrabBl.key === key) return this._pfFcCrabBl;
+          const out = this._pfFcCrabBl = { key, b: 1, by: {}, batches: 0, rows: 0, acc: null, accBy: {}, why: 'too few graded batches to test the crab layer yet' };
+          const R = done.filter(r => r.u >= last - win && typeof r.ec0 === 'number' && typeof r.ecf === 'number' && Math.abs(r.ecf - r.ec0) > 1e-6 && typeof r.y === 'number' && isFinite(r.y));
+          out.rows = R.length; out.batches = new Set(R.map(r => r.a)).size;
+          if (out.batches < FC_IND_MINB || R.length < 30) return out;
+          const G = [1, 0.75, 0.5, 0.25, 0], fmt = acc => Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
+          const pick = rows => { const acc = {}; for (const g of G) acc[g] = rows.reduce((s, r) => s + this._pfFcAcc(g * r.ecf + (1 - g) * r.ec0, r.y), 0) / rows.length; let best = 1; for (const g of G) if (g < best && acc[g] > acc[best] + 0.1) best = g; return { best, acc }; };
+          const all = pick(R); out.b = all.best; out.acc = fmt(all.acc);
+          const byW = {}; for (const r of R) { const w = r.bg && r.bg.cbw; if (w > 0) (byW[w] ||= []).push(r); }
+          for (const w of Object.keys(byW)) if (byW[w].length >= 30) { const p = pick(byW[w]); out.by[w] = p.best; out.accBy[w] = { rows: byW[w].length, accuracyByWeightPct: fmt(p.acc) }; }
+          out.why = out.b === 1 ? 'the crab layer is doing at least as well as any weaker mix' : out.b === 0 ? 'the crab layer is pulling accuracy down, so the forecast stands without it' : 'a weaker mix of the crab layer and the forecast is doing best';
+          return out;
+        },
+        _pfFcCrabBlend(w) { const c = this._pfFcCrabBlendCalc(); return (w > 0 && c.by[w] != null) ? c.by[w] : c.b; },
+        // Runs inside _pfFcLive after the indicator blend (and before Range Fit): a crabbing ticker's score is pulled toward the crab's expected move, strength cbu, scaled like the
+        // batch's own scores (their mean size). Both ends are kept (ec0 / ecf) so the weight can be tested; a profile's own crb weight, when it has one, replaces the managed weight.
+        _pfFcCrab(list) {
+          for (const f of list) { f.ec0 = null; f.ecf = null; }
+          if (!this._pfCrabOn()) return;
+          let S = 0, c = 0; for (const f of list) if (typeof f.e === 'number') { S += Math.abs(f.e); c++; }
+          S = c ? Math.max(0.05, S / c) : 0.1;
+          for (const f of list) {
+            const b = f.bg; if (!b || typeof f.e !== 'number' || !(b.cbw > 0) || !(b.cbu > 0) || typeof b.cbz !== 'number' || b.cbk) continue; // a crab that just broke out is left alone
+            const pb = typeof b.cbb === 'number' ? b.cbb : CRAB_P0, td = typeof b.cbd === 'number' ? b.cbd : 0, tgt = ((1 - pb) * b.cbz + pb * td) * S;
+            f.ec0 = f.e; f.ecf = +((1 - b.cbu) * f.e + b.cbu * tgt).toFixed(4);
+            const g = this._pfFcProfW(f, 'crb', this._pfFcCrabBlend(b.cbw));
+            f.e = +((1 - g) * f.ec0 + g * f.ecf).toFixed(4);
+          }
+        },
+        _pfCrabHint() {
+          if (!this._pfCrabOn()) return '';
+          const k = this._pfFcCrabBlendCalc(); return ` · Crab layer${k.rows ? `: ${k.rows} changed` : ''}${k.b < 1 ? `, weight ${Math.round(k.b * 100)}%` : ''}`;
+        },
+        _pfCrabRow(r, d, r2) { // the crab fields of one graded or pending forecast (pp fields in the bot's favor like projectedPp)
+          const b = r.bg; if (!b || typeof b.cbw !== 'number') return null;
+          return { windowHours: b.cbw, strength: r2(b.cbu), snapInBotFavor: b.cbz == null ? null : r2(d * b.cbz), positionInRange: r2(b.cbp), rangeWidthPct: r2(b.cbr), rangeLowPct: r2(b.cbl), rangeHighPct: r2(b.cbh), breakProbability: r2(b.cbb), breakTiltInBotFavor: b.cbd == null ? null : r2(d * b.cbd), brokeRecently: b.cbk || 0, preCrabPp: r.ec0 == null ? null : r2(d * r.ec0), fullCrabPp: r.ecf == null ? null : r2(d * r.ecf) };
+        },
+        _pfCrabExport() {
+          this._pfCrabEnsure(); const fc = this._pfFcStore(), d = this._pfSampleDir(), r3 = v => (v == null ? null : +Number(v).toFixed(3)), cfg = this._pfCrabCfg();
+          const rows = fc.done.filter(r => r.bg && typeof r.bg.cbw === 'number'), st = rs => { if (rs.length < 5) return { n: rs.length }; const x = this._pfFcStats(rs); return { n: x.n, hitPct: x.hit == null ? null : +(x.hit * 100).toFixed(1), accuracyPct: x.acc == null ? null : +x.acc.toFixed(1), rankCorrelationProjectedVsActual: r3(x.rho) }; };
+          const crab = rows.filter(r => r.bg.cbw > 0), none = rows.filter(r => !(r.bg.cbw > 0)), by = {};
+          for (const w of CRAB_W) { const g = crab.filter(r => r.bg.cbw === w); if (g.length) by[w] = st(g); }
+          const mean = a => a.length ? a.reduce((s, v) => s + v, 0) / a.length : null;
+          const pos = [['bottom third', r => r.bg.cbp < 1 / 3], ['middle third', r => r.bg.cbp >= 1 / 3 && r.bg.cbp <= 2 / 3], ['top third', r => r.bg.cbp > 2 / 3]].map(([nm, f]) => { const g = crab.filter(r => typeof r.bg.cbp === 'number' && f(r)); return { position: nm, n: g.length, meanMovePctVsBatch: r3(mean(g.map(r => r.y))), shareUpPct: g.length ? +(g.filter(r => r.y > 0).length / g.length * 100).toFixed(1) : null }; });
+          const sn = crab.filter(r => typeof r.bg.cbz === 'number' && r.bg.cbz !== 0 && r.y !== 0), snapHit = sn.length ? +(sn.filter(r => (r.bg.cbz > 0) === (r.y > 0)).length / sn.length * 100).toFixed(1) : null;
+          const cells = Object.fromEntries(Object.keys(CRAB.cells).sort().map(k => { const q = CRAB.cells[k], p = this._pfCrabBreakP(k); return [k, { crabsSeen: q.n, heldPct: q.n ? +((q.n - q.u - q.d) / q.n * 100).toFixed(1) : null, brokeUpPct: q.n ? +(q.u / q.n * 100).toFixed(1) : null, brokeDownPct: q.n ? +(q.d / q.n * 100).toFixed(1) : null, breakProbabilityUsed: r3(p.pb), breakTiltUsed: r3(p.tilt) }]; }));
+          const bl = this._pfFcCrabBlendCalc(), rq = fc.rty || {}, rk = Object.keys(rq), qc = rk.filter(s => rq[s].cb > 0).length;
+          return { enabled: this._pfCrabOn(),
+            settings: { strengthBarAt96hPct: Math.round(cfg.min * 100), strengthBarByWindowPct: Object.fromEntries(CRAB_W.map(w => [w, Math.round(Math.min(0.95, cfg.min + 0.06 * Math.log2(96 / w)) * 100)])), breakMarginPct: Math.round(cfg.edge * 100), windowsHours: CRAB_W, breakLookaheadHours: CRAB_H },
+            weight: { weightPct: Math.round(bl.b * 100), byWindowPct: Object.fromEntries(Object.keys(bl.by).map(w => [w, Math.round(bl.by[w] * 100)])), forecastsChanged: bl.rows, batches: bl.batches, accuracyByWeightPct: bl.acc, accuracyByWindow: bl.accBy, why: bl.why },
+            cohorts: { note: 'graded forecasts by crab state at forecast time (hitPct = the projected sign was right; accuracyPct as in the grades; rank correlation of projection vs the move). crabbing = a window scored over its bar; position test: the mean move (price direction, % vs its batch) of crabbing tickers by where they sat in their range, a snap-back shows as bottom third up / top third down; snapHitPct = how often the sign of the snap reading matched the sign of the move', withReading: rows.length, notCrabbing: st(none), crabbing: st(crab), brokeRecently: st(rows.filter(r => r.bg.cbk)), byLongestWindowHours: by, positionTest: pos, snapHitPct: snapHit },
+            retryQueue: { queued: rk.length, crabbingNow: qc, note: 'how many of the Forecast Focus retry queue were crabbing when they last graded (compare with the crabbing share of all graded forecasts: ' + (rows.length ? Math.round(crab.length / rows.length * 100) + '%' : 'n/a') + ')' },
+            breakerLibrary: { note: 'cell = where the price sat in the crab\'s range (b bottom / m middle / t top) + last-hour volume 2x median (1/0) + last 6 hours squeezed under 40% of the range (1/0); crabsSeen = past crabs filed in the cell; the break probability used starts at ' + CRAB_P0 * 100 + '% and moves toward what the cell has seen (prior weight ' + CRAB_PRIOR + ' crabs)', tickersLearned: Object.keys(CRAB.last).length, cells },
+            note: 'crab readings (cb6..cb96, cp6..cp96, cbu, cbw, cbz, cbp, cbr, cbl, cbh, cbb, cbd, cbk) are in every forecast\'s background readings; preCrabPp / fullCrabPp on the grades are the score before the crab layer and with it at full weight' };
+        },
+        _pfCrabPanel() {
+          if (!this._pfCrabOn()) return '<div style="font-size:10px;color:var(--text-lo)">Crab layer is off.</div>';
+          this._pfCrabEnsure(); const pend = this._pfFcStore().pend, cr = pend.filter(f => f.bg && f.bg.cbw > 0), bl = this._pfFcCrabBlendCalc(), n = Object.keys(CRAB.cells).reduce((s, k) => s + CRAB.cells[k].n, 0), u = Object.keys(CRAB.cells).reduce((s, k) => s + CRAB.cells[k].u, 0), dn = Object.keys(CRAB.cells).reduce((s, k) => s + CRAB.cells[k].d, 0);
+          const wc = {}, sgn = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; for (const f of cr) wc[f.bg.cbw] = (wc[f.bg.cbw] || 0) + 1;
+          let h = '<div style="font-size:10px;line-height:1.5;color:var(--text-lo)">Crabbing now: ' + cr.length + ' of ' + pend.length + ' forecasts in flight' + (cr.length ? ' (' + Object.keys(wc).map(w => wc[w] + ' x ' + w + 'h').join(', ') + ')' : '') + '<br>Breaker library: ' + (n ? n + ' past crabs · ' + Math.round((n - u - dn) / n * 100) + '% held, ' + Math.round(u / n * 100) + '% broke up, ' + Math.round(dn / n * 100) + '% broke down within ' + CRAB_H + 'h' : 'collecting') + '<br>Weight ' + Math.round(bl.b * 100) + '%' + (bl.rows ? ' · tested on ' + bl.rows + ' changed forecasts' : ' · untested (stands in full)') + '</div>';
+          const top = cr.slice().sort((a, b) => b.bg.cbu - a.bg.cbu).slice(0, 6);
+          if (top.length) { h += '<div style="font-size:9px;color:var(--text-lo);margin-top:4px">Strongest crabs (longest window, range low / high from the price, position in range)</div>'; for (const f of top) h += '<div style="font-family:var(--mono);font-size:10px;color:var(--text-hi)">' + f.s.replace('USDT', '') + ' ' + f.bg.cbw + 'h · ' + sgn(f.bg.cbl) + ' / ' + sgn(f.bg.cbh) + ' · ' + Math.round(f.bg.cbp * 100) + '%</div>'; }
+          return h;
         },
         // Which readings drive the direction. Re-tested whenever a batch has graded, on the graded forecasts of the last window (default 4 hours): every logged
         // reading is ranked within its batch against the move, a reading is used the way its own sign shows (a reversal reading counts upside down), and it
@@ -4210,7 +4424,7 @@
           if (B.length < FC_IND_MINB) { this._pfDivLive(out); return out; }
           const r3 = v => (v == null ? null : +v.toFixed(3)), mean = a => { const v = a.filter(x => x != null); return v.length ? v.reduce((s, x) => s + x, 0) / v.length : null; };
           const seen = new Map();
-          for (const b of B) for (const r of b) for (const s of ['sn', 'bg']) { const o = r[s]; if (!o) continue; for (const k of Object.keys(o)) if (!BG_SKIP(k) && typeof o[k] === 'number' && isFinite(o[k])) seen.set(s + ':' + k, (seen.get(s + ':' + k) || 0) + 1); }
+          for (const b of B) for (const r of b) for (const s of ['sn', 'bg']) { const o = r[s]; if (!o) continue; for (const k of Object.keys(o)) if (!BG_SKIP(k) && !CRAB_RX.test(k) && typeof o[k] === 'number' && isFinite(o[k])) seen.set(s + ':' + k, (seen.get(s + ':' + k) || 0) + 1); }
           const P = B.map(b => ({ n: b.length, y: this._pfFcRank(b.map(r => r.y)), f: new Map() })), ids = [], sigs = new Map();
           for (const [id, c] of seen) {
             const [s, k] = id.split(':');
@@ -4281,7 +4495,195 @@
             S = c ? Math.max(0.05, S / c) : 0.1; // the scorecard's typical size, so a rank score of -0.5..0.5 lands on the same scale
             for (const f of list) { const wf = this._pfFcProfW(f, 'ind', w), dc = f.bg && f.bg._dc; if (wf > 0 && typeof dc === 'number') f.e = +((1 - wf) * f.e + wf * 2 * dc * S).toFixed(4); }
           } else for (const f of list) if (f.bg) { delete f.bg._dc; delete f.bg._vi; }
+          this._pfFcCrab(list); // Crab layer: tickers moving along a range lean toward a snap back (before Range Fit, so the fit lays the leaned order onto each range)
           this._pfFcRangeFit(list, state);
+          this._pfFcRegime(list); // Regime caution: a second score beside e (e itself is final here and stays as it is)
+        },
+        // ── Regime caution ──
+        // A score is pp against its batch and the grade subtracts the batch's own move, so the market itself never shows in either. This layer reads how green or red the
+        // market is on several windows of the 1-hour candles already kept, where each ticker sits against it (position against the market's typical high / low, green share
+        // of its hours), and learns from graded forecasts how tickers in the same spot did against their score. It stores a second score beside e (er, price direction like e):
+        // e + the market's expected move (scaled by how far such tickers follow the market) + their usual miss, favourable shifts halved. e and its grade are untouched.
+        // A ticker moving against the market falls into buckets of its own, so whether that is bullish or bearish is read from what such tickers did, never assumed.
+        _pfRgOn() { return this._pfBgOn() && this.cfg.pfFcRegime !== false; },
+        _pfRgWins() {
+          const a = [...new Set(String(this.cfg.pfFcRegimeWins == null ? '2,6,12,24,48,96' : this.cfg.pfFcRegimeWins).split(/[^0-9]+/).map(Number).filter(v => v >= 1 && v <= RG_WIN_MAX))].sort((x, y) => x - y).slice(0, 8);
+          return a.length ? a : [2, 6, 12, 24, 48, 96];
+        },
+        _pfRgLevel(sm) { return sm <= -0.5 ? 0 : sm <= -0.15 ? 1 : sm < 0.15 ? 2 : sm < 0.5 ? 3 : 4; },
+        // One ticker's last w completed hours: move, highest high and lowest low from the reference close (%), share of green hours.
+        _pfRgRaw(st, w) {
+          const c = st.c, h = st.h, l = st.l, n = c.length;
+          if (n < w + 1) return null;
+          const ref = c[n - 1 - w]; if (!(ref > 0)) return null;
+          let hi = -Infinity, lo = Infinity, g = 0;
+          for (let i = n - w; i < n; i++) { if (h[i] > hi) hi = h[i]; if (l[i] < lo) lo = l[i]; if (c[i] > c[i - 1]) g++; }
+          return { mv: (c[n - 1] / ref - 1) * 100, hi: (hi / ref - 1) * 100, lo: (lo / ref - 1) * 100, gs: g / w };
+        },
+        // The market per window, from every ticker whose hour candles are fresh (last candle at most RG_FRESH_MS behind): the typical high / low (up / dn, %), the mean position
+        // against them (mz, -3..3: a move is divided by the typical extreme on its own side) and the mean green share (mg); sm = the mean of mz over the windows read.
+        _pfRgMarket(wins) {
+          const hs = this._pfHourStart(), ids = Object.keys(BG1H), key = hs + '|' + wins.join(',') + '|' + (ids.length / 20 | 0);
+          if (RGM.key === key) return RGM.v;
+          const per = wins.map(() => ({ n: 0, up: 0, dn: 0, mv: [], gs: 0 }));
+          for (const sym of ids) {
+            const st = BG1H[sym]; if (!st || !(hs - st.t <= RG_FRESH_MS) || st.c.length < 3) continue;
+            wins.forEach((w, i) => { const r = this._pfRgRaw(st, w); if (!r) return; const p = per[i]; p.n++; p.up += Math.max(0, r.hi); p.dn += Math.max(0, -r.lo); p.mv.push(r.mv); p.gs += r.gs; });
+          }
+          const out = wins.map((w, i) => {
+            const p = per[i]; if (p.n < RG_MIN_N) return null;
+            const up = Math.max(0.1, p.up / p.n), dn = Math.max(0.1, p.dn / p.n); let zs = 0;
+            for (const m of p.mv) zs += Math.max(-3, Math.min(3, m >= 0 ? m / up : m / dn));
+            return { w, n: p.n, up, dn, mz: zs / p.n, mg: p.gs / p.n };
+          });
+          const ok = out.filter(Boolean);
+          RGM.key = key; RGM.v = ok.length ? { w: out, sm: ok.reduce((s, x) => s + x.mz, 0) / ok.length, n: Math.max(...ok.map(x => x.n)) } : null;
+          return RGM.v;
+        },
+        // One ticker against the market. Per window: position z (move over the market's typical extreme on its side), its bucket (market state x z level, 25) and green bucket
+        // (market state x green share against the market's, 15). Market state: flat / red with the ticker red or flat / red with the ticker GREEN / green with the ticker green or
+        // flat / green with the ticker RED (the last two are the diverging ones). c = the profile overall: 0 aligned or none, 1 diverging up, 2 diverging down.
+        _pfRgRead(sym, mk, wins) {
+          const st = BG1H[sym]; if (!st || !(this._pfHourStart() - st.t <= 3600000)) return null;
+          const zb = [], gb = [], z = [], g = []; let ok = 0, du = 0, dd = 0;
+          wins.forEach((w, i) => {
+            const m = mk.w[i], r = m ? this._pfRgRaw(st, w) : null;
+            if (!r) { zb.push(-1); gb.push(-1); z.push(null); g.push(null); return; }
+            const zz = Math.max(-3, Math.min(3, r.mv >= 0 ? r.mv / m.up : r.mv / m.dn));
+            const rel = Math.abs(m.mz) < 0.15 ? 0 : m.mz < 0 ? (zz > 0.25 ? 2 : 1) : (zz < -0.25 ? 4 : 3);
+            const zl = zz <= -0.75 ? 0 : zz <= -0.25 ? 1 : zz < 0.25 ? 2 : zz < 0.75 ? 3 : 4, gl = r.gs <= m.mg - 0.15 ? 0 : r.gs >= m.mg + 0.15 ? 2 : 1;
+            zb.push(rel * 5 + zl); gb.push(rel * 3 + gl); z.push(+zz.toFixed(2)); g.push(+r.gs.toFixed(2)); ok++;
+            if (rel === 2) du++; else if (rel === 4) dd++;
+          });
+          if (!ok) return null;
+          return { v: 1, sm: +mk.sm.toFixed(3), l: this._pfRgLevel(mk.sm), c: (du > dd && du * 3 >= ok) ? 1 : (dd > du && dd * 3 >= ok) ? 2 : 0, n: mk.n, w: wins.slice(), zb, gb, z, g };
+        },
+        // What it has learned (kept in the forecast store): mu[level] = market moves seen per market level (cohorts, sum); bt[class] = sums of (ticker move x market move) and
+        // market move squared; tb['<hours>z' | '<hours>g'][bucket] = forecasts and the sum of their miss (actual relative move less score); ty = typical size of the market move.
+        // Every cell fades with RG_HL_MS as half-life.
+        _pfFcRgNew() { return { mu: {}, bt: {}, tb: {}, ty: { n: 0, a: 0, q: 0, u: 0 } }; },
+        _pfFcRgSanStore(d) {
+          const o = this._pfFcRgNew(), num = v => (typeof v === 'number' && isFinite(v)) ? v : null;
+          if (!d || typeof d !== 'object') return o;
+          const cell = (c, ks) => { if (!c || typeof c !== 'object') return null; const r = { u: num(c.u) || 0 }; for (const k of ks) { const v = num(c[k]); if (v == null) return null; r[k] = v; } return r; };
+          for (const k of Object.keys(d.mu || {}).slice(0, 5)) { const c = /^[0-4]$/.test(k) ? cell(d.mu[k], ['n', 's']) : null; if (c) o.mu[k] = c; }
+          for (const k of Object.keys(d.bt || {}).slice(0, 3)) { const c = /^[0-2]$/.test(k) ? cell(d.bt[k], ['n', 'a', 'b']) : null; if (c) o.bt[k] = c; }
+          for (const k of Object.keys(d.tb || {}).slice(0, 64)) {
+            if (!/^\d+[zg]$/.test(k) || !d.tb[k] || typeof d.tb[k] !== 'object') continue;
+            const T = {}; for (const b of Object.keys(d.tb[k]).slice(0, 30)) { const c = /^\d+$/.test(b) ? cell(d.tb[k][b], ['n', 's']) : null; if (c) T[b] = c; }
+            if (Object.keys(T).length) o.tb[k] = T;
+          }
+          const ty = cell(d.ty, ['n', 'a', 'q']); if (ty) o.ty = ty;
+          return o;
+        },
+        _pfFcRgSan(x) {
+          if (!x || typeof x !== 'object' || !Array.isArray(x.w) || !x.w.length) return null;
+          const num = v => (typeof v === 'number' && isFinite(v)) ? v : null, w = x.w.slice(0, 8).map(v => v | 0), n = w.length;
+          const pad = a => { const r = Array.isArray(a) ? a.slice(0, n).map(num) : []; while (r.length < n) r.push(null); return r; };
+          return { v: 1, sm: num(x.sm), l: x.l | 0, c: x.c | 0, n: x.n | 0, w, zb: pad(x.zb).map(v => v == null ? -1 : v | 0), gb: pad(x.gb).map(v => v == null ? -1 : v | 0), z: pad(x.z), g: pad(x.g), mu: num(x.mu), be: num(x.be), ms: num(x.ms), ad: num(x.ad), bw: num(x.bw) };
+        },
+        _pfRgAge(c, now, ks) { const dt = now - (c.u || now); if (dt > 0) { const f = Math.pow(0.5, dt / RG_HL_MS); for (const k of ks) c[k] *= f; } c.u = now; },
+        _pfRgTy(R) { const ok = R.ty.n >= 3; return { typ: ok ? R.ty.a / R.ty.n : 0.4, V: ok ? Math.max(0.01, R.ty.q / R.ty.n) : 0.25 }; }, // typical |market move| and its mean square (pp), with starting values until cohorts have been seen
+        // The layer's weight is the bot's own call, like the Crab layer's: every graded forecast it shifted (score e, full shift rg.ad, both kept) is replayed at weights 1 / .75 / .5 / .25 / 0
+        // on the RAW move (the shift carries the market's own move, which the relative grade hides) and the best accuracy wins (a lower weight must beat the one above by more than 0.1 points).
+        // Judged overall and per profile (aligned / diverging up / diverging down, 30+ rows each); a profile with no verdict yet uses the overall one. Under FC_IND_MINB graded batches or
+        // 30 shifted forecasts the layer stands in full. The shift is learned before each forecast is graded, so the replay is out of sample.
+        _pfFcRgBlendCalc() {
+          const fc = this._pfFcStore(), done = fc.done, n = done.length, last = n ? done[n - 1].u : 0, win = this._pfFcIndWinMs(), key = n + ':' + last + ':' + win;
+          if (this._pfFcRgBl && this._pfFcRgBl.key === key) return this._pfFcRgBl;
+          const out = this._pfFcRgBl = { key, b: 1, by: {}, batches: 0, rows: 0, acc: null, accBy: {}, why: 'too few graded batches to test the regime shift yet' };
+          const R = done.filter(r => r.u >= last - win && r.rg && typeof r.rg.ad === 'number' && Math.abs(r.rg.ad) > 1e-6 && typeof r.e === 'number' && typeof r.m === 'number' && isFinite(r.m));
+          out.rows = R.length; out.batches = new Set(R.map(r => r.a)).size;
+          if (out.batches < FC_IND_MINB || R.length < 30) return out;
+          const G = [1, 0.75, 0.5, 0.25, 0], fmt = acc => Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
+          const pick = rows => { const acc = {}; for (const g of G) acc[g] = rows.reduce((s, r) => s + this._pfFcAcc(r.e + g * r.rg.ad, r.m), 0) / rows.length; let best = 1; for (const g of G) if (g < best && acc[g] > acc[best] + 0.1) best = g; return { best, acc }; };
+          const all = pick(R); out.b = all.best; out.acc = fmt(all.acc);
+          for (const c of [0, 1, 2]) { const rs = R.filter(r => r.rg.c === c); if (rs.length >= 30) { const p = pick(rs); out.by[c] = p.best; out.accBy[RG_CLS[c]] = { rows: rs.length, accuracyByWeightPct: fmt(p.acc) }; } }
+          out.why = out.b === 1 ? 'the regime shift is doing at least as well as any weaker mix' : out.b === 0 ? 'the regime shift is pulling accuracy down, so the score stands without it' : 'a weaker mix of the regime shift and the score is doing best';
+          return out;
+        },
+        _pfFcRgBlend(c) { const b = this._pfFcRgBlendCalc(); return b.by[c] != null ? b.by[c] : b.b; },
+        // The second score for a list of new forecasts (called with every scoring pass, so it is recomputed from the fresh candles once they land).
+        _pfFcRegime(list) {
+          for (const f of list) { f.er = null; f.rg = null; }
+          if (!this._pfRgOn()) return;
+          const wins = this._pfRgWins(), mk = this._pfRgMarket(wins); if (!mk) return;
+          const R = this._pfFcStore().rg || this._pfFcRgNew(), d = this._pfSampleDir(), { typ, V } = this._pfRgTy(R);
+          for (const f of list) {
+            if (typeof f.e !== 'number') continue;
+            const rg = this._pfRgRead(f.s, mk, wins); if (!rg) continue;
+            const lv = R.mu[rg.l], mu = (RG_N0 * Math.max(-1, Math.min(1, rg.sm)) * typ + (lv ? lv.s : 0)) / (RG_N0 + (lv ? lv.n : 0)); // the market's expected move: red / green leans it that way (the starting guess) until cohorts of that level say otherwise
+            const bc = R.bt[rg.c], be = ((bc ? bc.a : 0) + RG_BN * V) / ((bc ? bc.b : 0) + RG_BN * V); // how far this kind of ticker follows the market (1 until it has history)
+            let sc = 0, sw = 0;
+            rg.w.forEach((w, i) => { for (const [kind, arr] of [['z', rg.zb], ['g', rg.gb]]) { const b = arr[i]; if (b < 0) continue; const T = R.tb[w + kind], c = T && T[b]; if (!c || !(c.n > 0)) continue; const cf = c.n / (c.n + RG_K); sc += cf * (c.s / c.n); sw += cf; } });
+            const ms = sw > 0 ? sc / Math.max(1, sw) : 0; // their usual miss (actual relative move less score), tables weighted by how much each has seen
+            let fav = d * (be * mu + ms); if (fav > 0) fav *= RG_UP; fav = Math.max(-RG_CAP, Math.min(RG_CAP, fav));
+            const ad = d * fav; // price direction again
+            const bw = this._pfFcRgBlend(rg.c); // the managed weight: the full shift stays in rg.ad, er carries the weighted one
+            f.rg = Object.assign(rg, { mu: +mu.toFixed(4), be: +be.toFixed(3), ms: +ms.toFixed(4), ad: +ad.toFixed(4), bw });
+            f.er = +(f.e + bw * ad).toFixed(4);
+          }
+        },
+        // A graded forecast: its miss (relative move less score) into each of its buckets, and the move-with-market sums into its profile.
+        _pfFcRgLearn(fc, f, m, y, M, now) {
+          const rg = f.rg; if (!rg || !Array.isArray(rg.w) || !isFinite(y - f.e) || !isFinite(m * M)) return;
+          const R = (fc.rg ||= this._pfFcRgNew()), r = y - f.e;
+          rg.w.forEach((w, i) => { for (const [kind, arr] of [['z', rg.zb], ['g', rg.gb]]) { const b = arr && arr[i]; if (b == null || b < 0) continue; const T = (R.tb[w + kind] ||= {}), c = (T[b] ||= { n: 0, s: 0, u: now }); this._pfRgAge(c, now, ['n', 's']); c.n += 1; c.s += r; } });
+          const bc = (R.bt[rg.c] ||= { n: 0, a: 0, b: 0, u: now }); this._pfRgAge(bc, now, ['n', 'a', 'b']); bc.n += 1; bc.a += m * M; bc.b += M * M;
+          const ks = Object.keys(R.tb); if (ks.length > 40) for (const k of ks.sort((p, q) => Math.max(...Object.values(R.tb[p]).map(c => c.u)) - Math.max(...Object.values(R.tb[q]).map(c => c.u))).slice(0, ks.length - 40)) delete R.tb[k]; // windows no longer used fade out
+        },
+        // A graded cohort: the market's move (price direction) at the market level it started in.
+        _pfFcRgCohort(fc, arr, M, now) {
+          const x = arr.find(a => a.f.rg && a.f.rg.l != null); if (!x || !isFinite(M)) return;
+          const R = (fc.rg ||= this._pfFcRgNew()), c = (R.mu[x.f.rg.l] ||= { n: 0, s: 0, u: now }); this._pfRgAge(c, now, ['n', 's']); c.n += 1; c.s += M;
+          this._pfRgAge(R.ty, now, ['n', 'a', 'q']); R.ty.n += 1; R.ty.a += Math.abs(M); R.ty.q += M * M;
+        },
+        _pfFcRgReset() { const fc = this._pfFcStore(); fc.rg = this._pfFcRgNew(); this._pfFcSave(); },
+        _pfRgHint() {
+          if (!this._pfRgOn()) return '';
+          const mk = this._pfRgMarket(this._pfRgWins());
+          return mk ? ` · Regime: market ${RG_LVL[this._pfRgLevel(mk.sm)]} (${mk.sm >= 0 ? '+' : ''}${mk.sm.toFixed(2)})` : ' · Regime: waiting for fresh hour candles';
+        },
+        _pfRgPanel() {
+          const lo = 'font-size:10px;line-height:1.5;color:var(--text-lo)';
+          if (!this._pfRgOn()) return `<div style="${lo}">Regime caution is off.</div>`;
+          const wins = this._pfRgWins(), mk = this._pfRgMarket(wins), fc = this._pfFcStore(), R = fc.rg || this._pfFcRgNew(), d = this._pfSampleDir(), rows = fc.pend.filter(f => f.rg && f.er != null);
+          const sg = (v, k = 2) => (v >= 0 ? '+' : '') + v.toFixed(k);
+          let h = `<div style="${lo}">` + (mk ? `Market now: ${RG_LVL[this._pfRgLevel(mk.sm)]} (${sg(mk.sm)}), ${mk.n} tickers read<br>` + mk.w.filter(Boolean).map(m => `${m.w}h ${sg(m.mz)}`).join(' · ') : 'Market: too few fresh hour candles yet');
+          const dn = rows.filter(f => d * f.rg.ad < -0.05).length, up = rows.filter(f => d * f.rg.ad > 0.05).length, dv = rows.filter(f => f.rg.c > 0);
+          h += `<br>In flight: ${rows.length} read · ${dn} marked down · ${up} marked up · ${dv.length} against the market`;
+          const bl = this._pfFcRgBlendCalc(); h += `<br>Learned: ${Math.round(Object.keys(R.mu).reduce((s, k) => s + R.mu[k].n, 0))} cohorts · ${Object.keys(R.tb).length} tables<br>Weight ${Math.round(bl.b * 100)}%: ${bl.why}</div>`;
+          const top = dv.slice().sort((a, b) => Math.max(...b.rg.z.map(v => Math.abs(v || 0))) - Math.max(...a.rg.z.map(v => Math.abs(v || 0)))).slice(0, 5);
+          if (top.length) { h += '<div style="font-size:9px;color:var(--text-lo);margin-top:4px">Against the market now (position vs its typical extreme, per window)</div>'; for (const f of top) h += '<div style="font-family:var(--mono);font-size:10px;color:var(--text-hi)">' + f.s.replace('USDT', '') + ' ' + (f.rg.c === 1 ? 'green vs red' : 'red vs green') + ' · ' + f.rg.w.map((w, i) => f.rg.z[i] == null ? '' : w + 'h ' + sg(f.rg.z[i], 1)).filter(Boolean).join(' ') + '</div>'; }
+          return h;
+        },
+        _pfRgRow(r, d, r2) { // the regime fields of one graded or pending forecast (pp fields in the bot's favor like projectedPp)
+          const g = r.rg; if (!g) return null;
+          return { marketScore: r2(g.sm), marketRegime: RG_LVL[g.l], tickerProfile: RG_CLS[g.c], windowsHours: g.w, positionVsMarketExtreme: g.z, greenShare: g.g, marketMovePpInBotFavor: g.mu == null ? null : r2(d * g.mu), sensitivityToMarket: r2(g.be), usualMissPpInBotFavor: g.ms == null ? null : r2(d * g.ms), shiftPpInBotFavor: g.ad == null ? null : r2(d * g.ad), weight: g.bw == null ? null : r2(g.bw), projectedPpWithRegime: r.er == null ? null : r2(d * r.er) };
+        },
+        _pfRgExport() {
+          const fc = this._pfFcStore(), d = this._pfSampleDir(), R = fc.rg || this._pfFcRgNew(), r3 = v => (v == null ? null : +Number(v).toFixed(3)), wins = this._pfRgWins(), mk = this._pfRgMarket(wins), { typ, V } = this._pfRgTy(R);
+          const mean = a => a.length ? a.reduce((s, v) => s + v, 0) / a.length : null, rows = fc.done.filter(r => r.er != null && r.m != null && r.rg);
+          const grp = rs => rs.length < 5 ? { n: rs.length } : { n: rs.length, meanRawMoveInBotFavorPp: r3(mean(rs.map(r => d * r.m))), profitableRawMovePct: +(rs.filter(r => d * r.m > 0).length / rs.length * 100).toFixed(1), meanRelativeMoveInBotFavorPp: r3(mean(rs.map(r => d * r.y))), meanProjectedPp: r3(mean(rs.map(r => d * r.e))), meanProjectedPpWithRegime: r3(mean(rs.map(r => d * r.er))) };
+          const vs = k => { const x = this._pfFcStats(rows.map(r => ({ ...r, e: k ? r.er : r.e, y: r.m }))); return x.n < 5 ? { n: x.n } : { n: x.n, hitPct: x.hit == null ? null : +(x.hit * 100).toFixed(1), accuracyPct: x.acc == null ? null : +x.acc.toFixed(1), rankCorrelation: r3(x.rho), slope: r3(x.slope), meanAbsErrorPp: r3(mean(rows.map(r => Math.abs(r.m - (k ? r.er : r.e))))) }; };
+          const tables = {};
+          for (const k of Object.keys(R.tb).sort((a, b) => parseInt(a) - parseInt(b) || a.localeCompare(b))) {
+            const z = k.slice(-1) === 'z', T = R.tb[k];
+            tables[k.slice(0, -1) + 'h ' + (z ? 'position' : 'green share')] = Object.keys(T).map(Number).sort((a, b) => a - b).filter(b => T[b].n > 0.5).map(b => ({ bucket: z ? RG_REL[Math.floor(b / 5)] + ' / ' + RG_ZL[b % 5] : RG_REL[Math.floor(b / 3)] + ' / ' + RG_GL[b % 3], forecasts: r3(T[b].n), usualMissPpInBotFavor: r3(d * T[b].s / T[b].n) }));
+          }
+          const bl = this._pfFcRgBlendCalc();
+          return { enabled: this._pfRgOn(),
+            weight: { overall: bl.b, byProfile: Object.fromEntries(Object.keys(bl.by).map(k => [RG_CLS[k], bl.by[k]])), shiftedForecasts: bl.rows, batches: bl.batches, accuracyByWeightPct: bl.acc, accuracyByProfile: bl.accBy, why: bl.why, note: 'the bot\'s own call: graded forecasts the shift changed are replayed at 100 / 75 / 50 / 25 / 0% of it on the raw move, overall and per profile, and the best wins' },
+            settings: { windowsHours: wins, maxWindowHours: RG_WIN_MAX, minTickersForMarket: RG_MIN_N, freshHoursMax: RG_FRESH_MS / 3600000, priorWeight: { cohortsPerMarketLevel: RG_N0, forecastsPerBucket: RG_K }, halfLifeHours: RG_HL_MS / 3600000, favourableShiftKeptPct: RG_UP * 100, shiftCapPp: RG_CAP },
+            marketNow: mk ? { score: r3(mk.sm), regime: RG_LVL[this._pfRgLevel(mk.sm)], tickersRead: mk.n, byWindow: mk.w.filter(Boolean).map(m => ({ hours: m.w, tickers: m.n, typicalHighPct: r3(m.up), typicalLowPct: r3(-m.dn), meanPosition: r3(m.mz), meanGreenShare: r3(m.mg) })) } : null,
+            marketMoveByRegime: RG_LVL.map((nm, k) => { const c = R.mu[k]; return { regime: nm, cohorts: c ? r3(c.n) : 0, meanMarketMoveInBotFavorPp: c && c.n > 0 ? r3(d * c.s / c.n) : null }; }),
+            typicalMarketMovePct: r3(typ), sensitivityByProfile: RG_CLS.map((nm, k) => { const c = R.bt[k]; return { profile: nm, forecasts: c ? r3(c.n) : 0, sensitivity: r3(((c ? c.a : 0) + RG_BN * V) / ((c ? c.b : 0) + RG_BN * V)) }; }),
+            tables,
+            test: { note: 'graded forecasts that carry a regime score, split by the shift it made (bot\'s favor: down = under -0.05 pp, up = over +0.05). The score is judged against the RAW move (market included); the usual grade is relative to the batch. A shift is working when marked-down forecasts move worse than left-alone ones', rows: rows.length,
+              markedDown: grp(rows.filter(r => d * r.rg.ad < -0.05)), leftAlone: grp(rows.filter(r => Math.abs(d * r.rg.ad) <= 0.05)), markedUp: grp(rows.filter(r => d * r.rg.ad > 0.05)),
+              byProfile: RG_CLS.map((nm, k) => ({ profile: nm, ...grp(rows.filter(r => r.rg.c === k)) })), byMarketRegime: RG_LVL.map((nm, k) => ({ regime: nm, ...grp(rows.filter(r => r.rg.l === k)) })),
+              scoreVsRawMove: vs(false), regimeScoreVsRawMove: vs(true) },
+            note: 'regime caution keeps a second score (projectedPpWithRegime on the grades, er in the store) beside the scorecard\'s; projectedPp and every grade stay as they were. Position = a ticker\'s move over a window divided by the market\'s typical high (if up) or low (if down) over that window, a ticker moving against the market\'s direction is its own profile (tickerProfile). Shift = sensitivity x the market\'s expected move for its level + the usual miss of tickers in its buckets (actual relative move less score), favourable shifts at ' + RG_UP * 100 + '%, nothing reads it yet' };
         },
         // ── Grading ──
         _pfFcRank(a) {
@@ -4336,11 +4738,11 @@
           if (!st || !st.n || st.n < 5 || st.acc == null) return null;
           return `accuracy ${Math.round(st.acc)}%`;
         },
-        // The last ten graded start batches (one column each) and the batches still to come (pending forecasts grouped by the batch they fall due in).
+        // Every graded start batch in the window (one column each) and the batches still to come (pending forecasts grouped by the batch they fall due in).
         _pfFcCohorts() {
           const fc = this._pfFcStore(), by = new Map();
           for (const r of fc.done) { let g = by.get(r.a); if (!g) by.set(r.a, g = { a: r.a, t: r.t, u: r.u, recs: [] }); g.recs.push(r); }
-          const done = [...by.values()].sort((x, y) => x.a - y.a).slice(-10).map(g => ({ ...g, st: this._pfFcStats(g.recs) }));
+          const done = [...by.values()].sort((x, y) => x.a - y.a).map(g => ({ ...g, st: this._pfFcStats(g.recs) }));
           const pd = new Map();
           for (const f of fc.pend) pd.set(f.d, (pd.get(f.d) || 0) + 1);
           const pend = [...pd.entries()].sort((x, y) => x[0] - y[0]).map(([d, n]) => ({ d, n, k: Math.max(1, d - fc.seq) }));
@@ -4355,10 +4757,10 @@
           const fc = this._pfFcStore(), f = this._pfFcFmt(this._pfFcStats(fc.done));
           const ri = this.pfFcRangeInfo, nt = Object.keys(PM.s).length, rb = this._pfFcRangeBlend();
           const fa = this._pfFcRangeOn() ? ` · Range Fit: ${nt} ticker${nt === 1 ? '' : 's'} of past moves` + (ri && ri.fitted ? `, ${ri.fitted} fitted${ri.skipped ? ` (${ri.skipped} short of history)` : ''}` : nt < 8 ? ', learning' : '') + (rb < 1 ? `, weight ${Math.round(rb * 100)}%` : '') : '';
-          return `${fc.pend.length} pending · ${fc.done.length} graded` + (f ? ' · ' + f : ' · too few graded to read yet') + fa + this._pfFcProfHint();
+          return `${fc.pend.length} pending · ${fc.done.length} graded` + (f ? ' · ' + f : ' · too few graded to read yet') + fa + this._pfFcProfHint() + this._pfCrabHint() + this._pfRgHint();
         },
         // ── Forecast chart (view 'fc') ──
-        // One column per graded start batch (the last ten): one bar per ticker = its forecast accuracy (0-100), up from the 70% line when at or above it, down when below. After a dashed line, the batches
+        // One column per graded start batch in the window (the chart scrolls): one bar per ticker = its forecast accuracy (0-100), up from the 70% line when at or above it, down when below. After a dashed line, the batches
         // still to come: a grey tick and the number of forecasts that fall due in each. Click a graded column for its tickers.
         _pfFcChartSvg() {
           this._pfOcYAxisHtml = ''; this._pfOcAvgYPx = null;
@@ -4488,11 +4890,13 @@
             about: 'Each ticker is scored by the scorecard on its non-price readings at its first sample appearance (projectedPp: pp against the field in the bot\'s favor), then graded at its revisit: actualPp = the price move less its start batch\'s mean move, in the bot\'s favor (rawMovePct = the move itself; maxUpPct / maxDownPct = the highest / lowest point since the forecast; projections = the sum of the poles and the strongest single pole, projectedPp being their mean, then laid onto the expected range when Range Fit is on (rawProjectedPp = the mean before the fit); snapshot = the readings at forecast time; batchContext = the market around each start batch). Void = the ticker was gone / late / in a cohort of fewer than 3. attempt = 1 for a first forecast on a ticker, 2 or more for a retry of a ticker that graded under 51% (Forecast Focus, see retryQueue in the Summary). accuracyPct = 50-100 when the direction was right (by size match), 0-50 when wrong; contributionPp = each criterion family\'s share of projectedPp. Every pp field (projectedPp, actualPp, contributionPp, projections) shares one sign: in the bot\'s favor (botFavorDir 1 = Chaser: + is price up; -1 = Winter: + is price down); the % fields (rawMovePct, relMovePct, batchMeanMovePct, maxUpPct, maxDownPct) are price moves, + is price up for either bot. actualVsBatchMedianPp = actualPp less its batch\'s median (the skew-free target); volRatio = the ticker\'s 60-minute range over its batch\'s median; featureIC = per snapshot feature, the mean per-batch rank correlation with the move (direction, in the bot\'s favor) and with its size (magnitude), and t over batches. readings (the Readings part) = the wide readings logged with each forecast (s.* snapshot, b.* background; the indicator forecast uses a few of them, see indicatorForecast); b.x_lqw / x_lqu / x_lqd / x_lql = liquidations in the 10 minutes AFTER the forecast started (watched flag, 0 = no reading; shorts $; longs $; lean pp) and x_lqs / x_lqg = seconds the watch listened / seconds it was blind, diagnostics only and never inputs. b.lqa / b.lqt = liquidation samples from before the forecast, age-weighted to the dropoff (lean -1..1 with liquidated shorts +; log10 of the weighted liquidated turnover), no reading when the ticker had none.',
             botFavorDir: d,
             parts: 'The Forecast Grader export comes in parts (Export Data menu): Summary (this file), Grades (one row per graded forecast), Readings (snapshot + background readings as compact columns, join on symbol + startBatch), Pending, Range Fit Past Moves.',
-            settings: { forecastFocus: this._pfFcFocusOn(), weightProfiles: this._pfFcProfOn(), profileMatchDistancePct: Math.round(this._pfFcProfDist() * 100), forecastsPerBatch: this._pfFcFocusN(), retrySharePct: Math.round(this._pfFcRtyShare() * 100), retryBelowPct: this._pfFcRtyLow(), retryPassPct: this._pfFcPass(), revisitSharePct: Math.round(this._pfFcShare() * 100), leadBatches: this._pfFcLead(), keep: this._pfFcKeep(), batchSize: Math.max(1, Math.min(2500, Math.round(Number(this.cfg.pfOcBatchSize) || 250))), scanStepMs: this._pfFcStepMs() },
+            settings: { forecastFocus: this._pfFcFocusOn(), weightProfiles: this._pfFcProfOn(), profileMatchDistancePct: Math.round(this._pfFcProfDist() * 100), forecastsPerBatch: this._pfFcFocusN(), retryBelowPct: this._pfFcRtyLow(), retryPassPct: this._pfFcPass(), revisitSharePct: Math.round(this._pfFcShare() * 100), leadBatches: this._pfFcLead(), keep: this._pfFcKeep(), batchSize: Math.max(1, Math.min(2500, Math.round(Number(this.cfg.pfOcBatchSize) || 250))), scanStepMs: this._pfFcStepMs() },
             rangeFit: { enabled: this._pfFcRangeOn(), weight: this._pfFcRangeBlendInfo(), pastMoves: { hoursKeptPerTicker: this._pfPmHours(), tickers: Object.keys(PM.s).length, peersMax: this._pfPmPeers(), minCorrelation: this._pfPmCorr(), ownSharePct: Math.round(this._pfPmOwn() * 100) }, lastFit: this.pfFcRangeInfo || null,
               about: 'Each forecast ticker is laid onto its OWN expected range: its past hourly moves (market-relative, scaled to the forecast horizon by the square root of time) pooled with those of the tickers whose market-relative hourly moves track it closest (each scaled to this ticker\'s volatility, weighted by correlation squared; ownSharePct of the weight stays with its own history). The batch is ranked by score and each ticker takes its own range\'s quantile at its rank (fittedPct, price direction, % points; the weight of the fit against the raw projection is the bot own call, see weight). lastFit.rows = the last batch: the peers used (correlation, shared hours) and the range\'s p10 / p50 / p90. A ticker under 12 hours of history is skipped and keeps its raw projection. The weight of the fit is tested on the graded window and backs off toward the raw projection when it does worse. The Range Fit Past Moves export part also holds the stored hourly moves.',
               store: part !== 'ranges' ? undefined : this._pfPmExport() },
             candleDivination: this._pfDivExport(),
+            crabLayer: this._pfCrabExport(),
+            regimeCaution: this._pfRgExport(),
             indicatorForecast: { enabled: this._pfFcIndOn(), directionBlendPct: Math.round(this._pfFcIndBlend() * 100), directionFeatures: this._pfFcIndSelect().feats.map(x => (x.o > 0 ? '+' : '-') + x.k), directionTest: (() => { const q = this._pfFcIndSelect(); return { windowHours: Math.round(this._pfFcIndWinMs() / 360000) / 10, batches: q.batches, forecasts: q.rows, minBatches: FC_IND_MINB, minAbsRankIC: FC_IND_FLOOR, ensembleRankIC: q.ic, note: 'rankIC = mean per-batch rank correlation of the reading with the price move (price direction, + = price up); h1 / h2 = the same over the first / second half of the window; in = used (with the sign shown by rankIC)', readings: q.table }; })(), liquidationDropoffHours: Math.round(this._pfFcLiqDropMs() / 360000) / 10, sizeFeatures: VOL_FEATS.map(x => x[0]), note: 'projectedPp ranks tickers by an equal-weight rank average of the direction features picked from the graded window (each reading used the way its own sign shows, kept only while it does not pull the ensemble down; none picked yet = the scorecard score stands; see directionTest), sized by the geometric mean of the size features against the batch median; the scorecard score is kept in projections.sc and graded as projectionTest.scorecard; background._dc and _vi are the per-ticker indicator direction score (price direction, -0.5 to 0.5) and size index', historyStorage: (this._pfFcIdb && !this._pfFcIdbBroken) ? { indexedDb: true, rows: this._pfFcIdb.w.size, provenOnReload: this._pfFcIdb.proven } : { indexedDb: false } },
             batchCounter: fc.seq, voids: fc.voids, noScoredPole: fc.nof, retryQueue: this._pfFcRtyExport(fc), weightProfiles: this._pfFcProfExport(fc), liquidationReservation: { waiting: Object.keys(fc.rsv || {}).length, dropoffHours: Math.round(this._pfFcLiqDropMs() / 360000) / 10, note: 'tickers with a liquidation event younger than the dropoff that have not started a forecast since; bg._rv = 1 marks forecasts started from a reservation' }, startLog: { note: 'per batch: results = tickers in the batch; revisits = taken by due revisits; pending = skipped because the ticker already has a forecast in flight; noPrice = no usable price; noScoredPole = nothing the scorecard could score; candidates = left to choose from; room = forecasts allowed to start; started = forecasts started; reserved = of those, started from a liquidation reservation; retries = of those, started on a ticker in the retry queue (attempt 2 or later). started under room = the batch ran out of candidates. Graded cohorts can still shrink later (void gone / late / thin)', rows: (fc.sl || []).map(e => ({ startBatch: e.a, results: e.r, revisits: e.v, pending: e.h, noPrice: e.p, noScoredPole: e.n, candidates: e.c, room: e.m, started: e.k, reserved: e.q, retries: e.y })) },
             window: this._pfFcStats(fc.done), featureIC: this._pfFcFeatureIC(byA, d), batches,
@@ -4502,8 +4906,8 @@
             batchContext: fc.ctx || {},
           };
           const gradeRow = r => ({ symbol: r.s, startBatch: r.a, attempt: r.rt || 1, gradedInBatch: r.d, forecastAt: new Date(r.t).toISOString(), gradedAt: new Date(r.u).toISOString(), elapsedMin: +((r.u - r.t) / 60000).toFixed(1),
-              projectedPp: r2(d * r.e), rawProjectedPp: r.e0 == null ? null : r2(d * r.e0), actualPp: r2(d * r.y), rawMovePct: r2(r.m), batchMeanMovePct: r2(r.k), accuracyPct: r2(this._pfFcAcc(r.e, r.y)), contributionPp: fav(r.w), relMovePct: r2(r.y), actualVsBatchMedianPp: r2(d * (r.y - (medY.get(r.a) ?? 0))), volRatio: (r.sn && r.sn.rng60 > 0 && medV.get(r.a)) ? r2(r.sn.rng60 / medV.get(r.a)) : null, maxUpPct: r2(r.mu), maxDownPct: r2(r.md), projections: fav(r.ep), indDirScore: (r.bg && r.bg._dc != null) ? r2(d * r.bg._dc) : null, sizeIndex: (r.bg && r.bg._vi != null) ? r2(r.bg._vi) : null, criteria: r.c, profile: r.pf == null ? null : r.pf, weightSet: r.pk === 'p' ? 'proven' : r.pk === 't' ? 'trial' : 'general', weights: r.pwt || null, traitRanks: r.pt || null });
-          const pendRow = f => ({ symbol: f.s, startBatch: f.a, attempt: f.rt || 1, dueBatch: f.d, forecastAt: new Date(f.t).toISOString(), priceAtForecast: f.p, rawPriceAtForecast: f.p0 ?? null, projectedPp: r2(d * f.e), rawProjectedPp: f.e0 == null ? null : r2(d * f.e0), contributionPp: fav(f.w), projections: fav(f.ep), criteria: f.c, profile: f.pf == null ? null : f.pf, weightSet: f.pk === 'p' ? 'proven' : f.pk === 't' ? 'trial' : 'general', weights: f.pwt || null, traitRanks: f.pt || null });
+              projectedPp: r2(d * r.e), rawProjectedPp: r.e0 == null ? null : r2(d * r.e0), actualPp: r2(d * r.y), rawMovePct: r2(r.m), batchMeanMovePct: r2(r.k), accuracyPct: r2(this._pfFcAcc(r.e, r.y)), contributionPp: fav(r.w), relMovePct: r2(r.y), actualVsBatchMedianPp: r2(d * (r.y - (medY.get(r.a) ?? 0))), volRatio: (r.sn && r.sn.rng60 > 0 && medV.get(r.a)) ? r2(r.sn.rng60 / medV.get(r.a)) : null, maxUpPct: r2(r.mu), maxDownPct: r2(r.md), projections: fav(r.ep), indDirScore: (r.bg && r.bg._dc != null) ? r2(d * r.bg._dc) : null, sizeIndex: (r.bg && r.bg._vi != null) ? r2(r.bg._vi) : null, criteria: r.c, profile: r.pf == null ? null : r.pf, weightSet: r.pk === 'p' ? 'proven' : r.pk === 't' ? 'trial' : 'general', weights: r.pwt || null, traitRanks: r.pt || null, crab: this._pfCrabRow(r, d, r2), regime: this._pfRgRow(r, d, r2) });
+          const pendRow = f => ({ symbol: f.s, startBatch: f.a, attempt: f.rt || 1, dueBatch: f.d, forecastAt: new Date(f.t).toISOString(), priceAtForecast: f.p, rawPriceAtForecast: f.p0 ?? null, projectedPp: r2(d * f.e), rawProjectedPp: f.e0 == null ? null : r2(d * f.e0), contributionPp: fav(f.w), projections: fav(f.ep), criteria: f.c, profile: f.pf == null ? null : f.pf, weightSet: f.pk === 'p' ? 'proven' : f.pk === 't' ? 'trial' : 'general', weights: f.pwt || null, traitRanks: f.pt || null, crab: this._pfCrabRow(f, d, r2), regime: this._pfRgRow(f, d, r2) });
           // The readings behind each forecast as compact columns (the key names were repeated in every row): columns = symbol, startBatch, then s.* (snapshot) and b.* (background); rows follow that order, null = no reading.
           const columns = items => {
             const keys = [], seen = new Set();
