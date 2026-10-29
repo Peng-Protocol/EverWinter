@@ -19,7 +19,7 @@ Copyleft 2026 Peng Protocol — PseudoChaser fork of PseudoWinter
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔆 PSEUDOCHASER v1.20.2 — Pseudo Mainnet Sim</title>
+<title>🔆 PSEUDOCHASER v1.21.0 — Pseudo Mainnet Sim</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Overpass:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -628,7 +628,7 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
   <div class="topbar">
     <div>
       <div class="logo-mark"><span x-text="themeEmoji"></span> <span x-text="appName"></span></div>
-      <div class="logo-sub">Pseudo Mainnet Sim · v1.20.2 · Long Only · No Real Orders</div>
+      <div class="logo-sub">Pseudo Mainnet Sim · v1.21.0 · Long Only · No Real Orders</div>
     </div>
     <!-- ── PC-ONLY OVERLAY-MENU BUTTONS (hidden on mobile; mobile keeps its own tab bar below) ── -->
     <div class="topbar-menu-btns">
@@ -2962,6 +2962,14 @@ function pw() { return {
       addRow(singleKeyMap[k] || (/^__ew_x[mpa]_/.test(k) ? 'Cross-Bot: corridor (in-flight packets)' : 'Other'), bytes, singleKeyMap[k] ? { key: k } : null);
     }
     try { const pm = JSON.parse(localStorage.getItem(window.__pluginSystem?.KEY) || '[]'); const b = pm.reduce((a, e) => a + (e.idb ? (e.srcBytes || 0) : 0), 0); if (b) addRow('Plugin sources (IndexedDB, outside the localStorage quota)', b); } catch(e) {}
+    // The data store (IndexedDB) holds what plugins fetched from Bybit — listed here, but outside the localStorage total.
+    try {
+      const IDB_NAMES = { oc_history: 'OC samples', dialpool: 'dial sample pool', sampleobs: 'sample observations', fc: 'forecast grader', pm: 'range-fit past moves', div: 'candle divination', bg1h: '1h candle cache', crab: 'crab library', ilq: 'illiquidity filter', stb: 'stablecoin filter', extremity: 'extremity scorecard', liq_pending: 'liquidation watch' };
+      for (const [k, n] of (window.__ewData ? window.__ewData.sizes() : [])) {
+        const m = k.match(/^__(?:ew_)?(?:af|pf|ash|pfr)_(.+?)(?:_v\d+)?$/), nm = m && (IDB_NAMES[m[1]] || m[1]);
+        addRow((singleKeyMap[k] || ('Plugin data: ' + (nm || k))) + ' (IndexedDB)', n, { key: k });
+      }
+    } catch(e) {}
     return { rows, targets, grand };
   },
   _storageFmtBytes(b) {
@@ -3005,6 +3013,7 @@ function pw() { return {
         } catch(e) {}
       } else {
         localStorage.removeItem(t.key);
+        window.__ewData?.removeItem(t.key);
       }
     }
   },
@@ -5270,9 +5279,9 @@ function pw() { return {
     return `Updated "${name}" v${prev} → v${next} (${delta})`;
   },
 
-  _pluginRemove(id) {
+  async _pluginRemove(id) {
     this._pluginList = this._pluginList.filter(p => p.id !== id);
-    const saved = window.__pluginSystem.save(this._pluginList);
+    const saved = await window.__pluginSystem.save(this._pluginList);
     if (!saved) {
       // Removal is still reflected in the UI (intentional — the person asked to remove
       // it), but it didn't actually persist: some other plugin still in the list is
@@ -5287,7 +5296,7 @@ function pw() { return {
     const file = event.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
         delete window.__BotPlugin;
         let _pluginCode = e.target.result;
@@ -5322,7 +5331,7 @@ function pw() { return {
         const previous = existing >= 0 ? this._pluginList[existing] : null;
         if (existing >= 0) this._pluginList.splice(existing, 1, entry);
         else this._pluginList.push(entry);
-        const saved = window.__pluginSystem.save(this._pluginList);
+        const saved = await window.__pluginSystem.save(this._pluginList);
         if (!saved) {
           // Never actually persisted (localStorage quota — a plugin's full raw src is
           // stored verbatim, see the entry object above). Roll back the in-memory
@@ -5347,6 +5356,84 @@ function pw() { return {
 
 };}
 
+// ─── DATA STORE (IndexedDB) ──────────────────────────────────────────────────
+// What plugins fetch from Bybit and the scores they build from it live here, not in localStorage — whose ~5 MB quota is
+// shared with the plugin manifests, bot state and logs. The whole store is read into memory once at boot (window.__ewDataReady),
+// so callers keep synchronous getItem/setItem/removeItem; writes reach IndexedDB a moment later, batched. A key an older build left
+// in localStorage moves on its first read (or adopt()): copied into memory, written to IndexedDB, and deleted from localStorage once
+// that write is confirmed. Without IndexedDB — or if it hangs or a write fails — the store passes straight through to localStorage.
+(function _dataStore() {
+  const DB = '__ew_data_pseudochaser', ST = 'kv';
+  const mem = new Map(), dirty = new Map(); // dirty: key -> string to write, or null to delete
+  let db = null, broken = !window.indexedDB, timer = null;
+  const lsGet = k => { try { return localStorage.getItem(k); } catch (_) { return null; } };
+  const lsDel = k => { try { localStorage.removeItem(k); } catch (_) {} };
+  function sched() { if (!timer) timer = setTimeout(flush, 400); }
+  function toLs(map) { for (const [k, v] of map) { try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (_) {} } }
+  function fail(batch, e) {
+    broken = true;
+    console.warn('[Data] IndexedDB write failed — data goes to localStorage from here:', e);
+    toLs(batch); toLs(dirty); dirty.clear();
+  }
+  function flush() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (!dirty.size || !db) return;
+    const batch = new Map(dirty); dirty.clear();
+    try {
+      const tx = db.transaction(ST, 'readwrite'), st = tx.objectStore(ST);
+      for (const [k, v] of batch) { if (v === null) st.delete(k); else st.put(v, k); }
+      tx.oncomplete = () => { for (const k of batch.keys()) lsDel(k); };
+      tx.onerror = tx.onabort = () => fail(batch, tx.error);
+    } catch (e) { fail(batch, e); }
+  }
+  async function load() {
+    if (broken) return;
+    const rq = window.indexedDB.open(DB, 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore(ST);
+    const opened = await new Promise((res, rej) => { rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error); rq.onblocked = () => rej(new Error('blocked')); });
+    if (broken) { try { opened.close(); } catch (_) {} return; } // the 6 s limit below already gave up on it
+    const rows = await new Promise((res, rej) => {
+      const tx = opened.transaction(ST, 'readonly'), st = tx.objectStore(ST), ks = st.getAllKeys(), vs = st.getAll();
+      tx.oncomplete = () => res(ks.result.map((k, i) => [k, vs.result[i]]));
+      tx.onerror = tx.onabort = () => rej(tx.error);
+    });
+    if (broken) { try { opened.close(); } catch (_) {} return; }
+    db = opened;
+    for (const [k, v] of rows) if (typeof v === 'string') mem.set(k, v);
+    for (const k of mem.keys()) { const l = lsGet(k); if (l !== null) { mem.set(k, l); dirty.set(k, l); } } // a localStorage copy is newer than IndexedDB's (it exists only if its write never got confirmed)
+    if (dirty.size) flush();
+  }
+  const ready = new Promise(res => {
+    const t = setTimeout(() => { if (!db && !broken) { broken = true; console.warn('[Data] IndexedDB did not answer within 6 s — using localStorage'); } res(); }, 6000);
+    load().catch(e => { broken = true; console.warn('[Data] IndexedDB unavailable — using localStorage:', e); }).then(() => { clearTimeout(t); res(); });
+  });
+  window.__ewDataReady = ready;
+  window.__ewData = {
+    getItem(k) {
+      if (mem.has(k)) return mem.get(k);
+      const l = lsGet(k);
+      if (l === null) return null;
+      if (db && !broken) { mem.set(k, l); dirty.set(k, l); sched(); } // moves to IndexedDB; the localStorage copy goes once that is confirmed
+      return l;
+    },
+    setItem(k, v) {
+      v = String(v);
+      mem.set(k, v);
+      if (broken || !db) { localStorage.setItem(k, v); return; } // throws on a full quota, as localStorage always did
+      dirty.set(k, v); sched();
+    },
+    removeItem(k) {
+      mem.delete(k); lsDel(k);
+      if (db && !broken) { dirty.set(k, null); sched(); }
+    },
+    adopt(keys) { for (const k of keys) if (!mem.has(k)) this.getItem(k); },
+    sizes() { return [...mem].map(([k, v]) => [k, v.length]); },
+    ok() { return !!db && !broken; },
+  };
+  addEventListener('pagehide', flush);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
+})();
+
 // ─── PLUGIN SYSTEM ───────────────────────────────────────────────────────────
 (function _pluginSystem() {
   // Own key — PseudoWinter uses __pw_plugins_v1; sharing it caused cross-bot
@@ -5366,6 +5453,7 @@ function pw() { return {
   const _srcVerified = {};  // id -> source that IndexedDB returned at boot, i.e. proven to survive a reload
   const _srcPut = {};       // id -> source written to IndexedDB this session
   let _idbBroken = !window.indexedDB;
+  let _idbProven = false;   // IndexedDB has returned a source on a boot (so it persists here): new sources go there first
   function _psRaw() { try { return JSON.parse(localStorage.getItem(_PS_KEY) || '[]'); } catch(e) { return []; } }
   function _psLoad() { return _psRaw().map(e => (e.src || !(e.id in _srcMem)) ? e : { ...e, src: _srcMem[e.id] }); }
   function _slim(p) {
@@ -5407,11 +5495,11 @@ function pw() { return {
       let v;
       try { v = await _idbDo(db, 'readonly', st => st.get(e.id)); } catch (err) { console.error('[Plugin] reading "' + e.id + '" from IndexedDB failed:', err); }
       if (!e.src) {                                                  // slim entry: the source lives only in IndexedDB
-        if (typeof v === 'string' && v) { _srcMem[e.id] = v; _srcVerified[e.id] = v; }
+        if (typeof v === 'string' && v) { _srcMem[e.id] = v; _srcVerified[e.id] = v; _idbProven = true; }
         else console.error('[Plugin] "' + e.id + '" source is missing from IndexedDB — re-load its plugin file');
         next.push(e); continue;
       }
-      if (v === e.src) { _srcVerified[e.id] = e.src; next.push(_slim(e)); rewrite = true; }
+      if (v === e.src) { _srcVerified[e.id] = e.src; _idbProven = true; next.push(_slim(e)); rewrite = true; }
       else {
         try { await _idbDo(db, 'readwrite', st => st.put(e.src, e.id)); _srcPut[e.id] = e.src; }
         catch (err) { console.warn('[Plugin] writing "' + e.id + '" to IndexedDB failed — it stays whole in localStorage:', err); }
@@ -5427,17 +5515,27 @@ function pw() { return {
     const timeout = new Promise(res => setTimeout(() => { if (!done) { _idbBroken = true; console.warn('[Plugin] IndexedDB did not answer within 4 s — continuing without it'); } res(); }, 4000));
     return Promise.race([work, timeout]);
   }
-  async function _psSync(plugins) {
+  // Writes every source IndexedDB doesn't hold yet and drops the ones no plugin owns; true only if all of them landed.
+  async function _psPut(plugins) {
     try {
       const db = await _idbOpen();
       for (const p of plugins) if (p.src && _srcPut[p.id] !== p.src && _srcVerified[p.id] !== p.src) { await _idbDo(db, 'readwrite', st => st.put(p.src, p.id)); _srcPut[p.id] = p.src; }
       const keys = await _idbDo(db, 'readonly', st => st.getAllKeys());
       const live = new Set(plugins.map(p => p.id));
       for (const k of keys) if (!live.has(k)) { await _idbDo(db, 'readwrite', st => st.delete(k)); delete _srcPut[k]; delete _srcVerified[k]; }
+      return true;
+    } catch (err) {
+      console.warn('[Plugin] saving plugin sources to IndexedDB failed:', err);
+      return false;
+    }
+  }
+  async function _psSync(plugins) {
+    if (!(await _psPut(plugins))) { _idbBroken = true; return; }
+    try {
       localStorage.setItem(_PS_KEY, JSON.stringify(plugins.map(p => (p.src && _srcVerified[p.id] === p.src) ? _slim(p) : (p.src && _srcPut[p.id] === p.src ? { ...p, idbPut: true } : p))));
     } catch (err) {
       _idbBroken = true;
-      console.warn('[Plugin] saving plugin sources to IndexedDB failed — kept whole in localStorage:', err);
+      console.warn('[Plugin] writing the plugin manifest failed — sources kept whole in localStorage:', err);
     }
   }
 
@@ -5476,8 +5574,14 @@ function pw() { return {
     // plugin or several loaded together. Callers decide what to do with a false: roll
     // back an in-memory add that never actually persisted, or warn on a remove that
     // still doesn't fit.
-    save(plugins) {
+    async save(plugins) {
       for (const p of plugins) if (p.src) _srcMem[p.id] = p.src;
+      // Once IndexedDB has handed a source back on an earlier boot (_idbProven), a source goes there first and the manifest keeps only
+      // its metadata — so a full localStorage can't block loading or updating a plugin.
+      if (_idbProven && !_idbBroken && await _psPut(plugins)) {
+        try { localStorage.setItem(_PS_KEY, JSON.stringify(plugins.map(p => p.src ? _slim(p) : p))); return true; }
+        catch (e) { return false; }
+      }
       // A source stays whole in the manifest until IndexedDB has returned it on a later boot (see _psSourcesInner), so nothing depends on it before then.
       const manifest = _idbBroken ? plugins : plugins.map(p => (p.src && _srcVerified[p.id] === p.src) ? _slim(p) : p);
       try { localStorage.setItem(_PS_KEY, JSON.stringify(manifest)); }
@@ -5598,7 +5702,7 @@ function pw() { return {
     }
   }
   }
-  window.__pluginReady = _psSources().then(_psBoot).catch(e => console.error('[Plugin] boot failed:', e));
+  window.__pluginReady = Promise.all([window.__ewDataReady, _psSources()]).then(_psBoot).catch(e => console.error('[Plugin] boot failed:', e));
 })();
 </script>
 

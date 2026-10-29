@@ -138,7 +138,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 - Check the activity log for `[PST]`/`[PERSIST]` entries.
 - Close any duplicate tabs of the same bot — a second tab can overwrite the first tab's saves with its own stale position count.
 
-**Storage usage** (dropdown below Persistence, PseudoWinter/PseudoChaser only): breaks this bot's localStorage footprint down to one row per data type, including genuinely shared cross-bot keys but never the partner's private state. Oversized rows show in red with a **✕** to clear that bucket (with confirmation), and **Export** downloads the breakdown as a text file. The cross-bot corridor shows as one row of in-flight packets (normally empty), and plugin sources show as an IndexedDB row that sits outside the localStorage quota and isn't part of the total.
+**Storage usage** (dropdown below Persistence, PseudoWinter/PseudoChaser only): breaks this bot's localStorage footprint down to one row per data type, including genuinely shared cross-bot keys but never the partner's private state. Oversized rows show in red with a **✕** to clear that bucket (with confirmation), and **Export** downloads the breakdown as a text file. The cross-bot corridor shows as one row of in-flight packets (normally empty), and plugin sources and plugin data (see Plugin data storage) show as IndexedDB rows that sit outside the localStorage quota and aren't part of the total.
 
 **Power usage** (dropdown below Storage usage): a rolling average and peak of how many milliseconds the app spends reacting each second. A rising figure usually means a plugin panel left open somewhere is doing more work than it needs to — closing analytics panels you're not actively watching brings it back down.
 
@@ -418,6 +418,12 @@ Yes confirms; No cancels with no change.
 Plugin sources live in IndexedDB (`__ew_plugins_pseudowinter` / `__ew_plugins_pseudochaser`, object store `src`), are read once at boot and are held in memory. localStorage keeps a manifest entry per plugin, and the css and slot markup aren't stored at all because running the source rebuilds them.
 
 An entry stays whole in the manifest until IndexedDB has returned its source identical on a later boot, so the manifest shrinks on the second load after a plugin file is loaded. A browser that doesn't persist IndexedDB for `file://` pages never loses a plugin; its entries just never shrink. If IndexedDB is unavailable, errors or doesn't answer within 4 s, the app starts anyway and plugin storage falls back to whole entries in localStorage. A manifest entry whose source is missing from IndexedDB is inactive, and the activity log says to re-load its plugin file. Removing a plugin deletes its source from IndexedDB.
+
+Once IndexedDB has returned a source on any boot, loading or updating a plugin writes the source to IndexedDB first and stores only the slim manifest entry, so a full localStorage can't block it.
+
+#### Plugin data storage
+
+What Ashfall and Permafrost keep from Bybit and the scores built from it lives in the host's IndexedDB data store (`__ew_data_pseudowinter` / `__ew_data_pseudochaser`, object store `kv`, same key names as before), not in localStorage. The store is read into memory at boot, so plugins still read and write synchronously, and writes reach IndexedDB in batches. A key an older version left in localStorage moves on first read and is deleted once IndexedDB confirms the write. If IndexedDB is unavailable, fails or doesn't answer within 6 s, the store passes through to localStorage as before. Bucket pruning is unchanged. Needs PseudoWinter 1.25.0 / PseudoChaser 1.21.0; an older host keeps everything in localStorage.
 
 Alpine loads only after the plugin sources have been read and applied (`window.__pluginReady`), which adds a few milliseconds to startup.
 
@@ -718,6 +724,8 @@ Hover shows the average edge, ↑/↓ counts and n. When Liquidation Surveillanc
 The share is the move in the bot's favor as a share of all raw move on that side. Hovering the gauge shows the sample count, the mean in dollars on one base position and the relative edge, while the per-criterion bars stay relative (mean edge vs the sampled population). **Bottom** and **peak** also need at least Min Samples, and they're cleared with the samples. The headline reads `—` until enough samples carry a raw move. With Liquidation Surveillance on, the dollar mean is mixed too (hover shows how many liquidation samples went in), and **bottom** and **peak** record the mixed share.
 
 ### localStorage Keys
+
+Since Ashfall/Permafrost 2.55.0 these keys are in the plugin data store (see Plugin data storage), not in localStorage, though their rows stay below: the `__ew_af_`/`__ew_pf_` keys for `extremity`, `dialpool`, `sampleobs`, `ilq`, `stb`, `fc`, `bg1h`, `pm`, `div` and `crab`, `__af_liq_pending`/`__pf_liq_pending`, and `__ash_oc_history`/`__pf_oc_history`. Everything else below stays in localStorage.
 
 | Key | Contents |
 |---|---|
