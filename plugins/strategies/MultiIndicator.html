@@ -1,34 +1,42 @@
 <!--
-  Multi-Indicator Strategy Plugin for PseudoChaser
+  Multi-Indicator Strategy Plugin for PseudoChaser and PseudoWinter (unified)
   Slot-based entry filter. A slot (Auto-generated or manually built) qualifies once a ticker
   exhibits at least micAutoSlotSize (Auto) or all of its own criteria (manual) from the
   secondary criteria set: fund, V/A, IO/L, IO/S, LTA, LPA. No criterion is mandatory.
+
+  One file for both sides. The side is read from the host at load (PseudoWinter defines
+  pseudoOpenShort, PseudoChaser pseudoOpenLong) and picks the host-side conventions: the open call and its
+  feasibility dry-run, which way Relative Target reads the LPA window (Chaser: average up move is TP;
+  Winter: average down move is TP), the fund badge, the accent colour and the history key.
+  Everything the scoring reads comes from Still-Water (_sw*/sw* names) — there is no AF/PF dependency.
 
   Auto Slots evaluates every non-excluded secondary criterion against each ticker and keeps
   every one that's true — not sliced down to a fixed count. Manual slots keep the existing
   criteria picker, an exact AND-gate of whatever's selected.
 
-  Substitution considers any held position in the book, not just MIC's own, same as
+  Substitution considers any held position in the book, not just MI's own, same as
   Liquid-Diver did — score-gated, not automatic.
 
   Re-entry Block Mode (micReentryBlockMode: 'both' / 'losers') is ported from Liquid-Diver:
   'losers' lets a symbol that just closed in profit re-trigger immediately.
 
-  Entry pool fires once per fresh sample batch (_afOcResultsAt) — will not re-scan
-  the same batch twice. Candidates are ranked on every ticker's latest stored reading (any age) and refetched before entry. TP, SL, and all exit logic use the host's settings.
+  Entry pool fires once per fresh sample batch (_swOcResultsAt) — will not re-scan
+  the same batch twice. Candidates are ranked on every ticker's latest stored reading (any age) and refetched before entry.
   Drawdown throttle and gains lock gate all entries.
 
-  Load via Plugin Manager in PseudoChaser's config panel.
-  Load AFTER SunChaser if using live trading — see README Plugin Stack Order.
-  targetBot: pseudochaser
+  Load via Plugin Manager in either bot's config panel, AFTER Still-Water (and after SunChaser / EverWinter if live).
+  targetBot: both
 -->
 <script>
 (function () {
   'use strict';
 
-    const VERSION       = '1.108.1'; // Change: Forecast Focus now REPLACES the batch instead of adding to it: the planner names every ticker of the batch (due revisits, liquidation reservations, retries, then its own draw of fresh tickers, FocusN in all, revisits first) and the host fetches only those for every sampler | previous: Change: Forecast Focus: the batch is sized by the Forecast Grader (its new forecasts plus their due revisits) instead of the fixed batch size when the grader's Forecast Focus is on | previous: 1.107.0 - Change: Targets readout moved out of the Exit tab into the main body as a two-sided gauge (SL + Sacrifice left, TP + Cascade right, green / red by viability); entries are vetoed when the ticker's projected pp (Forecast Grader scorecard projection) is negative (pool, refetch and substitution) | previous: 1.106.0 - Change: IO/L and IO/S (long / short share of open interest vs its window average) replace the open-interest criterion in slots, Auto, scoring and badges; each needs the ticker's long share from AF/PF 2.37.0 (batch reading, else one fresh read before entry) and wait for 10 readings in their window; saved manual slots still using the old criterion are flagged as retired
+    const VERSION       = '2.0.0'; // Change: Unified Multi-Indicator for both bots, replacing MultiIndicator-Chaser (1.108.1) and MultiIndicator-Winter (1.108.1). Reads Still-Water (_sw*/sw*) instead of Ashfall/Permafrost; side detected from the host; Winter's saved miw* config, history and open-position tags migrate to the mic* names on first load. Bridges IO/L and IO/S (Still-Water has no _swLsShare/_swLsFetch) and the sw-build scheduler id.
   const DEFAULT_SLOTS = [[]];
-  const MIC_HIST_KEY  = '__mic_hist_batches';
+  let   WINTER        = false;      // set in transform() from the host; every side switch below reads it
+  let   MIC_HIST_KEY  = '__mic_hist_batches'; // Winter keeps its own '__miw_hist_batches' so existing history carries over
+  const LS_FRESH      = {};         // sym -> { bl, ts }: forced long-share reads (see _micLsFetch)
+  let   LS_MAP        = { key: '', map: {} };
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
   // Auto picker, so both stay in sync by construction.
   const SECONDARY_CRITS = ['fund','va','iol','ios','lta','lpa'];
@@ -36,13 +44,13 @@
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
   // a plain array on cfg (no picker UI) — edit it directly in saved config if the list needs to
-  // change. Shared key name with Ashfall's own seed so either plugin can init it first.
+  // change. Shared key name with Still-Water's own seed so either plugin can init it first.
   const DEFAULT_MEGACAP_EXCLUDE = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','ADAUSDT','TRXUSDT','LINKUSDT'];
-  // Single source of truth for MIC's own scalar config defaults. Merged into cfg once during
+  // Single source of truth for MI's own scalar config defaults. Merged into cfg once during
   // init() (see below) — call sites read this.cfg.<key> directly, no inline `?? literal`.
   // Excludes: megacapExclude/micSlots (arrays with their own migration
-  // logic in init()), and any key actually owned by the Ashfall sibling plugin (those keep
-  // their defensive `?? literal` at the cross-read call site since Ashfall owns their default).
+  // logic in init()), and any key actually owned by the Still-Water sibling plugin (those keep
+  // their defensive `?? literal` at the cross-read call site since Still-Water owns their default).
   // micReentryBlockMode canonically defaults to 'losers'.
   const MIC_DEFAULT_CFG = Object.freeze({
     micEnabled: true,
@@ -59,9 +67,9 @@
     micSubstitutionMarginPct: 5,
     micSubstitutionMinAgeMins: 35,
     micDefermentEnabled: true, // Deferment: no new entries while the Sample Scorer headline is negative. Needs Sample Scoring.
-    micRelativeTargetEnabled: true, // Relative Target: each new position's entry TP and SL, and the Cascade / Sacrifice %, follow what the market is paying — the average up and down 1hr move in the AF LPA sample window x leverage. Replaces Relative Target. Needs no Sample Scoring; Cascade or Sacrifice must be on.
+    micRelativeTargetEnabled: true, // Relative Target: each new position's entry TP and SL, and the Cascade / Sacrifice %, follow what the market is paying — the average up and down 1hr move in the SW LPA sample window x leverage. Replaces Relative Target. Needs no Sample Scoring; Cascade or Sacrifice must be on.
     micMinEntryTp: 6,               // Relative Target floor, ROI %: below this a position can't clear its entry+exit fees, so a resolved entry TP or Cascade target under it = market not worth trading -> defer
-    micRelBatches: 6,               // Relative Target: how many of the latest AF sample batches the average up / down move is taken from (older batches are ignored)
+    micRelBatches: 6,               // Relative Target: how many of the latest SW sample batches the average up / down move is taken from (older batches are ignored)
     micDeferBothRedEnabled: true,  // Both-poles-red (sub-toggle of Deferment): also defer while any criterion has BOTH its + and - pole in the red on the scorecard
     micPoleBlockEnabled: false,    // Pole Blocking (Sample Scoring only): block a pole trailing its positive partner pole's scorecard edge by the threshold or more
     micPoleBlockPct: 200,           // Pole Blocking threshold, % of the partner pole's edge: blocked when (partner - pole) / partner >= this
@@ -83,14 +91,14 @@
   });
 
   // Per-criterion emoji for position badges. Fund emoji is app-relative:
-  // -fund = shorts paying = good carry for longs (🤑), bad for shorts (💸).
-  // +fund = longs paying = bad for longs (💸), good for shorts (🤑).
+  // Chaser: -fund = shorts paying = good carry for longs (🤑); +fund = bad (💸).
+  // Winter: +fund = longs paying = good carry for shorts (🤑); -fund = bad (💸).
   const CRIT_EMOJI = { 'fund': '💰', 'va': '🔊', 'vm': '🔊', 'iol': '🐂', 'ios': '🐻', 'iot': '🎲', 'iom': '🧲', 'lta': '🕐', 'lpa': '💹' };
   const CRIT_DESC  = { 'fund': 'Fund (tiered funding rate)', 'va': 'V/A (volume vs. population sample-window average)', 'vm': 'V/M (vol/mcap ratio) — retired, replaced by V/A', 'iol': 'IO/L (long open interest vs. population sample-window average)', 'ios': 'IO/S (short open interest vs. population sample-window average)', 'iot': 'IO/T (OI vs Turnover) — retired, replaced by IO/L and IO/S', 'iom': 'IO/M (OI vs MCap) — retired, replaced by IO/L and IO/S', 'lta': 'LTA (1hr turnover vs. the ticker\'s own 24h/24 average)', 'lpa': 'LPA (1hr price change vs. every other ticker in the sample window)' };
   // Slots qualify on any N of the 6 secondary criteria (fund, V/A, IO/L, IO/S, LTA, LPA) alone — see _micAutoQualify.
 
   const critEmoji = c => {
-    if (/^fund/.test(c)) { const s = c.slice(4); const num = parseFloat(s.replace(/^[<>]/,'')); return ((num < 0 || /^-/.test(s)) ? '🤑' : '💸') + s; }
+    if (/^fund/.test(c)) { const s = c.slice(4); const num = parseFloat(s.replace(/^[<>]/,'')); const good = (num < 0 || /^-/.test(s)) !== WINTER; return (good ? '🤑' : '💸') + s; }
     if (/^va/.test(c)) return '🔊' + c.slice(2);
     if (/^vm/.test(c)) return '🔊' + c.slice(2);
     // Retired (see VSG.md) — kept resolvable so old scorecard/history entries still render.
@@ -184,24 +192,25 @@
   };
 
   window.__BotPlugin = {
-    id:        'multiindicator-chaser',
-    name:      'Multi-Indicator (Chaser)',
+    id:        'multiindicator',
+    name:      'Multi-Indicator',
     version:   VERSION,
-    targetBot: 'pseudochaser',
-    after:     ['sunchaser', 'ashfall-chaser'],
+    targetBot: 'both',
+    after:     ['sunchaser', 'everwinter', 'still-water'],
     before:    [],
-    conflicts: ['liquiddiver-chaser'],
-    requires:  ['ashfall-chaser'],
+    conflicts: ['liquiddiver-chaser', 'liquiddiver-winter'],
+    requires:  ['still-water'],
     touches:   ['init', 'runScan', 'pseudoWatchPositions'],
 
     css: `
+      :root { --mic-rgb:255,150,80; --mic-acc:#ff9650; }
       .mic-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
       .mic-slot { display:inline-flex; flex-direction:column; align-items:center; gap:3px; padding:6px 5px; border-radius:3px; border:1px solid; cursor:pointer; min-width:52px; font-size:9px; font-family:var(--mono); text-align:center; transition:border-color .15s,background .15s; }
-      .mic-crit { font-size:8px; padding:1px 4px; border-radius:2px; background:rgba(255,150,80,.12); border:1px solid rgba(255,150,80,.3); color:#ff9650; white-space:nowrap; }
+      .mic-crit { font-size:8px; padding:1px 4px; border-radius:2px; background:rgba(var(--mic-rgb),.12); border:1px solid rgba(var(--mic-rgb),.3); color:var(--mic-acc); white-space:nowrap; }
       .mic-opt { padding:5px 7px; font-size:9px; font-family:var(--mono); border-radius:2px; border:1px solid; cursor:pointer; background:none; transition:border-color .12s,background .12s,color .12s; }
       .mic-tabs { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:2px; }
       .mic-tab { font-family:var(--mono); font-size:9px; padding:3px 9px; border-radius:2px; border:1px solid; cursor:pointer; background:none; transition:border-color .12s,color .12s,background .12s; letter-spacing:.5px; }
-      .mic-tab.on { border-color:rgba(255,150,80,.6); color:#ff9650; background:rgba(255,150,80,.08); }
+      .mic-tab.on { border-color:rgba(var(--mic-rgb),.6); color:var(--mic-acc); background:rgba(var(--mic-rgb),.08); }
       .mic-tab:not(.on) { border-color:rgba(255,255,255,.15); color:var(--text-lo); }
 
       .mic-tg { margin-top:8px; padding:8px; background:rgba(255,255,255,.02); border:1px solid rgba(255,255,255,.06); border-radius:3px; }
@@ -228,8 +237,8 @@
         <div x-data="{ open: false, tE: false, tX: false, tFe: false }">
           <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
             <div style="display:flex;align-items:center;gap:7px">
-              <span>♨ Multi-Indicator</span>
-              <span x-show="cfg.micEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,150,80,.15);border:1px solid rgba(255,150,80,.35);border-radius:2px;color:#ff9650;letter-spacing:1px">ON</span>
+              <span x-text="(_micWinter() ? '❄' : '♨') + ' Multi-Indicator'"></span>
+              <span x-show="cfg.micEnabled" style="font-size:8px;padding:1px 5px;background:rgba(var(--mic-rgb),.15);border:1px solid rgba(var(--mic-rgb),.35);border-radius:2px;color:var(--mic-acc);letter-spacing:1px">ON</span>
               <span x-show="!cfg.micEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
             </div>
             <span class="cfg-acc-arrow" :class="open?'open':''">▶</span>
@@ -239,7 +248,7 @@
               <div class="tog-t" :class="cfg.micEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micEnabled=!cfg.micEnabled;persist()}"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l">Multi-Indicator Mode</div>
-                <div class="mic-hint">Longs tickers matching any active entry slot; fires once per bulk ticker fetch using host TP/SL settings.</div>
+                <div class="mic-hint" x-text="(_micWinter() ? 'Shorts' : 'Longs') + ' tickers matching any active entry slot; fires once per bulk ticker fetch using host TP/SL settings.'"></div>
               </div>
             </label>
             <div x-show="cfg.micEnabled" style="margin-top:8px">
@@ -262,7 +271,7 @@
                   </div>
 
                   <!-- Auto slots controls -->
-                  <div x-show="cfg.micAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(255,150,80,.04);border:1px solid rgba(255,150,80,.12);border-radius:3px">
+                  <div x-show="cfg.micAutoSlots" style="margin-bottom:8px;padding:6px 8px;background:rgba(var(--mic-rgb),.04);border:1px solid rgba(var(--mic-rgb),.12);border-radius:3px">
                     <div class="lbl">Minimum Criteria per Slot <b x-text="cfg.micAutoSlotSize"></b> <span style="font-weight:normal;color:var(--text-lo)" x-text="'— '+(()=>{const n=cfg.micAutoSlotSize;const excl=new Set(cfg.micAutoSlotExclude||[]);const secTotal=['fund','va','iol','ios','lta','lpa'].filter(c=>!excl.has(c)).length;return 'qualifies on any '+n+' of '+secTotal+' secondary criteria — every one true gets scored, not capped at this minimum.'})()"></span></div>
                     <input type="range" min="1" max="6" step="1" x-model.number="cfg.micAutoSlotSize" @change="persist()">
                     <div class="lbl" style="margin-top:5px;margin-bottom:3px">Exclude from Auto</div>
@@ -285,7 +294,7 @@
                   </div>
 
                   <!-- Pole Blocking — Sample Scoring only -->
-                  <div x-show="cfg.afSampleScoringEnabled" style="margin-bottom:8px">
+                  <div x-show="cfg.swSampleScoringEnabled" style="margin-bottom:8px">
                     <label class="tog">
                       <div class="tog-t" :class="cfg.micPoleBlockEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micPoleBlockEnabled=!cfg.micPoleBlockEnabled;persist()}"><div class="tog-k"></div></div>
                       <div>
@@ -320,37 +329,37 @@
                               if(gateFocus){ const ex=(cfg.micSlots?.[cfg.micActiveSlot]||[]).find(x=>x.startsWith(c)); if(ex){ const m=ex.match(/^(?:fund|va|lta|lpa)([<>])(-?\d+)$/); if(m){gateDir=m[1];gateTier=parseInt(m[2],10)} } else { gateDir='>'; gateTier=c==='fund'?1:c==='va'?10:c==='lta'?5:c==='lpa'?2:25; } }
                             } else { ratioFocus=null; gateFocus=null; ocFocus=null; _micToggle(cfg.micActiveSlot, c) }
                           }"
-                          :style="(c==='iol'||c==='ios') ? (ratioFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='va'||c==='lta'||c==='lpa') ? (gateFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ocs'||c==='ocx') ? (ocFocus===c ? 'border-color:rgba(255,150,80,.8);color:#ff9650;background:rgba(255,150,80,.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.micSlots?.[cfg.micActiveSlot]||[]).includes(c) ? 'border-color:rgba(255,150,80,.6);color:#ff9650;background:rgba(255,150,80,.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
+                          :style="(c==='iol'||c==='ios') ? (ratioFocus===c ? 'border-color:rgba(var(--mic-rgb),.8);color:var(--mic-acc);background:rgba(var(--mic-rgb),.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(var(--mic-rgb),.6);color:var(--mic-acc);background:rgba(var(--mic-rgb),.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='fund'||c==='va'||c==='lta'||c==='lpa') ? (gateFocus===c ? 'border-color:rgba(var(--mic-rgb),.8);color:var(--mic-acc);background:rgba(var(--mic-rgb),.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(var(--mic-rgb),.6);color:var(--mic-acc);background:rgba(var(--mic-rgb),.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : (c==='ocs'||c==='ocx') ? (ocFocus===c ? 'border-color:rgba(var(--mic-rgb),.8);color:var(--mic-acc);background:rgba(var(--mic-rgb),.25)' : (cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(c)) ? 'border-color:rgba(var(--mic-rgb),.6);color:var(--mic-acc);background:rgba(var(--mic-rgb),.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent') : ((cfg.micSlots?.[cfg.micActiveSlot]||[]).includes(c) ? 'border-color:rgba(var(--mic-rgb),.6);color:var(--mic-acc);background:rgba(var(--mic-rgb),.15)' : 'border-color:var(--border);color:var(--text-lo);background:transparent')"
                           x-text="c.replace('fund','Fund').replace('va','V/A').replace('iol','IO/L').replace('ios','IO/S').replace('lta','LTA').replace('lpa','LPA')">
                         </button>
                       </template>
                       <!-- IO/L, IO/S tier config panel -->
-                      <div x-show="ratioFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(255,150,80,.06);border:1px solid rgba(255,150,80,.2);border-radius:3px">
+                      <div x-show="ratioFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(var(--mic-rgb),.06);border:1px solid rgba(var(--mic-rgb),.2);border-radius:3px">
                         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                           <span style="font-size:9px;color:var(--text-lo)" x-text="(ratioFocus==='iol'?'IO/L':'IO/S')+' tier'"></span>
                           <button @click.prevent="ratioDir=(ratioDir==='>'?'<':'>')"
-                            style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(255,150,80,.1);border:1px solid rgba(255,150,80,.35);border-radius:2px;color:#ff9650;cursor:pointer"
+                            style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(var(--mic-rgb),.1);border:1px solid rgba(var(--mic-rgb),.35);border-radius:2px;color:var(--mic-acc);cursor:pointer"
                             x-text="ratioDir"></button>
                           <input type="range" min="0" max="500" step="1" x-model.number="ratioTier" style="flex:1;min-width:60px">
-                          <span style="font-size:9px;color:#ff9650;min-width:52px;text-align:right" x-text="ratioTier+' (≈'+(ratioTier*(ratioFocus==='iol'?cfg.micIolStep:cfg.micIosStep)/100).toFixed(2)+')'"></span>
+                          <span style="font-size:9px;color:var(--mic-acc);min-width:52px;text-align:right" x-text="ratioTier+' (≈'+(ratioTier*(ratioFocus==='iol'?cfg.micIolStep:cfg.micIosStep)/100).toFixed(2)+')'"></span>
                           <button @click.prevent="if(!cfgLocked&&ratioFocus){ const slots=(cfg.micSlots||[]).map(s=>[...s]); const si=cfg.micActiveSlot; if(!slots[si]) return; const existIdx=slots[si].findIndex(x=>x.startsWith(ratioFocus)); if(existIdx!==-1){ slots[si].splice(existIdx,1); } else { slots[si].push(ratioFocus+ratioDir+ratioTier); } cfg.micSlots=slots; persist?.(); }"
-                            :style="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(ratioFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,150,80,.1);border:1px solid rgba(255,150,80,.35);color:#ff9650'"
+                            :style="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(ratioFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(var(--mic-rgb),.1);border:1px solid rgba(var(--mic-rgb),.35);color:var(--mic-acc)'"
                             x-text="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(ratioFocus??'__')) ? 'Remove' : 'Add'">
                           </button>
                         </div>
                       </div>
                       <!-- Fund/VM/Spike gate config panel -->
-                      <div x-show="gateFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(255,150,80,.06);border:1px solid rgba(255,150,80,.2);border-radius:3px">
+                      <div x-show="gateFocus !== null" style="width:100%;margin-top:6px;padding:5px 7px;background:rgba(var(--mic-rgb),.06);border:1px solid rgba(var(--mic-rgb),.2);border-radius:3px">
                         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                           <span style="font-size:9px;color:var(--text-lo)" x-text="({fund:'Fund',va:'V/A',lta:'LTA',lpa:'LPA'})[gateFocus]||gateFocus"></span>
                           <button @click.prevent="gateDir=(gateDir==='>'?'<':'>')"
-                            style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(255,150,80,.1);border:1px solid rgba(255,150,80,.35);border-radius:2px;color:#ff9650;cursor:pointer"
+                            style="font-family:var(--mono);font-size:9px;padding:1px 6px;background:rgba(var(--mic-rgb),.1);border:1px solid rgba(var(--mic-rgb),.35);border-radius:2px;color:var(--mic-acc);cursor:pointer"
                             x-text="gateDir"></button>
                           <input type="range" :min="gateFocus==='fund'?-400:((gateFocus==='lta'||gateFocus==='lpa')?-100:0)" :max="gateFocus==='fund'?400:200" step="1" x-model.number="gateTier" style="flex:1;min-width:60px">
-                          <span style="font-size:9px;color:#ff9650;min-width:52px;text-align:right"
+                          <span style="font-size:9px;color:var(--mic-acc);min-width:52px;text-align:right"
                             x-text="gateTier+' (≈'+(Math.abs(gateTier)*({fund:cfg.micFundStep,va:cfg.micVaStep,lta:cfg.micLtaStep,lpa:cfg.micLpaStep})[gateFocus]).toFixed(4).replace(/\.?0+$/,'')+'%)'"></span>
                           <button @click.prevent="if(!cfgLocked&&gateFocus){ const slots=(cfg.micSlots||[]).map(s=>[...s]); const si=cfg.micActiveSlot; if(!slots[si]) return; const existIdx=slots[si].findIndex(x=>x.startsWith(gateFocus)); if(existIdx!==-1){ slots[si].splice(existIdx,1); } else { slots[si].push(gateFocus+gateDir+gateTier); } cfg.micSlots=slots; persist?.(); }"
-                            :style="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(gateFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,150,80,.1);border:1px solid rgba(255,150,80,.35);color:#ff9650'"
+                            :style="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(gateFocus??'__')) ? 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(255,80,80,.15);border:1px solid rgba(255,80,80,.4);color:rgba(255,100,100,.9)' : 'font-size:9px;padding:1px 8px;border-radius:2px;cursor:pointer;background:rgba(var(--mic-rgb),.1);border:1px solid rgba(var(--mic-rgb),.35);color:var(--mic-acc)'"
                             x-text="(cfg.micSlots?.[cfg.micActiveSlot]||[]).some(x=>x.startsWith(gateFocus??'__')) ? 'Remove' : 'Add'">
                           </button>
                         </div>
@@ -362,7 +371,7 @@
                       <template x-for="(slot, i) in (cfg.micSlots||[])" :key="i">
                         <div class="mic-slot"
                           @click.prevent="if(!cfgLocked){cfg.micActiveSlot=(cfg.micActiveSlot===i?null:i);persist()}"
-                          :style="cfg.micActiveSlot===i?'border-color:rgba(255,150,80,.7);background:rgba(255,150,80,.07)':'border-color:var(--border);background:transparent'">
+                          :style="cfg.micActiveSlot===i?'border-color:rgba(var(--mic-rgb),.7);background:rgba(var(--mic-rgb),.07)':'border-color:var(--border);background:transparent'">
                           <div style="font-size:8px;color:var(--text-lo)">Slot <span x-text="i+1"></span></div>
                           <div style="display:flex;flex-direction:column;gap:2px;min-height:14px">
                             <template x-for="c in slot" :key="c">
@@ -377,10 +386,10 @@
                       </template>
                       <button x-show="!cfgLocked"
                         @click.prevent="_micAddSlot()"
-                        style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(255,150,80,.06);border:1px dashed rgba(255,150,80,.3);border-radius:3px;color:#ff9650;cursor:pointer">+</button>
+                        style="align-self:center;padding:8px 10px;font-size:12px;background:rgba(var(--mic-rgb),.06);border:1px dashed rgba(var(--mic-rgb),.3);border-radius:3px;color:var(--mic-acc);cursor:pointer">+</button>
                     </div>
                     <div class="mic-hint" style="margin-top:5px">A ticker qualifies when it matches every criterion in any one slot.</div>
-                    <div class="mic-hint" style="margin-top:5px;line-height:1.8">Badge key: 💸/🤑 Fund · 🔊 V/A · 🐂 IO/L · 🐻 IO/S · 🕐 LTA · 💹 LPA — click any tiered criterion to configure gate</div>
+                    <div class="mic-hint" style="margin-top:5px;line-height:1.8" x-text="'Badge key: ' + (_micWinter() ? '🤑/💸' : '💸/🤑') + ' Fund · 🔊 V/A · 🐂 IO/L · 🐻 IO/S · 🕐 LTA · 💹 LPA — click any tiered criterion to configure gate'"></div>
                   </div><!-- end manual builder -->
                   <div class="g" style="margin-top:8px">
                     <div class="lbl" style="margin-bottom:4px">Re-entry Block Mode</div>
@@ -399,7 +408,7 @@
                   <div class="tog-t" :class="cfg.micCascadeEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micCascadeEnabled=!cfg.micCascadeEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Cascade Exit</div>
-                    <div class="mic-hint">Bails all MIC positions when their collective unrealized profit reaches a % of total base margin.</div>
+                    <div class="mic-hint">Bails all MI positions when their collective unrealized profit reaches a % of total base margin.</div>
                   </div>
                 </label>
                 <div class="g" x-show="cfg.micCascadeEnabled && !cfg.micRelativeTargetEnabled" style="margin-top:8px">
@@ -411,7 +420,7 @@
                   <div class="tog-t" :class="cfg.micSacrificeEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micSacrificeEnabled=!cfg.micSacrificeEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Sacrifice Exit</div>
-                    <div class="mic-hint">Bails all MIC positions when their collective unrealized loss reaches a % of avg base margin.</div>
+                    <div class="mic-hint">Bails all MI positions when their collective unrealized loss reaches a % of avg base margin.</div>
                   </div>
                 </label>
                 <div class="g" x-show="cfg.micSacrificeEnabled && !cfg.micRelativeTargetEnabled" style="margin-top:8px">
@@ -424,7 +433,7 @@
                     <div class="tog-t" :class="cfg.micRelativeTargetEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micRelativeTargetEnabled=!cfg.micRelativeTargetEnabled;persist()}"><div class="tog-k"></div></div>
                     <div>
                       <div class="tog-l">Relative Target</div>
-                      <div class="mic-hint">Entry TP, SL, Cascade and Sacrifice follow the window's average up/down 1hr move × leverage. Sliders are unused.</div>
+                      <div class="mic-hint" x-text="'Entry TP, SL, Cascade and Sacrifice follow the window average ' + (_micWinter() ? 'down/up' : 'up/down') + ' 1hr move × leverage. Sliders are unused.'"></div>
                     </div>
                   </label>
                   <div x-show="cfg.micRelativeTargetEnabled" style="margin-top:8px">
@@ -539,7 +548,7 @@
               <div style="font-family:var(--mono);font-size:9.5px;color:var(--text-lo);margin-bottom:5px">Blocked until next bulk fetch:</div>
               <div style="display:flex;flex-wrap:wrap;gap:3px">
                 <template x-for="sym in syms" :key="sym">
-                  <span style="padding:1px 6px;border-radius:2px;background:rgba(255,150,80,.07);border:1px solid rgba(255,150,80,.3);color:#ff9650;font-family:var(--mono);font-size:9px" x-text="sym.replace('USDT','')"></span>
+                  <span style="padding:1px 6px;border-radius:2px;background:rgba(var(--mic-rgb),.07);border:1px solid rgba(var(--mic-rgb),.3);color:var(--mic-acc);font-family:var(--mono);font-size:9px" x-text="sym.replace('USDT','')"></span>
                 </template>
               </div>
             </div>
@@ -550,6 +559,16 @@
     },
 
     transform(def) {
+      // Side comes from the host: PseudoWinter opens shorts, PseudoChaser longs. A host exposing both is read as Chaser.
+      const _hasShort = typeof def.pseudoOpenShort === 'function', _hasLong = typeof def.pseudoOpenLong === 'function';
+      WINTER = _hasShort && !_hasLong;
+      const _sideAmbiguous = _hasShort === _hasLong;
+      MIC_HIST_KEY = WINTER ? '__miw_hist_batches' : '__mic_hist_batches';
+      try {
+        const rs = document.documentElement.style;
+        rs.setProperty('--mic-rgb', WINTER ? '96,210,255' : '255,150,80');
+        rs.setProperty('--mic-acc', WINTER ? 'var(--ice)' : '#ff9650');
+      } catch (_) {}
       const _origInit  = def.init;
       const _origScan  = def.runScan;
       const _origWatch = def.pseudoWatchPositions;
@@ -558,23 +577,86 @@
       return Object.assign({}, def, {
 
         micCollapsedSlotRanks: {},
+
+        // Side of the host this copy is running on; templates and scoring read it through this.
+        _micWinter() { return WINTER; },
+
+        // Long share of accounts (0-1) for a ticker, from what Still-Water already holds: a read forced by
+        // _micLsFetch, else the current batch's record, else the latest stored reading in the sample window.
+        // Still-Water has no _swLsShare, so without this IO/L and IO/S would never get a tier.
+        _micLsShare(t) {
+          const sym = t && t.symbol; if (!sym) return null;
+          const ok = b => (b > 0 && b < 1) ? b : null;
+          const f = LS_FRESH[sym];
+          if (f && Date.now() - f.ts < 600000) return f.bl;
+          const cur = ok(Number(this.swOcResults?.[sym]?.bl));
+          if (cur != null) return cur;
+          const hist = this._swOcCycleHistory || [];
+          const key = (this._swOcResultsAt || 0) + ':' + hist.length;
+          if (LS_MAP.key !== key) {
+            const map = {}, at = {};
+            for (const cy of hist) {
+              if (!cy || !Array.isArray(cy.results)) continue;
+              for (const r of cy.results) {
+                const b = ok(Number(r && r.bl));
+                if (r && typeof r.sym === 'string' && b != null && (at[r.sym] == null || cy.ts >= at[r.sym])) { map[r.sym] = b; at[r.sym] = cy.ts; }
+              }
+            }
+            LS_MAP = { key, map };
+          }
+          return LS_MAP.map[sym] ?? null;
+        },
+        // One forced long-share read for a symbol (Force-Evaluate top-up), kept 10 minutes.
+        async _micLsFetch(sym) {
+          try {
+            const bl = await this._swLsRatio?.(sym);
+            if (bl > 0 && bl < 1) {
+              const now = Date.now();
+              for (const k of Object.keys(LS_FRESH)) if (now - LS_FRESH[k].ts > 600000) delete LS_FRESH[k];
+              LS_FRESH[sym] = { bl, ts: now };
+            }
+          } catch (_) {}
+        },
+
+        // Winter installs saved this plugin as MultiIndicator-Winter (miw* config, _miw* position tags). Move them
+        // to the mic* names once; never overwrites a mic* value that already exists.
+        _micMigrateFromMiw() {
+          let moved = 0;
+          for (const k of Object.keys(this.cfg || {})) {
+            if (!/^miw[A-Z]/.test(k)) continue;
+            const nk = 'mic' + k.slice(3);
+            if (this.cfg[nk] === undefined) this.cfg[nk] = this.cfg[k];
+            delete this.cfg[k]; moved++;
+          }
+          for (const p of (this.positions || [])) {
+            if (!p || typeof p !== 'object') continue;
+            for (const k of Object.keys(p)) {
+              if (!/^_miw/.test(k)) continue;
+              const nk = '_mic' + k.slice(4);
+              if (p[nk] === undefined) p[nk] = p[k];
+              delete p[k]; moved++;
+            }
+          }
+          if (moved) { this.persist?.(); this.log(`[MI] Moved ${moved} saved Winter (miw*) name(s) to mic*`, 'info'); }
+        },
         _micLastSampledAt: 0,
         _micHaltLogged: false,
 
         async init() {
           await _origInit.call(this);
           this._micLoaded = true;
+          if (WINTER) this._micMigrateFromMiw();
           if (!this.micCollapsedSlotRanks) this.micCollapsedSlotRanks = {};
           if (!this.micCollapsedCritStats) this.micCollapsedCritStats = {};
           if (!Array.isArray(this.cfg.micSlots)) this.cfg.micSlots = DEFAULT_SLOTS.map(s => [...s]);
           // V/M, IO/T, IO/M retired in favor of population-relative V/A, IO/L and IO/S (see
-          // _afVolIoWindowAvg) — no mcap fetch machinery to init anymore. One-time cleanup of
+          // _swVolIoWindowAvg) — no mcap fetch machinery to init anymore. One-time cleanup of
           // saved config: strip the retired keys from the exclude list.
           if (Array.isArray(this.cfg.micAutoSlotExclude) && this.cfg.micAutoSlotExclude.some(c => c==='vm'||c==='iot'||c==='iom')) {
             this.cfg.micAutoSlotExclude = this.cfg.micAutoSlotExclude.filter(c => c!=='vm'&&c!=='iot'&&c!=='iom');
           }
           if (!Array.isArray(this.cfg.megacapExclude)) this.cfg.megacapExclude = [...DEFAULT_MEGACAP_EXCLUDE];
-          // Single source of truth for all other MIC scalar defaults — see MIC_DEFAULT_CFG above.
+          // Single source of truth for all other MI scalar defaults — see MIC_DEFAULT_CFG above.
           // Call sites read this.cfg.<key> directly with no inline fallback, since this
           // guarantees every key below is present after init runs once.
           // Target Halving was replaced by Relative Target: carry the old on/off choice across once.
@@ -627,18 +709,19 @@
           {
             const _retiredIn = s => s.filter(c => /^(vm|iot|iom|ioa|ocs|ocx|pec|vsg|regime|liqturnover|liqquiet|sliq|bliq|msliq|mbliq|0liq|past1)/.test(c));
             const _retiredSlots = (this.cfg.micSlots || []).map((s,i) => ({ i, crits: _retiredIn(s) })).filter(x => x.crits.length);
-            if (_retiredSlots.length) this.log(`[MIC] ⚠️ ${_retiredSlots.length} manual slot(s) reference retired criteria and will never match — slot(s) ${_retiredSlots.map(x=>x.i+1).join(', ')}. Replace with fund / V/A / IO/L / IO/S / LTA / LPA.`, 'warn');
+            if (_retiredSlots.length) this.log(`[MI] ⚠️ ${_retiredSlots.length} manual slot(s) reference retired criteria and will never match — slot(s) ${_retiredSlots.map(x=>x.i+1).join(', ')}. Replace with fund / V/A / IO/L / IO/S / LTA / LPA.`, 'warn');
           }
           this.registerRoleBadge?.(item => {
             if (!item || !item._mic) return null;
             const crits  = item._micCriteria || [];
             const emoji  = crits.map(c => critEmoji(c)).join('');
             const title  = crits.length ? 'Multi: ' + crits.map(c => critLabel(c)).join(' + ') : 'Multi-Indicator';
-            return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(255,150,80,.45);color:#ff9650;background:rgba(255,150,80,.10)" title="${title}">${emoji || 'Multi'}</span>`;
+            return `<span style="font-family:var(--mono);font-size:9px;padding:2px 5px;border-radius:2px;letter-spacing:1px;border:1px solid rgba(var(--mic-rgb),.45);color:var(--mic-acc);background:rgba(var(--mic-rgb),.10)" title="${title}">${emoji || 'Multi'}</span>`;
           });
           this.registerCloseReason?.('substitution', 'Sub');
           this.registerCloseReason?.('ejection', 'Eject');
-          this.log(`[MIC] Multi-Indicator (Chaser) v${VERSION} loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle`, 'info');
+          if (_sideAmbiguous) this.log('[MI] ⚠️ Could not tell the host side (pseudoOpenShort/pseudoOpenLong both or neither present) — running as Chaser.', 'warn');
+          this.log(`[MI] Multi-Indicator (${WINTER ? 'Winter' : 'Chaser'}) v${VERSION} loaded — ${this.cfg.micEnabled ? 'enabled' : 'disabled'} | ${(this.cfg.micSlots||[]).length} slots | ${this.cfg.micPicks}/cycle`, 'info');
           this.renderTradeFeed?.();
         },
 
@@ -681,8 +764,8 @@
         },
 
         // Collective uPnL and the resulting bail set both cover every open position, not just
-        // MIC's own — a winning position from another strategy should be able to push the
-        // portfolio into Cascade the same as a winning MIC position would, and a Sacrifice
+        // MI's own — a winning position from another strategy should be able to push the
+        // portfolio into Cascade the same as a winning MI position would, and a Sacrifice
         // shouldn't leave an untouched, unrelated position dominating the aggregate afterward.
         async _micCheckCascade() {
           if (!this.cfg.micCascadeEnabled) return;
@@ -693,9 +776,9 @@
           const _pct        = this._micEffCascadePct();
           const threshold   = baseMargin * (_pct / 100);
           if (totalUPnL >= threshold) {
-            this.log(`[MIC] 🌊 Cascade triggered — collective uPnL +${totalUPnL.toFixed(4)} ≥ ${threshold.toFixed(4)} USDT (${_pct.toFixed(1)}% of ${baseMargin.toFixed(4)} base margin) — bailing ${allPositions.length} position(s)`, 'info');
-            if (this.cfg.ashfallCrossEnabled && typeof this._afCrossWrite === 'function') {
-              this._afCrossWrite('cascade', null, { count: allPositions.length, pnl: totalUPnL });
+            this.log(`[MI] 🌊 Cascade triggered — collective uPnL +${totalUPnL.toFixed(4)} ≥ ${threshold.toFixed(4)} USDT (${_pct.toFixed(1)}% of ${baseMargin.toFixed(4)} base margin) — bailing ${allPositions.length} position(s)`, 'info');
+            if (this.cfg.ashfallCrossEnabled && typeof this._swCrossWrite === 'function') {
+              this._swCrossWrite('cascade', null, { count: allPositions.length, pnl: totalUPnL });
             }
             this._logBatchBegin?.();
             try {
@@ -703,9 +786,9 @@
               // one stacked those waits end to end. Local bookkeeping per close is unchanged.
               await Promise.all([...allPositions].map(async pos => {
                 try { await this.pseudoClosePosition(pos, 'cascade'); }
-                catch (e) { this.log(`[MIC] 🌊 Cascade close error (${pos.symbol}): ${e.message}`, 'warn'); }
+                catch (e) { this.log(`[MI] 🌊 Cascade close error (${pos.symbol}): ${e.message}`, 'warn'); }
               }));
-            } finally { this._logBatchEnd?.('[MIC] 🌊 Cascade roll-up'); }
+            } finally { this._logBatchEnd?.('[MI] 🌊 Cascade roll-up'); }
           }
         },
 
@@ -718,9 +801,9 @@
           const _pct        = this._micEffSacrificePct();
           const threshold   = -(baseMargin * (_pct / 100));
           if (totalUPnL <= threshold) {
-            this.log(`[MIC] 🩸 Sacrifice triggered — collective uPnL ${totalUPnL.toFixed(4)} ≤ ${threshold.toFixed(4)} USDT (${_pct.toFixed(1)}% of ${baseMargin.toFixed(4)} base margin) — bailing ${allPositions.length} position(s)`, 'info');
-            if (this.cfg.ashfallCrossEnabled && typeof this._afCrossWrite === 'function') {
-              this._afCrossWrite('sacrifice', null, { count: allPositions.length, pnl: totalUPnL });
+            this.log(`[MI] 🩸 Sacrifice triggered — collective uPnL ${totalUPnL.toFixed(4)} ≤ ${threshold.toFixed(4)} USDT (${_pct.toFixed(1)}% of ${baseMargin.toFixed(4)} base margin) — bailing ${allPositions.length} position(s)`, 'info');
+            if (this.cfg.ashfallCrossEnabled && typeof this._swCrossWrite === 'function') {
+              this._swCrossWrite('sacrifice', null, { count: allPositions.length, pnl: totalUPnL });
             }
             this._logBatchBegin?.();
             try {
@@ -728,20 +811,67 @@
               // one stacked those waits end to end. Local bookkeeping per close is unchanged.
               await Promise.all([...allPositions].map(async pos => {
                 try { await this.pseudoClosePosition(pos, 'sacrifice'); }
-                catch (e) { this.log(`[MIC] 🩸 Sacrifice close error (${pos.symbol}): ${e.message}`, 'warn'); }
+                catch (e) { this.log(`[MI] 🩸 Sacrifice close error (${pos.symbol}): ${e.message}`, 'warn'); }
               }));
-            } finally { this._logBatchEnd?.('[MIC] 🩸 Sacrifice roll-up'); }
+            } finally { this._logBatchEnd?.('[MI] 🩸 Sacrifice roll-up'); }
           }
         },
 
-        // Dry-run of pseudoOpenLong's tick-precision/notional/SL checks, without any of its
+        // Which host variant runs is decided by the side detected at load (see transform).
+        async _micCandidateOpenFeasible(sym, price) { return WINTER ? this._micFeasibleShort(sym, price) : this._micFeasibleLong(sym, price); },
+
+        // Dry-run of pseudoOpenShort's tick-precision/notional/TP/SL/leverage checks, without
+        // its logging/ban-list side effects beyond resolveEffectiveLeverage's own (that one bans
+        // for real on maxLeverage ≤ 5×, same as a live open would — leaving that in place is
+        // correct, since a candidate that would get permanently banned anyway should never cost
+        // us the position we were about to swap out of). Substitution calls this before closing
+        // anything. Kept local to MI rather than touching PseudoWinter's open path — mirrors the
+        // SHORT-side validation block there and must be kept in sync with it if that logic ever
+        // changes.
+        async _micFeasibleShort(sym, price) {
+          if (!sym || !(price > 0)) return false;
+          const instr = await this.getInstrInfo(sym);
+          if (!instr) return false;
+          if (instr.minPrice > 0 && price < instr.minPrice) return false;
+          const levResult = this.resolveEffectiveLeverage(sym, instr);
+          if (!levResult) return false;
+          const lev  = levResult.lev;
+          const binary  = this.cfg.binaryModeEnabled;
+          const effTp0  = binary ? this.cfg.binaryTpPct : this.cfg.entryTpRoi;
+          const notional = this.cfg.minNotional;
+          const qty = this.snapQty(notional / price, instr);
+          if (qty <= 0) return false;
+          const actualNotional = qty * price;
+          if (instr.minOrderAmt > 0 && actualNotional < instr.minOrderAmt) return false;
+          const tpPrice = this.snapPrice(price * (1 - (effTp0 / 100) / lev), instr); // SHORT: TP below entry
+          if (!tpPrice || tpPrice <= 0) return false;
+          if (binary) return true;
+          const effAddNotional = this.cfg.addNotional;
+          const effTpRoi       = [effTp0, this._tpRoi(1)];
+          let runNotional = price * qty;
+          let runSize     = qty;
+          const addPcts = this._activeAddPcts();
+          for (let i = 0; i < this._dcaStageCount(); i++) {
+            const addPrice = this.snapPrice(price * (1 + addPcts[i] / 100), instr); // SHORT: add above entry
+            if (!addPrice || addPrice <= 0) return false;
+            const addQty = this.snapQty(effAddNotional / addPrice, instr);
+            runNotional += addPrice * addQty;
+            runSize     += addQty;
+            const expectedAvg = runSize > 0 ? runNotional / runSize : addPrice;
+            const addTp = this.snapPrice(expectedAvg * (1 - (effTpRoi[i+1] / 100) / lev), instr);
+            if (!addTp || addTp <= 0) return false;
+          }
+          return true;
+        },
+
+        // Dry-run (Chaser variant) of pseudoOpenLong's tick-precision/notional/SL checks, without any of its
         // side effects (no ban, no log, no order placement) — just answers "would this candidate
         // actually be openable right now". Substitution calls this before closing anything, so a
         // candidate that would fail those checks (e.g. SL snaps to zero at this price/leverage)
-        // never costs us the position we were about to swap out of. Kept local to MIC rather than
+        // never costs us the position we were about to swap out of. Kept local to MI rather than
         // touching PseudoChaser's open path — see the SL/DCA validation block in pseudoOpenLong,
         // which this mirrors and must be kept in sync with if that logic ever changes.
-        async _micCandidateOpenFeasible(sym, price) {
+        async _micFeasibleLong(sym, price) {
           if (!sym || !(price > 0)) return false;
           const instr = await this.getInstrInfo(sym);
           if (!instr) return false;
@@ -780,7 +910,7 @@
           return true;
         },
 
-        // Only meaningful when Co-Qualifying Penalty is on (Ashfall) — otherwise compositeScore
+        // Only meaningful when Co-Qualifying Penalty is on (Still-Water) — otherwise compositeScore
         // is always 0 for both sides and the margin check never clears, so this is a safe no-op.
         // No path restriction on what it can close — cross-strategy, any held position, same as
         // Liquid-Diver's version. The swap is still score-gated, not automatic.
@@ -799,7 +929,7 @@
           if (!eligible.length) return false;
 
           // Recomputes the existing position's score live from its rolling-average
-          // criteria (see _afPositionAvgCriteria/_afPositionCriteriaSample), same as the
+          // criteria (see _swPositionAvgCriteria/_swPositionCriteriaSample), same as the
           // candidate's own score is computed fresh each scan.
           const scoreOf = p => p._mic ? this._micLiveCompositeScore(p) : -Infinity;
           eligible.sort((a, b) => scoreOf(a) - scoreOf(b));
@@ -822,7 +952,7 @@
               const full = await this._micTopUpGeneralCriteria(cand.t, cand.criteria);
               const ann  = (full || []).map(c => this._micAnnotateCritRaw(c, cand.t) ?? (c + '+0'));
               if (this._micIsEntryBlocked(ann)) {
-                this.log(`[MIC] 🔁 Substitution skipped ${cand.t.symbol} — blocked once general criteria were topped up`, 'info');
+                this.log(`[MI] 🔁 Substitution skipped ${cand.t.symbol} — blocked once general criteria were topped up`, 'info');
                 continue;
               }
               best = { ...cand, criteria: full };
@@ -832,11 +962,11 @@
           if (!best) return false;
           const _candPrice = parseFloat(best.t.lastPrice || 0);
           if (!(await this._micCandidateOpenFeasible(best.t.symbol, _candPrice))) {
-            this.log(`[MIC] 🔁 Substitution skipped — ${best.t.symbol} would fail open-time checks (tick precision/notional) at ${_candPrice} — leaving ${worst.symbol} in place`, 'warn');
+            this.log(`[MI] 🔁 Substitution skipped — ${best.t.symbol} would fail open-time checks (tick precision/notional) at ${_candPrice} — leaving ${worst.symbol} in place`, 'warn');
             return false;
           }
 
-          this.log(`[MIC] 🔁 Substitution — closing ${worst.symbol} (score ${worstScore === -Infinity ? 'n/a' : worstScore.toFixed(4)}) for ${best.t.symbol} (score ${best.compositeScore.toFixed(4)}), Δ${(best.compositeScore - worstScore).toFixed(4)} ≥ ${marginThreshold.toFixed(4)} margin`, 'info');
+          this.log(`[MI] 🔁 Substitution — closing ${worst.symbol} (score ${worstScore === -Infinity ? 'n/a' : worstScore.toFixed(4)}) for ${best.t.symbol} (score ${best.compositeScore.toFixed(4)}), Δ${(best.compositeScore - worstScore).toFixed(4)} ≥ ${marginThreshold.toFixed(4)} margin`, 'info');
           await this.pseudoClosePosition(worst, 'substitution');
           return await this._micOpen(best.t, best.criteria, best.slotIdx, best.compositeScore);
         },
@@ -850,21 +980,21 @@
             label:      'No Entry',
             labelStyle: 'color:rgba(255,160,0,.9)',
             border:     'border-color:rgba(255,160,0,.45);background:rgba(255,160,0,.06)',
-            title:      (d.weatherNeg != null ? `MIC deferment — new entries blocked (scorecard headline ${d.weatherNeg.toFixed(3)} < 0)` : d.bothRed ? `MIC deferment — new entries blocked (both poles of ${d.bothRed} are red)` : `MIC deferment — new entries blocked (relative target ${d.low.toFixed(1)}% < min entry TP ${d.minTp}%)`) + (d.eject ? ' · ejecting all positions' : ''),
+            title:      (d.weatherNeg != null ? `MI deferment — new entries blocked (scorecard headline ${d.weatherNeg.toFixed(3)} < 0)` : d.bothRed ? `MI deferment — new entries blocked (both poles of ${d.bothRed} are red)` : `MI deferment — new entries blocked (relative target ${d.low.toFixed(1)}% < min entry TP ${d.minTp}%)`) + (d.eject ? ' · ejecting all positions' : ''),
             action:     null,
           }];
         },
 
         // Relative Target — resolves this moment's targets from what the market is actually paying: the LPA sample window
-        // (AF's latest 1hr price change % per ticker, from the last cfg.micRelBatches batches only). The average up move (the side this bot profits from) x leverage is the
+        // (SW's latest 1hr price change % per ticker, from the last cfg.micRelBatches batches only). The average up move (the side this bot profits from) x leverage is the
         // entry TP; the average down move x leverage is the SL. Cascade is the entry TP and Sacrifice is the SL, so the four always agree.
         // Price move % x leverage = ROI %, the unit the host's TP / SL use. Returns the configured targets untouched (active:false) when
         // Relative Target is off, neither Cascade nor Sacrifice is on, or either side of the window holds too few readings —
         // callers then behave as before (and Deferment's floor path is off).
         _micRelMoves() {
-          const hist = this._afOcCycleHistory;
+          const hist = this._swOcCycleHistory;
           if (!Array.isArray(hist)) return null;
-          const min = Math.max(3, this.cfg.afExtremityMinSamples || 3), nb = Math.max(1, Math.round(Number(this.cfg.micRelBatches) || 6));
+          const min = Math.max(3, this.cfg.swExtremityMinSamples || 3), nb = Math.max(1, Math.round(Number(this.cfg.micRelBatches) || 6));
           // Latest nb batches (by time), then each ticker's latest reading within them — the same one-reading-per-ticker rule as the window stats.
           const cycles = hist.filter(c => c && typeof c.ts === 'number' && Array.isArray(c.results)).sort((x, y) => x.ts - y.ts).slice(-nb);
           const last = {};
@@ -882,7 +1012,8 @@
           if (!this.cfg.micRelativeTargetEnabled || !(this.cfg.micCascadeEnabled || this.cfg.micSacrificeEnabled)) return out;
           const mv = this._micRelMoves();
           if (!mv) return out;
-          const tp = mv.up * out.lev, sl = Math.max(1, mv.dn * out.lev); // SL never under 1%
+          const fav = WINTER ? mv.dn : mv.up, adv = WINTER ? mv.up : mv.dn; // Chaser profits on the up move, Winter on the down move
+          const tp = fav * out.lev, sl = Math.max(1, adv * out.lev); // SL never under 1%
           out.active = true; out.mv = mv;
           out.entryTp = tp; out.slPct = sl;
           out.cascadePct = tp; out.sacrificePct = sl;
@@ -897,23 +1028,23 @@
           if (!this.cfg.micRelativeTargetEnabled || !(this.cfg.micCascadeEnabled || this.cfg.micSacrificeEnabled)) return '';
           const t = this._micTargets();
           if (!t.active) return 'Waiting for the LPA window — needs 3+ readings on each side of zero in the latest batches.';
-          return `Now: avg up ${t.mv.up.toFixed(2)}% · avg down ${t.mv.dn.toFixed(2)}% (×${t.lev}, ${t.mv.nb} batch${t.mv.nb===1?'':'es'}, ${t.mv.nUp + t.mv.nDn} tickers) · entry TP ${t.entryTp.toFixed(1)}% · SL ${t.slPct.toFixed(1)}% · cascade ${this._micEffCascadePct().toFixed(1)}% · sacrifice ${this._micEffSacrificePct().toFixed(1)}%` + (t.entryTp < t.minTp ? ' — below floor: deferring' : '');
+          return `Now: ${WINTER ? `avg down ${t.mv.dn.toFixed(2)}% · avg up ${t.mv.up.toFixed(2)}%` : `avg up ${t.mv.up.toFixed(2)}% · avg down ${t.mv.dn.toFixed(2)}%`} (×${t.lev}, ${t.mv.nb} batch${t.mv.nb===1?'':'es'}, ${t.mv.nUp + t.mv.nDn} tickers) · entry TP ${t.entryTp.toFixed(1)}% · SL ${t.slPct.toFixed(1)}% · cascade ${this._micEffCascadePct().toFixed(1)}% · sacrifice ${this._micEffSacrificePct().toFixed(1)}%` + (t.entryTp < t.minTp ? ' — below floor: deferring' : '');
         },
 
         // Projected pp for one ticker, price direction (what the Forecast Grader would file for it on first sight): the scorecard's mean pole score
         // over the ticker's non-price tags (fund / va / iol / ios / lta; LPA is the realized move, so it never enters). null = no scored pole yet
         // (Sample Scoring off or scorecard too thin) -> nothing to veto on.
         _micProjectedPp(t) {
-          if (!t || typeof this._afFcParts !== 'function') return null;
+          if (!t || typeof this._swFcParts !== 'function') return null;
           const tags = [];
           for (const c of ['fund', 'va', 'iol', 'ios', 'lta']) { const a = this._micAnnotateCritRaw(c, t); if (a) tags.push(a); }
-          const pr = tags.length ? this._afFcParts(tags) : null;
-          return (pr && isFinite(pr.e)) ? this._afSampleDir() * pr.e : null;
+          const pr = tags.length ? this._swFcParts(tags) : null;
+          return (pr && isFinite(pr.e)) ? this._swSampleDir() * pr.e : null;
         },
-        // Entry veto: the projected pp points against this bot — negative for MIC (longs), positive for MIW (shorts). Unknown projection never vetoes.
+        // Entry veto: the projected pp points against this bot — negative on Chaser (longs), positive on Winter (shorts). Unknown projection never vetoes.
         _micPpBad(t) {
           const pp = this._micProjectedPp(t);
-          return pp != null && this._afSampleDir() * pp < 0;
+          return pp != null && this._swSampleDir() * pp < 0;
         },
         // Structured readout for the Multi-Indicator body: left = SL + Sacrifice, right = TP + Cascade, each green when viable, red when not.
         // Viable: the resolved value is at or above the Min Entry TP floor (green), under it = red. Cascade / Sacrifice colour on the resolved value; the text shows what actually fires (never under the floor) and they get no bar.
@@ -951,9 +1082,9 @@
         // Both-poles-red: the first criterion (dial family) whose + and - poles are BOTH proven and negative on the
         // scorecard side the chart shows. No entry pole to favor = no good entry.
         _micBothPolesRed() {
-          if (typeof this._afLukewarmFavoredSide !== 'function') return null;
-          const list = (this.afLukewarmScoreboard || {})[this._afLukewarmFavoredSide()] || [];
-          const min = Math.max(3, this.cfg.afExtremityMinSamples || 3);
+          if (typeof this._swLukewarmFavoredSide !== 'function') return null;
+          const list = (this.swLukewarmScoreboard || {})[this._swLukewarmFavoredSide()] || [];
+          const min = Math.max(3, this.cfg.swExtremityMinSamples || 3);
           const by = {};
           for (const e of list) if (e && e.pnl < 0 && !(typeof e.n === 'number' && e.n < min)) (by[e.family] ||= {})[e.pole] = true;
           for (const [fam, p] of Object.entries(by)) if (p.pos && p.neg) return fam;
@@ -961,8 +1092,8 @@
         },
         // The Sample Scorer headline when it is negative (else null) — same value/side the gauge shows. Needs Sample Scoring.
         _micWeatherNeg() {
-          if (!this.cfg.afSampleScoringEnabled || typeof this._afSampleWeather !== 'function' || typeof this._afLukewarmFavoredSide !== 'function') return null;
-          const wx = this._afSampleWeather(this._afLukewarmFavoredSide());
+          if (!this.cfg.swSampleScoringEnabled || typeof this._swSampleWeather !== 'function' || typeof this._swLukewarmFavoredSide !== 'function') return null;
+          const wx = this._swSampleWeather(this._swLukewarmFavoredSide());
           return (wx && wx.value != null && wx.value < 0) ? wx.value : null;
         },
         _micDefermentState() {
@@ -997,16 +1128,16 @@
         async _micEject(def) {
           const cands = (this.positions || []).filter(p => !p.isPending);
           if (!cands.length) return;
-          this.log(`[MIC] ⏏️ Ejection — ${def.why.length} deferment paths in effect (${def.why.join(' + ')}); closing all ${cands.length} position${cands.length === 1 ? '' : 's'}`, 'warn');
+          this.log(`[MI] ⏏️ Ejection — ${def.why.length} deferment paths in effect (${def.why.join(' + ')}); closing all ${cands.length} position${cands.length === 1 ? '' : 's'}`, 'warn');
           // Concurrent — see Cascade/Sacrifice: sequential live closes stacked their fill waits.
           await Promise.all(cands.map(async p => {
             try { await this.pseudoClosePosition(p, 'ejection'); }
-            catch (e) { this.log(`[MIC] ⏏️ Ejection error (${p.symbol}): ${e.message}`, 'warn'); }
+            catch (e) { this.log(`[MI] ⏏️ Ejection error (${p.symbol}): ${e.message}`, 'warn'); }
           }));
         },
 
 
-        // ── Scan stages (MIC) ────────────────────────────────────────────────────
+        // ── Scan stages (MI) ────────────────────────────────────────────────────
         // Stages hand data forward on ctx.mic; a stage returning false ends the mic group for this scan.
         // Registered with the host's scan pipeline from the bottom of transform(); on a host without
         // the pipeline _micRunScan below runs them back to back from the runScan wrap.
@@ -1014,7 +1145,7 @@
           if (!this.cfg.micEnabled) return false;
           const _micHalted = !!(this._isDrawdownHalted?.() || this._isGainsLocked?.());
           if (_micHalted) {
-            if (!this._micHaltLogged) { this.log(`[MIC] 💡 Halted — ${this._isGainsLocked?.() ? 'gains lock' : 'drawdown halt'} active; hist scoring continues`, 'info'); this._micHaltLogged = true; }
+            if (!this._micHaltLogged) { this.log(`[MI] 💡 Halted — ${this._isGainsLocked?.() ? 'gains lock' : 'drawdown halt'} active; hist scoring continues`, 'info'); this._micHaltLogged = true; }
           } else {
             this._micHaltLogged = false;
           }
@@ -1023,18 +1154,18 @@
           if (!allTickers.length) return false;
 
           // Rebuild block state from Extremity Scorer immediately before any slot or pool decisions
-          this._afExtremityBuild?.();
-          this._schIdleCancel?.('af-build'); // this rebuild supersedes the one AF queued for scan end
+          this._swExtremityBuild?.();
+          this._schIdleCancel?.('sw-build'); // this rebuild supersedes the one SW queued for scan end
 
-          // Open-Position Rolling-Average Criteria refresh (see Ashfall-Chaser's
-          // _afPositionCriteriaSample, which does its own fresh per-symbol fetch — the bulk
+          // Open-Position Rolling-Average Criteria refresh (see Still-Water's
+          // _swPositionCriteriaSample, which does its own fresh per-symbol fetch — the bulk
           // allTickers list is only the universe and can be hours old) — runs every cycle regardless of
           // whether any entry slot is active, since positions can still be open with none
           // configured. Only ever touches the handful of currently-open symbols, so it isn't
           // gated behind the follower no-own-fetch rule the rest of this scan is subject to.
           if (this.positions?.length) {
             for (const pos of this.positions) {
-              await this._afPositionCriteriaSample?.(pos);
+              await this._swPositionCriteriaSample?.(pos);
             }
           }
 
@@ -1051,7 +1182,7 @@
           const hasActiveEntry = autoMode ? this._micAutoActive() : slots.length > 0;
 
           if (!hasActiveEntry) {
-            this.log('[MIC] 💡 No active slots — skipping', 'info');
+            this.log('[MI] 💡 No active slots — skipping', 'info');
             return false;
           }
 
@@ -1077,7 +1208,7 @@
             if (activeSyms.has(t.symbol)) { scanSkip.excluded.active++; continue; }
             if (this._isSymbolBanned?.(t.symbol)) { scanSkip.excluded.banned++; continue; }
             if (this._micIsReentryBlocked(t.symbol)) { scanSkip.excluded.reentry++; continue; }
-            if (this._afGrayHas?.(t.symbol)) { scanSkip.excluded.gray++; continue; }
+            if (this._swGrayHas?.(t.symbol)) { scanSkip.excluded.gray++; continue; }
             basePool.push(t);
           };
 
@@ -1088,22 +1219,22 @@
           // Criteria data is fetched fresh, per ticker, for a random batch each scan — the bulk list only says what exists.
           // The batch is the unbiased sample that feeds scoring; entry candidates are ranked off every ticker's latest stored
           // reading, any age, and refetched right before entry (_micVerify). A follower seeds the leader's batch instead.
-          const cap0 = Math.max(1, Math.min(2500, Math.round(Number(this.cfg.afOcBatchSize) || 250)));
+          const cap0 = Math.max(1, Math.min(2500, Math.round(Number(this.cfg.swOcBatchSize) || 250)));
           let fillSyms = basePool.map(t => t.symbol);
           for (let i = fillSyms.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [fillSyms[i], fillSyms[j]] = [fillSyms[j], fillSyms[i]];
           }
           // Liquidation Surveillance: tickers that had liquidations in the watch just ended stay for continued sampling, quiet ones are
-          // graylisted and replaced, and the batch is always filled to the cap (_afLiqPick). null = off / following: the random batch stands.
-          // Forecast Grader (AF/PF): the revisits whose turn it is take their share of the slots first, planned before Liquidation Surveillance
+          // graylisted and replaced, and the batch is always filled to the cap (_swLiqPick). null = off / following: the random batch stands.
+          // Forecast Grader (SW): the revisits whose turn it is take their share of the slots first, planned before Liquidation Surveillance
           // fills the rest, and are taken out of the pool so the liquidation watch never sees them. null = off / following.
-          const fcPlan = this._afFcPlan?.(fillSyms, cap0);
+          const fcPlan = this._swFcPlan?.(fillSyms, cap0);
           let cap = cap0, batch;
           if (fcPlan && fcPlan.batch && fcPlan.batch.length) {
             // Forecast Focus: the grader's batch REPLACES the host's own draw, so every sampler (hour candles, liquidation watch, readings) uses exactly its tickers.
             // The liquidation watch is opened on that same list (pool = cap = the list, so it neither adds nor drops anything).
-            const liqSet = this._afLiqPick?.(fcPlan.batch, fcPlan.batch.length);
+            const liqSet = this._swLiqPick?.(fcPlan.batch, fcPlan.batch.length);
             batch = (liqSet && liqSet.length) ? liqSet : fcPlan.batch;
             cap = batch.length;
           } else {
@@ -1111,24 +1242,24 @@
             cap = (fcPlan && fcPlan.cap > 0) ? fcPlan.cap : cap0;
             const fcRev = (fcPlan && fcPlan.revisit) || [];
             if (fcRev.length) { const fcSet = new Set(fcRev); fillSyms = fillSyms.filter(s => !fcSet.has(s)); }
-            const liqBatch = this._afLiqPick?.(fillSyms, cap - fcRev.length);
+            const liqBatch = this._swLiqPick?.(fillSyms, cap - fcRev.length);
             if (liqBatch && liqBatch.length) fillSyms = liqBatch;
             batch = [...new Set([...fcRev, ...fillSyms])].slice(0, cap);
           }
           await this._ocFetchBatch(batch, null, false, needsHr);
-          const ocResults = this.afOcResults || {};
-          const freshAt = this._afOcResultsAt || 0;
+          const ocResults = this.swOcResults || {};
+          const freshAt = this._swOcResultsAt || 0;
           // Same batch as last scan (fetch skipped or failed, or the leader hasn't published a new one): nothing new to act on.
           if (!freshAt || freshAt === this._micLastActedAt) return false;
           this._micLastActedAt = freshAt;
           // Ranking pool: every non-excluded ticker with a stored per-ticker reading, any age. A batch ticker keeps its fresh
           // payload; the rest are rebuilt from their latest stored reading. Never-sampled tickers have nothing to rank on.
-          const latest = this._afLatestReadings?.() || {};
+          const latest = this._swLatestReadings?.() || {};
           const rankPool = [], rankOc = {};
           for (const bt of basePool) {
             const sym = bt.symbol, hit = latest[sym], live = ocResults[sym];
             if (!hit && !live) continue;
-            const t = live ? (this._afFreshTicker?.(sym) || this._afSynthTicker?.(sym, live)) : this._afSynthStored?.(sym, hit.rec, hit.ts);
+            const t = live ? (this._swFreshTicker?.(sym) || this._swSynthTicker?.(sym, live)) : this._swSynthStored?.(sym, hit.rec, hit.ts);
             if (!t) continue;
             rankPool.push(t); rankOc[sym] = live || hit.rec;
           }
@@ -1137,25 +1268,25 @@
         },
         async _micScanPool(ctx) {
           const { allTickers, freshAt, autoMode, slots, scanSkip, basePool } = ctx.mic;
-          const _afOcResults = ctx.mic.ocResults;
+          const _swOcResults = ctx.mic.ocResults;
 
-          const checkCrit = (c, fr, t) => this._micCheckCrit(c, fr, t, _afOcResults);
+          const checkCrit = (c, fr, t) => this._micCheckCrit(c, fr, t, _swOcResults);
 
           // Build pool before capacity check so historical matches are logged regardless
-          const _coQualEnabled = this.cfg.afCoQualPenaltyEnabled;
+          const _coQualEnabled = this.cfg.swCoQualPenaltyEnabled;
           const _cqRanks = _coQualEnabled ? (this.micCollapsedSlotRanks || {}) : null;
           const _cqScaledRank = (rawC, annotC) => this._micScaledRank(rawC, annotC, _cqRanks);
           // Wraps the raw annotation so every criterion reading produced during this scan's
-          // pool building feeds the Extremity Scorer's sample pool (see _afDialSample) —
+          // pool building feeds the Extremity Scorer's sample pool (see _swDialSample) —
           // regardless of whether this ticker ends up matching a slot or opening a trade.
           // Cutoffs need to be provable from the wide stream of what's actually out there,
           // not just from the narrow trickle of closed trades.
           const _micAnnotateCrit = (c, t) => {
             const tag = _micAnnotateCritRaw(c, t);
-            this._afDialSample?.(tag);
+            this._swDialSample?.(tag);
             return tag;
           };
-          // Delegates to the class-level _micAnnotateCritRaw (also called by Ashfall's open-position
+          // Delegates to the class-level _micAnnotateCritRaw (also called by Still-Water's open-position
           // sampler, which reads it off `this`). Only lta/lpa can come back null (no 1hr candle yet) —
           // by the time a criterion reaches here checkCrit already passed, so fall back to a neutral tier.
           const _micAnnotateCritRaw = (c, t) => this._micAnnotateCritRaw(c, t) ?? (c + '+0');
@@ -1163,7 +1294,7 @@
           // criterion's own collapsed rank, so capacity still favors historically-stronger
           // tickers even without Co-Qual scoring turned on.
           const _richness = e => e.criteria.reduce((s, c) => s + this._micCritScore(c), 0) * (e.dataFactor ?? 1);
-          const _poolOne = (t, ocMap = _afOcResults, sample = true) => {
+          const _poolOne = (t, ocMap = _swOcResults, sample = true) => {
               const checkCrit = (c, fr, tt) => this._micCheckCrit(c, fr, tt, ocMap);
               const _ann = sample ? _micAnnotateCrit : _micAnnotateCritRaw; // only the fresh random batch feeds the Extremity sample pool
               const fr       = parseFloat(t.fundingRate || 0) * 100;
@@ -1212,7 +1343,7 @@
                   compositeScore = bestScore + penalty;
                 }
               }
-              return { t, criteria: matched.criteria, slotIdx: matched.slotIdx, annotKey: _annotKey, annotCrits: _annotCrits, compositeScore, dataFactor: this._afSparse?.(_annotCrits)?.factor ?? 1 };
+              return { t, criteria: matched.criteria, slotIdx: matched.slotIdx, annotKey: _annotKey, annotCrits: _annotCrits, compositeScore, dataFactor: this._swSparse?.(_annotCrits)?.factor ?? 1 };
             };
           const _pooled = [];
           for (const t of basePool) {
@@ -1235,9 +1366,9 @@
           const _micTopReasons = obj => Object.entries(obj).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k}:${n}`).join(' ');
           const _micExcludedNote = _micTopReasons(scanSkip.excluded) || 'none';
           const _micUnmatchedNote = _micTopReasons(scanSkip.unmatched) || 'none';
-          this.log(`[MIC] 💡 Scan skip summary — universe:${allTickers.length} pool:${basePool.length} qualified:${pool.length} entry:${entryPool.length} | excluded ${_micExcludedNote} | unmatched ${_micUnmatchedNote} | vetoed:${scanSkip.blocked} pp-vetoed:${scanSkip.ppBad || 0}`, 'info');
-          if (this._micPoleBlockNotes?.size) { this.log(`[MIC] 🚧 Pole Blocking — ${[...this._micPoleBlockNotes].join(', ')}`, 'info'); this._micPoleBlockNotes.clear(); }
-          if (this._micSparseNotes?.size) { this.log(`[MIC] 🪶 Sparsity — blocked thin poles: ${[...this._micSparseNotes].join(', ')}`, 'info'); this._micSparseNotes.clear(); }
+          this.log(`[MI] 💡 Scan skip summary — universe:${allTickers.length} pool:${basePool.length} qualified:${pool.length} entry:${entryPool.length} | excluded ${_micExcludedNote} | unmatched ${_micUnmatchedNote} | vetoed:${scanSkip.blocked} pp-vetoed:${scanSkip.ppBad || 0}`, 'info');
+          if (this._micPoleBlockNotes?.size) { this.log(`[MI] 🚧 Pole Blocking — ${[...this._micPoleBlockNotes].join(', ')}`, 'info'); this._micPoleBlockNotes.clear(); }
+          if (this._micSparseNotes?.size) { this.log(`[MI] 🪶 Sparsity — blocked thin poles: ${[...this._micSparseNotes].join(', ')}`, 'info'); this._micSparseNotes.clear(); }
 
           ctx.mic.pool = pool; ctx.mic.entryPool = entryPool; ctx.mic.poolOne = _poolOne;
         },
@@ -1246,7 +1377,7 @@
           if (_micHalted) return;
 
           if (_micDef.deferring) {
-            if (!this._micDeferLogged) { this.log(_micDef.weatherNeg != null ? `[MIC] ⛔ Deferment — scorecard headline is negative (${_micDef.weatherNeg.toFixed(3)}); no new entries until it turns positive` : _micDef.bothRed ? `[MIC] ⛔ Deferment — both poles of ${_micDef.bothRed} are red on the scorecard; no new entries until one turns` : `[MIC] ⛔ Deferment — relative target resolves ${_micDef.low.toFixed(1)}%, under the ${_micDef.minTp}% min entry TP (avg up ${_micDef.mv.up.toFixed(2)}% × ${Number(this.cfg.leverage) || 6}); no new entries until it recovers`, 'info'); this._micDeferLogged = true; }
+            if (!this._micDeferLogged) { this.log(_micDef.weatherNeg != null ? `[MI] ⛔ Deferment — scorecard headline is negative (${_micDef.weatherNeg.toFixed(3)}); no new entries until it turns positive` : _micDef.bothRed ? `[MI] ⛔ Deferment — both poles of ${_micDef.bothRed} are red on the scorecard; no new entries until one turns` : `[MI] ⛔ Deferment — relative target resolves ${_micDef.low.toFixed(1)}%, under the ${_micDef.minTp}% min entry TP (avg up ${_micDef.mv.up.toFixed(2)}% × ${Number(this.cfg.leverage) || 6}); no new entries until it recovers`, 'info'); this._micDeferLogged = true; }
             return;
           }
 
@@ -1271,7 +1402,7 @@
             headroom = Math.min(headroom, capSlots - micCount);
             if (headroom < 1) {
               if (!(await this._micTrySubstitute(entryPool, ctx))) {
-                this.log('[MIC] 💡 Share cap reached — no slots available', 'info');
+                this.log('[MI] 💡 Share cap reached — no slots available', 'info');
               }
               return;
             }
@@ -1283,8 +1414,8 @@
             const fundStep = this.cfg.micFundStep;
             const posFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 >= fundStep).length;
             const negFund  = basePool.filter(t => parseFloat(t.fundingRate||0)*100 <= -fundStep).length;
-            const volIoNote = needsVolIo ? ` va/iol/ios-window:${this._afVolIoWindowAvg?.('vol')!=null?'ready':'warming'}` : '';
-            this.log(`[MIC] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund}${volIoNote}${needsHr ? ` lta/lpa-window:${this._afWindowStats?.('lpa')?.n ? 'ready' : 'warming'}` : ''}`, 'info');
+            const volIoNote = needsVolIo ? ` va/iol/ios-window:${this._swVolIoWindowAvg?.('vol')!=null?'ready':'warming'}` : '';
+            this.log(`[MI] 💡 No tickers matched — pool:${basePool.length} fund+:${posFund} fund-:${negFund}${volIoNote}${needsHr ? ` lta/lpa-window:${this._swWindowStats?.('lpa')?.n ? 'ready' : 'warming'}` : ''}`, 'info');
             return;
           }
 
@@ -1305,11 +1436,11 @@
               if (await this._micOpen(t, criteria, slotIdx, compositeScore)) { opened++; slotOpened[slotIdx]++; }
               else { blocked++; }
             }
-          } finally { this._logBatchEnd?.('[MIC] 💡 Entry roll-up'); }
+          } finally { this._logBatchEnd?.('[MI] 💡 Entry roll-up'); }
           const _micBlockNote = (blocked ? `, ${blocked} blocked (qty/lev)` : '') + (dropped ? `, ${dropped} dropped on refetch` : '');
           const openedParts   = slotOpened.map((n, i) => n > 0 ? (n > 1 ? `s${i+1}(${n})` : `s${i+1}`) : null).filter(Boolean);
           const openedNote    = openedParts.length ? ` via ${openedParts.join(' ')}` : '';
-          this.log(`[MIC] 💡 ${entryPool.length} qualified — ${opened} opened${_micBlockNote}${openedNote}`, 'info');
+          this.log(`[MI] 💡 ${entryPool.length} qualified — ${opened} opened${_micBlockNote}${openedNote}`, 'info');
         },
         // Pre-entry refetch of a ranked candidate. The ranking runs on each ticker's latest stored reading, however old, so before a
         // candidate opens (or displaces a position) its ticker, OC and 1hr data are read fresh and the slot match, veto and score rerun
@@ -1321,9 +1452,9 @@
           if (m.batchSyms?.has(sym)) return cand;
           if ((m.verifyLeft ?? 0) <= 0) return false;
           m.verifyLeft--;
-          const got = await this._afFetchCandidate?.(sym, false, m.needsHr);
+          const got = await this._swFetchCandidate?.(sym, false, m.needsHr);
           if (!got) return null;
-          if (got.oc) (this.afOcResults ||= {})[sym] = got.oc;
+          if (got.oc) (this.swOcResults ||= {})[sym] = got.oc;
           const r = m.poolOne?.(got.t, { [sym]: got.oc || m.ocResults?.[sym] }, false);
           if (!r || this._micIsEntryBlocked(r.annotCrits) || this._micPpBad(r.t)) return null;
           return r;
@@ -1355,11 +1486,11 @@
             criteria = await this._micTopUpGeneralCriteria(t, criteria);
           }
           const annotCrits = (criteria || []).map(c => this._micAnnotateCritRaw(c, t) ?? (c + '+0'));
-          // Feeds the Extremity Scorer's sample pool (see _afDialSample) — this is the
+          // Feeds the Extremity Scorer's sample pool (see _swDialSample) — this is the
           // actual-open annotation path, not just scan-time pool building, so a position's
           // own qualifying readings count toward the cutoff too.
-          for (const tag of annotCrits) this._afDialSample?.(tag);
-          if (this.cfg.micForceGeneralCriteria && this.cfg.micAutoSlots && this.cfg.afCoQualPenaltyEnabled) {
+          for (const tag of annotCrits) this._swDialSample?.(tag);
+          if (this.cfg.micForceGeneralCriteria && this.cfg.micAutoSlots && this.cfg.swCoQualPenaltyEnabled) {
             compositeScore = criteria.reduce((s, c, i) => s + this._micScaledRank(c, annotCrits[i]), 0);
           }
           // Top-up (above) can append criteria — most commonly fund — that were never part of
@@ -1375,7 +1506,7 @@
           this._micPending = (this._micPending || 0) + 1;
           try {
             // A ticker from this scan's own fresh batch already carries a current price; only older ones refetch.
-            if (!this._afTickerIsCurrent?.(t)) try {
+            if (!this._swTickerIsCurrent?.(t)) try {
               const r  = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
               const d  = await r.json();
               const lp = parseFloat(d?.result?.list?.[0]?.lastPrice);
@@ -1384,7 +1515,7 @@
             const change = parseFloat(t.price24hPcnt || 0) * 100;
             const fr     = parseFloat(t.fundingRate  || 0) * 100;
             const _tg = this._micTargets();
-            const pos = await this.pseudoOpenLong({
+            const pos = await this[WINTER ? 'pseudoOpenShort' : 'pseudoOpenLong']({
               symbol: sym, price, change, fundingRate: fr,
               _tpPct: _tg.active ? +_tg.entryTp.toFixed(2) : undefined,
               _slPct: _tg.active ? +_tg.slPct.toFixed(2) : undefined, // Relative Target: this position's own SL (host honours it via _slPctOverride) and entry TP (host honours it, see pseudoOpenLong)
@@ -1431,27 +1562,27 @@
           
           // lta/lpa: same loophole as ocs/ocx above — only fetch this symbol's 1hr candle when
           // nothing (own cache or the leader's shared batch) already has it.
-          if (missing.some(c => /^(lta|lpa)/.test(c)) && !this._afHourReading?.(sym)) {
-            jobs.push(this._afHourCandle?.(sym));
+          if (missing.some(c => /^(lta|lpa)/.test(c)) && !this._swHourReading?.(sym)) {
+            jobs.push(this._swHourCandle?.(sym));
           }
           // iol/ios: the long share isn't on the ticker payload -- one fresh read when neither the payload, a recent fresh read nor a stored sample has it.
-          if (missing.some(c => /^(iol|ios)/.test(c)) && this._afLsShare?.(t) == null) jobs.push(this._afLsFetch?.(sym));
+          if (missing.some(c => /^(iol|ios)/.test(c)) && this._micLsShare?.(t) == null) jobs.push(this._micLsFetch?.(sym));
           if (jobs.length) await Promise.all(jobs);
 
           const fr           = parseFloat(t.fundingRate || 0) * 100;
-          const ocResultsMap = this.afOcResults?.[sym] ? { [sym]: this.afOcResults[sym] } : {};
+          const ocResultsMap = this.swOcResults?.[sym] ? { [sym]: this.swOcResults[sym] } : {};
 
           const appended = missing.filter(c => this._micCheckCrit(c, fr, t, ocResultsMap));
           return appended.length ? [...criteria, ...appended] : criteria;
         },
 
         // Raw criterion annotation for one ticker — the single source for scan-time pool
-        // building, _micOpen, and Ashfall's per-scan open-position sampler (which calls it as
+        // building, _micOpen, and Still-Water's per-scan open-position sampler (which calls it as
         // this._micAnnotateCritRaw). Returns null only for lta/lpa when no 1hr candle is
         // available for the ticker yet.
         _micAnnotateCritRaw(c, t) {
-          if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._afVolIoWindowAvg?.('vol'); const step = this.cfg.micVaStep; const tier = (val && w) ? Math.floor((Math.log(val / w) * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
-          if (/^(iol|ios)/.test(c)) { const long = /^iol/.test(c), bl = this._afLsShare?.(t), oi = parseFloat(t.openInterestValue || 0), val = (bl > 0 && bl < 1 && oi > 0) ? oi * (long ? bl : 1 - bl) : 0, w = this._afVolIoWindowAvg?.(long ? 'oil' : 'ois'); if (!(val > 0 && w > 0)) return null; const step = long ? this.cfg.micIolStep : this.cfg.micIosStep; const tier = Math.floor((Math.log(val / w) * 100) / step); return `${long ? 'iol' : 'ios'}${tier>=0?'+':''}${tier}`; }
+          if (/^va/.test(c)) { const val = parseFloat(t.turnover24h || 0); const w = this._swVolIoWindowAvg?.('vol'); const step = this.cfg.micVaStep; const tier = (val && w) ? Math.floor((Math.log(val / w) * 100) / step) : 0; return `va${tier>=0?'+':''}${tier}`; }
+          if (/^(iol|ios)/.test(c)) { const long = /^iol/.test(c), bl = this._micLsShare?.(t), oi = parseFloat(t.openInterestValue || 0), val = (bl > 0 && bl < 1 && oi > 0) ? oi * (long ? bl : 1 - bl) : 0, w = this._swVolIoWindowAvg?.(long ? 'oil' : 'ois'); if (!(val > 0 && w > 0)) return null; const step = long ? this.cfg.micIolStep : this.cfg.micIosStep; const tier = Math.floor((Math.log(val / w) * 100) / step); return `${long ? 'iol' : 'ios'}${tier>=0?'+':''}${tier}`; }
           if (/^fund/.test(c)) { const step = this.cfg.micFundStep; const fr_ = parseFloat(t.fundingRate||0)*100; const tier = Math.trunc(fr_ / step); return `fund${fr_<0?'-':'+'}${Math.abs(tier)}`; }
           
           
@@ -1464,13 +1595,13 @@
         // 24h/24, per micLtaStep. LPA: percentage-point gap between its 1hr price change and the
         // mean of every other ticker in the window, per micLpaStep.
         _micHourTier(kind, t) {
-          const hr = this._afHourReadingWide?.(t.symbol);
+          const hr = this._swHourReadingWide?.(t.symbol);
           if (!hr) return null;
           if (kind === 'lta') {
-            const dev = this._afLtaDev?.(hr.ht, t.turnover24h);
+            const dev = this._swLtaDev?.(hr.ht, t.turnover24h);
             return dev == null ? null : Math.floor(dev / this.cfg.micLtaStep);
           }
-          const avg = this._afLpaWindowAvg?.(t.symbol);
+          const avg = this._swLpaWindowAvg?.(t.symbol);
           if (avg == null || typeof hr.hc !== 'number') return null;
           return Math.floor((hr.hc - avg) / this.cfg.micLpaStep);
         },
@@ -1489,7 +1620,7 @@
           }
           if (/^va/.test(c)) {
             const val = parseFloat(t.turnover24h || 0);
-            const windowAvg = this._afVolIoWindowAvg?.('vol');
+            const windowAvg = this._swVolIoWindowAvg?.('vol');
             if (!val || !windowAvg) return false;
             const step = this.cfg.micVaStep;
             const tier = Math.floor((Math.log(val / windowAvg) * 100) / step);
@@ -1498,9 +1629,9 @@
             return m[1] === '>' ? tier >= parseInt(m[2],10) : tier <= parseInt(m[2],10);
           }
           if (/^(iol|ios)/.test(c)) {
-            const long = /^iol/.test(c), bl = this._afLsShare?.(t), oi = parseFloat(t.openInterestValue || 0);
+            const long = /^iol/.test(c), bl = this._micLsShare?.(t), oi = parseFloat(t.openInterestValue || 0);
             const val = (bl > 0 && bl < 1 && oi > 0) ? oi * (long ? bl : 1 - bl) : 0;
-            const windowAvg = this._afVolIoWindowAvg?.(long ? 'oil' : 'ois');
+            const windowAvg = this._swVolIoWindowAvg?.(long ? 'oil' : 'ois');
             if (!val || !windowAvg) return false;
             const step = long ? this.cfg.micIolStep : this.cfg.micIosStep;
             const tier = Math.floor((Math.log(val / windowAvg) * 100) / step);
@@ -1521,12 +1652,12 @@
 
         // Co-Qualifying Penalty scoring for one criterion. Base rank is looked up from the
         // ticker's actual annotated tier (e.g. "fund+3" -> "fund+"), matching exactly how the
-        // Extremity Scorer collapses closes into dial-pole buckets (see _afExtremityBuild).
+        // Extremity Scorer collapses closes into dial-pole buckets (see _swExtremityBuild).
         // This drives ticker ordering (compositeScore sort in the entry pool) as well as the
         // co-qualification penalty itself. ranksOverride (used by the substitute-check path)
         // still wins when explicitly supplied.
         _micScaledRank(rawC, annotC, ranksOverride) {
-          const ranks = ranksOverride ?? (this.cfg.afCoQualPenaltyEnabled ? (this.micCollapsedSlotRanks || {}) : null);
+          const ranks = ranksOverride ?? (this.cfg.swCoQualPenaltyEnabled ? (this.micCollapsedSlotRanks || {}) : null);
           if (!ranks) return 0;
           const annotKey = (annotC || '').replace(/\d+$/, '');
           const base = ranks[annotKey] ?? 0;
@@ -1547,8 +1678,8 @@
           // Fund tiers are now {0.0025%} each; normalise its depth back to the old 0.25%-tier scale so
           // the finer step doesn't inflate fund's co-qual weight ~100x relative to the other criteria.
           if (/^fund/.test(annotKey)) depth = depth * (this.cfg.micFundStep / 0.25);
-          const depthPct = (this.cfg.afCoQualDepthPct ?? 10) / 100;
-          return base * (this._afSparseOne?.(annotC)?.f ?? 1) * (1 + depth * depthPct);
+          const depthPct = (this.cfg.swCoQualDepthPct ?? 10) / 100;
+          return base * (this._swSparseOne?.(annotC)?.f ?? 1) * (1 + depth * depthPct);
         },
         // Live version of the compositeScore frozen at open — used by substitution so an
         // existing position is judged on where it stands NOW, not where it stood at entry.
@@ -1556,7 +1687,7 @@
         // opened before _micRawCriteria existed) or Co-Qual scoring is off.
         _micLiveCompositeScore(pos) {
           if (!pos._micRawCriteria?.length) return pos._micCompositeScore ?? 0;
-          const avgAnnot = this._afPositionAvgCriteria?.(pos) || pos._micCriteria || [];
+          const avgAnnot = this._swPositionAvgCriteria?.(pos) || pos._micCriteria || [];
           return pos._micRawCriteria.reduce((s, c, i) => s + this._micScaledRank(c, avgAnnot[i]), 0);
         },
 
@@ -1568,11 +1699,11 @@
           return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
         },
 
-        // The Extremity Scorer's whole-ticker lukewarm veto (see _afExtremityVeto in
-        // Ashfall-Chaser — "explicitly avoid any ticker exhibiting lukewarm values").
+        // The Extremity Scorer's whole-ticker lukewarm veto (see _swExtremityVeto in
+        // Still-Water — "explicitly avoid any ticker exhibiting lukewarm values").
         _micIsEntryBlocked(annotCrits) {
-          if (this._afExtremityVeto?.(annotCrits)) return true;
-          const sp = this._afSparse?.(annotCrits);
+          if (this._swExtremityVeto?.(annotCrits)) return true;
+          const sp = this._swSparse?.(annotCrits);
           if (sp?.block) { (this._micSparseNotes ||= new Set()).add(sp.note); return true; }
           const pb = this._micPoleBlocked(annotCrits);
           if (pb) { (this._micPoleBlockNotes ||= new Set()).add(pb); return true; }
@@ -1585,9 +1716,9 @@
         // proven. A positive pole is never blocked; a non-positive partner is left to Deferment.
         // Returns a short note for the first blocked tag in annotCrits, else null.
         _micPoleBlocked(annotCrits) {
-          if (!this.cfg.micPoleBlockEnabled || !this.cfg.afSampleScoringEnabled || typeof this._afLukewarmFavoredSide !== 'function') return null;
-          const list = (this.afLukewarmScoreboard || {})[this._afLukewarmFavoredSide()] || [];
-          const min = Math.max(3, this.cfg.afExtremityMinSamples || 3);
+          if (!this.cfg.micPoleBlockEnabled || !this.cfg.swSampleScoringEnabled || typeof this._swLukewarmFavoredSide !== 'function') return null;
+          const list = (this.swLukewarmScoreboard || {})[this._swLukewarmFavoredSide()] || [];
+          const min = Math.max(3, this.cfg.swExtremityMinSamples || 3);
           const T = Number(this.cfg.micPoleBlockPct), pct = Number.isFinite(T) ? Math.max(0, T) : 200;
           const edge = {};
           for (const e of list) if (e && typeof e.n === 'number' && e.n >= min && typeof e.pnl === 'number') (edge[e.family] ||= {})[e.pole] = e.pnl;
