@@ -51,7 +51,7 @@ Two panels can be open at once; a third click always bumps whichever slot is due
 
 ## Plugins
 
-To load a plugin, open the **Plugin Manager** panel at the bottom of the config menu, click **Load Plugin**, and select the `.html` file. **A page reload is required after loading or removing any plugin** — the plugin pipeline runs once at page boot, so changes don't take effect until the next load. Plugin sources are stored in IndexedDB rather than localStorage, so they no longer use up the localStorage quota; the plugin config row in Storage usage shrinks to a small manifest on the second load after a plugin file is loaded. ([more](#general-details))
+To load a plugin, open the **Plugin Manager** panel at the bottom of the config menu, click **Load Plugin**, and select the `.html` file. **A page reload is required after loading or removing any plugin** — the plugin pipeline runs once at page boot, so changes don't take effect until the next load. Plugin sources are stored in IndexedDB rather than localStorage, so they no longer use up the localStorage quota; the plugin config row in Storage usage shrinks to a small manifest on the second load after a plugin file is loaded. **Side check:** a plugin built for the other bot no longer refuses to load. Each plugin declares `targetBot` (`pseudowinter`, `pseudochaser` or `both`); if it names the other bot, it loads and runs anyway and its Plugin Manager card shows a yellow ⚠ warning (also logged once on load). A plugin that declares `both` (any case), or declares nothing, never shows the warning. ([more](#general-details))
 
 ---
 
@@ -245,7 +245,7 @@ The six criteria are independent signed tiers, so any subset can be true for the
 
 ## Permafrost / Ashfall Plugin
 
-Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. They provide the **Extremity Scorer / Lukewarm Scoring** engine that decides which readings MIW/MIC may trade on, and the **cross-bot bus** that lets the two sides coordinate halts. The panel has two tabs, **CROSS** and **SCORE**, with the Danger Zone (Export / Import / Clear Profile / Clear Plugin State) below. ([more](#permafrost-and-ashfall-details))
+Permafrost targets PseudoWinter; Ashfall targets PseudoChaser. Loading either into the other bot is allowed but shows the yellow side warning in the Plugin Manager; they are written for their own side's direction, so results there may be wrong. They provide the **Extremity Scorer / Lukewarm Scoring** engine that decides which readings MIW/MIC may trade on, and the **cross-bot bus** that lets the two sides coordinate halts. The panel has two tabs, **CROSS** and **SCORE**, with the Danger Zone (Export / Import / Clear Profile / Clear Plugin State) below. ([more](#permafrost-and-ashfall-details))
 
 ### Config
 
