@@ -21,9 +21,9 @@
   'losers' lets a symbol that just closed in profit re-trigger immediately.
 
   Entry pool fires once per fresh sample batch (_swOcResultsAt) — will not re-scan
-  the same batch twice. Candidates are ranked by Still-Water's Indicator forecast for the batch (er when Regime caution is active, else e),
-  falling back to the scorecard projection for tickers with no forecast, and refetched before entry when not from the batch.
-  Drawdown throttle and gains lock gate all entries.
+  the same batch twice. MI sets what it will enter (its slot criteria); Still-Water suggests: only tickers the latest batch's Indicator forecast
+  covers are considered, ranked by it (er when Regime caution is active, else e). Without Still-Water, MI enters on its criteria alone, ungraded.
+  Candidates are refetched before entry when not from the batch. Drawdown throttle and gains lock gate all entries.
 
   Load via Plugin Manager in either bot's config panel, AFTER Still-Water (and after SunChaser / EverWinter if live).
   targetBot: both
@@ -32,7 +32,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '2.1.1'; // Change: A follower ranks entries on the leader's shared forecasts (Still-Water), so the scorecard projection only ranks tickers the batch has no forecast for. | previous: Change: Entries are ranked by Still-Water's Indicator forecast (er when Regime caution is active, else e; the scorecard projection ranks tickers the batch has no forecast for). Removed the Co-Qualifying ranking, the lukewarm veto, the sparsity block and the rolling-average position score; substitution compares forecast scores.
+    const VERSION       = '2.2.0'; // Change: MI decides what it enters and Still-Water suggests: only tickers in the latest batch's Indicator forecast that match MI's criteria are entered, ranked by forecast (no Still-Water = criteria only, unranked). Removed Sample Scorer headline deferment, Both Poles Red, Pole Blocking and the negative-forecast veto; substitution records each held position's latest forecast score; Min Age defaults to 60m; Picks per scan field is back. | previous: Change: A follower ranks entries on the leader's shared forecasts (Still-Water), so the scorecard projection only ranks tickers the batch has no forecast for.
   const DEFAULT_SLOTS = [[]];
   let   WINTER        = false;      // set in transform() from the host; every side switch below reads it
   let   MIC_HIST_KEY  = '__mic_hist_batches'; // Winter keeps its own '__miw_hist_batches' so existing history carries over
@@ -55,7 +55,7 @@
   // micReentryBlockMode canonically defaults to 'losers'.
   const MIC_DEFAULT_CFG = Object.freeze({
     micEnabled: true,
-    micPicks: 5,
+    micPicks: 5,                    // Most tickers entered per scan cycle
     micFrThreshold: 0.1,
     micShareCapEnabled: true,
     micShareCapPct: 100,
@@ -66,14 +66,10 @@
     micSacrificePct: 50,
     micSubstitutionEnabled: true,
     micSubstitutionMarginPct: 5,
-    micSubstitutionMinAgeMins: 35,
-    micDefermentEnabled: true, // Deferment: no new entries while the Sample Scorer headline is negative. Needs Sample Scoring.
+    micSubstitutionMinAgeMins: 60,
     micRelativeTargetEnabled: true, // Relative Target: each new position's entry TP and SL, and the Cascade / Sacrifice %, follow what the market is paying — the average up and down 1hr move in the SW LPA sample window x leverage. Replaces Relative Target. Needs no Sample Scoring; Cascade or Sacrifice must be on.
     micMinEntryTp: 6,               // Relative Target floor, ROI %: below this a position can't clear its entry+exit fees, so a resolved entry TP or Cascade target under it = market not worth trading -> defer
     micRelBatches: 6,               // Relative Target: how many of the latest SW sample batches the average up / down move is taken from (older batches are ignored)
-    micDeferBothRedEnabled: true,  // Both-poles-red (sub-toggle of Deferment): also defer while any criterion has BOTH its + and - pole in the red on the scorecard
-    micPoleBlockEnabled: false,    // Pole Blocking (Sample Scoring only): block a pole trailing its positive partner pole's scorecard edge by the threshold or more
-    micPoleBlockPct: 200,           // Pole Blocking threshold, % of the partner pole's edge: blocked when (partner - pole) / partner >= this
     micReentryBlockMode: 'losers',
     micAutoSlots: true,
     micAutoSlotSize: 3,
@@ -294,19 +290,13 @@
                     </label>
                   </div>
 
-                  <!-- Pole Blocking -->
+                  <!-- Picks per scan -->
                   <div style="margin-bottom:8px">
-                    <label class="tog">
-                      <div class="tog-t" :class="cfg.micPoleBlockEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micPoleBlockEnabled=!cfg.micPoleBlockEnabled;persist()}"><div class="tog-k"></div></div>
-                      <div>
-                        <div class="tog-l">Pole Blocking</div>
-                        <div class="mic-hint">Blocks a pole whose scorecard edge trails its partner pole's by the threshold or more.</div>
-                      </div>
-                    </label>
-                    <div x-show="cfg.micPoleBlockEnabled" style="margin-top:6px;display:flex;align-items:center;gap:6px">
-                      <span class="lbl" style="margin:0">Threshold %</span>
-                      <input type="number" min="0" step="10" x-model.number="cfg.micPoleBlockPct" @change="persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                    <div style="display:flex;align-items:center;gap:6px">
+                      <span class="lbl" style="margin:0">Picks per scan</span>
+                      <input type="number" min="1" step="1" x-model.number="cfg.micPicks" @change="cfg.micPicks=Math.max(1,Math.round(+cfg.micPicks||5));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                     </div>
+                    <div class="mic-hint">Most tickers entered in one scan cycle.</div>
                   </div>
 
                   <!-- Manual slot builder — hidden when Auto is on -->
@@ -467,24 +457,6 @@
                   </div>
                 </div>
 
-                  <div class="g" style="margin-top:10px">
-                    <label class="tog">
-                      <div class="tog-t" :class="cfg.micDefermentEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micDefermentEnabled=!cfg.micDefermentEnabled;persist()}"><div class="tog-k"></div></div>
-                      <div>
-                        <div class="tog-l">Deferment</div>
-                        <div class="mic-hint">No new entries at all while the Sample Scorer headline is negative. Two or more active paths at once close every position.</div>
-                      </div>
-                    </label>
-                    <div x-show="cfg.micDefermentEnabled" style="margin-top:5px;margin-left:2px">
-                      <label class="tog">
-                        <div class="tog-t" :class="cfg.micDeferBothRedEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micDeferBothRedEnabled=!cfg.micDeferBothRedEnabled;persist()}"><div class="tog-k"></div></div>
-                        <div>
-                          <div class="tog-l">Both Poles Red</div>
-                          <div class="mic-hint">Defers while any criterion has both poles in the red.</div>
-                        </div>
-                      </label>
-                    </div>
-                  </div>
               </div><!-- end exit zone -->
               <!-- Fade tab retired; extracted to /junk/MultiIndicator-fade-protectpathA-scrap.html. -->
 
@@ -929,13 +901,12 @@
           if (!eligible.length) return false;
 
           // The worst held position by its score now (see _micLiveCompositeScore), same scale as the candidate's.
-          const scoreOf = p => p._mic ? this._micLiveCompositeScore(p) : -Infinity;
+          // Each held position's latest score is recorded on it, so the log and the next comparison start from it.
+          const scoreOf = p => { if (!p._mic) return -Infinity; const v = this._micLiveCompositeScore(p); if (isFinite(v)) p._micCompositeScore = v; return v; };
           eligible.sort((a, b) => scoreOf(a) - scoreOf(b));
           const worst      = eligible[0];
           const worstScore = scoreOf(worst);
-          // Pre-flight the Force-Evaluate top-up + block re-check that _micOpen runs, before anything is closed: the pool's
-          // first-pass veto only saw pre-top-up criteria, so a candidate can still be blocked once top-up appends criteria,
-          // and by then worst would already be gone. A blocked candidate falls through to the next one in the pool.
+          // Pre-flight the Force-Evaluate top-up that _micOpen runs, before anything is closed.
           let best = null;
           for (const cand0 of pool) {
             if ((cand0.compositeScore - worstScore) < marginThreshold) break;
@@ -948,11 +919,6 @@
             }
             if (this.cfg.micForceGeneralCriteria && this.cfg.micAutoSlots) {
               const full = await this._micTopUpGeneralCriteria(cand.t, cand.criteria);
-              const ann  = (full || []).map(c => this._micAnnotateCritRaw(c, cand.t) ?? (c + '+0'));
-              if (this._micIsEntryBlocked(ann)) {
-                this.log(`[MI] 🔁 Substitution skipped ${cand.t.symbol} — blocked once general criteria were topped up`, 'info');
-                continue;
-              }
               best = { ...cand, criteria: full };
             } else best = cand;
             break;
@@ -978,7 +944,7 @@
             label:      'No Entry',
             labelStyle: 'color:rgba(255,160,0,.9)',
             border:     'border-color:rgba(255,160,0,.45);background:rgba(255,160,0,.06)',
-            title:      (d.weatherNeg != null ? `MI deferment — new entries blocked (scorecard headline ${d.weatherNeg.toFixed(3)} < 0)` : d.bothRed ? `MI deferment — new entries blocked (both poles of ${d.bothRed} are red)` : `MI deferment — new entries blocked (relative target ${d.low.toFixed(1)}% < min entry TP ${d.minTp}%)`) + (d.eject ? ' · ejecting all positions' : ''),
+            title:      `MI deferment — new entries blocked (relative target ${d.low.toFixed(1)}% < min entry TP ${d.minTp}%)`,
             action:     null,
           }];
         },
@@ -1029,22 +995,10 @@
           return `Now: ${WINTER ? `avg down ${t.mv.dn.toFixed(2)}% · avg up ${t.mv.up.toFixed(2)}%` : `avg up ${t.mv.up.toFixed(2)}% · avg down ${t.mv.dn.toFixed(2)}%`} (×${t.lev}, ${t.mv.nb} batch${t.mv.nb===1?'':'es'}, ${t.mv.nUp + t.mv.nDn} tickers) · entry TP ${t.entryTp.toFixed(1)}% · SL ${t.slPct.toFixed(1)}% · cascade ${this._micEffCascadePct().toFixed(1)}% · sacrifice ${this._micEffSacrificePct().toFixed(1)}%` + (t.entryTp < t.minTp ? ' — below floor: deferring' : '');
         },
 
-        // Projected pp for one ticker, price direction (what the Forecast Grader would file for it on first sight): the scorecard's mean pole score
-        // over the ticker's non-price tags (fund / va / iol / ios / lta; LPA is the realized move, so it never enters). null = no scored pole yet
-        // (scorecard too thin) -> nothing to rank on.
-        // One ticker's rank score: pp in this bot's favor. The batch's Indicator forecast when it has one, else the scorecard projection. Null = no score.
+        // One ticker's rank score: pp in this bot's favor, from the batch's Indicator forecast. Null = no forecast.
         _micRankScore(t, fcRank) {
           const s = fcRank && fcRank.get(t.symbol);
-          if (s != null) return { v: s, fc: true };
-          const pp = this._micProjectedPp(t);
-          return pp == null ? null : { v: this._swSampleDir() * pp, fc: false };
-        },
-        _micProjectedPp(t) {
-          if (!t || typeof this._swFcParts !== 'function') return null;
-          const tags = [];
-          for (const c of ['fund', 'va', 'iol', 'ios', 'lta']) { const a = this._micAnnotateCritRaw(c, t); if (a) tags.push(a); }
-          const pr = tags.length ? this._swFcParts(tags) : null;
-          return (pr && isFinite(pr.e)) ? this._swSampleDir() * pr.e : null;
+          return s == null ? null : { v: s, fc: true };
         },
         // Structured readout for the Multi-Indicator body: left = SL + Sacrifice, right = TP + Cascade, each green when viable, red when not.
         // Viable: the resolved value is at or above the Min Entry TP floor (green), under it = red. Cascade / Sacrifice colour on the resolved value; the text shows what actually fires (never under the floor) and they get no bar.
@@ -1076,44 +1030,14 @@
           };
         },
 
-        // Deferment — regime proxy. Defers (no new entries) while the Sample Scorer headline is negative (needs Sample Scoring); the Relative Target
-        // floor is its own separate stop (needs only the LPA window).
-        // eject: two or more deferment paths in effect at once -> Ejection bails every open position.
-        // Both-poles-red: the first criterion (dial family) whose + and - poles are BOTH proven and negative on the
-        // scorecard side the chart shows. No entry pole to favor = no good entry.
-        _micBothPolesRed() {
-          if (typeof this._swLukewarmFavoredSide !== 'function') return null;
-          const list = (this.swLukewarmScoreboard || {})[this._swLukewarmFavoredSide()] || [];
-          const min = Math.max(3, this.cfg.swExtremityMinSamples || 3);
-          const by = {};
-          for (const e of list) if (e && e.pnl < 0 && !(typeof e.n === 'number' && e.n < min)) (by[e.family] ||= {})[e.pole] = true;
-          for (const [fam, p] of Object.entries(by)) if (p.pos && p.neg) return fam;
-          return null;
-        },
-        // The Sample Scorer headline when it is negative (else null) — same value/side the gauge shows. Needs Sample Scoring.
-        _micWeatherNeg() {
-          if (typeof this._swSampleWeather !== 'function' || typeof this._swLukewarmFavoredSide !== 'function') return null;
-          const wx = this._swSampleWeather(this._swLukewarmFavoredSide());
-          return (wx && wx.value != null && wx.value < 0) ? wx.value : null;
-        },
+        // Deferment: no new entries while Relative Target's resolved entry TP is under the Min Entry TP floor.
         _micDefermentState() {
-          const base = this._micDefermentStateBase();
-          // Every deferment path is evaluated on its own; two or more in effect at once = Ejection (bail-all).
-          // Display priority is unchanged: negative headline, then both poles red, then the base reason.
-          const wn = this.cfg.micDefermentEnabled ? this._micWeatherNeg() : null;
-          const fam = (this.cfg.micDefermentEnabled && this.cfg.micDeferBothRedEnabled) ? this._micBothPolesRed() : null;
-          const why = [];
-          if (wn != null) why.push('negative headline');
-          if (fam) why.push(`both poles of ${fam} red`);
-          if (base.deferring) why.push('target under min entry TP');
-          if (!why.length) return base;
-          return Object.assign({}, base, { deferring: true, eject: why.length >= 2, why }, wn != null ? { weatherNeg: wn } : {}, fam ? { bothRed: fam } : {});
+          return this._micDefermentStateBase();
         },
         _micDefermentStateBase() {
           const off = { deferring: false, eject: false };
           // Relative Target mode — whenever it has a usable LPA window: defer while the resolved entry TP
           // (Cascade is the same number) is under the Min Entry TP floor.
-          // Independent of the Deferment toggle itself (the floor is Relative Target's own stop).
           const tg = this._micTargets();
           if (tg.active) {
             const low = tg.entryTp;
@@ -1152,10 +1076,6 @@
 
           const allTickers = this._lastAllTickers || [];
           if (!allTickers.length) return false;
-
-          // Rebuild block state from Extremity Scorer immediately before any slot or pool decisions
-          this._swExtremityBuild?.();
-          this._schIdleCancel?.('sw-build'); // this rebuild supersedes the one SW queued for scan end
 
           // Deferment/Ejection — every cycle, ahead of any slot logic so it still runs with no
           // active entry slots. Ejection (bail-all) fires when two or more deferment paths are in effect.
@@ -1255,7 +1175,8 @@
           ctx.mic.batchSyms = new Set(Object.keys(ocResults)); ctx.mic.verifyLeft = Math.max(cap, cap0);
         },
         async _micScanPool(ctx) {
-          const { allTickers, freshAt, autoMode, slots, scanSkip, basePool } = ctx.mic;
+          const { allTickers, freshAt, autoMode, slots, scanSkip } = ctx.mic;
+          let basePool = ctx.mic.basePool;
           const _swOcResults = ctx.mic.ocResults;
 
           const checkCrit = (c, fr, t) => this._micCheckCrit(c, fr, t, _swOcResults);
@@ -1263,7 +1184,10 @@
           // Entry ranking: Still-Water's Indicator forecast ranks this batch's tickers (er when Regime caution is active, else e), as pp in this
           // bot's favor (a follower reads the leader's shared forecasts). A ticker the batch has no forecast for is ranked by the
           // scorecard projection instead, after the forecast-ranked ones. No score at all = unranked: it sorts last and is never vetoed on score.
+          // SW present: only the tickers its batch forecast covers are candidates. SW absent: MI's criteria alone, unranked.
+          const swOn   = typeof this._swFcRankMap === 'function';
           const fcRank = (await this._swFcRankMap?.()) || new Map();
+          if (swOn) { const n0 = basePool.length; basePool = basePool.filter(t => fcRank.has(t.symbol)); scanSkip.excluded.noForecast = n0 - basePool.length; }
           // Only lta/lpa can come back null (no 1hr candle yet) — by the time a criterion reaches here checkCrit already passed, so fall back to a neutral tier.
           const _micAnnotateCrit = (c, t) => this._micAnnotateCritRaw(c, t) ?? (c + '+0');
           const _poolOne = (t, ocMap = _swOcResults) => {
@@ -1303,16 +1227,11 @@
           }
           const pool = _pooled
             .sort((a, b) => (b.fcRanked - a.fcRanked) || (b.compositeScore - a.compositeScore) || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
-          let entryPool = pool.filter(e => {
-            if (this._micIsEntryBlocked(e.annotCrits)) { scanSkip.blocked++; return false; }
-            if (e.ranked && e.compositeScore < 0) { scanSkip.ppBad = (scanSkip.ppBad || 0) + 1; return false; } // forecast (or projection) points against this bot: never enter
-            return true;
-          });
+          const entryPool = pool;
           const _micTopReasons = obj => Object.entries(obj).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k}:${n}`).join(' ');
           const _micExcludedNote = _micTopReasons(scanSkip.excluded) || 'none';
           const _micUnmatchedNote = _micTopReasons(scanSkip.unmatched) || 'none';
-          this.log(`[MI] 💡 Scan skip summary — universe:${allTickers.length} pool:${basePool.length} qualified:${pool.length} entry:${entryPool.length} | excluded ${_micExcludedNote} | unmatched ${_micUnmatchedNote} | vetoed:${scanSkip.blocked} pp-vetoed:${scanSkip.ppBad || 0}`, 'info');
-          if (this._micPoleBlockNotes?.size) { this.log(`[MI] 🚧 Pole Blocking — ${[...this._micPoleBlockNotes].join(', ')}`, 'info'); this._micPoleBlockNotes.clear(); }
+          this.log(`[MI] 💡 Scan skip summary — universe:${allTickers.length} pool:${basePool.length} qualified:${pool.length} entry:${entryPool.length} | excluded ${_micExcludedNote} | unmatched ${_micUnmatchedNote} `, 'info');
 
           ctx.mic.pool = pool; ctx.mic.entryPool = entryPool; ctx.mic.poolOne = _poolOne;
         },
@@ -1321,7 +1240,7 @@
           if (_micHalted) return;
 
           if (_micDef.deferring) {
-            if (!this._micDeferLogged) { this.log(_micDef.weatherNeg != null ? `[MI] ⛔ Deferment — scorecard headline is negative (${_micDef.weatherNeg.toFixed(3)}); no new entries until it turns positive` : _micDef.bothRed ? `[MI] ⛔ Deferment — both poles of ${_micDef.bothRed} are red on the scorecard; no new entries until one turns` : `[MI] ⛔ Deferment — relative target resolves ${_micDef.low.toFixed(1)}%, under the ${_micDef.minTp}% min entry TP (avg up ${_micDef.mv.up.toFixed(2)}% × ${Number(this.cfg.leverage) || 6}); no new entries until it recovers`, 'info'); this._micDeferLogged = true; }
+            if (!this._micDeferLogged) { this.log(`[MI] ⛔ Deferment — relative target resolves ${_micDef.low.toFixed(1)}%, under the ${_micDef.minTp}% min entry TP (avg up ${_micDef.mv.up.toFixed(2)}% × ${Number(this.cfg.leverage) || 6}); no new entries until it recovers`, 'info'); this._micDeferLogged = true; }
             return;
           }
 
@@ -1400,7 +1319,7 @@
           if (!got) return null;
           if (got.oc) (this.swOcResults ||= {})[sym] = got.oc;
           const r = m.poolOne?.(got.t, { [sym]: got.oc || m.ocResults?.[sym] });
-          if (!r || this._micIsEntryBlocked(r.annotCrits) || (r.ranked && r.compositeScore < 0)) return null;
+          if (!r) return null;
           return r;
         },
         async _micRunScan(ctx = {}) {
@@ -1430,15 +1349,6 @@
             criteria = await this._micTopUpGeneralCriteria(t, criteria);
           }
           const annotCrits = (criteria || []).map(c => this._micAnnotateCritRaw(c, t) ?? (c + '+0'));
-          // Top-up (above) can append criteria — most commonly fund — that were never part of
-          // the match _micIsEntryBlocked already cleared for entryPool. Re-check against the
-          // now-possibly-expanded annotCrits before actually opening; entryPool's own check stays
-          // as the first, cheaper pass, this is the one that has to hold once the real criteria
-          // list is final.
-          if (this.cfg.micForceGeneralCriteria && this.cfg.micAutoSlots
-              && this._micIsEntryBlocked(annotCrits)) {
-            return false;
-          }
           // Reserve this slot for the duration of the open call below.
           this._micPending = (this._micPending || 0) + 1;
           try {
@@ -1599,39 +1509,6 @@
         _micCritScore(c) {
           const ranks = this.micCollapsedSlotRanks || {};
           return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
-        },
-
-        // Pole Blocking is the only score-based entry block left; the forecast ranking vetoes on its own score (see _micScanPool).
-        _micIsEntryBlocked(annotCrits) {
-          const pb = this._micPoleBlocked(annotCrits);
-          if (pb) { (this._micPoleBlockNotes ||= new Set()).add(pb); return true; }
-          return false;
-        },
-
-        // Pole Blocking. On the scorecard side the chart shows, a dial family whose partner pole is
-        // non-positive pole blocks when the spread to its positive partner, measured against the smaller of the two
-        // magnitudes, reaches pct%: (Q - P) / min(|P|, Q) >= pct/100. Absolute gap, no magnitude floor; both poles must be
-        // proven. A positive pole is never blocked; a non-positive partner is left to Deferment.
-        // Returns a short note for the first blocked tag in annotCrits, else null.
-        _micPoleBlocked(annotCrits) {
-          if (!this.cfg.micPoleBlockEnabled || typeof this._swLukewarmFavoredSide !== 'function') return null;
-          const list = (this.swLukewarmScoreboard || {})[this._swLukewarmFavoredSide()] || [];
-          const min = Math.max(3, this.cfg.swExtremityMinSamples || 3);
-          const T = Number(this.cfg.micPoleBlockPct), pct = Number.isFinite(T) ? Math.max(0, T) : 200;
-          const edge = {};
-          for (const e of list) if (e && typeof e.n === 'number' && e.n >= min && typeof e.pnl === 'number') (edge[e.family] ||= {})[e.pole] = e.pnl;
-          for (const c of (annotCrits || [])) {
-            let fam, sign, m = String(c).match(/^(fund|va|iol|ios|lta|lpa)([+-])\d*$/);
-            if (m) { fam = m[1]; sign = m[2]; }
-            else if ((m = String(c).match(/^([+-])(fund)$/))) { sign = m[1]; fam = m[2]; }
-            else continue;
-            const e = edge[fam]; if (!e) continue;
-            const P = e[sign === '+' ? 'pos' : 'neg'], Q = e[sign === '+' ? 'neg' : 'pos'];
-            if (P == null || Q == null || !(Q > 0) || P > 0) continue;
-            const den = Math.min(Math.abs(P), Q), gap = den > 0 ? (Q - P) / den * 100 : Infinity;
-            if (gap > 0 && gap >= pct) return `${fam}${sign} ${P.toFixed(3)}pp vs ${Q.toFixed(3)}pp (${Number.isFinite(gap) ? Math.round(gap) + '%' : '∞'} gap)`;
-          }
-          return null;
         },
 
         // Reads the same shared graylist the host writes on every close (any strategy, keyed by
