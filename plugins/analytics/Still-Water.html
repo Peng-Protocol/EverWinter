@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '3.4.0'; // Change: The Crab layer reads one window, the one that matches the forecast horizon (6 x its length, 6 to 96 hours), instead of blending every window, and a window counts as a crab on any back-and-forth along an approximate range (softer tests, one score bar, a price just past an edge still counts), so far more tickers read as crabbing. | previous: Change: The leader publishes a batch's forecasts to a following bot once, after the slow readings have landed (final scores only), and the follower waits for that publish before ranking.
+  const VERSION = '3.5.0'; // Change: Regime caution also reads the market's shape (short windows against long ones) and its range: an hourly market line is kept for 30 days so ranges reach past the 100-hour candle cache, and the expected market move is learned per level, shape and range position. | previous: Change: The weight tests (indicator blend, Range Fit, Crab layer, Regime caution) and the profile weights bottom out at 1% instead of 0, so no tool is ever switched off and each keeps getting graded.
 
 
 
@@ -140,7 +140,7 @@
   const BG_SKIP = k => k.charAt(0) === '_' || k.indexOf('x_') === 0 || k === 'c60'; // predictions, post-start diagnostics and a data-quality count are never model inputs
   const FC_IND_MINB = 6, FC_IND_FLOOR = 0.02; // Indicator forecast, direction: fewest graded batches the readings are tested on (fewer = the scorecard's own score stands), and the weakest rank correlation worth integrating
   const FC_PROF_TRAITS = ['vol', 'oi', 'fr', 'spr', 'rng60', 'pos24', 'lta'], FC_PROF_MAX = 60; // Weight Profiles: the snapshot readings a ticker is profiled on (ranked inside its batch), and the most profiles kept
-  const FC_PROF_FAM = ['fund', 'va', 'iol', 'ios', 'lta'], FC_PROF_ALL = FC_PROF_FAM.concat(['ind', 'div', 'rng', 'crb']), FC_PROF_LIM = { fund: [-1, 2], va: [-1, 2], iol: [-1, 2], ios: [-1, 2], lta: [-1, 2], ind: [0, 1], div: [0, 2], rng: [0, 1], crb: [0, 1] }; // the weights a profile can set: scorecard family multipliers, indicator blend, divination share, Range Fit blend, crab layer weight
+  const FC_PROF_FAM = ['fund', 'va', 'iol', 'ios', 'lta'], FC_PROF_ALL = FC_PROF_FAM.concat(['ind', 'div', 'rng', 'crb']), FC_PROF_LIM = { fund: [-1, 2], va: [-1, 2], iol: [-1, 2], ios: [-1, 2], lta: [-1, 2], ind: [0.01, 1], div: [0.01, 2], rng: [0.01, 1], crb: [0.01, 1] }; // the weights a profile can set: scorecard family multipliers, indicator blend, divination share, Range Fit blend, crab layer weight
   const VOL_FEATS = [['rng60', 'sn'], ['gk60', 'bg'], ['atr14', 'bg']]; // Indicator forecast, size: geometric mean of own / batch-median ratios (each clamped 0.25 to 4)
   const FC_IDB = '__ew_sw_' + SIDE + '_fcdb_v1', FC_IDB_STORE = 'done', FC_LS_TAIL = 120; // graded forecasts live in IndexedDB; localStorage keeps this many of the newest once IndexedDB has proven itself
   const BG_KEY = '__ew_sw_' + SIDE + '_bg1h_v1', BG_PERSIST_MAX = 600; // persisted 1-hour candle state (compact), newest-used tickers kept
@@ -149,6 +149,9 @@
   const RG_WIN_MAX = 99, RG_MIN_N = 20, RG_FRESH_MS = 2 * 3600000, RG_K = 30, RG_N0 = 6, RG_BN = 30, RG_HL_MS = 72 * 3600000, RG_UP = 0.5, RG_CAP = 3; // Regime caution: longest window in hours (the candle cache holds 100), fewest fresh tickers for a market reading, how far behind a ticker's last hour candle may be and still count, prior weight (forecasts per bucket / cohorts per market level / forecasts per profile), half-life of what it learned, share of a favourable shift kept, cap on a shift (pp)
   const RG_LVL = ['deep red', 'red', 'flat', 'green', 'deep green'], RG_CLS = ['aligned with the market or no divergence', 'diverging up (green against a red market)', 'diverging down (red against a green market)'], RG_REL = ['market flat', 'market red, ticker red or flat', 'market red, ticker green', 'market green, ticker green or flat', 'market green, ticker red'], RG_ZL = ['deep down', 'down', 'flat', 'up', 'deep up'], RG_GL = ['fewer green hours than the market', 'about as many as the market', 'more green hours than the market'];
   const RGM = { key: '', v: null }; // memory: the market's reading per window, cached per hour
+  const MK_KEY = '__ew_sw_' + SIDE + '_mkt_v1', MK_MAX = 720, MK_W = [6, 12, 24, 48, 72, 96, 168, 336], MK_SPLIT = 12, MK_SH = 0.3, MK_SNAP = 0.5; // Market line: storage, hours kept, range windows (hours), longest "short" window of the shape, score gap that makes a shape, share of a typical market move a range's snap starts as
+  const MK = { loaded: false, dirty: false, t: 0, c: [], h: [], l: [] }; // memory: the market line, one equal-weight candle per hour (t = newest hour start, close / high / low as an index)
+  const RG_SH = ['short and long windows agree', 'short windows above long', 'short windows below long'], RG_MC = { b: 'near the bottom', m: 'in the middle', t: 'near the top', u: 'broke up', d: 'broke down', x: 'no range' };
   const CRAB_RX = /^c[bp]/; // crab readings (cb*, cp*): logged and exported, never fed to the indicator ensemble (the crab layer applies them itself)
 
   // Liquidation Surveillance (non-reactive, module-level): the WS connection, per-symbol liquidated-turnover tally for the
@@ -164,7 +167,7 @@
   // plugin keeps goes to the host's IndexedDB data store (window.__ewData, same getItem/setItem/removeItem), which moves a copy an older build
   // left in localStorage on its first read. A host without the store keeps using localStorage.
   const DS_LS_KEYS = () => [ASH_KEY, CROSS_KEY];
-  const DS_MOVED = () => [ASH_OC_HIST_KEY, SAMPLE_OBS_KEY, FC_KEY, PM_KEY, DIV_KEY, BG_KEY, CRAB_KEY, LIQ_KEY, ILQ_KEY, STB_KEY];
+  const DS_MOVED = () => [ASH_OC_HIST_KEY, SAMPLE_OBS_KEY, FC_KEY, PM_KEY, DIV_KEY, BG_KEY, CRAB_KEY, MK_KEY, LIQ_KEY, ILQ_KEY, STB_KEY];
   const DS = {
     _s: k => (window.__ewData && !DS_LS_KEYS().includes(k)) ? window.__ewData : localStorage,
     getItem: k => DS._s(k).getItem(k), setItem: (k, v) => DS._s(k).setItem(k, v), removeItem: k => DS._s(k).removeItem(k),
@@ -483,7 +486,7 @@
                   <div class="tog-t" :class="cfg.swFcRegime!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcRegime=!(cfg.swFcRegime!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Regime caution <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
-                    <div class="ash-hint" x-show="h">Keeps a second score beside each forecast, shifted by how the market's regime and tickers in the same spot did before; a ticker moving against the market is its own profile.</div>
+                    <div class="ash-hint" x-show="h">Keeps a second score beside each forecast, shifted by the market's regime, shape (short vs long windows) and range, and by how tickers in the same spot did before; a ticker moving against the market is its own profile.</div>
                   </div>
                 </label>
                 <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcRegime!==false" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
@@ -496,7 +499,7 @@
                 </div>
                 <div style="margin-top:6px">
                   <div class="lbl">Indicator direction (% of rank, start value)</div>
-                  <input type="number" min="0" max="100" step="5" x-model.number="cfg.swFcIndBlend" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <input type="number" min="1" max="100" step="5" x-model.number="cfg.swFcIndBlend" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Indicator test window (hours)</div>
                   <input type="number" min="1" max="48" step="1" x-model.number="cfg.swFcIndWin" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Liquidation dropoff (hours)</div>
@@ -3049,7 +3052,7 @@
         // PM_MIN hours of history keeps its raw projection. e0 keeps the raw projection (export: projectionTest.raw). Stored direction-neutral like everything here.
         _swFcRangeOn() { return this._swFcOn() && !!this.cfg.swFcRange; },
         // The fit's weight is the bot's own call, like the readings it backs off: the graded window (the indicator test's window) replays every forecast whose full
-        // fit (ef) and raw projection (e0) were both recorded at weights 1 / .75 / .5 / .25 / 0 and keeps the one whose accuracy is best; a lower weight must beat the one
+        // fit (ef) and raw projection (e0) were both recorded at weights 1 / .75 / .5 / .25 / .01 and keeps the one whose accuracy is best; a lower weight must beat the one
         // above it by more than 0.1 points. Under FC_IND_MINB graded batches the fit stands in full. Re-tested whenever a batch is graded.
         _swFcRangeBlendCalc() {
           const fc = this._swFcStore(), done = fc.done, n = done.length, last = n ? done[n - 1].u : 0, win = this._swFcIndWinMs(), key = n + ':' + last + ':' + win;
@@ -3058,11 +3061,11 @@
           const R = done.filter(r => r.u >= last - win && typeof r.ef === 'number' && typeof r.e0 === 'number' && isFinite(r.ef) && isFinite(r.e0) && typeof r.y === 'number' && isFinite(r.y));
           out.rows = R.length; out.batches = new Set(R.map(r => r.a)).size;
           if (out.batches < FC_IND_MINB) return out;
-          const G = [1, 0.75, 0.5, 0.25, 0], acc = {};
+          const G = [1, 0.75, 0.5, 0.25, 0.01], acc = {};
           for (const g of G) acc[g] = R.reduce((s, r) => s + this._swFcAcc(g * r.ef + (1 - g) * r.e0, r.y), 0) / R.length;
           let best = 1; for (const g of G) if (g < best && acc[g] > acc[best] + 0.1) best = g;
           out.b = best; out.acc = Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
-          out.why = best === 1 ? 'the full fit is doing at least as well as any weaker mix' : best === 0 ? 'the fit is pulling accuracy down, so the raw projection stands' : 'a weaker mix of the fit and the raw projection is doing best';
+          out.why = best === 1 ? 'the full fit is doing at least as well as any weaker mix' : best === 0.01 ? 'the fit is pulling accuracy down, so the raw projection stands' : 'a weaker mix of the fit and the raw projection is doing best';
           return out;
         },
         _swFcRangeBlend() { return this._swFcRangeBlendCalc().b; },
@@ -3211,9 +3214,9 @@
         // down, re-tested every graded batch). Size: the geometric mean of the 60-minute range, Garman-Klass and 1-hour ATR against the batch median. The
         // scorecard's own score stays in ep.sc (graded as projectionTest.scorecard). Per-ticker results are logged in bg._dc (direction, -0.5..0.5) and bg._vi (size index).
         _swFcIndOn() { return this._swBgOn(); },
-        _swFcIndBlendCfg() { const v = Number(this.cfg.swFcIndBlend); return Math.max(0, Math.min(100, isFinite(v) ? v : 100)) / 100; },
+        _swFcIndBlendCfg() { const v = Number(this.cfg.swFcIndBlend); return Math.max(1, Math.min(100, isFinite(v) ? v : 100)) / 100; },
         // The direction blend is the bot's own call, like the Crab layer's: every graded forecast the indicator score changed (base score eb, indicator-only score ei, both kept) is replayed at
-        // 1 / .75 / .5 / .25 / 0 and the best accuracy wins (a lower share must beat the one above by more than 0.1 points). Under FC_IND_MINB graded batches or 30 changed forecasts the set value stands.
+        // 1 / .75 / .5 / .25 / .01 and the best accuracy wins (a lower share must beat the one above by more than 0.1 points). Under FC_IND_MINB graded batches or 30 changed forecasts the set value stands.
         _swFcIndBlendCalc() {
           const fc = this._swFcStore(), done = fc.done, n = done.length, last = n ? done[n - 1].u : 0, win = this._swFcIndWinMs(), key = n + ':' + last + ':' + win;
           if (this._swFcIndBl && this._swFcIndBl.key === key) return this._swFcIndBl;
@@ -3221,11 +3224,11 @@
           const R = done.filter(r => r.u >= last - win && typeof r.eb === 'number' && typeof r.ei === 'number' && Math.abs(r.ei - r.eb) > 1e-6 && typeof r.y === 'number' && isFinite(r.y));
           out.rows = R.length; out.batches = new Set(R.map(r => r.a)).size;
           if (out.batches < FC_IND_MINB || R.length < 30) return out;
-          const G = [1, 0.75, 0.5, 0.25, 0], acc = {};
+          const G = [1, 0.75, 0.5, 0.25, 0.01], acc = {};
           for (const g of G) acc[g] = R.reduce((s, r) => s + this._swFcAcc(g * r.ei + (1 - g) * r.eb, r.y), 0) / R.length;
           let best = 1; for (const g of G) if (g < best && acc[g] > acc[best] + 0.1) best = g;
           out.b = best; out.acc = Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
-          out.why = best === 1 ? 'the indicator score is doing at least as well as any weaker mix' : best === 0 ? 'the indicator score is pulling accuracy down, so the scorecard score stands' : 'a weaker mix of the indicator and scorecard scores is doing best';
+          out.why = best === 1 ? 'the indicator score is doing at least as well as any weaker mix' : best === 0.01 ? 'the indicator score is pulling accuracy down, so the scorecard score stands' : 'a weaker mix of the indicator and scorecard scores is doing best';
           return out;
         },
         _swFcIndBlend() { const c = this._swFcIndBlendCalc(); return c.b != null ? c.b : this._swFcIndBlendCfg(); },
@@ -3536,7 +3539,7 @@
           return o;
         },
         // The crab layer's weight is the bot's own call, like Range Fit's: every graded forecast the layer changed (pre-crab score ec0, full-crab score ecf, both kept) is replayed at weights
-        // 1 / .75 / .5 / .25 / 0 and the best accuracy wins (a lower weight must beat the one above by more than 0.1 points). Judged overall and per window (30+ rows
+        // 1 / .75 / .5 / .25 / .01 and the best accuracy wins (a lower weight must beat the one above by more than 0.1 points). Judged overall and per window (30+ rows
         // each); a window with no verdict yet uses the overall one. Under FC_IND_MINB graded batches or 30 changed forecasts the layer stands in full.
         _swFcCrabBlendCalc() {
           const fc = this._swFcStore(), done = fc.done, n = done.length, last = n ? done[n - 1].u : 0, win = this._swFcIndWinMs(), key = n + ':' + last + ':' + win;
@@ -3545,12 +3548,12 @@
           const R = done.filter(r => r.u >= last - win && typeof r.ec0 === 'number' && typeof r.ecf === 'number' && Math.abs(r.ecf - r.ec0) > 1e-6 && typeof r.y === 'number' && isFinite(r.y));
           out.rows = R.length; out.batches = new Set(R.map(r => r.a)).size;
           if (out.batches < FC_IND_MINB || R.length < 30) return out;
-          const G = [1, 0.75, 0.5, 0.25, 0], fmt = acc => Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
+          const G = [1, 0.75, 0.5, 0.25, 0.01], fmt = acc => Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
           const pick = rows => { const acc = {}; for (const g of G) acc[g] = rows.reduce((s, r) => s + this._swFcAcc(g * r.ecf + (1 - g) * r.ec0, r.y), 0) / rows.length; let best = 1; for (const g of G) if (g < best && acc[g] > acc[best] + 0.1) best = g; return { best, acc }; };
           const all = pick(R); out.b = all.best; out.acc = fmt(all.acc);
           const byW = {}; for (const r of R) { const w = r.bg && r.bg.cbw; if (w > 0) (byW[w] ||= []).push(r); }
           for (const w of Object.keys(byW)) if (byW[w].length >= 30) { const p = pick(byW[w]); out.by[w] = p.best; out.accBy[w] = { rows: byW[w].length, accuracyByWeightPct: fmt(p.acc) }; }
-          out.why = out.b === 1 ? 'the crab layer is doing at least as well as any weaker mix' : out.b === 0 ? 'the crab layer is pulling accuracy down, so the forecast stands without it' : 'a weaker mix of the crab layer and the forecast is doing best';
+          out.why = out.b === 1 ? 'the crab layer is doing at least as well as any weaker mix' : out.b === 0.01 ? 'the crab layer is pulling accuracy down, so the forecast stands without it' : 'a weaker mix of the crab layer and the forecast is doing best';
           return out;
         },
         _swFcCrabBlend(w) { const c = this._swFcCrabBlendCalc(); return (w > 0 && c.by[w] != null) ? c.by[w] : c.b; },
@@ -3714,6 +3717,8 @@
         // of its hours), and learns from graded forecasts how tickers in the same spot did against their score. It stores a second score beside e (er, price direction like e):
         // e + the market's expected move (scaled by how far such tickers follow the market) + their usual miss, favourable shifts halved. e and its grade are untouched.
         // A ticker moving against the market falls into buckets of its own, so whether that is bullish or bearish is read from what such tickers did, never assumed.
+        // The market's own state has three parts: its level, its shape (the windows up to MK_SPLIT hours against the longer ones: a bounce after a drop reads differently from a steady drift) and its range
+        // (the market line below, read like a ticker's crab, assumed to be crabbing until it breaks). The expected move is learned per level, then per level and shape, then per level, shape and range position.
         _swRgOn() { return this._swBgOn() && this.cfg.swFcRegime !== false; },
         _swRgWins() {
           const a = [...new Set(String(this.cfg.swFcRegimeWins == null ? '2,6,12,24,48,96' : this.cfg.swFcRegimeWins).split(/[^0-9]+/).map(Number).filter(v => v >= 1 && v <= RG_WIN_MAX))].sort((x, y) => x - y).slice(0, 8);
@@ -3729,11 +3734,61 @@
           for (let i = n - w; i < n; i++) { if (h[i] > hi) hi = h[i]; if (l[i] < lo) lo = l[i]; if (c[i] > c[i - 1]) g++; }
           return { mv: (c[n - 1] / ref - 1) * 100, hi: (hi / ref - 1) * 100, lo: (lo / ref - 1) * 100, gs: g / w };
         },
+        // The market line: every completed hour, the equal-weight mean of all tickers' hourly close / high / low moves against their previous close (outliers clipped at 20%), chained into an index
+        // (high and low are the mean of the tickers' own, so a little wider than a true basket's). Kept for MK_MAX hours, so the market's ranges reach past the 100-hour candle cache.
+        _swMktEnsure() {
+          if (MK.loaded) return; MK.loaded = true;
+          try { const d = JSON.parse(DS.getItem(MK_KEY) || 'null'); if (d && d.v === 1 && d.t > 0 && Array.isArray(d.c) && Array.isArray(d.h) && Array.isArray(d.l) && d.c.length === d.h.length && d.c.length === d.l.length && d.c.every(v => typeof v === 'number' && v > 0)) { MK.t = d.t; MK.c = d.c; MK.h = d.h; MK.l = d.l; } } catch (_) {}
+        },
+        _swMktSaveSoon() { clearTimeout(this._swMktPt); this._swMktPt = setTimeout(() => this._swMktSave(), 20000); },
+        _swMktSave() { if (!MK.loaded) return; MK.dirty = false; try { DS.setItem(MK_KEY, JSON.stringify({ v: 1, t: MK.t, c: MK.c, h: MK.h, l: MK.l })); } catch (_) {} },
+        _swMktSnap(hs) {
+          this._swMktEnsure();
+          if (MK.t && hs - MK.t > 96 * 3600000) { MK.c = []; MK.h = []; MK.l = []; MK.t = 0; } // a gap the candle cache cannot fill: the line starts over
+          const from = MK.t ? MK.t + 3600000 : 0, acc = new Map(), cl = v => Math.max(-0.2, Math.min(0.2, v));
+          for (const sym of Object.keys(BG1H)) {
+            const st = BG1H[sym], n = st && st.c ? st.c.length : 0;
+            for (let i = 1; i < n; i++) {
+              const H = st.t - (n - 1 - i) * 3600000, p = st.c[i - 1]; if (H < from || H > hs || !(p > 0) || !(st.c[i] > 0)) continue;
+              let a = acc.get(H); if (!a) acc.set(H, a = { n: 0, c: 0, h: 0, l: 0 });
+              a.n++; a.c += cl(st.c[i] / p - 1); a.h += cl(st.h[i] / p - 1); a.l += cl(st.l[i] / p - 1);
+            }
+          }
+          let nMax = 0; for (const a of acc.values()) if (a.n > nMax) nMax = a.n;
+          for (const H of [...acc.keys()].sort((x, y) => x - y)) {
+            const a = acc.get(H); if (a.n < RG_MIN_N || (a.n < 0.6 * nMax && H > hs - 3 * 3600000)) break; // the newest hour waits until most tickers have it
+            if (MK.t && H !== MK.t + 3600000) { MK.c = []; MK.h = []; MK.l = []; }
+            const p = MK.c.length ? MK.c[MK.c.length - 1] : 100, rc = a.c / a.n, rh = Math.max(rc, a.h / a.n), rl = Math.min(rc, a.l / a.n);
+            MK.c.push(+(p * (1 + rc)).toFixed(4)); MK.h.push(+(p * (1 + rh)).toFixed(4)); MK.l.push(+(p * (1 + rl)).toFixed(4)); MK.t = H; MK.dirty = true;
+          }
+          if (MK.c.length > MK_MAX) { const k = MK.c.length - MK_MAX; MK.c.splice(0, k); MK.h.splice(0, k); MK.l.splice(0, k); }
+          if (MK.dirty) this._swMktSaveSoon();
+        },
+        // The market's range at line index i: the longest MK_W window the Crab layer's tests read as a crab (u = how far over the bar, 0..1).
+        _swMktDom(i, cfg) {
+          let dom = null;
+          for (const w of MK_W) { const L = this._swCrabLevel(MK.c, MK.h, MK.l, i, w, 0, cfg.edge); if (L && L.s >= cfg.bar) { L.u = (L.s - cfg.bar) / (1 - cfg.bar); dom = L; } }
+          return dom;
+        },
+        // Where the market sits in that range: b / m / t = bottom / middle / top, u / d = it broke out up / down in the last CRAB_H hours, x = no range. cz = the snap (+1 at the bottom = expect up) times u.
+        _swMktState() {
+          this._swMktEnsure(); const n = MK.c.length, cfg = this._swCrabCfg(), none = { mc: 'x', cz: 0, w: 0, lo: 0, hi: 0 };
+          if (n < 8) return none;
+          const i = n - 1, d = this._swMktDom(i, cfg), now = MK.c[i]; let k = 0;
+          for (let b = 1; b <= CRAB_H && !k; b++) {
+            const p = this._swMktDom(i - b, cfg); if (!p) continue; const dl = cfg.edge * p.rg;
+            for (let j = i - b + 1; j <= i; j++) { if (MK.c[j] > p.hi + dl) { k = 1; break; } if (MK.c[j] < p.lo - dl) { k = -1; break; } }
+          }
+          if (k) return Object.assign({}, none, { mc: k > 0 ? 'u' : 'd' });
+          if (!d) return none;
+          return { mc: d.pos < 0.2 ? 'b' : d.pos > 0.8 ? 't' : 'm', cz: d.z * d.u, w: d.W, lo: (d.lo / now - 1) * 100, hi: (d.hi / now - 1) * 100 };
+        },
         // The market per window, from every ticker whose hour candles are fresh (last candle at most RG_FRESH_MS behind): the typical high / low (up / dn, %), the mean position
         // against them (mz, -3..3: a move is divided by the typical extreme on its own side) and the mean green share (mg); sm = the mean of mz over the windows read.
         _swRgMarket(wins) {
           const hs = this._swHourStart(), ids = Object.keys(BG1H), key = hs + '|' + wins.join(',') + '|' + (ids.length / 20 | 0);
           if (RGM.key === key) return RGM.v;
+          this._swMktSnap(hs);
           const per = wins.map(() => ({ n: 0, up: 0, dn: 0, mv: [], gs: 0 }));
           for (const sym of ids) {
             const st = BG1H[sym]; if (!st || !(hs - st.t <= RG_FRESH_MS) || st.c.length < 3) continue;
@@ -3746,7 +3801,8 @@
             return { w, n: p.n, up, dn, mz: zs / p.n, mg: p.gs / p.n };
           });
           const ok = out.filter(Boolean);
-          RGM.key = key; RGM.v = ok.length ? { w: out, sm: ok.reduce((s, x) => s + x.mz, 0) / ok.length, n: Math.max(...ok.map(x => x.n)) } : null;
+          const sa = ok.filter(x => x.w <= MK_SPLIT), sb = ok.filter(x => x.w > MK_SPLIT), av = a => a.reduce((s, x) => s + x.mz, 0) / a.length, gap = (sa.length && sb.length) ? av(sa) - av(sb) : 0, mr = this._swMktState(); // shape: the short windows against the long ones
+          RGM.key = key; RGM.v = ok.length ? { w: out, sm: ok.reduce((s, x) => s + x.mz, 0) / ok.length, n: Math.max(...ok.map(x => x.n)), sh: gap >= MK_SH ? 1 : gap <= -MK_SH ? 2 : 0, mc: mr.mc, cz: mr.cz, mr } : null;
           return RGM.v;
         },
         // One ticker against the market. Per window: position z (move over the market's typical extreme on its side), its bucket (market state x z level, 25) and green bucket
@@ -3765,7 +3821,7 @@
             if (rel === 2) du++; else if (rel === 4) dd++;
           });
           if (!ok) return null;
-          return { v: 1, sm: +mk.sm.toFixed(3), l: this._swRgLevel(mk.sm), c: (du > dd && du * 3 >= ok) ? 1 : (dd > du && dd * 3 >= ok) ? 2 : 0, n: mk.n, w: wins.slice(), zb, gb, z, g };
+          return { v: 1, sm: +mk.sm.toFixed(3), l: this._swRgLevel(mk.sm), c: (du > dd && du * 3 >= ok) ? 1 : (dd > du && dd * 3 >= ok) ? 2 : 0, n: mk.n, sh: mk.sh, mc: mk.mc, cz: +mk.cz.toFixed(3), w: wins.slice(), zb, gb, z, g };
         },
         // What it has learned (kept in the forecast store): mu[level] = market moves seen per market level (cohorts, sum); bt[class] = sums of (ticker move x market move) and
         // market move squared; tb['<hours>z' | '<hours>g'][bucket] = forecasts and the sum of their miss (actual relative move less score); ty = typical size of the market move.
@@ -3775,7 +3831,7 @@
           const o = this._swFcRgNew(), num = v => (typeof v === 'number' && isFinite(v)) ? v : null;
           if (!d || typeof d !== 'object') return o;
           const cell = (c, ks) => { if (!c || typeof c !== 'object') return null; const r = { u: num(c.u) || 0 }; for (const k of ks) { const v = num(c[k]); if (v == null) return null; r[k] = v; } return r; };
-          for (const k of Object.keys(d.mu || {}).slice(0, 5)) { const c = /^[0-4]$/.test(k) ? cell(d.mu[k], ['n', 's']) : null; if (c) o.mu[k] = c; }
+          for (const k of Object.keys(d.mu || {}).slice(0, 100)) { const c = /^[0-4]([0-2][bmtud]?)?$/.test(k) ? cell(d.mu[k], ['n', 's']) : null; if (c) o.mu[k] = c; }
           for (const k of Object.keys(d.bt || {}).slice(0, 3)) { const c = /^[0-2]$/.test(k) ? cell(d.bt[k], ['n', 'a', 'b']) : null; if (c) o.bt[k] = c; }
           for (const k of Object.keys(d.tb || {}).slice(0, 64)) {
             if (!/^\d+[zg]$/.test(k) || !d.tb[k] || typeof d.tb[k] !== 'object') continue;
@@ -3789,11 +3845,19 @@
           if (!x || typeof x !== 'object' || !Array.isArray(x.w) || !x.w.length) return null;
           const num = v => (typeof v === 'number' && isFinite(v)) ? v : null, w = x.w.slice(0, 8).map(v => v | 0), n = w.length;
           const pad = a => { const r = Array.isArray(a) ? a.slice(0, n).map(num) : []; while (r.length < n) r.push(null); return r; };
-          return { v: 1, sm: num(x.sm), l: x.l | 0, c: x.c | 0, n: x.n | 0, w, zb: pad(x.zb).map(v => v == null ? -1 : v | 0), gb: pad(x.gb).map(v => v == null ? -1 : v | 0), z: pad(x.z), g: pad(x.g), mu: num(x.mu), be: num(x.be), ms: num(x.ms), ad: num(x.ad), bw: num(x.bw) };
+          return { v: 1, sm: num(x.sm), l: x.l | 0, c: x.c | 0, n: x.n | 0, sh: Math.max(0, Math.min(2, x.sh | 0)), mc: /^[bmtudx]$/.test(x.mc) ? x.mc : 'x', cz: num(x.cz) || 0, w, zb: pad(x.zb).map(v => v == null ? -1 : v | 0), gb: pad(x.gb).map(v => v == null ? -1 : v | 0), z: pad(x.z), g: pad(x.g), mu: num(x.mu), be: num(x.be), ms: num(x.ms), ad: num(x.ad), bw: num(x.bw) };
         },
         _swRgAge(c, now, ks) { const dt = now - (c.u || now); if (dt > 0) { const f = Math.pow(0.5, dt / RG_HL_MS); for (const k of ks) c[k] *= f; } c.u = now; },
         _swRgTy(R) { const ok = R.ty.n >= 3; return { typ: ok ? R.ty.a / R.ty.n : 0.4, V: ok ? Math.max(0.01, R.ty.q / R.ty.n) : 0.25 }; }, // typical |market move| and its mean square (pp), with starting values until cohorts have been seen
-        // The layer's weight is the bot's own call, like the Crab layer's: every graded forecast it shifted (score e, full shift rg.ad, both kept) is replayed at weights 1 / .75 / .5 / .25 / 0
+        // The market's expected move (price direction, pp): the red / green lean until cohorts say otherwise, then pulled by what cohorts of the same level, of that level and shape, and of that level, shape and
+        // range position saw (each cell starts from its parent's estimate; a range's snap toward its middle is the starting guess for its cell, learned away as cohorts come in).
+        _swRgMu(R, rg, typ) {
+          const st = (e, k) => { const c = R.mu[k]; return c ? (RG_N0 * e + c.s) / (RG_N0 + c.n) : e; }, k1 = String(rg.l), k2 = k1 + (rg.sh | 0);
+          let e = st(st(Math.max(-1, Math.min(1, rg.sm)) * typ, k1), k2);
+          if (rg.mc && rg.mc !== 'x') e = st(e + MK_SNAP * (rg.cz || 0) * typ, k2 + rg.mc);
+          return e;
+        },
+        // The layer's weight is the bot's own call, like the Crab layer's: every graded forecast it shifted (score e, full shift rg.ad, both kept) is replayed at weights 1 / .75 / .5 / .25 / .01
         // on the RAW move (the shift carries the market's own move, which the relative grade hides) and the best accuracy wins (a lower weight must beat the one above by more than 0.1 points).
         // Judged overall and per profile (aligned / diverging up / diverging down, 30+ rows each); a profile with no verdict yet uses the overall one. Under FC_IND_MINB graded batches or
         // 30 shifted forecasts the layer stands in full. The shift is learned before each forecast is graded, so the replay is out of sample.
@@ -3804,11 +3868,11 @@
           const R = done.filter(r => r.u >= last - win && r.rg && typeof r.rg.ad === 'number' && Math.abs(r.rg.ad) > 1e-6 && typeof r.e === 'number' && typeof r.m === 'number' && isFinite(r.m));
           out.rows = R.length; out.batches = new Set(R.map(r => r.a)).size;
           if (out.batches < FC_IND_MINB || R.length < 30) return out;
-          const G = [1, 0.75, 0.5, 0.25, 0], fmt = acc => Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
+          const G = [1, 0.75, 0.5, 0.25, 0.01], fmt = acc => Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
           const pick = rows => { const acc = {}; for (const g of G) acc[g] = rows.reduce((s, r) => s + this._swFcAcc(r.e + g * r.rg.ad, r.m), 0) / rows.length; let best = 1; for (const g of G) if (g < best && acc[g] > acc[best] + 0.1) best = g; return { best, acc }; };
           const all = pick(R); out.b = all.best; out.acc = fmt(all.acc);
           for (const c of [0, 1, 2]) { const rs = R.filter(r => r.rg.c === c); if (rs.length >= 30) { const p = pick(rs); out.by[c] = p.best; out.accBy[RG_CLS[c]] = { rows: rs.length, accuracyByWeightPct: fmt(p.acc) }; } }
-          out.why = out.b === 1 ? 'the regime shift is doing at least as well as any weaker mix' : out.b === 0 ? 'the regime shift is pulling accuracy down, so the score stands without it' : 'a weaker mix of the regime shift and the score is doing best';
+          out.why = out.b === 1 ? 'the regime shift is doing at least as well as any weaker mix' : out.b === 0.01 ? 'the regime shift is pulling accuracy down, so the score stands without it' : 'a weaker mix of the regime shift and the score is doing best';
           return out;
         },
         _swFcRgBlend(c) { const b = this._swFcRgBlendCalc(); return b.by[c] != null ? b.by[c] : b.b; },
@@ -3821,7 +3885,7 @@
           for (const f of list) {
             if (typeof f.e !== 'number') continue;
             const rg = this._swRgRead(f.s, mk, wins); if (!rg) continue;
-            const lv = R.mu[rg.l], mu = (RG_N0 * Math.max(-1, Math.min(1, rg.sm)) * typ + (lv ? lv.s : 0)) / (RG_N0 + (lv ? lv.n : 0)); // the market's expected move: red / green leans it that way (the starting guess) until cohorts of that level say otherwise
+            const mu = this._swRgMu(R, rg, typ); // the market's expected move: red / green leans it that way (the starting guess) until cohorts of that level say otherwise
             const bc = R.bt[rg.c], be = ((bc ? bc.a : 0) + RG_BN * V) / ((bc ? bc.b : 0) + RG_BN * V); // how far this kind of ticker follows the market (1 until it has history)
             let sc = 0, sw = 0;
             rg.w.forEach((w, i) => { for (const [kind, arr] of [['z', rg.zb], ['g', rg.gb]]) { const b = arr[i]; if (b < 0) continue; const T = R.tb[w + kind], c = T && T[b]; if (!c || !(c.n > 0)) continue; const cf = c.n / (c.n + RG_K); sc += cf * (c.s / c.n); sw += cf; } });
@@ -3844,7 +3908,8 @@
         // A graded cohort: the market's move (price direction) at the market level it started in.
         _swFcRgCohort(fc, arr, M, now) {
           const x = arr.find(a => a.f.rg && a.f.rg.l != null); if (!x || !isFinite(M)) return;
-          const R = (fc.rg ||= this._swFcRgNew()), c = (R.mu[x.f.rg.l] ||= { n: 0, s: 0, u: now }); this._swRgAge(c, now, ['n', 's']); c.n += 1; c.s += M;
+          const R = (fc.rg ||= this._swFcRgNew()), g = x.f.rg, k1 = String(g.l), k2 = k1 + (g.sh | 0), add = k => { const c = (R.mu[k] ||= { n: 0, s: 0, u: now }); this._swRgAge(c, now, ['n', 's']); c.n += 1; c.s += M; };
+          add(k1); add(k2); if (g.mc && g.mc !== 'x') add(k2 + g.mc); // the level, the level with the shape, and those with the market's range position
           this._swRgAge(R.ty, now, ['n', 'a', 'q']); R.ty.n += 1; R.ty.a += Math.abs(M); R.ty.q += M * M;
         },
         _swFcRgReset() { const fc = this._swFcStore(); fc.rg = this._swFcRgNew(); this._swFcSave(); },
@@ -3860,17 +3925,18 @@
           const sg = (v, k = 2) => (v >= 0 ? '+' : '') + v.toFixed(k);
           const mw = mk ? mk.w.filter(Boolean) : [];
           let h = mk ? this._swTblHtml(['Market now', 'Score', 'Tickers read', ...mw.map(m => m.w + 'h')], [[RG_LVL[this._swRgLevel(mk.sm)], sg(mk.sm), mk.n, ...mw.map(m => sg(m.mz))]]) : `<div style="${lo}">Market: too few fresh hour candles yet</div>`;
+          if (mk) h += this._swTblHtml(['Shape', 'Market range', 'Range hours', 'Low', 'High'], [[RG_SH[mk.sh], RG_MC[mk.mc], mk.mr.w || '—', mk.mr.w ? sg(mk.mr.lo, 1) + '%' : '—', mk.mr.w ? sg(mk.mr.hi, 1) + '%' : '—']]);
           const dn = rows.filter(f => d * f.rg.ad < -0.05).length, up = rows.filter(f => d * f.rg.ad > 0.05).length, dv = rows.filter(f => f.rg.c > 0);
           h += this._swTblHtml(['In flight', 'Marked down', 'Marked up', 'Against market'], [[rows.length, dn, up, dv.length]]);
           const bl = this._swFcRgBlendCalc();
-          h += this._swTblHtml(['Learned cohorts', 'Tables', 'Weight'], [[Math.round(Object.keys(R.mu).reduce((s, k) => s + R.mu[k].n, 0)), Object.keys(R.tb).length, Math.round(bl.b * 100) + '%']]) + `<div style="${lo};margin-top:2px">${bl.why}</div>`;
+          h += this._swTblHtml(['Learned cohorts', 'Tables', 'Weight'], [[Math.round(Object.keys(R.mu).filter(k => k.length === 1).reduce((s, k) => s + R.mu[k].n, 0)), Object.keys(R.tb).length, Math.round(bl.b * 100) + '%']]) + `<div style="${lo};margin-top:2px">${bl.why}</div>`;
           const top = dv.slice().sort((a, b) => Math.max(...b.rg.z.map(v => Math.abs(v || 0))) - Math.max(...a.rg.z.map(v => Math.abs(v || 0)))).slice(0, 5);
           if (top.length) h += this._swTblHtml(['Ticker', 'Pair', ...top[0].rg.w.map(w => w + 'h')], top.map(f => [f.s.replace('USDT', ''), f.rg.c === 1 ? 'green vs red' : 'red vs green', ...f.rg.w.map((w, i) => f.rg.z[i] == null ? '—' : sg(f.rg.z[i], 1))]), 'Against the market now (position vs its typical extreme, per window)');
           return h;
         },
         _swRgRow(r, d, r2) { // the regime fields of one graded or pending forecast (pp fields in the bot's favor like projectedPp)
           const g = r.rg; if (!g) return null;
-          return { marketScore: r2(g.sm), marketRegime: RG_LVL[g.l], tickerProfile: RG_CLS[g.c], windowsHours: g.w, positionVsMarketExtreme: g.z, greenShare: g.g, marketMovePpInBotFavor: g.mu == null ? null : r2(d * g.mu), sensitivityToMarket: r2(g.be), usualMissPpInBotFavor: g.ms == null ? null : r2(d * g.ms), shiftPpInBotFavor: g.ad == null ? null : r2(d * g.ad), weight: g.bw == null ? null : r2(g.bw), projectedPpWithRegime: r.er == null ? null : r2(d * r.er) };
+          return { marketScore: r2(g.sm), marketRegime: RG_LVL[g.l], marketShape: RG_SH[g.sh | 0], marketRange: RG_MC[g.mc] || RG_MC.x, tickerProfile: RG_CLS[g.c], windowsHours: g.w, positionVsMarketExtreme: g.z, greenShare: g.g, marketMovePpInBotFavor: g.mu == null ? null : r2(d * g.mu), sensitivityToMarket: r2(g.be), usualMissPpInBotFavor: g.ms == null ? null : r2(d * g.ms), shiftPpInBotFavor: g.ad == null ? null : r2(d * g.ad), weight: g.bw == null ? null : r2(g.bw), projectedPpWithRegime: r.er == null ? null : r2(d * r.er) };
         },
         _swRgExport() {
           const fc = this._swFcStore(), d = this._swSampleDir(), R = fc.rg || this._swFcRgNew(), r3 = v => (v == null ? null : +Number(v).toFixed(3)), wins = this._swRgWins(), mk = this._swRgMarket(wins), { typ, V } = this._swRgTy(R);
@@ -3888,6 +3954,7 @@
             settings: { windowsHours: wins, maxWindowHours: RG_WIN_MAX, minTickersForMarket: RG_MIN_N, freshHoursMax: RG_FRESH_MS / 3600000, priorWeight: { cohortsPerMarketLevel: RG_N0, forecastsPerBucket: RG_K }, halfLifeHours: RG_HL_MS / 3600000, favourableShiftKeptPct: RG_UP * 100, shiftCapPp: RG_CAP },
             marketNow: mk ? { score: r3(mk.sm), regime: RG_LVL[this._swRgLevel(mk.sm)], tickersRead: mk.n, byWindow: mk.w.filter(Boolean).map(m => ({ hours: m.w, tickers: m.n, typicalHighPct: r3(m.up), typicalLowPct: r3(-m.dn), meanPosition: r3(m.mz), meanGreenShare: r3(m.mg) })) } : null,
             marketMoveByRegime: RG_LVL.map((nm, k) => { const c = R.mu[k]; return { regime: nm, cohorts: c ? r3(c.n) : 0, meanMarketMoveInBotFavorPp: c && c.n > 0 ? r3(d * c.s / c.n) : null }; }),
+            marketMoveByShapeAndRange: Object.keys(R.mu).filter(k => k.length > 1).sort().map(k => ({ cell: RG_LVL[k[0]] + ' / ' + RG_SH[k[1]] + (k[2] ? ' / ' + RG_MC[k[2]] : ''), cohorts: r3(R.mu[k].n), meanMarketMoveInBotFavorPp: R.mu[k].n > 0 ? r3(d * R.mu[k].s / R.mu[k].n) : null })),
             typicalMarketMovePct: r3(typ), sensitivityByProfile: RG_CLS.map((nm, k) => { const c = R.bt[k]; return { profile: nm, forecasts: c ? r3(c.n) : 0, sensitivity: r3(((c ? c.a : 0) + RG_BN * V) / ((c ? c.b : 0) + RG_BN * V)) }; }),
             tables,
             test: { note: 'graded forecasts that carry a regime score, split by the shift it made (bot\'s favor: down = under -0.05 pp, up = over +0.05). The score is judged against the RAW move (market included); the usual grade is relative to the batch. A shift is working when marked-down forecasts move worse than left-alone ones', rows: rows.length,
