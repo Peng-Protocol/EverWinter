@@ -21,7 +21,8 @@
   'losers' lets a symbol that just closed in profit re-trigger immediately.
 
   Entry pool fires once per fresh sample batch (_swOcResultsAt) — will not re-scan
-  the same batch twice. Candidates are ranked on every ticker's latest stored reading (any age) and refetched before entry.
+  the same batch twice. Candidates are ranked by Still-Water's Indicator forecast for the batch (er when Regime caution is active, else e),
+  falling back to the scorecard projection for tickers with no forecast, and refetched before entry when not from the batch.
   Drawdown throttle and gains lock gate all entries.
 
   Load via Plugin Manager in either bot's config panel, AFTER Still-Water (and after SunChaser / EverWinter if live).
@@ -31,7 +32,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '2.0.0'; // Change: Unified Multi-Indicator for both bots, replacing MultiIndicator-Chaser (1.108.1) and MultiIndicator-Winter (1.108.1). Reads Still-Water (_sw*/sw*) instead of Ashfall/Permafrost; side detected from the host; Winter's saved miw* config, history and open-position tags migrate to the mic* names on first load. Bridges IO/L and IO/S (Still-Water has no _swLsShare/_swLsFetch) and the sw-build scheduler id.
+    const VERSION       = '2.1.1'; // Change: A follower ranks entries on the leader's shared forecasts (Still-Water), so the scorecard projection only ranks tickers the batch has no forecast for. | previous: Change: Entries are ranked by Still-Water's Indicator forecast (er when Regime caution is active, else e; the scorecard projection ranks tickers the batch has no forecast for). Removed the Co-Qualifying ranking, the lukewarm veto, the sparsity block and the rolling-average position score; substitution compares forecast scores.
   const DEFAULT_SLOTS = [[]];
   let   WINTER        = false;      // set in transform() from the host; every side switch below reads it
   let   MIC_HIST_KEY  = '__mic_hist_batches'; // Winter keeps its own '__miw_hist_batches' so existing history carries over
@@ -293,8 +294,8 @@
                     </label>
                   </div>
 
-                  <!-- Pole Blocking — Sample Scoring only -->
-                  <div x-show="cfg.swSampleScoringEnabled" style="margin-bottom:8px">
+                  <!-- Pole Blocking -->
+                  <div style="margin-bottom:8px">
                     <label class="tog">
                       <div class="tog-t" :class="cfg.micPoleBlockEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micPoleBlockEnabled=!cfg.micPoleBlockEnabled;persist()}"><div class="tog-k"></div></div>
                       <div>
@@ -450,7 +451,7 @@
                   <div class="tog-t" :class="cfg.micSubstitutionEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micSubstitutionEnabled=!cfg.micSubstitutionEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Substitution</div>
-                    <div class="mic-hint">When no slot is free, swaps the worst position (by live rolling-average score) for a better candidate; needs Co-Qualifying Penalty on.</div>
+                    <div class="mic-hint">When no slot is free, swaps the worst position (by its live forecast score) for a better candidate.</div>
                   </div>
                 </label>
                 <div x-show="cfg.micSubstitutionEnabled" style="margin-top:8px">
@@ -910,8 +911,7 @@
           return true;
         },
 
-        // Only meaningful when Co-Qualifying Penalty is on (Still-Water) — otherwise compositeScore
-        // is always 0 for both sides and the margin check never clears, so this is a safe no-op.
+        // compositeScore is the forecast score (pp in this bot's favor): a candidate must beat the worst held position's score by the margin.
         // No path restriction on what it can close — cross-strategy, any held position, same as
         // Liquid-Diver's version. The swap is still score-gated, not automatic.
         async _micTrySubstitute(pool, ctx) {
@@ -928,9 +928,7 @@
           });
           if (!eligible.length) return false;
 
-          // Recomputes the existing position's score live from its rolling-average
-          // criteria (see _swPositionAvgCriteria/_swPositionCriteriaSample), same as the
-          // candidate's own score is computed fresh each scan.
+          // The worst held position by its score now (see _micLiveCompositeScore), same scale as the candidate's.
           const scoreOf = p => p._mic ? this._micLiveCompositeScore(p) : -Infinity;
           eligible.sort((a, b) => scoreOf(a) - scoreOf(b));
           const worst      = eligible[0];
@@ -1033,18 +1031,20 @@
 
         // Projected pp for one ticker, price direction (what the Forecast Grader would file for it on first sight): the scorecard's mean pole score
         // over the ticker's non-price tags (fund / va / iol / ios / lta; LPA is the realized move, so it never enters). null = no scored pole yet
-        // (Sample Scoring off or scorecard too thin) -> nothing to veto on.
+        // (scorecard too thin) -> nothing to rank on.
+        // One ticker's rank score: pp in this bot's favor. The batch's Indicator forecast when it has one, else the scorecard projection. Null = no score.
+        _micRankScore(t, fcRank) {
+          const s = fcRank && fcRank.get(t.symbol);
+          if (s != null) return { v: s, fc: true };
+          const pp = this._micProjectedPp(t);
+          return pp == null ? null : { v: this._swSampleDir() * pp, fc: false };
+        },
         _micProjectedPp(t) {
           if (!t || typeof this._swFcParts !== 'function') return null;
           const tags = [];
           for (const c of ['fund', 'va', 'iol', 'ios', 'lta']) { const a = this._micAnnotateCritRaw(c, t); if (a) tags.push(a); }
           const pr = tags.length ? this._swFcParts(tags) : null;
           return (pr && isFinite(pr.e)) ? this._swSampleDir() * pr.e : null;
-        },
-        // Entry veto: the projected pp points against this bot — negative on Chaser (longs), positive on Winter (shorts). Unknown projection never vetoes.
-        _micPpBad(t) {
-          const pp = this._micProjectedPp(t);
-          return pp != null && this._swSampleDir() * pp < 0;
         },
         // Structured readout for the Multi-Indicator body: left = SL + Sacrifice, right = TP + Cascade, each green when viable, red when not.
         // Viable: the resolved value is at or above the Min Entry TP floor (green), under it = red. Cascade / Sacrifice colour on the resolved value; the text shows what actually fires (never under the floor) and they get no bar.
@@ -1092,7 +1092,7 @@
         },
         // The Sample Scorer headline when it is negative (else null) — same value/side the gauge shows. Needs Sample Scoring.
         _micWeatherNeg() {
-          if (!this.cfg.swSampleScoringEnabled || typeof this._swSampleWeather !== 'function' || typeof this._swLukewarmFavoredSide !== 'function') return null;
+          if (typeof this._swSampleWeather !== 'function' || typeof this._swLukewarmFavoredSide !== 'function') return null;
           const wx = this._swSampleWeather(this._swLukewarmFavoredSide());
           return (wx && wx.value != null && wx.value < 0) ? wx.value : null;
         },
@@ -1156,18 +1156,6 @@
           // Rebuild block state from Extremity Scorer immediately before any slot or pool decisions
           this._swExtremityBuild?.();
           this._schIdleCancel?.('sw-build'); // this rebuild supersedes the one SW queued for scan end
-
-          // Open-Position Rolling-Average Criteria refresh (see Still-Water's
-          // _swPositionCriteriaSample, which does its own fresh per-symbol fetch — the bulk
-          // allTickers list is only the universe and can be hours old) — runs every cycle regardless of
-          // whether any entry slot is active, since positions can still be open with none
-          // configured. Only ever touches the handful of currently-open symbols, so it isn't
-          // gated behind the follower no-own-fetch rule the rest of this scan is subject to.
-          if (this.positions?.length) {
-            for (const pos of this.positions) {
-              await this._swPositionCriteriaSample?.(pos);
-            }
-          }
 
           // Deferment/Ejection — every cycle, ahead of any slot logic so it still runs with no
           // active entry slots. Ejection (bail-all) fires when two or more deferment paths are in effect.
@@ -1272,37 +1260,20 @@
 
           const checkCrit = (c, fr, t) => this._micCheckCrit(c, fr, t, _swOcResults);
 
-          // Build pool before capacity check so historical matches are logged regardless
-          const _coQualEnabled = this.cfg.swCoQualPenaltyEnabled;
-          const _cqRanks = _coQualEnabled ? (this.micCollapsedSlotRanks || {}) : null;
-          const _cqScaledRank = (rawC, annotC) => this._micScaledRank(rawC, annotC, _cqRanks);
-          // Wraps the raw annotation so every criterion reading produced during this scan's
-          // pool building feeds the Extremity Scorer's sample pool (see _swDialSample) —
-          // regardless of whether this ticker ends up matching a slot or opening a trade.
-          // Cutoffs need to be provable from the wide stream of what's actually out there,
-          // not just from the narrow trickle of closed trades.
-          const _micAnnotateCrit = (c, t) => {
-            const tag = _micAnnotateCritRaw(c, t);
-            this._swDialSample?.(tag);
-            return tag;
-          };
-          // Delegates to the class-level _micAnnotateCritRaw (also called by Still-Water's open-position
-          // sampler, which reads it off `this`). Only lta/lpa can come back null (no 1hr candle yet) —
-          // by the time a criterion reaches here checkCrit already passed, so fall back to a neutral tier.
-          const _micAnnotateCritRaw = (c, t) => this._micAnnotateCritRaw(c, t) ?? (c + '+0');
-          // Richness score for sort priority when Co-Qual is off — sum of each matched
-          // criterion's own collapsed rank, so capacity still favors historically-stronger
-          // tickers even without Co-Qual scoring turned on.
-          const _richness = e => e.criteria.reduce((s, c) => s + this._micCritScore(c), 0) * (e.dataFactor ?? 1);
-          const _poolOne = (t, ocMap = _swOcResults, sample = true) => {
+          // Entry ranking: Still-Water's Indicator forecast ranks this batch's tickers (er when Regime caution is active, else e), as pp in this
+          // bot's favor (a follower reads the leader's shared forecasts). A ticker the batch has no forecast for is ranked by the
+          // scorecard projection instead, after the forecast-ranked ones. No score at all = unranked: it sorts last and is never vetoed on score.
+          const fcRank = (await this._swFcRankMap?.()) || new Map();
+          // Only lta/lpa can come back null (no 1hr candle yet) — by the time a criterion reaches here checkCrit already passed, so fall back to a neutral tier.
+          const _micAnnotateCrit = (c, t) => this._micAnnotateCritRaw(c, t) ?? (c + '+0');
+          const _poolOne = (t, ocMap = _swOcResults) => {
               const checkCrit = (c, fr, tt) => this._micCheckCrit(c, fr, tt, ocMap);
-              const _ann = sample ? _micAnnotateCrit : _micAnnotateCritRaw; // only the fresh random batch feeds the Extremity sample pool
               const fr       = parseFloat(t.fundingRate || 0) * 100;
               const critOk = c => checkCrit(c, fr, t);
 
               let matched = null; // { criteria, annotCrits, slotIdx }
               if (autoMode) {
-                const m = this._micAutoQualify(critOk, c => _ann(c, t));
+                const m = this._micAutoQualify(critOk, c => _micAnnotateCrit(c, t));
                 if (m) matched = { ...m, slotIdx: -1 };
               } else {
                 const slotIdx = slots.findIndex(s => s.length > 0 && s.every(c => checkCrit(c, fr, t)));
@@ -1310,7 +1281,7 @@
                   const _slotCrits = slots[slotIdx];
                   matched = {
                     criteria: _slotCrits,
-                    annotCrits: _slotCrits.map(c => _ann(c, t)),
+                    annotCrits: _slotCrits.map(c => _micAnnotateCrit(c, t)),
                     slotIdx,
                   };
                 }
@@ -1321,46 +1292,20 @@
               }
 
               const _annotCrits = matched.annotCrits;
-              const _annotKey = [..._annotCrits].sort().join(',');
-              let compositeScore = 0;
-              if (_coQualEnabled && _cqRanks) {
-                if (autoMode) {
-                  // Every true criterion is already captured in matched.criteria — sum
-                  // directly (positives and negatives together) rather than hunting for
-                  // "other matching combos" to penalize. There's only one canonical match
-                  // set per ticker now, so a separate penalty pass would be redundant.
-                  compositeScore = matched.criteria.reduce((s, c, i) => s + _cqScaledRank(c, _annotCrits[i]), 0);
-                } else {
-                  const bestScore = matched.criteria.reduce((s, c, i) => s + _cqScaledRank(c, _annotCrits[i]), 0);
-                  let penalty = 0;
-                  for (let i = 0; i < slots.length; i++) {
-                    if (i === matched.slotIdx) continue;
-                    if (!slots[i].length || !slots[i].every(c => checkCrit(c, fr, t))) continue;
-                    const otherAnnot = slots[i].map(c => _ann(c, t));
-                    const sc = slots[i].reduce((s, c, j) => s + _cqScaledRank(c, otherAnnot[j]), 0);
-                    if (sc < 0) penalty += sc;
-                  }
-                  compositeScore = bestScore + penalty;
-                }
-              }
-              return { t, criteria: matched.criteria, slotIdx: matched.slotIdx, annotKey: _annotKey, annotCrits: _annotCrits, compositeScore, dataFactor: this._swSparse?.(_annotCrits)?.factor ?? 1 };
+              const rs = this._micRankScore(t, fcRank);
+              return { t, criteria: matched.criteria, slotIdx: matched.slotIdx, annotKey: [..._annotCrits].sort().join(','), annotCrits: _annotCrits, compositeScore: rs ? rs.v : 0, ranked: !!rs, fcRanked: !!(rs && rs.fc) };
             };
           const _pooled = [];
           for (const t of basePool) {
             if (this._scanDue()) await this._scanCp();
-            const r = _poolOne(t, undefined, ctx.mic.batchSyms.has(t.symbol));
+            const r = _poolOne(t);
             if (r) _pooled.push(r);
           }
           const pool = _pooled
-            .sort((a, b) => _coQualEnabled
-              ? (b.compositeScore - a.compositeScore || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)))
-              : (_richness(b) - _richness(a) || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0))));
-          // The Extremity veto runs after hist logging so a vetoed type keeps generating the
-          // data it needs to recover (see _micIsEntryBlocked) — it only stops the real open.
+            .sort((a, b) => (b.fcRanked - a.fcRanked) || (b.compositeScore - a.compositeScore) || Math.abs(parseFloat(b.t.fundingRate || 0)) - Math.abs(parseFloat(a.t.fundingRate || 0)));
           let entryPool = pool.filter(e => {
-            const blocked = this._micIsEntryBlocked(e.annotCrits);
-            if (blocked) { scanSkip.blocked++; return false; }
-            if (this._micPpBad(e.t)) { scanSkip.ppBad = (scanSkip.ppBad || 0) + 1; return false; } // projected pp against this bot: never enter
+            if (this._micIsEntryBlocked(e.annotCrits)) { scanSkip.blocked++; return false; }
+            if (e.ranked && e.compositeScore < 0) { scanSkip.ppBad = (scanSkip.ppBad || 0) + 1; return false; } // forecast (or projection) points against this bot: never enter
             return true;
           });
           const _micTopReasons = obj => Object.entries(obj).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k}:${n}`).join(' ');
@@ -1368,7 +1313,6 @@
           const _micUnmatchedNote = _micTopReasons(scanSkip.unmatched) || 'none';
           this.log(`[MI] 💡 Scan skip summary — universe:${allTickers.length} pool:${basePool.length} qualified:${pool.length} entry:${entryPool.length} | excluded ${_micExcludedNote} | unmatched ${_micUnmatchedNote} | vetoed:${scanSkip.blocked} pp-vetoed:${scanSkip.ppBad || 0}`, 'info');
           if (this._micPoleBlockNotes?.size) { this.log(`[MI] 🚧 Pole Blocking — ${[...this._micPoleBlockNotes].join(', ')}`, 'info'); this._micPoleBlockNotes.clear(); }
-          if (this._micSparseNotes?.size) { this.log(`[MI] 🪶 Sparsity — blocked thin poles: ${[...this._micSparseNotes].join(', ')}`, 'info'); this._micSparseNotes.clear(); }
 
           ctx.mic.pool = pool; ctx.mic.entryPool = entryPool; ctx.mic.poolOne = _poolOne;
         },
@@ -1455,8 +1399,8 @@
           const got = await this._swFetchCandidate?.(sym, false, m.needsHr);
           if (!got) return null;
           if (got.oc) (this.swOcResults ||= {})[sym] = got.oc;
-          const r = m.poolOne?.(got.t, { [sym]: got.oc || m.ocResults?.[sym] }, false);
-          if (!r || this._micIsEntryBlocked(r.annotCrits) || this._micPpBad(r.t)) return null;
+          const r = m.poolOne?.(got.t, { [sym]: got.oc || m.ocResults?.[sym] });
+          if (!r || this._micIsEntryBlocked(r.annotCrits) || (r.ranked && r.compositeScore < 0)) return null;
           return r;
         },
         async _micRunScan(ctx = {}) {
@@ -1486,13 +1430,6 @@
             criteria = await this._micTopUpGeneralCriteria(t, criteria);
           }
           const annotCrits = (criteria || []).map(c => this._micAnnotateCritRaw(c, t) ?? (c + '+0'));
-          // Feeds the Extremity Scorer's sample pool (see _swDialSample) — this is the
-          // actual-open annotation path, not just scan-time pool building, so a position's
-          // own qualifying readings count toward the cutoff too.
-          for (const tag of annotCrits) this._swDialSample?.(tag);
-          if (this.cfg.micForceGeneralCriteria && this.cfg.micAutoSlots && this.cfg.swCoQualPenaltyEnabled) {
-            compositeScore = criteria.reduce((s, c, i) => s + this._micScaledRank(c, annotCrits[i]), 0);
-          }
           // Top-up (above) can append criteria — most commonly fund — that were never part of
           // the match _micIsEntryBlocked already cleared for entryPool. Re-check against the
           // now-possibly-expanded annotCrits before actually opening; entryPool's own check stays
@@ -1650,45 +1587,10 @@
           return false;
         },
 
-        // Co-Qualifying Penalty scoring for one criterion. Base rank is looked up from the
-        // ticker's actual annotated tier (e.g. "fund+3" -> "fund+"), matching exactly how the
-        // Extremity Scorer collapses closes into dial-pole buckets (see _swExtremityBuild).
-        // This drives ticker ordering (compositeScore sort in the entry pool) as well as the
-        // co-qualification penalty itself. ranksOverride (used by the substitute-check path)
-        // still wins when explicitly supplied.
-        _micScaledRank(rawC, annotC, ranksOverride) {
-          const ranks = ranksOverride ?? (this.cfg.swCoQualPenaltyEnabled ? (this.micCollapsedSlotRanks || {}) : null);
-          if (!ranks) return 0;
-          const annotKey = (annotC || '').replace(/\d+$/, '');
-          const base = ranks[annotKey] ?? 0;
-          if (!base) return 0;
-          // Depth = distance past the slot's own gate threshold, in the qualifying direction —
-          // NOT raw tier magnitude. For a ">" gate, a higher tier is further past threshold and
-          // deeper. For a "<" gate, a LOWER tier is further past threshold and deeper — using
-          // raw magnitude there would score a barely-qualifying ticker as "deeper" than one
-          // that qualifies strongly, which is backwards.
-          const annotM = (annotC || '').match(/([+-]?\d+)$/);
-          const tierVal = annotM ? parseInt(annotM[1], 10) : 0;
-          const gateM = rawC.match(/([<>])(-?\d+)$/);
-          let depth = Math.abs(tierVal);
-          if (gateM) {
-            const threshold = parseInt(gateM[2], 10);
-            depth = gateM[1] === '>' ? Math.max(0, tierVal - threshold) : Math.max(0, threshold - tierVal);
-          }
-          // Fund tiers are now {0.0025%} each; normalise its depth back to the old 0.25%-tier scale so
-          // the finer step doesn't inflate fund's co-qual weight ~100x relative to the other criteria.
-          if (/^fund/.test(annotKey)) depth = depth * (this.cfg.micFundStep / 0.25);
-          const depthPct = (this.cfg.swCoQualDepthPct ?? 10) / 100;
-          return base * (this._swSparseOne?.(annotC)?.f ?? 1) * (1 + depth * depthPct);
-        },
-        // Live version of the compositeScore frozen at open — used by substitution so an
-        // existing position is judged on where it stands NOW, not where it stood at entry.
-        // Falls back to the frozen score if raw criteria weren't stored (older positions
-        // opened before _micRawCriteria existed) or Co-Qual scoring is off.
+        // A held position's score now: the newest Still-Water forecast on its ticker, else the score frozen at open.
         _micLiveCompositeScore(pos) {
-          if (!pos._micRawCriteria?.length) return pos._micCompositeScore ?? 0;
-          const avgAnnot = this._swPositionAvgCriteria?.(pos) || pos._micCriteria || [];
-          return pos._micRawCriteria.reduce((s, c, i) => s + this._micScaledRank(c, avgAnnot[i]), 0);
+          const s = this._swFcScoreOf?.(pos.symbol);
+          return s != null ? s : (pos._micCompositeScore ?? 0);
         },
 
         // Shared collapsed-rank lookup (own + partner + historical PnL, see micCollapsedSlotRanks)
@@ -1699,24 +1601,20 @@
           return (ranks[c] ?? 0) + (ranks[c + '+'] ?? 0) + (ranks[c + '-'] ?? 0);
         },
 
-        // The Extremity Scorer's whole-ticker lukewarm veto (see _swExtremityVeto in
-        // Still-Water — "explicitly avoid any ticker exhibiting lukewarm values").
+        // Pole Blocking is the only score-based entry block left; the forecast ranking vetoes on its own score (see _micScanPool).
         _micIsEntryBlocked(annotCrits) {
-          if (this._swExtremityVeto?.(annotCrits)) return true;
-          const sp = this._swSparse?.(annotCrits);
-          if (sp?.block) { (this._micSparseNotes ||= new Set()).add(sp.note); return true; }
           const pb = this._micPoleBlocked(annotCrits);
           if (pb) { (this._micPoleBlockNotes ||= new Set()).add(pb); return true; }
           return false;
         },
 
-        // Pole Blocking (Sample Scoring only). On the scorecard side the chart shows, a dial family whose partner pole is
+        // Pole Blocking. On the scorecard side the chart shows, a dial family whose partner pole is
         // non-positive pole blocks when the spread to its positive partner, measured against the smaller of the two
         // magnitudes, reaches pct%: (Q - P) / min(|P|, Q) >= pct/100. Absolute gap, no magnitude floor; both poles must be
         // proven. A positive pole is never blocked; a non-positive partner is left to Deferment.
         // Returns a short note for the first blocked tag in annotCrits, else null.
         _micPoleBlocked(annotCrits) {
-          if (!this.cfg.micPoleBlockEnabled || !this.cfg.swSampleScoringEnabled || typeof this._swLukewarmFavoredSide !== 'function') return null;
+          if (!this.cfg.micPoleBlockEnabled || typeof this._swLukewarmFavoredSide !== 'function') return null;
           const list = (this.swLukewarmScoreboard || {})[this._swLukewarmFavoredSide()] || [];
           const min = Math.max(3, this.cfg.swExtremityMinSamples || 3);
           const T = Number(this.cfg.micPoleBlockPct), pct = Number.isFinite(T) ? Math.max(0, T) : 200;

@@ -2,24 +2,21 @@
   Ashfall Strategy Plugin for PseudoChaser
   Scoring and cross-bot coordination layer for MultiIndicator-Chaser.
 
-  Extremity Scorer / Lukewarm Scoring: every criterion reading MIC annotates is
-  sampled into a rolling pool and sorted, per pole, into extreme vs lukewarm
-  against that pole's own observed spread. Closed trades score both a per-pole
-  dial (what MIC's blocking and co-qual ranking read) and a two-bucket Extreme vs
-  Lukewarm tally; whichever bucket is in higher net profit becomes the side the
-  entry veto targets, re-decided on every rebuild rather than toggled by hand.
+  Sample Scorer: every criterion reading the sample batch carries is sorted, per pole, into
+  extreme vs lukewarm against that pole's own observed spread and scored against how the
+  sampled tickers moved. The chart and headline show the side that is earning more. The
+  Indicator forecast (always on) ranks each batch's tickers for entry: er when Regime caution
+  is active, else e (see _swFcRankMap).
 
-  Cross bus: cascade/sacrifice triggers, drawdown-halt and gains-lock transitions
-  and Gains Continuation steps are broadcast to Permafrost and read back, so the
-  two sides can lift each other's halts (Mutual DDH Lift) or halt pre-emptively
-  on the partner's winning streak (GC).
+  Cross bus: cascade/sacrifice triggers are broadcast to the partner bot and
+  listed in the Cross tab.
 
   Order Count Surveillance supplies the OC/volume/OI population samples that
   MIC's ocs, ocx, va, iol, ios, lta and lpa criteria are all measured against (lta/lpa read the
   1hr candle fetched per sampled ticker, see _swHourCandle).
 
-  The scorer is direction-agnostic: it only learns what realized PnL says
-  about this installation — the same logic powers Permafrost on PseudoWinter.
+  The scorer is direction-agnostic: it only learns what the sampled tickers did
+  — the same logic powers Permafrost on PseudoWinter.
 
   Load via Plugin Manager in PseudoChaser's config panel.
   Load AFTER SunChaser if using live trading — see README Plugin Stack Order.
@@ -29,7 +26,7 @@
 (function () {
   'use strict';
 
-    const VERSION = '3.1.0'; // Change: A following bot now merges the leader's graded forecasts into its own history (kept in IndexedDB) instead of keeping only the leader's latest 200, and the Indicator direction blend is tested on the graded window like the Crab layer's, with the set value standing until it has a verdict. | previous: Change: The panel follows the bot it runs on: Permafrost with ❄ and ice-blue on PseudoWinter, Ashfall with ♨ and orange on PseudoChaser; labels, hints and logs name this side and its partner.
+  const VERSION = '3.3.1'; // Change: The leader publishes a batch's forecasts to a following bot once, after the slow readings have landed (final scores only), and the follower waits for that publish before ranking. | previous: Change: Gains Continuation, Mutual DDH Lift and the drawdown-halt / gains-lock cross broadcasts are removed (the Cross tab keeps cascade/sacrifice); a following bot ranks entries from the leader's shared forecasts; the Regime caution and Crab layer readouts are tables.
 
 
 
@@ -47,32 +44,13 @@
     ashfallEnabled: true,
     // Cross Broadcast is always on (no toggle) — see cross tab template.
     ashfallCrossEnabled: true,
-    ashfallMutualDdLiftEnabled: true,
-    // Extremity Scorer / Lukewarm Scoring. Criteria universe: fund, V/A, IO/L, IO/S, LTA, LPA.
-    // swExtremitySplitPct/
-    // swExtremityMinSamples govern the same "sort >=3 values into high/lukewarm/low"
-    // cutoff for every remaining dial family; swLukewarmRatioPct is the whole-ticker veto
-    // share — see _swExtremityBuild/_swExtremityVeto.
+    // Sample Scorer. Criteria universe: fund, V/A, IO/L, IO/S, LTA, LPA.
+    // swExtremitySplitPct/swExtremityMinSamples govern the "sort >=3 values into
+    // high/lukewarm/low" cutoff for every dial family — see _swSampleBuild.
     swExtremityEnabled: true,
-    swCoQualPenaltyEnabled: true,
-    swCoQualDepthPct: 10,
     swExtremitySplitPct: 30,
     swExtremityMinSamples: 3,
-    swLukewarmRatioPct: 70,
-    swExtremityReEvalEnabled: true,
-    // Open-position rolling-average criteria. Off = frozen entry-time snapshot, no
-    // per-scan single-ticker fetch per open position. On = the rolling average.
-    swPosRollingAvgEnabled: false,
-    // Drift Credit (TENTATIVE — see _swCreditShares): how a closed position's PnL is split
-    // across its criteria. 'least' = least-drifted criterion gets most credit; 'most' = flipped;
-    // 'off' = even split.
-    swDriftCreditMode: 'least',
-    // Cap on swDialSamplePool — the rolling, in-memory-only pool of raw criterion
-    // readings (every annotation, not just closes) that the extreme-high/lukewarm/
-    // extreme-low cutoff is actually computed from. See _swDialSample/_swExtremityBuild.
-    swExtremitySampleCap: 300,
     swLiqEnabled: true,            // Liquidation Surveillance — watch the sample batch's liquidation feed and score it as a second outcome, 50/50 with price (own WS, no extra fetches)
-    swSampleScoringEnabled: true,  // Sample Scoring — score criteria against sampled tickers' LPA instead of closed-trade PnL
     swDistMins: 240,               // legacy time-based graylist (st.gray) — how long a graylisted ticker stays out of entries
     swInstabEnabled: true,         // Instability graylist (sub-toggle of Liquidation Surveillance): tickers whose liquidations are too mixed (long AND short) across the window are skipped for entry
     swInstabPct: 30,               // instability graylist threshold: skipped when this % or more above the window's average instability
@@ -84,7 +62,6 @@
     swStbMinPct: 0.01,             // Stablecoin Filter: absolute range (% of the open) below which a ticker counts as a stablecoin
     swStbHours: 12,                // Stablecoin Filter: hours a stablecoin verdict keeps the ticker out before it is re-evaluated
     swMixedPct: 30,                // pill presentation: a watch is 'mixed' when the minority side holds more than this % of its liquidated turnover
-    swFcEnabled: true,            // Forecast Grader (sub-toggle of Sample Scoring): freezes each sampled ticker's score as a price forecast and grades it at a revisit a few batches later; measurement only, touches no score
     swFcShare: 50,                // Forecast Grader: share (%) of each sample batch's slots taken by revisits (planned before Liquidation Surveillance fills the rest)
     swFcLead: 6,                  // Forecast Grader: batches between a forecast and its grading
     swFcFocus: true,             // Forecast Focus (sub-toggle of Forecast Grader): the forecast batch is built first and everything else is fetched from it; tickers that grade under 51% are queued and forecast again until a grade reaches 70%
@@ -97,7 +74,6 @@
     swFcPmCorr: 0.4,            // Range Fit: lowest correlation (market-relative hourly moves) a ticker must have to be pooled
     swFcPmOwn: 50,              // Range Fit: % of the range's weight held by the ticker's own history (the rest is shared by its peers by correlation squared)
     swFcKeep: 3000,               // Forecast Grader: graded forecasts kept (IndexedDB holds them; up to 6000)
-    swFcInd: true,                // Indicator forecast: rank by the indicators that held up in the background export, size by the volatility index (also logs the wide readings that feed it and the export)
     swFcIndBlend: 100,            // Indicator forecast: % of the forecast rank taken from the indicator direction score (the rest stays the scorecard score)
     swFcIndWin: 4,                  // Indicator forecast: hours of graded forecasts the direction readings are tested on (re-tested as every batch grades)
     swFcDiv: true,                // Indicator forecast sub-toggle: candle divination (learned 6-hour shapes read as dvp / dvv)
@@ -112,23 +88,10 @@
     swFcRegimeWins: '2,6,12,24,48,96', // Regime caution: windows in hours (comma separated, 1 to 99)
     swFcLiqDrop: 3,                // Indicator forecast: liquidation samples fade from full weight (fresh) to none at this age, in hours (the chart history holds about 4)
                  // a liquidation sample counts this much relative to a price sample in a pole's score (no UI)
-    swSparsePct: 25,              // sparsity floor: no entry when a candidate's thinnest pole holds under this % of its bucket type's median sample count (no UI)
-    swSpongeQuota: 30,
-    swStaleSlotDays: 7,
     
     swOcBatchSize: 50, 
     swLiqHistHrs: 24,            // Liquidation event-size history: how many hours of liquidation events judge how big a new one is (never shorter than the Score Horizon)
     swObsHorizonHrs: 3,           // Sample scores: observations older than this many hours drop out of every score (price and liquidation alike)
-    // Gains Continuation (GC): own rolling 6h PnL, stepped in increments of swGcThresholdPct
-    // of base margin (minNotional/leverage). Each new step crossed broadcasts a one-shot 'gc'
-    // cross event; if Permafrost also has GC on and reads it within swGcFreshnessMult scan
-    // intervals, it triggers a full drawdown halt on Permafrost (and vice versa). On by
-    // default — a hot streak on one side is read as headwind risk for the other, same
-    // rationale as Mutual DDH Lift; still requires GC on both bots to do anything, so a
-    // lone install with the partner file absent or on an old version is a no-op.
-    swGcEnabled: true,
-    swGcThresholdPct: 100,
-    swGcFreshnessMult: 2,
   });
   // Which bot this plugin is running on, from the host's plugin system. Everything side-specific (storage keys, cross-bot event tags, scoring direction) reads it.
   const SIDE = ({ pseudochaser: 'chaser', pseudowinter: 'winter' })[window.__pluginSystem && window.__pluginSystem.BOT];
@@ -139,16 +102,9 @@
   const ASH_OC_HIST_KEY     = '__sw_' + SIDE + '_oc_history';
   const UI_KEY              = '__sw_' + SIDE + '_score_ui'; // Score tab panel state
   const CROSS_KEY      = '__everwinter_cross_v1';
-  const CROSS_TTL      = 30 * 24 * 3600 * 1000; // Sized generously (30d) since halt hours are user-set and can run well past 24h — a bot's own
-    // ddh-start/glk-start marker aging off the shared bus mid-halt would silently kill Mutual DDH/Gains Lock lift.
-    // Own-side DDH lift math doesn't depend on this (see _swDdhStartedAt), but partner-side reads
-    // (Gains Lock lift) do, so it must outlast whatever halt length is configured.
-  // CROSS_TTL alone doesn't bound this bucket's size — it's a 30d floor sized for the rare
-  // long-halt marker, but most event kinds (gc) only need minutes to hours and end
-  // up carrying that same 30d tail for no reason. Byte-cap as the actual backstop, same
-  // pattern and cap as _trimSharedRegistry in PseudoChaser/PseudoWinter — oldest event first,
-  // regardless of kind, so a halt marker can still get evicted early under sustained pressure
-  // (TTL is not a floor against eviction, only against premature natural expiry).
+  const CROSS_TTL      = 30 * 24 * 3600 * 1000; // cross events older than this are dropped on read
+  // CROSS_TTL alone doesn't bound this bucket's size. Byte-cap as the actual backstop, same
+  // pattern and cap as _trimSharedRegistry in PseudoChaser/PseudoWinter — oldest event first.
   const CROSS_BYTE_CAP = 200 * 1024;
   function _trimCrossEvents(events, maxBytes = CROSS_BYTE_CAP) {
     let json = JSON.stringify({ events });
@@ -167,16 +123,7 @@
     }
     return sorted.slice(idx);
   }
-  // Extremity records are private to Ashfall (own scores only). LEGACY_SHARED_EXTREMITY_KEY
-  // is the old cross-bot-shared key; _swScoreRead migrates this side's own records out of it
-  // once, below. Permafrost does the same independently, filtering for its own 'winter'
-  // records — reading it here never deletes or touches Permafrost's half.
-  const EXTREMITY_KEY  = '__ew_sw_' + SIDE + '_extremity_v1';
-  const LEGACY_SHARED_EXTREMITY_KEY = '__everwinter_extremity_v1';
   const SCORE_SAFETY_TTL = 365 * 24 * 3600 * 1000;
-  // swDialSamplePool's persistence key — per-side; each bot's dial pool only serves its own cutoffs.
-  // See _swLoadDialPool/_swSaveDialPool.
-  const DIAL_POOL_KEY = '__ew_sw_' + SIDE + '_dialpool_v1';
   const SAMPLE_OBS_KEY = '__ew_sw_' + SIDE + '_sampleobs_v1'; // Sample Scoring: { obs:[] }
   // Non-reactive on purpose: both are read from inside x-text/x-html renders, and writing
   // reactive state from a render effect would re-trigger that same effect.
@@ -216,8 +163,8 @@
   // Where each key lives: the three below stay in localStorage (plugin state, and the keys other tabs or older builds read); everything else the
   // plugin keeps goes to the host's IndexedDB data store (window.__ewData, same getItem/setItem/removeItem), which moves a copy an older build
   // left in localStorage on its first read. A host without the store keeps using localStorage.
-  const DS_LS_KEYS = () => [ASH_KEY, CROSS_KEY, LEGACY_SHARED_EXTREMITY_KEY];
-  const DS_MOVED = () => [ASH_OC_HIST_KEY, EXTREMITY_KEY, DIAL_POOL_KEY, SAMPLE_OBS_KEY, FC_KEY, PM_KEY, DIV_KEY, BG_KEY, CRAB_KEY, LIQ_KEY, ILQ_KEY, STB_KEY];
+  const DS_LS_KEYS = () => [ASH_KEY, CROSS_KEY];
+  const DS_MOVED = () => [ASH_OC_HIST_KEY, SAMPLE_OBS_KEY, FC_KEY, PM_KEY, DIV_KEY, BG_KEY, CRAB_KEY, LIQ_KEY, ILQ_KEY, STB_KEY];
   const DS = {
     _s: k => (window.__ewData && !DS_LS_KEYS().includes(k)) ? window.__ewData : localStorage,
     getItem: k => DS._s(k).getItem(k), setItem: (k, v) => DS._s(k).setItem(k, v), removeItem: k => DS._s(k).removeItem(k),
@@ -229,7 +176,7 @@
       ? { p: '__ew_af_', st: '__ashfall_chaser_v1', ui: '__ash_score_ui', oc: '__ash_oc_history', liq: '__af_liq_pending' }
       : { p: '__ew_pf_', st: '__permafrost_winter_v1', ui: '__pfr_score_ui', oc: '__pf_oc_history', liq: '__pf_liq_pending' };
     const pairs = [[ASH_KEY, L.st, true], [UI_KEY, L.ui, true], [ASH_OC_HIST_KEY, L.oc], [LIQ_KEY, L.liq],
-      [EXTREMITY_KEY, L.p + 'extremity_v1'], [DIAL_POOL_KEY, L.p + 'dialpool_v1'], [SAMPLE_OBS_KEY, L.p + 'sampleobs_v1'], [FC_KEY, L.p + 'fc_v1'],
+      [SAMPLE_OBS_KEY, L.p + 'sampleobs_v1'], [FC_KEY, L.p + 'fc_v1'],
       [PM_KEY, L.p + 'pm_v1'], [DIV_KEY, L.p + 'div_v1'], [BG_KEY, L.p + 'bg1h_v1'], [CRAB_KEY, L.p + 'crab_v1'], [ILQ_KEY, L.p + 'ilq_v1'], [STB_KEY, L.p + 'stb_v1']];
     for (const [nk, ok, ls] of pairs) {
       try {
@@ -411,7 +358,7 @@
               <div class="tog-t" :class="cfg.ashfallEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashfallEnabled=!cfg.ashfallEnabled;persist()}"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l" x-text="_swName() + ' Mode'"></div>
-                <div class="ash-hint">Runs the Extremity Scorer (always on with this): scores which end of each criterion's range pays and vetoes candidates on the other. Sample Scoring scores sampled tickers instead of closed trades.</div>
+                <div class="ash-hint">Runs the Sample Scorer (always on with this): scores which end of each criterion's range pays, from how the sampled tickers moved.</div>
               </div>
             </label>
             <div class="ash-tabs" style="margin-top:10px">
@@ -419,34 +366,7 @@
               <button class="ash-tab" :class="tS?'on':''" @click="tS=!tS">SCORE</button>
             </div>
             <div class="ash-zone" x-show="tC">
-              <div class="ash-hint" style="padding:2px 0">Always on: broadcasts cascade/sacrifice closes and DDH/gains-lock transitions to <span x-text="_swPartnerName()"></span>.</div>
-              <div style="margin-top:6px">
-                <label class="tog">
-                  <div class="tog-t" :class="cfg.ashfallMutualDdLiftEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.ashfallMutualDdLiftEnabled=!cfg.ashfallMutualDdLiftEnabled;persist()}"><div class="tog-k"></div></div>
-                  <div>
-                    <div class="tog-l">Mutual DDH Lift</div>
-                    <div class="ash-hint">Lifts this bot's halt when <span x-text="_swPartnerName()"></span> is also in drawdown halt (checked every 15 s).</div>
-                  </div>
-                </label>
-                <label class="tog" style="margin-top:8px">
-                  <div class="tog-t" :class="cfg.swGcEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.swGcEnabled=!cfg.swGcEnabled;persist()}"><div class="tog-k"></div></div>
-                  <div>
-                    <div class="tog-l">Gains Continuation (GC)</div>
-                    <div class="ash-hint">Broadcasts each base-margin step of 6hr profit; a partner with GC on halts on a fresh one, both ways.</div>
-                  </div>
-                </label>
-                <div x-show="cfg.swGcEnabled" style="margin-top:8px">
-                  <div class="g">
-                    <div class="lbl">Step Size <b x-text="cfg.swGcThresholdPct+'%'"></b> of base margin</div>
-                    <input type="range" min="10" max="200" step="5" x-model.number="cfg.swGcThresholdPct" @change="persist()">
-                    <span style="font-size:9px;color:var(--text-lo);margin-left:6px" x-text="'($'+(cfg.minNotional/cfg.leverage*(cfg.swGcThresholdPct/100)).toFixed(2)+' per step)'"></span>
-                  </div>
-                  <div class="g" style="margin-top:6px">
-                    <div class="lbl">Freshness Window <b x-text="(Math.max(1,cfg.scanMins??10)*cfg.swGcFreshnessMult)+'min'"></b> <span style="color:var(--text-lo);font-weight:400" x-text="'('+cfg.swGcFreshnessMult+'× Scan Every)'"></span></div>
-                    <input type="range" min="1" max="6" step="1" x-model.number="cfg.swGcFreshnessMult" @change="persist()">
-                  </div>
-                </div>
-              </div>
+              <div class="ash-hint" style="padding:2px 0">Always on: broadcasts cascade/sacrifice closes to <span x-text="_swPartnerName()"></span>.</div>
               <div style="margin-top:6px;border:1px solid rgba(255,255,255,.08);border-radius:3px;background:rgba(255,255,255,.02);overflow:hidden">
                 <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo);padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.06)">LAST SHARE</div>
                 <div x-html="tC ? _swShareHtml() : ''" style="padding:2px 8px 4px"></div>
@@ -459,75 +379,72 @@
 <div class="ash-zone" x-show="tS" x-data="{ sc:(()=>{ let s={}; try{ s=JSON.parse(localStorage.getItem('${UI_KEY}')||'{}')||{}; }catch(_){} return Object.assign({sample:false,liq:false,set:false}, s); })(), flip(k){ this.sc[k]=!this.sc[k]; try{ localStorage.setItem('${UI_KEY}', JSON.stringify(this.sc)); }catch(_){} } }">
               <div style="display:flex;align-items:flex-start;gap:6px">
                 <label class="tog" style="flex:1">
-                  <div class="tog-t" :class="cfg.swSampleScoringEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.swSampleScoringEnabled=!cfg.swSampleScoringEnabled;_swExtremityBuild();persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Sample Scoring</div>
-                    <div class="ash-hint">Scores criteria by how the sampled tickers actually moved (LPA) instead of closed-trade PnL. Same Extreme/Lukewarm buckets and veto.</div>
-                    <div class="ash-hint" x-show="cfg.swSampleScoringEnabled && !sc.sample && cfg.swFcEnabled" x-text="'Forecast '+_swFcShort()"></div>
+                    <div class="ash-hint">Scores criteria by how the sampled tickers actually moved (LPA), in Extreme/Lukewarm buckets. The Indicator forecast ranks each batch for entry.</div>
+                    <div class="ash-hint" x-show="!sc.sample" x-text="'Forecast '+_swFcShort()"></div>
                   </div>
                 </label>
-                <button x-show="cfg.swSampleScoringEnabled" @click="flip('sample')" style="font-family:var(--mono);font-size:9px;padding:2px 7px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:none;color:var(--text-lo);cursor:pointer" x-text="sc.sample?'▾':'▸'"></button>
+                <button @click="flip('sample')" style="font-family:var(--mono);font-size:9px;padding:2px 7px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:none;color:var(--text-lo);cursor:pointer" x-text="sc.sample?'▾':'▸'"></button>
               </div>
-              <div x-show="cfg.swSampleScoringEnabled && sc.sample" x-transition.opacity style="margin:6px 0 0 6px;padding-left:8px;border-left:1px solid rgba(255,255,255,.08)">
+              <div x-show="sc.sample" x-transition.opacity style="margin:6px 0 0 6px;padding-left:8px;border-left:1px solid rgba(255,255,255,.08)">
                 <label class="tog" style="margin-top:8px" x-data="{h:false}">
-                  <div class="tog-t" :class="cfg.swFcEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcEnabled=!cfg.swFcEnabled;if(!cfg.swFcEnabled&&_swOcViewMode==='fc')_swOcViewMode='vol';_swFcToggle()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Forecast Grader <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
                     <div class="ash-hint" x-show="h">Freezes a ticker's score as a price forecast, then grades it against its real move a few batches later. Revisits take part of each batch. Touches no score.</div>
-                    <div class="ash-hint" x-show="cfg.swFcEnabled" x-text="_swFcHint()"></div>
+                    <div class="ash-hint" x-text="_swFcHint()"></div>
                   </div>
                 </label>
-                <div style="margin-top:6px" x-show="cfg.swFcEnabled">
+                <div style="margin-top:6px">
                   <div class="lbl">Revisits (% of each batch)</div>
                   <input type="number" min="5" max="90" step="5" x-model.number="cfg.swFcShare" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Lead (batches)</div>
                   <input type="number" min="2" max="24" step="1" x-model.number="cfg.swFcLead" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Graded forecasts kept</div>
                   <input type="number" min="60" max="6000" step="60" x-model.number="cfg.swFcKeep" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
-                <label class="tog" style="margin-top:8px" x-data="{h:false}" x-show="cfg.swFcEnabled">
+                <label class="tog" style="margin-top:8px" x-data="{h:false}">
                   <div class="tog-t" :class="cfg.swFcFocus!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcFocus=!(cfg.swFcFocus!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Forecast Focus <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
                     <div class="ash-hint" x-show="h">The forecast batch IS the batch: its due revisits, retries and new forecasts are the only tickers fetched, for every sampler (hour candles, liquidation watch, readings). Revisits come first; new forecasts fill the rest. A ticker whose forecast grades under 51% joins a retry pool; once the pool fills a whole batch of new forecasts they are forecast again together (longest waiting first) until one grade reaches 70%. While on, the revisit share above is not used.</div>
                   </div>
                 </label>
-                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcEnabled && cfg.swFcFocus!==false">
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcFocus!==false">
                   <div class="lbl">Tickers per batch (max 50)</div>
                   <input type="number" min="5" max="50" step="5" x-model.number="cfg.swFcFocusN" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                 </div>
-                <label class="tog" style="margin-top:8px" x-data="{h:false}" x-show="cfg.swFcEnabled && cfg.swFcFocus!==false">
+                <label class="tog" style="margin-top:8px" x-data="{h:false}" x-show="cfg.swFcFocus!==false">
                   <div class="tog-t" :class="cfg.swFcProf!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcProf=!(cfg.swFcProf!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Weight Profiles <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
                     <div class="ash-hint" x-show="h">A forecast under 51% gets a profile (its readings ranked in its batch). Its ticker is retried on different weights until one grade reaches 70%; later tickers matching the profile start on them, and start over if they fail. Too unlike every profile = a new one.</div>
                   </div>
                 </label>
-                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcEnabled && cfg.swFcFocus!==false && cfg.swFcProf!==false">
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcFocus!==false && cfg.swFcProf!==false">
                   <div class="lbl">Profile match distance (%)</div>
                   <input type="number" min="5" max="60" step="5" x-model.number="cfg.swFcProfDist" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                 </div>
-                <label class="tog" style="margin-top:8px" x-data="{h:false}" x-show="cfg.swFcEnabled">
+                <label class="tog" style="margin-top:8px" x-data="{h:false}">
                   <div class="tog-t" :class="cfg.swFcRange?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcRange=!cfg.swFcRange;_swFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Range Fit <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
                     <div class="ash-hint" x-show="h">Lays each forecast onto the range its own ticker, and the tickers that track it closest, has actually moved, in score order. Touches no score; the raw projection is kept.</div>
                   </div>
                 </label>
-                <label class="tog" style="margin-top:8px" x-data="{h:false}" x-show="cfg.swFcEnabled">
-                  <div class="tog-t" :class="cfg.swFcInd!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcInd=!(cfg.swFcInd!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
+                <label class="tog" style="margin-top:8px" x-data="{h:false}">
                   <div>
                     <div class="tog-l">Indicator forecast <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
-                    <div class="ash-hint" x-show="h">The foreground forecast. Each batch is ranked by the logged readings that hold up on the graded window (default 4h): a reading is used in the direction its own sign shows and stays in while it doesn't pull the ensemble down; flipping or weak ones are dropped. Equal weights. Size comes from a volatility index. Liquidation samples count fully when fresh and fade out at the dropoff age. The scorecard score is kept and graded beside it, and the share taken from the indicators is tested on the graded window (the set value stands until then). Off = scorecard-only grader, no extra fetches.</div>
+                    <div class="ash-hint" x-show="h">The foreground forecast. Each batch is ranked by the logged readings that hold up on the graded window (default 4h): a reading is used in the direction its own sign shows and stays in while it doesn't pull the ensemble down; flipping or weak ones are dropped. Equal weights. Size comes from a volatility index. Liquidation samples count fully when fresh and fade out at the dropoff age. The scorecard score is kept and graded beside it, and the share taken from the indicators is tested on the graded window (the set value stands until then).</div>
                   </div>
                 </label>
-                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}" x-show="cfg.swFcEnabled && cfg.swFcInd!==false">
+                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}">
                   <div class="tog-t" :class="cfg.swFcDiv!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcDiv=!(cfg.swFcDiv!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Candle divination <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
                     <div class="ash-hint" x-show="h">Learns candle shapes from the 1-hour candles the forecast already keeps: every 6 hours form a shape (bodies and wicks in units of the ticker's own range), grouped into learned prototypes that remember the hour and the 6 hours that followed. A ticker's reading is what its closest prototype saw next. It joins the forecast right away and is then tested like any other reading (dropped if it flips or pulls the ensemble down). Holds on until the test has a verdict. A pattern that matches no learned shape takes over the weakest old one. No extra fetches.</div>
                   </div>
                 </label>
-                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcEnabled && cfg.swFcInd!==false && cfg.swFcDiv!==false" x-data="{t:0,h:false}" x-init="setInterval(()=>t++,15000)">
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcDiv!==false" x-data="{t:0,h:false}" x-init="setInterval(()=>t++,15000)">
                   <label class="tog" style="margin-top:2px">
                     <div class="tog-t" :class="cfg.swFcDivVol!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcDivVol=!(cfg.swFcDivVol!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
                     <div><div class="tog-l">Volume shapes <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div><div class="ash-hint" x-show="h">Adds each hour's volume against the ticker's 24-hour median to the shape (a second library, reading dvv). The cache gains volume from now on, so this library fills as hours pass.</div></div>
@@ -544,14 +461,14 @@
                     <button class="btn btn-ghost" :disabled="cfgLocked" @click="_swDivReset(false);t++">Clear library</button>
                   </div>
                 </div>
-                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}" x-show="cfg.swFcEnabled && cfg.swFcInd!==false">
+                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}">
                   <div class="tog-t" :class="cfg.swFcCrab!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcCrab=!(cfg.swFcCrab!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Crab layer <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
                     <div class="ash-hint" x-show="h">Finds tickers moving along a range (6 to 96 hours of 1-hour candles, longer ranges win) and leans their forecast toward a snap back: up near the bottom, down near the top, unless history says that setup tends to break. Its weight is tested on the graded window and backs off when it hurts.</div>
                   </div>
                 </label>
-                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcEnabled && cfg.swFcInd!==false && cfg.swFcCrab!==false" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcCrab!==false" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
                   <div class="lbl">Crab score to count (% at 96h, shorter windows need more)</div>
                   <input type="number" min="40" max="90" step="5" x-model.number="cfg.swFcCrabMin" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Break margin (% of the range)</div>
@@ -562,14 +479,14 @@
                     <button class="btn btn-ghost" :disabled="cfgLocked" @click="_swCrabReset(false);t++">Clear library</button>
                   </div>
                 </div>
-                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}" x-show="cfg.swFcEnabled && cfg.swFcInd!==false">
+                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}">
                   <div class="tog-t" :class="cfg.swFcRegime!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcRegime=!(cfg.swFcRegime!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Regime caution <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
                     <div class="ash-hint" x-show="h">Keeps a second score beside each forecast, shifted by how the market's regime and tickers in the same spot did before; a ticker moving against the market is its own profile.</div>
                   </div>
                 </label>
-                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcEnabled && cfg.swFcInd!==false && cfg.swFcRegime!==false" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcRegime!==false" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
                   <div class="lbl">Windows (hours, comma separated, 1 to 99)</div>
                   <input type="text" x-model="cfg.swFcRegimeWins" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:140px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div style="margin-top:6px" x-html="t>=0 && _swRgPanel()"></div>
@@ -577,7 +494,7 @@
                     <button class="btn btn-ghost" :disabled="cfgLocked" @click="_swFcRgReset();t++">Clear what it learned</button>
                   </div>
                 </div>
-                <div style="margin-top:6px" x-show="cfg.swFcEnabled && cfg.swFcInd!==false">
+                <div style="margin-top:6px">
                   <div class="lbl">Indicator direction (% of rank, start value)</div>
                   <input type="number" min="0" max="100" step="5" x-model.number="cfg.swFcIndBlend" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Indicator test window (hours)</div>
@@ -585,7 +502,7 @@
                   <div class="lbl" style="margin-top:6px">Liquidation dropoff (hours)</div>
                   <input type="number" min="0.5" max="24" step="0.5" x-model.number="cfg.swFcLiqDrop" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                 </div>
-                <div style="margin-top:6px" x-show="cfg.swFcEnabled && cfg.swFcRange" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
+                <div style="margin-top:6px" x-show="cfg.swFcRange" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
                   <div class="lbl">Past moves kept (hours per ticker)</div>
                   <input type="number" min="48" max="720" step="24" x-model.number="cfg.swFcPmHours" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Correlated tickers pooled (max)</div>
@@ -600,7 +517,7 @@
                 </div>
               </div>
 
-              <div style="display:flex;align-items:flex-start;gap:6px;margin-top:8px" x-show="cfg.swSampleScoringEnabled">
+              <div style="display:flex;align-items:flex-start;gap:6px;margin-top:8px">
                 <label class="tog" style="flex:1">
                   <div class="tog-t" :class="cfg.swLiqEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.swLiqEnabled=!cfg.swLiqEnabled;_swLiqToggle()}"><div class="tog-k"></div></div>
                   <div>
@@ -611,7 +528,7 @@
                 </label>
                 <button x-show="cfg.swLiqEnabled" @click="flip('liq')" style="font-family:var(--mono);font-size:9px;padding:2px 7px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:none;color:var(--text-lo);cursor:pointer" x-text="sc.liq?'▾':'▸'"></button>
               </div>
-              <div x-show="cfg.swSampleScoringEnabled && cfg.swLiqEnabled && sc.liq" x-transition.opacity style="margin:6px 0 0 6px;padding-left:8px;border-left:1px solid rgba(255,255,255,.08)">
+              <div x-show="cfg.swLiqEnabled && sc.liq" x-transition.opacity style="margin:6px 0 0 6px;padding-left:8px;border-left:1px solid rgba(255,255,255,.08)">
                 <div x-data="{h:false}" style="margin-bottom:8px">
                   <div class="lbl">Event Size History <b x-text="cfg.swLiqHistHrs+'h'"></b> <span class="ash-i" @click="h=!h">ⓘ</span></div>
                   <input type="number" min="1" max="168" step="1" x-model.number="cfg.swLiqHistHrs" :disabled="cfgLocked" @change="cfg.swLiqHistHrs=Math.min(168,Math.max(1,+cfg.swLiqHistHrs||24));persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
@@ -634,7 +551,7 @@
 
               <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
                 <button @click="flip('set')" style="font-family:var(--mono);font-size:9px;padding:2px 8px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:none;color:var(--text-lo);cursor:pointer;letter-spacing:.5px;display:flex;align-items:center;gap:4px"><span x-text="sc.set?'▾':'▸'"></span>&nbsp;Scorer Settings</button>
-                <div class="ash-hint" x-show="!sc.set" x-text="'Split '+cfg.swExtremitySplitPct+'% · Veto '+cfg.swLukewarmRatioPct+'% · Batch '+cfg.swOcBatchSize"></div>
+                <div class="ash-hint" x-show="!sc.set" x-text="'Split '+cfg.swExtremitySplitPct+'% · Batch '+cfg.swOcBatchSize"></div>
                 <div x-show="sc.set" x-transition.opacity style="margin-top:8px">
                   <div class="g" x-data="{h:false}">
                     <div class="lbl">Extreme Split <b x-text="cfg.swExtremitySplitPct"></b>% <span class="ash-i" @click="h=!h">ⓘ</span></div>
@@ -644,38 +561,14 @@
                   <div class="g" style="margin-top:8px" x-data="{h:false}">
                     <div class="lbl">Min Samples <b x-text="cfg.swExtremityMinSamples"></b> <span class="ash-i" @click="h=!h">ⓘ</span></div>
                     <input type="range" min="3" max="30" step="1" x-model.number="cfg.swExtremityMinSamples" @change="_swExtremityBuild();persist()">
-                    <div class="ash-hint" x-show="h">Readings a criterion needs before it gets a cutoff — and, if Position Rolling Average is on, before a position's average replaces its entry snapshot.</div>
-                  </div>
-                  <div class="g" style="margin-top:8px" x-data="{h:false}">
-                    <div class="lbl">Lukewarm Veto <b x-text="cfg.swLukewarmRatioPct"></b>% <span class="ash-i" @click="h=!h">ⓘ</span> <span style="font-weight:400;font-size:9px;color:var(--text-lo)">favoring <b :style="_swLukewarmFavoredSide()==='lukewarm'?'color:rgba(150,150,255,.9)':'color:var(--sw-acc)'" x-text="_swLukewarmFavoredSide()==='lukewarm'?'LUKEWARM':'EXTREME'"></b></span></div>
-                    <input type="range" min="30" max="100" step="5" x-model.number="cfg.swLukewarmRatioPct" @change="persist()">
-                    <div class="ash-hint" x-show="h">Vetoes a ticker once this share of its criteria land on whichever side (Extreme/Lukewarm) is earning less.</div>
-                  </div>
-                  <label class="tog" style="margin-top:8px" x-data="{h:false}">
-                    <div class="tog-t" :class="cfg.swExtremityReEvalEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.swExtremityReEvalEnabled=!cfg.swExtremityReEvalEnabled;persist()}"><div class="tog-k"></div></div>
-                    <div>
-                      <div class="tog-l">Extremity Re-Evaluation <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
-                      <div class="ash-hint" x-show="h">Each scan, closes open positions whose criteria (snapshot, or rolling average if enabled) have crossed onto the non-favored side by the veto ratio.</div>
-                    </div>
-                  </label>
-                  <label class="tog" style="margin-top:8px" x-data="{h:false}">
-                    <div class="tog-t" :class="cfg.swCoQualPenaltyEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.swCoQualPenaltyEnabled=!cfg.swCoQualPenaltyEnabled;persist()}"><div class="tog-k"></div></div>
-                    <div>
-                      <div class="tog-l">Co-Qualifying Penalty <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
-                      <div class="ash-hint" x-show="h">Ranks a ticker lower for each extra co-qualifying slot with a negative score.</div>
-                    </div>
-                  </label>
-                  <div class="g" x-show="cfg.swCoQualPenaltyEnabled" style="margin-top:8px" x-data="{h:false}">
-                    <div class="lbl">Depth Multiplier <b x-text="(cfg.swCoQualDepthPct)+'%'"></b> per tier <span class="ash-i" @click="h=!h">ⓘ</span></div>
-                    <input type="range" min="0" max="50" step="1" x-model.number="cfg.swCoQualDepthPct" @change="persist()">
-                    <div class="ash-hint" x-show="h">Boosts a good score, or worsens a bad one, by this % per tier of qualifying depth.</div>
+                    <div class="ash-hint" x-show="h">Readings a criterion needs before it gets a cutoff.</div>
                   </div>
                   <div class="g" style="margin-top:10px" x-data="{h:false}">
                     <div class="lbl">Batch Size <b x-text="cfg.swOcBatchSize"></b> tickers/scan <span class="ash-i" @click="h=!h">ⓘ</span></div>
                     <input type="number" min="1" max="2500" step="1" x-model.number="cfg.swOcBatchSize" @change="cfg.swOcBatchSize=Math.min(2500,Math.max(1,Math.round(+cfg.swOcBatchSize||50)));persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                     <div class="ash-hint" x-show="h">Tickers whose data is fetched fresh each scan; entries come only from these.</div>
                   </div>
-                  <div class="g" x-show="cfg.swSampleScoringEnabled" style="margin-top:10px" x-data="{h:false}">
+                  <div class="g" style="margin-top:10px" x-data="{h:false}">
                     <div class="lbl">Score Horizon <b x-text="cfg.swObsHorizonHrs+'h'"></b> <span class="ash-i" @click="h=!h">ⓘ</span></div>
                     <input type="number" min="0.5" max="168" step="0.5" x-model.number="cfg.swObsHorizonHrs" @change="cfg.swObsHorizonHrs=Math.min(168,Math.max(0.5,+cfg.swObsHorizonHrs||3));_swSampleSave();_swExtremityBuild();persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                     <div class="ash-hint" x-show="h">Samples older than this drop out of every score, price and liquidation alike.</div>
@@ -707,36 +600,6 @@
                     <div class="lbl" style="margin-top:6px">Graylist for (hours)</div>
                     <input type="number" min="1" max="720" step="1" x-model.number="cfg.swStbHours" :disabled="cfgLocked" @change="cfg.swStbHours=Math.min(720,Math.max(1,Math.round(+cfg.swStbHours||12)));persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                     <div class="ash-hint" x-text="_swStbStats().n+' graylisted'"></div>
-                  </div>
-                  
-                  <div x-show="!cfg.swSampleScoringEnabled" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06)">
-                    <div class="ash-hint" style="margin:0 0 6px">Closed-trade scoring</div>
-                    <label class="tog" x-data="{h:false}">
-                      <div class="tog-t" :class="cfg.swPosRollingAvgEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.swPosRollingAvgEnabled=!cfg.swPosRollingAvgEnabled;persist()}"><div class="tog-k"></div></div>
-                      <div>
-                        <div class="tog-l">Position Rolling Average <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
-                        <div class="ash-hint" x-show="h">Off: open positions are scored on their entry snapshot. On: fetches a fresh ticker per open position every scan and averages readings over 24h (falls back to the snapshot until Min Samples).</div>
-                      </div>
-                    </label>
-                    <div style="margin-top:8px" x-data="{h:false}">
-                      <div class="lbl">Drift Credit <span style="font-size:8px;opacity:.6">(tentative)</span> <span class="ash-i" @click="h=!h">ⓘ</span></div>
-                      <select x-model="cfg.swDriftCreditMode" :disabled="cfgLocked" @change="_swExtremityBuild();persist()" style="font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
-                        <option value="least">Least drift = most credit</option>
-                        <option value="most">Most drift = most credit</option>
-                        <option value="off">Off — split evenly</option>
-                      </select>
-                      <div class="ash-hint" x-show="h">A close's PnL is split across its criteria, not credited in full to each. At close each criterion is re-read; drift from its entry value decides its share. Experimental — changing this re-scores history from stored drift.</div>
-                    </div>
-                    <div class="g" style="margin-top:8px" x-data="{h:false}">
-                      <div class="lbl">Sponge Quota <b x-text="cfg.swSpongeQuota"></b> closes/criterion <span class="ash-i" @click="h=!h">ⓘ</span></div>
-                      <input type="range" min="10" max="200" step="10" x-model.number="cfg.swSpongeQuota" @change="_swExtremityBuild();persist()">
-                      <div class="ash-hint" x-show="h">Most recent closes counted per criterion when scoring; lower adapts faster.</div>
-                    </div>
-                    <div class="g" style="margin-top:8px" x-data="{h:false}">
-                      <div class="lbl">Stale Purge <b x-text="cfg.swStaleSlotDays"></b> days <span class="ash-i" @click="h=!h">ⓘ</span></div>
-                      <input type="number" min="1" step="1" x-model.number="cfg.swStaleSlotDays" @change="_swScoreTrim();_swExtremityBuild();persist()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
-                      <div class="ash-hint" x-show="h">Slots with no new closes in this many days are fully removed from the scorecard.</div>
-                    </div>
                   </div>
                 </div>
               </div>
@@ -770,34 +633,23 @@
                       </template>
                     </span>
                   </div>
-                <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
-                  <button x-show="!c" @click="if(!cfgLocked)c=true" :disabled="cfgLocked" style="font-family:var(--mono);font-size:9px;padding:3px 10px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:none;color:var(--short);cursor:pointer;letter-spacing:.5px">Clear Plugin State</button>
-                  <template x-if="c">
-                    <span style="display:inline-flex;gap:3px;align-items:center">
-                      <span style="font-family:var(--mono);font-size:8px;color:var(--short)">Sure?</span>
-                      <button @click="localStorage.removeItem('${ASH_KEY}');persist();log('[ASH] Plugin state cleared from storage.','warn'); c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,69,96,.5);border-radius:2px;background:rgba(255,69,96,.12);color:var(--short);cursor:pointer;letter-spacing:.5px">Yes</button>
-                      <button @click="c=false" style="font-family:var(--mono);font-size:9px;padding:3px 8px;border:1px solid rgba(255,255,255,.15);border-radius:2px;background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
-                    </span>
-                  </template>
-                </span>
-                <div class="ash-hint" style="margin-top:4px">Wipes <span x-text="_swName()"></span>'s stored data (GC window, drawdown state); export first to keep your scorer data.</div>
               </div>
             </div>
             <div x-show="(cfg.micEnabled && _micPluginLoaded() || (cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded()))" style="margin-top:8px;padding:6px 8px;background:rgba(var(--sw-rgb),.03);border:1px solid rgba(var(--sw-rgb),.1);border-radius:3px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
-                <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)" x-text="cfg.swSampleScoringEnabled ? 'SAMPLE SCORER' : 'EXTREMITY SCORER'"></div>
+                <div style="font-family:var(--mono);font-size:8px;letter-spacing:1.5px;color:var(--text-lo)" x-text="'SAMPLE SCORER'"></div>
                 <span x-data="{c:false}" style="display:inline-flex;gap:3px;align-items:center">
                   <button x-show="!c" @click="if(!cfgLocked)c=true" :disabled="cfgLocked" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.35);background:rgba(255,80,80,.08);color:rgba(255,80,80,.8);cursor:pointer;letter-spacing:.5px">CLEAR</button>
                   <template x-if="c">
                     <span style="display:inline-flex;gap:3px;align-items:center">
                       <span style="font-family:var(--mono);font-size:7.5px;color:rgba(255,80,80,.8)">Sure?</span>
-                      <button @click="(window.__ewData||localStorage).setItem('${EXTREMITY_KEY}', '[]'); (window.__ewData||localStorage).removeItem('${DIAL_POOL_KEY}'); swDialSamplePool={}; _swSampleClear(); _swExtremityBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
+                      <button @click="_swSampleClear(); _swExtremityBuild(); c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,80,80,.5);background:rgba(255,80,80,.18);color:rgba(255,80,80,.9);cursor:pointer;letter-spacing:.5px">Yes</button>
                       <button @click="c=false" style="font-family:var(--mono);font-size:7.5px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:var(--text-lo);cursor:pointer;letter-spacing:.5px">No</button>
                     </span>
                   </template>
                 </span>
               </div>
-              <div x-show="cfg.swSampleScoringEnabled" style="margin-bottom:5px">
+              <div style="margin-bottom:5px">
                 <div x-html="_swSampleStatusHtml()" style="font-family:var(--mono);font-size:8px;color:var(--text-lo);line-height:1.6"></div>
               </div>
               <div x-html="_swExtremityHtml(open && (cfg.micEnabled && _micPluginLoaded() || (cfg.becEnabled && _becPluginLoaded()) || (cfg.ldcEnabled && _ldcPluginLoaded())))" @click="const c=$event.target.closest('[data-slot]');if(c){swScorecardExpanded=swScorecardExpanded===c.dataset.slot?null:c.dataset.slot}" style="display:flex;flex-wrap:wrap;gap:6px"></div>
@@ -842,49 +694,22 @@
         rs.setProperty('--sw-acc', SIDE === 'winter' ? 'var(--ice)' : '#ff9650');
       } catch (_) {}
       const _origInit  = def.init;
-      const _origPers  = def.persist;
       const _origScan  = def.runScan;
       const _origClose = def.pseudoClosePosition;
-
-      let _swWasHalted               = false;
-      let _swWasGainsLocked          = false;
 
       const _hostStages = Array.isArray(def._scanStageDefs); // host has the cooperative scan scheduler
       return Object.assign({}, def, {
 
-        _swDdhStartedAt: null, // Date.now() of this bot's own current DDH halt, set once at the
-                               // moment it starts and cleared on lift. Local + persisted, so Mutual
-                               // DDH Lift's age comparison never depends on reading our own ddh-start
-                               // note back off the shared cross bus, which can age out of CROSS_TTL
-                               // mid-halt on any halt longer than the TTL window.
-        swScoreboard: [],   // sorted Extremity Scorer entries built from EXTREMITY_KEY records
+        swScoreboard: [],   // sorted Sample Scorer entries (flat), see _swSampleBuild
         swLukewarmScoreboard: { extreme: [], lukewarm: [] }, // Lukewarm Scoring two-bucket display — see _swExtremityBuild
         swScorecardExpanded: null,     // key of currently expanded dial, or null
         swDialCutoffs: {},             // {[family|pole]: magnitude} — the live "extreme begins here" line per dial
-        // Rolling pool of raw criterion readings — every annotation call (scan-time pool
-        // building, live liq messages, Extremity Re-Evaluation) feeds it via _swDialSample,
-        // regardless of whether that reading ever becomes a candidate or a trade. This — NOT
-        // closed-trade records — is what swDialCutoffs is computed from. Persists across
-        // restarts via DIAL_POOL_KEY (init() loads it explicitly — see there for why the
-        // lazy `||=` pattern used elsewhere can't do this on its own, since this declared
-        // default is already truthy).
-        swDialSamplePool: {},          // {[family|pole]: number[]}
         swDialSampleCounts: {},        // {[family|pole]: n} — for the "unproven, still lukewarm by default" badge
         swSampleBucketMeans: null, // Sample Scoring: overall mean edge per bucket, decides the favored side
         _swSampleStore: { obs: [] },
         _swFc: { seq: 0, ts: 0, pend: [], done: [], voids: { gone: 0, late: 0, thin: 0 }, nof: 0 }, // Forecast Grader store (see _swFcLoad)
         _swFcSel: null, // Forecast chart: the clicked start batch ('d<seq>') the ticker table shows
         swCrossEvents: [],
-        // Gains Continuation (GC) — own rolling 6h closed-trade PnL log, independent of the
-        // host's Gains Lock window (that one only populates when cfg.gainsLockEnabled is on;
-        // GC needs to work regardless). _swGcLastStep is the highest step index already
-        // broadcast (high-water-mark — never re-fires a step already crossed); resets to 0 once
-        // rolling PnL drops back to ≤0 so a fresh climb re-arms from the first step. _swGcLastSeenTs
-        // is the ts of the latest partner 'gc' event already reacted to (fresh or stale), so the
-        // 15s loop doesn't re-evaluate the same event every tick.
-        swGcWindow:      [],
-        _swGcLastStep:   0,
-        _swGcLastSeenTs: 0,
         _swOcCycleHistory: [], // rolling per-cycle snapshots: {id, ts, results:[{sym,bc,sc,avgMs,n}]}
         _swOcCycleCounter: 0,
         swOcResults: {},       // {[sym]:{bc,sc,avgMs,n}} from the most recent OC fetch batch
@@ -904,60 +729,7 @@
         async init() {
           await _origInit.call(this);
           this.cfg.swExtremityEnabled = true; // Extremity Scorer is always on with Ashfall (toggle removed)
-          // Sync to the actual restored halt/gains-lock state instead of leaving these at their
-          // false initial value. Without this, reloading the tab mid-halt made the very next
-          // tick see a false→true "transition" that never really happened, rewriting the
-          // cross-event start timestamp to "now" — which silently made an already-old halt look
-          // freshly started, breaking the Mutual DDH Lift age comparison below (it picks the
-          // *older* halt to lift, so an inflated timestamp can flip which side loses the halt).
-          _swWasHalted      = this._isDrawdownHalted?.() ?? false;
-          _swWasGainsLocked = this._isGainsLocked?.()    ?? false;
-          // Restored early (ahead of the main ASH_KEY blob load further down) because the
-          // mid-halt backfill immediately below needs it to decide whether a value already
-          // exists before falling back to a back-calculated guess.
-          try {
-            _swMigrateLegacy();
-            try { window.__ewData?.adopt(DS_MOVED()); } catch (_) {}
-            const _swEarly = JSON.parse(DS.getItem(ASH_KEY) || 'null');
-            if (_swEarly && typeof _swEarly.ddhStartedAt === 'number') this._swDdhStartedAt = _swEarly.ddhStartedAt;
-          } catch(_) {}
-          // The sync above deliberately skips writing a ddh-start/glk-start cross event on a
-          // mid-halt reload (see comment above) to avoid an inflated "now" timestamp — but that
-          // means a bot whose tab restarts mid-halt (backgrounded/killed on mobile, manual
-          // refresh, etc.) never broadcasts *any* ddh-start for that halt, so Mutual DDH Lift can
-          // never react to it no matter how long the halt runs or what the partner does — this
-          // is the actual cause of a same-halt lift silently never firing, not CROSS_TTL. Backfill
-          // one here if the bus doesn't already show us as actively halted, using the halt's real
-          // start time (back-calculated from the restored _drawdownHaltUntil) rather than "now" —
-          // that preserves the age comparison Mutual DDH Lift depends on instead of trading a
-          // missing marker for a too-recent one.
-          if ((this.cfg.ashfallCrossEnabled ?? true)) {
-            if (_swWasHalted && !this._manualHalt && typeof this._drawdownHaltUntil === 'number') {
-              const _ownDdh = this._swCrossRead().filter(e => e.source === SIDE && (e.kind === 'ddh-start' || e.kind === 'ddh-end')).at(-1);
-              if (!_ownDdh || _ownDdh.kind === 'ddh-end') {
-                const _haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
-                this._swCrossWrite('ddh-start', null, { ts: this._drawdownHaltUntil - _haltMs });
-              }
-              // _swDdhStartedAt is normally restored from the persisted blob above (set the moment
-              // the halt began, on whichever earlier session actually triggered it). This only
-              // fires as a one-time migration fallback — upgrading mid-halt, or a persisted value
-              // that somehow never got written — using the same back-calculation as the cross-bus
-              // backfill above. Imperfect if the halt wasn't started via drawdownHaltHours (e.g. the
-              // host's own native throttle running a different duration), but only ever needed once;
-              // every halt-start going forward stamps this directly at the moment it happens.
-              if (this._swDdhStartedAt == null) {
-                const _haltMs = (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
-                this._swDdhStartedAt = this._drawdownHaltUntil - _haltMs;
-              }
-            }
-            if (_swWasGainsLocked && typeof this._gainsLockHaltUntil === 'number') {
-              const _ownGlk = this._swCrossRead().filter(e => e.source === SIDE && (e.kind === 'glk-start' || e.kind === 'glk-end')).at(-1);
-              if (!_ownGlk || _ownGlk.kind === 'glk-end') {
-                const _lockMs = (this.cfg.gainsLockHours ?? 6) * 3600 * 1000;
-                this._swCrossWrite('glk-start', null, { ts: this._gainsLockHaltUntil - _lockMs });
-              }
-            }
-          }
+          try { _swMigrateLegacy(); try { window.__ewData?.adopt(DS_MOVED()); } catch (_) {} } catch(_) {}
           if (!Array.isArray(this.cfg.megacapExclude)) this.cfg.megacapExclude = [...DEFAULT_MEGACAP_EXCLUDE];
           // Single source of truth for all other Ashfall scalar defaults — see
           // ASHFALL_DEFAULT_CFG above. Call sites read this.cfg.<key> directly with no inline
@@ -987,13 +759,6 @@
               this._swOcCycleCounter = Math.max(this._swOcCycleCounter, _last?.id || 0);
             }
           } catch(_) {}
-          // Explicit load, not the lazy `||=` _swDialSample/_swExtremityBuild otherwise use —
-          // swDialSamplePool's own reactive declaration above starts it at `{}`, which is
-          // already truthy, so `this.swDialSamplePool ||= this._swLoadDialPool()` never actually
-          // ran the load; every restart silently kept the freshly-declared empty pool instead of
-          // the persisted one, forcing every dial's cutoff to reprove itself from scratch. Load
-          // for real here, before the first _swExtremityBuild() call below.
-          this.swDialSamplePool = this._swLoadDialPool();
           this._swSampleLoad();
           this._swIlqLoad();
           this._swStbLoad();
@@ -1002,514 +767,24 @@
           this._swFcIdbBoot(); // graded history from IndexedDB, merged in when it answers (never awaited)
           this._swBgLoad();
           this._swPmLoad();
-          this._swScoreTrim();
           this._swExtremityBuild();
-          try {
-            const raw = DS.getItem(ASH_KEY);
-            if (raw) {
-              const s = JSON.parse(raw);
-              // GC window is re-filtered to the live 6h cutoff on load, same as the host's own
-              // gainsWindow restore — a stale entry surviving a long-offline reload shouldn't
-              // count toward a step it wouldn't have reached had the tab stayed open.
-              if (Array.isArray(s.gcWindow)) this.swGcWindow = s.gcWindow.filter(e => e?.ts && (Date.now() - e.ts) < 6 * 3600 * 1000);
-              if (typeof s.gcLastStep === 'number') this._swGcLastStep = s.gcLastStep;
-            }
-          } catch(e) {}
           this.log(`[ASH] ${NAME} (${SIDE === 'chaser' ? 'Chaser' : 'Winter'}) v${VERSION} loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'}`, 'info');
-          setInterval(() => {
-            if (this.cfg.ashfallCrossEnabled) this._swCheckCross().catch(() => {});
-            // _swExtremityBuild() is NOT called on THIS setInterval timer (it runs every few
-            // seconds, purely for cross-plugin housekeeping) — it's called once per runScan
-            // cycle instead (see runScan), which is frequent enough to track the sample pool
-            // filling in without redoing the full sort/rebuild on every single interval tick.
-            if (this.cfg.ashfallCrossEnabled) {
-              const _halted  = this._isDrawdownHalted?.() ?? false;
-              const _glocked = this._isGainsLocked?.()    ?? false;
-              if (_halted !== _swWasHalted) {
-                _swWasHalted = _halted;
-                this._swDdhStartedAt = _halted ? Date.now() : null;
-                this.persist();
-                this._swCrossWrite(_halted ? 'ddh-start' : 'ddh-end');
-              }
-              if (_glocked !== _swWasGainsLocked) {
-                _swWasGainsLocked = _glocked;
-                this._swCrossWrite(_glocked ? 'glk-start' : 'glk-end');
-              }
-              if (this.cfg.ashfallMutualDdLiftEnabled && _halted) {
-                // Self side reads _swDdhStartedAt (local, persisted, never expires) instead of
-                // reading our own ddh-start note back off the shared cross bus — that note is
-                // still written below for the partner's benefit, but it ages out of CROSS_TTL on
-                // any halt longer than the TTL, which used to silently strand this comparison
-                // with nothing to compare against for the rest of a long halt. Partner side still
-                // reads the bus, since that's the only visibility we have into their state.
-                const _partnerDdh = this._swCrossRead().filter(e => e.source === PARTNER && (e.kind === 'ddh-start' || e.kind === 'ddh-end')).at(-1);
-                if (_partnerDdh?.kind === 'ddh-start' && this._swDdhStartedAt != null) {
-                  if (this._swDdhStartedAt < _partnerDdh.ts) {
-                    this._drawdownHaltUntil = null;
-                    this._haltLoggedKind = null;
-                    this._swDdhStartedAt = null;
-                    this.persist();
-                    this.log(`[ASH] ${ICON} Mutual DDH lift — own halt is older; cleared.`, 'info');
-                  }
-                }
-              }
-              // Gains Continuation (GC) receive side — requires this bot to also have GC on
-              // (own toggle doubles as the opt-in to react to the partner's broadcast, same
-              // convention as Mutual DDH Lift). Freshness window mirrors the codebase's
-              // established partner-staleness pattern (2× scan cadence = 1 missed-cycle grace),
-              // just user-configurable here via swGcFreshnessMult instead of hardcoded 2×.
-              // Dedupes on event ts via _swGcLastSeenTs so a still-fresh event isn't re-actioned
-              // every 15s tick, and a since-gone-stale one isn't re-checked forever either.
-              if (this.cfg.swGcEnabled) {
-                const _gcEvt = this._swCrossRead().filter(e => e.source === PARTNER && e.kind === 'gc').at(-1);
-                if (_gcEvt && _gcEvt.ts !== this._swGcLastSeenTs) {
-                  this._swGcLastSeenTs = _gcEvt.ts;
-                  const _gcFreshMs = Math.max(1, this.cfg.scanMins ?? 10) * (this.cfg.swGcFreshnessMult ?? 2) * 60 * 1000;
-                  if ((Date.now() - _gcEvt.ts) < _gcFreshMs) {
-                    this._drawdownHaltUntil = Date.now() + (this.cfg.drawdownHaltHours ?? 6) * 3600 * 1000;
-                    this._haltLoggedKind = null;
-                    this.persist();
-                    this.log(`[ASH] 🚨 Gains Continuation — fresh broadcast from ${PARTNER_NAME} (step ${_gcEvt.step ?? '?'}, +${(_gcEvt.pnl ?? 0).toFixed(2)} USDT 6hr) — full drawdown halt triggered.`, 'warn');
-                  }
-                }
-              }
-            }
-          }, 15000);
+          setInterval(() => { if (this.cfg.ashfallCrossEnabled) this._swCheckCross().catch(() => {}); }, 15000);
         },
 
-        persist() {
-          _origPers.call(this);
-          try {
-            this.swGcWindow   = trimToByteCap(this.swGcWindow);
-            DS.setItem(ASH_KEY, JSON.stringify({
-              gcWindow: this.swGcWindow, gcLastStep: this._swGcLastStep,
-              ddhStartedAt: this._swDdhStartedAt,
-            }));
-          } catch(e) {}
-        },
-
-        _swScoreRead() {
-          try {
-            if (DS.getItem(EXTREMITY_KEY) === null) {
-              // One-time migration off the old shared key — see the comment on
-              // LEGACY_SHARED_EXTREMITY_KEY above. Runs once: after this, EXTREMITY_KEY
-              // exists (even as '[]') so this branch never fires again.
-              try {
-                const legacyRaw = DS.getItem(LEGACY_SHARED_EXTREMITY_KEY);
-                const legacy = legacyRaw ? JSON.parse(legacyRaw) : [];
-                const mine = Array.isArray(legacy) ? legacy.filter(r => r.source === SIDE) : [];
-                DS.setItem(EXTREMITY_KEY, JSON.stringify(mine));
-              } catch(_) { DS.setItem(EXTREMITY_KEY, '[]'); }
-            }
-            const raw = DS.getItem(EXTREMITY_KEY);
-            if (!raw) return [];
-            const cut = Date.now() - SCORE_SAFETY_TTL;
-            return (JSON.parse(raw) || []).filter(r => r.ts >= cut && Array.isArray(r.criteria) && r.criteria.length);
-          } catch(e) { return []; }
-        },
-        _swScoreTrim() {
-          try {
-            const records   = this._swScoreRead();
-            const quota     = this.cfg.swSpongeQuota;
-            const staleDays = this.cfg.swStaleSlotDays;
-            const staleMs   = staleDays * 24 * 3600 * 1000;
-            const now       = Date.now();
-            // +fund/-fund are NOT legacy — Blind-Entry and Liquid-Diver actively write them as
-            // their primary criteria tags. Only the genuinely dead pre-tiered criteria purge here.
-            const LEGACY    = new Set(['>10pct','<10pct','lsa','lba','rasl','rabl']);
-            const isLegacy  = r => r.criteria.some(c => LEGACY.has(c));
-            const bySlot = {};
-            for (const r of records) {
-              if (isLegacy(r)) continue;
-              const k = collapseKey(r.criteria);
-              if (!bySlot[k]) bySlot[k] = [];
-              bySlot[k].push(r);
-            }
-            const trimmed = [];
-            for (const recs of Object.values(bySlot)) {
-              recs.sort((a, b) => b.ts - a.ts);
-              const kept = recs.slice(0, quota);
-              if (!kept.length) continue;
-              if (now - kept[0].ts < staleMs) trimmed.push(...kept);
-            }
-            const GLOBAL_CAP = 5000;
-            const capped = trimmed.sort((a, b) => b.ts - a.ts).slice(0, GLOBAL_CAP);
-            // Per-slot quota + GLOBAL_CAP bound the record *count*, but with enough
-            // distinct auto-generated slot buckets the total byte size can still run
-            // large — apply the same atomized byte cap as a final safety net, oldest first.
-            const byteCapped = trimToByteCap([...capped].reverse()).reverse();
-            DS.setItem(EXTREMITY_KEY, JSON.stringify(byteCapped));
-          } catch(e) {}
-        },
-        _swScoreWrite(criteria, pnl, hist = false, drift = null) {
-          try {
-            const records = this._swScoreRead();
-            const rec = { ts: Date.now(), criteria, pnl, source: SIDE };
-            if (hist) rec.hist = true;
-            // Per-criterion drift measured at close (see _swCloseDrift) — raw, not shares, so the
-            // credit mode can be flipped later and re-score history. null = unmeasurable.
-            if (Array.isArray(drift) && drift.length === criteria.length) rec.d = drift.map(x => (typeof x === 'number' && isFinite(x)) ? Math.round(x * 1000) / 1000 : null);
-            records.push(rec);
-            const quota = this.cfg.swSpongeQuota;
-            const bySlot = {};
-            for (const r of records) {
-              const k = collapseKey(r.criteria);
-              if (!bySlot[k]) bySlot[k] = [];
-              bySlot[k].push(r);
-            }
-            const trimmed = [];
-            for (const recs of Object.values(bySlot)) {
-              recs.sort((a, b) => b.ts - a.ts);
-              trimmed.push(...recs.slice(0, quota));
-            }
-            const byteCapped = trimToByteCap([...trimmed].reverse()).reverse();
-            DS.setItem(EXTREMITY_KEY, JSON.stringify(byteCapped));
-            return byteCapped;
-          } catch(e) { return null; }
-        },
-        // Feeds the Extremity Scorer's cutoff computation. Called from every criterion
-        // annotation — scan-time pool building, live liq messages, Extremity Re-Evaluation —
-        // NOT gated behind a close or even an actual entry. This is deliberate: a dial's
-        // cutoff needs to be provable from the wide stream of what the market is actually
-        // showing right now, not from the narrow trickle of closed trades. Sampling only from
-        // closes would deadlock at cold start — nothing opens until a dial is proven, and a
-        // dial can only prove itself from closes that require something to have opened first.
-        _swDialSample(tag) {
-          if (!tag) return;
-          const info = dialInfo(collapseCrit(tag));
-          if (!info) return;
-          const m = tag.match(/(-?\d+)$/);
-          if (!m) return; // bare Blind-Entry/Liquid-Diver tags (+fund/-fund/+ocs/-ocs) carry no
-                           // magnitude — they always classify extreme regardless (see
-                           // _swExtremityBuild/_swExtremityVeto), nothing to prove here.
-          const dk = info.family + '|' + info.pole;
-          const pool = (this.swDialSamplePool ||= this._swLoadDialPool());
-          const arr = (pool[dk] ||= []);
-          arr.push(Math.abs(parseInt(m[1], 10)));
-          const cap = this.cfg.swExtremitySampleCap || 300;
-          if (arr.length > cap) arr.splice(0, arr.length - cap);
-          this._swSaveDialPool();
-        },
-        // swDialSamplePool persists (DIAL_POOL_KEY) so a restart doesn't reset every dial to
-        // "unproven". Loaded lazily (first _swDialSample/_swExtremityBuild call each
-        // session) rather than at some fixed init point, and saved with a light throttle since
-        // _swDialSample fires on every live annotation, not just closes.
-        _swLoadDialPool() {
-          try {
-            const raw = DS.getItem(DIAL_POOL_KEY);
-            return raw ? JSON.parse(raw) : {};
-          } catch (e) { return {}; }
-        },
-        _swSaveDialPool() {
-          const now = Date.now();
-          if (now - (this._swDialPoolLastWrite || 0) < 3000) return;
-          this._swDialPoolLastWrite = now;
-          try { DS.setItem(DIAL_POOL_KEY, JSON.stringify(this.swDialSamplePool || {})); } catch (e) {}
-        },
-        // ── Open-Position Rolling-Average Criteria ─────────────────
-        //
-        // Replaces the single entry-time snapshot (_micCriteria/_becCriteria/_ldcCriteria,
-        // frozen once in *Open) as the source feeding close-time scoring, Extremity
-        // Re-Evaluation, and substitution's live score. No separate sample list and no new
-        // poller/timer — this rides the existing scan cycle: called once per open position
-        // per scan from MIC/MIW's runScan (_swPositionCriteriaSample), exempt from the
-        // follower no-own-fetch rule since it only ever touches the handful of symbols
-        // currently open, not the full ticker universe (same loophole _micTopUpGeneralCriteria
-        // already uses for ocs/ocx via _ocFetchSingle's allowOwnFetch flag).
-        //
-        // A position's locked criteria FAMILIES never change after entry — that's what
-        // defines its slot. Only the observed magnitude/tier of each is re-sampled, into a
-        // calendar-time window (default 24h) kept on the position itself.
-        POS_CRIT_WINDOW_MS: 24 * 3600 * 1000,
-        async _swPositionCriteriaSample(pos) {
-          if (!this.cfg.swPosRollingAvgEnabled) return; // toggle off: no per-scan fetch, frozen snapshot only
-          const crits = pos._micCriteria || pos._becCriteria || pos._ldcCriteria;
-          if (!crits?.length) return;
-          // Own fresh single-ticker fetch, not this._lastAllTickers — that bulk snapshot is
-          // cached for cfg.bulkTickerCooldownHours (default 1h, user-configurable up to 12h)
-          // and reused across many scans in between, so fund/va/iol/ios read off it would mostly
-          // resample the exact same stale number instead of tracking real drift. Still routed
-          // through _qFetch (rate/concurrency limited) — just not gated behind the follower
-          // no-own-fetch rule, same exemption as the ocs/ocx fetch below.
-          let t = null;
-          try {
-            const r = await this._qFetch(`${this.base}/v5/market/tickers?category=linear&symbol=${pos.symbol}`);
-            const d = await r.json();
-            t = d?.retCode === 0 ? d.result?.list?.[0] : null;
-          } catch(e) {}
-          if (!t) return;
-          const now = Date.now();
-          const buf = (pos._swCritSamples ||= {});
-          for (const tag of crits) {
-            const family = tag.replace(/[+-]?\d+$/, ''); // bare family, e.g. "fund", "va", "ocs"
-            if (/^(lta|lpa)/.test(family)) { try { await this._swHourCandle(pos.symbol); } catch(e) {} }
-            const fresh = this._micAnnotateCritRaw?.(family, t);
-            if (!fresh) continue;
-            const m = fresh.match(/(-?\d+)$/);
-            if (!m) continue;
-            const arr = (buf[family] ||= []);
-            arr.push({ tier: parseInt(m[1], 10), ts: now });
-            const cut = now - (this.POS_CRIT_WINDOW_MS || 24 * 3600 * 1000);
-            while (arr.length && arr[0].ts < cut) arr.shift();
-          }
-        },
-        // Reconstructs a position's criteria as averaged tags, in the same family+tier
-        // string format every other tag already uses (e.g. "fund+3"). Falls back to the
-        // frozen entry-time snapshot for any family with fewer than swExtremityMinSamples
-        // readings — a position that closes fast simply hasn't had enough scans to average.
-        _swPositionAvgCriteria(pos) {
-          const crits = pos._micCriteria || pos._becCriteria || pos._ldcCriteria;
-          if (!crits?.length) return crits;
-          if (!this.cfg.swPosRollingAvgEnabled) return crits; // toggle off: entry-time snapshot
-          const minSamples = Math.max(3, this.cfg.swExtremityMinSamples || 3);
-          const buf = pos._swCritSamples || {};
-          return crits.map(tag => {
-            const family = tag.replace(/[+-]?\d+$/, '');
-            const arr = buf[family];
-            if (!arr || arr.length < minSamples) return tag; // fallback: frozen snapshot
-            const avgTier = Math.round(arr.reduce((s, r) => s + r.tier, 0) / arr.length);
-            return `${family}${avgTier >= 0 ? '+' : ''}${avgTier}`;
-          });
-        },
-        // ── Drift Credit ────────────────────────────────────────────────
-        // TENTATIVE — this whole mechanism is a first attempt and may well be wrong or need
-        // redoing. THE PROBLEM: a closed position's PnL used to be credited IN FULL to every
-        // criterion it carried, so a +$0.02 close with 4 criteria put +$0.08 on the scorecard
-        // (and the Extreme-vs-Lukewarm totals the veto compares were inflated by criteria
-        // count, not by anything real). THE ATTEMPT: split the one PnL across the criteria so
-        // the shares sum to exactly the PnL. Shares come from DRIFT — at close we re-read
-        // each criterion's live value and measure how far it moved from its entry-time tier,
-        // normalised by that family's typical magnitude in the dial sample pool (raw tier
-        // units aren't comparable between fund/va/ocs/lta...). Current rule (mode 'least'):
-        // the criterion that drifted LEAST gets the MOST credit — its condition still held
-        // over the trade's life, so it's treated as most culpable for the outcome — and the
-        // one that drifted most gets the least. Mode 'most' flips that (untested hunch that it
-        // may be the reverse). Nothing here is settled: the drift measure, the 1/(1+d) curve,
-        // and the assumption that "held steady" == "responsible" are all open questions.
-        // Each closed record stores its raw drift array (`d`), NOT final shares, so flipping
-        // the mode re-scores all history instantly with no re-fetch. Records with no `d`
-        // (pre-1.87.0, or drift fetch failed/timed out) fall back to an even split.
-        async _swSettleCloseScore(pos, scoreCrits, pnl) {
-          let drift = null;
-          const mode = this.cfg.swDriftCreditMode;
-          if ((mode === 'least' || mode === 'most') && scoreCrits.length > 1) {
-            // Hard timeout so a stuck fetch can't leave the close unscored — falls back to an even split.
-            try { drift = await Promise.race([this._swCloseDrift(pos), new Promise(res => setTimeout(() => res(null), 15000))]); } catch(_) {}
-            if (!Array.isArray(drift) || drift.length !== scoreCrits.length) drift = null;
-          }
-          this._swExtremityBuild(this._swScoreWrite(scoreCrits, pnl, false, drift));
-        },
-        // Re-reads every entry criterion for this position's symbol and returns, per criterion
-        // (same order as the entry snapshot), |closeTier - entryTier| / familyScale — or null
-        // where it can't be measured (bare Blind-Entry/Liquid-Diver tags, missing data, fetch
-        // failure). Compares against the frozen ENTRY snapshot, not the rolling average.
-        async _swCloseDrift(pos) {
-          const entry = pos._micCriteria || pos._becCriteria || pos._ldcCriteria;
-          if (!entry?.length || !pos.symbol) return null;
-          let t = null;
-          try {
-            const r = await this._qFetch(`${this.base}/v5/market/tickers?category=linear&symbol=${pos.symbol}`);
-            const d = await r.json();
-            t = d?.retCode === 0 ? d.result?.list?.[0] : null;
-          } catch(_) {}
-          if (!t) return null;
-          const fams = entry.map(tag => tag.replace(/[+-]?\d+$/, ''));
-          if (fams.some(f => /^(lta|lpa)/.test(f))) { try { await this._swHourCandle(pos.symbol); } catch(_) {} }
-          return entry.map((tag, i) => {
-            const m0 = tag.match(/(-?\d+)$/);
-            const fresh = this._micAnnotateCritRaw?.(fams[i], t);
-            const m1 = typeof fresh === 'string' ? fresh.match(/(-?\d+)$/) : null;
-            if (!m0 || !m1) return null;
-            const a = parseInt(m0[1], 10), b = parseInt(m1[1], 10);
-            return Math.abs(b - a) / this._swDriftScale(fams[i], a);
-          });
-        },
-        // Typical tier magnitude for a family (mean over both poles of the dial sample pool),
-        // so a 3-tier move on a family that normally spans ~30 tiers reads as small drift and
-        // on one that spans ~4 as large. Falls back to the entry tier itself while the pool is thin.
-        _swDriftScale(family, entryTier) {
-          const pool = this.swDialSamplePool || {};
-          const mags = [...(pool[family + '|pos'] || []), ...(pool[family + '|neg'] || [])];
-          const floor = Math.max(3, this.cfg.swExtremityMinSamples || 3);
-          if (mags.length >= floor) {
-            const mean = mags.reduce((a, b) => a + b, 0) / mags.length;
-            if (mean >= 1) return mean;
-          }
-          return Math.max(1, Math.abs(entryTier));
-        },
-        // Drift array -> shares summing to 1. Unmeasurable entries (null) get the mean weight of
-        // the measured ones; nothing measurable / mode 'off' / legacy record -> even split.
-        //   'least': w = 1/(1+d)        — steadiest criterion is most culpable (current default)
-        //   'most':  w = d/(1+d) + .05  — the flipped reading; .05 keeps zero-drift from zeroing out
-        _swCreditShares(dArr) {
-          const n = dArr.length;
-          const even = () => dArr.map(() => 1 / n);
-          const mode = this.cfg.swDriftCreditMode;
-          if (mode !== 'least' && mode !== 'most') return even();
-          const ok = x => typeof x === 'number' && isFinite(x) && x >= 0;
-          const known = dArr.filter(ok);
-          if (!known.length) return even();
-          const f = mode === 'most' ? (d => d / (1 + d) + 0.05) : (d => 1 / (1 + d));
-          const raw = dArr.map(x => ok(x) ? f(x) : null);
-          const fill = raw.filter(x => x != null).reduce((a, b) => a + b, 0) / known.length;
-          const vals = raw.map(x => x ?? fill);
-          const sum = vals.reduce((a, b) => a + b, 0);
-          return vals.map(v => v / sum);
-        },
-        // ── Extremity Scorer / Lukewarm Scoring core build.
-        //
-        // Cutoffs are computed FIRST, from swDialSamplePool (the observation stream — see
-        // _swDialSample above), independent of closed-trade records entirely: for each dial
-        // pole with >= swExtremityMinSamples readings, the cutoff is the magnitude at the
-        // configured split percentile of that pole's OWN observed spread — "organically
-        // arrange them into highs and lows" per the user's own framing. A pole below the
-        // sample floor has no proven cutoff and stays lukewarm by default (never credited,
-        // never blocking) until it clears the floor — which, sampling from live readings
-        // rather than closes, usually happens within the first scan or two, not never.
-        //
-        // Records are then walked ONCE. Extreme occurrences score into that pole's
-        // win/loss/pnl exactly as before — this is what MIC's blocking/co-qual reads via
-        // micCollapsedSlotRanks, unchanged in shape. Lukewarm Scoring adds a second,
-        // parallel tally alongside it: EVERY occurrence (extreme or lukewarm) also lands in
-        // swLukewarmScoreboard under its classification bucket and family — "which side
-        // (Extreme vs Lukewarm) has been more profitable overall, and which criteria within
-        // that side actually drove it" — purely a display/advisory layer, never read by
-        // blocking or the veto.
-        //
-        // Bare Blind-Entry/Liquid-Diver tags always classify extreme — there's nothing to
-        // be lukewarm about.
-        _swExtremityBuild(records) {
-          if (this.cfg.swSampleScoringEnabled) { try { return this._swSampleBuild(); } catch (e) { console.warn('[ASH] Sample Scoring build failed', e); } }
-          records = records || this._swScoreRead();
-          const exclude = new Set(this.cfg.micAutoSlotExclude || []);
-          const quota = this.cfg.swSpongeQuota;
-          const minSamples = Math.max(3, this.cfg.swExtremityMinSamples || 3);
-          const splitPct = Math.min(0.49, Math.max(0.01, (this.cfg.swExtremitySplitPct ?? 30) / 100));
-          const sortedRecords = [...records].sort((a, b) => b.ts - a.ts).filter(r => r.source === SIDE);
-          // Scorecards fully separated per side — Ashfall's Extremity
-          // Scorer only ever aggregates its own closed trades. No cross-bot reading, no
-          // sign flipping, no shared bias/pool needed: partner-sourced records in
-          // EXTREMITY_KEY (if any linger from before this change) are filtered out above
-          // and never reach dialStats/bucketStats/ranks below.
-
-          const samplePool = (this.swDialSamplePool ||= this._swLoadDialPool());
-          const cutoffs = {};
-          for (const [dk, mags] of Object.entries(samplePool)) {
-            if (mags.length < minSamples) { cutoffs[dk] = null; continue; }
-            const sorted = [...mags].sort((a, b) => a - b);
-            const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * (1 - splitPct)));
-            cutoffs[dk] = sorted[idx];
-          }
-
-          const dialStats = {};
-          const dialCount = {};
-          const subtagStats = {};
-          const bucketStats = { extreme: {}, lukewarm: {} };
-          const bucketCount = { extreme: {}, lukewarm: {} };
-          for (const r of sortedRecords) {
-            const keptIdx = [];
-            for (let i = 0; i < r.criteria.length; i++) if (!exclude.size || !exclude.has(r.criteria[i])) keptIdx.push(i);
-            if (!keptIdx.length) continue;
-            const pnl = typeof r.pnl === 'number' ? r.pnl : (r.win ? 1 : -1);
-            // Drift Credit (TENTATIVE — see _swCreditShares): each criterion gets a SHARE of the
-            // position's PnL, shares summing to 1 across the criteria that survive the exclude
-            // filter, instead of the whole PnL apiece. Own-only records (see sortedRecords filter above).
-            const shares = this._swCreditShares(keptIdx.map(i => Array.isArray(r.d) ? r.d[i] : null));
-            for (let ki = 0; ki < keptIdx.length; ki++) {
-              const c = r.criteria[keptIdx[ki]];
-              const effectivePnl = pnl * shares[ki];
-              const key = collapseCrit(c);
-              const info = dialInfo(key);
-              if (!info) continue; // unrecognized/retired tag — no dial, not scored
-              const noGradation = !!BARE_DIAL_TAGS[key];
-              let mag = Infinity;
-              if (!noGradation) {
-                const m2 = c.match(/(-?\d+)$/);
-                mag = m2 ? Math.abs(parseInt(m2[1], 10)) : 0;
-              }
-              const pole = info.pole;
-              const dk = info.family + '|' + pole;
-              const cutoff = cutoffs[dk];
-              const isExtreme = !Number.isFinite(mag) || (cutoff != null && mag >= cutoff);
-
-              // Lukewarm Scoring: every occurrence lands here, extreme or not. Keyed by dk
-              // (family+pole), not family alone — a two-pole family's '+' and '-' sides are
-              // opposite signals and must not be netted into one pill.
-              const bucket = isExtreme ? 'extreme' : 'lukewarm';
-              const bCount = bucketCount[bucket];
-              if ((bCount[dk] = (bCount[dk] ?? 0) + 1) <= quota) {
-                const bStats = bucketStats[bucket];
-                if (!bStats[dk]) bStats[dk] = { pnl: 0, wins: 0, losses: 0 };
-                const bs = bStats[dk];
-                bs.pnl += effectivePnl; if (effectivePnl > 0) bs.wins++; else bs.losses++;
-              }
-
-              if (!isExtreme) continue; // lukewarm — not scored into the blocking-facing dial below
-
-              if ((dialCount[dk] = (dialCount[dk] ?? 0) + 1) > quota) continue;
-              if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, hasHist: false, hasTrade: false };
-              const stats = dialStats[dk];
-              stats.pnl += effectivePnl; if (effectivePnl > 0) stats.wins++; else stats.losses++;
-              if (r.hist) stats.hasHist = true; else stats.hasTrade = true;
-              const subtagKey = key;
-              if (!subtagStats[subtagKey]) subtagStats[subtagKey] = { pnl: 0, wins: 0, losses: 0 };
-              const ts = subtagStats[subtagKey];
-              ts.pnl += effectivePnl; if (effectivePnl > 0) ts.wins++; else ts.losses++;
-            }
-          }
-          // A dial can have a proven cutoff (samples exist) but zero closes yet — still needs
-          // to show up (0 pnl, real sample count) rather than vanish from the panel/ranks.
-          for (const dk of Object.keys(cutoffs)) {
-            if (!dialStats[dk]) dialStats[dk] = { pnl: 0, wins: 0, losses: 0, hasHist: false, hasTrade: false };
-          }
-          for (const dk of Object.keys(dialStats)) {
-            dialStats[dk].cutoff = cutoffs[dk] ?? null;
-            dialStats[dk].sampleCount = (samplePool[dk] || []).length;
-          }
-
-          this.swDialCutoffs = cutoffs;
-          this.swDialSampleCounts = Object.fromEntries(Object.entries(samplePool).map(([k, v]) => [k, v.length]));
-          // Flat display-key -> stats map, same shape the old micCollapsedSlotRanks/
-          // micCollapsedCritStats used — _micScaledRank/_micCritScore/_micIsCritBlocked keep
-          // reading this one flat lookup unchanged, with no idea dials or poles exist beneath it.
-          const ranks = {}, dispStats = {};
-          for (const [dk, stats] of Object.entries(dialStats)) {
-            const [family, pole] = dk.split('|');
-            const key = dialDisplayKey(family, pole);
-            ranks[key] = stats.pnl;
-            dispStats[key] = stats;
-          }
-          // Per-tag scores layer on top for blocking's benefit — never overwrites a dk-based
-          // key above (every family's raw tag already equals its own dk key, so this is a
-          // no-op re-write for them, not a collision).
-          for (const [tag, ts] of Object.entries(subtagStats)) {
-            ranks[tag] = ts.pnl;
-          }
-          this.micCollapsedSlotRanks = ranks;
-          this.micCollapsedCritStats = dispStats;
-          this.swScoreboard = Object.entries(dispStats).sort(([,a],[,b]) => b.pnl - a.pnl).map(([key, s]) => ({ key, ...s }));
-          // Lukewarm Scoring display layer — two buckets (Extreme / Lukewarm), each with a
-          // per-pole breakdown (dk = family+pole — see above). See _swExtremityHtml for the render.
-          const _dkToLukewarmEntry = ([dk, s]) => {
-            const [family, pole] = dk.split('|');
-            return { family, pole, key: dialDisplayKey(family, pole), ...s };
-          };
-          this.swLukewarmScoreboard = {
-            extreme: Object.entries(bucketStats.extreme).sort(([,a],[,b]) => b.pnl - a.pnl).map(_dkToLukewarmEntry),
-            lukewarm: Object.entries(bucketStats.lukewarm).sort(([,a],[,b]) => b.pnl - a.pnl).map(_dkToLukewarmEntry),
-          };
+        // Sample Scorer build: cutoffs, Extreme/Lukewarm buckets and the headline all come from the sample observations (see _swSampleBuild).
+        _swExtremityBuild() {
+          try { return this._swSampleBuild(); } catch (e) { console.warn('[ASH] Sample Scorer build failed', e); }
         },
         // ── Sample Scoring ─────────────────────────────────────────────────
         // A PROACTIVE alternative to the reactive (closed-trade) Extremity Scorer. Instead of crediting
         // criteria with the PnL of trades we already made, it scores every criterion against how the
         // SAMPLED tickers actually moved (LPA = 1hr price change vs the population), so the scorecard
-        // can learn before any entry happens. Everything downstream (Extreme vs Lukewarm buckets, the
-        // favored-side veto, blocking, co-qual ranking) still reads the same swLukewarmScoreboard /
-        // micCollapsedSlotRanks / swDialCutoffs — only the numbers feeding them change.
+        // can learn before any entry happens. It feeds the Extreme vs Lukewarm buckets (swLukewarmScoreboard /
+        // micCollapsedSlotRanks / swDialCutoffs), the chart and headline, and the base score each forecast starts from.
         //
         // Units: a score is the MEAN EDGE in percentage points of LPA in this bot's favor (Chaser:
-        // 1=+1 wants price up, -1 wants it down), NOT dollars. Blocking therefore compares it against
-        // (micSlotBlockPct/100) pp — see _swBlockThreshold.
+        // 1=+1 wants price up, -1 wants it down), NOT dollars.
         //
         // Pairing: criteria tiers and the outcome come from the same sample moment; the outcome is the LAST COMPLETED hour's
         // price change, so it is a same-moment correlation. LPA is excluded as a criterion (it would be scoring itself); LTA stays in
@@ -1609,7 +884,7 @@
         //      longs, as a share of the turnover, -1..+1) is converted to pp by the window's typical move so it counts 1:1 with a price
         //      observation; the bot's favor is dir x pp (Chaser likes liquidated shorts, Winter liquidated longs), exactly like price.
         // Only the leader watches; a follower adopts the 'l' observations through the shared sampleScore store.
-        _swLiqOn() { return !!(this.cfg.swLiqEnabled && this.cfg.swSampleScoringEnabled && !this._swFollowing()); },
+        _swLiqOn() { return !!(this.cfg.swLiqEnabled && !this._swFollowing()); },
         _swLiqToggle() {
           if (!this.cfg.swLiqEnabled) this._swLiqWsStop();
           this._swExtremityBuild();
@@ -2043,7 +1318,7 @@
           this._swInstabMemo = { key, val };
           return val;
         },
-        _swInstabOn() { return !!(this.cfg.swLiqEnabled && this.cfg.swInstabEnabled && this.cfg.swSampleScoringEnabled); },
+        _swInstabOn() { return !!(this.cfg.swLiqEnabled && this.cfg.swInstabEnabled); },
         // The check the MIC/MIW pool build uses: the unstable set (works for a follower too — the split rides on the adopted history),
         // plus the legacy time-based graylist (st.gray) for the leader.
         _swGrayHas(sym) {
@@ -2051,7 +1326,7 @@
           if (this._swIlqIs(sym)) return true; // Illiquidity Filter: measured slow, reading still live
           if (this._swInstabOn() && this._swInstabStats().gray.has(sym)) return true;
           const c = this.cfg, t = this._swSampleStore?.gray?.[sym];
-          return !!t && !!c.swSampleScoringEnabled && !this._swFollowing()
+          return !!t && !this._swFollowing()
             && Date.now() - t <= (Math.max(1, Number(c.swDistMins) || 240)) * 60000;
         },
         // Liq-view pill presentation, from one watch's split. 'fav' = pure and in the bot's favor, 'mixfav' = mixed, favorable side
@@ -2074,7 +1349,7 @@
         // records are per-bot, but sample scores are market data — a follower can't fetch/resolve them itself, so it
         // must share the leader's). Deduped on the shared snapshot's ts.
         _swSampleAdopt() {
-          if (!this.cfg.swSampleScoringEnabled || !this._swFollowing()) return false;
+          if (!this._swFollowing()) return false;
           const sh = this._sharedRead?.('sampleScore');
           if (!sh?.data || !Array.isArray(sh.data.obs)) return false;
           if (sh.ts && sh.ts === this._swSampleLastSharedTs) return false;
@@ -2117,7 +1392,7 @@
         // Called with each new sample-cycle entry: criteria tiers at sample time against the last completed hour's price change (demeaned
         // against the rolling LPA average).
         _swSampleIngest(entry) {
-          if (!this.cfg.swSampleScoringEnabled || !entry || !Array.isArray(entry.results)) return;
+          if (!entry || !Array.isArray(entry.results)) return;
           if (this._swFollowing()) return; // following — adopt the leader's scored store (_swSampleAdopt) instead of double-counting its batch
           const st = (this._swSampleStore ||= { obs: [] });
           let added = 0;
@@ -2298,89 +1573,19 @@
           const ok = a != null && n >= min, sv = lw ? m.sL : m.sE;
           return { s: (ok && sv != null) ? sv : null, share: (ok && sv != null) ? (1 + sv) / 2 : null, sHi: w?.sHi ?? null, sLo: w?.sLo ?? null, value: ok ? notional * a / 100 : null, nl: side === 'lukewarm' ? (m.nlL || 0) : (m.nlE || 0), cap, tpRoi, n, rel: m[side], hi: w?.hi != null ? notional * w.hi / 100 : null, lo: w?.lo != null ? notional * w.lo / 100 : null, hiT: w?.hiT || 0, loT: w?.loT || 0 };
         },
-        // Threshold a criterion's rank must fall to for Slot Blocking: dollars of base margin for the
-        // reactive scorer, percentage points of edge for Sample Scoring. MIC/MIW read this too.
-        _swBlockThreshold() {
-          const pct = (this.cfg.micSlotBlockPct ?? 25) / 100;
-          if (this.cfg.swSampleScoringEnabled) return pct;
-          return ((this.cfg.minNotional || 6) / (this.cfg.leverage || 6)) * pct;
-        },
 
         // Which side Lukewarm Scoring currently favors — whichever bucket's total $ (summed
-        // across every family in it) is ahead. This is what _swExtremityVeto actually targets:
+        // across every family in it) is ahead. This is the side the chart and headline show:
         // no more manual Lukewarm Targeting toggle, the system re-decides for itself every time
         // _swExtremityBuild runs, off the same scoreboard the panel shows. Ties (including
         // 0 vs 0, before either bucket has real data) default to 'extreme' — the original,
         // always-avoid-lukewarm behavior, until the data actually says otherwise.
         _swLukewarmFavoredSide() {
-          const board = this.swLukewarmScoreboard || { extreme: [], lukewarm: [] };
-          const sum = arr => arr.reduce((a, s) => a + s.pnl, 0);
-          if (this.cfg.swSampleScoringEnabled) {
-            // Sample Scoring: compare the buckets' overall MEAN edge (per-observation), not their totals —
-            // the extreme bucket is ~25% of readings by construction, so totals would always favor lukewarm.
-            const m = this.swSampleBucketMeans, min = Math.max(3, this.cfg.swExtremityMinSamples || 3);
-            if (m && m.extreme != null && m.lukewarm != null && m.nE >= min && m.nL >= min) return m.lukewarm > m.extreme ? 'lukewarm' : 'extreme';
-            return 'extreme';
-          }
-          return sum(board.lukewarm) > sum(board.extreme) ? 'lukewarm' : 'extreme';
-        },
-        // Overall veto — "explicitly avoid any ticker exhibiting values from the LOSING side of
-        // Lukewarm Scoring". Counts, across every dial-eligible criterion the ticker actually
-        // exhibits, what share classifies as the non-favored side against the current cutoffs;
-        // an unproven dial (below swExtremityMinSamples) always counts against the ticker here,
-        // same as a genuinely non-favored reading. Vetoes once that share reaches
-        // swLukewarmRatioPct (default 70%). Favored side comes from _swLukewarmFavoredSide —
-        // see there for how it's decided and how the default (favor extreme) applies before
-        // there's enough data either way.
-        _swExtremityVeto(annotCrits) {
-          const cutoffs = this.swDialCutoffs || {};
-          const favorLukewarm = this._swLukewarmFavoredSide() === 'lukewarm';
-          let total = 0, against = 0;
-          for (const c of (annotCrits || [])) {
-            const key = collapseCrit(c);
-            const info = dialInfo(key);
-            if (!info) continue;
-            total++;
-            if (!!BARE_DIAL_TAGS[key]) { if (favorLukewarm) against++; continue; } // no gradation — always extreme, so counts against a lukewarm-favoring veto
-            const m2 = c.match(/(-?\d+)$/);
-            const mag = m2 ? Math.abs(parseInt(m2[1], 10)) : 0;
-            const cutoff = cutoffs[info.family + '|' + info.pole];
-            const isExtreme = cutoff != null && mag >= cutoff;
-            if (favorLukewarm ? isExtreme : !isExtreme) against++;
-          }
-          if (!total) return false;
-          const againstPct = against / total * 100;
-          return againstPct >= (this.cfg.swLukewarmRatioPct ?? 70);
-        },
-        // Extremity Re-Evaluation (secondary toggle, off by default). At the end of every
-        // scan, re-derives each open position's own qualifying criteria against the CURRENT
-        // dial cutoffs and closes it once it crosses the same lukewarm-ratio bar it had to
-        // clear to open in the first place — held to the same standard throughout its life,
-        // not just at entry. Deliberately reads only data this cycle already cached (bulk
-        // ticker snapshot + MIC's live OC cache) rather than firing fresh fetches of its
-        // own, so it rides the existing scan cadence instead of adding load on top of the
-        // scan scheduler. A symbol with no fresh-enough cached tick this cycle is skipped
-        // rather than forcing a fetch.
-        async _swExtremityReEval() {
-          if (!this.cfg.swExtremityReEvalEnabled) return;
-          const snapshot = [...(this.positions || [])];
-          const _closes = []; // closed concurrently below — live closes wait on exchange fills
-          for (const pos of snapshot) {
-            if (!pos || !pos.symbol) continue;
-            const crits = pos._micCriteria || pos._becCriteria || pos._ldcCriteria;
-            if (!crits || !crits.length) continue;
-            // Reads the rolling average built each scan by _swPositionCriteriaSample.
-            const liveCrits = this._swPositionAvgCriteria(pos);
-            if (this._swExtremityVeto(liveCrits)) {
-              _closes.push((async () => {
-                try {
-                  await this.pseudoClosePosition(pos, 'Ext-Rvl');
-                  this.log(`[ASH] ${pos.symbol} closed — Extremity Re-Evaluation: crossed onto the non-favored side.`, 'info');
-                } catch (e) { this.log(`[ASH] Ext-Rvl close error (${pos.symbol}): ${e.message}`, 'warn'); }
-              })());
-            }
-          }
-          if (_closes.length) await Promise.all(_closes);
+          // Compare the buckets' overall MEAN edge (per-observation), not their totals —
+          // the extreme bucket is ~25% of readings by construction, so totals would always favor lukewarm.
+          const m = this.swSampleBucketMeans, min = Math.max(3, this.cfg.swExtremityMinSamples || 3);
+          if (m && m.extreme != null && m.lukewarm != null && m.nE >= min && m.nL >= min) return m.lukewarm > m.extreme ? 'lukewarm' : 'extreme';
+          return 'extreme';
         },
         // cfg.micEnabled is a persisted toggle value — it survives MIC being removed via the
         // Plugin Manager, so it alone can't tell us whether MIC is actually loaded right now.
@@ -2402,22 +1607,6 @@
         _ocChartViable() {
           return this._micPluginLoaded() || this._becPluginLoaded();
         },
-        // Slot Blocking: true once a criterion's collapsed score is a loss beyond the
-        // configured % of base margin. Auto-clears the moment the score recovers — no manual
-        // reset needed. A lukewarm-classified occurrence never reaches this score at all (see
-        // _swExtremityBuild) — blocking only ever reacts to a losing EXTREME, same standard
-        // the dial applies everywhere else.
-        _swIsCritBlocked(key) {
-          if (!this.cfg.micSlotBlockEnabled) return false;
-          const ranks = this.micCollapsedSlotRanks || {};
-          const threshold  = this._swBlockThreshold();
-          if (!this.cfg.micSlotBlockTags) return false;
-          const blockable = (this.cfg.micSlotBlockCriteria || []).filter(Boolean);
-          if (!blockable.length) return false;
-          const esc = v => String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const rx = new RegExp('^(' + blockable.map(esc).join('|') + ')[+-]?$');
-          return rx.test(key) && (ranks[key] ?? 0) <= -threshold;
-        },
         // Lukewarm Scoring pill UI — two big buckets, Extreme and Lukewarm, each
         // headlined by its aggregate $ record (which side has actually been more
         // profitable overall), with smaller per-criterion pills nested inside showing which
@@ -2425,19 +1614,19 @@
         _swExtremityHtml(shown) {
           if (!shown) return '';
           const board = this.swLukewarmScoreboard || { extreme: [], lukewarm: [] };
-          if (!board.extreme.length && !board.lukewarm.length) return `<span style="font-size:9px;color:var(--text-lo)">${this.cfg.swSampleScoringEnabled ? 'No scored samples yet.' : 'No Extremity closes recorded yet.'}</span>`;
+          if (!board.extreme.length && !board.lukewarm.length) return `<span style="font-size:9px;color:var(--text-lo)">No scored samples yet.</span>`;
           // one chart at a time: only the side the bot currently favors is drawn.
           // One row of criterion duos (left bar = '+' end, right bar = '-' end); profit rises
           // above the zero line, loss hangs below it. Sized off the container, never wraps.
           const side = this._swLukewarmFavoredSide();
           const entries = board[side] || [];
           const accent = side === 'lukewarm' ? 'rgba(150,150,160,.45)' : 'rgba(var(--sw-rgb),.45)';
-          const FAMS = ['fund', 'va', 'iol', 'ios', 'lta', 'lpa'].filter(f => !(this.cfg.swSampleScoringEnabled && !this.cfg.swLiqEnabled && f === 'lpa')); // Sample Scoring never scores LPA (it is the outcome), so its dial stays hidden
+          const FAMS = ['fund', 'va', 'iol', 'ios', 'lta', 'lpa'].filter(f => !(!this.cfg.swLiqEnabled && f === 'lpa')); // Sample Scoring never scores LPA (it is the outcome), so its dial stays hidden
           const byKey = {};
           for (const s of entries) byKey[s.key] = s;
-          const sm = !!this.cfg.swSampleScoringEnabled;
+          const sm = true;
           const fmt = sm ? (v => (v >= 0 ? '+' : '-') + Math.abs(v).toFixed(2) + 'pp') : (v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2));
-          const GREEN = 'rgba(100,220,150,.9)', PURPLE = 'rgba(190,130,255,.95)';
+          const GREEN = 'rgba(100,220,150,.9)';
           const total = (sm && this.swSampleBucketMeans && this.swSampleBucketMeans[side] != null) ? this.swSampleBucketMeans[side] : entries.reduce((a, s) => a + s.pnl, 0);
           const totalColor = total > 0 ? GREEN : total < 0 ? 'var(--short)' : 'var(--text-lo)';
           const wx = sm ? this._swSampleWeather(side) : null;
@@ -2458,8 +1647,7 @@
           const bar = key => {
             const s = byKey[key];
             const v = s ? s.pnl : 0;
-            const blocked = this._swIsCritBlocked(key);
-            const color = blocked ? PURPLE : v > 0 ? GREEN : v < 0 ? 'var(--short)' : 'var(--text-lo)';
+            const color = v > 0 ? GREEN : v < 0 ? 'var(--short)' : 'var(--text-lo)';
             const h = v === 0 ? 0 : Math.max(3, Math.min(100, Math.abs(v) / maxAbs * 100));
             const tip = s ? (sm ? `${key}  ${fmt(v)} avg edge  ${s.wins}↑ ${s.losses}↓  n=${s.n}` : `${key}  ${fmt(v)}  ${s.wins}W ${s.losses}L`) : `${key}  ${sm ? 'no samples yet' : 'no closes yet'}`;
             const half = (up) => `<div style="flex:1 1 0;min-height:0;display:flex;align-items:${up ? 'flex-end' : 'flex-start'}">`
@@ -2509,19 +1697,12 @@
           this.swCrossEvents = fromWinter.slice(-20);
         },
 
-        // Renders the Cross tab's Partner Feed — every broadcast kind Winter can write to the
-        // shared bus (cascade/sacrifice closes, DDH/glk start+end transitions, GC steps), not
-        // just close reasons. Built for debugging Mutual DDH Lift and GC lift: the start/end
+        // Renders the Cross tab's Partner Feed — the cascade / sacrifice closes the partner broadcast on the shared bus.
         // pairing and step numbers here are what actually decide whether a lift condition fires.
         _swCrossFeedHtml() {
           const meta = {
             'cascade':   { icon: '⚡', label: 'Cascade',          color: 'rgba(100,220,150,.9)' },
             'sacrifice': { icon: '🩸', label: 'Sacrifice',        color: 'rgba(255,80,80,.9)' },
-            'ddh-start': { icon: '🧊', label: 'DDH Start',        color: 'rgba(120,180,255,.9)' },
-            'ddh-end':   { icon: '🧊', label: 'DDH Lift',         color: 'rgba(120,180,255,.55)' },
-            'glk-start': { icon: '🔒', label: 'Gains-Lock Start', color: 'rgba(220,180,100,.9)' },
-            'glk-end':   { icon: '🔓', label: 'Gains-Lock Lift',  color: 'rgba(220,180,100,.55)' },
-            'gc':        { icon: '📡', label: 'GC Step',          color: 'rgba(180,140,255,.9)' },
           };
           const events = (this.swCrossEvents || []).filter(e => meta[e.kind]).slice().reverse();
           if (!events.length) return '';
@@ -2532,8 +1713,7 @@
             const dateUTC = d.toISOString().slice(0, 10);
             const t = (dateUTC !== todayUTC ? dateUTC.slice(5) + ' ' : '') + d.toISOString().slice(11, 19) + ' UTC';
             let detail = '';
-            if (e.kind === 'gc') detail = (e.pnl != null ? '+' + e.pnl.toFixed(2) : '') + (e.step != null ? ' · step ' + e.step : '');
-            else if (e.kind === 'cascade' || e.kind === 'sacrifice') detail = (e.count != null ? '×' + e.count + ' ' : '') + (e.pnl != null ? (e.pnl >= 0 ? '+' : '') + e.pnl.toFixed(2) : '') + (e.symbol ? ' ' + e.symbol : '');
+            if (e.kind === 'cascade' || e.kind === 'sacrifice') detail = (e.count != null ? '×' + e.count + ' ' : '') + (e.pnl != null ? (e.pnl >= 0 ? '+' : '') + e.pnl.toFixed(2) : '') + (e.symbol ? ' ' + e.symbol : '');
             else if (e.symbol) detail = e.symbol;
             return `<div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:8px;line-height:12px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">` +
               `<span>${m.icon}</span>` +
@@ -2570,16 +1750,13 @@
             { id: 'forecast:readings', icon: '🧮', label: 'Forecast Grader · Readings', sub: 'The snapshot and background readings behind each graded forecast, as compact columns (join on symbol + startBatch)' },
             { id: 'forecast:pending', icon: '⏳', label: 'Forecast Grader · Pending', sub: 'Forecasts still waiting for their revisit, with their readings' },
             { id: 'forecast:ranges', icon: '📏', label: 'Forecast Grader · Range Fit Past Moves', sub: 'The stored hourly past moves and the last fit\'s ranges and peers' },
-            { id: 'pool', icon: '🎚', label: 'Dial Sample Pool', sub: 'Samples behind each dial cutoff' },
-            { id: 'closed', icon: '📈', label: 'Closed-Trade History', sub: 'Extremity records from closed positions' },
             { sec: 'Sample charts' },
             { id: 'charts', icon: '🗂', label: 'All Sample Charts', sub: 'Every batch, every ticker, every field (the raw chart history)' },
             { grid: [['chart:vol', 'Vol'], ['chart:io', 'IO'], ['chart:ls', 'L/S'], ['chart:fund', 'Fund'], ['chart:lta', 'LTA'], ['chart:lpa', 'LPA'], ['chart:liq', 'Liq']] },
             { sec: 'Live and state' },
             { id: 'liqwatch', icon: '💥', label: 'Liquidation Watch', sub: 'Watch in progress, live tally per ticker, unscored closing watch' },
-            { id: 'cross', icon: '📡', label: 'Cross Events', sub: 'GC steps, cascade / sacrifice, DDH and gains-lock log' },
-            { id: 'state', icon: '🔧', label: 'Plugin State', sub: 'GC window, drawdown state' },
-            { id: 'profile', icon: '💾', label: 'Profile (for Import)', sub: 'Every importable store: closed trades, charts, observations, forecasts, dial pool, cross events' },
+            { id: 'cross', icon: '📡', label: 'Cross Events', sub: 'Cascade / sacrifice log' },
+            { id: 'profile', icon: '💾', label: 'Profile (for Import)', sub: 'Every importable store: charts, observations, forecasts, cross events' },
           ];
         },
         swExportOpen() {
@@ -2624,8 +1801,7 @@
         _swExportPart(id) {
           const rd = k => { try { const r = DS.getItem(k); return r ? JSON.parse(r) : null; } catch (_) { return null; } };
           switch (id) {
-            case 'profile': return Object.assign({}, ...['closed', 'charts', 'obs', 'forecast:store', 'pool', 'cross'].map(k => this._swExportPart(k))); // every importable store
-            case 'closed':  return { extremity: rd(EXTREMITY_KEY) || [] };
+            case 'profile': return Object.assign({}, ...['charts', 'obs', 'forecast:store', 'cross'].map(k => this._swExportPart(k))); // every importable store
             case 'charts':  return { ocHistory: this._swOcCycleHistory || [] };
             case 'obs':     return { sampleStore: this._swSampleStore || rd(SAMPLE_OBS_KEY) || { obs: [] } };
             case 'forecast': return this._swFcExport();
@@ -2634,7 +1810,6 @@
             case 'forecast:pending': return this._swFcExport('pending');
             case 'forecast:ranges': return this._swFcExport('ranges');
             case 'forecast:store': return this._swFcExport('store'); // the raw store: Profile export / import only
-            case 'pool':    return { dialPool: this.swDialSamplePool || rd(DIAL_POOL_KEY) || {} };
             case 'cross':   return { crossEvents: this._swCrossRead() };
             case 'score':   return this._swExportScore();
             case 'liqwatch': return { liqWatch: {
@@ -2643,10 +1818,9 @@
               tally: LIQ.tally || {}, // per ticker: up = liquidated shorts (turnover), dn = liquidated longs, n = events
               closing: LIQ.closing ? { snap: LIQ.closing.snap, syms: [...LIQ.closing.watch.syms] } : null,
               stored: rd(LIQ_KEY) } };
-            case 'state':   return { pluginState: rd(ASH_KEY), gcWindow: this.swGcWindow || [], gcLastStep: this._swGcLastStep ?? null, ddhStartedAt: this._swDdhStartedAt ?? null };
             case 'all': {
               const out = {};
-              for (const k of ['score', 'profile', 'liqwatch', 'state']) Object.assign(out, this._swExportPart(k));
+              for (const k of ['score', 'profile', 'liqwatch']) Object.assign(out, this._swExportPart(k));
               return out;
             }
           }
@@ -2660,9 +1834,9 @@
           const cfg = {};
           for (const [k, v] of Object.entries(this.cfg || {})) if (k.startsWith('sw')) cfg[k] = v;
           const hostCfg = {};
-          for (const k of ['minNotional', 'leverage', 'entryTpRoi', 'binaryModeEnabled', 'binaryTpPct', 'micSlotBlockPct']) hostCfg[k] = this.cfg ? this.cfg[k] : undefined;
+          for (const k of ['minNotional', 'leverage', 'entryTpRoi', 'binaryModeEnabled', 'binaryTpPct']) hostCfg[k] = this.cfg ? this.cfg[k] : undefined;
           return { scorer: {
-            mode: this.cfg.swSampleScoringEnabled ? 'sample' : 'closed-trade',
+            mode: 'sample',
             favoredSide: fav,
             headline: safe(() => ({ extreme: this._swSampleWeather('extreme'), lukewarm: this._swSampleWeather('lukewarm'), favored: this._swSampleWeather(fav) })),
             bucketMeans: this.swSampleBucketMeans || null,
@@ -2739,8 +1913,6 @@
           const got = [];
           if (!d || typeof d !== 'object') return got;
           const put = (k, v) => { try { DS.setItem(k, JSON.stringify(v)); } catch (_) {} };
-          const ext = d.extremity || d.scorecard; // 'scorecard' = pre-Extremity exports (same record shape)
-          if (Array.isArray(ext)) { put(EXTREMITY_KEY, ext); got.push(`${ext.length} closed-trade records`); }
           if (Array.isArray(d.ocHistory)) {
             this._swOcCycleHistory = this._ocSanitizeHistory(d.ocHistory).cleaned;
             put(ASH_OC_HIST_KEY, this._swOcCycleHistory);
@@ -2758,19 +1930,13 @@
             this._swFcSave();
             got.push(`${this._swFc.done.length} graded forecasts, ${this._swFc.pend.length} pending`);
           }
-          if (d.dialPool && typeof d.dialPool === 'object' && !Array.isArray(d.dialPool)) {
-            this.swDialSamplePool = d.dialPool;
-            this._swDialPoolLastWrite = 0;
-            this._swSaveDialPool();
-            got.push(`dial pool (${Object.keys(d.dialPool).length} dials)`);
-          }
           if (Array.isArray(d.crossEvents)) {
             const have = this._swCrossRead(), id = x => [x.ts, x.kind, x.source, x.symbol].join('|'), seen = new Set(have.map(id));
             const add = d.crossEvents.filter(x => x && typeof x.ts === 'number' && !seen.has(id(x)));
             if (add.length) put(CROSS_KEY, { events: _trimCrossEvents(have.concat(add).sort((a, b) => a.ts - b.ts)) });
             got.push(`${add.length} cross events (merged)`);
           }
-          if (got.length) { this.persist(); this._swScoreTrim(); this._swExtremityBuild(); }
+          if (got.length) { this.persist(); this._swExtremityBuild(); }
           return got;
         },
 
@@ -2782,44 +1948,6 @@
 
 
         
-        // Sample count behind the pole bucket a tier tag lands in (Extreme or Lukewarm, by the dial's own cutoff), and the median
-        // count across that bucket type's poles. MIC/MIW read this for the sparsity rule. null when there is no scoreboard yet or the family is not scored.
-        _swPoleData(annot) {
-          const key = collapseCrit(annot), info = dialInfo(key), board = this.swLukewarmScoreboard;
-          if (!info || !board) return null;
-          const cutoff = (this.swDialCutoffs || {})[info.family + '|' + info.pole];
-          const m = String(annot).match(/(-?\d+)$/);
-          const ext = !!BARE_DIAL_TAGS[key] || (cutoff != null && m != null && Math.abs(parseInt(m[1], 10)) >= cutoff);
-          const list = (ext ? board.extreme : board.lukewarm) || [];
-          // A family the scorecard does not score at all (LPA, under the hour-move pairing) is absent, not thin: skip it.
-          if (![...(board.extreme || []), ...(board.lukewarm || [])].some(e => e.family === info.family)) return null;
-          const cnt = e => (typeof e.n === 'number' ? e.n : (e.wins || 0) + (e.losses || 0));
-          const ns = list.map(cnt).sort((a, b) => a - b);
-          if (!ns.length) return null;
-          const hit = list.find(e => e.family === info.family && e.pole === info.pole), mid = Math.floor(ns.length / 2);
-          return { n: hit ? cnt(hit) : 0, med: ns.length % 2 ? ns[mid] : (ns[mid - 1] + ns[mid]) / 2 };
-        },
-        // Sparsity of one tier tag: f = n/(n+minSamples) pulls a thinly-evidenced pole's score toward zero; ratio = n / median.
-        _swSparseOne(annot) {
-          const d = this._swPoleData(annot);
-          if (!d) return null;
-          const k = Math.max(3, this.cfg.swExtremityMinSamples || 3);
-          return { f: d.n / (d.n + k), ratio: d.med > 0 ? d.n / d.med : 1, n: d.n, med: d.med };
-        },
-        // Sparsity of a candidate's whole tag list: factor = its thinnest pole's f; block when that pole holds under swSparsePct% of
-        // its bucket type's median sample count (default 25). Not optional — there is no toggle.
-        _swSparse(annots) {
-          let factor = 1, worst = null;
-          for (const a of (annots || [])) {
-            const o = this._swSparseOne(a);
-            if (!o) continue;
-            if (o.f < factor) factor = o.f;
-            if (dialInfo(collapseCrit(a))?.family === 'lpa') continue; // LPA is liquidation-fed only, so its poles are thin by nature: exempt from the block (its score still shrinks by f)
-            if (!worst || o.ratio < worst.ratio) worst = { ...o, tag: collapseCrit(a) };
-          }
-          const floor = Number.isFinite(+this.cfg.swSparsePct) ? +this.cfg.swSparsePct : 25;
-          return { factor, block: !!worst && worst.med > 0 && worst.ratio * 100 < floor, note: worst ? `${worst.tag} n=${worst.n} vs median ${Math.round(worst.med)}` : '' };
-        },
 
 
 
@@ -2831,16 +1959,6 @@
         async _swScanPost() {
           if (!this.cfg.ashfallEnabled) return;
           this._swCheckCross().catch(() => {});
-          // Re-eval waits for the end of the scan (idle lane) so MIC's own fetches land first. Not awaited — closes can
-          // take a while and the scan shouldn't wait on them.
-          if (this._schIdle) this._schIdle('sw-reeval', () => { this._swExtremityReEval().catch(() => {}); });
-          else setTimeout(() => this._swExtremityReEval().catch(() => {}), 0);
-          // swDialSamplePool persists across restarts (loaded explicitly in init()) — this call
-          // keeps the panel in sync as new live samples land. _swExtremityBuild() is otherwise only
-          // called on a close/config-change/import (see runScan's comment on why it's not on a
-          // timer), so without it a freshly-loaded page shows every dial-based score as zero until
-          // the next close. Once per scan is cheap enough (same call the toggles above make on
-          // every slider drag).
           this._swSampleAdopt?.();
           this._swFcAdopt?.();
           // Coalesced: MIC rebuilds right before it decides entries and cancels this one; when MIC doesn't run
@@ -2856,55 +1974,8 @@
           const _hadRec = (this.closedTrades || []).some(x => x.id === pos.id);
           await _origClose.call(this, pos, reason, fillPrice);
           const _rec = _hadRec ? null : (this.closedTrades || []).find(x => x.id === pos.id);
-          if (_rec) {
-            // totalPnl (incl. funding) is what the base feeds its halt windows
-            const t   = _rec;
-            const pnl = t?.totalPnl ?? t?.pnl;
-            // Gains Continuation (GC) — own rolling 6h PnL, independent of the host's Gains
-            // Lock window. Stepped in swGcThresholdPct-of-base-margin increments (default 50% —
-            // e.g. $0.50, $1.00, $1.50 at $1 base margin): every NEW step crossed upward fires a
-            // one-shot 'gc' broadcast (high-water-mark — a step already fired never re-fires on
-            // its own, only on a fresh climb after the window resets to ≤0). Read side is in the
-            // 15s loop below.
-            if (this.cfg.swGcEnabled && typeof pnl === 'number') {
-              const _gcNow = Date.now();
-              const _gcCut = _gcNow - 6 * 3600 * 1000;
-              this.swGcWindow.push({ pnl, ts: _gcNow });
-              this.swGcWindow = this.swGcWindow.filter(e => (e.ts || 0) >= _gcCut);
-              const _gcRolling = this.swGcWindow.reduce((s, e) => s + (e.pnl || 0), 0);
-              const _gcBaseMargin = (this.cfg.minNotional || 6) / (this.cfg.leverage || 6);
-              const _gcStep = _gcBaseMargin * Math.max(0.01, (this.cfg.swGcThresholdPct ?? 50) / 100);
-              const _gcStepIdx = Math.floor(_gcRolling / _gcStep);
-              if (_gcStepIdx > this._swGcLastStep) {
-                this._swGcLastStep = _gcStepIdx;
-                if (this.cfg.ashfallCrossEnabled) this._swCrossWrite('gc', null, { pnl: _gcRolling, step: _gcStepIdx });
-                this.log(`[ASH] 📡 Gains Continuation — 6hr rolling PnL +${_gcRolling.toFixed(2)} crossed step ${_gcStepIdx} (+${_gcStep.toFixed(2)} USDT increments) — broadcast to ${PARTNER_NAME}.`, 'success');
-              } else if (_gcRolling <= 0 && this._swGcLastStep !== 0) {
-                this._swGcLastStep = 0; // back to flat/negative — re-arm from the first step
-              }
-            }
-          }
           // Cascade/Sacrifice broadcasts fire once per trigger from MIC itself (at the collective-
           // exit decision point), not here per closed position — see _micCheckCascade/_micCheckSacrifice.
-          // Blind-Entry has no real filtering criteria (see docs/blind-entry-plan.md) — its
-          // _becCriteria are sign-only recording tags (+24h/-24h, +fund/-fund, +ocs/-ocs), never
-          // used to gate entry, that exist purely so the scorecard has something to bucket.
-          const _hasScoreCriteria = (pos._mic && pos._micCriteria?.length)
-            || (pos._bec && pos._becCriteria?.length)
-            || (pos._ldc && pos._ldcCriteria?.length);
-          // Rolling average (see _swPositionAvgCriteria) instead of the frozen entry-time
-          // snapshot — falls back to that same snapshot per-family if too few samples
-          // accumulated before this close (fast-close case).
-          const _scoreCriteria = _hasScoreCriteria ? this._swPositionAvgCriteria(pos) : null;
-          if (_scoreCriteria) {
-            const _t = _rec;
-            const _pnl = _t?.totalPnl ?? _t?.pnl;
-            if (typeof _pnl === 'number') {
-              // Not awaited: the drift refetch below can queue behind scan traffic, and a
-              // close (esp. bailAll) shouldn't wait on it. The record lands once drift is in.
-              this._swSettleCloseScore(pos, _scoreCriteria, _pnl).catch(() => {});
-            }
-          }
           // MIC-only feedback: direction-awareness lock, independent of the scorecard toggle.
           if (pos._mic && pos._micCriteria?.length) {
             const _t2  = _rec;
@@ -3251,7 +2322,38 @@
         _swFcPass() { return 70; },
         _swFcMid() { return 50; }, // second cutoff: 50-70 reads yellow
         _swFcClr(a) { return a >= this._swFcPass() ? 'rgba(110,220,160,.9)' : a >= this._swFcMid() ? 'rgba(255,214,102,.9)' : 'rgba(255,130,170,.9)'; },
-        _swFcOn() { return !!(this.cfg.swSampleScoringEnabled && this.cfg.swFcEnabled); },
+        _swFcOn() { return true; }, // Sample Scoring, the Forecast Grader and the Indicator forecast are always on
+        // Entry ranking. The Indicator forecast ranks each batch's tickers for entry: pp in the bot's favor, from er when Regime caution is
+        // active and the forecast carries one, else from e (both are stored in price direction). Null when the forecast has no score.
+        _swFcFavor(f) {
+          const v = (this._swRgOn() && typeof f.er === 'number') ? f.er : f.e;
+          return (typeof v === 'number' && isFinite(v)) ? this._swSampleDir() * v : null;
+        },
+        // The newest forecast on one ticker, any age (a held position's score now). Null when it has none.
+        _swFcScoreOf(sym) {
+          let best = null;
+          for (const f of this._swFcStore().pend) if (f.s === sym && (!best || f.a > best.a)) best = f;
+          return best ? this._swFcFavor(best) : null;
+        },
+        // This batch's forecasts, symbol -> score in the bot's favor, once the slow readings have landed (waits for them, 20s at most).
+        // A follower starts no forecasts of its own: it takes the leader's shared store (_swFcAdopt, published once per batch with the final scores) and ranks on the leader's forecasts for the batch it seeded.
+        async _swFcRankMap() {
+          const m = new Map();
+          if (this._swFollowing()) {
+            // The leader publishes a batch's forecasts once, with the final scores. Wait (20s at most) for a store newer than the last one ranked on.
+            const last = this._swFcRankSeq ?? -1, t0 = Date.now();
+            for (;;) {
+              this._swFcAdopt();
+              if (this._swFcStore().seq > last || Date.now() - t0 > 20000) break;
+              await new Promise(r => setTimeout(r, 1000));
+            }
+            if (this._swFcStore().seq <= last) return m; // not published in time: the host falls back to the scorecard projection
+            this._swFcRankSeq = this._swFcStore().seq;
+          } else if (this._swBgRunP) { try { await Promise.race([this._swBgRunP, new Promise(r => setTimeout(r, 20000))]); } catch (_) {} }
+          const fc = this._swFcStore();
+          for (const f of fc.pend) if (f.a === fc.seq) { const s = this._swFcFavor(f); if (s != null) m.set(f.s, s); }
+          return m;
+        },
         _swFcShare() { const v = Number(this.cfg.swFcShare); return Math.max(5, Math.min(90, isFinite(v) && v > 0 ? v : 50)) / 100; },
         _swFcLead() { const v = Math.round(Number(this.cfg.swFcLead)); return Math.max(2, Math.min(24, isFinite(v) && v > 0 ? v : 6)); },
         _swFcKeep() { const v = Math.round(Number(this.cfg.swFcKeep)); return Math.max(60, Math.min(6000, isFinite(v) && v > 0 ? v : 3000)); },
@@ -3298,7 +2400,7 @@
             if (idb) this._swFcIdbPush(idb, fc);
             const n = (idb && idb.proven) ? FC_LS_TAIL : Math.min(keep, 600); // IndexedDB has handed rows back on a boot = it persists here: localStorage keeps only a tail; until then it keeps what it always did
             DS.setItem(FC_KEY, JSON.stringify(fc.done.length > n ? { ...fc, done: fc.done.slice(-n) } : fc));
-            if (!this._swFollowing()) this._sharedWrite?.('fcGrade', { ...fc, done: fc.done.slice(-200) }); // a following partner adopts it
+            if (!this._swFollowing() && !(this._swBgBusy && Date.now() - this._swBgBusy < 90000)) this._sharedWrite?.('fcGrade', { ...fc, done: fc.done.slice(-200) }); // a following partner adopts it
           } catch (_) {
             try {
               const fc = this._swFcStore();
@@ -3675,8 +2777,9 @@
           fc.pend = still.concat(pick);
           fc.done = fc.done.slice(-keep);
           this._swFcPlanned = null;
+          if (pick.length && this._swBgOn()) this._swBgBusy = Date.now(); // the slow readings are still to land: a following bot gets this batch only once they have (see _swBgRun)
           this._swFcSave();
-          this._swBgRun(pick); // slow background readings + the two background models (no await: the scan never waits on it)
+          this._swBgRunP = this._swBgRun(pick); // slow background readings + the two background models (no await: the scan never waits on it)
         },
         // ── Indicator readings ──
         // Each forecast started here also logs a wide set of readings: free ones from the ticker and the 5-minute candles at once, and 1-hour candles
@@ -3685,7 +2788,7 @@
         // research feed the export's feature IC reads, to find the next indicators. The two ridge models this used to fit (bg._pd / _pm / _bd / _bm) are
         // retired; rows graded before that still carry those fields and they are ignored.
         // x_lq*: liquidations seen in the 10 minutes AFTER the forecast started (the watch opens at the start), a diagnostic and never an input.
-        _swBgOn() { return this._swFcOn() && this.cfg.swFcInd !== false; },
+        _swBgOn() { return this._swFcOn(); },
         // ── Persisted 1-hour candle state ──
         // A reload keeps the candle windows so tickers are not re-warmed (100 candles each): closes as hourly log-returns (1e-5), highs/lows as wicks off the
         // close (1e-4), the Wilder averages exactly, the last 20 RSI12 values. About 1 KB per ticker; the most recently used BG_PERSIST_MAX tickers are kept,
@@ -3899,8 +3002,10 @@
             await Promise.all([worker(), worker(), worker()]);
             if (this._swDivOn()) this._swDivMaybeBuild(); // a young library clusters once the batch's pairs are in
             { const cx = this._swFcStore().ctx; this._swFcLive(pick, cx && cx[pick[0].a]); } // the slow readings (1-hour ATR, open-interest change) are in: score the batch again with all of them
-            this._swFcSave(); this._swBgDirty = false; this._swBgPersistSoon();
-          } catch (_) {}
+            this._swBgBusy = 0; this._swFcSave(); this._swBgDirty = false; this._swBgPersistSoon(); // final scores: published to a following bot here
+          } catch (_) {
+            if (this._swBgBusy) { this._swBgBusy = 0; this._swFcSave(); }
+          }
         },
         // Liquidations the watch saw in the 10 minutes after each pending forecast started (diagnostic only; see the note above).
         _swBgLiq(cyc, syms, lean, split, cl) {
@@ -4486,13 +3591,21 @@
             breakerLibrary: { note: 'cell = where the price sat in the crab\'s range (b bottom / m middle / t top) + last-hour volume 2x median (1/0) + last 6 hours squeezed under 40% of the range (1/0); crabsSeen = past crabs filed in the cell; the break probability used starts at ' + CRAB_P0 * 100 + '% and moves toward what the cell has seen (prior weight ' + CRAB_PRIOR + ' crabs)', tickersLearned: Object.keys(CRAB.last).length, cells },
             note: 'crab readings (cb6..cb96, cp6..cp96, cbu, cbw, cbz, cbp, cbr, cbl, cbh, cbb, cbd, cbk) are in every forecast\'s background readings; preCrabPp / fullCrabPp on the grades are the score before the crab layer and with it at full weight' };
         },
+        // Small table for the Score tab readouts: first column left, the rest right; head and rows are plain strings or numbers.
+        _swTblHtml(head, rows, cap) {
+          const th = (t, i) => `<th style="text-align:${i ? 'right' : 'left'};font-weight:normal;${i ? 'padding-left:10px;' : ''}color:var(--text-lo)">${t}</th>`;
+          const td = (t, i) => `<td style="text-align:${i ? 'right' : 'left'};padding:1px 0 1px ${i ? '10px' : '0'};color:${i ? 'var(--text-hi)' : 'var(--text-lo)'}">${t}</td>`;
+          return (cap ? `<div style="font-size:9px;color:var(--text-lo);margin-top:6px">${cap}</div>` : '') + `<div style="overflow-x:auto;margin-top:2px"><table style="border-collapse:collapse;font-family:var(--mono);font-size:9px"><thead><tr>${head.map(th).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${r.map(td).join('')}</tr>`).join('')}</tbody></table></div>`;
+        },
         _swCrabPanel() {
           if (!this._swCrabOn()) return '<div style="font-size:10px;color:var(--text-lo)">Crab layer is off.</div>';
           this._swCrabEnsure(); const pend = this._swFcStore().pend, cr = pend.filter(f => f.bg && f.bg.cbw > 0), bl = this._swFcCrabBlendCalc(), n = Object.keys(CRAB.cells).reduce((s, k) => s + CRAB.cells[k].n, 0), u = Object.keys(CRAB.cells).reduce((s, k) => s + CRAB.cells[k].u, 0), dn = Object.keys(CRAB.cells).reduce((s, k) => s + CRAB.cells[k].d, 0);
-          const wc = {}, sgn = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; for (const f of cr) wc[f.bg.cbw] = (wc[f.bg.cbw] || 0) + 1;
-          let h = '<div style="font-size:10px;line-height:1.5;color:var(--text-lo)">Crabbing now: ' + cr.length + ' of ' + pend.length + ' forecasts in flight' + (cr.length ? ' (' + Object.keys(wc).map(w => wc[w] + ' x ' + w + 'h').join(', ') + ')' : '') + '<br>Breaker library: ' + (n ? n + ' past crabs · ' + Math.round((n - u - dn) / n * 100) + '% held, ' + Math.round(u / n * 100) + '% broke up, ' + Math.round(dn / n * 100) + '% broke down within ' + CRAB_H + 'h' : 'collecting') + '<br>Weight ' + Math.round(bl.b * 100) + '%' + (bl.rows ? ' · tested on ' + bl.rows + ' changed forecasts' : ' · untested (stands in full)') + '</div>';
+          const wc = {}, sgn = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%', pc = v => Math.round(v / n * 100) + '%'; for (const f of cr) wc[f.bg.cbw] = (wc[f.bg.cbw] || 0) + 1;
+          let h = this._swTblHtml(['Crabbing now', 'In flight', 'By window'], [[cr.length, pend.length, cr.length ? Object.keys(wc).map(w => wc[w] + ' x ' + w + 'h').join(', ') : '—']]);
+          h += this._swTblHtml(['Breaker library', 'Held', 'Broke up', 'Broke down'], [[n ? n + ' past crabs' : 'collecting', n ? pc(n - u - dn) : '—', n ? pc(u) : '—', n ? pc(dn) : '—']], 'Outcome within ' + CRAB_H + 'h');
+          h += this._swTblHtml(['Weight', 'Tested on'], [[Math.round(bl.b * 100) + '%', bl.rows ? bl.rows + ' changed forecasts' : 'untested (stands in full)']]);
           const top = cr.slice().sort((a, b) => b.bg.cbu - a.bg.cbu).slice(0, 6);
-          if (top.length) { h += '<div style="font-size:9px;color:var(--text-lo);margin-top:4px">Strongest crabs (longest window, range low / high from the price, position in range)</div>'; for (const f of top) h += '<div style="font-family:var(--mono);font-size:10px;color:var(--text-hi)">' + f.s.replace('USDT', '') + ' ' + f.bg.cbw + 'h · ' + sgn(f.bg.cbl) + ' / ' + sgn(f.bg.cbh) + ' · ' + Math.round(f.bg.cbp * 100) + '%</div>'; }
+          if (top.length) h += this._swTblHtml(['Ticker', 'Window', 'Range low', 'Range high', 'In range'], top.map(f => [f.s.replace('USDT', ''), f.bg.cbw + 'h', sgn(f.bg.cbl), sgn(f.bg.cbh), Math.round(f.bg.cbp * 100) + '%']), 'Strongest crabs (longest window, range low / high from the price, position in range)');
           return h;
         },
         // Which readings drive the direction. Re-tested whenever a batch has graded, on the graded forecasts of the last window (default 4 hours): every logged
@@ -4741,12 +3854,14 @@
           if (!this._swRgOn()) return `<div style="${lo}">Regime caution is off.</div>`;
           const wins = this._swRgWins(), mk = this._swRgMarket(wins), fc = this._swFcStore(), R = fc.rg || this._swFcRgNew(), d = this._swSampleDir(), rows = fc.pend.filter(f => f.rg && f.er != null);
           const sg = (v, k = 2) => (v >= 0 ? '+' : '') + v.toFixed(k);
-          let h = `<div style="${lo}">` + (mk ? `Market now: ${RG_LVL[this._swRgLevel(mk.sm)]} (${sg(mk.sm)}), ${mk.n} tickers read<br>` + mk.w.filter(Boolean).map(m => `${m.w}h ${sg(m.mz)}`).join(' · ') : 'Market: too few fresh hour candles yet');
+          const mw = mk ? mk.w.filter(Boolean) : [];
+          let h = mk ? this._swTblHtml(['Market now', 'Score', 'Tickers read', ...mw.map(m => m.w + 'h')], [[RG_LVL[this._swRgLevel(mk.sm)], sg(mk.sm), mk.n, ...mw.map(m => sg(m.mz))]]) : `<div style="${lo}">Market: too few fresh hour candles yet</div>`;
           const dn = rows.filter(f => d * f.rg.ad < -0.05).length, up = rows.filter(f => d * f.rg.ad > 0.05).length, dv = rows.filter(f => f.rg.c > 0);
-          h += `<br>In flight: ${rows.length} read · ${dn} marked down · ${up} marked up · ${dv.length} against the market`;
-          const bl = this._swFcRgBlendCalc(); h += `<br>Learned: ${Math.round(Object.keys(R.mu).reduce((s, k) => s + R.mu[k].n, 0))} cohorts · ${Object.keys(R.tb).length} tables<br>Weight ${Math.round(bl.b * 100)}%: ${bl.why}</div>`;
+          h += this._swTblHtml(['In flight', 'Marked down', 'Marked up', 'Against market'], [[rows.length, dn, up, dv.length]]);
+          const bl = this._swFcRgBlendCalc();
+          h += this._swTblHtml(['Learned cohorts', 'Tables', 'Weight'], [[Math.round(Object.keys(R.mu).reduce((s, k) => s + R.mu[k].n, 0)), Object.keys(R.tb).length, Math.round(bl.b * 100) + '%']]) + `<div style="${lo};margin-top:2px">${bl.why}</div>`;
           const top = dv.slice().sort((a, b) => Math.max(...b.rg.z.map(v => Math.abs(v || 0))) - Math.max(...a.rg.z.map(v => Math.abs(v || 0)))).slice(0, 5);
-          if (top.length) { h += '<div style="font-size:9px;color:var(--text-lo);margin-top:4px">Against the market now (position vs its typical extreme, per window)</div>'; for (const f of top) h += '<div style="font-family:var(--mono);font-size:10px;color:var(--text-hi)">' + f.s.replace('USDT', '') + ' ' + (f.rg.c === 1 ? 'green vs red' : 'red vs green') + ' · ' + f.rg.w.map((w, i) => f.rg.z[i] == null ? '' : w + 'h ' + sg(f.rg.z[i], 1)).filter(Boolean).join(' ') + '</div>'; }
+          if (top.length) h += this._swTblHtml(['Ticker', 'Pair', ...top[0].rg.w.map(w => w + 'h')], top.map(f => [f.s.replace('USDT', ''), f.rg.c === 1 ? 'green vs red' : 'red vs green', ...f.rg.w.map((w, i) => f.rg.z[i] == null ? '—' : sg(f.rg.z[i], 1))]), 'Against the market now (position vs its typical extreme, per window)');
           return h;
         },
         _swRgRow(r, d, r2) { // the regime fields of one graded or pending forecast (pp fields in the bot's favor like projectedPp)
