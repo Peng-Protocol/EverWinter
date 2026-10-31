@@ -37,14 +37,14 @@
   window.__BotPlugin = {
     id:        'everwinter',
     name:      'EverWinter',
-    version:   '1.5.4',
+    version:   '1.7.0',
     targetBot: 'pseudowinter',
     after:     [],
     before:    [],
     conflicts: [],
     requires:  [],
-    touches:   ['init', 'pseudoOpenShort', 'pseudoClosePosition', 'pseudoWatchPositions', 'refreshBalance', 'bailAll'],
-    suppresses: ['pseudoOpenShort', 'refreshBalance'],
+    touches:   ['init', 'pseudoOpenShort', 'pseudoClosePosition', 'pseudoWatchPositions', 'refreshBalance', 'bailAll', '_condSubmit', 'cancelCondOrder', 'pseudoWatchCondOrders'],
+    suppresses: ['pseudoOpenShort', 'refreshBalance', '_condSubmit', 'pseudoWatchCondOrders'],
 
     css: `
       .ew-inp { width: 100%; background: var(--bg-void); border: 1px solid var(--border-hi); color: var(--text-hi); padding: 5px 8px; border-radius: 4px; font-family: var(--mono); font-size: 10px; margin-bottom: 6px; }
@@ -141,6 +141,7 @@
       const _origWatch = def.pseudoWatchPositions;
       const _origCycle = def.runScheduledCycle;
       const _origBailAll = def.bailAll;
+      const _origCancelCond = def.cancelCondOrder;
 
       return Object.assign({}, def, {
 
@@ -658,16 +659,151 @@
           } catch(e) { this.log(`[EW] sync error: ${e.message}`, 'warn'); }
         },
 
+        // ── Conditional limit entries (live) ──
+        // The host's placeCondEntry validates and records the order; this places the real Bybit conditional
+        // limit order (trigger = limit = target). On fill the host's normal entry path builds the position.
+        async _condSubmit(order) {
+          if (!this.creds.key || !this.creds.secret) { this.log('[EW] cond. order refused — no credentials set', 'warn'); return false; }
+          const sym = order.symbol;
+          const refuse = why => { this.log(`[EW] ${sym}: cond. order refused — ${why}`, 'warn'); return false; };
+          const instr = await this.getInstrInfo(sym);
+          if (!instr) return refuse('instrument info unavailable');
+          if (this._ewOpposite?.[sym]) return refuse('opposite position open on exchange');
+          try {
+            await this._ewDelay();
+            const q = `category=linear&symbol=${sym}`;
+            const h = await _sign(this.creds.key, this.creds.secret, q, this._tsOffset);
+            const d = await this._ewSafeJson(await fetch(`${this.base}/v5/position/list?${q}`, { headers: h }));
+            if (d?.retCode === 0 && (d.result?.list || []).some(e => parseFloat(e.size) > 0)) return refuse('position already open on exchange');
+          } catch (e) {}
+          const levRes = this.resolveEffectiveLeverage(sym, instr);
+          if (!levRes) return false;
+          const lev = (typeof levRes === 'object' ? levRes.lev : levRes) || this.cfg.leverage;
+          const target = this.snapPrice(order.target, instr);
+          const qty    = this.snapQty(this.cfg.minNotional / target, instr);
+          if (!target || !qty || qty < (instr.minQty || 0)) return refuse('qty below exchange minimum at target');
+          if (instr.minOrderAmt > 0 && qty * target < instr.minOrderAmt) return refuse('notional below exchange minimum');
+          if (!await this._ewSetLeverage(sym, lev)) return false;
+          await this._ewDelay();
+          const px = target.toFixed(this._ewPriceDp(sym));
+          const b  = JSON.stringify({ category: 'linear', symbol: sym, side: 'Sell', orderType: 'Limit', qty: String(qty), price: px, triggerPrice: px, triggerBy: 'LastPrice', triggerDirection: order.dir > 0 ? 1 : 2, timeInForce: 'GTC', reduceOnly: false });
+          const h  = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+          try {
+            const d = await this._ewSafeJson(await fetch(`${this.base}/v5/order/create`, { method: 'POST', headers: h, body: b }));
+            if (!d || d.retCode !== 0 || !d.result?.orderId) return refuse(d?.retMsg || 'no response');
+            order.orderId = d.result.orderId;
+          } catch (e) { return refuse(e.message); }
+          order._pseudo = false; order.qty = qty; order.target = target;
+          return true;
+        },
+
+        async _ewCondStatus(o) {
+          const qs = `category=linear&symbol=${o.symbol}&orderId=${o.orderId}`;
+          for (const path of ['realtime', 'history']) {
+            try {
+              await this._ewDelay();
+              const h = await _sign(this.creds.key, this.creds.secret, qs, this._tsOffset);
+              const d = await this._ewSafeJson(await fetch(`${this.base}/v5/order/${path}?${qs}`, { headers: h }));
+              const st = d?.retCode === 0 ? d.result?.list?.[0]?.orderStatus : null;
+              if (st) return st;
+            } catch (e) {}
+          }
+          return null;
+        },
+
+        async _ewCondCancel(o) {
+          await this._ewDelay();
+          const b = JSON.stringify({ category: 'linear', symbol: o.symbol, orderId: o.orderId });
+          const h = await _sign(this.creds.key, this.creds.secret, b, this._tsOffset);
+          try {
+            const d = await this._ewSafeJson(await fetch(`${this.base}/v5/order/cancel`, { method: 'POST', headers: h, body: b }));
+            return d?.retCode === 0;
+          } catch (e) { return false; }
+        },
+
+        // Exchange cancel first; if the exchange refuses because the order already filled, track the position instead.
+        async cancelCondOrder(id, reason = 'manual') {
+          const o = this.condOrders.find(x => x.id === id);
+          if (o && o._pseudo === false && o.orderId && !await this._ewCondCancel(o)) {
+            const st = await this._ewCondStatus(o);
+            if (st === 'Filled') { await this._ewCondFilled(o); return false; }
+            if (st && !['Cancelled', 'Deactivated', 'Rejected', 'PartiallyFilledCanceled'].includes(st)) {
+              this.log(`[EW] ${o.symbol}: cond. order cancel refused (status ${st}) — will retry`, 'warn');
+              return false;
+            }
+          }
+          return _origCancelCond.call(this, id, reason);
+        },
+
+        // Filled on the exchange: hand the real fill to the normal entry path (position, TP/SL, DCA orders).
+        async _ewCondFilled(o) {
+          if (!this.condOrders.some(x => x.id === o.id)) return;
+          this.condOrders = this.condOrders.filter(x => x.id !== o.id); // remove first — blocks a double conversion
+          let fill = o.target;
+          try {
+            await this._ewDelay();
+            const q = `category=linear&symbol=${o.symbol}`;
+            const h = await _sign(this.creds.key, this.creds.secret, q, this._tsOffset);
+            const d = await this._ewSafeJson(await fetch(`${this.base}/v5/position/list?${q}`, { headers: h }));
+            const e = (d?.result?.list || []).find(x => x.side === 'Sell' && parseFloat(x.size) > 0);
+            const ap = e ? parseFloat(e.avgPrice || e.entryPrice || 0) : 0;
+            if (ap > 0) fill = ap;
+          } catch (e) {}
+          this.log(`[EW] ${o.symbol}: cond. order filled @ ${fill} — tracking position`, 'info');
+          const pos = await this.pseudoOpenShort({ ...o.candidate, symbol: o.symbol, price: o.target, _condFill: fill, _condQty: o.qty });
+          if (!pos) this.log(`[EW] ${o.symbol}: cond. fill could not be tracked — exchange position left unmanaged`, 'error');
+          this.persist();
+        },
+
+        // Live cond. orders: one open-orders poll per tick, then status lookups only for orders that left the list.
+        async pseudoWatchCondOrders() {
+          const live = this.condOrders.filter(o => o._pseudo === false);
+          if (!live.length || !(this.creds.key && this.creds.secret) || this._ewCondWatching) return;
+          this._ewCondWatching = true;
+          try {
+            const open = new Map(); let listOk = true, cursor = '';
+            for (let page = 0; page < 5; page++) {
+              await this._ewDelay();
+              const qs = 'category=linear&settleCoin=USDT&limit=50' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+              const h  = await _sign(this.creds.key, this.creds.secret, qs, this._tsOffset);
+              const d  = await this._ewSafeJson(await fetch(`${this.base}/v5/order/realtime?${qs}`, { headers: h }));
+              if (!d || d.retCode !== 0) { listOk = false; break; }
+              for (const x of (d.result?.list || [])) open.set(x.orderId, x);
+              cursor = d.result?.nextPageCursor || '';
+              if (!cursor) break;
+            }
+            const px = await this._condPrices(live.map(o => o.symbol));
+            for (const o of live) {
+              if (!this.condOrders.some(x => x.id === o.id)) continue;
+              if (listOk && !open.has(o.orderId)) {
+                const st = await this._ewCondStatus(o);
+                if (st === 'Filled') { await this._ewCondFilled(o); continue; }
+                if (st) { this.log(`[EW] ${o.symbol}: cond. order ${st} on exchange — removed`, 'warn'); this.condOrders = this.condOrders.filter(x => x.id !== o.id); this.persist(); continue; }
+                if ((o._miss = (o._miss || 0) + 1) >= 3) { this.log(`[EW] ${o.symbol}: cond. order not found on exchange — removed`, 'warn'); this.condOrders = this.condOrders.filter(x => x.id !== o.id); this.persist(); }
+                continue;
+              }
+              o._miss = 0;
+              const lp = px[o.symbol];
+              if (!(lp > 0)) continue;
+              const hit = this._condHit(o, lp);
+              o.markPrice = lp; o._lastPx = lp; o._lastSeen = Date.now();
+              if (hit === 'worst') await this.cancelCondOrder(o.id, 'worst case reached');
+              else this._condWhiplashCheck(o, lp);
+            }
+          } finally { this._ewCondWatching = false; }
+        },
+
         async pseudoOpenShort(candidate) {
           if (!this.creds.key || !this.creds.secret) {
             this.log('[EW] No credentials set — set API key/secret in config panel.', 'warn');
             return;
           }
           const sym = candidate.symbol;
+          const _cf = candidate._condFill > 0; // live cond. order already filled on the exchange — track it, skip the entry-side guards and order
           if (typeof this._isSymbolBanned === 'function' ? this._isSymbolBanned(sym) : this._symbolBanlist?.[sym]) return;
-          { const cd = this._ewFillCooldown?.[sym]; if (cd && Date.now() < cd) return; } // recent fill timeout -- don't retry every cycle
+          if (!_cf) { const cd = this._ewFillCooldown?.[sym]; if (cd && Date.now() < cd) return; } // recent fill timeout -- don't retry every cycle
           // Before the entry: symbol-scoped exchange check — never stack a new order on an untracked position
-          try {
+          if (!_cf) try {
             await this._ewDelay();
             const _q = `category=linear&symbol=${sym}`;
             const _h = await _sign(this.creds.key, this.creds.secret, _q, this._tsOffset);
@@ -676,13 +812,14 @@
               this.log(`[EW] ${sym}: position already open on exchange — skipping entry`, 'warn'); return;
             }
           } catch(e) {}
-          if (this._ewOpposite?.[sym]) {
+          if (!_cf && this._ewOpposite?.[sym]) {
             this.log(`[EW] ${sym}: skipped — opposite (long) position open on exchange`, 'warn');
             return;
           }
           if (this.positions.find(p => p.symbol === sym)) return;
-          if (this.positions.length >= this.cfg.maxPos) return;
-          if (typeof this._lfPartnerHasSymbol === 'function' && this._lfPartnerHasSymbol(sym)) {
+          if (!_cf && this.condOrders?.some(o => o.symbol === sym)) return; // cond. order pending on this ticker
+          if (!_cf && this.positions.length >= this.cfg.maxPos) return;
+          if (!_cf && typeof this._lfPartnerHasSymbol === 'function' && this._lfPartnerHasSymbol(sym)) {
             this.log(`[EW] ${sym}: entry blocked -- leader already holds a position on this ticker`, 'warn');
             return;
           }
@@ -701,7 +838,7 @@
           if (!levRes) return;
           const lev = (typeof levRes === 'object' ? levRes.lev : levRes) || this.cfg.leverage;
 
-          const rawQty = this.cfg.minNotional / price;
+          const rawQty = (_cf && candidate._condQty > 0) ? candidate._condQty : this.cfg.minNotional / price;
           const qty    = this.snapQty(rawQty, instr);
           if (!qty || qty < (instr.minQty || 0)) {
             this.log(`[EW] ${sym}: qty below min — BLACKLISTED`, 'warn');
@@ -719,13 +856,13 @@
           // candidate._tpPct / _slPct: per-position targets from MIW/MIC Target Halving (host honours them the same way)
           const tpPct  = (candidate._tpPct > 0) ? candidate._tpPct : (binary ? (this.cfg.binaryTpPct ?? 18) : this.cfg.entryTpRoi);
 
-          if (!await this._ewSetLeverage(sym, lev)) return;
-          if ((typeof this._isDrawdownHalted === 'function' && this._isDrawdownHalted()) || (typeof this._isGainsLocked === 'function' && this._isGainsLocked())) {
+          if (!_cf && !await this._ewSetLeverage(sym, lev)) return;
+          if (!_cf && ((typeof this._isDrawdownHalted === 'function' && this._isDrawdownHalted()) || (typeof this._isGainsLocked === 'function' && this._isGainsLocked()))) {
             this.log(`[EW] ${sym}: entry halted mid-flight -- aborting`, 'warn');
             return;
           }
-          this.log(`[EW] Placing SELL ${sym} qty=${qty} @ ~${price}…`, 'info');
-          const ent = await this._ewEnter(sym, qty, price);
+          if (!_cf) this.log(`[EW] Placing SELL ${sym} qty=${qty} @ ~${price}…`, 'info');
+          const ent = _cf ? { fill: candidate._condFill, placed: true, banned: false } : await this._ewEnter(sym, qty, price);
           if (ent.banned) { this.log(`[EW] ${sym}: blocked by exchange — banned for 1 week`, 'warn'); this._banSymbol?.(sym, 'blocked by exchange (unsupported or agreement required)'); return; }
           const fillPrice = ent.fill;
           if (!fillPrice) { if (ent.placed) (this._ewFillCooldown ||= {})[sym] = Date.now() + (this.cfg.ewFillCooldownMs ?? 15 * 60000); return; }
@@ -803,7 +940,7 @@
           // Pass through any caller-supplied tagging fields (e.g. MIW's _miw/_miwCriteria)
           // so a registered _roleBadgeProviders entry can claim this position's badge
           // instead of falling back to the plain GAINER/LOSER default.
-          { const _openSkip = new Set(['_tpPct','_slPct','_pseudo','_lastSeenAt','_stageCount','_swStageCount','_binary','_slPctOverride','_fundingIntervalMs','_funIntervalMs','_fundingAccrued']); for (const [k,v] of Object.entries(candidate)) { if (k.startsWith('_') && !_openSkip.has(k)) pos[k] = v; } }
+          { const _openSkip = new Set(['_condFill','_condQty','_tpPct','_slPct','_pseudo','_lastSeenAt','_stageCount','_swStageCount','_binary','_slPctOverride','_fundingIntervalMs','_funIntervalMs','_fundingAccrued']); for (const [k,v] of Object.entries(candidate)) { if (k.startsWith('_') && !_openSkip.has(k)) pos[k] = v; } }
           if (typeof this.persist === 'function') this.persist();
 
           if (tpPrice > 0) await this.setTP(pos, tpPrice);

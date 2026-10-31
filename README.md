@@ -64,6 +64,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 |---|---|
 | **Scan Interval** (`scanMins`) | How often (minutes) the bot runs a full market scan. Controls both entry frequency and the scan bar in the UI. Can be changed while the bot is running (PseudoWinter/PseudoChaser): the interval is frozen when each cycle starts, so an edit applies from the next cycle and never fires or shifts the current one. |
 | **Max Positions** (`maxPos`) | Maximum simultaneously open positions. No new entries open once this is reached. |
+| **Max Cond. Orders** (`maxCond`, default 30) | Maximum pending conditional-limit entries ([Conditional Orders](#conditional-orders)). Counted separately from **Max Positions**; no new cond. order is accepted once it is reached. |
 | **Leverage** (`leverage`) | Position leverage. Affects order size, TP/SL prices, and EDa thresholds. |
 | **Min Notional** (`minNotional`) | Base margin per position in USDT. Actual order size = minNotional × leverage. |
 | **Entry TP** (`entryTpRoi`, default 50%) | Take-profit ROI % target. When EDa is active this is the buffered target — the debt-free close happens at a lower percentage. In DCA Mode this is also the base the per-stage TP ladder scales down from (entry TP ÷ (stage+1), min 3%). |
@@ -80,7 +81,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | **TP Buffer** (`laggardProfitOffset`) | Extra TP headroom reserved above the functional target (%). The debt-free close happens at `tpPct ÷ (1 + buffer/100)` — at 50% buffer with an 18% TP slider, trades close at 12% without debt. Requires the EDa plugin. |
 | **Ticker Cooldown** (`bulkTickerCooldownHours`) | How long the bot reuses a cached bulk ticker fetch before hitting the API again (default 12h). The bulk list only says which symbols exist — criteria data never reads it — and the same window sets how long MI's re-entry block and the Ticker Graylist hold a closed symbol. |
 | **Whiplash Audit** (`whiplashEnabled`) | When on, the position watcher fetches 1-minute klines near TP and near SL to confirm whether price spiked through either between watcher cycles. The SL audit (PseudoWinter 1.6.8 / PseudoChaser 1.6.9) uses the same proximity rule and 5-minute delay as the TP audit, with its own `_whiplashSlScheduled` flag, and closes at the SL price if a candle high (Winter) or low (Chaser) reached it. It aborts if the SL moved or cleared before the check ran. |
-| **Whiplash Proximity** (`whiplashProximityPct`) | How close (%) to the TP or SL price triggers the kline audit. One setting drives both. |
+| **Whiplash Proximity** (`whiplashProximityPct`) | How close (%) to the TP or SL price triggers the kline audit. One setting drives both, and it also drives the cond. order audit against target and worst case. |
 | **Runtime Limit** (`runtimeHours`) | Maximum position age. Forces a close at the deadline if TP hasn't been hit. |
 | **Symbol Banlist** (`banlistEnabled`) | When on, symbols on the ban list are excluded from all scans. Entries expire after 7 days. |
 | **Position Price Feed** (`restPollEnabled`) | When on, replaces the WebSocket price stream for open positions with periodic REST calls; use it if the WS feed returns stale prices. Exactly one source runs at a time. Pseudo bots default to on and Psycho bots to off. ([more](#general-details)) |
@@ -151,6 +152,14 @@ The trades panel shows a card for each closed trade, newest first, with a close-
 **PnL chart**: click the **PNL CHART** bar below the header to expand a cumulative PnL line chart, green when the net result is positive and red when negative. It only appears once at least 2 individual trades are closed. ([more](#general-details))
 
 **CLEAR button**: removes all closed trades, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. It asks for an inline confirmation ("Sure? Yes / No") before anything is deleted. ([more](#general-details))
+
+---
+
+## Conditional Orders
+
+A plugin can enter through a conditional limit order instead of opening at once: `placeCondEntry({ candidate, target, worst, tag })`, where `candidate` is what it would hand to `pseudoOpenShort`/`pseudoOpenLong`. Nothing calls it by default; it is an API for plugins. The order opens a position only when price reaches **target**; if price reaches **worst** (the worst case) first, it is cancelled. Target and worst sit on opposite sides of the **entry** price, the last price when the order was made.
+
+Pending orders are listed under **Cond. Orders** in the market column, below Open Positions. Each card shows Entry, Target and Worst with a thin bar and the distance of the current price from each. They have their own count (**Max Cond. Orders**, default 30), are saved with the bot's state and are cancelled by **Bail All**. On PseudoWinter/PseudoChaser the fill is simulated; on EverWinter/SunChaser the order is a real Bybit conditional limit order. ([more](#general-details))
 
 ---
 
@@ -358,7 +367,13 @@ The dropped keys cover both the bot and any installed plugin, and the cleanup al
 
 **BAIL** closes every open position immediately on both bots. **Sub** marks a close that freed a slot for a higher-ranked candidate via MI Substitution, and **Eject** one made by MI Ejection, which needs two or more Deferment paths and so can't currently trigger. A reason with no registered label shows its raw name. On EverWinter/SunChaser, a bail sweep is followed by a direct exchange re-check.
 
-The fees are `FEE_MAKER_PCT` 0.02% on entry and DCA fills and `FEE_TAKER_PCT` 0.055% on the close (the Bybit base-tier rates); live positions are skipped.
+The fees are `FEE_MAKER_PCT` 0.02% on entry and DCA fills and `FEE_TAKER_PCT` 0.055% on the close (the Bybit base-tier rates); live positions are skipped. Each estimate is then multiplied by a random 2–10×, skewed higher as the session win rate rises (`u^k` with `k = 3^(1 − 2·winRate)`: about 4× on average at a 0% win rate, 6× at 50%, 8× at 100%).
+
+#### Conditional orders
+
+`placeCondEntry` refuses an order when target and worst aren't on opposite sides of the entry price, when the symbol already has a position or a pending order, is banned or held by the leader, when entries are halted, or at **Max Cond. Orders**. A normal entry on a symbol with a pending order is blocked. In the simulation the order fills when the last price (WebSocket ticker, else one REST call per symbol every **Price Poll Interval** base) reaches target, including a move that crossed it between two samples; if both levels were crossed, the one nearer the previous sample wins. The fill opens a normal position at the target price with the usual fees, or drops the order if no position slot is free or entries are halted. A live fill is always tracked, even over **Max Positions**.
+
+The whiplash check starts when price is within **Whiplash Proximity** of target or worst (share of the entry-to-level distance left); five minutes later it re-reads the last six minutes of 1-minute klines and resolves the order if a candle touched a level. The gap audit runs on bot start, before the position gap audit: it replays klines since each order was last seen, in pages of 200 candles, and the first level touched resolves it. A target fill found this way is back-dated to the candle time. A candle that touched both levels goes to the one nearer its open. Live orders only check worst case; the exchange owns the fill. PseudoChaser has no position gap audit, so its cond. order audit is the only one it runs.
 
 #### PnL chart
 
@@ -668,7 +683,7 @@ Still-Water keys carry the side in their name (`<side>` = `chaser` on PseudoChas
 
 | Key | Contents |
 |---|---|
-| `pw_v1` | PseudoWinter: cfg, positions, sess, closedTrades, bot timestamps, symbolBanlist, lostValue, laggardId |
+| `pw_v1` | PseudoWinter: cfg, positions, sess, closedTrades, bot timestamps, symbolBanlist, lostValue, laggardId, condOrders |
 | `pw_v1_log` | PseudoWinter activity log (capped at 300 entries) |
 | `__pw_plugins_v1` | PseudoWinter plugin manifest: per plugin its id, name, version, load-order and conflict metadata, `idb: true` and the source size. The sources are in IndexedDB; an entry stays whole here until IndexedDB has returned its source on a later boot (see **Plugin source storage**) |
 | `pc_v1` | PseudoChaser: same structure as pw_v1 |
@@ -798,6 +813,14 @@ The receiver reassembles in memory, checks the length and checksum, and exposes 
 - Every background or bulk fetch (bulk tickers, market watch, and any loaded plugin's kline and sample batches) runs through a single per-bot scheduling queue (**Scan Scheduling** in Main Config) instead of firing all at once. This keeps the browser responsive with one bot open and workable with two. Execution-critical single-symbol calls (opening, closing and watching a position) bypass the queue so order execution is never delayed behind background scanning. The scan itself is a pipeline of named stages that hands control back to the browser after each time slice (**Slice Budget**), so position watching, clicks and timers run mid-scan instead of waiting for it to finish.
 - **Running both bots**: When both are open simultaneously they automatically share bulk ticker fetches, kline caches, and sample batches to halve API load. Either bot works normally on its own when the other tab isn't open.
 
+### Cond. Order Internals
+
+- **Order record** (`condOrders`, saved in `pw_v1`/`pc_v1`): `id`, `symbol`, `entryPrice`, `target`, `worst`, `dir` (1 when target is above entry, -1 below), `markPrice`, `createdAt`, `tag`, `candidate` (JSON copy), `_pseudo` (false for live), `_lastPx`, `_lastSeen`; live orders add `orderId` and `qty`.
+- **Host hooks**: `placeCondEntry` validates and calls `_condSubmit(order)`, a no-op in the simulation. `pseudoWatchCondOrders` runs from `pseudoWatchPositions` (one run at a time, `_condWatchRunning`) and handles `_pseudo !== false` orders; in WebSocket mode their symbols join the watched set. `_condPrices`, `_condHit`, `_condKlines`, `_condKlineHit`, `_condResolve`, `_condWhiplashCheck`/`_condWhiplashAudit` and `_condGapAudit` are shared with the live plugins. `bailAll` calls `cancelAllCondOrders` first.
+- **Fill**: `_condTrigger(o, at)` removes the order first, so a second caller returns, then opens through `pseudoOpenShort`/`pseudoOpenLong` with `candidate._condFill` set. The open function uses it in place of the last price, and `_condFill`/`_condQty` are left off the position's copied fields. `at` back-dates `openedAt` and `_lastSeenAt`.
+- **Live order** (EverWinter/SunChaser): the plugin replaces `_condSubmit` and `pseudoWatchCondOrders` and wraps `cancelCondOrder`. `_condSubmit` runs the entry checks, sets leverage and posts `POST /v5/order/create` as a GTC Limit order, not reduce-only, with `triggerPrice` = `price` = target, `triggerBy` LastPrice and `triggerDirection` 1 (rising) or 2 (falling); qty is `minNotional / target` snapped.
+- **Live watcher**: one `GET /v5/order/realtime` per tick (settleCoin USDT, up to 5 pages). An order missing from it is looked up by `orderId` in `realtime`, then `order/history`; one found in neither is dropped after 3 polls. `Filled` hands the exchange `avgPrice` to the open function as `_condFill` with `_condQty`, which skips the entry-side guards and the order itself, then builds TP, SL and DCA orders as usual. Worst case cancels on the exchange; if the cancel is refused because the order filled, the position is tracked instead.
+
 ### Live-Mode Internals
 
 - **The tab buttons always work**: every control from **Order type** down is locked while Config Lock is on (it locks automatically while the bot runs). Settings are saved in the bot's config, so they persist and travel with Export / Import. Keys use the `ew` prefix on EverWinter and `sc` on SunChaser.
@@ -824,7 +847,7 @@ Each plugin's `transform(def)` receives and returns the component definition, so
 
 ### Bybit API Endpoints Used
 
-**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for criteria data), `GET /v5/market/recent-trade`, `GET /v5/market/kline` (hourly bars on the bots, 5-minute bars on Still-Water, plus 1-hour bars for their Indicator Forecast), `GET /v5/market/account-ratio` (long/short account ratio, Still-Water only), `GET /v5/market/open-interest` and `GET /v5/market/funding/history` (Still-Water Indicator Forecast only), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots (DCA/AMa ladder fill checks). Signing: HMAC-SHA-256 via `crypto.subtle.sign`; 250ms minimum gap between signed requests (plugins).
+**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for criteria data), `GET /v5/market/recent-trade`, `GET /v5/market/kline` (hourly bars on the bots, 5-minute bars on Still-Water, plus 1-hour bars for their Indicator Forecast, and 1-minute bars for the whiplash and gap audits), `GET /v5/market/account-ratio` (long/short account ratio, Still-Water only), `GET /v5/market/open-interest` and `GET /v5/market/funding/history` (Still-Water Indicator Forecast only), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history` (cond. order status lookups), `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots (DCA/AMa ladder fill checks). Signing: HMAC-SHA-256 via `crypto.subtle.sign`; 250ms minimum gap between signed requests (plugins).
 
 **Call cadence**: the full-book `position/list` runs only before and after each scan loop. Single-symbol `position/list` calls happen around an entry (once before it, then polling for the fill) and while a close is repricing. On the Psycho bots, `execution/list` is called for a pending DCA/AMa stage only once price has reached that stage's trigger, plus one sweep of every pending stage after each scan loop to catch a wick through a trigger.
 
