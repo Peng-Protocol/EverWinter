@@ -207,12 +207,15 @@ See StrategyBook's **Market Reading** section for what each criterion means and 
 | **Substitution Min Age** (`micSubstitutionMinAgeMins`, default 60) | Minimum minutes a position must be held before it becomes eligible to be substituted out. |
 | **Deferment** (`micDefermentEnabled`, default on) | Toggle on the **Exit** tab, shown only while Still-Water is loaded. The headline factor also scales how long a position or cond. order may live, up to the host's **Force Close Runtime**; one under 50% closes every position (reason `defer`) and blocks entries behind a **No Entry** pill. ([more](#multiindicator-details)) |
 | **Min Time** (`micDeferMinMins`, default **10**, 1–60) | Shown only while Deferment is on. The least time a position or cond. order gets, at a headline of 50%. |
+| **Fade** (`micFadeEnabled`, default off) | Toggle on the **Entry** tab, shown only while Still-Water is loaded. A qualified ticker whose forecast score is negative (pointing against this side) isn't entered; it waits as a cond. order at the end of its expected move and clears after 1h. ([more](#multiindicator-details)) |
+| **Reach** (`micFadeReachPct`, default **50**, 10–90) | Shown only while Fade is on. The share of similar graded forecasts that moved at least as far as the target. |
+| **Fade only** (`micFadeOnly`, default off) | Shown only while Fade is on. Blocks every normal entry and Substitution, so only Fade orders open positions. |
 | **Re-entry Block Mode** (`micReentryBlockMode`) | Defaults to **Losers Only**, which lets a symbol that just closed in profit re-trigger immediately and blocks only a symbol that closed at a loss. **Winners + Losers** blocks a symbol from re-triggering for one bulk-ticker cooldown window (12h by default) after any close, win or loss. |
 | **Auto Slots** (`micAutoSlots`) | Replaces the manual slot list with a minimum-gate qualifier: a ticker qualifies once it satisfies at least **Minimum Criteria per Slot** non-excluded criteria — not a fixed-size combination. Every criterion the ticker actually satisfies is captured and scored, not just enough to clear the floor. See `_micAutoQualify`. |
 | **Minimum Criteria per Slot** (`micAutoSlotSize`) | The floor (1–6). At 1, a single true criterion qualifies the ticker — any others it happens to satisfy are still captured and scored. |
 | **Exclude from Auto** (`micAutoSlotExclude`) | Criteria omitted from Auto's qualifying set entirely — never checked, never counted toward the minimum, never scored. Excluding more than `6 − Minimum Criteria per Slot` leaves Auto unable to ever reach its floor, and the plugin reports no active entry gate (`_micAutoActive`). |
 | **Force-Evaluate General Criteria** (`micForceGeneralCriteria`, on by default) | Auto mode only. When on, just before a ticker opens, the plugin re-checks `fund`, `iol`/`ios` and `lta`/`lpa` with a forced per-symbol fetch, since the cycle's capped sample may not have reached it yet, and adds any that are newly true. It never drops a criterion already found, and costs a few extra requests per entry. ([more](#multiindicator-details)) |
-| **Forecast Ranking** (no toggle, always on) | With Still-Water loaded, only tickers in the latest batch's Indicator Forecast are entered, ranked by its score in the bot's favor: Regime Caution's second score when that is on and the forecast has one, else the usual one. A negative score doesn't block an entry. A ticker the batch has no forecast for isn't a candidate. A following bot ranks on the leader's published forecasts for the batch (it waits up to 20 s for them). Without Still-Water, entries come from MI's criteria alone, unranked. ([more](#multiindicator-details)) |
+| **Forecast Ranking** (no toggle, always on) | With Still-Water loaded, only tickers in the latest batch's Indicator Forecast are entered, ranked by its score in the bot's favor: Regime Caution's second score when that is on and the forecast has one, else the usual one. A negative score doesn't block an entry, unless Fade takes it. A ticker the batch has no forecast for isn't a candidate. A following bot ranks on the leader's published forecasts for the batch (it waits up to 20 s for them). Without Still-Water, entries come from MI's criteria alone, unranked. ([more](#multiindicator-details)) |
 
 ### Slots UI
 
@@ -425,6 +428,10 @@ Entry TP and Cascade never shrink below it, Sacrifice never fires below it, and 
 
 Each scan, ahead of slot logic, the allowed time is **Force Close Runtime** × the headline factor, never under **Min Time** nor over the runtime. Positions past it close with reason `timing`, and cond. orders past it (by `createdAt`) are cancelled; both are rechecked every scan, so the allowance shrinks as the headline drops. Under 50% the allowance is zero: every held position (any strategy's) closes with reason `defer`, every cond. order is cancelled and no entry opens until the headline is back over 50%. The Targets Gauge shows the allowance as `Time allowed`. With no headline, Deferment does nothing.
 
+#### Fade
+
+A negative Forecast Ranking score points against this side: up for Winter, down for Chaser. Instead of entering that ticker, Fade places a cond. order at the end of the move. Its length is read from the 60 graded forecasts on this side with the nearest score: the highest or lowest price each reached, and the move **Reach** % of them hit. Worst case mirrors the target on the other side of the entry price, and TP and SL are the Relative Target percents when the order is placed, applied from the fill price. Up to **Picks** orders are placed per scan, one per ticker, and each clears after 1h (reason `fade expired`) or sooner under Deferment. A ticker with fewer than 20 graded forecasts on this side enters as usual. The simulation fills the order when price touches the target.
+
 #### Targets Gauge
 
 TP and SL each get a bar from the centre axis, with a tick on the TP bar at Min Entry TP; Cascade and Sacrifice are text only, since they never fire below the floor. TP and SL are judged on the resolved value; Cascade and Sacrifice are judged on the resolved value *before* the floor lifts it, while their text shows the value that actually fires, so they read red while the floor is holding them up. A disabled Cascade or Sacrifice reads `off`.
@@ -437,7 +444,7 @@ The function is `_micTopUpGeneralCriteria`. On a following bot this is the one e
 
 #### Forecast Ranking
 
-The score is Still-Water's Indicator Forecast for the ticker, in the bot's favor: `er` (Regime Caution's second score) when that layer is on and the forecast carries one, else `e`. Higher ranks first. Only tickers the latest batch started a forecast on are candidates, so a ticker outside it is neither ranked nor entered, and a negative score is not skipped. The leader publishes a batch's forecasts once, with their final scores, after the slow readings land, and a follower waits up to 20 s for that publish before it ranks. If none arrive the scan finds no candidates.
+The score is Still-Water's Indicator Forecast for the ticker, in the bot's favor: `er` (Regime Caution's second score) when that layer is on and the forecast carries one, else `e`. Higher ranks first. Only tickers the latest batch started a forecast on are candidates, so a ticker outside it is neither ranked nor entered, and a negative score is not skipped (Fade, when on, takes it). The leader publishes a batch's forecasts once, with their final scores, after the slow readings land, and a follower waits up to 20 s for that publish before it ranks. If none arrive the scan finds no candidates.
 
 Without Still-Water, MI enters any ticker matching its criteria, with no forecast ranking.
 
@@ -744,6 +751,12 @@ Still-Water keys carry the side in their name (`<side>` = `chaser` on PseudoChas
 - **Timing**: `_micAllowedMs` is `min(base, max(minMs, base × f))`, with `base` the `runtimeHours` and `minMs` the `micDeferMinMins` in ms, or null with Deferment off or no headline. `_micEnforceTiming` runs every scan in `_micScanPrep` ahead of slot logic (so it acts with no active slots), closes non-pending positions of any strategy older than that with `timing` and cancels `condOrders` older than it by `createdAt` through `cancelCondOrder`. While deferring the allowance is 0 and the reasons are `defer`. Closes and cancels run concurrently (`Promise.all`), each in its own try/catch, with one log line per pass.
 - **Entry effect**: the scan returns before every open path, with guards inside `_micTrySubstitute` and `_micOpen`. Historical scoring still runs. One `⛔ Deferment` log line per streak, and `_extraStatusPills` shows the **No Entry** pill.
 - **Ejection**: retired. `_micEject` and the `ejection` label remain, but nothing calls it.
+
+### Fade Internals
+
+- **Entry**: `_micFadeEntry` runs in `_micScanEntry` right after the Deferment return. For each pool candidate with `fcRanked` and `compositeScore < 0` that `_micFadeDist` can size, it runs `_micVerify`, refreshes the price and calls `placeCondEntry` with `tag: 'fade'`, `target` and `worst` at `price × (1 ± dist/100)`, and a candidate carrying `_micFade`, `_tpPct` and `_slPct`. The pool it returns leaves out the tickers it took.
+- **Distance**: `_micFadeRows` turns `_swFcStore().done` rows with `_swFcFavor < 0` into `[score, excursion]`, the excursion from `mu` (Winter) or `-md` (Chaser). `_micFadeDist` needs 20 rows, takes the 60 nearest by score and reads the (100 − Reach)th percentile of their excursions.
+- **Only and expiry**: with `micFadeOnly` the scan returns after Fade runs. `_micFadeExpire` runs in `_micScanPrep` after `_micEnforceTiming` and cancels `tag === 'fade'` orders 1h past `createdAt` through `cancelCondOrder`.
 
 ### Relative Target Internals
 

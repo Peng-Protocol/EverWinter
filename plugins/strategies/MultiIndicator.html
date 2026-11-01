@@ -31,7 +31,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '2.3.1'; // Change: The targets readout shows the time allowance Deferment currently resolves. | previous: Change: Deferment is back, driven by the Still-Water headline: the closer the favored side's share is to 50%, the less time a position (or cond. order) gets, down to a minimum; below 50% everything is closed with reason defer and no entries are made. Relative Target shrinks entry TP, SL, Cascade and Sacrifice by the same headline factor (share vs its recorded peak) instead of the LPA window. Both appear only with Still-Water loaded.
+    const VERSION       = '2.5.0'; // Change: Fade only — a sub-toggle that blocks every normal entry (and substitution) so only Fade cond. orders open positions. | previous: Change: Fade — with Still-Water loaded, a qualified ticker whose forecast points against this side is no longer entered at once: it gets a cond. limit entry at the end of its expected move (from graded forecasts of similar score), kept for 1h, with TP/SL from the Relative Target percents at its fill price.
   const DEFAULT_SLOTS = [[]];
   let   WINTER        = false;      // set in transform() from the host; every side switch below reads it
   let   MIC_HIST_KEY  = '__mic_hist_batches'; // Winter keeps its own '__miw_hist_batches' so existing history carries over
@@ -40,6 +40,9 @@
   // Full secondary criteria list — shared by Auto's minimum-gate qualifier, the Exclude-from-
   // Auto picker, so both stay in sync by construction.
   const SECONDARY_CRITS = ['fund','va','iol','ios','lta','lpa'];
+  const FADE_LIFE_MS    = 3600000; // Fade: how long a cond. entry waits (the forecast's horizon)
+  const FADE_MIN_ROWS   = 20;      // Fade: graded forecasts on this side needed before a target is set
+  const FADE_NEAR       = 60;      // Fade: graded forecasts of the nearest score a target is read from
 
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
@@ -70,6 +73,9 @@
     micMinEntryTp: 6,               // Relative Target floor, ROI %: the shrunk entry TP and Cascade / Sacrifice never go below this, so a position can still clear its entry+exit fees
     micDefermentEnabled: true,      // Deferment: the headline factor also scales how long a position or cond. order may live (up to the host's Force Close Runtime); a headline under 50% closes everything (reason defer) and blocks entries. Needs Still-Water.
     micDeferMinMins: 10,            // Deferment: the least time a position or cond. order gets, at a headline of 50%
+    micFadeEnabled: false,          // Fade: a qualified ticker whose forecast points against this side waits as a cond. limit entry at the end of that move (1h) instead of entering at once. Needs Still-Water.
+    micFadeOnly: false,             // Fade: also block every normal entry, so only Fade cond. orders open positions
+    micFadeReachPct: 50,            // Fade: share of similar graded forecasts that moved at least as far as the target
     micReentryBlockMode: 'losers',
     micAutoSlots: true,
     micAutoSlotSize: 3,
@@ -297,6 +303,29 @@
                       <input type="number" min="1" step="1" x-model.number="cfg.micPicks" @change="cfg.micPicks=Math.max(1,Math.round(+cfg.micPicks||5));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                     </div>
                     <div class="mic-hint">Most tickers entered in one scan cycle.</div>
+                  </div>
+
+                  <!-- Fade -->
+                  <div x-show="_micSwLoaded()" style="margin-bottom:8px">
+                    <label class="tog">
+                      <div class="tog-t" :class="cfg.micFadeEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micFadeEnabled=!cfg.micFadeEnabled;persist()}"><div class="tog-k"></div></div>
+                      <div>
+                        <div class="tog-l">Fade</div>
+                        <div class="mic-hint">A ticker forecast to move against this side waits as a cond. order at the end of that move, for 1h.</div>
+                      </div>
+                    </label>
+                    <div x-show="cfg.micFadeEnabled" style="margin-top:8px">
+                      <div class="lbl">Reach <b x-text="cfg.micFadeReachPct+'%'"></b></div>
+                      <input type="range" min="10" max="90" step="5" x-model.number="cfg.micFadeReachPct" @change="persist()">
+                      <div class="mic-hint">Share of similar graded forecasts that moved at least this far.</div>
+                      <label class="tog" style="margin-top:8px">
+                        <div class="tog-t" :class="cfg.micFadeOnly?'on':''" @click.prevent="if(!cfgLocked){cfg.micFadeOnly=!cfg.micFadeOnly;persist()}"><div class="tog-k"></div></div>
+                        <div>
+                          <div class="tog-l">Fade only</div>
+                          <div class="mic-hint">Blocks all normal entries; only Fade orders open positions.</div>
+                        </div>
+                      </label>
+                    </div>
                   </div>
 
                   <!-- Manual slot builder — hidden when Auto is on -->
@@ -1076,6 +1105,77 @@
           ]);
         },
 
+        _micFadeOn()   { return !!(this.cfg.micFadeEnabled && this._micSwLoaded() && typeof this.placeCondEntry === 'function'); },
+        _micFadeOnly() { return this._micFadeOn() && !!this.cfg.micFadeOnly; },
+        // Fade orders live FADE_LIFE_MS, the horizon of the forecast they follow.
+        async _micFadeExpire() {
+          const now = Date.now(), old = (this.condOrders || []).filter(o => o.tag === 'fade' && now - (o.createdAt || 0) >= FADE_LIFE_MS);
+          for (const o of old) { try { await this.cancelCondOrder(o.id, 'fade expired'); } catch (e) { this.log(`[MI] fade expiry error (${o.symbol}): ${e.message}`, 'warn'); } }
+        },
+        // Graded forecasts as [score in this side's favor, % the price reached in the direction a negative score points], from the
+        // highest / lowest point each one touched after it started. Only scores under 0 (pointing against this side) are kept.
+        _micFadeRows() {
+          const pd = WINTER ? 1 : -1, out = [];
+          for (const r of (this._swFcStore?.()?.done || [])) {
+            const f = this._swFcFavor?.(r), x = pd > 0 ? r.mu : (r.md == null ? null : -r.md);
+            if (f != null && f < 0 && x != null && isFinite(x)) out.push([f, Math.max(0, x)]);
+          }
+          return out;
+        },
+        // How far a forecast of this score usually runs: among the FADE_NEAR graded forecasts of the nearest score, the move (% of price)
+        // that micFadeReachPct of them reached. Null when there is too little history.
+        _micFadeDist(rows, fav) {
+          if (rows.length < FADE_MIN_ROWS) return null;
+          const near = rows.map(r => [Math.abs(r[0] - fav), r[1]]).sort((a, b) => a[0] - b[0]).slice(0, FADE_NEAR).map(r => r[1]).sort((a, b) => a - b);
+          const reach = Math.min(90, Math.max(10, Number(this.cfg.micFadeReachPct) || 50));
+          const d = near[Math.min(near.length - 1, Math.floor(near.length * (1 - reach / 100)))];
+          return d > 0 ? { dist: d, n: near.length } : null;
+        },
+        // Fade: a qualified ticker whose forecast points against this side (score under 0) does not enter now. It gets a cond. limit entry
+        // at the end of its expected move (up for Winter, down for Chaser); worst case mirrors the target on the other side, where the forecast
+        // is plainly wrong. TP/SL come from the Relative Target percents, applied from the fill price. Returns the pool without the tickers
+        // Fade took; one with too little graded history for a target stays and enters as usual.
+        async _micFadeEntry(pool, ctx) {
+          if (!this._micFadeOn()) return pool;
+          const rows = this._micFadeRows(), pd = WINTER ? 1 : -1, cap = this.cfg.maxCond ?? 30, picks = Math.max(1, Math.round(this.cfg.micPicks)), taken = new Set();
+          let placed = 0;
+          for (const cand of pool) {
+            if (!(cand.fcRanked && cand.compositeScore < 0)) continue;
+            const lv = this._micFadeDist(rows, cand.compositeScore);
+            if (!lv) continue;
+            const sym = cand.t.symbol;
+            taken.add(sym);
+            if (placed >= picks || this.condOrders.length >= cap) continue;
+            if (this.condOrders.some(o => o.symbol === sym) || this.positions.some(p => p.symbol === sym)) continue;
+            const v = await this._micVerify(cand, ctx);
+            if (!v) continue;
+            const t = v.t;
+            let price = parseFloat(t.lastPrice || 0);
+            if (!this._swTickerIsCurrent?.(t)) try {
+              const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+              const lp = parseFloat((await r.json())?.result?.list?.[0]?.lastPrice);
+              if (lp > 0) price = lp;
+            } catch (e) {}
+            if (!(price > 0)) continue;
+            const _tg = this._micTargets();
+            const o = await this.placeCondEntry({
+              candidate: {
+                symbol: sym, price, change: parseFloat(t.price24hPcnt || 0) * 100, fundingRate: parseFloat(t.fundingRate || 0) * 100,
+                _tpPct: _tg.active ? +_tg.entryTp.toFixed(2) : undefined,
+                _slPct: _tg.active ? +_tg.slPct.toFixed(2) : undefined,
+                _mic: true, _micPathA: true, _micFade: true,
+                _micSlotIdx: v.slotIdx ?? 0, _micCompositeScore: v.compositeScore ?? 0,
+                _micCriteria: v.annotCrits, _micRawCriteria: v.criteria,
+              },
+              target: price * (1 + pd * lv.dist / 100),
+              worst:  price * (1 - pd * lv.dist / 100),
+              tag: 'fade',
+            });
+            if (o) { placed++; this.log(`[MI] 🎯 Fade ${sym}: forecast ${v.compositeScore.toFixed(2)}pp against this side — cond. ${lv.dist.toFixed(2)}% away (${lv.n} graded)`, 'info'); }
+          }
+          return taken.size ? pool.filter(c => !taken.has(c.t.symbol)) : pool;
+        },
+
         // Ejection: bail-all — closes every open position (any held position, same reach as substitution) as soon as
         // two or more deferment paths are in effect at once. Called once per scan.
         async _micEject(def) {
@@ -1110,6 +1210,7 @@
           const _micDef = this._micDefermentState();
           if (!_micDef.deferring) this._micDeferLogged = false;
           await this._micEnforceTiming(_micDef);
+          await this._micFadeExpire();
 
           // Entry slots — Auto mode has no generated slot list any more (see _micAutoQualify);
           // Manual mode keeps its exact combo list as before.
@@ -1264,13 +1365,16 @@
           ctx.mic.pool = pool; ctx.mic.entryPool = entryPool; ctx.mic.poolOne = _poolOne;
         },
         async _micScanEntry(ctx) {
-          const { halted: _micHalted, def: _micDef, allTickers, freshAt, slots, needsVolIo, needsHr, scanSkip, basePool, pool, entryPool } = ctx.mic;
+          const { halted: _micHalted, def: _micDef, allTickers, freshAt, slots, needsVolIo, needsHr, scanSkip, basePool, pool, entryPool: entryAll } = ctx.mic;
           if (_micHalted) return;
 
           if (_micDef.deferring) {
             if (!this._micDeferLogged) { this.log(`[MI] ⛔ Deferment — headline ${(_micDef.share * 100).toFixed(1)}% is under 50%; no new entries until it recovers`, 'info'); this._micDeferLogged = true; }
             return;
           }
+
+          const entryPool = await this._micFadeEntry(entryAll, ctx);
+          if (this._micFadeOnly()) return;
 
           // Reserve-counted headroom: guards against a substitution path (_micTrySubstitute) or
           // this same open loop being mid-open — past its own headroom check, still awaiting a
