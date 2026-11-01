@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '3.6.1'; // Change: The most Weight Profiles kept doubles to 120, since a profile now belongs to one regime class. | previous: Change: Weight Profiles also match on the market's view of a ticker (its Regime caution class, its position and green share against the market, its Crab strength), a profile belongs to one regime class, and Regime caution's weight is tested per Weight Profile (then per class, then overall).
+  const VERSION = '3.7.0'; // Change: Sequence map: tickers whose hourly move (against the market) or volume jumps together are flagged, up to 10 of the strongest per scan get 5-minute candles to confirm and order their onsets, and the confirmed order files leader to follower edges (strength rises with every sighting, falls with every miss, an edge is dropped after repeated misses); a follower of a ticker that just shifted leans the same way as a forecast layer with its own tested weight, and the average time a ticker stays in a mode and a follower takes to respond are recorded. | previous: Change: Weight Profiles also match on the market's view of a ticker (its Regime caution class, its position and green share against the market, its Crab strength), a profile belongs to one regime class, and Regime caution's weight is tested per Weight Profile (then per class, then overall).
 
 
 
@@ -83,6 +83,12 @@
     swFcDivFar: 2,                // divination: no reading when the nearest shape is farther than this x the typical distance
     swFcCrab: true,               // Indicator forecast sub-toggle: Crab layer (tickers moving along a range lean toward a snap back to its middle; a ticker that broke its range is left alone)
     swFcCrabBar: 50,              // Crab layer: crab score (%) a window must reach to count
+    swFcSeq: true,                // Indicator forecast sub-toggle: Sequence map (tickers that shift together, in order; followers of a ticker that just shifted lean the same way)
+    swSqZ: 3,                     // Sequence map: hourly move (x the ticker's normal market-relative hourly move) that counts as a shift
+    swSqVol: 2,                   // Sequence map: hourly volume (x its median) that, with half that move, also counts
+    swSqMin: 5,                   // Sequence map: tickers shifting in the same hour for it to be an event
+    swSqGap: 5,                   // Sequence map: longest gap (minutes) between members of one shift
+    swSqCap: 10,                  // Sequence map: most tickers given 5-minute candles per scan
     swFcCrabEdge: 15,             // Crab layer: a close this far (% of the range) beyond an edge is a break
     swFcRegime: true,             // Indicator forecast sub-toggle: Regime caution (a second score beside each forecast, shifted by the market's regime and how tickers in the same spot did before)
     swFcRegimeWins: '2,6,12,24,48,96', // Regime caution: windows in hours (comma separated, 1 to 99)
@@ -139,8 +145,8 @@
   const BG_FAM = { rsi6: 'mom', rsi12: 'mom', rsi24: 'mom', stk12: 'mom', atr14: 'vol', bbw: 'vol', vreg: 'vol', gk60: 'vol', rng24: 'vol', sq: 'vol', rng60: 'vol', rv: 'vol', vr: 'vol', bbp: 'pos', ema20: 'pos', rt24: 'pos', rt72: 'pos', d72h: 'pos', d72l: 'pos', dd1h: 'pos', pos24: 'pos', vwd: 'pos', r10: 'ret', r30: 'ret', r60: 'ret', r120: 'ret', ch: 'ret', p1h: 'ret', hc: 'ret', oi15: 'oi', oi1h: 'oi', oi4h: 'oi', oi: 'oi', fr: 'fund', fhl: 'fund', fhm: 'fund', fhs: 'fund', fhi: 'fund', fih: 'fund', nf: 'fund', clv60: 'flow', clv120: 'flow', tob: 'flow', wku: 'flow', wkd: 'flow', rsk: 'flow' }; // everything else is 'ctx'
   const BG_SKIP = k => k.charAt(0) === '_' || k.indexOf('x_') === 0 || k === 'c60'; // predictions, post-start diagnostics and a data-quality count are never model inputs
   const FC_IND_MINB = 6, FC_IND_FLOOR = 0.02; // Indicator forecast, direction: fewest graded batches the readings are tested on (fewer = the scorecard's own score stands), and the weakest rank correlation worth integrating
-  const FC_PROF_TRAITS = ['vol', 'oi', 'fr', 'spr', 'rng60', 'pos24', 'lta', 'rgz', 'rgg', 'cbu'], FC_PROF_MAX = 120; // Weight Profiles: the readings a ticker is profiled on (ranked inside its batch): snapshot readings, its position (rgz) and green share (rgg) against the market, its Crab strength (cbu); and the most profiles kept
-  const FC_PROF_FAM = ['fund', 'va', 'iol', 'ios', 'lta'], FC_PROF_ALL = FC_PROF_FAM.concat(['ind', 'div', 'rng', 'crb']), FC_PROF_LIM = { fund: [-1, 2], va: [-1, 2], iol: [-1, 2], ios: [-1, 2], lta: [-1, 2], ind: [0.01, 1], div: [0.01, 2], rng: [0.01, 1], crb: [0.01, 1] }; // the weights a profile can set: scorecard family multipliers, indicator blend, divination share, Range Fit blend, crab layer weight
+  const FC_PROF_TRAITS = ['vol', 'oi', 'fr', 'spr', 'rng60', 'pos24', 'lta', 'rgz', 'rgg', 'cbu'], FC_PROF_MAX = 60; // Weight Profiles: the readings a ticker is profiled on (ranked inside its batch): snapshot readings, its position (rgz) and green share (rgg) against the market, its Crab strength (cbu); and the most profiles kept
+  const FC_PROF_FAM = ['fund', 'va', 'iol', 'ios', 'lta'], FC_PROF_ALL = FC_PROF_FAM.concat(['ind', 'div', 'rng', 'crb', 'seq']), FC_PROF_LIM = { fund: [-1, 2], va: [-1, 2], iol: [-1, 2], ios: [-1, 2], lta: [-1, 2], ind: [0.01, 1], div: [0.01, 2], rng: [0.01, 1], crb: [0.01, 1], seq: [0.01, 1] }; // the weights a profile can set: scorecard family multipliers, indicator blend, divination share, Range Fit blend, crab layer weight
   const VOL_FEATS = [['rng60', 'sn'], ['gk60', 'bg'], ['atr14', 'bg']]; // Indicator forecast, size: geometric mean of own / batch-median ratios (each clamped 0.25 to 4)
   const FC_IDB = '__ew_sw_' + SIDE + '_fcdb_v1', FC_IDB_STORE = 'done', FC_LS_TAIL = 120; // graded forecasts live in IndexedDB; localStorage keeps this many of the newest once IndexedDB has proven itself
   const BG_KEY = '__ew_sw_' + SIDE + '_bg1h_v1', BG_PERSIST_MAX = 600; // persisted 1-hour candle state (compact), newest-used tickers kept
@@ -152,6 +158,9 @@
   const MK_KEY = '__ew_sw_' + SIDE + '_mkt_v1', MK_MAX = 720, MK_W = [6, 12, 24, 48, 72, 96, 168, 336], MK_SPLIT = 12, MK_SH = 0.3, MK_SNAP = 0.5; // Market line: storage, hours kept, range windows (hours), longest "short" window of the shape, score gap that makes a shape, share of a typical market move a range's snap starts as
   const MK = { loaded: false, dirty: false, t: 0, c: [], h: [], l: [] }; // memory: the market line, one equal-weight candle per hour (t = newest hour start, close / high / low as an index)
   const RG_SH = ['short and long windows agree', 'short windows above long', 'short windows below long'], RG_MC = { b: 'near the bottom', m: 'in the middle', t: 'near the top', u: 'broke up', d: 'broke down', x: 'no range' };
+  const SQ_KEY = '__ew_sw_' + SIDE + '_seq_v1', SQ_MB = 1, SQ_ON = 2, SQ_W0 = 0.2, SQ_UP = 0.25, SQ_DN = 0.6, SQ_DROP = 0.05, SQ_MISS = 3, SQ_CMIN = 3, SQ_MINW = 0.1, SQ_EDGE_MAX = 3000, SQ_TTL = 168; // Sequence map: storage, band of a mode (x the 6-hour spread), onset size (x the ticker's own 5-minute spread), strength a new edge starts at, share of the gap to 1 a sighting closes, share kept after a miss, strength under which an edge is dropped, misses in a row that drop it, fewest confirmed tickers in one shift, weakest edge read, most edges kept, hours an unseen edge is kept
+  const SQ = { loaded: false, dirty: false, mode: {}, edges: {}, dw: {}, lag: { n: 0, s: 0 }, ev: [], q: null, hit: 0, miss: 0, cnt: 0 }; // memory: per ticker its mode ({ m: -1 / 0 / 1, t: hour it began, h: last hour read, o: 1 = began while watched }), edges ('A>B' -> { w, n, l, s, x, t }), time spent per mode, response times, recent events, the hour in progress
+  const SM_RX = /^sm/; // sequence readings (smd, smn, smw, sml, smm, smk): logged and exported, never fed to the indicator ensemble (the sequence layer applies them itself)
   const CRAB_RX = /^c[bp]/; // crab readings (cb*, cp*): logged and exported, never fed to the indicator ensemble (the crab layer applies them itself)
 
   // Liquidation Surveillance (non-reactive, module-level): the WS connection, per-symbol liquidated-turnover tally for the
@@ -167,7 +176,7 @@
   // plugin keeps goes to the host's IndexedDB data store (window.__ewData, same getItem/setItem/removeItem), which moves a copy an older build
   // left in localStorage on its first read. A host without the store keeps using localStorage.
   const DS_LS_KEYS = () => [ASH_KEY, CROSS_KEY];
-  const DS_MOVED = () => [ASH_OC_HIST_KEY, SAMPLE_OBS_KEY, FC_KEY, PM_KEY, DIV_KEY, BG_KEY, CRAB_KEY, MK_KEY, LIQ_KEY, ILQ_KEY, STB_KEY];
+  const DS_MOVED = () => [ASH_OC_HIST_KEY, SAMPLE_OBS_KEY, FC_KEY, PM_KEY, DIV_KEY, BG_KEY, CRAB_KEY, SQ_KEY, MK_KEY, LIQ_KEY, ILQ_KEY, STB_KEY];
   const DS = {
     _s: k => (window.__ewData && !DS_LS_KEYS().includes(k)) ? window.__ewData : localStorage,
     getItem: k => DS._s(k).getItem(k), setItem: (k, v) => DS._s(k).setItem(k, v), removeItem: k => DS._s(k).removeItem(k),
@@ -481,6 +490,27 @@
                     <button class="btn btn-ghost" :disabled="cfgLocked" @click="_swCrabReset(true);t++">Rebuild from candle cache</button>
                     <button class="btn btn-ghost" :disabled="cfgLocked" @click="_swCrabReset(false);t++">Clear library</button>
                   </div>
+                </div>
+                <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}">
+                  <div class="tog-t" :class="cfg.swFcSeq!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcSeq=!(cfg.swFcSeq!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Sequence map <span class="ash-i" @click.prevent.stop="h=!h">ⓘ</span></div>
+                    <div class="ash-hint" x-show="h">Finds tickers that shift together within minutes, learns who moves first, and leans a follower the way its leaders just moved.</div>
+                  </div>
+                </label>
+                <div style="margin-top:6px;margin-left:14px" x-show="cfg.swFcSeq!==false" x-data="{t:0}" x-init="setInterval(()=>t++,15000)">
+                  <div class="lbl">Shift size (x the ticker's normal hourly move)</div>
+                  <input type="number" min="1.5" max="8" step="0.5" x-model.number="cfg.swSqZ" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Volume spike that counts with half that move (x median)</div>
+                  <input type="number" min="1" max="20" step="0.5" x-model.number="cfg.swSqVol" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Tickers shifting in one hour for an event</div>
+                  <input type="number" min="3" max="50" step="1" x-model.number="cfg.swSqMin" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Longest gap inside one shift (minutes)</div>
+                  <input type="number" min="5" max="30" step="5" x-model.number="cfg.swSqGap" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">5-minute checks per scan</div>
+                  <input type="number" min="1" max="30" step="1" x-model.number="cfg.swSqCap" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div style="margin-top:6px" x-html="t>=0 && _swSqPanel()"></div>
+                  <div style="margin-top:6px"><button class="btn btn-ghost" :disabled="cfgLocked" @click="_swSqReset();t++">Clear map</button></div>
                 </div>
                 <label class="tog" style="margin-top:8px;margin-left:14px" x-data="{h:false}">
                   <div class="tog-t" :class="cfg.swFcRegime!==false?'on':''" @click.prevent="if(!cfgLocked){cfg.swFcRegime=!(cfg.swFcRegime!==false);_swFcCfgChanged()}"><div class="tog-k"></div></div>
@@ -2385,9 +2415,9 @@
           const v = d.voids || {};
           o.voids = { gone: v.gone | 0, late: v.late | 0, thin: v.thin | 0 };
           if (Array.isArray(d.pend)) o.pend = d.pend.filter(f => f && typeof f.s === 'string' && num(f.a) != null && num(f.d) != null && num(f.t) != null && num(f.p) > 0 && num(f.e) != null)
-            .map(f => ({ s: f.s, a: f.a | 0, d: f.d | 0, t: f.t, p: f.p, p0: num(f.p0), e: f.e, e0: num(f.e0), ef: num(f.ef), ec0: num(f.ec0), ecf: num(f.ecf), eb: num(f.eb), ei: num(f.ei), rt: num(f.rt), c: this._swFcSanC(f.c), w: this._swFcSanW(f.w), ep: this._swFcSanW(f.ep), sn: this._swFcSanW(f.sn), bg: this._swFcSanW(f.bg), pf: num(f.pf), pk: (f.pk === 'g' || f.pk === 'p' || f.pk === 't') ? f.pk : null, pc: num(f.pc), pt: Array.isArray(f.pt) ? f.pt.map(num) : null, pwt: this._swFcProfSanW(f.pwt), er: num(f.er), rg: this._swFcRgSan(f.rg) }));
+            .map(f => ({ s: f.s, a: f.a | 0, d: f.d | 0, t: f.t, p: f.p, p0: num(f.p0), e: f.e, e0: num(f.e0), ef: num(f.ef), ec0: num(f.ec0), ecf: num(f.ecf), es0: num(f.es0), esf: num(f.esf), eb: num(f.eb), ei: num(f.ei), rt: num(f.rt), c: this._swFcSanC(f.c), w: this._swFcSanW(f.w), ep: this._swFcSanW(f.ep), sn: this._swFcSanW(f.sn), bg: this._swFcSanW(f.bg), pf: num(f.pf), pk: (f.pk === 'g' || f.pk === 'p' || f.pk === 't') ? f.pk : null, pc: num(f.pc), pt: Array.isArray(f.pt) ? f.pt.map(num) : null, pwt: this._swFcProfSanW(f.pwt), er: num(f.er), rg: this._swFcRgSan(f.rg) }));
           if (Array.isArray(d.done)) o.done = d.done.filter(r => r && typeof r.s === 'string' && num(r.a) != null && num(r.e) != null && num(r.y) != null)
-            .map(r => ({ s: r.s, a: r.a | 0, d: r.d | 0, t: num(r.t) || 0, u: num(r.u) || 0, e: r.e, e0: num(r.e0), ef: num(r.ef), ec0: num(r.ec0), ecf: num(r.ecf), eb: num(r.eb), ei: num(r.ei), rt: num(r.rt), y: (num(r.m) != null && num(r.k) != null) ? +(r.m - r.k).toFixed(4) : r.y, m: num(r.m), k: num(r.k), mu: num(r.mu), md: num(r.md), c: this._swFcSanC(r.c), w: this._swFcSanW(r.w), ep: this._swFcSanW(r.ep), sn: this._swFcSanW(r.sn), bg: this._swFcSanW(r.bg), pf: num(r.pf), pk: (r.pk === 'g' || r.pk === 'p' || r.pk === 't') ? r.pk : null, pc: num(r.pc), pt: Array.isArray(r.pt) ? r.pt.map(num) : null, pwt: this._swFcProfSanW(r.pwt), er: num(r.er), rg: this._swFcRgSan(r.rg) }));
+            .map(r => ({ s: r.s, a: r.a | 0, d: r.d | 0, t: num(r.t) || 0, u: num(r.u) || 0, e: r.e, e0: num(r.e0), ef: num(r.ef), ec0: num(r.ec0), ecf: num(r.ecf), es0: num(r.es0), esf: num(r.esf), eb: num(r.eb), ei: num(r.ei), rt: num(r.rt), y: (num(r.m) != null && num(r.k) != null) ? +(r.m - r.k).toFixed(4) : r.y, m: num(r.m), k: num(r.k), mu: num(r.mu), md: num(r.md), c: this._swFcSanC(r.c), w: this._swFcSanW(r.w), ep: this._swFcSanW(r.ep), sn: this._swFcSanW(r.sn), bg: this._swFcSanW(r.bg), pf: num(r.pf), pk: (r.pk === 'g' || r.pk === 'p' || r.pk === 't') ? r.pk : null, pc: num(r.pc), pt: Array.isArray(r.pt) ? r.pt.map(num) : null, pwt: this._swFcProfSanW(r.pwt), er: num(r.er), rg: this._swFcRgSan(r.rg) }));
           return o;
         },
         _swFcLoad() {
@@ -2573,8 +2603,8 @@
         // Improving how tickers are profiled can improve overall accuracy, so every forecast tool should take its weight through a profile.
         _swFcProfOn() { return this._swFcFocusOn() && this.cfg.swFcProf !== false; },
         _swFcProfDist() { const v = Number(this.cfg.swFcProfDist); return Math.max(5, Math.min(60, isFinite(v) && v > 0 ? v : 25)) / 100; },
-        _swFcProfKeys() { const k = FC_PROF_FAM.slice(); if (this._swFcIndOn()) { k.push('ind'); if (this._swDivOn()) k.push('div'); } if (this._swFcRangeOn()) k.push('rng'); if (this._swCrabOn()) k.push('crb'); return k; },
-        _swFcProfGeneral() { const g = { ind: this._swFcIndBlend(), div: 1, rng: this._swFcRangeBlend(), crb: this._swFcCrabBlend(0) }; for (const k of FC_PROF_FAM) g[k] = 1; return g; },
+        _swFcProfKeys() { const k = FC_PROF_FAM.slice(); if (this._swFcIndOn()) { k.push('ind'); if (this._swDivOn()) k.push('div'); } if (this._swFcRangeOn()) k.push('rng'); if (this._swCrabOn()) k.push('crb'); if (this._swSqOn()) k.push('seq'); return k; },
+        _swFcProfGeneral() { const g = { ind: this._swFcIndBlend(), div: 1, rng: this._swFcRangeBlend(), crb: this._swFcCrabBlend(0), seq: this._swFcSeqBlend() }; for (const k of FC_PROF_FAM) g[k] = 1; return g; },
         _swFcProfSanW(w) { if (!w || typeof w !== 'object') return null; const o = {}; for (const k of FC_PROF_ALL) if (typeof w[k] === 'number' && isFinite(w[k])) o[k] = w[k]; return Object.keys(o).length ? o : null; },
         _swFcProfWts(f) { return (this._swFcProfOn() && f && f.pwt) ? f.pwt : null; },
         _swFcProfW(f, k, dflt) { const m = this._swFcProfWts(f); return (m && typeof m[k] === 'number') ? m[k] : dflt; },
@@ -2620,7 +2650,7 @@
           let c = null;
           for (let i = 0; i < 12; i++) {
             const x = Object.assign({}, gen);
-            for (const k of keys) { const lim = FC_PROF_LIM[k], sd = (k === 'ind' || k === 'rng' || k === 'crb') ? sg * 0.6 : sg; x[k] = Math.max(lim[0], Math.min(lim[1], base[k] + gs() * sd)); }
+            for (const k of keys) { const lim = FC_PROF_LIM[k], sd = (k === 'ind' || k === 'rng' || k === 'crb' || k === 'seq') ? sg * 0.6 : sg; x[k] = Math.max(lim[0], Math.min(lim[1], base[k] + gs() * sd)); }
             c = x;
             if (dist(x, gen) >= 0.25 && !avoid.some(a => dist(x, a) < 0.12)) break;
           }
@@ -2674,7 +2704,7 @@
           const P = (fc.prof || []).slice().sort((a, b) => (b.n || 0) - (a.n || 0)), iso = v => v > 0 ? new Date(v).toISOString() : null, r1 = v => v == null ? null : Math.round(v * 10) / 10;
           return { enabled: this._swFcProfOn(), matchDistancePct: Math.round(this._swFcProfDist() * 100), maxProfiles: FC_PROF_MAX, traits: FC_PROF_TRAITS, generalWeights: this._swFcProfGeneral(), activeWeights: this._swFcProfKeys(),
             learning: P.filter(p => p.st !== 'p').length, proven: P.filter(p => p.st === 'p').length,
-            note: 'a profile belongs to one regime class (regimeClass; none = an older profile, which matches any class); a forecast under retryBelowPct gets a profile (traitRanks = its readings ranked inside its batch, -0.5..0.5, in the traits order; centroid = the profile centre, which follows its members); its ticker is retried on trial weights until one grade reaches retryPassPct, which become the proven weights; later forecasts matching a proven profile start on its weights, and a failure sends the profile back to learning (restarts; failedProvenWeights are avoided). Weights: fund / va / iol / ios / lta multiply that scorecard family\'s contribution (1 = general), ind = the indicator blend, div = the candle-divination share, rng = the Range Fit blend (0..1), crb = the crab layer\'s weight (0..1). weightSet on the grades: general / trial / proven',
+            note: 'a profile belongs to one regime class (regimeClass; none = an older profile, which matches any class); a forecast under retryBelowPct gets a profile (traitRanks = its readings ranked inside its batch, -0.5..0.5, in the traits order; centroid = the profile centre, which follows its members); its ticker is retried on trial weights until one grade reaches retryPassPct, which become the proven weights; later forecasts matching a proven profile start on its weights, and a failure sends the profile back to learning (restarts; failedProvenWeights are avoided). Weights: fund / va / iol / ios / lta multiply that scorecard family\'s contribution (1 = general), ind = the indicator blend, div = the candle-divination share, rng = the Range Fit blend (0..1), crb = the crab layer\'s weight (0..1), seq = the sequence layer\'s weight (0..1). weightSet on the grades: general / trial / proven',
             profiles: P.map(p => ({ id: p.id, regimeClass: p.rc == null ? null : RG_CLS[p.rc], status: p.st === 'p' ? 'proven' : 'learning', members: p.n || 0, recentTickers: p.ms || [], centroid: p.c, provenWeights: p.w || null, provenAccuracyPct: r1(p.wa), gradesOnProvenPassed: p.ok || 0, gradesOnProvenFailed: p.ko || 0, restarts: p.rs || 0, trialsThisRound: (p.tr || []).length, trialsTotal: p.tn || 0, bestTrialAccuracyPct: (p.tr || []).length ? r1(Math.max(...p.tr.map(t => t.a))) : null, currentTrial: p.cand || null, failedProvenWeights: p.fw || [], createdAt: iso(p.t), updatedAt: iso(p.u) })) };
         },
         _swFcPlan(pool, cap) {
@@ -2753,7 +2783,7 @@
           for (const [a, arr] of groups) {
             if (arr.length < 3) { fc.voids.thin += arr.length; continue; }
             const M = arr.reduce((s, x) => s + x.m, 0) / arr.length;
-            for (const { f, m, mu, md } of arr) { fc.done.push({ rt: f.rt || null, s: f.s, a, d: seq, t: f.t, u: entry.ts, e: f.e, e0: f.e0 ?? null, ef: f.ef ?? null, ec0: f.ec0 ?? null, ecf: f.ecf ?? null, eb: f.eb ?? null, ei: f.ei ?? null, y: +(m - M).toFixed(4), m: +m.toFixed(4), k: +M.toFixed(4), mu: mu == null ? null : +mu.toFixed(4), md: md == null ? null : +md.toFixed(4), c: f.c, w: f.w || null, ep: f.ep || null, sn: f.sn || null, bg: this._swBgSeal(f), pf: f.pf == null ? null : f.pf, pk: f.pk || null, pc: f.pc == null ? null : f.pc, pt: f.pt || null, pwt: (f.pk && f.pk !== 'g') ? (f.pwt || null) : null, er: f.er == null ? null : f.er, rg: f.rg || null }); const ac = this._swFcAcc(f.e, +(m - M).toFixed(4)); this._swFcRtyNote(fc, f.s, ac, entry.ts, f.bg && f.bg.cbu); this._swFcProfGrade(fc, f, ac, entry.ts); this._swFcRgLearn(fc, f, m, +(m - M).toFixed(4), M, entry.ts); }
+            for (const { f, m, mu, md } of arr) { fc.done.push({ rt: f.rt || null, s: f.s, a, d: seq, t: f.t, u: entry.ts, e: f.e, e0: f.e0 ?? null, ef: f.ef ?? null, ec0: f.ec0 ?? null, ecf: f.ecf ?? null, es0: f.es0 ?? null, esf: f.esf ?? null, eb: f.eb ?? null, ei: f.ei ?? null, y: +(m - M).toFixed(4), m: +m.toFixed(4), k: +M.toFixed(4), mu: mu == null ? null : +mu.toFixed(4), md: md == null ? null : +md.toFixed(4), c: f.c, w: f.w || null, ep: f.ep || null, sn: f.sn || null, bg: this._swBgSeal(f), pf: f.pf == null ? null : f.pf, pk: f.pk || null, pc: f.pc == null ? null : f.pc, pt: f.pt || null, pwt: (f.pk && f.pk !== 'g') ? (f.pwt || null) : null, er: f.er == null ? null : f.er, rg: f.rg || null }); const ac = this._swFcAcc(f.e, +(m - M).toFixed(4)); this._swFcRtyNote(fc, f.s, ac, entry.ts, f.bg && f.bg.cbu); this._swFcProfGrade(fc, f, ac, entry.ts); this._swFcRgLearn(fc, f, m, +(m - M).toFixed(4), M, entry.ts); }
             this._swFcRgCohort(fc, arr, M, entry.ts);
           }
           fc.ctx = fc.ctx || {}; fc.ctx[seq] = this._swFcCtx(entry); // the market around this batch, for the export
@@ -3010,6 +3040,7 @@
               }
             };
             await Promise.all([worker(), worker(), worker()]);
+            if (this._swSqOn()) { try { await this._swSqStep(); for (const f of pick) { const r = this._swSqRead(f.s); if (Object.keys(r).length) Object.assign(f.bg ||= {}, r); } } catch (_) {} } // Sequence map: this scan's shifts, then each forecast's sequence readings
             if (this._swDivOn()) this._swDivMaybeBuild(); // a young library clusters once the batch's pairs are in
             { const cx = this._swFcStore().ctx; this._swFcLive(pick, cx && cx[pick[0].a], true); } // the slow readings (1-hour ATR, open-interest change) are in: score the batch again with all of them
             this._swBgBusy = 0; this._swFcSave(); this._swBgDirty = false; this._swBgPersistSoon(); // final scores: published to a following bot here
@@ -3622,6 +3653,236 @@
           if (top.length) h += this._swTblHtml(['Ticker', 'Window', 'Range low', 'Range high', 'In range'], top.map(f => [f.s.replace('USDT', ''), f.bg.cbw + 'h', sgn(f.bg.cbl), sgn(f.bg.cbh), Math.round(f.bg.cbp * 100) + '%']), 'Strongest crabs (range low / high from the price, position in range)');
           return h;
         },
+        // ── Sequence map ──
+        // Someone moves many tickers at nearly the same time, and the same tickers tend to be moved together again. A ticker shifts when its market-relative hourly move is a multiple of its own normal
+        // size (or its hourly volume jumps along with half that move); enough tickers shifting in the same hour is an event. Only then do the strongest few (the scan cap) get 5-minute candles: a ticker's
+        // onset is the first 5-minute candle that jumps in its direction by a multiple of its own 5-minute spread, after taking out what BTC explains. Onsets chained within the gap (minutes) form one
+        // shift, ordered by onset, and every earlier -> later pair files an edge (leader -> follower): it counts at once, gains strength with every sighting, loses strength with every miss (a follower
+        // that did not move when its leader did) and is dropped after repeated misses or when unseen for a week. Tickers on the same 5-minute candle are filed both ways. A ticker's mode (bullish, bearish
+        // or crab) is read every hour from its market-relative 6-hour move, with the Crab layer's 6-hour range test, and the time spent in a mode is kept. A follower of tickers that shifted this hour gets
+        // smd = the direction they point it (price direction, -1..1, 0 = none) from the edges' strength and sign; the layer then pulls its forecast that way, with a weight the bot tests like the Crab layer's.
+        _swSqOn() { return this._swBgOn() && this.cfg.swFcSeq !== false; },
+        _swSqCfg() { const c = this.cfg, n = (v, d, lo, hi) => { v = Number(v); return Math.max(lo, Math.min(hi, isFinite(v) && v > 0 ? v : d)); }; return { z: n(c.swSqZ, 3, 1.5, 8), vol: n(c.swSqVol, 2, 1, 20), min: Math.round(n(c.swSqMin, 5, 3, 50)), gap: Math.round(n(c.swSqGap, 5, 5, 30)) * 60000, cap: Math.round(n(c.swSqCap, 10, 1, 30)) }; },
+        _swSqEnsure() {
+          if (SQ.loaded) return; SQ.loaded = true;
+          try {
+            const d = JSON.parse(DS.getItem(SQ_KEY) || 'null');
+            if (d && d.v === 1) {
+              for (const k of Object.keys(d.mode || {})) { const a = d.mode[k]; if (Array.isArray(a)) SQ.mode[k] = { m: a[0], t: a[1], h: a[2], o: a[3] }; }
+              for (const k of Object.keys(d.edges || {})) { const a = d.edges[k]; if (Array.isArray(a) && a.length >= 6) SQ.edges[k] = { w: a[0], n: a[1], l: a[2], s: a[3], x: a[4], t: a[5] }; }
+              SQ.dw = d.dw || {}; SQ.lag = d.lag || { n: 0, s: 0 }; SQ.ev = d.ev || []; SQ.q = d.q || null; SQ.hit = d.hit | 0; SQ.miss = d.miss | 0; SQ.cnt = d.cnt | 0;
+            }
+          } catch (_) {}
+        },
+        _swSqSaveSoon() { clearTimeout(this._swSqPt); this._swSqPt = setTimeout(() => this._swSqSave(), 20000); },
+        _swSqSave() {
+          if (!SQ.loaded) return; SQ.dirty = false;
+          const mode = {}, edges = {}, r = v => +v.toFixed(3);
+          for (const k of Object.keys(SQ.mode)) { const m = SQ.mode[k]; mode[k] = [m.m, m.t, m.h, m.o]; }
+          for (const k of Object.keys(SQ.edges)) { const e = SQ.edges[k]; edges[k] = [r(e.w), e.n, +e.l.toFixed(1), r(e.s), e.x, e.t]; }
+          try { DS.setItem(SQ_KEY, JSON.stringify({ v: 1, at: Date.now(), mode, edges, dw: SQ.dw, lag: SQ.lag, ev: SQ.ev, q: SQ.q, hit: SQ.hit, miss: SQ.miss, cnt: SQ.cnt })); } catch (_) {}
+        },
+        _swSqReset() {
+          clearTimeout(this._swSqPt); SQ.mode = {}; SQ.edges = {}; SQ.dw = {}; SQ.lag = { n: 0, s: 0 }; SQ.ev = []; SQ.q = null; SQ.hit = 0; SQ.miss = 0; SQ.cnt = 0; SQ.loaded = true; SQ.dirty = false;
+          try { DS.removeItem(SQ_KEY); } catch (_) {}
+        },
+        // A ticker's mode for the hour: crab when its 6-hour range test passes, else bullish / bearish by its market-relative 6-hour move against its own spread (a mode it is already in is kept down to half the band).
+        // The time a finished stay lasted is kept per mode (stays that began unwatched, or with gaps in the readings, are not counted).
+        _swSqMode(sym, st, a, j, hi, sd) {
+          let m = SQ.mode[sym]; if (m && m.h >= hi) return;
+          let net = 0, k = 0; for (let i = j - 5; i <= j; i++) { const x = a[i]; if (x === x) { net += x; k++; } }
+          if (k < 5) return;
+          const band = SQ_MB * sd * Math.sqrt(6), cc = this._swCrabCfg(), L = this._swCrabLevel(st.c, st.h, st.l, st.c.length - 1, 6, 0, cc.edge);
+          let nm;
+          if (L && L.s >= cc.bar) nm = 0;
+          else if (m && m.m === 1 && net > 0.5 * band) nm = 1;
+          else if (m && m.m === -1 && net < -0.5 * band) nm = -1;
+          else nm = net > band ? 1 : net < -band ? -1 : 0;
+          if (!m) SQ.mode[sym] = { m: nm, t: hi, h: hi, o: 0 };
+          else {
+            if (nm !== m.m) { if (m.o && hi - m.h <= 3) { const d = (SQ.dw[m.m] ||= [0, 0]); d[0]++; d[1] += hi - m.t; } m.m = nm; m.t = hi; m.o = 1; }
+            m.h = hi;
+          }
+          SQ.dirty = true;
+        },
+        // Every ticker whose completed hour is in the candle cache: its mode, and whether the hour was a shift (dir, z, volume ratio).
+        _swSqScan(hs) {
+          const R = this._swPmRel(), hi = Math.round(hs / 3600000), j = hi - R.h0, cfg = this._swSqCfg(), fl = {};
+          if (!(R.W > 0) || j < 6 || j >= R.W) return fl;
+          for (const sym of Object.keys(BG1H)) {
+            const st = BG1H[sym], a = R.S[sym], sd = R.sd[sym]; if (!st || st.t !== hs || !a || !(sd > 0)) continue;
+            const v = a[j]; if (v !== v) continue;
+            const z = v / sd; let vr = 0; const vv = st.v;
+            if (vv && vv.length === st.c.length) { const x = vv[vv.length - 1], b = vv.slice(-25, -1).filter(y => y > 0).sort((p, q) => p - q); if (x > 0 && b.length >= 12) vr = x / b[b.length >> 1]; }
+            try { this._swSqMode(sym, st, a, j, hi, sd); } catch (_) {}
+            if (Math.abs(z) >= cfg.z || (vr >= cfg.vol && Math.abs(z) >= cfg.z / 2)) fl[sym] = [z > 0 ? 1 : -1, +z.toFixed(2), +vr.toFixed(1)];
+          }
+          return fl;
+        },
+        // The 5-minute candles of the shift hour (the batch's own when they cover it): the ticker's onset = the first candle that jumps its way by SQ_ON x its own spread, less what BTC explains.
+        async _swSqOnset(sym, q, hs) {
+          q.done[sym] = 0;
+          try {
+            const get = async s => {
+              const c = CAND5[s] && CAND5[s].c;
+              if (c && c.length && c[0].s <= hs && c[c.length - 1].s >= hs + 3300000) return c;
+              const lim = Math.max(14, Math.min(60, Math.ceil((Date.now() - hs) / 300000) + 1));
+              const res = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${s}&interval=5&limit=${lim}`), js = await res.json();
+              return this._swC5Parse(js?.result?.list);
+            };
+            const cs = await get(sym); if (!cs || cs.length < 8) return;
+            let bt = null; if (sym !== 'BTCUSDT') { if (!this._swSqB5 || Date.now() - this._swSqB5.at > 240000 || this._swSqB5.hs !== hs) this._swSqB5 = { at: Date.now(), hs, p: get('BTCUSDT').catch(() => null) }; bt = await this._swSqB5.p; } // one BTC request shared by the checks of a scan
+            const bm = new Map((bt || []).map(x => [x.s, x.o > 0 ? x.c / x.o - 1 : 0])), rs = cs.map(x => ({ s: x.s, r: x.o > 0 ? x.c / x.o - 1 : 0 }));
+            let sxy = 0, sxx = 0; for (const x of rs) { const b = bm.get(x.s); if (b != null) { sxy += x.r * b; sxx += b * b; } }
+            const beta = sxx > 0 ? Math.max(0, Math.min(3, sxy / sxx)) : 0, e = rs.map(x => ({ s: x.s, r: x.r - beta * (bm.get(x.s) || 0) }));
+            const ab = e.map(x => Math.abs(x.r)).sort((p, c2) => p - c2), sig = 1.4826 * ab[ab.length >> 1]; if (!(sig > 0)) return;
+            const d = q.fl[sym][0], on = e.find(x => x.s >= hs && x.s < hs + 3600000 && x.r * d >= SQ_ON * sig);
+            if (on) { q.done[sym] = on.s; q.conf[sym] = { d, o: on.s }; }
+          } catch (_) {}
+        },
+        _swSqEdge(a, b, lag, sp, hi) {
+          const key = a + '>' + b; let e = SQ.edges[key];
+          if (!e) SQ.edges[key] = { w: SQ_W0, n: 1, l: lag, s: sp, x: 0, t: hi };
+          else { e.w += (1 - e.w) * SQ_UP; e.n++; e.l += (lag - e.l) / Math.min(e.n, 20); e.s += (sp - e.s) / Math.min(e.n, 20); e.x = 0; e.t = hi; }
+          SQ.dirty = true;
+        },
+        // Confirmed tickers chained by onset within the gap = one shift (at least SQ_CMIN of them); each pair, earlier -> later, files once per hour.
+        _swSqLink(q, hi, cfg) {
+          const C = Object.keys(q.conf).map(s => ({ s, d: q.conf[s].d, o: q.conf[s].o })).sort((x, y) => x.o - y.o), groups = []; let cur = [];
+          for (const x of C) { if (cur.length && x.o - cur[cur.length - 1].o > cfg.gap) { groups.push(cur); cur = []; } cur.push(x); }
+          if (cur.length) groups.push(cur);
+          for (const g of groups) {
+            if (g.length < SQ_CMIN) continue;
+            for (let i = 0; i < g.length; i++) for (let k = i + 1; k < g.length; k++) {
+              const x = g[i], y = g[k], lag = (y.o - x.o) / 60000;
+              for (const [p, r] of (lag === 0 ? [[x, y], [y, x]] : [[x, y]])) { const key = p.s + '>' + r.s; if (q.seen[key]) continue; q.seen[key] = 1; this._swSqEdge(p.s, r.s, lag, p.d * r.d, hi); }
+            }
+            for (let k = 1; k < g.length; k++) { const key = 'L' + g[k].s; if (q.seen[key]) continue; q.seen[key] = 1; SQ.lag.n++; SQ.lag.s += (g[k].o - g[0].o) / 60000; }
+          }
+        },
+        // One scan: modes and flagged tickers from the candle cache, 5-minute candles for the strongest few not checked yet, then the edges.
+        async _swSqStep() {
+          if (!this._swSqOn()) return;
+          this._swSqEnsure();
+          const hs = this._swHourStart(), hi = Math.round(hs / 3600000), cfg = this._swSqCfg();
+          if (SQ.q && SQ.q.h !== hi) this._swSqClose();
+          const fl = this._swSqScan(hs); let q = SQ.q;
+          if (!q) q = SQ.q = { h: hi, fl: {}, done: {}, seen: {}, conf: {} };
+          for (const k of Object.keys(fl)) q.fl[k] = fl[k];
+          const keys = Object.keys(q.fl);
+          if (keys.length >= cfg.min) {
+            const todo = keys.filter(s => !(s in q.done)).sort((x, y) => Math.abs(q.fl[y][1]) - Math.abs(q.fl[x][1])).slice(0, cfg.cap);
+            for (let i = 0; i < todo.length; i += 3) await Promise.all(todo.slice(i, i + 3).map(s => this._swSqOnset(s, q, hs)));
+            this._swSqLink(q, hi, cfg); SQ.dirty = true;
+          }
+          if (SQ.dirty) this._swSqSaveSoon();
+        },
+        // The hour is over: a leader's follower that did not move with it is a miss (its edge loses strength, repeated misses drop it), one that did move is a lighter sighting; the event is logged and old or surplus edges go.
+        _swSqClose() {
+          const q = SQ.q; SQ.q = null; if (!q) return;
+          const R = this._swPmRel(), j = q.h - R.h0, cfg = this._swSqCfg(), conf = Object.keys(q.conf);
+          if (Object.keys(q.fl).length >= cfg.min) {
+            SQ.cnt++;
+            conf.sort((x, y) => q.conf[x].o - q.conf[y].o);
+            const ord = conf.slice(0, 12).map(s => [s, q.conf[s].d, Math.round((q.conf[s].o - q.conf[conf[0]].o) / 60000)]);
+            SQ.ev.unshift({ h: q.h, f: Object.keys(q.fl).length, c: Object.keys(q.conf).length, o: ord }); if (SQ.ev.length > 20) SQ.ev.length = 20;
+          }
+          if (Object.keys(q.conf).length >= SQ_CMIN && j >= 0 && j < R.W) {
+            for (const key of Object.keys(SQ.edges)) {
+              const e = SQ.edges[key], p = key.indexOf('>'), a = key.slice(0, p), b = key.slice(p + 1), ca = q.conf[a];
+              if (!ca || q.conf[b] || e.t === q.h || Math.abs(e.s) < 0.2) continue;
+              const x = R.S[b], v = x ? x[j] : NaN; if (!(v === v) || !(R.sd[b] > 0)) continue;
+              const z = v / R.sd[b], ex = Math.sign(e.s) * ca.d;
+              if (z * ex >= cfg.z / 2) { e.w += (1 - e.w) * SQ_UP / 2; e.x = 0; e.t = q.h; SQ.hit++; }
+              else if (Math.abs(z) < 1 || z * ex < 0) { e.w *= SQ_DN; e.x++; SQ.miss++; if (e.w < SQ_DROP || e.x >= SQ_MISS) delete SQ.edges[key]; }
+            }
+          }
+          const hi = q.h, ks = Object.keys(SQ.edges);
+          for (const k of ks) if (hi - SQ.edges[k].t > SQ_TTL) delete SQ.edges[k];
+          const left = Object.keys(SQ.edges); if (left.length > SQ_EDGE_MAX) left.sort((x, y) => SQ.edges[y].w - SQ.edges[x].w).slice(SQ_EDGE_MAX).forEach(k => delete SQ.edges[k]);
+          SQ.dirty = true; this._swSqSaveSoon();
+        },
+        // The readings one ticker gets (logged and exported, never fed to the indicator ensemble): smm = its mode (1 bullish / 0 crab / -1 bearish), smk = hours in it (when watched from the start),
+        // smd = the direction the tickers that shifted this hour point it (price direction, -1..1; absent = none), smn = how many of them, smw = the strongest edge, sml = their average lag in minutes.
+        _swSqRead(sym) {
+          const o = {}; this._swSqEnsure(); const m = SQ.mode[sym], hi = Math.round(this._swHourStart() / 3600000);
+          if (m) { o.smm = m.m; if (m.o) o.smk = Math.max(0, hi - m.t); }
+          const q = SQ.q;
+          if (q && q.h === hi && !q.fl[sym]) {
+            let sum = 0, n = 0, wm = 0, lg = 0;
+            for (const a of Object.keys(q.conf)) { const e = SQ.edges[a + '>' + sym]; if (!e || e.w < SQ_MINW) continue; sum += e.w * e.s * q.conf[a].d; n++; wm = Math.max(wm, e.w); lg += e.l; }
+            if (n) { o.smd = +Math.tanh(sum).toFixed(3); o.smn = n; o.smw = +wm.toFixed(3); o.sml = +(lg / n).toFixed(1); }
+          }
+          return o;
+        },
+        // The sequence layer's weight is the bot's own call, like the Crab layer's: every graded forecast the layer changed (score before es0, with the layer at full weight esf, both kept) is replayed at
+        // weights 1 / .75 / .5 / .25 / .01 and the best accuracy wins (a lower weight must beat the one above by more than 0.1 points). Under FC_IND_MINB graded batches or 30 changed forecasts the layer stands in full.
+        _swFcSeqBlendCalc() {
+          const fc = this._swFcStore(), done = fc.done, n = done.length, last = n ? done[n - 1].u : 0, win = this._swFcIndWinMs(), key = n + ':' + last + ':' + win;
+          if (this._swFcSeqBl && this._swFcSeqBl.key === key) return this._swFcSeqBl;
+          const out = this._swFcSeqBl = { key, b: 1, batches: 0, rows: 0, acc: null, why: 'too few graded batches to test the sequence layer yet' };
+          const R = done.filter(r => r.u >= last - win && typeof r.es0 === 'number' && typeof r.esf === 'number' && Math.abs(r.esf - r.es0) > 1e-6 && typeof r.y === 'number' && isFinite(r.y));
+          out.rows = R.length; out.batches = new Set(R.map(r => r.a)).size;
+          if (out.batches < FC_IND_MINB || R.length < 30) return out;
+          const G = [1, 0.75, 0.5, 0.25, 0.01], acc = {};
+          for (const g of G) acc[g] = R.reduce((s, r) => s + this._swFcAcc(g * r.esf + (1 - g) * r.es0, r.y), 0) / R.length;
+          let best = 1; for (const g of G) if (g < best && acc[g] > acc[best] + 0.1) best = g;
+          out.b = best; out.acc = Object.fromEntries(G.map(g => [Math.round(g * 100) + '%', +acc[g].toFixed(2)]));
+          out.why = best === 1 ? 'the sequence layer is doing at least as well as any weaker mix' : best === 0.01 ? 'the sequence layer is pulling accuracy down, so the forecast stands without it' : 'a weaker mix of the sequence layer and the forecast is doing best';
+          return out;
+        },
+        _swFcSeqBlend() { return this._swFcSeqBlendCalc().b; },
+        // Runs inside _swFcLive after the Crab layer: a follower's score is pulled toward the direction its leaders point (strength |smd|), scaled like the batch's own scores (their mean size).
+        // Both ends are kept (es0 / esf) so the weight can be tested; a profile's own seq weight, when it has one, replaces the managed weight.
+        _swFcSeq(list) {
+          for (const f of list) { f.es0 = null; f.esf = null; }
+          if (!this._swSqOn()) return;
+          let S = 0, c = 0; for (const f of list) if (typeof f.e === 'number') { S += Math.abs(f.e); c++; }
+          S = c ? Math.max(0.05, S / c) : 0.1;
+          for (const f of list) {
+            const b = f.bg; if (!b || typeof f.e !== 'number' || typeof b.smd !== 'number' || b.smd === 0) continue;
+            const u = Math.min(1, Math.abs(b.smd)), tgt = (b.smd > 0 ? 1 : -1) * S;
+            f.es0 = f.e; f.esf = +((1 - u) * f.e + u * tgt).toFixed(4);
+            const g = this._swFcProfW(f, 'seq', this._swFcSeqBlend());
+            f.e = +((1 - g) * f.es0 + g * f.esf).toFixed(4);
+          }
+        },
+        _swSqHint() {
+          if (!this._swSqOn()) return '';
+          const k = this._swFcSeqBlendCalc(); return ` · Sequence map${k.rows ? `: ${k.rows} changed` : ''}${k.b < 1 ? `, weight ${Math.round(k.b * 100)}%` : ''}`;
+        },
+        _swSqPanel() {
+          if (!this._swSqOn()) return '<div style="font-size:10px;color:var(--text-lo)">Sequence map is off.</div>';
+          this._swSqEnsure(); const q = SQ.q, ek = Object.keys(SQ.edges), bl = this._swFcSeqBlendCalc(), pend = this._swFcStore().pend;
+          const nm = s => s.replace('USDT', ''), ar = d => d > 0 ? '▲' : '▼', pf = pend.filter(f => f.bg && typeof f.bg.smd === 'number' && f.bg.smd !== 0).length;
+          let h = this._swTblHtml(['Edges', 'Events seen', 'Flagged / confirmed now', 'Followers leaning'], [[ek.length, SQ.cnt, q ? Object.keys(q.fl).length + ' / ' + Object.keys(q.conf).length : '—', pf]]);
+          const cur = { 1: 0, 0: 0, '-1': 0 }; for (const s of Object.keys(SQ.mode)) cur[SQ.mode[s].m]++;
+          const names = { 1: 'Bullish', 0: 'Crab', '-1': 'Bearish' };
+          h += this._swTblHtml(['Mode', 'Tickers now', 'Stays seen', 'Average stay'], [1, 0, -1].map(m => { const d = SQ.dw[m]; return [names[m], cur[m], d ? d[0] : 0, d && d[0] ? (d[1] / d[0]).toFixed(1) + 'h' : '—']; }), 'How long a ticker stays in a mode before it switches');
+          h += this._swTblHtml(['Follower response', 'Followers seen', 'Moved without 5m proof', 'Missed'], [[SQ.lag.n ? (SQ.lag.s / SQ.lag.n).toFixed(1) + ' min' : '—', SQ.lag.n, SQ.hit, SQ.miss]], 'Average time a follower takes after the first ticker of its shift');
+          const ev = SQ.ev[0];
+          if (ev) h += this._swTblHtml(['Last event (UTC)', 'Flagged', 'Confirmed'], [[new Date(ev.h * 3600000).toISOString().slice(5, 16).replace('T', ' '), ev.f, ev.c]], ev.o.length ? ev.o.map(x => nm(x[0]) + ar(x[1]) + (x[2] ? ' +' + x[2] + 'm' : '')).join(' → ') : 'no order confirmed');
+          const top = ek.map(k => [k, SQ.edges[k]]).sort((x, y) => y[1].w * Math.log(1 + y[1].n) - x[1].w * Math.log(1 + x[1].n)).slice(0, 8);
+          if (top.length) h += this._swTblHtml(['Leader → follower', 'Lag', 'Moves', 'Strength', 'Seen'], top.map(([k, e]) => { const p = k.indexOf('>'); return [nm(k.slice(0, p)) + ' → ' + nm(k.slice(p + 1)), Math.round(e.l) + 'm', e.s >= 0 ? 'same way' : 'opposite', Math.round(e.w * 100) + '%', e.n]; }), 'Strongest links');
+          h += this._swTblHtml(['Weight', 'Tested on'], [[Math.round(bl.b * 100) + '%', bl.rows ? bl.rows + ' changed forecasts' : 'untested (stands in full)']]);
+          return h;
+        },
+        _swSqExport() {
+          this._swSqEnsure(); const cfg = this._swSqCfg(), bl = this._swFcSeqBlendCalc(), fc = this._swFcStore(), r3 = v => (v == null ? null : +Number(v).toFixed(3)), hi = Math.round(this._swHourStart() / 3600000);
+          const rows = fc.done.filter(r => r.bg && typeof r.bg.smd === 'number' && r.bg.smd !== 0 && typeof r.y === 'number' && r.y !== 0), hit = rows.length ? +(rows.filter(r => (r.bg.smd > 0) === (r.y > 0)).length / rows.length * 100).toFixed(1) : null;
+          const edges = Object.keys(SQ.edges).map(k => { const e = SQ.edges[k], p = k.indexOf('>'); return { leader: k.slice(0, p), follower: k.slice(p + 1), strengthPct: Math.round(e.w * 100), seen: e.n, averageLagMin: r3(e.l), sameWayShare: r3(e.s), missesInARow: e.x, lastSeenHoursAgo: hi - e.t }; }).sort((x, y) => y.strengthPct - x.strengthPct).slice(0, 300);
+          const modes = { 1: 0, 0: 0, '-1': 0 }; for (const s of Object.keys(SQ.mode)) modes[SQ.mode[s].m]++;
+          const stay = Object.fromEntries([['bullish', 1], ['crab', 0], ['bearish', -1]].map(([n, m]) => [n, { tickersNow: modes[m], staysSeen: SQ.dw[m] ? SQ.dw[m][0] : 0, averageStayHours: SQ.dw[m] && SQ.dw[m][0] ? r3(SQ.dw[m][1] / SQ.dw[m][0]) : null }]));
+          return { enabled: this._swSqOn(),
+            settings: { shiftSizeX: cfg.z, volumeSpikeX: cfg.vol, tickersNeededForAnEvent: cfg.min, maxGapMinutes: cfg.gap / 60000, fiveMinuteChecksPerScan: cfg.cap, minConfirmedInAShift: SQ_CMIN, onsetSizeX: SQ_ON },
+            weight: { weightPct: Math.round(bl.b * 100), forecastsChanged: bl.rows, batches: bl.batches, accuracyByWeightPct: bl.acc, why: bl.why },
+            followers: { note: 'graded forecasts whose ticker had shifted leaders (a sequence reading); hitPct = how often the sign of the reading matched the sign of the move against its batch', n: rows.length, hitPct: hit },
+            modes: { note: 'mode = bullish / bearish by the market-relative 6-hour move against the ticker\'s own spread, crab when the Crab layer\'s 6-hour range test passes; stays are finished stays watched from their start', ...stay },
+            response: { followersSeen: SQ.lag.n, averageMinutesAfterTheFirst: SQ.lag.n ? r3(SQ.lag.s / SQ.lag.n) : null, movedWithoutProof: SQ.hit, misses: SQ.miss },
+            events: SQ.ev.map(e => ({ hourUtc: new Date(e.h * 3600000).toISOString(), flagged: e.f, confirmed: e.c, order: e.o.map(x => ({ symbol: x[0], direction: x[1] > 0 ? 'up' : 'down', minutesAfterTheFirst: x[2] })) })),
+            edges: { note: 'leader -> follower: when the leader shifts, the follower is expected to move sameWayShare x the leader\'s direction (1 = the same way, -1 = the opposite); strength starts at ' + SQ_W0 * 100 + '% and rises with every sighting; 5-minute candles give lags in 5-minute steps (0 = the same candle, filed both ways)', total: Object.keys(SQ.edges).length, strongest: edges },
+            note: 'sequence readings (smm, smk, smd, smn, smw, sml) are in every forecast\'s background readings; preSequence / withSequence on the grades are es0 / esf (the score before the layer and with it at full weight)' };
+        },
         // Which readings drive the direction. Re-tested whenever a batch has graded, on the graded forecasts of the last window (default 4 hours): every logged
         // reading is ranked within its batch against the move, a reading is used the way its own sign shows (a reversal reading counts upside down), and it
         // stays in only if (1) that sign is the same in both halves of the window, (2) it is not negligible, and (3) adding it does not pull the ensemble's
@@ -3637,7 +3898,7 @@
           if (B.length < FC_IND_MINB) { this._swDivLive(out); return out; }
           const r3 = v => (v == null ? null : +v.toFixed(3)), mean = a => { const v = a.filter(x => x != null); return v.length ? v.reduce((s, x) => s + x, 0) / v.length : null; };
           const seen = new Map();
-          for (const b of B) for (const r of b) for (const s of ['sn', 'bg']) { const o = r[s]; if (!o) continue; for (const k of Object.keys(o)) if (!BG_SKIP(k) && !CRAB_RX.test(k) && typeof o[k] === 'number' && isFinite(o[k])) seen.set(s + ':' + k, (seen.get(s + ':' + k) || 0) + 1); }
+          for (const b of B) for (const r of b) for (const s of ['sn', 'bg']) { const o = r[s]; if (!o) continue; for (const k of Object.keys(o)) if (!BG_SKIP(k) && !CRAB_RX.test(k) && !SM_RX.test(k) && typeof o[k] === 'number' && isFinite(o[k])) seen.set(s + ':' + k, (seen.get(s + ':' + k) || 0) + 1); }
           const P = B.map(b => ({ n: b.length, y: this._swFcRank(b.map(r => r.y)), f: new Map() })), ids = [], sigs = new Map();
           for (const [id, c] of seen) {
             const [s, k] = id.split(':');
@@ -3715,6 +3976,7 @@
             }
           } else for (const f of list) { f.eb = null; f.ei = null; if (f.bg) { delete f.bg._dc; delete f.bg._vi; } }
           this._swFcCrab(list); // Crab layer: tickers moving along a range lean toward a snap back (before Range Fit, so the fit lays the leaned order onto each range)
+          this._swFcSeq(list); // Sequence layer: followers of tickers that just shifted lean the way those shifted
           this._swFcRangeFit(list, state);
           this._swFcRegime(list); // Regime caution: a second score beside e (e itself is final here and stays as it is)
         },
@@ -4043,7 +4305,7 @@
           const fc = this._swFcStore(), f = this._swFcFmt(this._swFcStats(fc.done));
           const ri = this.swFcRangeInfo, nt = Object.keys(PM.s).length, rb = this._swFcRangeBlend();
           const fa = this._swFcRangeOn() ? ` · Range Fit: ${nt} ticker${nt === 1 ? '' : 's'} of past moves` + (ri && ri.fitted ? `, ${ri.fitted} fitted${ri.skipped ? ` (${ri.skipped} short of history)` : ''}` : nt < 8 ? ', learning' : '') + (rb < 1 ? `, weight ${Math.round(rb * 100)}%` : '') : '';
-          return `${fc.pend.length} pending · ${fc.done.length} graded` + (f ? ' · ' + f : ' · too few graded to read yet') + fa + this._swFcProfHint() + this._swCrabHint() + this._swRgHint();
+          return `${fc.pend.length} pending · ${fc.done.length} graded` + (f ? ' · ' + f : ' · too few graded to read yet') + fa + this._swFcProfHint() + this._swCrabHint() + this._swSqHint() + this._swRgHint();
         },
         // ── Forecast chart (view 'fc') ──
         // One column per graded start batch in the window (the chart scrolls): one bar per ticker = its forecast accuracy (0-100), up from the 70% line when at or above it, down when below. After a dashed line, the batches
@@ -4182,6 +4444,7 @@
               store: part !== 'ranges' ? undefined : this._swPmExport() },
             candleDivination: this._swDivExport(),
             crabLayer: this._swCrabExport(),
+            sequenceMap: this._swSqExport(),
             regimeCaution: this._swRgExport(),
             indicatorForecast: { enabled: this._swFcIndOn(), directionBlendPct: Math.round(this._swFcIndBlend() * 100), directionBlendTest: (() => { const q = this._swFcIndBlendCalc(); return { setPct: Math.round(this._swFcIndBlendCfg() * 100), testedPct: q.b == null ? null : Math.round(q.b * 100), changedForecasts: q.rows, batches: q.batches, accuracyByWeightPct: q.acc, why: q.why }; })(), directionFeatures: this._swFcIndSelect().feats.map(x => (x.o > 0 ? '+' : '-') + x.k), directionTest: (() => { const q = this._swFcIndSelect(); return { windowHours: Math.round(this._swFcIndWinMs() / 360000) / 10, batches: q.batches, forecasts: q.rows, minBatches: FC_IND_MINB, minAbsRankIC: FC_IND_FLOOR, ensembleRankIC: q.ic, note: 'rankIC = mean per-batch rank correlation of the reading with the price move (price direction, + = price up); h1 / h2 = the same over the first / second half of the window; in = used (with the sign shown by rankIC)', readings: q.table }; })(), liquidationDropoffHours: Math.round(this._swFcLiqDropMs() / 360000) / 10, sizeFeatures: VOL_FEATS.map(x => x[0]), note: 'projectedPp ranks tickers by an equal-weight rank average of the direction features picked from the graded window (each reading used the way its own sign shows, kept only while it does not pull the ensemble down; none picked yet = the scorecard score stands; see directionTest), sized by the geometric mean of the size features against the batch median; the scorecard score is kept in projections.sc and graded as projectionTest.scorecard; background._dc and _vi are the per-ticker indicator direction score (price direction, -0.5 to 0.5) and size index', historyStorage: (this._swFcIdb && !this._swFcIdbBroken) ? { indexedDb: true, rows: this._swFcIdb.w.size, provenOnReload: this._swFcIdb.proven } : { indexedDb: false } },
             batchCounter: fc.seq, voids: fc.voids, noScoredPole: fc.nof, retryQueue: this._swFcRtyExport(fc), weightProfiles: this._swFcProfExport(fc), liquidationReservation: { waiting: Object.keys(fc.rsv || {}).length, dropoffHours: Math.round(this._swFcLiqDropMs() / 360000) / 10, note: 'tickers with a liquidation event younger than the dropoff that have not started a forecast since; bg._rv = 1 marks forecasts started from a reservation' }, startLog: { note: 'per batch: results = tickers in the batch; revisits = taken by due revisits; pending = skipped because the ticker already has a forecast in flight; noPrice = no usable price; noScoredPole = nothing the scorecard could score; candidates = left to choose from; room = forecasts allowed to start; started = forecasts started; reserved = of those, started from a liquidation reservation; retries = of those, started on a ticker in the retry queue (attempt 2 or later). started under room = the batch ran out of candidates. Graded cohorts can still shrink later (void gone / late / thin)', rows: (fc.sl || []).map(e => ({ startBatch: e.a, results: e.r, revisits: e.v, pending: e.h, noPrice: e.p, noScoredPole: e.n, candidates: e.c, room: e.m, started: e.k, reserved: e.q, retries: e.y })) },
