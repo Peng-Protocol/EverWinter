@@ -31,7 +31,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '2.5.0'; // Change: Fade only — a sub-toggle that blocks every normal entry (and substitution) so only Fade cond. orders open positions. | previous: Change: Fade — with Still-Water loaded, a qualified ticker whose forecast points against this side is no longer entered at once: it gets a cond. limit entry at the end of its expected move (from graded forecasts of similar score), kept for 1h, with TP/SL from the Relative Target percents at its fill price.
+    const VERSION       = '2.6.1'; // Change: Fade — a substitution due in Fade mode is exempt from the Fade slots and Fade only: it places a Fade cond. order for the better ticker and closes the worst position, whose slot the order holds (a cond. that never fills frees it). | previous: Change: Fade slots — at most micFadeSlots Fade cond. orders pending, each holding a position slot normal entries leave free; none left (or none free) cancels them and blocks new ones, and a worse forecast replaces the weakest every scan. Fade targets now scale from the last completed forecast batch (price move per pp of score) instead of nearest-score history.
   const DEFAULT_SLOTS = [[]];
   let   WINTER        = false;      // set in transform() from the host; every side switch below reads it
   let   MIC_HIST_KEY  = '__mic_hist_batches'; // Winter keeps its own '__miw_hist_batches' so existing history carries over
@@ -41,8 +41,8 @@
   // Auto picker, so both stay in sync by construction.
   const SECONDARY_CRITS = ['fund','va','iol','ios','lta','lpa'];
   const FADE_LIFE_MS    = 3600000; // Fade: how long a cond. entry waits (the forecast's horizon)
-  const FADE_MIN_ROWS   = 20;      // Fade: graded forecasts on this side needed before a target is set
-  const FADE_NEAR       = 60;      // Fade: graded forecasts of the nearest score a target is read from
+  const FADE_MIN_ROWS   = 20;      // Fade: graded forecasts (last batch, then older ones) needed to read a price-per-pp scale
+  const FADE_MAX_BATCHES = 5;      // Fade: most batches the scale is read from
 
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
@@ -73,9 +73,38 @@
     micMinEntryTp: 6,               // Relative Target floor, ROI %: the shrunk entry TP and Cascade / Sacrifice never go below this, so a position can still clear its entry+exit fees
     micDefermentEnabled: true,      // Deferment: the headline factor also scales how long a position or cond. order may live (up to the host's Force Close Runtime); a headline under 50% closes everything (reason defer) and blocks entries. Needs Still-Water.
     micDeferMinMins: 10,            // Deferment: the least time a position or cond. order gets, at a headline of 50%
-    micFadeEnabled: false,          // Fade: a qualified ticker whose forecast points against this side waits as a cond. limit entry at the end of that move (1h) instead of entering at once. Needs Still-Water.
+    micFadeEnabled: false,          // One Fade cond. order for a verified candidate, |score| x scale away from its price. sub: a substitution's order (exempt from the Fade slots).
+        async _micFadePlace(v, sc, sub = false, replaced = null) {
+          const t = v.t, sym = t.symbol, pd = WINTER ? 1 : -1;
+          let price = parseFloat(t.lastPrice || 0);
+          if (!this._swTickerIsCurrent?.(t)) try {
+            const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+            const lp = parseFloat((await r.json())?.result?.list?.[0]?.lastPrice);
+            if (lp > 0) price = lp;
+          } catch (e) {}
+          if (!(price > 0)) return null;
+          const dist = Math.abs(v.compositeScore) * sc.k, _tg = this._micTargets();
+          const o = await this.placeCondEntry({
+            candidate: {
+              symbol: sym, price, change: parseFloat(t.price24hPcnt || 0) * 100, fundingRate: parseFloat(t.fundingRate || 0) * 100,
+              _tpPct: _tg.active ? +_tg.entryTp.toFixed(2) : undefined,
+              _slPct: _tg.active ? +_tg.slPct.toFixed(2) : undefined,
+              _mic: true, _micPathA: true, _micFade: true, _micSub: sub || undefined,
+              _micSlotIdx: v.slotIdx ?? 0, _micCompositeScore: v.compositeScore ?? 0,
+              _micCriteria: v.annotCrits, _micRawCriteria: v.criteria,
+            },
+            target: price * (1 + pd * dist / 100),
+            worst:  price * (1 - pd * dist / 100),
+            tag: 'fade',
+          });
+          if (o) this.log(`[MI] 🎯 Fade ${sym}: forecast ${v.compositeScore.toFixed(2)}pp against this side — cond. ${dist.toFixed(2)}% away (${sc.k.toFixed(3)}% per pp, ${sc.n} graded)${replaced ? ` — replaced ${replaced}` : ''}`, 'info');
+          return o;
+        },
+
+        // Fade: a qualified ticker whose forecast points against this side waits as a cond. limit entry at the end of that move (1h) instead of entering at once. Needs Still-Water.
     micFadeOnly: false,             // Fade: also block every normal entry, so only Fade cond. orders open positions
-    micFadeReachPct: 50,            // Fade: share of similar graded forecasts that moved at least as far as the target
+    micFadeSlots: 3,                // Fade: most Fade cond. orders pending at once; each holds a position slot until it fills or is cancelled
+    micFadeReachPct: 50,            // Fade: share of the last batch's score (by weight) that moved at least as far per pp as the scale
     micReentryBlockMode: 'losers',
     micAutoSlots: true,
     micAutoSlotSize: 3,
@@ -317,7 +346,12 @@
                     <div x-show="cfg.micFadeEnabled" style="margin-top:8px">
                       <div class="lbl">Reach <b x-text="cfg.micFadeReachPct+'%'"></b></div>
                       <input type="range" min="10" max="90" step="5" x-model.number="cfg.micFadeReachPct" @change="persist()">
-                      <div class="mic-hint">Share of similar graded forecasts that moved at least this far.</div>
+                      <div class="mic-hint">Share of the last graded batch that moved at least this far per pp of score.</div>
+                      <div style="display:flex;align-items:center;gap:6px;margin-top:8px">
+                        <span class="lbl" style="margin:0">Fade slots</span>
+                        <input type="number" min="0" step="1" x-model.number="cfg.micFadeSlots" @change="cfg.micFadeSlots=Math.max(0,Math.round(+cfg.micFadeSlots||0));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:4px;color:var(--text);padding:2px 5px">
+                      </div>
+                      <div class="mic-hint">Most Fade orders pending at once, each holding a position slot; a worse forecast replaces the weakest.</div>
                       <label class="tog" style="margin-top:8px">
                         <div class="tog-t" :class="cfg.micFadeOnly?'on':''" @click.prevent="if(!cfgLocked){cfg.micFadeOnly=!cfg.micFadeOnly;persist()}"><div class="tog-k"></div></div>
                         <div>
@@ -950,14 +984,21 @@
           const worstScore = scoreOf(worst);
           // Pre-flight the Force-Evaluate top-up that _micOpen runs, before anything is closed.
           let best = null;
+          // Fade mode: an against-side ticker (a Fade cond. target) can win too, and with Fade only nothing else can.
+          const fadeSc = this._micFadeOn() ? this._micFadeScale() : null, fadeOnly = this._micFadeOnly();
+          const against  = c => !!(fadeSc && c.fcRanked && c.compositeScore < 0);
+          const fadeable = c => against(c) && !this.condOrders.some(o => o.symbol === c.t.symbol);
+          const skip     = c => against(c) ? !fadeable(c) : fadeOnly;   // against-side tickers only ever become Fade orders
           for (const cand0 of pool) {
             if ((cand0.compositeScore - worstScore) < marginThreshold) break;
+            if (skip(cand0)) continue;
             // Ranked on stored readings, so refetch and rescore before this candidate can displace a held position.
             let cand = cand0;
             if (ctx) {
               cand = await this._micVerify(cand0, ctx);
               if (cand === false) break;
               if (!cand || (cand.compositeScore - worstScore) < marginThreshold) continue;
+              if (skip(cand)) continue;
             }
             if (this.cfg.micForceGeneralCriteria && this.cfg.micAutoSlots) {
               const full = await this._micTopUpGeneralCriteria(cand.t, cand.criteria);
@@ -972,6 +1013,14 @@
             return false;
           }
 
+          // A Fade substitution: the order goes in first and the worst position closes after it, so a refused order closes nothing.
+          if (fadeable(best)) {
+            const o = await this._micFadePlace(best, fadeSc, true);
+            if (!o) return false;
+            this.log(`[MI] 🔁 Substitution (Fade) — closing ${worst.symbol} (score ${worstScore === -Infinity ? 'n/a' : worstScore.toFixed(4)}) for a cond. order on ${best.t.symbol} (score ${best.compositeScore.toFixed(4)})`, 'info');
+            await this.pseudoClosePosition(worst, 'substitution');
+            return true;
+          }
           this.log(`[MI] 🔁 Substitution — closing ${worst.symbol} (score ${worstScore === -Infinity ? 'n/a' : worstScore.toFixed(4)}) for ${best.t.symbol} (score ${best.compositeScore.toFixed(4)}), Δ${(best.compositeScore - worstScore).toFixed(4)} ≥ ${marginThreshold.toFixed(4)} margin`, 'info');
           await this.pseudoClosePosition(worst, 'substitution');
           return await this._micOpen(best.t, best.criteria, best.slotIdx, best.compositeScore);
@@ -1112,66 +1161,85 @@
           const now = Date.now(), old = (this.condOrders || []).filter(o => o.tag === 'fade' && now - (o.createdAt || 0) >= FADE_LIFE_MS);
           for (const o of old) { try { await this.cancelCondOrder(o.id, 'fade expired'); } catch (e) { this.log(`[MI] fade expiry error (${o.symbol}): ${e.message}`, 'warn'); } }
         },
-        // Graded forecasts as [score in this side's favor, % the price reached in the direction a negative score points], from the
-        // highest / lowest point each one touched after it started. Only scores under 0 (pointing against this side) are kept.
-        _micFadeRows() {
-          const pd = WINTER ? 1 : -1, out = [];
-          for (const r of (this._swFcStore?.()?.done || [])) {
-            const f = this._swFcFavor?.(r), x = pd > 0 ? r.mu : (r.md == null ? null : -r.md);
-            if (f != null && f < 0 && x != null && isFinite(x)) out.push([f, Math.max(0, x)]);
-          }
-          return out;
+        // Pending Fade orders each hold a position slot, so normal entries leave them free (see _micScanEntry).
+        _micFadeHeld() { return (this.condOrders || []).reduce((n, o) => n + (o.tag === 'fade' ? 1 : 0), 0); },
+        // A substitution's Fade order holds the slot of the position it replaced; it is exempt from the Fade slots (see _micTrySubstitute).
+        _micFadeSub(o) { return o.tag === 'fade' && !!o.candidate?._micSub; },
+        // Fade orders allowed now: the Fade slots setting, never more than the position slots still free.
+        _micFadeRoom() {
+          const free = Math.max(0, (this.cfg.maxPos || 0) - (this.positions?.length ?? 0) - (this._micPending || 0) - (this.condOrders || []).filter(o => this._micFadeSub(o)).length);
+          return Math.min(Math.max(0, Math.round(Number(this.cfg.micFadeSlots) || 0)), free);
         },
-        // How far a forecast of this score usually runs: among the FADE_NEAR graded forecasts of the nearest score, the move (% of price)
-        // that micFadeReachPct of them reached. Null when there is too little history.
-        _micFadeDist(rows, fav) {
-          if (rows.length < FADE_MIN_ROWS) return null;
-          const near = rows.map(r => [Math.abs(r[0] - fav), r[1]]).sort((a, b) => a[0] - b[0]).slice(0, FADE_NEAR).map(r => r[1]).sort((a, b) => a - b);
-          const reach = Math.min(90, Math.max(10, Number(this.cfg.micFadeReachPct) || 50));
-          const d = near[Math.min(near.length - 1, Math.floor(near.length * (1 - reach / 100)))];
-          return d > 0 ? { dist: d, n: near.length } : null;
+        // A pending Fade order's forecast score now (pp in this bot's favor, the newest forecast on its ticker), else the score it was placed on.
+        _micFadeNow(o) {
+          const s = this._swFcScoreOf?.(o.symbol);
+          return (s != null && isFinite(s)) ? s : (o.candidate?._micCompositeScore ?? 0);
+        },
+        // Cancels Fade orders beyond what the slots allow: all of them when no slot is free, else the weakest forecasts first.
+        async _micFadeCap() {
+          const cur = (this.condOrders || []).filter(o => o.tag === 'fade' && !this._micFadeSub(o)), room = this._micFadeRoom();
+          if (cur.length <= room) return;
+          const drop = cur.sort((a, b) => this._micFadeNow(b) - this._micFadeNow(a)).slice(0, cur.length - room);
+          this.log(`[MI] 🎯 Fade — cancelling ${drop.length} cond. order${drop.length === 1 ? '' : 's'} (${room ? `only ${room} slot${room === 1 ? '' : 's'} free` : 'no slot free'})`, 'warn');
+          for (const o of drop) { try { await this.cancelCondOrder(o.id, room ? 'over fade slots' : 'no slot free'); } catch (e) { this.log(`[MI] fade cap error (${o.symbol}): ${e.message}`, 'warn'); } }
+        },
+        // Price move per pp of score, read from the last completed forecast batch (older ones only when it has under FADE_MIN_ROWS forecasts):
+        // each forecast's move to the highest / lowest point it touched in the direction of its score (% of price), divided by its score size.
+        // k is the ratio that micFadeReachPct of the batch's score weight reached or passed. Null when there is too little graded history.
+        _micFadeScale() {
+          const fc = this._swFcStore?.(), done = fc?.done;
+          if (!done?.length) return null;
+          const reach = Math.min(90, Math.max(10, Number(this.cfg.micFadeReachPct) || 50)), rg = !!this._swRgOn?.();
+          const key = done.length + ':' + done[done.length - 1].u + ':' + reach + ':' + (rg ? 1 : 0);
+          if (this._micFadeSc && this._micFadeSc.key === key) return this._micFadeSc.v;
+          const by = new Map();
+          for (let i = done.length - 1; i >= 0 && i >= done.length - 600; i--) {
+            const r = done[i], pe = (rg && typeof r.er === 'number') ? r.er : r.e, x = pe > 0 ? r.mu : (r.md == null ? null : -r.md);
+            if (typeof pe !== 'number' || !isFinite(pe) || pe === 0 || typeof x !== 'number' || !isFinite(x)) continue;
+            if (!by.has(r.a)) { if (by.size >= FADE_MAX_BATCHES) break; by.set(r.a, []); }
+            by.get(r.a).push({ w: Math.abs(pe), q: Math.max(0, x) / Math.abs(pe) });
+          }
+          const rows = []; let nb = 0;
+          for (const g of by.values()) { rows.push(...g); nb++; if (rows.length >= FADE_MIN_ROWS) break; }
+          let v = null;
+          if (rows.length >= FADE_MIN_ROWS) {
+            rows.sort((a, b) => b.q - a.q);
+            const tot = rows.reduce((s, r) => s + r.w, 0); let cum = 0, k = 0;
+            for (const r of rows) { cum += r.w; k = r.q; if (cum >= tot * reach / 100) break; }
+            if (k > 0) v = { k, n: rows.length, b: nb };
+          }
+          this._micFadeSc = { key, v };
+          return v;
         },
         // Fade: a qualified ticker whose forecast points against this side (score under 0) does not enter now. It gets a cond. limit entry
-        // at the end of its expected move (up for Winter, down for Chaser); worst case mirrors the target on the other side, where the forecast
-        // is plainly wrong. TP/SL come from the Relative Target percents, applied from the fill price. Returns the pool without the tickers
-        // Fade took; one with too little graded history for a target stays and enters as usual.
+        // at the end of its expected move (up for Winter, down for Chaser), |score| x the batch scale away; worst case mirrors the target on
+        // the other side, where the forecast is plainly wrong. TP/SL come from the Relative Target percents, applied from the fill price.
+        // At most _micFadeRoom() orders at once: once full, a worse forecast (more against this side) replaces the weakest pending one.
+        // Returns the pool without the tickers Fade took; with too little graded history for a scale, every ticker stays and enters as usual.
         async _micFadeEntry(pool, ctx) {
           if (!this._micFadeOn()) return pool;
-          const rows = this._micFadeRows(), pd = WINTER ? 1 : -1, cap = this.cfg.maxCond ?? 30, picks = Math.max(1, Math.round(this.cfg.micPicks)), taken = new Set();
+          const sc = this._micFadeScale();
+          if (!sc) return pool;
+          const pd = WINTER ? 1 : -1, cap = this.cfg.maxCond ?? 30, picks = Math.max(1, Math.round(this.cfg.micPicks)), room = this._micFadeRoom(), taken = new Set();
+          const cands = pool.filter(c => c.fcRanked && c.compositeScore < 0).sort((a, b) => a.compositeScore - b.compositeScore);
           let placed = 0;
-          for (const cand of pool) {
-            if (!(cand.fcRanked && cand.compositeScore < 0)) continue;
-            const lv = this._micFadeDist(rows, cand.compositeScore);
-            if (!lv) continue;
+          for (const cand of cands) {
             const sym = cand.t.symbol;
             taken.add(sym);
-            if (placed >= picks || this.condOrders.length >= cap) continue;
+            if (placed >= picks || !room) continue;
             if (this.condOrders.some(o => o.symbol === sym) || this.positions.some(p => p.symbol === sym)) continue;
+            let weak = null;
+            const held = this.condOrders.filter(o => o.tag === 'fade' && !this._micFadeSub(o));
+            if (held.length >= room) {
+              weak = held.reduce((a, b) => this._micFadeNow(b) > this._micFadeNow(a) ? b : a);
+              if (!(cand.compositeScore < this._micFadeNow(weak))) continue;
+            } else if (this.condOrders.length >= cap) continue;
             const v = await this._micVerify(cand, ctx);
             if (!v) continue;
-            const t = v.t;
-            let price = parseFloat(t.lastPrice || 0);
-            if (!this._swTickerIsCurrent?.(t)) try {
-              const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
-              const lp = parseFloat((await r.json())?.result?.list?.[0]?.lastPrice);
-              if (lp > 0) price = lp;
-            } catch (e) {}
-            if (!(price > 0)) continue;
-            const _tg = this._micTargets();
-            const o = await this.placeCondEntry({
-              candidate: {
-                symbol: sym, price, change: parseFloat(t.price24hPcnt || 0) * 100, fundingRate: parseFloat(t.fundingRate || 0) * 100,
-                _tpPct: _tg.active ? +_tg.entryTp.toFixed(2) : undefined,
-                _slPct: _tg.active ? +_tg.slPct.toFixed(2) : undefined,
-                _mic: true, _micPathA: true, _micFade: true,
-                _micSlotIdx: v.slotIdx ?? 0, _micCompositeScore: v.compositeScore ?? 0,
-                _micCriteria: v.annotCrits, _micRawCriteria: v.criteria,
-              },
-              target: price * (1 + pd * lv.dist / 100),
-              worst:  price * (1 - pd * lv.dist / 100),
-              tag: 'fade',
-            });
-            if (o) { placed++; this.log(`[MI] 🎯 Fade ${sym}: forecast ${v.compositeScore.toFixed(2)}pp against this side — cond. ${lv.dist.toFixed(2)}% away (${lv.n} graded)`, 'info'); }
+            if (!(v.compositeScore < 0)) { taken.delete(sym); continue; }
+            if (weak && !(v.compositeScore < this._micFadeNow(weak))) continue;
+            if (weak) await this.cancelCondOrder(weak.id, 'fade replaced');
+            if (await this._micFadePlace(v, sc, false, weak?.symbol)) placed++;
           }
           return taken.size ? pool.filter(c => !taken.has(c.t.symbol)) : pool;
         },
@@ -1211,6 +1279,7 @@
           if (!_micDef.deferring) this._micDeferLogged = false;
           await this._micEnforceTiming(_micDef);
           await this._micFadeExpire();
+          await this._micFadeCap();
 
           // Entry slots — Auto mode has no generated slot list any more (see _micAutoQualify);
           // Manual mode keeps its exact combo list as before.
@@ -1374,7 +1443,8 @@
           }
 
           const entryPool = await this._micFadeEntry(entryAll, ctx);
-          if (this._micFadeOnly()) return;
+          // Substitution sees the against-side tickers Fade took out of the entry pool (it can turn one into a Fade cond. order).
+          const subPool = this._micFadeOn() ? entryAll : entryPool;
 
           // Reserve-counted headroom: guards against a substitution path (_micTrySubstitute) or
           // this same open loop being mid-open — past its own headroom check, still awaiting a
@@ -1383,10 +1453,16 @@
           // overshooting maxPos. _micPending is incremented the instant an open is committed to
           // and released once that attempt resolves (see _micOpen), so it always reflects slots
           // that are spoken for even before pseudoOpenLong actually pushes them onto this.positions.
-          const _micInFlight = this._micPending || 0;
+          // Pending Fade orders count as in flight too: each holds the slot it will fill.
+          const _fadeHeld = this._micFadeHeld();
+          const _micInFlight = (this._micPending || 0) + _fadeHeld;
 
+          if (this._micFadeOnly()) {
+            if ((this.positions?.length ?? 0) + _micInFlight >= this.cfg.maxPos) await this._micTrySubstitute(subPool, ctx);
+            return;
+          }
           if ((this.positions?.length ?? 0) + _micInFlight >= this.cfg.maxPos) {
-            await this._micTrySubstitute(entryPool, ctx);
+            await this._micTrySubstitute(subPool, ctx);
             return;
           }
 
@@ -1396,7 +1472,7 @@
             const micCount = (this.positions || []).filter(p => p._mic).length;
             headroom = Math.min(headroom, capSlots - micCount);
             if (headroom < 1) {
-              if (!(await this._micTrySubstitute(entryPool, ctx))) {
+              if (!(await this._micTrySubstitute(subPool, ctx))) {
                 this.log('[MI] 💡 Share cap reached — no slots available', 'info');
               }
               return;
@@ -1422,7 +1498,7 @@
           try {
             for (const cand of entryPool) {
               if (opened >= picks) break;
-              if ((this.positions?.length ?? 0) + (this._micPending || 0) >= maxPos) break;
+              if ((this.positions?.length ?? 0) + (this._micPending || 0) + _fadeHeld >= maxPos) break;
               const v = await this._micVerify(cand, ctx);
               if (v === false) break; // refetch budget spent
               if (!v) { dropped++; continue; }
