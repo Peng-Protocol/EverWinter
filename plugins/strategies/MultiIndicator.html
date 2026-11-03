@@ -20,8 +20,11 @@
   'losers' lets a symbol that just closed in profit re-trigger immediately.
 
   Entry pool fires once per fresh sample batch (_swOcResultsAt) — will not re-scan
-  the same batch twice. MI sets what it will enter (its slot criteria); Still-Water suggests: only tickers the latest batch's Indicator forecast
-  covers are considered, ranked by it (er when Regime caution is active, else e). Without Still-Water, MI enters on its criteria alone, ungraded.
+  the same batch twice. MI sets what it will enter (its slot criteria); Still-Water suggests: only tickers the latest batch's sample score
+  covers are considered, ranked by it (the Forecast Grader's forecasts are made from that same score). Without Still-Water, MI enters on its criteria alone, ungraded.
+  Inverse forecast (general rule): when Still-Water's Forecast Grader window net profit is negative while its window inverse net profit (the forecasts taken in reverse order)
+  is positive and its average ROI per trade is over the Min Entry TP, MI enters on the inverse forecast only (the most against-side scores first; Fade is off, Relative Target
+  stands down, Deferment never defers). Deferment also defers whenever that window net profit is negative (and the inverse rule is not in use).
   Candidates are refetched before entry when not from the batch. Drawdown throttle and gains lock gate all entries.
 
   Load via Plugin Manager in either bot's config panel, AFTER Still-Water (and after SunChaser / EverWinter if live).
@@ -31,7 +34,7 @@
 (function () {
   'use strict';
 
-    const VERSION       = '2.7.0'; // Change: Fade — Regime fade sub-toggle: with the Still-Water headline under 50% Fade follows the forecast instead of fading it, placing cond. orders at the end of favourable moves (score above 0) on the assumption the motion continues; pending Fade orders of the other regime are cancelled. | previous: Change: Fix — _micFadePlace had landed inside MIC_DEFAULT_CFG instead of the methods block, so the mic-entry stage threw \"not a function\"; moved beside the other Fade helpers.
+    const VERSION       = '2.8.0'; // Change: Inverse forecast is a general rule: a negative Forecast Grader window net profit with a positive window inverse net profit over the Min Entry TP enters on the inverse forecast only (Fade off, Deferment lifted, Relative Target stands down with its readout showing full targets in purple); Deferment also defers on a negative window net profit; Fade and every other reader of the old Indicator forecast read the new Forecast Grader | previous: Change: Fade — Regime fade sub-toggle: with the Still-Water headline under 50% Fade follows the forecast instead of fading it, placing cond. orders at the end of favourable moves (score above 0) on the assumption the motion continues; pending Fade orders of the other regime are cancelled. | previous: Change: Fix — _micFadePlace had landed inside MIC_DEFAULT_CFG instead of the methods block, so the mic-entry stage threw \"not a function\"; moved beside the other Fade helpers.
   const DEFAULT_SLOTS = [[]];
   let   WINTER        = false;      // set in transform() from the host; every side switch below reads it
   let   MIC_HIST_KEY  = '__mic_hist_batches'; // Winter keeps its own '__miw_hist_batches' so existing history carries over
@@ -43,6 +46,7 @@
   const FADE_LIFE_MS    = 3600000; // Fade: how long a cond. entry waits (the forecast's horizon)
   const FADE_MIN_ROWS   = 20;      // Fade: graded forecasts (last batch, then older ones) needed to read a price-per-pp scale
   const FADE_MAX_BATCHES = 5;      // Fade: most batches the scale is read from
+  const INV_MIN_BATCHES = 3;       // Deferment exemption: graded batches with an inverse pick the window needs before its inverse net profit can lift the deferment
 
   // Megacaps excluded from the population pool alongside BTC — their size skews OC/IO/Volume/liq
   // averages the same way BTC would. cfg.megacapExclude is seeded from this default below but is
@@ -232,8 +236,8 @@
       .mic-tg-bar u { position:absolute; top:-2px; bottom:-2px; width:1px; background:rgba(255,255,255,.55); }
       .mic-tg-val { font-family:var(--mono); font-size:10px; white-space:nowrap; }
       .mic-tg-val small { font-size:8px; opacity:.75; margin-right:3px; letter-spacing:.5px; }
-      .mic-tg-val.ok { color:#3ddc84; } .mic-tg-val.bad { color:#ff5a5a; } .mic-tg-val.off { color:var(--text-lo); }
-      .mic-tg-bar i.ok { background:rgba(61,220,132,.55); } .mic-tg-bar i.bad { background:rgba(255,90,90,.55); } .mic-tg-bar i.off { background:transparent; }
+      .mic-tg-val.ok { color:#3ddc84; } .mic-tg-val.bad { color:#ff5a5a; } .mic-tg-val.off { color:var(--text-lo); } .mic-tg-val.inv { color:#b57bff; }
+      .mic-tg-bar i.ok { background:rgba(61,220,132,.55); } .mic-tg-bar i.bad { background:rgba(255,90,90,.55); } .mic-tg-bar i.off { background:transparent; } .mic-tg-bar i.inv { background:rgba(181,123,255,.55); }
       .mic-zone { margin-top:8px; padding:8px; background:rgba(255,255,255,.02); border:1px solid rgba(255,255,255,.06); border-radius:3px; }
     `,
 
@@ -483,7 +487,7 @@
                   <div class="tog-t" :class="cfg.micDefermentEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.micDefermentEnabled=!cfg.micDefermentEnabled;persist()}"><div class="tog-k"></div></div>
                   <div>
                     <div class="tog-l">Deferment</div>
-                    <div class="mic-hint">Position time shrinks as the headline nears 50%; below it, everything closes and entries stop.</div>
+                    <div class="mic-hint">Position time shrinks as the headline nears 50%; below it, everything closes and entries stop. Also defers while the Forecast Grader's window net profit is negative, unless the inverse forecast is in use (window inverse net profit positive and over the Min Entry TP per trade).</div>
                   </div>
                 </label>
                 <div x-show="_micSwLoaded() && cfg.micDefermentEnabled" style="margin-top:8px">
@@ -1017,7 +1021,7 @@
             label:      'No Entry',
             labelStyle: 'color:rgba(255,160,0,.9)',
             border:     'border-color:rgba(255,160,0,.45);background:rgba(255,160,0,.06)',
-            title:      `MI deferment — new entries blocked (headline ${(d.share * 100).toFixed(1)}% is under 50%)`,
+            title:      `MI deferment — new entries blocked (${d.why.join(' + ')})`,
             action:     null,
           }];
         },
@@ -1044,6 +1048,7 @@
           const baseSl = Number(c.binaryModeEnabled ? (c.binarySlPct ?? 18) : (c.dcaSlPct ?? 16)) || 18;
           const out = { active: false, slPct: null, entryTp: baseTp, cascadePct: c.micCascadePct, sacrificePct: c.micSacrificePct, minTp: Math.max(0, Number(c.micMinEntryTp) || 0), h: null, lev: Number(c.leverage) || 6 };
           if (!c.micRelativeTargetEnabled || !(c.micCascadeEnabled || c.micSacrificeEnabled)) return out;
+          if (this._micInverseOn()) return out; // inverse forecast in use: Relative Target stands down, the full targets apply
           const h = this._micHeadline();
           if (!h) return out;
           out.active = true; out.h = h;
@@ -1060,21 +1065,24 @@
         _micTargetsText() {
           if (!this.cfg.micRelativeTargetEnabled || !(this.cfg.micCascadeEnabled || this.cfg.micSacrificeEnabled)) return '';
           const t = this._micTargets();
+          if (this._micInverseOn()) return `Inverse forecast in use — Relative Target stands down · entry TP ${t.entryTp.toFixed(1)}% · SL ${(Number(this.cfg.binaryModeEnabled ? (this.cfg.binarySlPct ?? 18) : (this.cfg.dcaSlPct ?? 16)) || 18).toFixed(1)}% · cascade ${this._micEffCascadePct().toFixed(1)}% · sacrifice ${this._micEffSacrificePct().toFixed(1)}%`;
           if (!t.active) return 'Waiting for the Still-Water headline — needs enough samples.';
           return `Now: headline ${(t.h.share * 100).toFixed(1)}% · factor ×${t.h.f.toFixed(2)} · entry TP ${t.entryTp.toFixed(1)}% · SL ${t.slPct.toFixed(1)}% · cascade ${this._micEffCascadePct().toFixed(1)}% · sacrifice ${this._micEffSacrificePct().toFixed(1)}%`;
         },
 
-        // One ticker's rank score: pp in this bot's favor, from the batch's Indicator forecast. Null = no forecast.
-        _micRankScore(t, fcRank) {
+        // One ticker's rank score: pp in this bot's favor, from the batch's sample score (the Forecast Grader's forecast). Null = no score.
+        // inv = the Deferment exemption's inverse forecast: the same score with its sign flipped (higher = more against this side).
+        _micRankScore(t, fcRank, inv) {
           const s = fcRank && fcRank.get(t.symbol);
-          return s == null ? null : { v: s, fc: true };
+          return s == null ? null : { v: inv ? -s : s, fc: true };
         },
         // Structured readout for the Multi-Indicator body: left = SL + Sacrifice, right = TP + Cascade, each green when viable, red when not.
         // Viable: the resolved value is at or above the Min Entry TP floor (green), under it = red. Cascade / Sacrifice colour on the resolved value; the text shows what actually fires (never under the floor) and they get no bar.
         _micTargetsView() {
           const c = this.cfg, t = this._micTargets();
           const rtOn = !!c.micRelativeTargetEnabled && !!(c.micCascadeEnabled || c.micSacrificeEnabled);
-          const waiting = rtOn && !t.active;
+          const inv = rtOn && !!this._micInverseOn(); // inverse forecast in use: full targets, shown in purple
+          const waiting = rtOn && !t.active && !inv;
           const f = v => (v == null || !isFinite(v)) ? '--' : v.toFixed(1) + '%';
           const floor = t.minTp, hostSl = Number(c.binarySlPct ?? 18) || 18;
           const tp = t.entryTp, sl = t.active ? t.slPct : hostSl;
@@ -1083,18 +1091,19 @@
           const casRaw = t.active ? t.cascadePct : c.micCascadePct;
           const scale = Math.max(1, tp, sl, cas || 0, sac || 0, floor) * 1.1;
           const w = v => v == null ? 0 : Math.max(2, Math.min(100, v / scale * 100));
-          const fl = rtOn ? +(floor / scale * 100).toFixed(1) : null;
-          const row = (k, v, ok, off, tip, fl2, nb) => ({ k, nb: !!nb, txt: off ? 'off' : f(v), w: (off || nb) ? 0 : +w(v).toFixed(1), c: off ? 'off' : (waiting ? 'off' : (ok ? 'ok' : 'bad')), tip, fl: fl2 ?? null });
+          const fl = (rtOn && !inv) ? +(floor / scale * 100).toFixed(1) : null;
+          const row = (k, v, ok, off, tip, fl2, nb) => ({ k, nb: !!nb, txt: off ? 'off' : f(v), w: (off || nb) ? 0 : +w(v).toFixed(1), c: off ? 'off' : (inv ? 'inv' : (waiting ? 'off' : (ok ? 'ok' : 'bad'))), tip, fl: fl2 ?? null });
           const tpOk = tp >= floor, casOk = casOn && casRaw >= floor;
           const sacRaw = t.active ? t.sacrificePct : c.micSacrificePct;
           const slOk = sl >= floor, sacOk = sacOn && sacRaw >= floor;
           let note;
-          if (waiting) note = 'Waiting for the Still-Water headline — needs enough samples.';
+          if (inv) note = `Inverse forecast in use — Relative Target stands down (full targets) · window inverse ${this._micUsd(this._micInverseOn().usd)}`;
+          else if (waiting) note = 'Waiting for the Still-Water headline — needs enough samples.';
           else if (t.active) note = `headline ${(t.h.share * 100).toFixed(1)}%${t.h.peak != null ? ` (peak ${(t.h.peak * 100).toFixed(1)}%)` : ''} · factor ×${t.h.f.toFixed(2)}`;
           else note = 'Static targets (Relative Target off).';
           const dd = this._micDefermentState(), al = this._micAllowedMs();
           const dur = ms => { const m = Math.round(ms / 60000); return m < 60 ? m + 'm' : (m % 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : m / 60 + 'h'); };
-          const time = dd.deferring ? 'Time allowed: none — deferring' : al == null ? '' : 'Time allowed: ' + dur(al);
+          const time = dd.deferring ? 'Time allowed: none — deferring' : (dd.inverse ? `Inverse forecast only (window ${dd.inv.roiPct >= 0 ? '+' : ''}${dd.inv.roiPct.toFixed(1)}% ROI per trade)` + (al == null ? '' : ' · ') : '') + (al == null ? '' : 'Time allowed: ' + dur(al));
           return {
             time,
             left:  [row('SL', sl, slOk, false, 'Entry stop-loss, ROI %. Red when under the Min Entry TP floor.'), row('SACRIFICE', sac, sacOk, !sacOn, 'Collective bail-out on loss. Fires at the floor at minimum; red when the resolved value is under it.', null, true)],
@@ -1103,20 +1112,47 @@
           };
         },
 
-        // Deferment: while the headline's favorable share is under 50%, no new entries and everything held is closed (see _micEnforceTiming).
+        // Deferment: while the headline's favorable share is under 50%, or the Forecast Grader's window net profit is negative, no new entries and everything held is closed
+        // (see _micEnforceTiming). Never while the inverse forecast is in use (_micInverseOn): then deferring is false and inverse is true.
         _micDefermentState() {
-          const off = { deferring: false };
+          const off = { deferring: false, inverse: false };
+          const inv = this._micInverseOn();
+          if (inv) return { deferring: false, inverse: true, inv };
           if (!this.cfg.micDefermentEnabled) return off;
-          const h = this._micHeadline();
-          return (h && h.s < 0) ? { deferring: true, share: h.share } : off;
+          const h = this._micHeadline(), f = this._micFcWin(), why = [];
+          if (h && h.s < 0) why.push(`headline ${(h.share * 100).toFixed(1)}% under 50%`);
+          if (f && f.reg && f.reg.nb >= INV_MIN_BATCHES && f.reg.usd < 0) why.push(`window net profit ${f.reg.usd < 0 ? '-' : '+'}$${Math.abs(f.reg.usd).toFixed(2)}`);
+          return why.length ? { deferring: true, inverse: false, share: h ? h.share : null, why } : off;
+        },
+        // Still-Water's Forecast Grader window run through the trade simulation twice: in forecast order (reg) and in reverse order (inv). Memoised on the graded
+        // history and the settings the simulation reads. Null when Still-Water is not loaded.
+        _micFcWin() {
+          if (typeof this._swFcWindowNet !== 'function' || !this._micSwLoaded()) return null;
+          const c = this.cfg, done = this._swFcStore?.()?.done || [], last = done.length ? done[done.length - 1] : null;
+          const key = [done.length, last ? last.u : 0, c.binaryModeEnabled, c.binaryTpPct, c.binarySlPct, c.entryTpRoi, c.dcaSlPct, c.leverage, c.minNotional, c.maxPos].join('|');
+          if (this._micFcWinMemo && this._micFcWinMemo.key === key) return this._micFcWinMemo.v;
+          const v = { reg: this._swFcWindowNet(false), inv: this._swFcWindowNet(true) };
+          this._micFcWinMemo = { key, v };
+          return v;
+        },
+        // The inverse forecast rule (general, not tied to Deferment): the window net profit is negative while the window inverse net profit is positive and its
+        // average ROI % per simulated trade (the unit the Min Entry TP is in) is over the Min Entry TP, over at least INV_MIN_BATCHES graded batches each.
+        // Returns the numbers, null when the rule is not in force.
+        _micInverseOn() {
+          const f = this._micFcWin();
+          if (!f) return null;
+          const r = f.reg, i = f.inv, minTp = Math.max(0, Number(this.cfg.micMinEntryTp) || 0);
+          return (r && r.nb >= INV_MIN_BATCHES && r.usd < 0 && i && i.nb >= INV_MIN_BATCHES && i.usd > 0 && i.roiPct != null && i.roiPct > minTp)
+            ? { usd: i.usd, roiPct: i.roiPct, nb: i.nb, minTp, regUsd: r.usd } : null;
         },
         // How long a position or cond. order may live right now: the host's Force Close Runtime x the headline factor, never under
         // Min Time (nor over the runtime). Null = no cap (Deferment off, or no headline).
         _micAllowedMs() {
           if (!this.cfg.micDefermentEnabled) return null;
+          const base = (Number(this.cfg.runtimeHours) || 12) * 3600000;
+          if (this._micInverseOn()) return base; // inverse forecast in use: no deferment, the host's full Force Close Runtime
           const h = this._micHeadline();
           if (!h) return null;
-          const base = (Number(this.cfg.runtimeHours) || 12) * 3600000;
           const min  = Math.max(1, Number(this.cfg.micDeferMinMins) || 10) * 60000;
           return Math.min(base, Math.max(min, base * h.f));
         },
@@ -1129,22 +1165,23 @@
           const pos  = (this.positions  || []).filter(p => !p.isPending && (def.deferring || now - (p.openedAt  || 0) >= allowed));
           const cond = (this.condOrders || []).filter(o =>                  (def.deferring || now - (o.createdAt || 0) >= allowed));
           if (!pos.length && !cond.length) return;
-          this.log(`[MI] ${def.deferring ? '⏏️ Deferment' : '⏱️ Timing'} — closing ${pos.length} position${pos.length === 1 ? '' : 's'}${cond.length ? ` and cancelling ${cond.length} cond. order${cond.length === 1 ? '' : 's'}` : ''} (${def.deferring ? `headline ${(def.share * 100).toFixed(1)}% under 50%` : `over the ${Math.round(allowed / 60000)}m allowed`})`, 'warn');
+          this.log(`[MI] ${def.deferring ? '⏏️ Deferment' : '⏱️ Timing'} — closing ${pos.length} position${pos.length === 1 ? '' : 's'}${cond.length ? ` and cancelling ${cond.length} cond. order${cond.length === 1 ? '' : 's'}` : ''} (${def.deferring ? def.why.join(' + ') : `over the ${Math.round(allowed / 60000)}m allowed`})`, 'warn');
           await Promise.all([
             ...pos.map(async p => { try { await this.pseudoClosePosition(p, reason); } catch (e) { this.log(`[MI] ${reason} close error (${p.symbol}): ${e.message}`, 'warn'); } }),
             ...cond.map(async o => { try { await this.cancelCondOrder(o.id, reason); } catch (e) { this.log(`[MI] ${reason} cond. cancel error (${o.symbol}): ${e.message}`, 'warn'); } }),
           ]);
         },
 
-        _micFadeOn()   { return !!(this.cfg.micFadeEnabled && this._micSwLoaded() && typeof this.placeCondEntry === 'function'); },
+        _micUsd(v) { return (v < 0 ? '-' : '+') + '$' + Math.abs(v).toFixed(2); },
+        _micFadeOn()   { return !!(this.cfg.micFadeEnabled && this._micSwLoaded() && typeof this.placeCondEntry === 'function' && !this._micDefermentState().inverse); }, // off while the Deferment exemption enters on the inverse forecast only
         _micFadeOnly() { return this._micFadeOn() && !!this.cfg.micFadeOnly; },
         // Regime fade: true while the headline is under 50% and Regime fade is on. Fade then follows the forecast (score above 0) instead of fading it.
         _micRegimeOn() { const h = (this.cfg.micRegimeFadeEnabled && this._micFadeOn()) ? this._micHeadline() : null; return !!(h && h.s < 0); },
         // Cancels Fade orders placed under the other regime, since the reason they were placed no longer holds.
         async _micFadeRegimeSync() {
-          const rg = this._micRegimeOn(), old = (this.condOrders || []).filter(o => o.tag === 'fade' && !!o.candidate?._micRegime !== rg);
+          const rg = this._micRegimeOn(), inv = !!this._micDefermentState().inverse, old = (this.condOrders || []).filter(o => o.tag === 'fade' && (inv || !!o.candidate?._micRegime !== rg));
           if (!old.length) return;
-          this.log(`[MI] 🎯 Fade — ${rg ? 'headline under 50%' : 'regime over'}: cancelling ${old.length} cond. order${old.length === 1 ? '' : 's'} placed for the other regime`, 'info');
+          this.log(`[MI] 🎯 Fade — ${inv ? 'inverse forecast in use' : rg ? 'headline under 50%' : 'regime over'}: cancelling ${old.length} cond. order${old.length === 1 ? '' : 's'} placed for the other regime`, 'info');
           for (const o of old) { try { await this.cancelCondOrder(o.id, 'fade regime changed'); } catch (e) { this.log(`[MI] fade regime error (${o.symbol}): ${e.message}`, 'warn'); } }
         },
         // Fade orders live FADE_LIFE_MS, the horizon of the forecast they follow.
@@ -1161,7 +1198,7 @@
           const free = Math.max(0, (this.cfg.maxPos || 0) - (this.positions?.length ?? 0) - (this._micPending || 0) - (this.condOrders || []).filter(o => this._micFadeSub(o)).length);
           return Math.min(Math.max(0, Math.round(Number(this.cfg.micFadeSlots) || 0)), free);
         },
-        // A pending Fade order's forecast score now (pp in this bot's favor, the newest forecast on its ticker), else the score it was placed on.
+        // A pending Fade order's score now (pp in this bot's favor, the newest sample score / forecast on its ticker), else the score it was placed on.
         _micFadeNow(o) {
           const s = this._swFcScoreOf?.(o.symbol);
           return (s != null && isFinite(s)) ? s : (o.candidate?._micCompositeScore ?? 0);
@@ -1201,18 +1238,18 @@
           if (o) this.log(`[MI] 🎯 ${rg ? 'Regime fade' : 'Fade'} ${sym}: forecast ${v.compositeScore.toFixed(2)}pp ${rg ? 'in favor of' : 'against'} this side — cond. ${dist.toFixed(2)}% away (${sc.k.toFixed(3)}% per pp, ${sc.n} graded)${replaced ? ` — replaced ${replaced}` : ''}`, 'info');
           return o;
         },
-        // Price move per pp of score, read from the last completed forecast batch (older ones only when it has under FADE_MIN_ROWS forecasts):
+        // Price move per pp of score, read from the Forecast Grader's last completed forecast batch (older ones only when it has under FADE_MIN_ROWS forecasts):
         // each forecast's move to the highest / lowest point it touched in the direction of its score (% of price), divided by its score size.
         // k is the ratio that micFadeReachPct of the batch's score weight reached or passed. Null when there is too little graded history.
         _micFadeScale() {
           const fc = this._swFcStore?.(), done = fc?.done;
           if (!done?.length) return null;
-          const reach = Math.min(90, Math.max(10, Number(this.cfg.micFadeReachPct) || 50)), rg = !!this._swRgOn?.();
-          const key = done.length + ':' + done[done.length - 1].u + ':' + reach + ':' + (rg ? 1 : 0);
+          const reach = Math.min(90, Math.max(10, Number(this.cfg.micFadeReachPct) || 50));
+          const key = done.length + ':' + done[done.length - 1].u + ':' + reach;
           if (this._micFadeSc && this._micFadeSc.key === key) return this._micFadeSc.v;
           const by = new Map();
           for (let i = done.length - 1; i >= 0 && i >= done.length - 600; i--) {
-            const r = done[i], pe = (rg && typeof r.er === 'number') ? r.er : r.e, x = pe > 0 ? r.mu : (r.md == null ? null : -r.md);
+            const r = done[i], pe = r.e, x = pe > 0 ? r.mu : (r.md == null ? null : -r.md);
             if (typeof pe !== 'number' || !isFinite(pe) || pe === 0 || typeof x !== 'number' || !isFinite(x)) continue;
             if (!by.has(r.a)) { if (by.size >= FADE_MAX_BATCHES) break; by.set(r.a, []); }
             by.get(r.a).push({ w: Math.abs(pe), q: Math.max(0, x) / Math.abs(pe) });
@@ -1295,6 +1332,9 @@
           // Deferment/timing — every cycle, ahead of any slot logic so it still runs with no active entry slots.
           const _micDef = this._micDefermentState();
           if (!_micDef.deferring) this._micDeferLogged = false;
+          if (_micDef.inverse) {
+            if (!this._micInvLogged) { this.log(`[MI] 🔁 Inverse forecast — window net profit is ${this._micUsd(_micDef.inv.regUsd)} while the window inverse net profit (${_micDef.inv.nb} batches) is ${this._micUsd(_micDef.inv.usd)}, averaging ${_micDef.inv.roiPct.toFixed(1)}% ROI per trade, over the ${_micDef.inv.minTp.toFixed(1)}% Min Entry TP: entering on the inverse forecast only, no deferment, Relative Target stands down`, 'info'); this._micInvLogged = true; }
+          } else this._micInvLogged = false;
           await this._micEnforceTiming(_micDef);
           await this._micFadeExpire();
           await this._micFadeRegimeSync();
@@ -1350,27 +1390,15 @@
             const j = Math.floor(Math.random() * (i + 1));
             [fillSyms[i], fillSyms[j]] = [fillSyms[j], fillSyms[i]];
           }
-          // Liquidation Surveillance: tickers that had liquidations in the watch just ended stay for continued sampling, quiet ones are
-          // graylisted and replaced, and the batch is always filled to the cap (_swLiqPick). null = off / following: the random batch stands.
           // Forecast Grader (SW): the revisits whose turn it is take their share of the slots first, planned before Liquidation Surveillance
-          // fills the rest, and are taken out of the pool so the liquidation watch never sees them. null = off / following.
+          // fills the rest, and are taken out of the pool so the liquidation watch never sees them. null = following.
           const fcPlan = this._swFcPlan?.(fillSyms, cap0);
-          let cap = cap0, batch;
-          if (fcPlan && fcPlan.batch && fcPlan.batch.length) {
-            // Forecast Focus: the grader's batch REPLACES the host's own draw, so every sampler (hour candles, liquidation watch, readings) uses exactly its tickers.
-            // The liquidation watch is opened on that same list (pool = cap = the list, so it neither adds nor drops anything).
-            const liqSet = this._swLiqPick?.(fcPlan.batch, fcPlan.batch.length);
-            batch = (liqSet && liqSet.length) ? liqSet : fcPlan.batch;
-            cap = batch.length;
-          } else {
-            // Forecast Grader (non-Focus): the revisits whose turn it is take their share of the slots, the host fills the rest.
-            cap = (fcPlan && fcPlan.cap > 0) ? fcPlan.cap : cap0;
-            const fcRev = (fcPlan && fcPlan.revisit) || [];
-            if (fcRev.length) { const fcSet = new Set(fcRev); fillSyms = fillSyms.filter(s => !fcSet.has(s)); }
-            const liqBatch = this._swLiqPick?.(fillSyms, cap - fcRev.length);
-            if (liqBatch && liqBatch.length) fillSyms = liqBatch;
-            batch = [...new Set([...fcRev, ...fillSyms])].slice(0, cap);
-          }
+          const cap = (fcPlan && fcPlan.cap > 0) ? fcPlan.cap : cap0;
+          const fcRev = (fcPlan && fcPlan.revisit) || [];
+          if (fcRev.length) { const fcSet = new Set(fcRev); fillSyms = fillSyms.filter(s => !fcSet.has(s)); }
+          const liqBatch = this._swLiqPick?.(fillSyms, cap - fcRev.length);
+          if (liqBatch && liqBatch.length) fillSyms = liqBatch;
+          const batch = [...new Set([...fcRev, ...fillSyms])].slice(0, cap);
           await this._ocFetchBatch(batch, null, false, needsHr);
           const ocResults = this.swOcResults || {};
           const freshAt = this._swOcResultsAt || 0;
@@ -1397,14 +1425,16 @@
           const _swOcResults = ctx.mic.ocResults;
 
           const checkCrit = (c, fr, t) => this._micCheckCrit(c, fr, t, _swOcResults);
+          const invMode = !!ctx.mic.def?.inverse;
 
-          // Entry ranking: Still-Water's Indicator forecast ranks this batch's tickers (er when Regime caution is active, else e), as pp in this
-          // bot's favor (a follower reads the leader's shared forecasts). A ticker the batch has no forecast for is ranked by the
-          // scorecard projection instead, after the forecast-ranked ones. No score at all = unranked: it sorts last and is never vetoed on score.
-          // SW present: only the tickers its batch forecast covers are candidates. SW absent: MI's criteria alone, unranked.
+          // Entry ranking: Still-Water's sample score ranks this batch's tickers, as pp in this bot's favor (a follower reads the leader's
+          // shared scores); the Forecast Grader's forecasts are made from the same score. No score at all = unranked: it sorts last and is never vetoed on score.
+          // SW present: only the tickers its batch score covers are candidates. SW absent: MI's criteria alone, unranked.
+          // Inverse forecast rule (_micDef.inverse): the inverse forecast only, i.e. the scores flip sign and only against-side tickers stay,
+          // so the most against-side one ranks first and everything downstream (substitution margin, the pool order) reads the flipped score.
           const swOn   = typeof this._swFcRankMap === 'function';
           const fcRank = (await this._swFcRankMap?.()) || new Map();
-          if (swOn) { const n0 = basePool.length; basePool = basePool.filter(t => fcRank.has(t.symbol)); scanSkip.excluded.noForecast = n0 - basePool.length; }
+          if (swOn) { const n0 = basePool.length; basePool = basePool.filter(t => fcRank.has(t.symbol)); scanSkip.excluded.noScore = n0 - basePool.length; }
           // Only lta/lpa can come back null (no 1hr candle yet) — by the time a criterion reaches here checkCrit already passed, so fall back to a neutral tier.
           const _micAnnotateCrit = (c, t) => this._micAnnotateCritRaw(c, t) ?? (c + '+0');
           const _poolOne = (t, ocMap = _swOcResults) => {
@@ -1433,7 +1463,8 @@
               }
 
               const _annotCrits = matched.annotCrits;
-              const rs = this._micRankScore(t, fcRank);
+              const rs = this._micRankScore(t, fcRank, invMode);
+              if (invMode && !(rs && rs.v > 0)) { scanSkip.excluded.notAgainst = (scanSkip.excluded.notAgainst || 0) + 1; return null; } // inverse forecast only: a ticker not forecast against this side is no candidate
               return { t, criteria: matched.criteria, slotIdx: matched.slotIdx, annotKey: [..._annotCrits].sort().join(','), annotCrits: _annotCrits, compositeScore: rs ? rs.v : 0, ranked: !!rs, fcRanked: !!(rs && rs.fc) };
             };
           const _pooled = [];
@@ -1457,7 +1488,7 @@
           if (_micHalted) return;
 
           if (_micDef.deferring) {
-            if (!this._micDeferLogged) { this.log(`[MI] ⛔ Deferment — headline ${(_micDef.share * 100).toFixed(1)}% is under 50%; no new entries until it recovers`, 'info'); this._micDeferLogged = true; }
+            if (!this._micDeferLogged) { this.log(`[MI] ⛔ Deferment — ${_micDef.why.join(' + ')}; no new entries until it recovers`, 'info'); this._micDeferLogged = true; }
             return;
           }
 
@@ -1724,10 +1755,11 @@
           return false;
         },
 
-        // A held position's score now: the newest Still-Water forecast on its ticker, else the score frozen at open.
+        // A held position's score now: the newest Still-Water score / forecast on its ticker, else the score frozen at open. While the Deferment
+        // exemption ranks on the inverse forecast the sign is flipped, so it sits on the same scale as the candidates it is compared with.
         _micLiveCompositeScore(pos) {
           const s = this._swFcScoreOf?.(pos.symbol);
-          return s != null ? s : (pos._micCompositeScore ?? 0);
+          return s != null ? (this._micDefermentState().inverse ? -s : s) : (pos._micCompositeScore ?? 0);
         },
 
         // Shared collapsed-rank lookup (own + partner + historical PnL, see micCollapsedSlotRanks)
