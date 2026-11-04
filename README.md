@@ -369,7 +369,7 @@ The dropped keys cover both the bot and any installed plugin, and the cleanup al
 
 #### Trade cards
 
-**BAIL** closes every open position immediately; **Sub**, **Defer**, **Time** and **Eject** mark a Substitution close, a Deferment close-all, a position that outlived Deferment's time allowance and the retired Ejection (a reason with no registered label shows its raw name). Fees are 0.02% maker on entry and DCA fills and 0.055% taker on the close (`FEE_MAKER_PCT`, `FEE_TAKER_PCT`), with live positions skipped. One close in three is then multiplied by a random 2–10×, skewed higher as the session win rate rises (about 4× on average at 0%, 8× at 100%), and the other two pay the flat fee.
+**BAIL** closes every open position immediately; **Sub**, **Defer**, **Time** and **Eject** mark a Substitution close, a Deferment close-all, a position that outlived Deferment's time allowance and the retired Ejection (a reason with no registered label shows its raw name). Fees are 0.02% maker on entry and DCA fills and 0.055% taker on the close (`FEE_MAKER_PCT`, `FEE_TAKER_PCT`), with live positions skipped. One close in three is then multiplied by a random 2–3×, skewed higher as the session win rate rises (about 2.25× on average at 0%, 2.75× at 100%), and the other two pay the flat fee.
 
 #### Conditional orders
 
@@ -509,7 +509,7 @@ Bars are sorted best first on a 0–100 axis (up at or above the 70% line, down 
 
 #### Swing view
 
-Points sit at the market's swing length in hours on a signed axis sized to 1.3x the 95th percentile of the length (never under 2h), above the midline for upslope and peak and below it for downslope and bottom. Batches with no market reading leave a gap the line skips over. Each column is stamped with its sample time, and the latest is selected by default.
+Points sit at the market's swing length in hours on a signed axis sized to 1.3x the 95th percentile of the length (never under 2h), above the midline for upslope and peak and below it for downslope and bottom. Batches with no market reading leave a gap the line skips over. Rows are matched to batches by sample time or published time, so a follower plots the leader's rows too. Each column is stamped with its sample time, and the latest is selected by default.
 
 #### Liq view
 
@@ -558,7 +558,7 @@ Still-Water keys carry the side in their name (`<side>` = `chaser` on PseudoChas
 | `__ew_sw_<side>_ilq_v1` | This side's Illiquidity Filter readings: symbol → `{t, g}` (time measured, average gap in ms between its last 3 trades), live for **Measure again after** days and dropped when unseen for 3× that. Kept apart from the sample store so clearing samples doesn't discard a week of fetches. The leader hands it over as `ilq` and a follower merges it in |
 | `__ew_sw_<side>_stb_v1` | This side's Stablecoin Filter verdicts: symbol → time judged, live for **Graylist for (hours)** and dropped when expired. The leader hands it over as `stb` and a follower merges it in. Loaded on first use |
 | `__ew_sw_<side>_fc_v2` | This side's Forecast Grader store (version 2): `seq`, `ts`, `pend` (`{s, a: start batch, d: due batch, t, p: frozen price, p0, e: sample score, c: tags}`), `done` (`{s, a, d, t, u: time graded, e, y: actual less batch mean, m: raw move %, k: batch mean %, mu / md: highest / lowest point, c}`, kept to Graded forecasts kept), `rk` (`{a, m: {symbol: sample score}}`, the scores that rank MI's entries), `voids` and `nof`. `e`, `y` and `rk` are in price direction. A follower adopts the leader's copy as `fcGrade` (newest 200 graded plus `rk`) |
-| `__ew_sw_<side>_swing_v1` | This side's Swing Phase readings: `{v: 1, rows: [{u, m, t}]}`, one row per sample batch, newest 400 kept. A follower files the leader's published rows here. |
+| `__ew_sw_<side>_swing_v1` | This side's Swing Phase readings: `{v: 1, rows: [{u, p, m, t}]}`, one row per sample batch (`p` is the ts the leader published the batch under, which a follower files it by), newest 400 kept. A follower files the leader's published rows here. |
 | `__ew_sw_<side>_fc_v1`, `…_bg1h_v1`, `…_pm_v1`, `…_div_v1`, `…_crab_v1`, `…_seq_v1`, `…_mkt_v1`, `…_period_v1`, `…_period_pat_v1`, IndexedDB `…_fcdb_v1` | The retired Forecast Grader layers' stores. Deleted on load; no longer read or written |
 | `__sw_<side>_liq_pending` | This side's liquidation watch in progress: watched tickers, running turnover tally, blind time and any closed watch not yet scored. Saved as events arrive (4 s throttle), on each pick and ingest and on page hide, restored by the first scan after a reload, and cleared when Liquidation Surveillance is turned off. Dropped if older than 12 h |
 | `__ew_creds` | EverWinter live plugin API credentials |
