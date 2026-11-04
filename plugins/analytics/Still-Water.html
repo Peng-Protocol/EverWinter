@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '4.0.0'; // Change: Forecast Grader cut back to the sample scorer: tickers are ranked by their sample score again; the Indicator forecast and everything that fed it (Forecast Focus, Weight Profiles, Range Fit, candle divination, Crab layer, Sequence map, Regime caution, retry pool, liquidation reservation, background readings) is removed; the forecast chart stays as the place forecasts made from the sample score are graded, and gains Batch and Window inverse net profit readouts (the same simulation with the forecasts arranged in reverse order). | previous: Change: Sequence map: tickers whose hourly move (against the market) or volume jumps together are flagged, up to 10 of the strongest per scan get 5-minute candles to confirm and order their onsets, and the confirmed order files leader to follower edges (strength rises with every sighting, falls with every miss, an edge is dropped after repeated misses); a follower of a ticker that just shifted leans the same way as a forecast layer with its own tested weight, and the average time a ticker stays in a mode and a follower takes to respond are recorded.
+  const VERSION = '4.3.0'; // Change: Swing Phase is a per-batch line chart (height = swing length in hours, above the midline rising / peak, below falling / bottom, color = phase; click a batch for its tickers), one reading per batch is stored and shared leader -> follower, no extra kline fetches (candles cached from the batch fetch); the defer rules moved to MIC/MIW. | previous: Change: Swing Phase: a Swing view (idealized oscillation at the measured average swing, newest sample lit), a phase dot on every ticker pill, and a hard-stop gate for MIC/MIW (market phase, ticker phase, swings under the minimum); 5m fetch widened to 72 candles. | previous: Change: Forecast Grader readouts cut to two lines under the grayed header (Window / Batch: accuracy, net, inverse, in profit, inverse in profit) and the chart marks where a new day starts. | previous: Change: Forecast Grader cut back to the sample scorer: tickers are ranked by their sample score again; the Indicator forecast and everything that fed it (Forecast Focus, Weight Profiles, Range Fit, candle divination, Crab layer, Sequence map, Regime caution, retry pool, liquidation reservation, background readings) is removed; the forecast chart stays as the place forecasts made from the sample score are graded, and gains Batch and Window inverse net profit readouts (the same simulation with the forecasts arranged in reverse order). | previous: Change: Sequence map: tickers whose hourly move (against the market) or volume jumps together are flagged, up to 10 of the strongest per scan get 5-minute candles to confirm and order their onsets, and the confirmed order files leader to follower edges (strength rises with every sighting, falls with every miss, an edge is dropped after repeated misses); a follower of a ticker that just shifted leans the same way as a forecast layer with its own tested weight, and the average time a ticker stays in a mode and a follower takes to respond are recorded.
 
 
 
@@ -62,6 +62,9 @@
     swStbMinPct: 0.01,             // Stablecoin Filter: absolute range (% of the open) below which a ticker counts as a stablecoin
     swStbHours: 12,                // Stablecoin Filter: hours a stablecoin verdict keeps the ticker out before it is re-evaluated
     swMixedPct: 30,                // pill presentation: a watch is 'mixed' when the minority side holds more than this % of its liquidated turnover
+    swSwingEnabled: true,         // Swing Phase: hard stop for MIC/MIW entries by the market's and each ticker's position in its 5m swing
+    swSwingHours: 100,            // Swing Phase: hours of 5m candles kept per ticker (6-100); coarser timescales are aggregated from them
+    swSwingK: 3,                  // Swing Phase: a reversal counts after price retraces this many mean 5m steps (adaptive per ticker)
     swFcShare: 50,                // Forecast Grader: share (%) of each sample batch's slots taken by revisits (planned before Liquidation Surveillance fills the rest)
     swFcLead: 6,                  // Forecast Grader: batches between a forecast and its grading
     swFcKeep: 3000,               // Forecast Grader: graded forecasts kept (IndexedDB holds them; up to 6000)
@@ -105,6 +108,8 @@
   const SAMPLE_OBS_KEY = '__ew_sw_' + SIDE + '_sampleobs_v1'; // Sample Scoring: { obs:[] }
   // Non-reactive on purpose: both are read from inside x-text/x-html renders, and writing
   // reactive state from a render effect would re-trigger that same effect.
+  const SWS_KEY = '__ew_sw_' + SIDE + '_swing_v1'; // Swing Phase samples: { v: 1, rows: [{ u, m, t }] }, one row per sample batch
+  const SWS_KEEP = 400;
   const FC_KEY = '__ew_sw_' + SIDE + '_fc_v2'; // Forecast Grader: { v: 2, seq, ts, pend:[{s,a,d,t,p,e,c}], done:[{s,a,d,t,u,e,y,m,k,mu,md,c}], rk:{a,m:{sym:score}}, voids, nof }
   const FC_RETIRED = ['period_v1', 'period_pat_v1', 'fc_v1', 'pm_v1', 'div_v1', 'bg1h_v1', 'crab_v1', 'seq_v1', 'mkt_v1'].map(n => '__ew_sw_' + SIDE + '_' + n)
     .concat(['fc_v1', 'pm_v1', 'div_v1', 'bg1h_v1', 'crab_v1'].map(n => '__ew_' + (SIDE === 'chaser' ? 'af' : 'pf') + '_' + n)); // the Period Scorer's and the old indicator forecast's stores (graded history, past moves, shape / crab libraries, candle state, sequence map, market line), removed on load
@@ -149,6 +154,8 @@
     }
     for (const k of ['period_v1', 'period_pat_v1', 'rs_v1']) { try { (window.__ewData || localStorage).removeItem(L.p + k); } catch (_) {} } // retired stores
   };
+  const SW_SCALES = [5, 10, 15, 30, 60, 120, 240, 360]; // Swing Phase timescales (minutes): the 5m candles are merged into each and swings are read at every one
+  const SWC = {}; // sym -> { at, c: 5m candles } kept across batches for the swing phase (CAND5 is wiped each batch)
   const CAND5 = {}; // sym -> { at, c: [5-minute candles, ascending] } from this batch's fetch; memory only, read by the grader right after the batch
   const swCritEmoji = c => {
     if (/^fund/.test(c)) { const s = c.slice(4); const isNeg = s[0] === '-' || s === '<'; return (isNeg ? '🤑' : '💸') + s; }
@@ -362,6 +369,19 @@
                   <input type="number" min="2" max="24" step="1" x-model.number="cfg.swFcLead" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                   <div class="lbl" style="margin-top:6px">Graded forecasts kept</div>
                   <input type="number" min="60" max="6000" step="60" x-model.number="cfg.swFcKeep" :disabled="cfgLocked" @change="_swFcCfgChanged()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                </div>
+                <label class="tog" style="margin-top:8px">
+                  <div class="tog-t" :class="cfg.swSwingEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.swSwingEnabled=!cfg.swSwingEnabled;persist?.()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Swing Phase</div>
+                    <div class="ash-hint">Reads where the market and each ticker sit in their swing (bottom / upslope / peak / downslope) from the 5m candles the batches already fetch, merged into 10m through 6h with the best-fit scale chosen per series. One reading per batch is kept, shared with a following bot. MIC/MIW decide what to defer from it. Dot on each ticker pill: red bottom, pink downslope, deep green peak, pale green upslope.</div>
+                  </div>
+                </label>
+                <div x-show="cfg.swSwingEnabled" style="margin-top:6px">
+                  <div class="lbl" style="margin-top:6px">Candle history kept (hours, max 100; built from the batches' own fetches)</div>
+                  <input type="number" min="6" max="100" step="2" x-model.number="cfg.swSwingHours" :disabled="cfgLocked" @change="persist?.()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
+                  <div class="lbl" style="margin-top:6px">Reversal threshold (x mean 5m step)</div>
+                  <input type="number" min="1" max="20" step="0.5" x-model.number="cfg.swSwingK" :disabled="cfgLocked" @change="persist?.()" style="width:70px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 6px">
                 </div>
               </div>
 
@@ -614,6 +634,7 @@
           this._swStbLoad();
           try { DS.removeItem('__ew_sw_' + SIDE + '_rs_v1'); } catch (_) {} // retired Silence Amplifier re-sample counters
           this._swFcLoad();
+          this._swSwLoad();
           this._swExtremityBuild();
           this.log(`[ASH] ${NAME} (${SIDE === 'chaser' ? 'Chaser' : 'Winter'}) v${VERSION} loaded — ${this.cfg.ashfallEnabled ? 'enabled' : 'disabled'}`, 'info');
           setInterval(() => { if (this.cfg.ashfallCrossEnabled) this._swCheckCross().catch(() => {}); }, 15000);
@@ -656,7 +677,7 @@
           const alive = !!this._lfPartnerAlive?.();
           const role = this.cfg.lfFollowPartner ? (alive ? 'following ' + who(PARTNER) : 'follow on, ' + who(PARTNER) + ' silent: scanning own') : 'leading';
           let h = `<div style="${mono};${lo};padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">Role: <b style="color:var(--text-hi)">${role}</b> · ${who(PARTNER)} heartbeat ${hb && hb.ts ? ago(hb.ts) + ' ago' : 'none'}</div>`;
-          const T = [['bulkTickers', 'Bulk tickers'], ['ocResults', 'OC batch'], ['sampleScore', 'Sample scoring'], ['liqLean', 'Liq lean'], ['ilq', 'Illiquidity'], ['stb', 'Stablecoin'], ['fcGrade', 'Forecast grading'], ['klines_1h', 'Klines 1h'], ['watchTickers', 'Watch tickers']];
+          const T = [['bulkTickers', 'Bulk tickers'], ['ocResults', 'OC batch'], ['sampleScore', 'Sample scoring'], ['liqLean', 'Liq lean'], ['ilq', 'Illiquidity'], ['stb', 'Stablecoin'], ['fcGrade', 'Forecast grading'], ['swSwing', 'Swing readings'], ['klines_1h', 'Klines 1h'], ['watchTickers', 'Watch tickers']];
           for (const [k, label] of T) {
             const e = meta[k] || {};
             const tx = e.tx, rx = Object.entries(e.rx || {}).sort((x, y) => y[1].at - x[1].at)[0];
@@ -1894,6 +1915,7 @@
           await this._scanCp?.();
           this._swSampleIngest?.(entry);
           this._swFcIngest?.(entry);
+          this._swSwIngest?.(entry);
           const withInterval = Object.values(results).filter(r => r.avgMs != null);
           const withVolIo = Object.values(results).filter(r => r.vol != null || r.oi != null);
           const parts = [`${Object.keys(results).length}t`];
@@ -1978,6 +2000,7 @@
             this._swOcCycleHistory.push(histEntry);
             this._swSampleIngest?.(histEntry);
             this._swFcIngest?.(histEntry);
+            this._swSwIngest?.(histEntry);
             if (this._swOcCycleHistory.length > 25) this._swOcCycleHistory = this._swOcCycleHistory.slice(-25);
             this._ocPersistHistory();
           }
@@ -2020,10 +2043,10 @@
         // already the population-relative criteria, not a per-ticker ratio).
         // Chart views rotate in this order; the two header buttons are labelled with the
         // previous/next view's name and wrap around at either end.
-        _swOcViewModes() { const m = this.cfg.swLiqEnabled ? ['vol', 'io', 'ls', 'fund', 'lta', 'lpa', 'liq'] : ['vol', 'io', 'ls', 'fund', 'lta', 'lpa']; if (this._swFcOn()) m.push('fc'); return m; },
+        _swOcViewModes() { const m = this.cfg.swLiqEnabled ? ['vol', 'io', 'ls', 'fund', 'lta', 'lpa', 'liq'] : ['vol', 'io', 'ls', 'fund', 'lta', 'lpa']; if (this._swFcOn()) m.push('fc'); if (this.cfg.swSwingEnabled) m.push('swg'); return m; },
         _swOcViewName(step) {
           const M = this._swOcViewModes();
-          const N = { vol: 'Vol', io: 'IO', ls: 'L/S', fund: 'Fund', lta: 'LTA', lpa: 'LPA', liq: 'Liq', fc: 'Fcst' };
+          const N = { vol: 'Vol', io: 'IO', ls: 'L/S', fund: 'Fund', lta: 'LTA', lpa: 'LPA', liq: 'Liq', fc: 'Fcst', swg: 'Swing' };
           const i = Math.max(0, M.indexOf(this._swOcViewMode || 'vol'));
           return N[M[(i + step + M.length) % M.length]];
         },
@@ -2035,6 +2058,7 @@
         _swOcModeCfg() {
           const mode = this._swOcViewMode || 'vol';
           const fmtCompact = v => { if (v==null) return 'n/a'; const a=Math.abs(v); if (a>=1e9) return '$'+(v/1e9).toFixed(2)+'B'; if (a>=1e6) return '$'+(v/1e6).toFixed(2)+'M'; if (a>=1e3) return '$'+(v/1e3).toFixed(1)+'K'; return '$'+v.toFixed(0); };
+          if (mode === 'swg') return { label: 'SWING PHASE', color: '255,140,190', cap: null, getVal: () => null, fmt: () => '', higherIsBusier: true, avgLabel: 'Swing' };
           if (mode === 'fc') return { label: 'FORECAST GRADER', color: '120,200,255', cap: null, signed: true, getVal: () => null, fmt: v => (v >= 0 ? '+' : '') + v.toFixed(2) + 'pp', higherIsBusier: true, avgLabel: 'Forecast' };
           if (mode === 'vol') return { label: 'VOLUME SAMPLE', color: '96,210,255', cap: null, getVal: r => r.vol, fmt: fmtCompact, higherIsBusier: true, avgLabel: 'Avg volume' };
           if (mode === 'io')  return { label: 'OPEN INTEREST SAMPLE', color: '190,130,230', cap: null, getVal: r => r.oi, fmt: fmtCompact, higherIsBusier: true, avgLabel: 'Avg open interest' };
@@ -2051,6 +2075,7 @@
         _swOcChartSvg(shown) {
           if (!shown) return '';
           if (this._swOcViewMode === 'fc') return this._swFcChartSvg();
+          if (this._swOcViewMode === 'swg') return this._swSwChartSvg();
           const mc = this._swOcModeCfg();
           // Defensive: a stale/partial write (e.g. a crash mid-save) or leftover pre-redesign
           // entries in storage can leave a history array with malformed shapes. Filter to
@@ -2408,8 +2433,16 @@
           const cw = 28, H = 92, padT = 6, padB = 16, padL = 30, padR = 6, plotH = H - padT - padB, y = v => padT + plotH * (1 - v / 100), zy = y(this._swFcPass());
           const hhmm = ts => { const d = new Date(ts); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); };
           const cur = (sel && done.find(g => 'd' + g.a === sel)) || done[done.length - 1];
-          let x = padL, out = '';
+          const dayGapW = 38, MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+          const lday = ts => { const d = new Date(ts); return isNaN(d.getTime()) ? 0 : d.getFullYear() * 1000 + d.getMonth() * 32 + d.getDate(); };
+          let x = padL, out = '', prev = null;
           for (const g of done) {
+            if (prev && lday(g.u) !== lday(prev.u)) {
+              const gx = x + dayGapW / 2, d = new Date(g.u);
+              out += `<line x1="${gx.toFixed(1)}" y1="${padT}" x2="${gx.toFixed(1)}" y2="${padT + plotH}" stroke="rgba(120,200,255,.4)" stroke-dasharray="2 2" pointer-events="none"/><text x="${gx.toFixed(1)}" y="${H - 3}" fill="rgba(120,200,255,.65)" font-size="7" font-family="monospace" text-anchor="middle">${MON[d.getMonth()]} ${d.getDate()}</text>`;
+              x += dayGapW;
+            }
+            prev = g;
             const key = 'd' + g.a, isSel = cur && cur.a === g.a;
             let el = isSel ? `<rect x="${x}" y="${padT}" width="${cw}" height="${plotH}" fill="rgba(255,255,255,.07)"/>` : '';
             const accs = g.recs.map(r => ({ s: r.s, a: this._swFcAcc(r.e, r.y) })).sort((p, q) => q.a - p.a), n = accs.length, bw = Math.max(1, Math.min(4, cw * 0.9 / Math.max(1, n)));
@@ -2476,11 +2509,11 @@
             return { e: d * r.e, m, fav: Math.max(m, path ? (d > 0 ? r.mu : -r.md) : m), adv: Math.max(-m, path ? (d > 0 ? -r.md : r.mu) : -m) };
           }).filter(r => inv ? r.e < 0 : r.e > 0).sort((a, b) => inv ? a.e - b.e : b.e - a.e).slice(0, Math.max(1, Math.round(Number(this.cfg.maxPos)) || 3));
           if (!R.length) return null;
-          const o = { n: R.length, usd: 0, tp: 0, sl: 0, liq: 0, held: 0, lev, tpRoi, slRoi, margin };
+          const o = { n: R.length, usd: 0, tp: 0, sl: 0, liq: 0, held: 0, win: 0, lev, tpRoi, slRoi, margin };
           for (const r of R) {
             if (r.adv >= stop) { if (sl <= liq) { o.sl++; o.usd -= notional * sl / 100; } else { o.liq++; o.usd -= margin; } }
-            else if (r.fav >= tp) { o.tp++; o.usd += notional * tp / 100; }
-            else { o.held++; o.usd += notional * r.m / 100; }
+            else if (r.fav >= tp) { o.tp++; o.win++; o.usd += notional * tp / 100; }
+            else { o.held++; if (r.m > 0) o.win++; o.usd += notional * r.m / 100; }
           }
           return o;
         },
@@ -2494,30 +2527,24 @@
           for (const recs of by.values()) { const nt = this._swFcNet(recs, inv); if (nt) { usd += nt.usd; nb++; n += nt.n; margin = nt.margin; if (nt.usd > 0) nw++; } }
           return nb ? { usd, nb, nw, n, roiPct: (n > 0 && margin > 0) ? usd / (n * margin) * 100 : null } : null;
         },
+        // The two condensed readouts under the grayed header: accuracy, net, inverse net, and how many of each were in profit (the window counts batches, a batch counts positions).
+        _swFcNetWindowText() {
+          if ((this._swOcViewMode || 'vol') !== 'fc') return null;
+          const st = this._swFcStats(this._swFcStore().done), w = this._swFcWindowNet(false), v = this._swFcWindowNet(true);
+          const acc = st.n >= 5 && st.acc != null ? Math.round(st.acc) + '%' : 'n/a';
+          return `Window: ${acc} accurate · ${w ? this._swFcUsd(w.usd) : 'n/a'} net · ${v ? this._swFcUsd(v.usd) : 'n/a'} inverse · ${w ? w.nw + '/' + w.nb : '0/0'} in profit · ${v ? v.nw + '/' + v.nb : '0/0'} inverse`;
+        },
         _swFcNetBatchText() {
           if ((this._swOcViewMode || 'vol') !== 'fc') return null;
           const g = this._swFcSelBatch();
           if (!g) return null;
-          const nt = this._swFcNet(g.recs, false);
-          return nt ? `Batch net profit: ${this._swFcUsd(nt.usd)}` : 'Batch net profit: no forecast projected in the bot\'s favor';
+          const t = new Date(g.u), hm = String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0');
+          const a = this._swFcNet(g.recs, false), b = this._swFcNet(g.recs, true);
+          const acc = g.st && g.st.n >= 5 && g.st.acc != null ? Math.round(g.st.acc) + '%' : 'n/a';
+          return `Batch ${hm}: ${acc} accurate · ${a ? this._swFcUsd(a.usd) : 'n/a'} net · ${b ? this._swFcUsd(b.usd) : 'n/a'} inverse · ${a ? a.win + '/' + a.n : '0/0'} in profit · ${b ? b.win + '/' + b.n : '0/0'} inverse`;
         },
-        _swFcNetWindowText() {
-          if ((this._swOcViewMode || 'vol') !== 'fc') return null;
-          const w = this._swFcWindowNet(false);
-          return w ? `Window net profit (${w.nb} batch${w.nb === 1 ? '' : 'es'}): ${this._swFcUsd(w.usd)} · ${w.nw}/${w.nb} batches in profit` : 'Window net profit: nothing to estimate yet';
-        },
-        _swFcInvBatchText() {
-          if ((this._swOcViewMode || 'vol') !== 'fc') return null;
-          const g = this._swFcSelBatch();
-          if (!g) return null;
-          const nt = this._swFcNet(g.recs, true);
-          return nt ? `Batch inverse net profit: ${this._swFcUsd(nt.usd)}` : 'Batch inverse net profit: no forecast projected against the bot';
-        },
-        _swFcInvWindowText() {
-          if ((this._swOcViewMode || 'vol') !== 'fc') return null;
-          const w = this._swFcWindowNet(true);
-          return w ? `Window inverse net profit (${w.nb} batch${w.nb === 1 ? '' : 'es'}): ${this._swFcUsd(w.usd)} · ${w.nw}/${w.nb} batches in profit` + (w.roiPct == null ? '' : ` · avg ${(w.roiPct >= 0 ? '+' : '') + w.roiPct.toFixed(1)}% ROI per trade`) : 'Window inverse net profit: nothing to estimate yet';
-        },
+        _swFcInvBatchText() { return null; },
+        _swFcInvWindowText() { return null; },
         // Everything behind the grade, in plain field names, plus the compact store the Import restores.
         _swFcExport(part) {
           const fc = this._swFcStore(), d = this._swSampleDir(), r2 = v => (v == null ? null : +Number(v).toFixed(4));
@@ -2577,6 +2604,7 @@
           if (!shown) return '';
           const mode = this._swOcViewMode || 'vol';
           if (mode === 'fc') return this._swFcSummaryText();
+          if (mode === 'swg') return this._swSwSummaryText();
           const last = this._swOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
@@ -2661,10 +2689,11 @@
           const hit = HOUR_CACHE[sym];
           if (!fresh && hit && hit.start === start) return hit;
           try {
-            const res = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=5&limit=26`);
+            const res = await this._qFetch(`${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=5&limit=72`);
             const js  = await res.json();
             // Bybit list rows: [start, open, high, low, close, volume, turnover], newest first.
             const cs = this._swC5Parse(js?.result?.list);
+            if (cs.length && this.cfg.swSwingEnabled) this._swSwMerge(sym, cs, true); // cached from the batch's own fetch (6h of 5m candles each)
             const inH = cs.filter(x => x.s >= start && x.s < start + 3600000);
             if (!inH.length) return null;
             const o = inH[0].o, c = inH[inH.length - 1].c, hi = Math.max(...inH.map(x => x.h)), lo = Math.min(...inH.map(x => x.l)), ht = inH.reduce((s, x) => s + x.v, 0);
@@ -2686,6 +2715,230 @@
             if (s > 0 && o > 0 && h > 0 && l > 0 && c > 0) out.push({ s, o, h, l, c, v: isFinite(v) ? v : 0 });
           }
           return out.sort((a, b) => a.s - b.s);
+        },
+        // ── Swing phase (view 'swg'): where the market and each ticker sit in their 5m swing. A hard stop for MIC/MIW, not an indicator. ──
+        // Zigzag on closes at every timescale (the 5m candles merged into 10m / 15m / 30m / 1h / 2h / 4h / 6h; up to 100h of 5m candles kept); a reversal counts once price retraces swSwingK x the series' own mean 5m step (adaptive, so every ticker and the market line get a threshold that fits them).
+        // Needs 3 confirmed pivots (2 legs); fewer = unknown, and unknown never blocks.
+        _swSwAnalyze(pts, k) {
+          if (!pts || pts.length < 8) return null;
+          let sum = 0;
+          for (let i = 1; i < pts.length; i++) sum += Math.abs(pts[i].p / pts[i - 1].p - 1) * 100;
+          const thr = Math.max(0.5, Number(k) || 5) * sum / (pts.length - 1);
+          if (!(thr > 0)) return null;
+          const piv = []; let dir = 0, hi = pts[0], lo = pts[0];
+          for (const x of pts) {
+            if (dir === 0) {
+              if (x.p > hi.p) hi = x; if (x.p < lo.p) lo = x;
+              if ((hi.p / lo.p - 1) * 100 >= thr) { if (hi.s > lo.s) { piv.push({ ...lo, t: 'L' }); dir = 1; } else { piv.push({ ...hi, t: 'H' }); dir = -1; } if (dir === 1) hi = x; else lo = x; }
+            } else if (dir === 1) {
+              if (x.p > hi.p) hi = x; else if ((hi.p - x.p) / hi.p * 100 >= thr) { piv.push({ ...hi, t: 'H' }); dir = -1; lo = x; }
+            } else {
+              if (x.p < lo.p) lo = x; else if ((x.p - lo.p) / lo.p * 100 >= thr) { piv.push({ ...lo, t: 'L' }); dir = 1; hi = x; }
+            }
+          }
+          if (piv.length < 2) return null; // 2 pivots = one confirmed leg: a rough reading, which the host's average smooths once more batches arrive
+          const legs = piv.slice(-9).map((v, i, a) => i ? { ms: v.s - a[i - 1].s, amp: Math.abs(v.p / a[i - 1].p - 1) * 100 } : null).filter(Boolean);
+          const legMs = legs.reduce((s, l) => s + l.ms, 0) / legs.length, amp = legs.reduce((s, l) => s + l.amp, 0) / legs.length;
+          const lp = piv[piv.length - 1], p = pts[pts.length - 1].p;
+          const f = Math.max(0, Math.min(1, (lp.t === 'L' ? (p / lp.p - 1) : (1 - p / lp.p)) * 100 / amp));
+          let phase = lp.t === 'L' ? (f < 0.2 ? 'bottom' : f < 0.8 ? 'up' : 'peak') : (f < 0.2 ? 'peak' : f < 0.8 ? 'down' : 'bottom');
+          // Confirmation lags: a leg that ran most of an average swing and has turned back a little off its running extreme already reads as bottom / peak.
+          if (lp.t === 'H' && f >= 0.6 && (p / lo.p - 1) * 100 >= 0.4 * thr) phase = 'bottom';
+          if (lp.t === 'L' && f >= 0.6 && (hi.p / p - 1) * 100 >= 0.4 * thr) phase = 'peak';
+          return { thr, phase, frac: f, theta: lp.t === 'L' ? f * 0.5 : 0.5 + f * 0.5, legMs, cycleMs: 2 * legMs, amp, n: piv.length };
+        },
+        _swSwHrs() { return Math.max(6, Math.min(100, Number(this.cfg.swSwingHours) || 100)); },
+        // Keep up to swSwingHours of 5m candles per ticker, built up from the batches' own fetches (nothing extra is requested; memory only, so a reload starts over): new candles merge into what is held (newer rows win), the oldest fall off. fresh = this came from the live batch fetch.
+        _swSwMerge(sym, cs, fresh) {
+          const keep = Math.ceil(this._swSwHrs() * 12), e = SWC[sym] || (SWC[sym] = { at: 0, c: [] });
+          const m = new Map(e.c.map(x => [x.s, x]));
+          for (const x of cs) m.set(x.s, x);
+          e.c = [...m.values()].sort((a, b) => a.s - b.s).slice(-keep);
+          if (fresh) e.at = Date.now();
+          const ks = Object.keys(SWC);
+          if (ks.length > 400) for (const k of ks) if (Date.now() - SWC[k].at > 43200000) delete SWC[k];
+          return e;
+        },
+        // Merge a 5m series [{s,p}] into coarser candles (close of each bucket); the forming bucket keeps its latest close so the newest price always counts.
+        _swSwAgg(pts, mins) {
+          const ms = mins * 60000, out = [];
+          for (const x of pts) { const b = Math.floor(x.s / ms) * ms, l = out[out.length - 1]; if (l && l.s === b) l.p = x.p; else out.push({ s: b, p: x.p }); }
+          return out;
+        },
+        // Swings at every timescale. The market's (or ticker's) own timeframe is the scale whose swings stand furthest above a random walk: mean leg size over what
+        // the 5m step volatility alone would move in a leg of that length (about 1 for pure noise, well above it for a real swing). Scales within 10% of the best
+        // are reading the same swing, so the coarsest of them wins. Needs 5 pivots; with none that qualifies, the scale with the most pivots stands in.
+        _swSwBest(pts, k) {
+          if (!pts || pts.length < 8) return null;
+          let ss = 0; for (let i = 1; i < pts.length; i++) ss += Math.pow((pts[i].p / pts[i - 1].p - 1) * 100, 2);
+          const sig = Math.sqrt(ss / (pts.length - 1));
+          if (!(sig > 0)) return null;
+          // With little history the set threshold can leave no confirmed swing at all; relax it in steps rather than report nothing.
+          for (const kk of [k, k * 0.6, k * 0.35]) {
+            const all = {}; let best = null;
+            for (const m of SW_SCALES) {
+              const a = this._swSwAnalyze(m === 5 ? pts : this._swSwAgg(pts, m), kk);
+              if (!a) continue;
+              a.scale = m; a.fit = a.amp / (sig * Math.sqrt(a.legMs / 300000)); all[m] = a;
+              if (a.n >= 5 && (!best || a.fit > best.fit)) best = a;
+            }
+            if (best) for (const a of Object.values(all)) if (a.n >= 5 && a.fit >= 0.9 * best.fit && a.scale > best.scale) best = a;
+            if (!best) for (const a of Object.values(all)) if (!best || a.n > best.n || (a.n === best.n && a.scale < best.scale)) best = a;
+            if (best) return { ...best, all };
+          }
+          return null;
+        },
+        _swSwScl(m) { return m >= 60 ? (m / 60) + 'h' : m + 'm'; },
+        // Market line = mean normalized 5m close of every ticker with fresh candles; swings are read off it exactly like a ticker's.
+        _swSwState() {
+          const now = Date.now(), k = this.cfg.swSwingK, syms = Object.keys(SWC).filter(s => SWC[s].c.length >= 8 && now - SWC[s].at < 1800000);
+          const key = syms.length + '|' + syms.reduce((m, s) => Math.max(m, SWC[s].at) + SWC[s].c.length, 0) + '|' + k + '|' + this._swSwHrs();
+          if (this._swSwMemo && this._swSwMemo.key === key) return this._swSwMemo.v;
+          const tk = {}; let mkt = null;
+          if (syms.length) {
+            for (const s of syms) {
+              const c = SWC[s].c; let a = c.length - 1;
+              while (a > 0 && c[a].s - c[a - 1].s <= 1200000) a--; // newest unbroken run only: a gap between two fetches is not a price move
+              tk[s] = this._swSwBest(c.slice(a).map(x => ({ s: x.s, p: x.c })), k);
+            }
+            // Market line: the mean 5m return of every ticker that traded both candles, chained into an index (tickers with different history lengths all contribute where they have data).
+            const acc = new Map();
+            for (const s of syms) { const c = SWC[s].c; for (let i = 1; i < c.length; i++) if (c[i].s - c[i - 1].s === 300000) { const a = acc.get(c[i].s) || { n: 0, v: 0 }; a.n++; a.v += c[i].c / c[i - 1].c - 1; acc.set(c[i].s, a); } }
+            let p = 100; const pts = [];
+            for (const [s, a] of [...acc.entries()].sort((x, y) => x[0] - y[0])) if (a.n >= Math.min(syms.length, Math.max(2, Math.ceil(0.3 * syms.length)))) { p *= 1 + a.v / a.n; pts.push({ s, p }); }
+            mkt = this._swSwBest(pts, k);
+          }
+          const v = { mkt, tk, n: syms.length };
+          this._swSwMemo = { key, v };
+          return v;
+        },
+        _swSwBad(ph) { return this._swSampleDir() > 0 ? (ph === 'down' || ph === 'peak') : (ph === 'up' || ph === 'bottom'); },
+        _swSwLbl(ph) { return { bottom: 'bottom', down: 'downslope', peak: 'peak', up: 'upslope' }[ph] || 'unknown'; },
+        _swSwRgb(ph) { return { bottom: '235,75,75', down: '255,140,190', peak: '25,150,75', up: '160,228,170' }[ph] || '120,120,120'; },
+        // ---- Swing samples: one row per sample batch, built by the leader from candles it already fetched (no extra requests) and shared with a follower.
+        // row = { u: batch time, m: [phase letter, swing minutes, scale minutes] | null (the market), t: { SYMBOL: [phase letter, swing minutes, scale minutes] } }.
+        // This side only records and shows them; MIC/MIW decide what to defer from the window readouts below.
+        _swSwStore() { return (this._swSw ||= { v: 1, rows: [] }); },
+        _swSwLoad() {
+          try {
+            const d = JSON.parse(DS.getItem(SWS_KEY) || 'null');
+            if (d && d.v === 1 && Array.isArray(d.rows)) this._swSw = { v: 1, rows: d.rows.filter(r => r && typeof r.u === 'number' && r.t && typeof r.t === 'object').slice(-SWS_KEEP) };
+          } catch (_) {}
+        },
+        _swSwSave() {
+          const st = this._swSwStore();
+          st.rows = st.rows.slice(-SWS_KEEP);
+          try { DS.setItem(SWS_KEY, JSON.stringify(st)); } catch (_) { try { DS.setItem(SWS_KEY, JSON.stringify({ v: 1, rows: st.rows.slice(-120) })); } catch (_2) {} }
+          if (!this._swFollowing()) this._sharedWrite?.('swSwing', { v: 1, rows: st.rows.slice(-60) }); // a following partner adopts it
+        },
+        // A follower runs no candles of its own: it files the leader's published rows (new batch times only) into its own store.
+        _swSwAdopt() {
+          if (!this._swFollowing()) return;
+          const sh = this._sharedRead?.('swSwing');
+          if (!sh?.data || !Array.isArray(sh.data.rows)) return;
+          if (sh.ts && sh.ts === this._swSwLastShared) return;
+          this._swSwLastShared = sh.ts;
+          const st = this._swSwStore(), have = new Set(st.rows.map(r => r.u));
+          const add = sh.data.rows.filter(r => r && typeof r.u === 'number' && r.t && typeof r.t === 'object' && !have.has(r.u));
+          if (!add.length) return;
+          st.rows = st.rows.concat(add).sort((a, b) => a.u - b.u).slice(-SWS_KEEP);
+          this._swSwSave();
+        },
+        // Called with every new sample batch (leader only). The batch's tickers were just fetched, so their candles are current.
+        _swSwIngest(entry) {
+          if (!this.cfg.swSwingEnabled || this._swFollowing() || !entry || !Array.isArray(entry.results) || typeof entry.ts !== 'number') return;
+          const st = this._swSwStore(), last = st.rows[st.rows.length - 1];
+          if (last && entry.ts <= last.u) return;
+          const live = this._swSwState();
+          if (!live.mkt && !Object.values(live.tk).some(Boolean)) return;
+          const enc = a => [a.phase[0], Math.round(a.cycleMs / 60000), a.scale], t = {};
+          for (const r of entry.results) { const a = r && live.tk[r.sym]; if (a) t[r.sym] = enc(a); }
+          st.rows.push({ u: entry.ts, m: live.mkt ? enc(live.mkt) : null, t });
+          this._swSwSave();
+        },
+        _swSwDec(v) { return Array.isArray(v) ? { phase: { b: 'bottom', d: 'down', p: 'peak', u: 'up' }[v[0]], cyc: v[1], scale: v[2] } : null; },
+        _swSwRowAt(ts) {
+          this._swSwAdopt();
+          const rows = this._swSwStore().rows;
+          return rows.find(r => r.u === ts) || rows.find(r => Math.abs(r.u - ts) <= 90000) || null;
+        },
+        _swSwLast() { this._swSwAdopt(); const rows = this._swSwStore().rows, r = rows[rows.length - 1]; return r && Date.now() - r.u < 5400000 ? r : null; }, // older than 90 min = no reading
+        // For MIC/MIW. The ticker's phase in the newest batch, when that phase is unfavourable for this bot's side (else null; unknown never blocks).
+        _swSwTickerBad(sym) { const r = this._swSwLast(), d = r && this._swSwDec(r.t[sym]); return d && this._swSwBad(d.phase) ? d.phase : null; },
+        // For MIC/MIW. Window readouts over the last `mins` of batches: the market's newest phase, the average swing (minutes), and the share of
+        // ticker readings in unfavourable swing points. Null when no batch falls in the window.
+        _swSwWin(mins) {
+          this._swSwAdopt();
+          const from = Date.now() - Math.max(1, mins) * 60000, w = this._swSwStore().rows.filter(r => r.u >= from);
+          if (!w.length) return null;
+          let cs = 0, cn = 0, bad = 0, tot = 0;
+          for (const r of w) {
+            const m = this._swSwDec(r.m); if (m) { cs += m.cyc; cn++; }
+            for (const v of Object.values(r.t)) { const d = this._swSwDec(v); if (!d) continue; tot++; if (this._swSwBad(d.phase)) bad++; }
+          }
+          const last = w[w.length - 1];
+          return { n: w.length, cyc: cn ? Math.round(cs / cn) : null, badPct: tot ? Math.round(100 * bad / tot) : null, mkt: this._swSwDec(last.m), u: last.u };
+        },
+        _swSwDotHtml(phase, title) { return `<span title="${title || this._swSwLbl(phase)}" style="display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:3px;vertical-align:middle;background:rgb(${this._swSwRgb(phase)})"></span>`; },
+        _swSwDot(sym) {
+          if (!this.cfg.swSwingEnabled) return '';
+          const r = this._swSwLast(), d = r && this._swSwDec(r.t[sym]);
+          return d ? this._swSwDotHtml(d.phase) : '';
+        },
+        _swSwSummaryText() {
+          const cyc = this._swOcDisplayedCycle(), row = cyc && this._swSwRowAt(cyc.ts);
+          if (!row) { const ks = Object.keys(SWC), mx = ks.reduce((m, x) => Math.max(m, SWC[x].c.length), 0); return `Swing: no reading for this batch · ${ks.length} tickers cached, longest ${mx} candles${this._swFollowing() ? ' · following: waiting on the leader\'s readings' : ' · a reading needs 8+ unbroken 5m candles and a confirmed swing'}`; }
+          const m = this._swSwDec(row.m), c = {}, t = new Date(row.u);
+          for (const v of Object.values(row.t)) { const d = this._swSwDec(v); if (d) c[d.phase] = (c[d.phase] || 0) + 1; }
+          return `Batch ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}: market ${m ? this._swSwLbl(m.phase) + ' · swing ' + m.cyc + 'm on the ' + this._swSwScl(m.scale) + ' scale' : 'unknown'} · tickers ${c.bottom || 0} bottom / ${c.up || 0} up / ${c.peak || 0} peak / ${c.down || 0} down`;
+        },
+        _swSwWindowText() {
+          const mins = Math.max(5, Number(this.cfg.micSwWinMins) || 60), w = this._swSwWin(mins);
+          if (!w) return `Window ${mins}m: no swing readings yet`;
+          return `Window ${mins}m: ${w.n} batch${w.n === 1 ? '' : 'es'} · avg swing ${w.cyc != null ? w.cyc + 'm' : 'n/a'} · ${w.badPct != null ? w.badPct + '%' : 'n/a'} of tickers in unfavourable swing points`;
+        },
+        // One point per batch on the same grid as the other views. Height = the swing's length in hours (the spacing between swings at the scale that fits best), above the
+        // midline while rising / at a peak, below it while falling / at a bottom; color alone tells rising from peak and falling from bottom.
+        _swSwChartSvg() {
+          const history = this._swOcHist().filter(c => c && typeof c.ts === 'number' && !isNaN(c.ts)).sort((a, b) => a.ts - b.ts);
+          if (!history.length) return '';
+          this._swSwAdopt();
+          const cycleW = 28, dayGapW = 38, H = 80, padL = 28, padB = 16, padT = 6, padR = 4, plotH = H - padT - padB;
+          const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+          const localDay = ts => { const d = new Date(ts); return isNaN(d.getTime()) ? 0 : d.getFullYear() * 1000 + d.getMonth() * 32 + d.getDate(); };
+          const xPos = []; let xCur = padL;
+          for (let ci = 0; ci < history.length; ci++) { if (ci > 0 && localDay(history[ci].ts) !== localDay(history[ci - 1].ts)) xCur += dayGapW; xPos.push(xCur); xCur += cycleW; }
+          const W = xCur + padR, byU = new Map(this._swSwStore().rows.map(r => [r.u, r]));
+          const pts = history.map(c => { const r = byU.get(c.ts), m = r && this._swSwDec(r.m); return m ? { m, h: (m.phase === 'up' || m.phase === 'peak' ? 1 : -1) * m.cyc / 60 } : null; });
+          const abs = pts.filter(Boolean).map(p => Math.abs(p.h)).sort((a, b) => a - b);
+          const maxH = Math.max(2, (abs.length ? abs[Math.floor(0.95 * (abs.length - 1))] : 0) * 1.3);
+          const yV = v => padT + plotH - ((Math.max(-maxH, Math.min(maxH, v)) + maxH) / (2 * maxH)) * plotH;
+          const _ow = padL + 6, _ax = padL + 6, fmtH = v => (Math.abs(v) < 10 ? v.toFixed(1) : Math.round(v)) + 'h';
+          let ya = `<svg width="${_ow}" height="${H + 8}" style="display:block"><line x1="${_ax}" y1="${4 + padT}" x2="${_ax}" y2="${4 + padT + plotH}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>`;
+          for (const f of [0, 0.25, 0.5, 0.75, 1]) { const v = -maxH + 2 * maxH * f; ya += `<text x="${_ax - 3}" y="${(4 + yV(v) + 3).toFixed(1)}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="end">${fmtH(v)}</text>`; }
+          this._swOcYAxisHtml = ya + '</svg>'; this._swOcAvgYPx = null;
+          const minH = Math.max(1, Number(this.cfg.micSwMinMins) || 60) / 60, displayedTs = this._swOcHighlightedCycleTs ?? history[history.length - 1].ts;
+          let hits = '', marks = '', line = '', prev = null;
+          history.forEach((cycle, ci) => {
+            const cx = xPos[ci], mid = cx + cycleW / 2;
+            hits += `<rect class="swoc-cycle-hit" data-oc-cycle-ts="${cycle.ts}" x="${cx.toFixed(1)}" y="${padT}" width="${cycleW}" height="${plotH}" fill="${cycle.ts === displayedTs ? 'rgba(255,140,190,.10)' : 'transparent'}" pointer-events="all" style="cursor:pointer"/>`;
+            if (ci > 0 && localDay(cycle.ts) !== localDay(history[ci - 1].ts)) {
+              const gx = cx - dayGapW / 2, d = new Date(cycle.ts);
+              marks += `<line x1="${gx.toFixed(1)}" y1="${padT}" x2="${gx.toFixed(1)}" y2="${padT + plotH}" stroke="rgba(255,140,190,.4)" stroke-dasharray="2 2"/><text x="${gx.toFixed(1)}" y="${H - 2}" fill="rgba(255,140,190,.65)" font-size="7" font-family="monospace" text-anchor="middle">${MONTHS[d.getMonth()]} ${d.getDate()}</text>`;
+            } else if (ci > 0) marks += `<line x1="${cx.toFixed(1)}" y1="${padT}" x2="${cx.toFixed(1)}" y2="${padT + plotH}" stroke="rgba(255,255,255,.08)" stroke-width="0.5"/>`;
+            const d = new Date(cycle.ts);
+            marks += `<text x="${mid.toFixed(1)}" y="${H - 2}" fill="rgba(255,255,255,.3)" font-size="7" font-family="monospace" text-anchor="middle">${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}</text>`;
+            const p = pts[ci];
+            if (!p) return;
+            const y = yV(p.h);
+            if (prev) line += `<line x1="${prev[0].toFixed(1)}" y1="${prev[1].toFixed(1)}" x2="${mid.toFixed(1)}" y2="${y.toFixed(1)}" stroke="rgba(255,255,255,.35)" stroke-width="1"/>`;
+            prev = [mid, y];
+            const on = cycle.ts === displayedTs;
+            marks += `<circle cx="${mid.toFixed(1)}" cy="${y.toFixed(1)}" r="${on ? 4.5 : 3}" fill="rgb(${this._swSwRgb(p.m.phase)})"${on ? ' stroke="#fff" stroke-width="1"' : ''} pointer-events="none"/>`;
+          });
+          const grids = [0, 0.25, 0.5, 0.75, 1].map(f => { const y = yV(-maxH + 2 * maxH * f).toFixed(1); return `<line x1="${padL}" y1="${y}" x2="${(W - padR).toFixed(1)}" y2="${y}" stroke="rgba(255,255,255,.05)" stroke-width="0.5"/>`; }).join('');
+          const band = `<rect x="${padL}" y="${yV(minH).toFixed(1)}" width="${(W - padL - padR).toFixed(1)}" height="${Math.max(1, yV(-minH) - yV(minH)).toFixed(1)}" fill="rgba(235,75,75,.07)"/>`;
+          return `<svg width="${W}" height="${H}" style="display:block">${hits}${band}<line x1="${padL}" y1="${yV(0).toFixed(1)}" x2="${W - padR}" y2="${yV(0).toFixed(1)}" stroke="rgba(255,255,255,.12)" stroke-width="0.5"/>${grids}${line}${marks}</svg>`;
         },
         // Typical price of the last ~10 minutes: the two newest candles started within 15 minutes of now (the forming one included),
         // (highest high + lowest low + last close) / 3. 0 when the ticker traded nothing that recently.
@@ -2726,7 +2979,8 @@
         _swOcAvgValueText(shown) {
           if (!shown) return null;
           const mode = this._swOcViewMode || 'vol';
-          if (mode === 'fc') return this._swFcBatchText();
+          if (mode === 'fc') return null;
+          if (mode === 'swg') return this._swSwWindowText();
           const mc = this._swOcModeCfg();
           const last = this._swOcDisplayedCycle();
           const withField = (last?.results || []).filter(r => r && mc.getVal(r) != null && (mode !== 'liq' || this._swLiqHas(r)));
@@ -2740,7 +2994,7 @@
         _swOcTotalAvgText(shown) {
           if (!shown) return null;
           const mode = this._swOcViewMode || 'vol';
-          if (mode === 'fc') return this._swFcWindowText();
+          if (mode === 'fc' || mode === 'swg') return null;
           const mc = this._swOcModeCfg();
           const st = this._swWindowStats(mode === 'io' ? 'oi' : mode === 'fund' ? 'fr' : mode);
           if (mode === 'liq') return st.n ? `Window avg liquidation lean: ${mc.fmt(st.sum / st.n)} · ${st.n} ticker${st.n === 1 ? '' : 's'} with liquidations (window)` : 'Window avg liquidation lean: no liquidation events in the window';
@@ -2754,6 +3008,12 @@
           const last = this._swOcDisplayedCycle();
           const results = (last?.results || []).filter(r => r && typeof r.sym === 'string');
           if (!results.length) return '';
+          if (mode === 'swg') {
+            const row = last && this._swSwRowAt(last.ts), ord = { bottom: 0, down: 1, up: 2, peak: 3 };
+            const items = row ? Object.entries(row.t).map(([sym, v]) => ({ sym, d: this._swSwDec(v) })).filter(x => x.d) : [];
+            items.sort((a, b) => (ord[a.d.phase] - ord[b.d.phase]) || a.sym.localeCompare(b.sym));
+            return items.map(({ sym, d }) => `<span title="${sym}: ${this._swSwLbl(d.phase)} · swing ${d.cyc}m on the ${this._swSwScl(d.scale)} scale" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid rgba(255,255,255,.12);color:${this._swSwBad(d.phase) ? 'var(--text-lo)' : 'var(--text-hi)'};white-space:nowrap">${this._swSwDotHtml(d.phase)}${sym.replace('USDT', '')} <span style="opacity:.65">${d.cyc}m</span></span>`).join('');
+          }
           {
             const mc = this._swOcModeCfg();
             const withField = results.filter(r => mc.getVal(r) != null);
@@ -2773,7 +3033,7 @@
                 const iv = unstable && unstable.inst[r.sym], bad = unstable && unstable.gray.has(r.sym);
                 const mix = k.u == null || k.cls === 'quiet' ? '' : ` · S${Math.round(k.u * 100)}/L${Math.round(k.d * 100)}`;
                 const ins = iv != null ? ` · inst ${Math.round(iv * 100)}%${bad ? ' · skipped' : ''}` : '';
-                return `<span title="${r.sym}: ${mc.fmt(v)} · ${LBL[k.cls]}${mix}${ins}" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:${bdr};background:${fill};color:${clr};white-space:nowrap">${r.sym.replace('USDT','')} <span style="opacity:.65">${mc.fmt(v)}</span>${bad ? '<sup style="opacity:.8">!</sup>' : ''}</span>`;
+                return `<span title="${r.sym}: ${mc.fmt(v)} · ${LBL[k.cls]}${mix}${ins}" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:${bdr};background:${fill};color:${clr};white-space:nowrap">${this._swSwDot(r.sym)}${r.sym.replace('USDT','')} <span style="opacity:.65">${mc.fmt(v)}</span>${bad ? '<sup style="opacity:.8">!</sup>' : ''}</span>`;
               }).join('');
             }
             // LPA / LTA: coloured = favorable, gray = unfavorable, judged by the ticker's own 1hr move against this bot's side (the same
@@ -2788,7 +3048,7 @@
               const clr=lsC?`rgba(${lsC},.9)`:aboveAvg?`rgba(${mc.color},.9)`:'var(--text-lo)';
               const bdr=lsC?`rgba(${lsC},.4)`:aboveAvg?`rgba(${mc.color},.4)`:'rgba(255,255,255,.1)';
               const bg=lsC?`rgba(${lsC},.06)`:aboveAvg?`rgba(${mc.color},.06)`:'transparent';
-              return `<span title="${tip}" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${r.sym.replace('USDT','')} <span style="opacity:.65">${mc.fmt(v)}</span></span>`;
+              return `<span title="${tip}" style="font-family:var(--mono);font-size:8px;padding:1px 5px;border-radius:2px;border:1px solid ${bdr};background:${bg};color:${clr};white-space:nowrap">${this._swSwDot(r.sym)}${r.sym.replace('USDT','')} <span style="opacity:.65">${mc.fmt(v)}</span></span>`;
             }).join('');
           }
         },
