@@ -8,19 +8,15 @@
 2. [Techniques](#techniques)
    - [Proactive Techniques](#proactive-techniques)
    - [Reactive Techniques](#reactive-techniques)
-3. [Market Intelligence](#market-intelligence)
-   - [Reactive Scoring](#reactive-scoring)
-   - [Proactive Scoring](#proactive-scoring)
-   - [Reading the Scorecard](#reading-the-scorecard)
-4. [Psycho Mode](#psycho-mode)
-5. [Sizing](#sizing)
-6. [Conclusion](#conclusion)
+3. [Psycho Mode](#psycho-mode)
+4. [Sizing](#sizing)
+5. [Conclusion](#conclusion)
 
 ---
 
 ## Philosophy Overview
 
-A seasoned trader has no directional bias. On one side they open shorts; the other they open longs. thereby covering both sides of the market from the same analytical framework.
+A seasoned trader has no directional bias. On one side they open shorts; the other they open longs, thereby covering both sides of the market from the same analytical framework.
 
 The core insight is about **meta-structure**, not individual tickers. On any given day the market moves with a character — broadly bullish, broadly bearish, or choppy. Trying to predict what any single ticker will do inside that character is hard. Reading the character itself and trading alongside it is easier, and more consistent.
 
@@ -30,15 +26,13 @@ On a **bearish day**: gainers that ran up are likely to retrace, and losers are 
 
 On a **volatile day**: neither side dominates. Coins pump and dump freely in both directions — overbought tickers snap back, oversold tickers bounce hard. Both the short side and the long side can be profitable simultaneously because the market is producing clear extremes on both ends.
 
-The best proxy for regime is a pooled sample of price-change over a period of time for every ticker on the market, this tells you want the market has done within that timeframe, but do no presume it will tell you what the market *will* do in the immediate future, meta-structure is necessary without being sufficient. Trading with the structure still produces losses when the specific signals driving entries are not genuinely aligned with it. Knowing which indicators are actually bullish or bearish in the current environment — not just nominally available — determines whether entries within a favorable structure produce profit or drag. This is directly addressed by scoring every entry signal and asking not just whether it wins or loses, but *where* it's actually paying — whether that is read from the trades already closed or from how the sampled market is moving, a signal is to be trusted at whichever pole of its own readings have genuinely been paying, these are extreme or lukewarm ends. It would be unwise to assume that the sharp edge is always the honest read or that the middle is always noise, and vice versa. A candidate leaning too heavily on a losing pole should be passed over entirely, even if every individual tag on it is technically favorable. This same perspective benefits the counter-structure side: rather than absorbing consistent losses, a trader identifies pockets where the counter-trend case is supported — and in some sessions, the scorecard data is enough to put the counter-structure in profit despite the broader directional headwind; more often, the aligned side wins decently.
+Meta-structure is necessary without being sufficient: it says what the market has done, not what it will do in the next hour. Trading with the structure still loses when the entry itself is careless, so the entry is where the proactive approach spends its effort, and the exit is where the reactive approach does.
 
 **Two approaches coexist within this system:**
 
-**Proactive**: Design budget spent at the entry gate — this asks what tickers are best to enter based on behavior or traits the ticker may be exhibiting.
+**Proactive**: Design budget spent at the entry — this asks where a ticker should be entered, and how far it is allowed to travel before the trade is judged, based on how that ticker actually behaves.
 
 **Reactive**: Design budget spent in the exit system — this asks what techniques are best to use to exit a ticker that is not cooperating.
-
-The split reaches into how the trader is expected to learn: scoring can draw on what has already happened or on what is happening now (see Market Intelligence).
 
 Neither is strictly better. Proactive suits tighter risk tolerance and cleaner books. Reactive suits traders comfortable with simultaneous multi-stage drawdown and wider capital headroom in exchange for higher throughput.
 
@@ -70,64 +64,49 @@ Binary Mode suits the meta-structure approach: when the read is correct, positio
 
 A session that consistently loses is either a choppy, undirected market or a wrong read on the day's character. In either case, opening more positions compounds the damage. To mitigate this, drawdown throttling works in tandem with a structural and psychological "gains locking" quota system.
 
-When drawdown reaches the configured threshold, or conversely, once a specific profit quota is achieved, new position entries are to be suspended for a designated period of time. For drawdown; this serves to prevent exposure to continuation of adverse conditions, stay down and wait out the storm. For gains locking; it serves to protect the trader against sudden, violent regime changes, while giving psychological and operational space to prepare for subsequent legs of operation. Crucially, data collection, market scanning, and scorecard tracking should continue uninterrupted even while the trader is sitting out on a drawdown throttle or a gains lock. The throttle can be lifted after a fixed interval. 
+When drawdown reaches the configured threshold, or conversely, once a specific profit quota is achieved, new position entries are to be suspended for a designated period of time. For drawdown; this serves to prevent exposure to continuation of adverse conditions, stay down and wait out the storm. For gains locking; it serves to protect the trader against sudden, violent regime changes, while giving psychological and operational space to prepare for subsequent legs of operation. Crucially, market scanning should continue uninterrupted even while the trader is sitting out on a drawdown throttle or a gains lock. The throttle can be lifted after a fixed interval. 
 
 If running both longs and shorts, you may lift the throttle on your short-side operation if the long-side suffers a drawdown halt, and vice versa, an adversarial market for one end of the operation is favourable for the other. 
 **Gains Continuation** extends this same logic across the aisle: a sustained winning streak on the long-side is read as confirmation of a bullish market character and therefore headwind for the short-side and vice versa. So the trader ought to trigger a halt pre-emptively on the disadvantafed side rather than waiting for the market to trigger a drawdown. 
 
 ---
 
-#### Deferment & Ejection
+#### Breakout
 
-> "Knowing what to enter is equally as important as knowing *when* to enter. The regime rules everything; it's statistically better to enter longs when the market overall is bullish, and vice versa. This guide does not attempt to give you a crystal ball, but rather a probability engine."
+> "Don't chase the ticker. Measure how far it really moves, and make it come to you."
 
-**Deferment** is the act of standing aside when the market is against you: no new shorts while the market is rising, no new longs while it is falling. You must block every new entry, and lift only once the market turns back.
+Breakout enters through a conditional order placed away from the current price, at a distance taken from the ticker's own behavior rather than from a fixed percentage.
 
-You must do this under the following conditions;
+**The average move.** Take the ticker's last twenty-four one-hour candles and measure each candle's range, low to high, as a share of its open. The average of those twenty-four is the ticker's average move: its own yardstick of a normal hour. A quiet ticker has a small one; a wild one has a large one.
 
-- **The headline is negative.** The average price move over the last hour, across the coins you sampled, is going the wrong way for your side.
-- **Both poles are red.** One of the signals is losing at both its high and low end, so there is no good place left to enter on.
-- **The targets are too small.** A weak market shrinks the profit margin. Once it is too small to cover trading fees, you must stop entering.
-- **The forecasts are losing.** The ranked forecasts, run as trades over the recent window, are net losers, so the scores are not currently telling you where to enter.
+**The setup** (m is the average move):
 
-**Ejection** is the next step up. If two or more of the above conditions are true at the same time, you must close every open position, small winners included, instead of riding out the turn.
+| | Long side | Short side |
+|---|---|---|
+| Entry | m **below** the current price | m **above** the current price |
+| Take profit | m above the entry | m below the entry |
+| Stop loss | m below the entry | m above the entry |
+| Worse price | m above the current price | m below the current price |
 
-**Inversion** is the one exception that lifts a deferment. If the forecasts are net losers but the same forecasts run in reverse order are paying well enough to clear your minimum target per trade, stop deferring and enter on the reverse alone: the most against-side scores first, no fading, and the full targets rather than the shrunk ones. The market is not against you, only the ranking is.
+The long side buys a dip of normal size and aims for a normal bounce; the short side sells a normal pop and aims for a normal retrace. Because the target and the stop are both one average move, every bracket is scaled to the ticker it sits on: tight on quiet tickers, wide on wild ones, never one size for all.
 
----
+**The worse price** is the mirror image of the entry on the other side of the current price. If price runs to it first, the dip or pop you were waiting for is not coming from here, but the ticker has proven it is moving. Do not simply cancel and forget it: put it at the front of the next batch, re-measure its candles, and try again from the new price.
 
-#### Market Reading
+**Expiry.** An order that has not filled within an hour is cancelled, since the setup is only worth the hour it was measured for. An expired order is not retried; the slot goes back to the next batch.
 
-The entry gate is to be built from slots. Each slot is a set of criteria that must all be true simultaneously. A ticker qualifies for entry when it satisfies every criterion in any one slot. Each slot is a distinct thesis — "funding rate elevated and price rising" is a different case from "high participation confirming momentum." Both can be active at the same time; each runs on its own terms. A position opens when any slot is satisfied; when none are, the scan passes.
+**The batch.** Each time slots are free, fill every one of them: queued retries first, then tickers drawn at random from the market. Pending orders hold their slots, so the book never overcommits.
 
-**The criteria:**
+**Two filters, always on:**
 
-- **fund>N** — The funding rate has reached tier N (longs paying shorts). At the default 0.0025% step, `fund>100` requires FR ≥ 0.25%. Elevated positive funding means longs are carrying the cost — an overcrowded long side often vulnerable to reversal.
-- **fund<-N** — The funding rate has reached tier −N (shorts paying longs). At the default step, `fund<-100` requires FR ≤ −0.25%. An overcrowded short side with carry embedded for the long.
-- **V/A>N** — The ticker's 24-hour trading volume is running above tier N relative to the average volume across the current sampled population (1% step by default). `V/A>10` means this ticker's volume is running 10% hotter than the rest of the sampled market right now. Unusually high participation relative to the crowd — confirms momentum is broadly backed, not a thin-market artifact.
-- **V/A<N** — Volume running below tier N relative to the population average. The coin moved but participation lagged the rest of the market. This is the fade case: momentum without conviction.
-- **IO/L>N / IO/L<N** — The ticker's long share of open interest (its open interest times the long share of accounts) compared to the average of that share across the current sampled population, at tier N (1% step by default). High IO/L signals this ticker is carrying unusually heavy long positioning right now compared to the rest of the market; low IO/L signals comparatively light long-side commitment.
-- **IO/S>N / IO/S<N** — The same reading for the short share of open interest. High IO/S signals unusually heavy short positioning relative to the crowd; low IO/S signals comparatively light short-side commitment.
-- **LTA>N / LTA<N** — The ticker's most recently completed hour of trading volume, compared to its own typical hourly pace (24-hour volume ÷ 24), at tier N (10% step by default). `LTA>3` means the last hour ran roughly 30% hotter than this ticker's own average hour. Unlike V/A, this measures a ticker against itself rather than against the crowd — a burst or lull specific to this name, regardless of what the rest of the market is doing. High LTA signals a sudden spike of interest; low LTA signals it's gone quiet relative to its own norm.
-- **LPA>N / LPA<N** — The ticker's price change over the most recently completed hour, compared to the average hourly price change of every other ticker in the sampled population, at tier N (0.25 percentage-point step by default). `LPA>2` means this ticker moved about half a point more than the rest of the market did over the same hour. High LPA singles out a ticker outperforming its peers in the short term; low LPA singles out one lagging or moving against the grain.
+- **Stablecoin.** A ticker whose last twenty-four hours span less than 1%, lowest low to highest high, is pegged and has no average move worth trading.
+- **Illiquidity.** Look at the last three trades before entering. If they average more than twelve seconds apart, fills will slip and the ticker is skipped.
 
-**Building slots**: A slot containing only "V/A>10" behaves like a bare participation filter — one condition, no confirmation. Adding "fund<-1" to it requires unusual participation and a funding premium to align before opening. Adding "LTA>3" on top demands that the ticker be running hot against its own norm too. Each addition narrows the filter from permissive to strict without changing the underlying logic. No single reading is privileged — a slot is whatever combination of conditions you are willing to open on, and a slot of only one criteria is a perfectly valid thesis.
+A randomly drawn ticker that fails either filter is set aside for a week. One that passes the illiquidity check is trusted for a week and not checked again.
+
+Breakout relies on Binary Mode: the target and the stop must both be set at entry.
 
 ---
 
-#### Re-entry Cooldown
-
-A symbol that was just closed doesn't immediately re-qualify for entry — it should sit out for a determined amount of time before becoming eligible again. This prevents chasing the same ticker straight back into the a setup that might reverse. Even if the move continues, it is far safer to take a break and collect more data. You can apply this rule to either positions you won or lost or only losers, rarely, chasing a winner without additional readings is a great way to make extra profit... or undo your gains. 
-
----
-
-#### Substitution
-
-A full book shouldn't turn away a strong new candidate. Its case should be scored the same way any other entry is, if it clearly beats the weakest current holding then close the weakest and open the new one.
-
-The bar for swapping is deliberate, not marginal — a small edge doesn't justify the round trip. A newly opened position should also get a grace period before it can be swapped out, avoiding churning positions too much.
-
----
 
 ### Reactive Techniques
 
@@ -226,7 +205,7 @@ When the final DCA stage fills and absorption has reduced position margin signif
 
 When combined unrealized loss crosses a threshold, one can either close all positions at once or only the oldest — one position per trigger. The former sweeps exposure clean; the latter reduces it gradually. Use the staged approach when you want to de-risk without abandoning the book entirely.
 
-The README covers the specific sacrifice and cascade variations Winter-Chaser runs in more detail.
+The Handbook covers the specific sacrifice and cascade variations Winter-Chaser runs in more detail.
 
 ---
 
@@ -243,36 +222,6 @@ The README covers the specific sacrifice and cascade variations Winter-Chaser ru
 Positions open with no TP; as price moves in the profitable direction, flat adds are placed at −1.5%, −3%, −6%, −9%, −12%, −15%, and −18% from entry. At the seventh add, a TP is set at −22% from the original entry.
 
 A perfect AMa run returns roughly **709% on the original entry margin** at 6× leverage. If price reverses and a DCA level triggers, AMa cancels and a standard stage-based TP is set against the current weighted average.
-
----
-
-## Market Intelligence
-
-A good trader learns which entry conditions pay and which do not, then ranks every candidate based on that evidence. Combinations that win rise to the top of the entry queue; consistently losing combinations are to be deprioritized. That evidence can come from two directions; the reactive and proactive method. 
-
-### Reactive Scoring
-
-Reactive scoring learns from outcomes: these are your own closed positions, credit or debit each criterion that was present at entry. This is grounded in what trades really paid, but you can only learn once entries have been made and resolved, so you lag a change in regime by however long positions take to close. Your effort is spent on the far side of the entry.
-
-### Proactive Scoring
-
-Proactive scoring learns from the market by sampling price changes over a period, before any entry: each criterion is scored by how the tickers exhibiting it have been moving, with price movement as the grounding truth. Because this needs no closed trade to learn from, you get to recognize edge and adapt to a shift in regime much faster, and pick your targets before capital is committed. A more accurate way to apply this is to gather the criteria exhibited, then after a period of time compare the price change (averaging highs, lows and close), this directly tells you how the ticker behaved over the course of that time. Liquidations add a second grounding truth: a ticker's forced liquidations over a period show which side was flushed out, and criteria are scored on both what price did and what liquidations did. Liquidation samples count equally to a price sample, but they are rarer: liquidation events don't happen regularly, so gathering them takes time, and a score derived from them is slow to move. Expect liquidation-driven readings to firm up over many hours, not minutes, and the rarest corners of the scorecard to lag the rest. Liquidations also show how orderly a ticker is: one whose liquidations keep arriving on both sides, longs and shorts flushed alike across the window, is unstable, and an unstable ticker is passed over for entry once it is well above the average for the market.
-
-The same score is also the entry ranking, and forecasting is how you test it. The scorecard can project a ticker before it moves: the mean score of the poles its current readings land in, read as how far it should beat or trail the field, and the tickers in a batch are ranked by it, best first. Some batches later a share of those tickers is sampled again, and the projection is graded against what it actually did relative to its own cohort. The grade never moves a score or the headline, but it tells you whether the ranking carries any foresight, and what trading it would have earned. A projection should not be taken at face-value, and it will be better at some readings than others. Run the same forecasts in reverse order and you learn the opposite: what the batch would have earned had every forecast been wrong. When the forecasts have been losing as a whole while their reverse has been paying, the ranking has inverted for now, and the sound move is to enter on the reverse. A ticker whose projection points against your side ranks last in the normal case; when the ranking is inverted, those are the tickers you want.
-
-### Reading the Scorecard
-
-Every criterion you watch is to be sorted continuously into three bands against recent history: an extreme high end, an extreme low end, and a lukewarm middle. This isn't a ranking of which band is more trustworthy — it's just where a reading currently sits relative to where it's recently been. Which band is actually paying is a live question with a live answer, not a fixed assumption baked into the system.
-
-That live answer takes one of several shapes at any given time. Sometimes both extreme ends are producing profit while the middle sits quiet. Sometimes only one extreme end is working and its opposite number is a trap. Sometimes it flips entirely — the lukewarm middle is where the money is, on one side or both, while the sharp edges chop. There's no fixed hierarchy where extremes beat lukewarm or the reverse; which configuration is in effect depends entirely on the prevailing market regime, and the regime is unknowable in advance. So the system does not guess and does not assume. It keeps a running tally of every band, targets whichever ones have actually been paying — one, two, three, or all four at once — and passes over any candidate leaning too heavily on a band that isn't currently paying. When the tally shifts, the target shifts with it, and open positions are held to the same live standard for their whole life, closed once they drift onto ground that's currently losing rather than held on the strength of a read that was true when the position opened but isn't anymore.
-
-The same logic runs two levels down, per criterion. Every criterion carries its own bullish-favoring and bearish-favoring reading — two directions on the same signal — and each of those, in turn, gets banded into its own extreme and lukewarm reads. That's four independently scored slices per criterion, not two. A reading that only pays on its bearish-favoring side, and only at the extreme, shouldn't be credited for a win its bullish-favoring lukewarm read never actually earned — pooling them together just hides which specific slice is doing the work until the criterion as a whole looks mediocre. Each of the four is scored on its own, so a criterion earns trust exactly where it's genuinely working and loses it everywhere else without dragging the rest of the criterion down with it.
-
-The scorecard also remains highly useful for the explicit acts of substitution and ordering entries, as secondary, lesser indicators frequently prove to be valuable supplemental filters to refine your execution queue.
-
-Both sides use the same record, however it was learned. A win for the short side is a loss for the long side, and the scorecard accounts for this — each side sees the other's outcomes inverted, whether those outcomes are closed trades, sampled price moves or liquidations, so consistently losing combinations are deprioritized from both directions rather than just one.
-
-When one side enters gains quota and halts, the other halts as well. This is more psychological than functional, one side winning the session is an indicator both sides should take a break and prepare for regime change. 
 
 ---
 
@@ -315,7 +264,7 @@ Each position uses exactly the configured notional. No DCA means no additional m
 | 10 | $6 | $1 | $10 |
 | 10 | $12 | $2 | $20 |
 
-Sizing for binary mode is simple: `total margin = positions × (notional / leverage)`. Size notional so total margin across all positions is within comfortable loss tolerance — binary SL means all positions could close at max loss simultaneously on an extreme adverse day.
+Breakout runs in binary mode, so the same sizing applies. Sizing for binary mode is simple: `total margin = positions × (notional / leverage)`. Size notional so total margin across all positions is within comfortable loss tolerance — binary SL means all positions could close at max loss simultaneously on an extreme adverse day.
 
 **Psycho Mode:**
 
@@ -345,7 +294,7 @@ At this size, Loss Absorption's lowered trigger threshold means cuts fire often 
 
 ## Conclusion
 
-These strategies are designed for automation. The mental overhead of manually tracking drawdown throttle states, climate profile scores, scorecard blocks, EDa TP adjustments across multiple open positions, and simultaneous management of a full position book is overwhelming in real time. Automation handles it without error.
+These strategies are designed for automation. The mental overhead of manually tracking drawdown throttle states, EDa TP adjustments across multiple open positions, pending entry orders and simultaneous management of a full position book is overwhelming in real time. Automation handles it without error.
 
 The meta-structure approach means neither side needs to be right all day — just more right than wrong over a session. Drawdown throttling enforces a hard floor on any session's loss. The system works best when you let it run and resist the impulse to override.
 
