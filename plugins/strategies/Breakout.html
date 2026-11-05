@@ -1,0 +1,326 @@
+<!--
+  Breakout Plugin for PseudoChaser and PseudoWinter (unified)
+  Modelled on MI's Fade (cond. entry, worst-case price, 1hr life) with none of MI's scoring.
+
+  Each batch picks as many tickers as there are free position slots (up to Max Positions), reads the last twenty-four
+  closed 1hr candles of each, and takes the average move: the mean candle range, (high - low) / open, in %.
+
+  Chaser (long):  cond. entry BELOW price by the average move; TP above the trigger by the average move; SL below it by the same;
+                  worse price ABOVE price by the average move.
+  Winter (short): the mirror: cond. entry ABOVE price; TP below the trigger; SL above it; worse price BELOW price.
+
+  Two fixed filters run before every order (no toggles):
+    Stablecoin   — the 24 candles' full span (lowest low to highest high) must be at least 1%, else the ticker is a stablecoin.
+    Illiquidity  — the last 3 trades are fetched; if they average more than 12s apart the ticker is illiquid.
+  A ticker failing either during random selection is graylisted for a week (a queued retry is only skipped).
+  A ticker confirmed liquid is whitelisted for a week and skips the trade fetch.
+
+  Orders expire after Order Life (default 60 min) and are simply cancelled. If price reaches the worse price first, the ticker is queued
+  and goes to the front of the next batch, where its candles are re-read and a fresh order is made.
+
+  TP / SL are set at entry only in Binary Mode, so Binary Mode must be on (the plugin places nothing otherwise).
+  Needs no other plugin. The side is read from the host at load.
+
+  Load via Plugin Manager in either bot's config panel, AFTER SunChaser / EverWinter if live.
+  targetBot: both
+-->
+<script>
+(function () {
+  'use strict';
+
+  const VERSION = '1.1.1'; // Change: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
+  const CANDLES = 24;      // closed 1hr candles the average move is read from
+  const HOUR_MS = 3600000;
+  const MIN_SPAN_PCT = 1;          // stablecoin filter: least % span the 24 candles must cover
+  const MAX_GAP_MS   = 12000;      // illiquidity filter: most average ms between the last 3 trades
+  const GRAY_MS      = 7 * 86400000; // graylist time for a ticker that fails either filter
+  let   WINTER  = false;   // set in transform() from the host
+
+  const BO_DEFAULT_CFG = Object.freeze({
+    boEnabled: true,   // Breakout mode
+    boLifeMins: 60,    // how long a cond. order waits before it is cancelled
+    boRetry: [],       // tickers that hit the worse price, first in line for the next batch
+    boWhite: {},       // symbol -> epoch ms it was confirmed liquid; skips the trade fetch for a week
+    boGray: {},        // symbol -> epoch ms it was graylisted (stablecoin / illiquid), kept a week
+  });
+
+  window.__BotPlugin = {
+    id:        'breakout',
+    name:      'Breakout',
+    version:   VERSION,
+    targetBot: 'both',
+    after:     ['sunchaser', 'everwinter'],
+    before:    [],
+    conflicts: [],
+    requires:  [],
+    touches:   ['init', 'runScan', 'cancelCondOrder', 'pseudoWatchCondOrders'],
+
+    css: `
+      :root { --bo-rgb:255,200,60; --bo-acc:#ffc83c; }
+      .bo-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+    `,
+
+    slots: {
+      'mode-label-extra': `<span x-show="cfg.boEnabled"> + Breakout</span>`,
+      'strategy-accordions': `
+        <div x-data="{ open: false }">
+          <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
+            <div style="display:flex;align-items:center;gap:7px">
+              <span>💥 Breakout</span>
+              <span x-show="cfg.boEnabled" style="font-size:8px;padding:1px 5px;background:rgba(var(--bo-rgb),.15);border:1px solid rgba(var(--bo-rgb),.35);border-radius:2px;color:var(--bo-acc);letter-spacing:1px">ON</span>
+              <span x-show="!cfg.boEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
+            </div>
+            <span class="cfg-acc-arrow" :class="open?'open':''">▶</span>
+          </button>
+          <div x-show="open" x-transition.opacity class="cfg-acc-body">
+            <label class="tog">
+              <div class="tog-t" :class="cfg.boEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.boEnabled=!cfg.boEnabled;persist()}"><div class="tog-k"></div></div>
+              <div>
+                <div class="tog-l">Breakout Mode</div>
+                <div class="bo-hint" x-text="'Cond. entry one average move ' + (_boWinter() ? 'above' : 'below') + ' price; TP and SL one average move from the trigger.'"></div>
+              </div>
+            </label>
+            <div x-show="cfg.boEnabled" style="margin-top:8px">
+              <div style="display:flex;align-items:center;gap:6px">
+                <span class="lbl" style="margin:0">Order life (min)</span>
+                <input type="number" min="1" step="1" x-model.number="cfg.boLifeMins" @change="cfg.boLifeMins=Math.max(1,Math.round(+cfg.boLifeMins||60));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
+              </div>
+              <div class="bo-hint">Unfilled orders are cancelled after this; a worse-price hit requeues the ticker instead.</div>
+              <div class="bo-hint" title="The 24 candles must span at least 1% from lowest low to highest high, else the ticker is a stablecoin and is skipped.">🪙 Stablecoin filter · always on</div>
+              <div class="bo-hint" title="The last 3 trades are fetched before entry; if they average more than 12s apart the ticker is illiquid and is skipped, and one that passes skips the fetch for a week.">💧 Illiquidity filter · always on</div>
+              <div class="bo-hint">Tickers failing either in random selection are graylisted for a week.</div>
+              <div class="bo-hint" x-show="!cfg.binaryModeEnabled" style="color:var(--warn)">Turn on Binary Mode: TP and SL are only set at entry there.</div>
+              <div class="bo-hint" style="font-family:var(--mono)" x-text="_boStatus()"></div>
+            </div>
+          </div>
+        </div>
+      `,
+    },
+
+    transform(def) {
+      const _hasShort = typeof def.pseudoOpenShort === 'function', _hasLong = typeof def.pseudoOpenLong === 'function';
+      WINTER = _hasShort && !_hasLong;
+      try {
+        const rs = document.documentElement.style;
+        rs.setProperty('--bo-rgb', WINTER ? '96,210,255' : '255,200,60');
+        rs.setProperty('--bo-acc', WINTER ? 'var(--ice)' : '#ffc83c');
+      } catch (_) {}
+
+      const _origInit   = def.init;
+      const _origScan   = def.runScan;
+      const _origCancel = def.cancelCondOrder;
+      const _origWatch  = def.pseudoWatchCondOrders;
+      const _hostStages = Array.isArray(def._scanStageDefs); // host has the cooperative scan scheduler
+
+      return Object.assign({}, def, {
+
+        _boLoaded: false,
+        _boBusy: false,
+        _boBinWarned: false,
+
+        _boWinter() { return WINTER; },
+        _boStatus() {
+          const q = this.cfg.boRetry || [];
+          return 'Pending ' + (this.condOrders || []).filter(o => o.tag === 'breakout').length + ' · Retry queue ' + (q.length ? q.map(s => s.replace('USDT', '')).join(', ') : 'empty') + ' · Graylisted ' + Object.keys(this.cfg.boGray || {}).length;
+        },
+
+        async init() {
+          await _origInit.call(this);
+          this._boLoaded = true;
+          for (const [k, v] of Object.entries(BO_DEFAULT_CFG)) {
+            if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : v;
+          }
+          if (!Array.isArray(this.cfg.boRetry)) this.cfg.boRetry = [];
+          for (const k of ['boGray', 'boWhite']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
+        },
+
+        // A worse-price hit is the one cancel that requeues the ticker: the host (and live plugins) cancel with a reason starting 'worst case reached'.
+        async cancelCondOrder(id, reason = 'manual') {
+          const o = (this.condOrders || []).find(x => x.id === id);
+          const ok = await _origCancel.call(this, id, reason);
+          if (ok && o && o.tag === 'breakout' && /^worst case reached/.test(String(reason))) this._boRetryAdd(o.symbol);
+          return ok;
+        },
+
+        // Expiry rides the cond. order watcher so it fires on time rather than at the next scan.
+        async pseudoWatchCondOrders() {
+          const r = await _origWatch.call(this);
+          if (this._boLoaded) { try { await this._boExpire(); } catch (e) { this.log(`[BO] expiry error: ${e.message}`, 'warn'); } }
+          return r;
+        },
+
+        _boRetryAdd(sym) {
+          if (!Array.isArray(this.cfg.boRetry)) this.cfg.boRetry = [];
+          if (this.cfg.boRetry.includes(sym)) return;
+          this.cfg.boRetry.push(sym);
+          this.log(`[BO] 🔁 ${sym} reached the worse price — queued for the next batch`, 'info');
+          this.persist();
+        },
+
+        async _boExpire() {
+          const now = Date.now(), life = Math.max(1, Number(this.cfg.boLifeMins) || 60) * 60000;
+          const old = (this.condOrders || []).filter(o => o.tag === 'breakout' && now - (o.createdAt || 0) >= life);
+          for (const o of old) {
+            try { await this.cancelCondOrder(o.id, 'breakout expired'); }
+            catch (e) { this.log(`[BO] expiry error (${o.symbol}): ${e.message}`, 'warn'); }
+          }
+        },
+
+        // Last 24 closed 1hr candles, newest first from the exchange; the forming candle is dropped. Null when the ticker has fewer than 24.
+        async _boCandles(sym) {
+          const url = `${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=60&limit=${CANDLES + 1}`;
+          const r = await (typeof this._qFetch === 'function' ? this._qFetch(url) : fetch(url));
+          const list = (await r.json())?.result?.list;
+          if (!Array.isArray(list)) return null;
+          const now = Date.now();
+          const closed = list.filter(c => Number(c[0]) + HOUR_MS <= now).slice(0, CANDLES);
+          return closed.length === CANDLES ? closed : null;
+        },
+
+        // Average move, %: mean of (high - low) / open over the candles.
+        _boAvgMove(candles) {
+          let sum = 0, n = 0;
+          for (const c of candles) {
+            const o = parseFloat(c[1]), h = parseFloat(c[2]), l = parseFloat(c[3]);
+            if (!(o > 0) || !(h >= l)) continue;
+            sum += (h - l) / o * 100; n++;
+          }
+          return n === CANDLES ? sum / n : null;
+        },
+
+        // Stablecoin filter: the 24 candles' full span, %. A stablecoin never moves 1%.
+        _boSpan(candles) {
+          let hi = -Infinity, lo = Infinity;
+          for (const c of candles) { hi = Math.max(hi, parseFloat(c[2])); lo = Math.min(lo, parseFloat(c[3])); }
+          return lo > 0 && isFinite(hi) ? (hi / lo - 1) * 100 : 0;
+        },
+
+        // Illiquidity filter: average gap between the last 3 trades, ms (newest first). Null when the read fails.
+        async _boTradeGap(sym) {
+          try {
+            const r = await fetch(`${this.base}/v5/market/recent-trade?category=linear&symbol=${sym}&limit=3`);
+            const ts = ((await r.json())?.result?.list || []).map(x => Number(x.time)).filter(x => x > 0);
+            if (ts.length < 3) return Infinity; // fewer than 3 trades on record is as illiquid as it gets
+            return (Math.max(...ts) - Math.min(...ts)) / (ts.length - 1);
+          } catch (e) { return null; }
+        },
+
+        _boGrayAdd(sym, why) {
+          this.cfg.boGray[sym] = Date.now();
+          this.log(`[BO] ⛔ ${sym}: ${why} — graylisted for a week`, 'info');
+        },
+
+        // Leverage the host will open with: Winter resolves it per ticker, Chaser uses the config value. TP / SL are ROI %, i.e. price move % x leverage.
+        async _boLev(sym) {
+          if (typeof this.resolveEffectiveLeverage === 'function') {
+            const instr = await this.getInstrInfo(sym);
+            const r = instr && this.resolveEffectiveLeverage(sym, instr);
+            return r && r.lev > 0 ? r.lev : null;
+          }
+          return this.cfg.leverage > 0 ? this.cfg.leverage : 1;
+        },
+
+        // One cond. order. Chaser: trigger below price, worse above. Winter: trigger above, worse below.
+        async _boPlace(sym, t, retry) {
+          const candles = await this._boCandles(sym);
+          if (!candles) { this.log(`[BO] ${sym}: fewer than ${CANDLES} closed 1hr candles — skipped`, 'info'); return null; }
+          const m = this._boAvgMove(candles);
+          if (!(m > 0)) return null;
+          const span = this._boSpan(candles);
+          if (span < MIN_SPAN_PCT) {
+            if (retry) this.log(`[BO] ${sym}: stablecoin filter — ${span.toFixed(2)}% span over ${CANDLES}h — skipped`, 'info');
+            else this._boGrayAdd(sym, `stablecoin filter, ${span.toFixed(2)}% span over ${CANDLES}h`);
+            return null;
+          }
+          const white = Date.now() - (this.cfg.boWhite[sym] || 0) < GRAY_MS;
+          const gap = white ? 0 : await this._boTradeGap(sym);
+          if (gap != null && gap > MAX_GAP_MS) {
+            const why = `illiquidity filter, last 3 trades ${isFinite(gap) ? (gap / 1000).toFixed(1) + 's' : 'not found'} apart`;
+            if (retry) this.log(`[BO] ${sym}: ${why} — skipped`, 'info');
+            else this._boGrayAdd(sym, why);
+            return null;
+          }
+          if (gap != null && !white) this.cfg.boWhite[sym] = Date.now();
+          let price = parseFloat(t?.lastPrice || 0);
+          try {
+            const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+            const lp = parseFloat((await r.json())?.result?.list?.[0]?.lastPrice);
+            if (lp > 0) price = lp;
+          } catch (e) {}
+          if (!(price > 0)) return null;
+          const lev = await this._boLev(sym);
+          if (!lev) return null;
+          const dir = WINTER ? 1 : -1;
+          const target = price * (1 + dir * m / 100), worst = price * (1 - dir * m / 100);
+          const roi = +(m * lev).toFixed(2);
+          const o = await this.placeCondEntry({
+            candidate: {
+              symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100,
+              _tpPct: roi, _slPct: roi, _bo: true, _boMovePct: +m.toFixed(3),
+            },
+            target, worst, tag: 'breakout',
+          });
+          if (o) this.log(`[BO] 💥 ${sym}${retry ? ' (retry)' : ''}: average move ${m.toFixed(2)}% (${CANDLES}×1hr) — cond. ${(WINTER ? '+' : '-')}${m.toFixed(2)}%, TP/SL ${m.toFixed(2)}% from the trigger`, 'info');
+          return o;
+        },
+
+        // Fills every free position slot: queued retries first, then random tickers from the bulk list.
+        async _boBatch() {
+          if (this._boBusy) return;
+          this._boBusy = true;
+          try {
+            const c = this.cfg;
+            if (!c.boEnabled) return;
+            if (!c.binaryModeEnabled) {
+              if (!this._boBinWarned) { this._boBinWarned = true; this.log('[BO] ⚠️ Binary Mode is off — TP and SL are only set at entry there, so no Breakout orders are placed', 'warn'); }
+              return;
+            }
+            this._boBinWarned = false;
+            if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
+
+            const n = (this.condOrders || []).length;
+            const free = Math.min(Math.max(0, Math.round(c.maxPos || 0)) - (this.positions?.length ?? 0) - n, (c.maxCond ?? 30) - n);
+            if (free <= 0) return;
+
+            const taken = new Set([...(this.positions || []).map(p => p.symbol), ...(this.condOrders || []).map(o => o.symbol)]);
+            const tmap = new Map((this._lastAllTickers || []).map(t => [t.symbol, t]));
+
+            // Retries the batch has room for leave the queue; the rest wait for the next batch.
+            const usable = (Array.isArray(c.boRetry) ? c.boRetry : []).filter(s => !taken.has(s) && !this._isSymbolBanned?.(s));
+            const retries = usable.slice(0, free);
+            c.boRetry = usable.slice(free);
+            const rset = new Set(retries);
+
+            const now = Date.now();
+            for (const m of [c.boGray, c.boWhite]) for (const k of Object.keys(m)) if (now - m[k] >= GRAY_MS) delete m[k];
+            const mega = new Set(Array.isArray(c.megacapExclude) ? c.megacapExclude : []);
+            const pool = (this._lastAllTickers || []).filter(t => t.symbol && t.symbol.endsWith('USDT') && !taken.has(t.symbol) && !rset.has(t.symbol)
+              && !mega.has(t.symbol) && !(t.symbol in c.boGray) && parseFloat(t.lastPrice || 0) > 0 && !this._isSymbolBanned?.(t.symbol));
+            for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+
+            const queue = [...retries.map(s => ({ s, t: tmap.get(s), retry: true })), ...pool.map(t => ({ s: t.symbol, t, retry: false }))];
+            const maxTry = free * 3; // a few spare picks for tickers that fail (new listings, refused orders)
+            let placed = 0, tries = 0;
+            for (const q of queue) {
+              if (placed >= free || tries >= maxTry) break;
+              tries++;
+              try { if (await this._boPlace(q.s, q.t, q.retry)) placed++; }
+              catch (e) { this.log(`[BO] ${q.s} error: ${e.message}`, 'warn'); }
+            }
+            this.log(`[BO] 💥 Batch — ${placed}/${free} order${free === 1 ? '' : 's'} placed${retries.length ? ` (${retries.length} retry)` : ''}`, 'info');
+            this.persist();
+          } finally { this._boBusy = false; }
+        },
+
+      }, _hostStages
+        ? { _scanStageDefs: [...def._scanStageDefs,
+            { id: 'bo-batch', group: 'bo', run: function (ctx) { return this._boBatch(ctx); } },
+          ] }
+        : { async runScan() {
+            await _origScan.call(this);
+            await this._boBatch();
+          } });
+    },
+  };
+})();
+</script>
