@@ -110,7 +110,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 - Check the activity log for `[PST]`/`[PERSIST]` entries.
 - Close any duplicate tabs of the same bot — a second tab can overwrite the first tab's saves with its own stale position count.
 
-**Storage usage** (dropdown below Persistence, PseudoWinter/PseudoChaser only): breaks this bot's localStorage footprint down to one row per data type, including genuinely shared cross-bot keys but never the partner's private state. Oversized rows show in red with a **✕** to clear that bucket (with confirmation), and **Export** downloads the breakdown as a text file. The cross-bot corridor shows as one row of in-flight packets (normally empty), and plugin sources and plugin data (see Plugin data storage) show as IndexedDB rows that sit outside the localStorage quota and aren't part of the total.
+**Storage usage** (dropdown below Persistence, requires `plugins/analytics/Meters`): breaks this bot's localStorage footprint down to one row per data type, including genuinely shared cross-bot keys but never the partner's private state. Oversized rows show in red with a **✕** to clear that bucket (with confirmation), and **Export** downloads the breakdown as a text file. The cross-bot corridor shows as one row of in-flight packets (normally empty), and plugin sources and plugin data (see Plugin data storage) show as IndexedDB rows that sit outside the localStorage quota and aren't part of the total.
 
 **Power usage** (dropdown below Storage usage): a rolling average and peak of how many milliseconds the app spends reacting each second. A rising figure usually means a plugin panel left open somewhere is doing more work than it needs to — closing analytics panels you're not actively watching brings it back down.
 
@@ -163,7 +163,7 @@ Breakout is one file for both bots (`plugins/strategies/Breakout.html`, all sett
 
 ### Entry
 
-Each scan, a batch fills every free slot: **Max Positions** less open positions less pending cond. orders, also capped by **Max Cond. Orders**. Queued retries go first, then random tickers from the bulk list (USDT pairs only, not banned, not held, not in `megacapExclude`, not graylisted). For each ticker:
+Each scan, a batch fills every free slot up to **Max Positions** with pending cond. orders, this is also capped by **Max Cond. Orders**. The system queues tickers for retry if their "worst" price was breached, these queued retries go first in each entry loop, after which are random tickers from the bulk list (USDT pairs only, not banned, not held, not in `megacapExclude`, not graylisted). For each ticker:
 
 1. Read the last 24 closed 1h candles. The **average move** `m` is the mean candle range `(high − low) ÷ open`, in %.
 2. Run the stablecoin and illiquidity filters.

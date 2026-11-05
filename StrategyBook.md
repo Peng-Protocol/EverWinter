@@ -18,15 +18,15 @@
 
 A seasoned trader has no directional bias. On one side they open shorts; the other they open longs, thereby covering both sides of the market from the same analytical framework.
 
-The core insight is about **meta-structure**, not individual tickers. On any given day the market moves with a character — broadly bullish, broadly bearish, or choppy. Trying to predict what any single ticker will do inside that character is hard. Reading the character itself and trading alongside it is easier, and more consistent.
+The core insight is about **meta-structure**, not individual tickers. In any given period the market moves with a character — broadly bullish, broadly bearish, or choppy. Trying to predict what any single ticker will do inside that character is hard. Reading the character itself and trading alongside it is easier, and more consistent.
 
-On a **bullish day**: gainers are likely to continue pumping, and losers are likely to revert upward. The better trades are longs — longs on gaining momentum, longs on oversold coins recovering. Shorts taken into that environment face headwind.
+In a **bullish period**: gainers are likely to continue pumping, and losers are likely to revert upward. The better trades are longs — longs on gaining momentum, longs on oversold coins recovering. Shorts taken into that environment face headwind.
 
-On a **bearish day**: gainers that ran up are likely to retrace, and losers are likely to extend further downward. The better trades are shorts — shorts on overbought gainers, shorts on coins still in freefall.
+In a **bearish period**: gainers that ran up are likely to retrace, and losers are likely to extend further downward. The better trades are shorts — shorts on overbought gainers, shorts on coins still in freefall.
 
-On a **volatile day**: neither side dominates. Coins pump and dump freely in both directions — overbought tickers snap back, oversold tickers bounce hard. Both the short side and the long side can be profitable simultaneously because the market is producing clear extremes on both ends.
+In a **volatile period**: neither side dominates. Coins pump and dump freely in both directions — overbought tickers snap back, oversold tickers bounce hard. Both the short side and the long side can be profitable (or in loss) simultaneously because the market is producing clear extremes on both ends.
 
-Meta-structure is necessary without being sufficient: it says what the market has done, not what it will do in the next hour. Trading with the structure still loses when the entry itself is careless, so the entry is where the proactive approach spends its effort, and the exit is where the reactive approach does.
+Meta-structure is necessary without being sufficient: it says what the market has done, not what it will do in the next period. Trading with the structure still loses when the entry itself is careless, so the entry is where the proactive approach spends its effort, and the exit is where the reactive approach does.
 
 **Two approaches coexist within this system:**
 
@@ -73,37 +73,12 @@ If running both longs and shorts, you may lift the throttle on your short-side o
 
 #### Breakout
 
-> "Don't chase the ticker. Measure how far it really moves, and make it come to you."
+> "Don't chase the ticker. Make it come to you."
 
-Breakout enters through a conditional order placed away from the current price, at a distance taken from the ticker's own behavior rather than from a fixed percentage.
+With Breakout, the trader enters through a conditional order placed away from the current price, at a distance taken from the ticker's own recent behavior rather than from a fixed percentage.
 
-**The average move.** Take the ticker's last twenty-four one-hour candles and measure each candle's range, low to high, as a share of its open. The average of those twenty-four is the ticker's average move: its own yardstick of a normal hour. A quiet ticker has a small one; a wild one has a large one.
-
-**The setup** (m is the average move):
-
-| | Long side | Short side |
-|---|---|---|
-| Entry | m **below** the current price | m **above** the current price |
-| Take profit | m above the entry | m below the entry |
-| Stop loss | m below the entry | m above the entry |
-| Worse price | m above the current price | m below the current price |
-
-The long side buys a dip of normal size and aims for a normal bounce; the short side sells a normal pop and aims for a normal retrace. Because the target and the stop are both one average move, every bracket is scaled to the ticker it sits on: tight on quiet tickers, wide on wild ones, never one size for all.
-
-**The worse price** is the mirror image of the entry on the other side of the current price. If price runs to it first, the dip or pop you were waiting for is not coming from here, but the ticker has proven it is moving. Do not simply cancel and forget it: put it at the front of the next batch, re-measure its candles, and try again from the new price.
-
-**Expiry.** An order that has not filled within an hour is cancelled, since the setup is only worth the hour it was measured for. An expired order is not retried; the slot goes back to the next batch.
-
-**The batch.** Each time slots are free, fill every one of them: queued retries first, then tickers drawn at random from the market. Pending orders hold their slots, so the book never overcommits.
-
-**Two filters, always on:**
-
-- **Stablecoin.** A ticker whose last twenty-four hours span less than 1%, lowest low to highest high, is pegged and has no average move worth trading.
-- **Illiquidity.** Look at the last three trades before entering. If they average more than twelve seconds apart, fills will slip and the ticker is skipped.
-
-A randomly drawn ticker that fails either filter is set aside for a week. One that passes the illiquidity check is trusted for a week and not checked again.
-
-Breakout relies on Binary Mode: the target and the stop must both be set at entry.
+The idea is; tickers often move in oscillations, if the target is currently at its local top, then a long is better placed at the nearest local bottom, expecting a pullback. Whereas with shorts; if the ticker is currently at its local bottom, then a short is better placed at the nearest local top. This style of entry attempts to pre-empt adverse changes in price based on the idea that the market is constantly fluctuating. 
+If the ticker moves in the opposite direction and exceeds your "worst" price (i.e you missed a good entry), then you simply open another conditional order, hoping for a new entry. Ideally you would catch the pullback before the continuation. 
 
 ---
 
