@@ -15,7 +15,7 @@
 | `ChartWinter.html` | Chart and market scan tool |
 | `plugins/modes/EverWinter.html` | Live trading plugin for PseudoWinter |
 | `plugins/modes/SunChaser.html` | Live trading plugin for PseudoChaser |
-| `plugins/strategies/Breakout.html` | Proactive entry plugin for both Pseudo bots: average-move conditional entries, optional per-ticker flow targeting |
+| `plugins/strategies/Breakout.html` | Proactive entry plugin for both Pseudo bots: average-move conditional entries, per-ticker flow targeting |
 
 ---
 
@@ -116,7 +116,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's queues and state (`boRetry`, `boGray`, `boWhite`, `boEdges`, `boLog`, plus its `boEntry`, `boFlowOn`, `boFlow`, `boAuto`, `boAutoPct`, `boAutoTicker` and `boTickLatch` settings) sit in the config and travel with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's queues and state (`boRetry`, `boGray`, `boWhite`, `boEdges`, `boLog`, plus its `boEntry`, `boFlowOn`, `boFlowUp`, `boFlowDown`, `boAuto`, `boAutoPct`, `boAutoTicker` and `boTickLatch` settings) sit in the config and travel with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -200,43 +200,55 @@ A ticker that fails either during random selection is **graylisted for a week**;
 
 **Enter at** (Top / Bottom) sets which edge of the range the trigger sits at. Each order remembers the edge it was placed at, so changing it only affects new orders. Pending orders and the positions they become carry a **TOP** or **BOTTOM** badge showing that edge, on the cond. cards, in Open Positions and in the closed trades list.
 
-**Auto-switch** hides the selector and flips the edge on uPnL (with Ticker flow on, it flips With / Against instead, see below). About once a minute it sums the uPnL of the open positions that entered at the current edge and compares it with their **base margin**: the entry margin (`minNotional ÷ leverage`) per position, DCA adds excluded. When the loss reaches **Switch at** % of that (default 25) the edge flips and a `[BO]` line is logged. Only positions stamped with the current edge count, so positions from before a switch don't trigger another one. Gains never switch it. The tooltip ends with **Currently resolving**, the edge in use.
+**Auto-switch** (default on) hides the selector and flips the edge on uPnL (with Ticker flow on, it flips a skew's With / Against instead, see below). About once a minute it sums the uPnL of the open positions that entered at the current edge and compares it with their **base margin**: the entry margin (`minNotional ÷ leverage`) per position, DCA adds excluded. When the loss reaches **Switch at** % of that (default 25) the edge flips and a `[BO]` line is logged. Only positions stamped with the current edge count, so positions from before a switch don't trigger another one. Gains never switch it. The [live readout](#live-readout) shows the edge in use and the loss against the limit.
 
-**Per-ticker trip** (sub-toggle under Auto-switch, default off) adds a second trigger. About once a minute, before the aggregate check, any single Breakout position whose uPnL is at or below −**Switch at** % of its own base margin flips the switch at once (With ↔ Against while Ticker flow is on, else top ↔ bottom). That ticker is then latched, so it flips once however long it stays down. If a latched ticker later reaches +**Switch at** % of its base margin it reverses the flip and is re-armed. A latch clears when its position closes. A trip skips the aggregate check for that minute, so one tick never flips twice. Unlike the aggregate check, it counts every Breakout position, whatever edge or flow it was stamped with.
+**Per-ticker trip** (sub-toggle under Auto-switch, default on) adds a second trigger. About once a minute, before the aggregate check, any single Breakout position whose uPnL is at or below −**Switch at** % of its own base margin flips the switch at once (that position's skew switch, With ↔ Against, while Ticker flow is on, else top ↔ bottom). That ticker is then latched, so it flips once however long it stays down. If a latched ticker later reaches +**Switch at** % of its base margin it reverses the flip and is re-armed. A latch clears when its position closes. A trip skips the aggregate check for that minute, so one tick never flips twice. Unlike the aggregate check, it counts every Breakout position, whatever edge or flow it was stamped with, except that with Ticker flow on a position with no flow stamp has no skew and is skipped.
 
 ### Ticker flow
 
-**Ticker flow** (`boFlowOn`, default off) picks the edge per ticker from the skew of its 24 candles, instead of one edge for every order. A candle breaks upward if its high is more than `m` above its open, and downward if its low is more than `m` below its open; one candle can do both. The ticker has **upside skew** with more upward than downward breaks, **downside skew** with more downward than upward, and **no skew** on a tie.
+**Ticker flow** (`boFlowOn`, default on) picks the edge per ticker from the skew of its 24 candles, instead of one edge for every order. A candle breaks upward if its high is more than `m` above its open, and downward if its low is more than `m` below its open; one candle can do both. The ticker has **upside skew** with more upward than downward breaks, **downside skew** with more downward than upward, and **no skew** on a tie.
 
-| Mode (`boFlow`) | Upside skew | Downside skew |
+| Mode | Upside skew | Downside skew |
 |---|---|---|
 | **With flow** (default) | Enter at the top | Enter at the bottom |
 | **Against flow** | Enter at the bottom | Enter at the top |
 
-A ticker with no skew uses the global edge and carries no flow stamp. Each order is stamped with its flow (`_boFlow`), and the badge gains a prefix: **W-TOP**, **W-BOTTOM** (with) and **A-TOP**, **A-BOTTOM** (against). While Ticker flow is on, **Enter at** is hidden and the tally readout loses its green / red colouring, since there is no single entry edge. The placement log line shows the skew and the counts, e.g. `upside skew 5T/2B`.
+Each skew has its own switch: `boFlowUp` for upside-skew tickers and `boFlowDown` for downside-skew tickers, both default With, so one skew can enter With flow while the other enters Against. Because they are independent, both can end up entering at the same edge (upside Against with downside With puts every order at the bottom).
 
-With **Auto-switch** on, the uPnL rule flips **With ↔ Against** instead of top ↔ bottom, counting only positions stamped with the current flow, and the Per-ticker trip flips the same way. **With flow** / **Against flow** is hidden while Auto-switch is on, which writes it.
+A ticker with no skew uses the global edge and carries no flow stamp. Each order is stamped with its flow (`_boFlow`), and the badge gains a prefix: **W-TOP**, **W-BOTTOM** (with) and **A-TOP**, **A-BOTTOM** (against). While Ticker flow is on, **Enter at** is hidden, since there is no single entry edge. The placement log line shows the skew and the counts, e.g. `upside skew 5T/2B`.
 
-### Tally
+With **Auto-switch** on, each skew is checked on its own: the uPnL rule sums the positions of that skew that entered under its current mode (the skew is recovered from the stamped flow and edge: with + top or against + bottom is upside) and flips only that skew's switch. The Per-ticker trip flips the switch of the tripped position's skew. The **Upside skew** and **Downside skew** selectors are hidden while Auto-switch is on, which writes them.
 
-A readout in the accordion, **Broke top · Broke bottom · No break**, counts the last 50 resolved orders by which edge of its range price reached first: the target counts for the order's own edge, the worse price for the opposite edge, and an expiry as no break. The count for the edge the bot is entering at shows green and the other red. A fill the host drops for want of a position slot still counts; an order cancelled by hand, by a bail or by a halt doesn't.
+### Live readout
+
+A three-row panel in the accordion, below the config fields, with no labels and only the app's own colours (gray, theme, green, yellow, red). **Hover** a row on PC, or **tap** it on mobile, for a popover with the detail.
+
+| Row | Shows |
+|---|---|
+| **LIVE** | Pending cond. orders over **Max Cond. Orders**, then the break counts ▲ top · ▼ bottom · – neither for the last 50 resolved orders, the larger of ▲ / ▼ in the theme colour. **⚡** (latched tickers) and **↻** (retry queue) appear only when non-zero. A pulsing red dot and red border show once a loss reaches 80% of its limit, and a blinking yellow **⚠** shows while Binary Mode is off. The popover adds the pending top / bottom split, the trip's worst position, the retry queue and the graylist count. |
+| **UP** / **DOWN** (Ticker flow on) | One row per skew: a **WITH** (theme) or **AGAINST** (yellow) chip, the entry edge (▲ TOP / ▼ BOTTOM) and, with Auto-switch on, the uPnL / limit of that skew's positions, green in profit and turning yellow, then red, as the loss nears the limit. The popover explains the skew and its positions. |
+| **EDGE** (Ticker flow off) | One row: the entry edge and its uPnL / limit. |
+
+The break counts record which edge of its range price reached first: the target counts for the order's own edge, the worse price for the opposite edge, and an expiry as no break. A fill the host drops for want of a position slot still counts; an order cancelled by hand, by a bail or by a halt doesn't.
 
 ### Config
+
+Each setting's explanation sits behind a circled **!** button next to it (click to show). Defaults apply to a setting with no saved value, so a bot whose saved config already holds an on / off state keeps it.
 
 | Setting | What it does |
 |---|---|
 | **Breakout Mode** (`boEnabled`, default on) | Master on/off. When off, no new orders are placed; pending ones still expire. |
 | **Order life** (`boLifeMins`, default **60**, min 1) | Minutes an order waits before it is cancelled. |
 | **Enter at** (`boEntry`, default Chaser bottom / Winter top) | Top or bottom edge of the range for new orders. Hidden while Auto-switch is on, which writes it. |
-| **Ticker flow** (`boFlowOn`, default off) | Chooses each ticker's edge from its candle skew. Hides **Enter at** while on. |
-| **With flow / Against flow** (`boFlow`, default `with`) | Which way new orders go relative to a ticker's skew. Shown while Ticker flow is on and Auto-switch is off. |
-| **Auto-switch** (`boAuto`, default off) | Flips **Enter at**, or **With / Against** while Ticker flow is on, when the current setting's open positions lose past the threshold. |
+| **Ticker flow** (`boFlowOn`, default on) | Chooses each ticker's edge from its candle skew. Hides **Enter at** while on. |
+| **Upside skew / Downside skew** (`boFlowUp` / `boFlowDown`, default `with`) | Each skew's With / Against: which way its new orders go relative to the ticker's skew. Shown while Ticker flow is on and Auto-switch is off. |
+| **Auto-switch** (`boAuto`, default on) | Flips **Enter at**, or each skew's **With / Against** while Ticker flow is on, when the open positions of the current setting (of that skew) lose past the threshold. |
 | **Switch at** (`boAutoPct`, default **25**, min 1) | uPnL loss, as % of base margin, that flips the switch. Also the per-ticker trip and reverse threshold. Shown while Auto-switch is on. |
-| **Per-ticker trip** (`boAutoTicker`, default off) | Sub-toggle of Auto-switch: one position at −**Switch at** % flips the switch once, latched; +**Switch at** % on it reverses. Shown while Auto-switch is on. |
+| **Per-ticker trip** (`boAutoTicker`, default on) | Sub-toggle of Auto-switch: one position at −**Switch at** % flips the switch once, latched; +**Switch at** % on it reverses. Shown while Auto-switch is on. |
 | **Trip latches** (`boTickLatch`) | Symbol → `'L'` for tickers whose loss trip has flipped the switch. No control. |
-| **Tally** (`boLog`, `boEdges`) | The last 50 resolved orders (`T`, `B` or `N`) and the edge each pending order was placed at, keyed by symbol. Shown as the readout, no control. |
-| **Retry queue** (`boRetry`) | Symbols that reached the worse price, first in line for the next batch. Shown in the status line, no control. |
-| **Graylist / Whitelist** (`boGray` / `boWhite`) | Symbol → epoch ms, held one week. The status line shows the graylist count, no control. |
+| **Tally** (`boLog`, `boEdges`) | The last 50 resolved orders (`T`, `B` or `N`) and the edge each pending order was placed at, keyed by symbol. Feeds the live readout, no control. |
+| **Retry queue** (`boRetry`) | Symbols that reached the worse price, first in line for the next batch. The count shows in the live readout and the queue in its popover, no control. |
+| **Graylist / Whitelist** (`boGray` / `boWhite`) | Symbol → epoch ms, held one week. The live readout's popover shows the graylist count, no control. |
 
 ---
 
@@ -327,10 +339,11 @@ The graylist and whitelist are pruned at the start of each batch. A queued retry
 - **Expiry**: `_boExpire` runs after each cond. order watcher tick, cancelling `tag === 'breakout'` orders past `boLifeMins` with reason `breakout expired`.
 - **Slots**: `_boBatch` free slots are `maxCond − condOrders`; `maxPos` and open positions don't cap it. It skips while drawdown-halted or gains-locked.
 - **Tally**: `_boResolve(sym, hit)` logs one order (`entry`, `worse` or `none`) against the edge in `boEdges`. The `cancelCondOrder` wrapper logs worse-price and `breakout expired` cancels, the `_condTrigger` wrapper logs a target hit before the host's first await (so a fill dropped for no free slot still counts), and `_boReconcile` is a fallback for fills that bypass `_condTrigger`: a tracked order gone from the list with a position on its symbol.
-- **Auto-switch**: `_boAutoCheck` runs from the `pseudoWatchCondOrders` wrapper, throttled to once per 60 s. Both the aggregate rule and the per-ticker trip end in `_boFlip(why)`, which flips `boFlow` while `boFlowOn` is set, else `boEntry`.
-- **Per-ticker trip**: `_boTickCheck` runs first when `boAutoTicker` is on and returns true if it flipped. It prunes `boTickLatch` of symbols no longer held, flips and latches a position at −limit, and flips back and clears the latch for a latched one at +limit, where limit is `boAutoPct` % of `minNotional ÷ leverage`.
-- **Ticker flow**: `_boLean(candles, m)` returns the upward / downward break counts and the skew (`upside`, `downside` or null); `_boFlowEdge(skew)` maps it to an edge through `boFlow`. `_boPlace` calls both after the filters and overrides its `edge` argument, stamping `_boFlow` on the candidate.
+- **Auto-switch**: `_boAutoCheck` runs from the `pseudoWatchCondOrders` wrapper, throttled to once per 60 s. While `boFlowOn` is set it runs the aggregate rule once per skew (one bucket for the global edge otherwise). Both it and the per-ticker trip end in `_boFlip(why, skew)`, which flips that skew's `boFlowUp` / `boFlowDown` while `boFlowOn` is set, else `boEntry`.
+- **Per-ticker trip**: `_boTickCheck` runs first when `boAutoTicker` is on and returns true if it flipped. It prunes `boTickLatch` of symbols no longer held, flips and latches a position at −limit, and flips back and clears the latch for a latched one at +limit, where limit is `boAutoPct` % of `minNotional ÷ leverage`. With `boFlowOn` it considers only positions with a flow stamp and flips the switch of `_boPosLean(p)`, the skew derived from the stamped `_boFlow` and `_boEdge`.
+- **Ticker flow**: `_boLean(candles, m)` returns the upward / downward break counts and the skew (`upside`, `downside` or null); `_boFlowEdge(skew)` maps it to an edge through that skew's mode (`_boFlowMode`: `boFlowUp` for upside, `boFlowDown` for downside). An older saved `boFlow` migrates on load to both keys and is deleted. `_boPlace` calls both after the filters and overrides its `edge` argument, stamping `_boFlow` on the candidate.
 - **Badge**: the `registerRoleBadge` provider reads `_boEdge` and `_boFlow` off a position or off an order's `candidate` and returns the **TOP** / **BOTTOM** badge, with a **W-** or **A-** prefix when `_boFlow` is set. The base bots render `_roleBadge(o)` in the cond. card header and in the position card.
+- **Live readout**: `_boBuckets` (uPnL and limit per skew, or one bucket for the global edge), `_boTrip`, `_boPend` and `_boHot` feed three rows in the `strategy-accordions` slot, below the config fields; `_boTipHead` and `_boTipBucket` write the popover text. The popover opens on `pointerenter` for a mouse and on tap for touch, and every colour is one of the host's own variables.
 - **Leverage**: `_boLev` uses `resolveEffectiveLeverage` where the host has it (PseudoWinter), else `leverage`.
 
 ### localStorage Keys
