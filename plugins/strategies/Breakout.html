@@ -2,12 +2,19 @@
   Breakout Plugin for PseudoChaser and PseudoWinter (unified)
   Modelled on MI's Fade (cond. entry, worst-case price, 1hr life) with none of MI's scoring.
 
-  Each batch picks as many tickers as there are free position slots (up to Max Positions), reads the last twenty-four
-  closed 1hr candles of each, and takes the average move: the mean candle range, (high - low) / open, in %.
+  Each batch fills the host's Max Cond. Orders limit (minus cond. orders already pending) with tickers, independent of
+  Max Positions: the host drops a cond. that triggers past maxPos, and real orders fail if the balance is short.
+  It reads the last twenty-four closed 1hr candles of each, and takes the average move: the mean candle range, (high - low) / open, in %.
 
   Chaser (long):  cond. entry BELOW price by the average move; TP above the trigger by the average move; SL below it by the same;
                   worse price ABOVE price by the average move.
   Winter (short): the mirror: cond. entry ABOVE price; TP below the trigger; SL above it; worse price BELOW price.
+
+  Entry edge: Chaser enters at the BOTTOM of the range by default, Winter at the TOP. The Enter-at setting flips it (Chaser at the top,
+              Winter at the bottom). TP / SL stay on the bot's own side of the trigger; only the trigger and worse prices swap sides.
+  Tally:      each resolved order is logged by the edge price reached first: top, bottom, or neither (expired). Last 50 are kept.
+  Auto-switch: replaces the manual selector. About every minute, the uPnL of open positions entered at the current edge is compared to their
+              base margin (entry margin each); at -25% (setting) or worse the edge flips. Only positions stamped with the current edge count.
 
   Two fixed filters run before every order (no toggles):
     Stablecoin   — the 24 candles' full span (lowest low to highest high) must be at least 1%, else the ticker is a stablecoin.
@@ -28,17 +35,24 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.1'; // Change: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
+  const VERSION = '1.4.1'; // Change: Chaser plugin glyph is the text-style hot springs symbol (fire-like) instead of the alchemical fire triangle. | previous: Auto-switch rebuilt on uPnL: flips the entry edge when open positions entered at the current edge are down 25% (setting) of their base margin, checked every minute; plugin glyph (snowflake / fire) replaces the explosion emoji. | previous: Auto-switch rule: tally in the bot's favor (Chaser: tops lead, Winter: bottoms lead) enters at the leading edge, against it at the opposite edge. | previous: TOP / BOTTOM position-type badge on pending conds and positions (needs the base bots' cond card badge slot); Auto-switch tooltip rewritten in plain English with the currently resolving edge. | previous: Entry edge setting (Chaser can enter at the top, Winter at the bottom); top / bottom / no-break tally readout; batch fills the host's Max Cond. Orders limit instead of being capped by Max Positions; tally counts fills dropped past Max Positions; Auto-switch picks the edge from the tally's skew. | previous: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
   const CANDLES = 24;      // closed 1hr candles the average move is read from
   const HOUR_MS = 3600000;
   const MIN_SPAN_PCT = 1;          // stablecoin filter: least % span the 24 candles must cover
   const MAX_GAP_MS   = 12000;      // illiquidity filter: most average ms between the last 3 trades
   const GRAY_MS      = 7 * 86400000; // graylist time for a ticker that fails either filter
+  const TALLY_WINDOW = 50;         // resolved orders the tally (and Auto-switch) looks at
+  const opp = e => e === 'top' ? 'bottom' : 'top';
   let   WINTER  = false;   // set in transform() from the host
 
   const BO_DEFAULT_CFG = Object.freeze({
     boEnabled: true,   // Breakout mode
     boLifeMins: 60,    // how long a cond. order waits before it is cancelled
+    boEntry: null,     // 'top' | 'bottom': edge of the range the cond. enters at; null = the bot's default (Chaser bottom, Winter top)
+    boAuto: false,     // Auto-switch: flips the entry edge when the current edge's open positions lose past boAutoPct, manual selector hidden
+    boAutoPct: 25,     // Auto-switch threshold: % loss of the base margin (entry margin per position) of the current edge's open positions
+    boEdges: {},       // symbol -> edge its pending order enters at
+    boLog: [],         // last resolved orders: 'T' top reached first, 'B' bottom, 'N' neither (expired)
     boRetry: [],       // tickers that hit the worse price, first in line for the next batch
     boWhite: {},       // symbol -> epoch ms it was confirmed liquid; skips the trade fetch for a week
     boGray: {},        // symbol -> epoch ms it was graylisted (stablecoin / illiquid), kept a week
@@ -53,11 +67,14 @@
     before:    [],
     conflicts: [],
     requires:  [],
-    touches:   ['init', 'runScan', 'cancelCondOrder', 'pseudoWatchCondOrders'],
+    touches:   ['init', 'runScan', 'cancelCondOrder', 'pseudoWatchCondOrders', '_condTrigger'],
 
     css: `
       :root { --bo-rgb:255,200,60; --bo-acc:#ffc83c; }
       .bo-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
+      .bo-g { color:#3ddc84; } .bo-r { color:#ff5a5f; }
+      .bo-seg { font-family:var(--mono); font-size:10px; padding:2px 9px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.12); border-radius:3px; color:var(--text-lo); cursor:pointer; }
+      .bo-seg.on { background:rgba(var(--bo-rgb),.15); border-color:rgba(var(--bo-rgb),.35); color:var(--bo-acc); }
     `,
 
     slots: {
@@ -66,7 +83,7 @@
         <div x-data="{ open: false }">
           <button class="cfg-acc-hd" @click="open=!open" :class="open?'open':''">
             <div style="display:flex;align-items:center;gap:7px">
-              <span>💥 Breakout</span>
+              <span><span x-text="_boGlyph()"></span> Breakout</span>
               <span x-show="cfg.boEnabled" style="font-size:8px;padding:1px 5px;background:rgba(var(--bo-rgb),.15);border:1px solid rgba(var(--bo-rgb),.35);border-radius:2px;color:var(--bo-acc);letter-spacing:1px">ON</span>
               <span x-show="!cfg.boEnabled" style="font-size:8px;padding:1px 5px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:2px;color:var(--text-lo);letter-spacing:1px">OFF</span>
             </div>
@@ -77,7 +94,7 @@
               <div class="tog-t" :class="cfg.boEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.boEnabled=!cfg.boEnabled;persist()}"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l">Breakout Mode</div>
-                <div class="bo-hint" x-text="'Cond. entry one average move ' + (_boWinter() ? 'above' : 'below') + ' price; TP and SL one average move from the trigger.'"></div>
+                <div class="bo-hint" x-text="'Cond. entry one average move ' + (_boResolveEdge() === 'top' ? 'above' : 'below') + ' price; TP and SL one average move from the trigger.'"></div>
               </div>
             </label>
             <div x-show="cfg.boEnabled" style="margin-top:8px">
@@ -86,6 +103,29 @@
                 <input type="number" min="1" step="1" x-model.number="cfg.boLifeMins" @change="cfg.boLifeMins=Math.max(1,Math.round(+cfg.boLifeMins||60));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
               </div>
               <div class="bo-hint">Unfilled orders are cancelled after this; a worse-price hit requeues the ticker instead.</div>
+              <div class="bo-hint" x-text="'Fills up to Max Cond. Orders (' + (cfg.maxCond ?? 30) + '), independent of Max Positions; the host drops a cond. that triggers past Max Positions.'"></div>
+              <div x-show="!cfg.boAuto" style="display:flex;align-items:center;gap:6px;margin-top:8px">
+                <span class="lbl" style="margin:0">Enter at</span>
+                <button type="button" class="bo-seg" :class="cfg.boEntry==='top'?'on':''" @click="if(!cfgLocked){cfg.boEntry='top';persist()}">Top</button>
+                <button type="button" class="bo-seg" :class="cfg.boEntry==='bottom'?'on':''" @click="if(!cfgLocked){cfg.boEntry='bottom';persist()}">Bottom</button>
+              </div>
+              <label class="tog" style="margin-top:8px">
+                <div class="tog-t" :class="cfg.boAuto?'on':''" @click.prevent="if(!cfgLocked){cfg.boAuto=!cfg.boAuto;persist()}"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l" :title="_boAutoTip()">Auto-switch</div>
+                  <div class="bo-hint" x-text="_boAutoTip()"></div>
+                </div>
+              </label>
+              <div x-show="cfg.boAuto" style="display:flex;align-items:center;gap:6px;margin-top:6px">
+                <span class="lbl" style="margin:0">Switch at</span>
+                <input type="number" min="1" step="1" x-model.number="cfg.boAutoPct" @change="cfg.boAutoPct=Math.max(1,Math.round(+cfg.boAutoPct||25));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
+                <span class="bo-hint" style="margin:0">% uPnL loss of base margin</span>
+              </div>
+              <div class="bo-hint" style="font-family:var(--mono);margin-top:8px" title="Which edge of its range each resolved order's price reached first (last 50). The entry edge is green, the other red.">
+                Broke top <b :class="_boResolveEdge()==='top'?'bo-g':'bo-r'" x-text="_boTally().top"></b> ·
+                Broke bottom <b :class="_boResolveEdge()==='bottom'?'bo-g':'bo-r'" x-text="_boTally().bottom"></b> ·
+                No break <b x-text="_boTally().none"></b>
+              </div>
               <div class="bo-hint" title="The 24 candles must span at least 1% from lowest low to highest high, else the ticker is a stablecoin and is skipped.">🪙 Stablecoin filter · always on</div>
               <div class="bo-hint" title="The last 3 trades are fetched before entry; if they average more than 12s apart the ticker is illiquid and is skipped, and one that passes skips the fetch for a week.">💧 Illiquidity filter · always on</div>
               <div class="bo-hint">Tickers failing either in random selection are graylisted for a week.</div>
@@ -110,6 +150,7 @@
       const _origScan   = def.runScan;
       const _origCancel = def.cancelCondOrder;
       const _origWatch  = def.pseudoWatchCondOrders;
+      const _origTrigger = def._condTrigger;
       const _hostStages = Array.isArray(def._scanStageDefs); // host has the cooperative scan scheduler
 
       return Object.assign({}, def, {
@@ -119,34 +160,123 @@
         _boBinWarned: false,
 
         _boWinter() { return WINTER; },
+        _boDefaultEdge() { return WINTER ? 'top' : 'bottom'; },
+        // Plugin symbol (text glyphs, not emoji): snowflake for Winter, fire for Chaser.
+        _boGlyph() { return WINTER ? '\u2744\uFE0E' : '\u2668\uFE0E'; },
+
+        // Tally of the last resolved orders by the edge reached first.
+        _boTally() {
+          let top = 0, bottom = 0, none = 0;
+          const log = Array.isArray(this.cfg.boLog) ? this.cfg.boLog : [];
+          for (const x of log) { if (x === 'T') top++; else if (x === 'B') bottom++; else if (x === 'N') none++; }
+          return { top, bottom, none, n: log.length };
+        },
+
+        // Edge the next batch enters at. Manual: the selector. Auto-switch: the dominant edge (Chaser) or its opposite (Winter), flipped by Invert; a tie keeps the current edge.
+        // Edge the next batch enters at: the selector, or whatever Auto-switch last flipped it to.
+        _boResolveEdge() {
+          const e = this.cfg.boEntry;
+          return (e === 'top' || e === 'bottom') ? e : this._boDefaultEdge();
+        },
+        _boAutoTip() {
+          return 'Switches where conditionals are set (top or bottom of the range) when the open Breakout positions entered at the current edge are down ' + (this.cfg.boAutoPct ?? 25) + '% of their base margin (the entry margin per position, DCA adds excluded) in uPnL. Checked about every minute; positions from before a switch no longer count. Currently resolving: ' + this._boResolveEdge();
+        },
+
+        // Auto-switch: uPnL of the positions that entered at the current edge vs their base margin. Loss only; flips the edge.
+        _boAutoCheck() {
+          const c = this.cfg;
+          if (!c.boAuto) return;
+          const now = Date.now();
+          if (now - (this._boAutoAt || 0) < 60000) return;
+          this._boAutoAt = now;
+          const cur = this._boResolveEdge();
+          const mine = (this.positions || []).filter(p => p._boEdge === cur);
+          if (!mine.length) return;
+          const base = mine.length * ((c.minNotional || 6) / (c.leverage || 6));
+          const up = mine.reduce((sum, p) => sum + (Number.isFinite(p.upnl) ? p.upnl : 0), 0);
+          const thr = (Number(c.boAutoPct) || 25) / 100 * base;
+          if (up > -thr) return;
+          c.boEntry = opp(cur);
+          this.log(`[BO] ${this._boGlyph()} Auto-switch: ${cur} positions at ${up.toFixed(2)} USDT (limit -${thr.toFixed(2)}) — now entering at the ${c.boEntry}`, 'warn');
+          this.persist();
+        },
+
+        // Logs one resolved order: hit = 'entry' (trigger reached), 'worse' (worse price reached) or 'none' (expired).
+        _boResolve(sym, hit) {
+          const edges = this.cfg.boEdges || {};
+          const edge = edges[sym];
+          if (!edge) return;
+          delete edges[sym];
+          const side = hit === 'entry' ? edge : hit === 'worse' ? opp(edge) : null;
+          if (!Array.isArray(this.cfg.boLog)) this.cfg.boLog = [];
+          this.cfg.boLog.push(side === 'top' ? 'T' : side === 'bottom' ? 'B' : 'N');
+          if (this.cfg.boLog.length > TALLY_WINDOW) this.cfg.boLog.splice(0, this.cfg.boLog.length - TALLY_WINDOW);
+          this.persist();
+        },
+
+        // Fallback for fills that bypass _condTrigger (live plugins): a tracked order gone from the cond. list with a position on the ticker was triggered; any other disappearance is dropped from the tally.
+        _boReconcile() {
+          const edges = this.cfg.boEdges;
+          if (!edges) return;
+          const live = new Set((this.condOrders || []).filter(o => o.tag === 'breakout').map(o => o.symbol));
+          const held = new Set((this.positions || []).map(p => p.symbol));
+          let dirty = false;
+          for (const sym of Object.keys(edges)) {
+            if (live.has(sym)) continue;
+            if (held.has(sym)) this._boResolve(sym, 'entry'); else delete edges[sym];
+            dirty = true;
+          }
+          if (dirty) this.persist();
+        },
+
         _boStatus() {
           const q = this.cfg.boRetry || [];
-          return 'Pending ' + (this.condOrders || []).filter(o => o.tag === 'breakout').length + ' · Retry queue ' + (q.length ? q.map(s => s.replace('USDT', '')).join(', ') : 'empty') + ' · Graylisted ' + Object.keys(this.cfg.boGray || {}).length;
+          return 'Pending ' + (this.condOrders || []).filter(o => o.tag === 'breakout').length + '/' + (this.cfg.maxCond ?? 30) + ' · Retry queue ' + (q.length ? q.map(s => s.replace('USDT', '')).join(', ') : 'empty') + ' · Graylisted ' + Object.keys(this.cfg.boGray || {}).length;
         },
 
         async init() {
           await _origInit.call(this);
           this._boLoaded = true;
+          // Position-type badge: TOP / BOTTOM on pending conds and on positions / closed trades they became (stamped via the candidate's _boEdge).
+          if (typeof this.registerRoleBadge === 'function') this.registerRoleBadge(item => {
+            const e = item && (item._boEdge || item.candidate?._boEdge);
+            if (e !== 'top' && e !== 'bottom') return null;
+            return `<span title="Breakout ${e}" style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid rgba(var(--bo-rgb),.35);background:rgba(var(--bo-rgb),.15);color:var(--bo-acc)">${e.toUpperCase()}</span>`;
+          });
           for (const [k, v] of Object.entries(BO_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : v;
           }
           if (!Array.isArray(this.cfg.boRetry)) this.cfg.boRetry = [];
-          for (const k of ['boGray', 'boWhite']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
+          if (this.cfg.boEntry !== 'top' && this.cfg.boEntry !== 'bottom') this.cfg.boEntry = this._boDefaultEdge();
+          this.cfg.boLog = (Array.isArray(this.cfg.boLog) ? this.cfg.boLog : []).filter(x => x === 'T' || x === 'B' || x === 'N').slice(-TALLY_WINDOW);
+          for (const k of ['boGray', 'boWhite', 'boEdges']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
+          // Orders pending from before the edge setting all entered at the bot's default edge.
+          for (const o of (this.condOrders || [])) if (o.tag === 'breakout' && !this.cfg.boEdges[o.symbol]) this.cfg.boEdges[o.symbol] = this._boDefaultEdge();
         },
 
         // A worse-price hit is the one cancel that requeues the ticker: the host (and live plugins) cancel with a reason starting 'worst case reached'.
         async cancelCondOrder(id, reason = 'manual') {
           const o = (this.condOrders || []).find(x => x.id === id);
           const ok = await _origCancel.call(this, id, reason);
-          if (ok && o && o.tag === 'breakout' && /^worst case reached/.test(String(reason))) this._boRetryAdd(o.symbol);
+          if (ok && o && o.tag === 'breakout') {
+            if (/^worst case reached/.test(String(reason))) { this._boResolve(o.symbol, 'worse'); this._boRetryAdd(o.symbol); }
+            else if (reason === 'breakout expired') this._boResolve(o.symbol, 'none');
+            else if (this.cfg.boEdges) delete this.cfg.boEdges[o.symbol];
+          }
           return ok;
         },
 
         // Expiry rides the cond. order watcher so it fires on time rather than at the next scan.
         async pseudoWatchCondOrders() {
           const r = await _origWatch.call(this);
-          if (this._boLoaded) { try { await this._boExpire(); } catch (e) { this.log(`[BO] expiry error: ${e.message}`, 'warn'); } }
+          if (this._boLoaded) { try { this._boAutoCheck(); this._boReconcile(); await this._boExpire(); } catch (e) { this.log(`[BO] expiry error: ${e.message}`, 'warn'); } }
           return r;
+        },
+
+        // A target hit is the fill, even when the host then drops it for no free position slot. Logged before the host's first await so a reconcile can't miss it.
+        async _condTrigger(o, at = 0) {
+          if (o && o.tag === 'breakout' && (this.condOrders || []).some(x => x.id === o.id)) this._boResolve(o.symbol, 'entry');
+          return _origTrigger.call(this, o, at);
         },
 
         _boRetryAdd(sym) {
@@ -220,8 +350,8 @@
           return this.cfg.leverage > 0 ? this.cfg.leverage : 1;
         },
 
-        // One cond. order. Chaser: trigger below price, worse above. Winter: trigger above, worse below.
-        async _boPlace(sym, t, retry) {
+        // One cond. order. Edge 'bottom': trigger below price, worse above. Edge 'top': trigger above, worse below.
+        async _boPlace(sym, t, retry, edge) {
           const candles = await this._boCandles(sym);
           if (!candles) { this.log(`[BO] ${sym}: fewer than ${CANDLES} closed 1hr candles — skipped`, 'info'); return null; }
           const m = this._boAvgMove(candles);
@@ -250,17 +380,20 @@
           if (!(price > 0)) return null;
           const lev = await this._boLev(sym);
           if (!lev) return null;
-          const dir = WINTER ? 1 : -1;
+          const dir = edge === 'top' ? 1 : -1;
           const target = price * (1 + dir * m / 100), worst = price * (1 - dir * m / 100);
           const roi = +(m * lev).toFixed(2);
           const o = await this.placeCondEntry({
             candidate: {
               symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100,
-              _tpPct: roi, _slPct: roi, _bo: true, _boMovePct: +m.toFixed(3),
+              _tpPct: roi, _slPct: roi, _bo: true, _boMovePct: +m.toFixed(3), _boEdge: edge,
             },
             target, worst, tag: 'breakout',
           });
-          if (o) this.log(`[BO] 💥 ${sym}${retry ? ' (retry)' : ''}: average move ${m.toFixed(2)}% (${CANDLES}×1hr) — cond. ${(WINTER ? '+' : '-')}${m.toFixed(2)}%, TP/SL ${m.toFixed(2)}% from the trigger`, 'info');
+          if (o) {
+            this.cfg.boEdges[sym] = edge;
+            this.log(`[BO] ${this._boGlyph()} ${sym}${retry ? ' (retry)' : ''}: average move ${m.toFixed(2)}% (${CANDLES}×1hr) — cond. ${dir > 0 ? '+' : '-'}${m.toFixed(2)}% (${edge}), TP/SL ${m.toFixed(2)}% from the trigger`, 'info');
+          }
           return o;
         },
 
@@ -278,9 +411,13 @@
             this._boBinWarned = false;
             if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return;
 
+            this._boReconcile();
             const n = (this.condOrders || []).length;
-            const free = Math.min(Math.max(0, Math.round(c.maxPos || 0)) - (this.positions?.length ?? 0) - n, (c.maxCond ?? 30) - n);
+            const free = (c.maxCond ?? 30) - n; // the host's Max Cond. Orders; Max Positions does not cap this
             if (free <= 0) return;
+
+            const edge = this._boResolveEdge();
+            c.boEntry = edge;
 
             const taken = new Set([...(this.positions || []).map(p => p.symbol), ...(this.condOrders || []).map(o => o.symbol)]);
             const tmap = new Map((this._lastAllTickers || []).map(t => [t.symbol, t]));
@@ -304,10 +441,10 @@
             for (const q of queue) {
               if (placed >= free || tries >= maxTry) break;
               tries++;
-              try { if (await this._boPlace(q.s, q.t, q.retry)) placed++; }
+              try { if (await this._boPlace(q.s, q.t, q.retry, edge)) placed++; }
               catch (e) { this.log(`[BO] ${q.s} error: ${e.message}`, 'warn'); }
             }
-            this.log(`[BO] 💥 Batch — ${placed}/${free} order${free === 1 ? '' : 's'} placed${retries.length ? ` (${retries.length} retry)` : ''}`, 'info');
+            this.log(`[BO] ${this._boGlyph()} Batch — ${placed}/${free} order${free === 1 ? '' : 's'} placed${retries.length ? ` (${retries.length} retry)` : ''}`, 'info');
             this.persist();
           } finally { this._boBusy = false; }
         },
