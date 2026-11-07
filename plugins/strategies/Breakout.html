@@ -16,6 +16,18 @@
   Auto-switch: replaces the manual selector. About every minute, the uPnL of open positions entered at the current edge is compared to their
               base margin (entry margin each); at -25% (setting) or worse the edge flips. Only positions stamped with the current edge count.
 
+  Ticker flow: per ticker, the 24 candles are scored for breakout skew: a candle breaks past the average move upward if its high is more than the
+              average move above its open, downward if its low is more than the average move below its open (measured from the open; a candle can do
+              both). More upward breaks = upside skew, more downward breaks = downside skew, equal = no skew (that ticker uses the global edge and
+              carries no flow badge).
+              With flow: upside skew enters at the top, downside skew at the bottom. Against flow: upside skew at the bottom, downside skew at the top.
+              Badges read W-TOP / W-BOTTOM (with) and A-TOP / A-BOTTOM (against). With Auto-switch on, the uPnL rule flips With <-> Against
+              (on positions stamped with the current flow) instead of top <-> bottom.
+
+  Per-ticker trip (sub-toggle of Auto-switch): any single Breakout position whose uPnL reaches -25% (same setting) of its base margin flips the
+              switch at once (With <-> Against while flow is on, else top <-> bottom). That ticker is latched, so it flips once; if it later swings to
+              +25% of its base margin it reverses the switch and is re-armed. Latches clear when the position closes.
+
   Two fixed filters run before every order (no toggles):
     Stablecoin   — the 24 candles' full span (lowest low to highest high) must be at least 1%, else the ticker is a stablecoin.
     Illiquidity  — the last 3 trades are fetched; if they average more than 12s apart the ticker is illiquid.
@@ -35,7 +47,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.4.1'; // Change: Chaser plugin glyph is the text-style hot springs symbol (fire-like) instead of the alchemical fire triangle. | previous: Auto-switch rebuilt on uPnL: flips the entry edge when open positions entered at the current edge are down 25% (setting) of their base margin, checked every minute; plugin glyph (snowflake / fire) replaces the explosion emoji. | previous: Auto-switch rule: tally in the bot's favor (Chaser: tops lead, Winter: bottoms lead) enters at the leading edge, against it at the opposite edge. | previous: TOP / BOTTOM position-type badge on pending conds and positions (needs the base bots' cond card badge slot); Auto-switch tooltip rewritten in plain English with the currently resolving edge. | previous: Entry edge setting (Chaser can enter at the top, Winter at the bottom); top / bottom / no-break tally readout; batch fills the host's Max Cond. Orders limit instead of being capped by Max Positions; tally counts fills dropped past Max Positions; Auto-switch picks the edge from the tally's skew. | previous: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
+  const VERSION = '1.6.0'; // Change: Per-ticker trip sub-toggle under Auto-switch: one position at -25% of its base margin flips the switch (and flow) once, latched; a swing to +25% reverses it and re-arms. | previous: Ticker flow: each ticker is scored toppy / bottomy from its 24 candles (breaks of the average move above the open vs below it) and enters With or Against that flow; W-/A- prefix on the TOP / BOTTOM badges; Auto-switch flips With <-> Against while flow is on. | previous: Chaser plugin glyph is the text-style hot springs symbol (fire-like) instead of the alchemical fire triangle. | previous: Auto-switch rebuilt on uPnL: flips the entry edge when open positions entered at the current edge are down 25% (setting) of their base margin, checked every minute; plugin glyph (snowflake / fire) replaces the explosion emoji. | previous: Auto-switch rule: tally in the bot's favor (Chaser: tops lead, Winter: bottoms lead) enters at the leading edge, against it at the opposite edge. | previous: TOP / BOTTOM position-type badge on pending conds and positions (needs the base bots' cond card badge slot); Auto-switch tooltip rewritten in plain English with the currently resolving edge. | previous: Entry edge setting (Chaser can enter at the top, Winter at the bottom); top / bottom / no-break tally readout; batch fills the host's Max Cond. Orders limit instead of being capped by Max Positions; tally counts fills dropped past Max Positions; Auto-switch picks the edge from the tally's skew. | previous: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
   const CANDLES = 24;      // closed 1hr candles the average move is read from
   const HOUR_MS = 3600000;
   const MIN_SPAN_PCT = 1;          // stablecoin filter: least % span the 24 candles must cover
@@ -51,6 +63,10 @@
     boEntry: null,     // 'top' | 'bottom': edge of the range the cond. enters at; null = the bot's default (Chaser bottom, Winter top)
     boAuto: false,     // Auto-switch: flips the entry edge when the current edge's open positions lose past boAutoPct, manual selector hidden
     boAutoPct: 25,     // Auto-switch threshold: % loss of the base margin (entry margin per position) of the current edge's open positions
+    boFlowOn: false,   // Ticker flow: each ticker's edge follows its candles' breakout skew (replaces the global edge while on)
+    boFlow: 'with',    // 'with' | 'against': enter with the ticker's flow (upside skew -> top, downside skew -> bottom) or against it; Auto-switch flips it while flow is on
+    boAutoTicker: false, // Auto-switch sub-toggle: a single position at -boAutoPct of its base margin flips the switch; +boAutoPct on that ticker reverses it
+    boTickLatch: {},   // symbol -> 'L' once that ticker's loss trip flipped the switch (waits for +boAutoPct to reverse)
     boEdges: {},       // symbol -> edge its pending order enters at
     boLog: [],         // last resolved orders: 'T' top reached first, 'B' bottom, 'N' neither (expired)
     boRetry: [],       // tickers that hit the worse price, first in line for the next batch
@@ -94,7 +110,7 @@
               <div class="tog-t" :class="cfg.boEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.boEnabled=!cfg.boEnabled;persist()}"><div class="tog-k"></div></div>
               <div>
                 <div class="tog-l">Breakout Mode</div>
-                <div class="bo-hint" x-text="'Cond. entry one average move ' + (_boResolveEdge() === 'top' ? 'above' : 'below') + ' price; TP and SL one average move from the trigger.'"></div>
+                <div class="bo-hint" x-text="'Cond. entry one average move ' + (cfg.boFlowOn ? 'above or below (per ticker flow)' : (_boResolveEdge() === 'top' ? 'above' : 'below')) + ' price; TP and SL one average move from the trigger.'"></div>
               </div>
             </label>
             <div x-show="cfg.boEnabled" style="margin-top:8px">
@@ -104,7 +120,19 @@
               </div>
               <div class="bo-hint">Unfilled orders are cancelled after this; a worse-price hit requeues the ticker instead.</div>
               <div class="bo-hint" x-text="'Fills up to Max Cond. Orders (' + (cfg.maxCond ?? 30) + '), independent of Max Positions; the host drops a cond. that triggers past Max Positions.'"></div>
-              <div x-show="!cfg.boAuto" style="display:flex;align-items:center;gap:6px;margin-top:8px">
+              <label class="tog" style="margin-top:8px">
+                <div class="tog-t" :class="cfg.boFlowOn?'on':''" @click.prevent="if(!cfgLocked){cfg.boFlowOn=!cfg.boFlowOn;persist()}"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l" :title="_boFlowTip()">Ticker flow</div>
+                  <div class="bo-hint" x-text="_boFlowTip()"></div>
+                </div>
+              </label>
+              <div x-show="cfg.boFlowOn && !cfg.boAuto" style="display:flex;align-items:center;gap:6px;margin-top:6px">
+                <span class="lbl" style="margin:0">Enter</span>
+                <button type="button" class="bo-seg" :class="cfg.boFlow==='with'?'on':''" @click="if(!cfgLocked){cfg.boFlow='with';persist()}">With flow</button>
+                <button type="button" class="bo-seg" :class="cfg.boFlow==='against'?'on':''" @click="if(!cfgLocked){cfg.boFlow='against';persist()}">Against flow</button>
+              </div>
+              <div x-show="!cfg.boAuto && !cfg.boFlowOn" style="display:flex;align-items:center;gap:6px;margin-top:8px">
                 <span class="lbl" style="margin:0">Enter at</span>
                 <button type="button" class="bo-seg" :class="cfg.boEntry==='top'?'on':''" @click="if(!cfgLocked){cfg.boEntry='top';persist()}">Top</button>
                 <button type="button" class="bo-seg" :class="cfg.boEntry==='bottom'?'on':''" @click="if(!cfgLocked){cfg.boEntry='bottom';persist()}">Bottom</button>
@@ -116,14 +144,21 @@
                   <div class="bo-hint" x-text="_boAutoTip()"></div>
                 </div>
               </label>
+              <label class="tog" x-show="cfg.boAuto" style="margin-top:6px">
+                <div class="tog-t" :class="cfg.boAutoTicker?'on':''" @click.prevent="if(!cfgLocked){cfg.boAutoTicker=!cfg.boAutoTicker;persist()}"><div class="tog-k"></div></div>
+                <div>
+                  <div class="tog-l" :title="_boTickTip()">Per-ticker trip</div>
+                  <div class="bo-hint" x-text="_boTickTip()"></div>
+                </div>
+              </label>
               <div x-show="cfg.boAuto" style="display:flex;align-items:center;gap:6px;margin-top:6px">
                 <span class="lbl" style="margin:0">Switch at</span>
                 <input type="number" min="1" step="1" x-model.number="cfg.boAutoPct" @change="cfg.boAutoPct=Math.max(1,Math.round(+cfg.boAutoPct||25));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
                 <span class="bo-hint" style="margin:0">% uPnL loss of base margin</span>
               </div>
               <div class="bo-hint" style="font-family:var(--mono);margin-top:8px" title="Which edge of its range each resolved order's price reached first (last 50). The entry edge is green, the other red.">
-                Broke top <b :class="_boResolveEdge()==='top'?'bo-g':'bo-r'" x-text="_boTally().top"></b> ·
-                Broke bottom <b :class="_boResolveEdge()==='bottom'?'bo-g':'bo-r'" x-text="_boTally().bottom"></b> ·
+                Broke top <b :class="cfg.boFlowOn?'':(_boResolveEdge()==='top'?'bo-g':'bo-r')" x-text="_boTally().top"></b> ·
+                Broke bottom <b :class="cfg.boFlowOn?'':(_boResolveEdge()==='bottom'?'bo-g':'bo-r')" x-text="_boTally().bottom"></b> ·
                 No break <b x-text="_boTally().none"></b>
               </div>
               <div class="bo-hint" title="The 24 candles must span at least 1% from lowest low to highest high, else the ticker is a stablecoin and is skipped.">🪙 Stablecoin filter · always on</div>
@@ -178,7 +213,27 @@
           const e = this.cfg.boEntry;
           return (e === 'top' || e === 'bottom') ? e : this._boDefaultEdge();
         },
+        // Ticker flow: score the candles. A candle breaks past the average move (m, %) upward when its high is more than m above its open, downward when its low is more than m below its open; one candle can do both.
+        _boLean(candles, m) {
+          let top = 0, bottom = 0;
+          for (const c of candles) {
+            const o = parseFloat(c[1]), h = parseFloat(c[2]), l = parseFloat(c[3]);
+            if (!(o > 0)) continue;
+            if ((h - o) / o * 100 > m) top++;
+            if ((o - l) / o * 100 > m) bottom++;
+          }
+          return { top, bottom, lean: top > bottom ? 'upside' : bottom > top ? 'downside' : null };
+        },
+        // Edge for a ticker under the current flow mode. With: upside skew -> top, downside skew -> bottom. Against: the opposite. Null lean: no flow.
+        _boFlowEdge(lean) {
+          const w = this.cfg.boFlow !== 'against';
+          return lean === 'upside' ? (w ? 'top' : 'bottom') : lean === 'downside' ? (w ? 'bottom' : 'top') : null;
+        },
+        _boFlowTip() {
+          return 'Per ticker: counts how many of its 24 candles broke past the average move upward vs downward (measured from each candle open). More upward breaks = upside skew, more downward = downside skew. With flow enters at the top on upside skew and the bottom on downside skew; against flow is the reverse. Badges read W-/A- before TOP / BOTTOM. A tie has no skew and uses the global edge. Currently: ' + (this.cfg.boFlow === 'against' ? 'against' : 'with') + ' flow.';
+        },
         _boAutoTip() {
+          if (this.cfg.boFlowOn) return 'Flips between entering with and against the ticker flow when the open Breakout positions entered at the current flow are down ' + (this.cfg.boAutoPct ?? 25) + '% of their base margin (the entry margin per position, DCA adds excluded) in uPnL. Checked about every minute; positions from before a switch no longer count. Currently resolving: ' + (this.cfg.boFlow === 'against' ? 'against' : 'with') + ' flow';
           return 'Switches where conditionals are set (top or bottom of the range) when the open Breakout positions entered at the current edge are down ' + (this.cfg.boAutoPct ?? 25) + '% of their base margin (the entry margin per position, DCA adds excluded) in uPnL. Checked about every minute; positions from before a switch no longer count. Currently resolving: ' + this._boResolveEdge();
         },
 
@@ -189,16 +244,60 @@
           const now = Date.now();
           if (now - (this._boAutoAt || 0) < 60000) return;
           this._boAutoAt = now;
-          const cur = this._boResolveEdge();
-          const mine = (this.positions || []).filter(p => p._boEdge === cur);
+          if (c.boAutoTicker && this._boTickCheck()) return;
+          const flowOn = !!c.boFlowOn;
+          const cur = flowOn ? (c.boFlow === 'against' ? 'against' : 'with') : this._boResolveEdge();
+          const mine = (this.positions || []).filter(p => flowOn ? p._boFlow === cur : p._boEdge === cur);
           if (!mine.length) return;
           const base = mine.length * ((c.minNotional || 6) / (c.leverage || 6));
           const up = mine.reduce((sum, p) => sum + (Number.isFinite(p.upnl) ? p.upnl : 0), 0);
           const thr = (Number(c.boAutoPct) || 25) / 100 * base;
           if (up > -thr) return;
-          c.boEntry = opp(cur);
-          this.log(`[BO] ${this._boGlyph()} Auto-switch: ${cur} positions at ${up.toFixed(2)} USDT (limit -${thr.toFixed(2)}) — now entering at the ${c.boEntry}`, 'warn');
+          this._boFlip(`${cur}${flowOn ? '-flow' : ''} positions at ${up.toFixed(2)} USDT (limit -${thr.toFixed(2)})`);
+        },
+
+        // Flips the switch: With <-> Against while flow is on, else top <-> bottom.
+        _boFlip(why) {
+          const c = this.cfg;
+          if (c.boFlowOn) {
+            c.boFlow = c.boFlow === 'against' ? 'with' : 'against';
+            this.log(`[BO] ${this._boGlyph()} Auto-switch: ${why} — now entering ${c.boFlow} flow`, 'warn');
+          } else {
+            c.boEntry = opp(this._boResolveEdge());
+            this.log(`[BO] ${this._boGlyph()} Auto-switch: ${why} — now entering at the ${c.boEntry}`, 'warn');
+          }
           this.persist();
+        },
+
+        _boTickTip() {
+          const pct = this.cfg.boAutoPct ?? 25;
+          return 'Any single Breakout position at -' + pct + '% of its base margin in uPnL flips the switch right away, once per ticker. If that ticker later swings to +' + pct + '% it reverses the switch and is re-armed. Latches clear when the position closes.';
+        },
+
+        // Per-ticker trip: a loss at -pct flips and latches the ticker; a latched ticker at +pct reverses the flip and re-arms. Returns true when it flipped.
+        _boTickCheck() {
+          const c = this.cfg;
+          if (!c.boTickLatch || typeof c.boTickLatch !== 'object') c.boTickLatch = {};
+          const L = c.boTickLatch;
+          const mine = (this.positions || []).filter(p => p._boEdge === 'top' || p._boEdge === 'bottom');
+          const held = new Set(mine.map(p => p.symbol));
+          for (const k of Object.keys(L)) if (!held.has(k)) delete L[k];
+          const lim = (Number(c.boAutoPct) || 25) / 100 * ((c.minNotional || 6) / (c.leverage || 6));
+          for (const p of mine) {
+            if (!Number.isFinite(p.upnl)) continue;
+            if (L[p.symbol] === 'L') {
+              if (p.upnl < lim) continue;
+              delete L[p.symbol];
+              this._boFlip(`${p.symbol} swung to ${p.upnl.toFixed(2)} USDT (limit +${lim.toFixed(2)}), reversing`);
+              return true;
+            }
+            if (p.upnl > -lim) continue;
+            L[p.symbol] = 'L';
+            this._boFlip(`${p.symbol} at ${p.upnl.toFixed(2)} USDT (limit -${lim.toFixed(2)})`);
+            return true;
+          }
+          this.persist();
+          return false;
         },
 
         // Logs one resolved order: hit = 'entry' (trigger reached), 'worse' (worse price reached) or 'none' (expired).
@@ -231,7 +330,7 @@
 
         _boStatus() {
           const q = this.cfg.boRetry || [];
-          return 'Pending ' + (this.condOrders || []).filter(o => o.tag === 'breakout').length + '/' + (this.cfg.maxCond ?? 30) + ' · Retry queue ' + (q.length ? q.map(s => s.replace('USDT', '')).join(', ') : 'empty') + ' · Graylisted ' + Object.keys(this.cfg.boGray || {}).length;
+          return (this.cfg.boFlowOn ? (this.cfg.boFlow === 'against' ? 'Against' : 'With') + ' flow · ' : '') + 'Pending ' + (this.condOrders || []).filter(o => o.tag === 'breakout').length + '/' + (this.cfg.maxCond ?? 30) + ' · Retry queue ' + (q.length ? q.map(s => s.replace('USDT', '')).join(', ') : 'empty') + ' · Graylisted ' + Object.keys(this.cfg.boGray || {}).length;
         },
 
         async init() {
@@ -241,7 +340,10 @@
           if (typeof this.registerRoleBadge === 'function') this.registerRoleBadge(item => {
             const e = item && (item._boEdge || item.candidate?._boEdge);
             if (e !== 'top' && e !== 'bottom') return null;
-            return `<span title="Breakout ${e}" style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid rgba(var(--bo-rgb),.35);background:rgba(var(--bo-rgb),.15);color:var(--bo-acc)">${e.toUpperCase()}</span>`;
+            const f = item._boFlow || item.candidate?._boFlow;
+            const pre = f === 'with' ? 'W-' : f === 'against' ? 'A-' : '';
+            const ttl = f === 'with' ? 'Breakout with flow, ' + e : f === 'against' ? 'Breakout against flow, ' + e : 'Breakout ' + e;
+            return `<span title="${ttl}" style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid rgba(var(--bo-rgb),.35);background:rgba(var(--bo-rgb),.15);color:var(--bo-acc)">${pre}${e.toUpperCase()}</span>`;
           });
           for (const [k, v] of Object.entries(BO_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : v;
@@ -249,7 +351,7 @@
           if (!Array.isArray(this.cfg.boRetry)) this.cfg.boRetry = [];
           if (this.cfg.boEntry !== 'top' && this.cfg.boEntry !== 'bottom') this.cfg.boEntry = this._boDefaultEdge();
           this.cfg.boLog = (Array.isArray(this.cfg.boLog) ? this.cfg.boLog : []).filter(x => x === 'T' || x === 'B' || x === 'N').slice(-TALLY_WINDOW);
-          for (const k of ['boGray', 'boWhite', 'boEdges']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
+          for (const k of ['boGray', 'boWhite', 'boEdges', 'boTickLatch']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
           // Orders pending from before the edge setting all entered at the bot's default edge.
           for (const o of (this.condOrders || [])) if (o.tag === 'breakout' && !this.cfg.boEdges[o.symbol]) this.cfg.boEdges[o.symbol] = this._boDefaultEdge();
         },
@@ -371,6 +473,13 @@
             return null;
           }
           if (gap != null && !white) this.cfg.boWhite[sym] = Date.now();
+          // Ticker flow: this ticker's own edge from its candles' breakout skew; no skew falls back to the global edge, unstamped.
+          let flow = null, lean = null;
+          if (this.cfg.boFlowOn) {
+            lean = this._boLean(candles, m);
+            const fe = this._boFlowEdge(lean.lean);
+            if (fe) { edge = fe; flow = this.cfg.boFlow === 'against' ? 'against' : 'with'; }
+          }
           let price = parseFloat(t?.lastPrice || 0);
           try {
             const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
@@ -386,13 +495,13 @@
           const o = await this.placeCondEntry({
             candidate: {
               symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100,
-              _tpPct: roi, _slPct: roi, _bo: true, _boMovePct: +m.toFixed(3), _boEdge: edge,
+              _tpPct: roi, _slPct: roi, _bo: true, _boMovePct: +m.toFixed(3), _boEdge: edge, ...(flow ? { _boFlow: flow } : {}),
             },
             target, worst, tag: 'breakout',
           });
           if (o) {
             this.cfg.boEdges[sym] = edge;
-            this.log(`[BO] ${this._boGlyph()} ${sym}${retry ? ' (retry)' : ''}: average move ${m.toFixed(2)}% (${CANDLES}×1hr) — cond. ${dir > 0 ? '+' : '-'}${m.toFixed(2)}% (${edge}), TP/SL ${m.toFixed(2)}% from the trigger`, 'info');
+            this.log(`[BO] ${this._boGlyph()} ${sym}${retry ? ' (retry)' : ''}: average move ${m.toFixed(2)}% (${CANDLES}×1hr) — cond. ${dir > 0 ? '+' : '-'}${m.toFixed(2)}% (${flow ? (flow === 'with' ? 'W-' : 'A-') : ''}${edge}${lean ? `; ${lean.lean ? lean.lean + ' skew' : 'no skew'} ${lean.top}T/${lean.bottom}B` : ''}), TP/SL ${m.toFixed(2)}% from the trigger`, 'info');
           }
           return o;
         },

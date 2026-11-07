@@ -80,6 +80,8 @@ With Breakout, the trader enters through a conditional order placed away from th
 The idea is; tickers often move in oscillations, if the target is currently at its local top, then a long is better placed at the nearest local bottom, expecting a pullback. Whereas with shorts; if the ticker is currently at its local bottom, then a short is better placed at the nearest local top. This style of entry attempts to pre-empt adverse changes in price based on the idea that the market is constantly fluctuating. 
 If the ticker moves in the opposite direction and exceeds your "worst" price (i.e you missed a good entry), then you simply open another conditional order, hoping for a new entry. Ideally you would catch the pullback before the continuation. 
 
+However, there are multiple ways you can approach the market, you can flip your targets and instead enter longs at the local top or place shorts at the local bottom (expecting continuation). How you pick your direction depends on the character of the ticker and the on-going performance of each preference. If continuation is blowing you out, then try fade, if a ticker is looking strongly bullish or bearish, then continuation may be the better choice, but if it looks choppy, you should consider the general read on the market state. 
+
 ---
 
 
