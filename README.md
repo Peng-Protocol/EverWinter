@@ -15,7 +15,7 @@
 | `ChartWinter.html` | Chart and market scan tool |
 | `plugins/modes/EverWinter.html` | Live trading plugin for PseudoWinter |
 | `plugins/modes/SunChaser.html` | Live trading plugin for PseudoChaser |
-| `plugins/strategies/Breakout.html` | Proactive entry plugin for both Pseudo bots: average-move conditional entries, per-ticker flow targeting, double entries on the unfavored skew, internal tracking at max positions |
+| `plugins/strategies/Breakout.html` | Proactive entry plugin for both Pseudo bots: average-move conditional entries drawn by per-cell $ scores (lean cohorts, 1× to 3× distance), a quiet watch list of simulated hypotheticals, stand-down when every cell is under water |
 
 ---
 
@@ -116,7 +116,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's queues and state (`boRetry`, `boGray`, `boWhite`, `boEdges`, `boLog`, `boInval`, `boTrack`, plus its `boEntry`, `boFlowOn`, `boFlowUp`, `boFlowDown`, `boAuto`, `boAutoPct`, `boAutoTicker`, `boTickLatch` and `boMult` settings) sit in the config and travel with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's queues and state (`boRetry`, `boGray`, `boWhite`, `boEdges`, `boLog`, `boInval`, `boCells`, `boCellOf`, `boW1`, `boW2`, `boHypo`, plus its `boFlowOn`, `boGate`, `boSamples`, `boWatchMax` and `boStepX` settings) sit in the config and travel with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -154,40 +154,38 @@ The trades panel shows a card for each closed trade, newest first, with a close-
 
 A plugin can enter through a conditional limit order instead of opening at once: `placeCondEntry({ candidate, target, worst, tag })`, where `candidate` is what it would hand to `pseudoOpenShort`/`pseudoOpenLong`. Breakout is the only caller by default. The order opens a position only when price reaches **target**; if price reaches **worst** (the worst case) first, it is cancelled. Target and worst sit on opposite sides of the **entry** price, the last price when the order was made.
 
-Pending orders are listed under **Cond. Orders** in the market column, below Open Positions. Each card's header shows the ticker, the side badge, a plugin role badge where the placing plugin stamps one (Breakout's **TOP** / **BOTTOM**, prefixed **W-**, **A-** or **D-** under Ticker flow) and the order's tag; the body shows Entry, Target and Worst with a thin bar and the distance of the current price from each. They have their own count (**Max Cond. Orders**, default 30), are saved with the bot's state and are cancelled by **Bail All Positions & Cond. Orders**. On PseudoWinter/PseudoChaser the fill is simulated; on EverWinter/SunChaser the order is a real Bybit conditional limit order. ([more](#general-details))
+Pending orders are listed under **Cond. Orders** in the market column, below Open Positions. Each card's header shows the ticker, the side badge, a plugin role badge where the placing plugin stamps one (Breakout's **TOP** / **BOTTOM**, prefixed **W-**, **A-** or **D-** when the ticker has a lean) and the order's tag; the body shows Entry, Target and Worst with a thin bar and the distance of the current price from each. They have their own count (**Max Cond. Orders**, default 30), are saved with the bot's state and are cancelled by **Bail All Positions & Cond. Orders**. On PseudoWinter/PseudoChaser the fill is simulated; on EverWinter/SunChaser the order is a real Bybit conditional limit order. ([more](#general-details))
 
 ---
 
 ## Breakout Plugin
 
-Breakout is one file for both bots (`plugins/strategies/Breakout.html`, all settings `bo*`). It reads which bot it is loaded into and uses that side's conventions (PseudoChaser longs, PseudoWinter shorts), and needs no other plugin. Its accordion is marked with the plugin symbol, a text glyph rather than an emoji: ❄︎ on PseudoWinter, ♨︎ on PseudoChaser. It is the only proactive plugin: it enters through [Conditional Orders](#conditional-orders) placed one average move from the last price, at a fixed edge or, with Ticker flow, at an edge chosen per ticker (two average moves out on the skew the bot can't win with, see [Double entries](#double-entries)). Once open positions reach **Max Positions** it places no orders and tracks tickers internally instead ([Max positions](#max-positions)). **Binary Mode must be on**, since TP and SL are only set at entry there; with it off the plugin logs one warning and places nothing. ([more](#breakout-details))
+Breakout is one file for both bots (`plugins/strategies/Breakout.html`, all settings `bo*`). It reads which bot it is loaded into and uses that side's conventions (PseudoChaser longs, PseudoWinter shorts), and needs no other plugin. Its accordion is marked with the plugin symbol, a text glyph rather than an emoji: ❄︎ on PseudoWinter, ♨︎ on PseudoChaser. It is the only proactive plugin: it enters through [Conditional Orders](#conditional-orders) placed 1×, 2× or 3× the average move from the last price, at an edge and multiplier drawn from per-cell $ scores ([Cells and scores](#cells-and-scores), [Entry choice](#entry-choice-and-stand-down)). Alongside the real orders it runs a quiet **watch list** of up to 50 tickers whose every cell is simulated without placing anything ([Watch lists](#watch-lists)); those hypotheticals, the real orders and the real closes all feed the scores. Once open positions reach **Max Positions** it cancels its pending orders and places none ([Max positions](#max-positions)). **Binary Mode must be on**, since TP and SL are only set at entry there; with it off the plugin logs one warning and places no orders (the watch lists keep running). ([more](#breakout-details))
 
 ### Entry
 
-Each scan, a batch fills every free cond. slot (**Max Cond. Orders** minus the pending orders) with pending cond. orders while a position slot is free; once open positions reach **Max Positions** it places trackers instead ([Max positions](#max-positions)). The host drops a cond. order that triggers once no position slot is free, and a live order fails if the balance is short, which the cap check prevents. The system queues tickers for retry if their "worst" price was breached, these queued retries go first in each entry loop, after which are random tickers from the bulk list (USDT pairs only, not banned, not held, not in `megacapExclude`, not graylisted). For each ticker:
+Each scan, a batch fills every free cond. slot (**Max Cond. Orders** minus the pending orders) while a position slot is free; at **Max Positions** the batch does nothing ([Max positions](#max-positions)). The host drops a cond. order that triggers once no position slot is free, and a live order fails if the balance is short, which the cap check prevents. The system queues tickers for retry if their \"worst\" price was breached, these queued retries go first in each entry loop, after which are random tickers from the bulk list (USDT pairs only, not banned, not held, not in `megacapExclude`, not graylisted). For each ticker:
 
 1. Read the last 24 closed 1h candles. The **average move** `m` is the mean candle range `(high − low) ÷ open`, in %.
 2. Run the stablecoin and illiquidity filters.
-3. Read a fresh last price and place the cond. order.
+3. Read a fresh last price, work out the ticker's lean ([Ticker flow](#ticker-flow)), draw a cell and place the cond. order at it.
 
-| Level | PseudoChaser | PseudoWinter |
+For the drawn edge and multiplier `k` (1, 2 or 3):
+
+| Level | Edge bottom | Edge top |
 |---|---|---|
-| Entry (target) | price × (1 − m) | price × (1 + m) |
+| Entry (target) | price × (1 − k·m) | price × (1 + k·m) |
 | Worse price | price × (1 + m) | price × (1 − m) |
-| TP | entry × (1 + m) | entry × (1 − m) |
-| SL | entry × (1 − m) | entry × (1 + m) |
 
-The table shows each bot's default edge: PseudoChaser enters at the bottom of the range, PseudoWinter at the top. **Enter at** flips the entry and worse prices (PseudoChaser at the top: entry price × (1 + m), worse price × (1 − m); PseudoWinter at the bottom is the mirror). TP and SL stay on the bot's own side of the entry. With **Ticker flow** on, the edge is chosen per ticker instead (see [Ticker flow](#ticker-flow)).
-
-TP and SL are ROI %, so each order carries `_tpPct` = `_slPct` = m × leverage, and the host applies them at fill in Binary Mode.
+TP and SL are always one `m` from the entry, on the bot's own side: PseudoChaser TP = entry × (1 + m) and SL = entry × (1 − m); PseudoWinter the reverse. The default edge is PseudoChaser bottom and PseudoWinter top. The trigger distance `k·m` is capped at 90% so the price stays positive. TP and SL are ROI %, so each order carries `_tpPct` = `_slPct` = m × leverage, and the host applies them at fill in Binary Mode.
 
 ### Expiry and worse price
 
-An order is cancelled once it is older than **Order life**. If price reaches the worse price first, the ticker joins the retry queue and goes to the front of the next batch, where its candles and price are read again. The hit is also counted as an invalidation of the order's direction assumption ([Invalidations](#invalidations)). An expired order is not queued, but an expired double entry lowers the multiplier.
+An order is cancelled once it is older than **Order life**. If price reaches the worse price first, the ticker joins the retry queue and goes to the front of the next batch, where its candles and price are read again. The hit is also counted as an invalidation of the order's direction assumption ([Invalidations](#invalidations)). An expired order is not queued.
 
 ### Filters
 
-Both are always on, with no toggle.
+Both are always on, with no toggle, and run before every order and every watch.
 
 | Filter | Rule |
 |---|---|
@@ -196,73 +194,82 @@ Both are always on, with no toggle.
 
 A ticker that fails either during random selection is **graylisted for a week**; a queued retry that fails is only skipped. A ticker that passes the illiquidity check is **whitelisted for a week** and skips the trade fetch. The stablecoin check still runs each time. A failed fetch neither graylists nor whitelists.
 
-### Entry edge and Auto-switch
+### Cells and scores
 
-**Enter at** (Top / Bottom) sets which edge of the range the trigger sits at. Each order remembers the edge it was placed at, so changing it only affects new orders. Pending orders and the positions they become carry a **TOP** or **BOTTOM** badge showing that edge, on the cond. cards, in Open Positions and in the closed trades list.
+Every ticker belongs to a **lean cohort** and every order to an edge and a multiplier, so the unit of account is a **cell**: lean (`U` upside, `D` downside, `N` none) × edge (`T` top, `B` bottom) × `k` (1, 2, 3), written e.g. `UT1` or `DB2`. Each cell keeps the last **Samples per type** (default 50) of three data types, with no decay, so that number alone sets how fast the scores react (fewer = faster and noisier, more = slower and steadier). A cell's **score** is the sum of the three types' windows.
 
-**Auto-switch** (default on) hides the selector and flips the edge on uPnL (with Ticker flow on, it flips a skew's With / Against instead, see below). About once a minute it sums the uPnL of the open positions that entered at the current edge and compares it with their **base margin**: the entry margin (`minNotional ÷ leverage`) per position, DCA adds excluded. When the loss reaches **Switch at** % of that (default 25) the edge flips and a `[BO]` line is logged. Only positions stamped with the current edge count, so positions from before a switch don't trigger another one. Gains never switch it. The [live readout](#live-readout) shows the edge in use and the loss against the limit.
+| Type | Key | Sample |
+|---|---|---|
+| **First-passage** | `a` | One per resolved cond. order (real orders and round-1 hypotheticals): trigger reached first = **+k·m**, worse price first = **−m**. An expired order is not stored. |
+| **Round-2 sim** | `b` | One per hypothetical position closed at TP, SL or Force Close, net of estimated fees and funding. |
+| **Real** | `c` | One per real position closed at TP, SL or Force Close, net P&L (`totalPnl`). Bails and manual closes are not counted. |
 
-**Per-ticker trip** (sub-toggle under Auto-switch, default on) adds a second trigger. About once a minute, before the aggregate check, any single Breakout position whose uPnL is at or below −**Switch at** % of its own base margin flips the switch at once (that position's skew switch, With ↔ Against, while Ticker flow is on, else top ↔ bottom). That ticker is then latched, so it flips once however long it stays down. If a latched ticker later reaches +**Switch at** % of its base margin it reverses the flip and is re-armed. A latch clears when its position closes. A trip skips the aggregate check for that minute, so one tick never flips twice. Unlike the aggregate check, it counts every Breakout position, whatever edge or flow it was stamped with, except that with Ticker flow on a position with no flow stamp has no skew and is skipped.
+All samples are in dollars at the configured notional: price move × notional, which equals the move × leverage × base margin (a 5% move at base settings is $0.30). A bigger mover therefore weighs more. Open-position uPnL never feeds a score. Because the first-passage sample pays +k·m against −m, a random walk has zero expected value at any `k`, so drift in that score is signal. Real closes are fed once each from `closedTrades` (stamped `_boCell`), so gap-audit closes count too.
 
 ### Ticker flow
 
-**Ticker flow** (`boFlowOn`, default on) picks the edge per ticker from the skew of its 24 candles, instead of one edge for every order. A candle breaks upward if its high is more than `m` above its open, and downward if its low is more than `m` below its open; one candle can do both. The ticker has **upside skew** with more upward than downward breaks, **downside skew** with more downward than upward, and **no skew** on a tie.
-
-| Mode | Upside skew | Downside skew |
-|---|---|---|
-| **With flow** (default) | Enter at the top | Enter at the bottom |
-| **Against flow** | Enter at the bottom | Enter at the top |
-
-Each skew has its own switch: `boFlowUp` for upside-skew tickers and `boFlowDown` for downside-skew tickers, both default With, so one skew can enter With flow while the other enters Against. Only the favored skew (upside for PseudoChaser, downside for PseudoWinter) uses its switch. The other skew always enters a [double entry](#double-entries), whatever its switch says, so the contradictory combinations (Chaser with bottom / against top, Winter with top / against bottom) are never placed.
-
-A ticker with no skew uses the global edge and carries no flow stamp. Each order is stamped with its flow (`_boFlow`), and the badge gains a prefix: **W-TOP**, **W-BOTTOM** (with) and **A-TOP**, **A-BOTTOM** (against), with **D-TOP** / **D-BOTTOM** for a double entry. While Ticker flow is on, **Enter at** is hidden, since there is no single entry edge. The placement log line shows the skew and the counts, e.g. `upside skew 5T/2B`.
-
-With **Auto-switch** on, each skew is checked on its own: the uPnL rule sums the positions of that skew that entered under its current mode (the skew is recovered from the stamped flow and edge: with + top or against + bottom is upside) and flips only that skew's switch. The Per-ticker trip flips the switch of the tripped position's skew. The **Upside skew** and **Downside skew** selectors are hidden while Auto-switch is on, which writes them. On the unfavored skew the switch is replaced by the double entry multiplier: a loss raises it by 1 and a reversal lowers it by 1.
-
-### Double entries
+**Ticker flow** (`boFlowOn`, default on) groups tickers into lean cohorts from the skew of their 24 candles. A candle breaks upward if its high is more than `m` above its open, and downward if its low is more than `m` below its open; one candle can do both. The ticker has **upside skew** (`U`) with more upward than downward breaks, **downside skew** (`D`) with more downward than upward, and **no skew** (`N`) on a tie. Each cohort has its own cell scores, so the data decides whether the lean predicts anything. With Ticker flow off every ticker is `N`.
 
 The flow labels mean: **with top**, expecting the ticker to keep going up; **with bottom**, keep going down; **against top**, expecting it to top and reverse; **against bottom**, expecting it to bottom and reverse. PseudoChaser (long) can only win with top or against bottom, PseudoWinter (short) only with bottom or against top; the other two mean expecting to lose.
 
 | | PseudoChaser | PseudoWinter |
 |---|---|---|
-| Favored skew (uses With / Against) | Upside | Downside |
-| Unfavored skew | Downside | Upside |
-| Double entry | **D-BOTTOM** | **D-TOP** |
+| Favored lean | Upside | Downside |
+| Unfavored lean | Downside | Upside |
 
-When the bot expects a ticker to move against it (unfavored skew) it doesn't enter at the average move. It places a **double entry**: the trigger sits `boMult` × `m` from price (base 2×) on the bot's default edge, assuming the ticker keeps going and bounces (Chaser) or dips (Winter) back later. TP, SL and the worse price stay at one `m`. The trigger distance is capped at 90% so the price stays positive. The order carries `_boMult` and the **D-** badge.
+Each order is stamped with its cell (`_boCell`) and, when the ticker has a lean, its flow (`_boFlow`, `with` / `against`) and, when `k` is above 1, `_boMult`. The badge gains a prefix: **W-TOP**, **W-BOTTOM** (with), **A-TOP**, **A-BOTTOM** (against) and **D-TOP** / **D-BOTTOM** for any order with `k` above 1; a ticker with no lean carries no prefix. The placement log line shows the cell, its score and the skew counts, e.g. `upside skew 5T/2B`.
 
-The multiplier (`boMult`, default 2, never below 2, editable as **Double entry ×**) adapts:
+### Entry choice and stand down
 
-- **+1** when open double-entry positions entered at the current multiplier lose past **Switch at** % (the aggregate rule, bucketed for the unfavored skew), or a single one trips Per-ticker trip. Positions from an older multiplier don't count.
-- **−1** when a latched ticker's trip reverses (+**Switch at** %), and when a double cond. order expires without reaching its trigger (at most once a minute, so a batch that expires together steps once).
+For each ticker the batch draws one of the lean's **eligible cells** with weight `exp((score − best) ÷ step) × prior(k)`, where the prior is 1, 0.5, 0.25 for k = 1, 2, 3 (the starting preference before the scores say otherwise) and **step** is **Score step** × one base margin (`minNotional ÷ leverage`, $1 at base settings). A cell one step behind the best is drawn about 37% as often.
+
+| Lean | Eligible cells |
+|---|---|
+| Favored, or none | All six (top and bottom at 1×, 2×, 3×) |
+| Unfavored | The default edge at 2× or 3× only (Chaser bottom, Winter top), so the contradictory combinations (Chaser with bottom / against top, Winter with top / against bottom) are never placed |
+
+**Stand down** (`boGate`, default on): when the best eligible cell of a lean is at or below −step, no real order is placed for that lean. The ticker is watched instead, and the hypotheticals keep scoring, so entries resume once a cell recovers. Six stood-down picks in a row end the batch, to save fetches.
+
+### Watch lists
+
+The watch lists run on the cond. order watcher tick, throttled to one pass every 30 s, and place no orders. They keep up to **Watch tickers** (default 50; 0 turns them off) random tickers in round 1, through the same filters as real orders, skipping held, pending and already-watched tickers. At scan time a ticker's price, `m`, lean, funding rate and funding interval are stored, and every cell (2 edges × 3 `k`) is simulated at once from that one set of data. A pass refills at most 6 watches and walks at most 8 tickers' due items.
+
+**Round 1** runs one **Order life** after the scan (default 60 min). The twelve 5-minute candles since the scan (from the next 5-minute boundary, so up to 5 minutes of the window go unobserved) are walked per cell for the trigger or the worse price first, which feeds the first-passage scores. If both are touched inside one candle, one finer 1-minute fetch for that ticker decides it; if still both, the worse price counts first. A cell whose trigger was reached becomes a round-2 sim, opened at the trigger price at the end of the candle it triggered in and walked through the rest of the window.
+
+**Round 2** walks the position to its TP or SL for as long as a real one would live: the host's **Force Close Runtime** (`runtimeHours`). A sim is checked at each 4-hour boundary:
+
+- 4-hour candles bound every hour inside them: price staying between TP and SL means nothing happened, and touching only one side resolves it.
+- If a 4-hour candle touches both, one finer 15-minute fetch for that ticker decides it, and SL counts first if still both.
+- The stretch from the end of round 1 to the next 4-hour boundary, and the last stretch before the horizon, use 5-minute candles.
+- **Funding** is added at each funding time crossed (rate and interval from the host's funding cache, else the scan-time values; longs pay a positive rate, shorts receive it).
+- **Fees** come from the host's `_estTradeFee` at close, so sim fees follow the base bot's estimate, random multiplier included. There is no separate slippage model.
+- Reaching the horizon books a Force Close at the last close seen.
+
+Sims are capped at 240 live; ones that still cannot be fetched a day past their horizon are dropped. The **HYPO** row of the [live readout](#live-readout) shows the realized hypothetical P&L, and its popover compares the average sim result with the average real result per cell, which exposes a cost the sim is missing.
+
+**Data use**: each new watch costs about three requests (24 hourly candles through the host queue, `recent-trade` unless whitelisted, one price read); round 1 adds one 5-minute kline read per watch, and round 2 one kline read per ticker per due 4-hour boundary (several sims on one ticker share it), plus the occasional finer fetch. Lowering **Watch tickers** scales this down directly.
 
 ### Invalidations
 
-Reaching the worse price first means price moved the wrong way before the trigger, so the order's direction assumption was wrong. Each hit is counted in `boInval` (last 50) under the order's badge: W-TOP, W-BOTTOM, A-TOP, A-BOTTOM, D-TOP or D-BOTTOM. Orders with no flow stamp aren't counted. The counts show in the LIVE popover and don't change entries by themselves.
+Reaching the worse price first means price moved the wrong way before the trigger, so the order's direction assumption was wrong. Each hit is counted in `boInval` (last 50) under the order's badge: W-TOP, W-BOTTOM, A-TOP, A-BOTTOM, D-TOP or D-BOTTOM. Orders with no flow stamp (tickers with no lean) aren't counted. The counts show in the LIVE popover and don't change entries by themselves.
 
 ### Max positions
 
-Once open positions reach **Max Positions**, every pending Breakout cond. order is cancelled (reason `breakout max positions`) and no new ones are placed. Each cancelled order, and each ticker picked from then on (same filters, skew, double entries and order life), becomes an **internal tracker**: the same trigger and worse price, with no order behind it. A tracker resolves like an order would:
-
-- **Trigger reached**: a top / bottom break is logged in the tally. No position opens.
-- **Worse price reached**: counted as an invalidation, and the ticker joins the retry queue.
-- **Order life up**: logged as neither, and an expired double entry lowers the multiplier.
-
-The check runs after every cond. order fill (every graduation), on each watcher tick and at the start of each batch, so no other cond. can push past the cap. Trackers count against **Max Cond. Orders** while at the cap. When a slot frees up, real orders resume and existing trackers finish on their own. Trackers are price-sampled only: the host's whiplash and gap audits cover real orders.
+Once open positions reach **Max Positions**, every pending Breakout cond. order is cancelled (reason `breakout max positions`) and no new ones are placed. Nothing is tracked internally: the watch lists keep the data flowing, and a cancelled order simply drops out (it adds nothing to the tally or the scores). The check runs after every cond. order fill, on each watcher tick and at the start of each batch, so no other cond. can push past the cap. When a slot frees up, real orders resume.
 
 ### Live readout
 
-A three-row panel in the accordion, below the config fields, with no labels and only the app's own colours (gray, theme, green, yellow, red). **Hover** a row on PC, or **tap** it on mobile, for a popover with the detail.
+A panel in the accordion, below the config fields, with no labels and only the app's own colours (gray, theme, green, yellow, red). **Hover** a row on PC, or **tap** it on mobile, for a popover with the detail.
 
 | Row | Shows |
 |---|---|
-| **LIVE** | Pending cond. orders over **Max Cond. Orders**, then the break counts ▲ top · ▼ bottom · – neither for the last 50 resolved orders, the larger of ▲ / ▼ in the theme colour. **⚡** (latched tickers) and **↻** (retry queue) appear only when non-zero. A pulsing red dot and red border show once a loss reaches 80% of its limit, and a blinking yellow **⚠** shows while Binary Mode is off. The popover adds the pending top / bottom split, the trip's worst position, the retry queue, the graylist count, the invalidation tally and the tracked count. |
-| **UP** / **DOWN** (Ticker flow on) | One row per skew: a **WITH** (theme) or **AGAINST** (yellow) chip, the entry edge (▲ TOP / ▼ BOTTOM) and, with Auto-switch on, the uPnL / limit of that skew's positions, green in profit and turning yellow, then red, as the loss nears the limit. The popover explains the skew and its positions. On the unfavored skew the chip reads **DOUBLE**, the multiplier (e.g. 2x) follows the edge, and the uPnL / limit covers only positions entered at the current multiplier. |
-| **EDGE** (Ticker flow off) | One row: the entry edge and its uPnL / limit. |
+| **LIVE** | Pending cond. orders over **Max Cond. Orders**, then the break counts ▲ top · ▼ bottom · – neither for the last 50 resolved orders, the larger of ▲ / ▼ in the theme colour. **↻** (retry queue) appears only when non-zero. A pulsing red dot and red border show while any lean is standing down, and a blinking yellow **⚠** shows while Binary Mode is off. The popover adds the break counts in words, the invalidation tally, the retry queue size and the round-1 watch count. |
+| **UP** / **DOWN** (Ticker flow on), **ALL** (off) | One row per lean: a **WITH** (theme), **AGAINST** or **DOUBLE** (yellow) chip, or **STAND DOWN**; the best eligible cell's entry edge (▲ TOP / ▼ BOTTOM), its multiplier when above 1, and its score in $ (green, or red when negative). The popover lists every eligible cell by score with its three sums and sample counts (`R1` first-passage, `R2` sim, `real`). |
+| **HYPO** | Hypotheticals closed (`n`), win % (✓), live round-1 (R1) and round-2 (R2) counts, and the realized hypothetical P&L. The popover adds the average hold, and the sim-vs-real average per cell for the six cells with most data. |
 
-The break counts record which edge of its range price reached first: the target counts for the order's own edge, the worse price for the opposite edge, and an expiry as no break. A fill the host drops for want of a position slot still counts; an order cancelled by hand, by a bail or by a halt doesn't. A tracked ticker counts the same way, and a cond. cancelled by the max positions cap carries on as a tracker instead of dropping out of the tally.
+The break counts record which edge of its range price reached first: the target counts for the order's own edge, the worse price for the opposite edge, and an expiry as no break. A fill the host drops for want of a position slot still counts; an order cancelled by hand, by a bail, by a halt or by the max-positions cap doesn't.
 
-**Tracked table**: below the readout, shown only while trackers exist. Each ticker gets a mini cond. card: ticker, badge, age, current price and one bar combining worst (left) and trigger (right), with a tick at the entry price and a fill from entry to the current price (green toward the trigger, red toward the worse price). The figure on the right is the distance to the trigger.
+**Round 1** and **Round 2** lists sit below the readout, each shown only while it has entries and collapsed until tapped. Round 1 rows show the ticker, its lean (UP / DOWN / —), `m` and the minutes left (or `due`). Round 2 rows show the ticker, the sim's cell label, its age and the hours left to its horizon.
 
 ### Config
 
@@ -270,21 +277,22 @@ Each setting's explanation sits behind a circled **!** button next to it (click 
 
 | Setting | What it does |
 |---|---|
-| **Breakout Mode** (`boEnabled`, default on) | Master on/off. When off, no new orders are placed; pending ones still expire. |
-| **Order life** (`boLifeMins`, default **60**, min 1) | Minutes an order waits before it is cancelled. |
-| **Enter at** (`boEntry`, default Chaser bottom / Winter top) | Top or bottom edge of the range for new orders. Hidden while Auto-switch is on, which writes it. |
-| **Ticker flow** (`boFlowOn`, default on) | Chooses each ticker's edge from its candle skew. Hides **Enter at** while on. |
-| **Upside skew / Downside skew** (`boFlowUp` / `boFlowDown`, default `with`) | Each skew's With / Against: which way its new orders go relative to the ticker's skew. Shown while Ticker flow is on and Auto-switch is off, for the favored skew only; the unfavored skew uses the double entry multiplier. |
-| **Auto-switch** (`boAuto`, default on) | Flips **Enter at**, or each skew's **With / Against** while Ticker flow is on, when the open positions of the current setting (of that skew) lose past the threshold. |
-| **Switch at** (`boAutoPct`, default **25**, min 1) | uPnL loss, as % of base margin, that flips the switch. Also the per-ticker trip and reverse threshold. Shown while Auto-switch is on. |
-| **Per-ticker trip** (`boAutoTicker`, default on) | Sub-toggle of Auto-switch: one position at −**Switch at** % flips the switch once, latched; +**Switch at** % on it reverses. Shown while Auto-switch is on. |
-| **Trip latches** (`boTickLatch`) | Symbol → `'L'` for tickers whose loss trip has flipped the switch. No control. |
-| **Double entry ×** (`boMult`, default **2**, min 2) | Trigger distance, in average moves, of a double entry on the unfavored skew. Auto-switch raises it by 1 on losses and lowers it by 1 on a reversal or an untouched expiry. Shown while Ticker flow is on. |
+| **Breakout Mode** (`boEnabled`, default on) | Master on/off. When off, no new orders are placed and the watch lists pause; pending orders still expire. |
+| **Order life** (`boLifeMins`, default **60**, min 1) | Minutes an order waits before it is cancelled, and the length of the round-1 window. |
+| **Ticker flow** (`boFlowOn`, default on) | Groups tickers into lean cohorts from their candle skew. Off = every ticker is `N`. |
+| **Stand down** (`boGate`, default on) | No real orders for a lean while its best eligible cell is at or below −step. |
+| **Samples per type** (`boSamples`, default **50**, min 5) | Samples kept per data type per cell; how fast the scores move. |
+| **Watch tickers** (`boWatchMax`, default **50**) | Tickers watched at once in round 1; 0 turns the hypotheticals off. |
+| **Score step** (`boStepX`, default **1**, min 0.1) | Step in base margins: the draw's temperature and the stand-down floor. |
+| **Cells** (`boCells`) | Cell key → `{ a, b, c }`, the last `boSamples` $ samples of each type. No control. |
+| **Cell link** (`boCellOf`) | Symbol → `{ c, m, k }` for each pending order, so its resolution feeds its cell. No control. |
+| **Watch lists** (`boW1`, `boW2`, `boHypo`) | Round-1 watches, live round-2 sims and the realized hypothetical totals (`n`, `w`, `pnl`, `dur`). No control. |
 | **Invalidations** (`boInval`) | The last 50 worse-price hits by badge (`WT`, `WB`, `AT`, `AB`, `DT`, `DB`). Feeds the LIVE popover, no control. |
-| **Trackers** (`boTrack`) | Internal trackers while at max positions: symbol, entry, target, worst, age and badge stamps. Feeds the Tracked table, no control. |
 | **Tally** (`boLog`, `boEdges`) | The last 50 resolved orders (`T`, `B` or `N`) and the edge each pending order was placed at, keyed by symbol. Feeds the live readout, no control. |
-| **Retry queue** (`boRetry`) | Symbols that reached the worse price, first in line for the next batch. The count shows in the live readout and the queue in its popover, no control. |
-| **Graylist / Whitelist** (`boGray` / `boWhite`) | Symbol → epoch ms, held one week. The live readout's popover shows the graylist count, no control. |
+| **Retry queue** (`boRetry`) | Symbols that reached the worse price, first in line for the next batch. The count shows in the live readout, no control. |
+| **Graylist / Whitelist** (`boGray` / `boWhite`) | Symbol → epoch ms, held one week. No control. |
+
+Settings retired in 2.0 (`boEntry`, `boAuto`, `boAutoPct`, `boAutoTicker`, `boTickLatch`, `boFlowUp`, `boFlowDown`, `boMult`, `boFlow`) and in 2.1 (`boTrack`) are deleted from a saved config on load.
 
 ---
 
@@ -358,31 +366,34 @@ The details left out of the shortened Breakout entries.
 
 #### Average move
 
-The newest 25 candles are fetched (`interval=60`) and the forming one dropped, so all 24 are closed; a ticker with fewer than 24 is skipped. Candles go through the scheduling queue, while the last-price and `recent-trade` reads are direct fetches.
+The newest 25 candles are fetched (`interval=60`) and the forming one dropped, so all 24 are closed; a ticker with fewer than 24 is skipped. Candles go through the scheduling queue, while the last-price and `recent-trade` reads are direct fetches. The price read also returns the funding rate and interval, which a watch stores.
 
 #### Batch
 
-Attempts per batch are capped at 3× the free slots, so a ticker that fails (new listing, refused order, a filter) is replaced by the next pick. A retry leaves the queue when a batch takes it, one attempt each, and retries beyond the free slots wait for the next batch. Candidates carry `_bo`, `_boMovePct`, `_boEdge`, `_tpPct` and `_slPct`, plus `_boFlow` (`with` / `against`) when Ticker flow gave the ticker a skew, and `_boMult` on a double entry; the underscore keys are copied onto the position and its closed trade, which is what the badge reads.
+Attempts per batch are capped at 3× the free slots, so a ticker that fails (new listing, refused order, a filter) is replaced by the next pick. A retry leaves the queue when a batch takes it, one attempt each, and retries beyond the free slots wait for the next batch. Candidates carry `_bo`, `_boMovePct`, `_boEdge`, `_boCell`, `_tpPct` and `_slPct`, plus `_boFlow` (`with` / `against`) when the ticker has a lean and `_boMult` when `k` is above 1; the underscore keys are copied onto the position and its closed trade, which is what the badge and the real-close feed read.
 
 #### Filters
 
 The graylist and whitelist are pruned at the start of each batch. A queued retry is exempt from graylisting but not from the filters.
 
+#### Hypotheticals
+
+The sim books price P&L as `side × (exit − entry) ÷ entry × notional`, with `notional` = `minNotional`, so leverage affects only the TP / SL ROI % the host applies, not the dollar result. Walks use closed candles only. The Bybit `kline` reads pass both `start` and `end`, and results are memoised per pass, so sims on one ticker share a fetch.
+
 ### Breakout Internals
 
-- **Hooks**: `init` (config defaults, and the `registerRoleBadge` provider), a scan stage `bo-batch` (a `runScan` wrapper on a host without stages), `cancelCondOrder`, `pseudoWatchCondOrders` and `_condTrigger`. Declares `after: ['sunchaser', 'everwinter']` so it wraps the live plugins' versions.
+- **Hooks**: `init` (config defaults and migration, and the `registerRoleBadge` provider), a scan stage `bo-batch` (a `runScan` wrapper on a host without stages), `cancelCondOrder`, `pseudoWatchCondOrders` and `_condTrigger`. Declares `after: ['sunchaser', 'everwinter']` so it wraps the live plugins' versions.
 - **Worse price**: the `cancelCondOrder` wrapper queues the symbol when the order's tag is `breakout` and the reason starts `worst case reached`, which covers the host watcher, the kline audits and the live plugins. It also calls `_boInvalidate(o)`.
-- **Expiry**: `_boExpire` runs after each cond. order watcher tick, cancelling `tag === 'breakout'` orders past `boLifeMins` with reason `breakout expired`. An expired order with `_boMult` > 1 lowers `boMult` through `_boMultStep(-1)`.
-- **Slots**: `_boBatch` free slots are `maxCond − condOrders`, plus the trackers while at the cap. It runs `_boCapCheck` first and, when `positions.length >= maxPos`, passes `track` to `_boPlace`, which builds a tracker (`_boTrackAdd`) instead of calling `placeCondEntry`. It skips while drawdown-halted or gains-locked.
-- **Tally**: `_boResolve(sym, hit)` logs one order (`entry`, `worse` or `none`) against the edge in `boEdges`. The `cancelCondOrder` wrapper logs worse-price and `breakout expired` cancels, the `_condTrigger` wrapper logs a target hit before the host's first await (so a fill dropped for no free slot still counts), and `_boReconcile` is a fallback for fills that bypass `_condTrigger`: a tracked order gone from the list with a position on its symbol.
-- **Auto-switch**: `_boAutoCheck` runs from the `pseudoWatchCondOrders` wrapper, throttled to once per 60 s. While `boFlowOn` is set it runs the aggregate rule once per skew (one bucket for the global edge otherwise). Both it and the per-ticker trip end in `_boFlip(why, skew)`, which flips that skew's `boFlowUp` / `boFlowDown` while `boFlowOn` is set, else `boEntry`; for the unfavored skew it calls `_boMultStep` instead.
-- **Per-ticker trip**: `_boTickCheck` runs first when `boAutoTicker` is on and returns true if it flipped. It prunes `boTickLatch` of symbols no longer held, flips and latches a position at −limit, and flips back and clears the latch for a latched one at +limit, where limit is `boAutoPct` % of `minNotional ÷ leverage`. With `boFlowOn` it considers only positions with a flow stamp and flips the switch of `_boPosLean(p)`, the skew derived from the stamped `_boFlow` and `_boEdge`.
-- **Ticker flow**: `_boLean(candles, m)` returns the upward / downward break counts and the skew (`upside`, `downside` or null); `_boFlowEdge(skew)` maps it to an edge through that skew's mode (`_boFlowMode`: `boFlowUp` for upside, `boFlowDown` for downside). An older saved `boFlow` migrates on load to both keys and is deleted. `_boPlace` calls both after the filters and overrides its `edge` argument, stamping `_boFlow` on the candidate.
+- **Expiry**: `_boExpire` runs after each cond. order watcher tick, cancelling `tag === 'breakout'` orders past `boLifeMins` with reason `breakout expired`.
+- **Slots**: `_boBatch` free slots are `maxCond − condOrders`. It runs `_boCapCheck` first and returns when `positions.length >= maxPos`. It skips while drawdown-halted or gains-locked. `_boPlace` returns the order, `'gated'` (the lean stood down; the ticker is added to the round-1 list instead) or null.
+- **Tally**: `_boResolve(sym, hit)` logs one order (`entry`, `worse` or `none`) against the edge in `boEdges`, and for `entry` / `worse` also pushes the first-passage sample to the cell recorded in `boCellOf`. The `cancelCondOrder` wrapper logs worse-price and `breakout expired` cancels, the `_condTrigger` wrapper logs a target hit before the host's first await (so a fill dropped for no free slot still counts), and `_boReconcile` is a fallback for fills that bypass `_condTrigger`: a pending order gone from the list with a position on its symbol.
+- **Cells**: `_boCellKey` builds the key, `_boSample(key, type, $)` pushes and trims to `boSamples`, `_boCellScore` sums the three windows, `_boEligible(lean)` lists the allowed cells and `_boPick(lean)` does the weighted draw and the stand-down test. `_boU` is one base margin, `_boTau` the step.
+- **Ticker flow**: `_boLean(candles, m)` returns the upward / downward break counts and the skew (`upside`, `downside` or null); `_boPrep` turns it into the lean code (`U` / `D` / `N`, always `N` with `boFlowOn` off). `_boFlowOf(lean, edge)` gives `with` / `against`.
 - **Badge**: the `registerRoleBadge` provider reads `_boEdge` and `_boFlow` off a position or off an order's `candidate` and returns the **TOP** / **BOTTOM** badge, with a **W-** or **A-** prefix when `_boFlow` is set, or **D-** when `_boMult` is above 1. The base bots render `_roleBadge(o)` in the cond. card header and in the position card.
-- **Live readout**: `_boBuckets` (uPnL and limit per skew, or one bucket for the global edge), `_boTrip`, `_boPend` and `_boHot` feed three rows in the `strategy-accordions` slot, below the config fields, with the Tracked table under them (it reuses the host's `.cnd-card` styles); `_boTipHead` and `_boTipBucket` write the popover text. The popover opens on `pointerenter` for a mouse and on tap for touch, and every colour is one of the host's own variables.
-- **Double entries**: `_boFavLean` / `_boUnfavLean` give the favored and unfavored skew per bot. For the unfavored skew `_boFlowEdge` returns the default edge and `_boFlowMode` returns `against`, `_boPosLean` returns the unfavored skew for any position with `_boMult` > 1 (the stamped flow and edge alone are ambiguous there), and `_boPlace` sets the trigger at `min(m × boMult, 90)` %. `_boMultStep(±1, why)` moves `boMult` (floor `MULT_BASE` = 2; decreases throttled to once per 60 s); `_boFlip` and the per-ticker trip call it for the unfavored skew, and the trip skips positions entered under an older multiplier.
-- **Invalidations**: `_boInvalidate(o)` pushes `W`/`A`/`D` + `T`/`B` into `boInval` (cap 50) from the order's or tracker's `_boFlow`, `_boEdge` and `_boMult`, read through `_boMeta`.
-- **Max positions**: `_boCapCheck` (from the `_condTrigger` wrapper after every fill, the watcher wrapper and `_boBatch`) converts each pending `breakout` order to a `boTrack` entry (`_boTrackAdd`) and cancels it with reason `breakout max positions`, which the `cancelCondOrder` wrapper leaves alone so `boEdges` survives. `_boTrackWatch` runs from the watcher wrapper: it reads prices through the host's `_condPrices`, decides with `_condHit` and resolves through `_boResolve`, `_boInvalidate`, `_boRetryAdd` and `_boMultStep`. `_boReconcile` treats tracker symbols as live. `_boTrackBar(t)` feeds the Tracked table.
+- **Live readout**: `_boRows` (best eligible cell per lean), `_boPend`, `_boHot` and `_boHypo` feed the rows in the `strategy-accordions` slot, below the config fields; `_boTipHead`, `_boTipRow` and `_boTipHypo` write the popover text. The popover opens on `pointerenter` for a mouse and on tap for touch, and every colour is one of the host's own variables.
+- **Invalidations**: `_boInvalidate(o)` pushes `W`/`A`/`D` + `T`/`B` into `boInval` (cap 50) from the order's `_boFlow`, `_boEdge` and `_boMult`, read through `_boMeta`.
+- **Max positions**: `_boCapCheck` (from the `_condTrigger` wrapper after every fill, the watcher wrapper and `_boBatch`) cancels each pending `breakout` order with reason `breakout max positions`; the `cancelCondOrder` wrapper then drops its `boEdges` and `boCellOf` entries like any other cancel.
+- **Watch lists**: `_boSimTick` runs from the `pseudoWatchCondOrders` wrapper, throttled to 30 s, and does four things in order: `_boFeedReal` (real closes into `c` samples, once each, marked `_boFed` on the closed trade), due round-1 watches through `_boRound1`, due round-2 sims through `_boRound2`, then `_boWatchFill`. `_boPrep` is shared with real orders (candles, filters, lean, price, funding). `_boKl` fetches closed candles, `_boScan` finds the first barrier touched and does the one finer fetch (`REFINE`: 240→15, 15→1, 5→1), `_boFund` adds funding, `_boSimClose` books the net result and the `boHypo` totals, and `_boSimDue` sets the next 4-hour check.
 - **Leverage**: `_boLev` uses `resolveEffectiveLeverage` where the host has it (PseudoWinter), else `leverage`.
 
 ### localStorage Keys
@@ -469,7 +480,7 @@ Each plugin's `transform(def)` receives and returns the component definition, so
 
 ### Bybit API Endpoints Used
 
-**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for Breakout's pre-entry price), `GET /v5/market/recent-trade` (Breakout's illiquidity filter), `GET /v5/market/kline` (hourly bars for Breakout, 1-minute bars for the whiplash and gap audits), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots; signing is HMAC-SHA-256 via `crypto.subtle.sign` with a 250ms minimum gap between signed requests (plugins).
+**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for Breakout's pre-entry price and funding), `GET /v5/market/recent-trade` (Breakout's illiquidity filter), `GET /v5/market/kline` (hourly bars for Breakout's average move; 5-minute, 4-hour and finer bars for its watch lists; 1-minute bars for the whiplash and gap audits), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots; signing is HMAC-SHA-256 via `crypto.subtle.sign` with a 250ms minimum gap between signed requests (plugins).
 
 **Call cadence**: the full-book `position/list` runs only before and after each scan loop. Single-symbol `position/list` calls happen around an entry and while a close is repricing. On the Psycho bots, `execution/list` is called for a pending DCA/AMa stage once price reaches its trigger, plus one sweep of every pending stage after each scan loop to catch a wick.
 

@@ -6,45 +6,43 @@
   Max Positions: the host drops a cond. that triggers past maxPos, and real orders fail if the balance is short.
   It reads the last twenty-four closed 1hr candles of each, and takes the average move: the mean candle range, (high - low) / open, in %.
 
-  Chaser (long):  cond. entry BELOW price by the average move; TP above the trigger by the average move; SL below it by the same;
-                  worse price ABOVE price by the average move.
-  Winter (short): the mirror: cond. entry ABOVE price; TP below the trigger; SL above it; worse price BELOW price.
+  Cond. geometry (k = distance multiplier, 1 / 2 / 3):
+  Chaser (long):  edge BOTTOM: cond. entry BELOW price by k x the average move, worse price ABOVE price by 1 x; edge TOP: the mirror.
+  Winter (short): the same two edges; only TP / SL differ. TP / SL are always 1 x the average move from the trigger, on the bot's own side
+                  (Chaser TP above / SL below, Winter TP below / SL above).
 
-  Entry edge: Chaser enters at the BOTTOM of the range by default, Winter at the TOP. The Enter-at setting flips it (Chaser at the top,
-              Winter at the bottom). TP / SL stay on the bot's own side of the trigger; only the trigger and worse prices swap sides.
+  Cells: every ticker belongs to a lean cohort and every cond. to an edge and a k, so a CELL is lean (U upside / D downside / N none) x edge (T / B) x k,
+  e.g. UT1. The lean is the ticker's breakout skew from its 24 candles (candles whose high / low broke past the average move from their open,
+  up vs down; ties and Ticker flow off = N). Cell labels follow the old badges: W- (with the lean), A- (against), D- (k above 1).
+
+  Scores (all in $ at the configured notional, i.e. price move % x notional = move % x leverage x base margin; $0.30 for a 5% move at base settings).
+  Each cell keeps the last Samples (default 50) of THREE data types, no decay, and its score is their sum:
+    1. First-passage (cond. orders: real and round-1 hypotheticals): trigger reached first = +k x m, worse price first = -m (m = the ticker's
+       average move %), expired = not stored. Zero-expectation for a random walk at any k, so any drift is signal. Bigger movers weigh more.
+    2. Round-2 hypothetical positions closed at TP / SL / Force Close, net of the base bot's estimated fees and of funding.
+    3. Real positions closed at TP / SL / Force Close, net (uPnL never feeds a score).
+
+  Entry choice: for each ticker the eligible cells of its lean are weighted by exp((score - best) / step) x a small prior against k above 1, and one is drawn.
+  Step = the Score step setting x one base margin ($1 at base settings). Eligible: favored lean (Chaser upside, Winter downside) and no lean = all six cells;
+  the unfavored lean (the bot would expect to lose) = the default edge (Chaser bottom, Winter top) at k 2 or 3 only.
+  Stand down: when the best eligible cell of a lean is at or below -step, no real cond. is placed for that lean (the ticker is still watched), until the scores recover.
+
+  Watch lists (hypotheticals, no orders): up to Watch tickers (default 50) random tickers pass the same filters, then every cell (2 edges x 3 k) is simulated at once.
+    Round 1: 1 order life later (default 60 min) the twelve 5-minute candles since the scan are walked per cell: trigger or worse price first. Both touched in one
+             candle = one finer (1 min) fetch for that ticker, still both = worse price first. A cell whose trigger was reached opens a hypothetical position.
+    Round 2: the position is walked to its TP / SL for as long as a real one would live (the host's Force Close Runtime). 4-hour candles bound every hour inside them
+             (inside TP / SL = nothing happened; one side touched = resolved); both touched = one finer (15 min) fetch for that ticker, still both = SL first.
+             The stretch from the end of round 1 to the next 4h boundary uses 5-minute candles. Funding is added at each funding time crossed (rate and interval from the
+             host's cache), fees come from the host's _estTradeFee at close, Force Close at the horizon books at the last close seen.
+  The HYPO row shows the hypothetical P&L; its hover compares sim vs real averages per cell (a sim that disagrees with reality is missing a cost).
+
   Tally:      each resolved order is logged by the edge price reached first: top, bottom, or neither (expired). Last 50 are kept.
-  Auto-switch: replaces the manual selector. About every minute, the uPnL of open positions entered at the current edge is compared to their
-              base margin (entry margin each); at -25% (setting) or worse the edge flips. Only positions stamped with the current edge count.
+  Invalidation: a worse-price hit proves the order's directional assumption wrong; counted by badge (W-TOP, ..., D-BOTTOM), last 50, shown in the LIVE popover.
 
-  Ticker flow: per ticker, the 24 candles are scored for breakout skew: a candle breaks past the average move upward if its high is more than the
-              average move above its open, downward if its low is more than the average move below its open (measured from the open; a candle can do
-              both). More upward breaks = upside skew, more downward breaks = downside skew, equal = no skew (that ticker uses the global edge and
-              carries no flow badge).
-              With flow: upside skew enters at the top, downside skew at the bottom. Against flow: upside skew at the bottom, downside skew at the top.
-              Upside-skew and downside-skew tickers have separate With / Against switches, so one skew can stay With while the other goes Against.
-              Badges read W-TOP / W-BOTTOM (with) and A-TOP / A-BOTTOM (against). With Auto-switch on, the uPnL rule runs per skew: it sums the
-              positions of that skew entered under its current mode and flips only that skew's switch (instead of top <-> bottom).
+  Max positions: once open positions reach the host's Max Positions, every pending Breakout cond. is cancelled and no new ones are placed (nothing is tracked
+              internally: the watch lists keep the data flowing without per-cond. price polling). Real conds resume when a slot frees.
 
-  Per-ticker trip (sub-toggle of Auto-switch): any single Breakout position whose uPnL reaches -25% (same setting) of its base margin flips the
-              switch at once (that position's skew switch With <-> Against while flow is on, else top <-> bottom). That ticker is latched, so it flips once; if it later swings to
-              +25% of its base margin it reverses the switch and is re-armed. Latches clear when the position closes.
-
-  Unfavored skew: Chaser wants upside-skew tickers (with top / against bottom), Winter downside-skew (with bottom / against top). The other skew
-              would mean expecting to lose (Chaser with bottom / against top, Winter with top / against bottom), so it never enters at the average
-              move: it places a DOUBLE entry (badge D-BOTTOM for Chaser, D-TOP for Winter) at Boost x the average move (base 2x, TP / SL and the
-              worse price unchanged), assuming the ticker keeps going and bounces / dips back later. Its With / Against switch is unused. Auto-switch
-              (uPnL rule and Per-ticker trip) raises the multiplier by 1 when positions entered under the current multiplier lose, a trip reversal
-              lowers it by 1; a double cond. that expires without reaching its trigger lowers it by 1 (at most once a minute); never below 2.
-  Invalidation: a worse-price hit proves the order's directional assumption wrong; it is counted in a separate tally by badge (W-TOP, W-BOTTOM,
-              A-TOP, A-BOTTOM, D-TOP, D-BOTTOM), last 50, shown in the LIVE popover.
-
-  Max positions: once open positions reach the host's Max Positions, every pending Breakout cond. is cancelled and no new ones are placed. Each one
-              (and each new pick from then on) becomes an internal tracker: same trigger / worse price / life, no order. Price reaching the trigger
-              logs a top / bottom break in the tally, the worse price counts as an invalidation (and requeues the ticker), expiry counts as neither
-              (and lowers the double multiplier for a double entry), exactly as a real cond. would. The check runs after every cond. fill, so no other
-              cond. can push past the cap, and on every watcher tick / batch. Trackers show in the Tracked table; real conds resume when a slot frees.
-
-  Two fixed filters run before every order (no toggles):
+  Two fixed filters run before every order and every watch (no toggles):
     Stablecoin   — the 24 candles' full span (lowest low to highest high) must be at least 1%, else the ticker is a stablecoin.
     Illiquidity  — the last 3 trades are fetched; if they average more than 12s apart the ticker is illiquid.
   A ticker failing either during random selection is graylisted for a week (a queued retry is only skipped).
@@ -53,7 +51,7 @@
   Orders expire after Order Life (default 60 min) and are simply cancelled. If price reaches the worse price first, the ticker is queued
   and goes to the front of the next batch, where its candles are re-read and a fresh order is made.
 
-  TP / SL are set at entry only in Binary Mode, so Binary Mode must be on (the plugin places nothing otherwise).
+  TP / SL are set at entry only in Binary Mode, so Binary Mode must be on (the plugin places nothing otherwise; watches and sims still run).
   Needs no other plugin. The side is read from the host at load.
 
   Load via Plugin Manager in either bot's config panel, AFTER SunChaser / EverWinter if live.
@@ -63,33 +61,37 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.10.0'; // Change: At max positions every Breakout cond. is cancelled and no new ones are placed; those tickers are tracked internally (top / bottom breaks, invalidations, expiry feed the tallies and the double multiplier) and listed in a new Tracked table with a one-bar progress view; re-checked after every cond. fill. | previous: Contradictory moves removed: the unfavored skew (Chaser downside, Winter upside) enters a double top / bottom cond. at 2x the average move (multiplier rises +1 when those positions lose, falls -1 when a double cond. expires untouched, floor 2); worse-price hits are counted as invalidations per W-/A- badge. | previous: Live readout cut to three label-free rows (LIVE: pending + break counts; UP skew; DOWN skew) using only the app's gray / theme / green / yellow / red; extra detail moved into a hover (PC) or tap (mobile) popover per row. | previous: Live readout moved into the Breakout accordion body, below the config fields, and shrunk to a compact bar-free table (entry mode + edge per skew with its loss figure, break counts, pending, trip, queue); General accordion's Mode line restored. | previous: Live readouts (pending / flow modes / auto-switch loss meters / per-ticker trip / break tally / retry queue / Binary warning) moved out of the Breakout config into the General accordion's Mode line, shown bold and colored with meters, pulses and an outcome strip. | previous: All hint text and hover tooltips are hidden behind circled "!" buttons next to their toggle or setting (click to show); Ticker flow, Auto-switch and Per-ticker trip default to on. | previous: Ticker flow With / Against is now two switches, one for upside-skew tickers and one for downside-skew tickers; Auto-switch and Per-ticker trip flip only the skew whose positions lost (or reversed). | previous: Per-ticker trip sub-toggle under Auto-switch: one position at -25% of its base margin flips the switch (and flow) once, latched; a swing to +25% reverses it and re-arms. | previous: Ticker flow: each ticker is scored toppy / bottomy from its 24 candles (breaks of the average move above the open vs below it) and enters With or Against that flow; W-/A- prefix on the TOP / BOTTOM badges; Auto-switch flips With <-> Against while flow is on. | previous: Chaser plugin glyph is the text-style hot springs symbol (fire-like) instead of the alchemical fire triangle. | previous: Auto-switch rebuilt on uPnL: flips the entry edge when open positions entered at the current edge are down 25% (setting) of their base margin, checked every minute; plugin glyph (snowflake / fire) replaces the explosion emoji. | previous: Auto-switch rule: tally in the bot's favor (Chaser: tops lead, Winter: bottoms lead) enters at the leading edge, against it at the opposite edge. | previous: TOP / BOTTOM position-type badge on pending conds and positions (needs the base bots' cond card badge slot); Auto-switch tooltip rewritten in plain English with the currently resolving edge. | previous: Entry edge setting (Chaser can enter at the top, Winter at the bottom); top / bottom / no-break tally readout; batch fills the host's Max Cond. Orders limit instead of being capped by Max Positions; tally counts fills dropped past Max Positions; Auto-switch picks the edge from the tally's skew. | previous: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
+  const VERSION = '2.1.0'; // Change: Internal tracking of conds. at max positions removed (it polled every tracked ticker's price; the watch lists replace it): at max positions pending conds are simply cancelled and none are placed, and the Tracked table, tracker storage and their tally / invalidation feed are gone | previous: Numerical cell scoring replaces Auto-switch, the per-ticker trip, the With / Against switches and the double-entry ratchet: every ticker is simulated at both edges and 1x / 2x / 3x (round 1: twelve 5m candles of the order life, round 2: the position walked to TP / SL on 4h candles with one finer fetch when both touch, funding and fees included), cond. orders, hypotheticals and real TP / SL / Force Close results feed per-cell $ scores (last 50 samples per type, no decay, uPnL no longer scored), entries are drawn by score, and a lean whose cells are all under water stands down; new Round 1 / Round 2 lists and a HYPO row | previous: At max positions every Breakout cond. is cancelled and no new ones are placed; those tickers are tracked internally (top / bottom breaks, invalidations, expiry feed the tallies and the double multiplier) and listed in a new Tracked table with a one-bar progress view; re-checked after every cond. fill. | previous: Contradictory moves removed: the unfavored skew (Chaser downside, Winter upside) enters a double top / bottom cond. at 2x the average move (multiplier rises +1 when those positions lose, falls -1 when a double cond. expires untouched, floor 2); worse-price hits are counted as invalidations per W-/A- badge. | previous: Live readout cut to three label-free rows (LIVE: pending + break counts; UP skew; DOWN skew) using only the app's gray / theme / green / yellow / red; extra detail moved into a hover (PC) or tap (mobile) popover per row. | previous: Live readout moved into the Breakout accordion body, below the config fields, and shrunk to a compact bar-free table (entry mode + edge per skew with its loss figure, break counts, pending, trip, queue); General accordion's Mode line restored. | previous: Live readouts (pending / flow modes / auto-switch loss meters / per-ticker trip / break tally / retry queue / Binary warning) moved out of the Breakout config into the General accordion's Mode line, shown bold and colored with meters, pulses and an outcome strip. | previous: All hint text and hover tooltips are hidden behind circled "!" buttons next to their toggle or setting (click to show); Ticker flow, Auto-switch and Per-ticker trip default to on. | previous: Ticker flow With / Against is now two switches, one for upside-skew tickers and one for downside-skew tickers; Auto-switch and Per-ticker trip flip only the skew whose positions lost (or reversed). | previous: Per-ticker trip sub-toggle under Auto-switch: one position at -25% of its base margin flips the switch (and flow) once, latched; a swing to +25% reverses it and re-arms. | previous: Ticker flow: each ticker is scored toppy / bottomy from its 24 candles (breaks of the average move above the open vs below it) and enters With or Against that flow; W-/A- prefix on the TOP / BOTTOM badges; Auto-switch flips With <-> Against while flow is on. | previous: Chaser plugin glyph is the text-style hot springs symbol (fire-like) instead of the alchemical fire triangle. | previous: Auto-switch rebuilt on uPnL: flips the entry edge when open positions entered at the current edge are down 25% (setting) of their base margin, checked every minute; plugin glyph (snowflake / fire) replaces the explosion emoji. | previous: Auto-switch rule: tally in the bot's favor (Chaser: tops lead, Winter: bottoms lead) enters at the leading edge, against it at the opposite edge. | previous: TOP / BOTTOM position-type badge on pending conds and positions (needs the base bots' cond card badge slot); Auto-switch tooltip rewritten in plain English with the currently resolving edge. | previous: Entry edge setting (Chaser can enter at the top, Winter at the bottom); top / bottom / no-break tally readout; batch fills the host's Max Cond. Orders limit instead of being capped by Max Positions; tally counts fills dropped past Max Positions; Auto-switch picks the edge from the tally's skew. | previous: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
   const CANDLES = 24;      // closed 1hr candles the average move is read from
   const HOUR_MS = 3600000;
   const MIN_SPAN_PCT = 1;          // stablecoin filter: least % span the 24 candles must cover
   const MAX_GAP_MS   = 12000;      // illiquidity filter: most average ms between the last 3 trades
   const GRAY_MS      = 7 * 86400000; // graylist time for a ticker that fails either filter
-  const MULT_BASE    = 2;          // double entry multiplier floor / start
-  const TALLY_WINDOW = 50;         // resolved orders the tally (and Auto-switch) looks at
+  const TALLY_WINDOW = 50;         // resolved orders the T / B / neither tally looks at
+  const SAMPLE_DEF = 50, WATCH_DEF = 50, SIM_MAX = 240; // default samples per type per cell, round-1 watch size, hard cap on live round-2 sims
+  const MIN5 = 300000, H4 = 4 * HOUR_MS;
+  const KS = [1, 2, 3];            // cond. distance multipliers (x average move) every ticker is simulated at
+  const K_PRIOR = { 1: 1, 2: 0.5, 3: 0.25 }; // starting preference per multiplier, before the scores say otherwise
+  const REFINE = { 240: 15, 60: 5, 15: 1, 5: 1 }; // candle interval (min) -> finer interval (min) fetched once when both barriers touch in one candle
   const opp = e => e === 'top' ? 'bottom' : 'top';
   let   WINTER  = false;   // set in transform() from the host
 
   const BO_DEFAULT_CFG = Object.freeze({
     boEnabled: true,   // Breakout mode
-    boLifeMins: 60,    // how long a cond. order waits before it is cancelled
-    boEntry: null,     // 'top' | 'bottom': edge of the range the cond. enters at; null = the bot's default (Chaser bottom, Winter top)
-    boAuto: true,      // Auto-switch: flips the entry edge when the current edge's open positions lose past boAutoPct, manual selector hidden
-    boAutoPct: 25,     // Auto-switch threshold: % loss of the base margin (entry margin per position) of the current edge's open positions
-    boFlowOn: true,    // Ticker flow: each ticker's edge follows its candles' breakout skew (replaces the global edge while on)
-    boFlowUp: 'with',  // 'with' | 'against' for upside-skew tickers: with -> top, against -> bottom; Auto-switch flips it while flow is on
-    boFlowDown: 'with', // 'with' | 'against' for downside-skew tickers: with -> bottom, against -> top; Auto-switch flips it while flow is on
-    boAutoTicker: true,  // Auto-switch sub-toggle: a single position at -boAutoPct of its base margin flips the switch; +boAutoPct on that ticker reverses it
-    boTickLatch: {},   // symbol -> 'L' once that ticker's loss trip flipped the switch (waits for +boAutoPct to reverse)
+    boLifeMins: 60,    // how long a cond. order waits before it is cancelled (also the round-1 watch window)
+    boFlowOn: true,    // Ticker flow: tickers are grouped into lean cohorts (U / D / N) by their candles' breakout skew; off = every ticker is N
+    boGate: true,      // Stand down: no real cond. for a lean while its best eligible cell is at or below -step
+    boSamples: 50,     // samples kept per data type per cell (no decay: this is how fast the scores move)
+    boWatchMax: 50,    // tickers watched at once in round 1
+    boStepX: 1,        // score step in base margins ($1 at base settings): softmax temperature and stand-down floor
+    boCells: {},       // cell key (e.g. 'UT1') -> { a: [$...], b: [$...], c: [$...] } first-passage / round-2 sim / real, last boSamples each
+    boCellOf: {},      // symbol -> { c: cell key, m: average move %, k } of its pending cond., so its resolution feeds the cell
+    boW1: [],          // round-1 watch list: { s, t (scan ms), p (price), m (avg move %), L (lean code), fr (funding %), fi (funding interval ms) }
+    boW2: [],          // round-2 sims: { id, s, c, e, k, m, ent, et, ck, tp, sl, sd, n, fr, fi, fa, lc, h }
+    boHypo: null,      // { n, w, pnl, dur } realized hypothetical totals (created in init)
     boEdges: {},       // symbol -> edge its pending order enters at
     boLog: [],         // last resolved orders: 'T' top reached first, 'B' bottom, 'N' neither (expired)
-    boMult: 2,         // unfavored skew: cond. distance multiplier (x average move), base 2, Auto-switch raises / lowers it
     boInval: [],       // last worse-price hits by badge: 'WT' 'WB' 'AT' 'AB' 'DT' 'DB' (W/A/D = with/against/double, T/B = top/bottom)
-    boTrack: [],       // internal trackers (virtual conds) while at max positions: { id, symbol, entryPrice, target, worst, dir, markPrice, _lastPx, createdAt, _boEdge, _boFlow?, _boMult?, _boMovePct }
     boRetry: [],       // tickers that hit the worse price, first in line for the next batch
     boWhite: {},       // symbol -> epoch ms it was confirmed liquid; skips the trade fetch for a week
     boGray: {},        // symbol -> epoch ms it was graylisted (stablecoin / illiquid), kept a week
@@ -126,14 +128,14 @@
       .bo-edge { font-weight:700; letter-spacing:1px; color:var(--text-hi); }
       .bo-num { margin-left:auto; font-weight:700; white-space:nowrap; }
       .bo-cnt { color:var(--text-lo); } .bo-cnt b { margin-left:2px; color:var(--text-hi); } .bo-cnt.lead b { color:var(--bo-acc); }
-      .bo-tbar { position:relative; height:5px; background:var(--bg-void); border-radius:2px; overflow:hidden; }
-      .bo-tbar i { position:absolute; top:0; bottom:0; background:var(--profit); } .bo-tbar i.w { background:var(--short); }
-      .bo-tbar b { position:absolute; top:0; bottom:0; width:1px; background:var(--text-mid); }
       .bo-pulse { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--short); animation:bo-pulse 1s infinite; }
       @keyframes bo-pulse { 0% { box-shadow:0 0 0 0 rgba(255,69,96,.7); } 70% { box-shadow:0 0 0 6px rgba(255,69,96,0); } 100% { box-shadow:0 0 0 0 rgba(255,69,96,0); } }
       .bo-blink { color:var(--warn); animation:bo-blink 1.6s infinite; }
       @keyframes bo-blink { 50% { opacity:.4; } }
       .bo-pop { position:absolute; left:0; right:0; top:100%; z-index:20; margin-top:2px; padding:5px 7px; font-size:9px; font-weight:400; letter-spacing:0; line-height:1.5; color:var(--text-mid); background:var(--bg-panel,#15110c); border:1px solid rgba(var(--bo-rgb),.35); border-radius:3px; box-shadow:0 4px 12px rgba(0,0,0,.5); }
+      .bo-tbl { max-height:140px; overflow-y:auto; border:1px solid rgba(255,255,255,.07); border-radius:3px; padding:2px 6px; }
+      .bo-trw { display:flex; align-items:center; gap:8px; padding:3px 0; font-family:var(--mono); font-size:10px; }
+      .bo-trw + .bo-trw { border-top:1px solid rgba(255,255,255,.05); }
     `,
 
     slots: {
@@ -153,7 +155,7 @@
               <div class="tog-t" :class="cfg.boEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.boEnabled=!cfg.boEnabled;persist()}"><div class="tog-k"></div></div>
               <div x-data="{ tip: false }">
                 <div class="tog-l">Breakout Mode<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
-                <div class="bo-hint" x-show="tip" x-text="'Cond. entry one average move ' + (cfg.boFlowOn ? 'above or below (per ticker flow)' : (_boResolveEdge() === 'top' ? 'above' : 'below')) + ' price; TP and SL one average move from the trigger.'"></div>
+                <div class="bo-hint" x-show="tip" x-text="'Cond. entry at the top or bottom of the range, 1x to 3x the average move from price, at the cell the scores favor; TP and SL one average move from the trigger.'"></div>
               </div>
             </label>
             <div x-show="cfg.boEnabled" style="margin-top:8px">
@@ -173,47 +175,36 @@
                   <div class="bo-hint" x-show="tip" x-text="_boFlowTip()"></div>
                 </div>
               </label>
-              <div x-show="cfg.boFlowOn && !cfg.boAuto && _boUnfavLean() !== 'upside'" style="display:flex;align-items:center;gap:6px;margin-top:6px">
-                <span class="lbl" style="margin:0">Upside skew</span>
-                <button type="button" class="bo-seg" :class="cfg.boFlowUp==='with'?'on':''" @click="if(!cfgLocked){cfg.boFlowUp='with';persist()}">With flow</button>
-                <button type="button" class="bo-seg" :class="cfg.boFlowUp==='against'?'on':''" @click="if(!cfgLocked){cfg.boFlowUp='against';persist()}">Against flow</button>
-              </div>
-              <div x-show="cfg.boFlowOn && !cfg.boAuto && _boUnfavLean() !== 'downside'" style="display:flex;align-items:center;gap:6px;margin-top:6px">
-                <span class="lbl" style="margin:0">Downside skew</span>
-                <button type="button" class="bo-seg" :class="cfg.boFlowDown==='with'?'on':''" @click="if(!cfgLocked){cfg.boFlowDown='with';persist()}">With flow</button>
-                <button type="button" class="bo-seg" :class="cfg.boFlowDown==='against'?'on':''" @click="if(!cfgLocked){cfg.boFlowDown='against';persist()}">Against flow</button>
-              </div>
-              <div x-show="cfg.boFlowOn" x-data="{ tip: false }" style="margin-top:6px">
+              <label class="tog" style="margin-top:6px">
+                <div class="tog-t" :class="cfg.boGate?'on':''" @click.prevent="if(!cfgLocked){cfg.boGate=!cfg.boGate;persist()}"><div class="tog-k"></div></div>
+                <div x-data="{ tip: false }">
+                  <div class="tog-l">Stand down<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
+                  <div class="bo-hint" x-show="tip" x-text="_boGateTip()"></div>
+                </div>
+              </label>
+              <div x-data="{ tip: false }" style="margin-top:8px">
                 <div style="display:flex;align-items:center;gap:6px">
-                  <span class="lbl" style="margin:0">Double entry &times;</span>
-                  <input type="number" min="2" step="1" x-model.number="cfg.boMult" @change="cfg.boMult=Math.max(2,Math.round(+cfg.boMult||2));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
+                  <span class="lbl" style="margin:0">Samples per type</span>
+                  <input type="number" min="5" step="5" x-model.number="cfg.boSamples" @change="cfg.boSamples=Math.max(5,Math.round(+cfg.boSamples||50));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
                   <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
                 </div>
-                <div class="bo-hint" x-show="tip" x-text="'The skew this bot cannot win with (' + (_boUnfavLean() === 'upside' ? 'upside' : 'downside') + ') enters a double ' + _boDefaultEdge() + ' cond. this many average moves from price (TP, SL and the worse price stay at one). Auto-switch raises it by 1 when those positions lose and lowers it by 1 when a double cond. expires untouched; never below 2.'"></div>
+                <div class="bo-hint" x-show="tip">How many of the latest samples each cell keeps for each data type (first-passage, round-2 sims, real closes). No decay: fewer samples = the scores react faster and are noisier, more = slower and steadier.</div>
               </div>
-              <div x-show="!cfg.boAuto && !cfg.boFlowOn" style="display:flex;align-items:center;gap:6px;margin-top:8px">
-                <span class="lbl" style="margin:0">Enter at</span>
-                <button type="button" class="bo-seg" :class="cfg.boEntry==='top'?'on':''" @click="if(!cfgLocked){cfg.boEntry='top';persist()}">Top</button>
-                <button type="button" class="bo-seg" :class="cfg.boEntry==='bottom'?'on':''" @click="if(!cfgLocked){cfg.boEntry='bottom';persist()}">Bottom</button>
+              <div x-data="{ tip: false }" style="margin-top:6px">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span class="lbl" style="margin:0">Watch tickers</span>
+                  <input type="number" min="0" step="5" x-model.number="cfg.boWatchMax" @change="cfg.boWatchMax=Math.max(0,Math.round(+cfg.boWatchMax||0));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
+                  <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
+                </div>
+                <div class="bo-hint" x-show="tip">Tickers quietly watched at once in round 1: every cell (top / bottom at 1x, 2x, 3x) is simulated on each, no orders. 0 turns the hypotheticals off.</div>
               </div>
-              <label class="tog" style="margin-top:8px">
-                <div class="tog-t" :class="cfg.boAuto?'on':''" @click.prevent="if(!cfgLocked){cfg.boAuto=!cfg.boAuto;persist()}"><div class="tog-k"></div></div>
-                <div x-data="{ tip: false }">
-                  <div class="tog-l">Auto-switch<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
-                  <div class="bo-hint" x-show="tip" x-text="_boAutoTip()"></div>
+              <div x-data="{ tip: false }" style="margin-top:6px">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span class="lbl" style="margin:0">Score step (&times; base margin)</span>
+                  <input type="number" min="0.1" step="0.1" x-model.number="cfg.boStepX" @change="cfg.boStepX=Math.max(0.1,+cfg.boStepX||1);persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
+                  <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
                 </div>
-              </label>
-              <label class="tog" x-show="cfg.boAuto" style="margin-top:6px">
-                <div class="tog-t" :class="cfg.boAutoTicker?'on':''" @click.prevent="if(!cfgLocked){cfg.boAutoTicker=!cfg.boAutoTicker;persist()}"><div class="tog-k"></div></div>
-                <div x-data="{ tip: false }">
-                  <div class="tog-l">Per-ticker trip<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
-                  <div class="bo-hint" x-show="tip" x-text="_boTickTip()"></div>
-                </div>
-              </label>
-              <div x-show="cfg.boAuto" style="display:flex;align-items:center;gap:6px;margin-top:6px">
-                <span class="lbl" style="margin:0">Switch at</span>
-                <input type="number" min="1" step="1" x-model.number="cfg.boAutoPct" @change="cfg.boAutoPct=Math.max(1,Math.round(+cfg.boAutoPct||25));persist()" style="width:60px;font-family:var(--mono);font-size:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.12);border-radius:3px;color:var(--text-hi);padding:2px 5px">
-                <span class="bo-hint" style="margin:0">% uPnL loss of base margin</span>
+                <div class="bo-hint" x-show="tip" x-text="_boStepTip()"></div>
               </div>
               <div class="bo-live" :class="_boHot()?'hot':''">
                 <div class="bo-lr" x-data="{ tip: false }" @pointerenter="if ($event.pointerType === 'mouse') tip = true" @pointerleave="if ($event.pointerType === 'mouse') tip = false" @click="if (($event.pointerType || 'touch') !== 'mouse') tip = !tip">
@@ -224,38 +215,54 @@
                   <span class="bo-cnt" :class="_boTally().top>_boTally().bottom?'lead':''">&#9650;<b x-text="_boTally().top"></b></span>
                   <span class="bo-cnt" :class="_boTally().bottom>_boTally().top?'lead':''">&#9660;<b x-text="_boTally().bottom"></b></span>
                   <span class="bo-cnt">&ndash;<b x-text="_boTally().none"></b></span>
-                  <span class="bo-cnt" x-show="_boTrip().latched" style="color:var(--warn)">&#9889;<b x-text="_boTrip().latched" style="color:var(--warn)"></b></span>
                   <span class="bo-cnt" x-show="(cfg.boRetry || []).length">&#8635;<b x-text="(cfg.boRetry || []).length"></b></span>
                   <div class="bo-pop" x-show="tip" x-text="_boTipHead()"></div>
                 </div>
-                <template x-for="b in _boBuckets()" :key="b.key">
+                <template x-for="r in _boRows()" :key="r.key">
                   <div class="bo-lr" x-data="{ tip: false }" @pointerenter="if ($event.pointerType === 'mouse') tip = true" @pointerleave="if ($event.pointerType === 'mouse') tip = false" @click="if (($event.pointerType || 'touch') !== 'mouse') tip = !tip">
-                    <span class="bo-sk" x-text="b.tag"></span>
-                    <span class="bo-chip" x-show="b.mode" :class="b.mode==='against'?'bo-ag':'bo-wi'" x-text="b.mult?'DOUBLE':b.mode==='against'?'AGAINST':'WITH'"></span>
-                    <span class="bo-edge" x-text="b.edge==='top'?'&#9650; TOP':'&#9660; BOTTOM'"></span>
-                    <span class="bo-edge" x-show="b.mult" x-text="b.mult + 'x'"></span>
-                    <span class="bo-num" x-show="cfg.boAuto" :style="'color:'+(b.n ? (b.up<0 ? b.col : 'var(--profit)') : 'var(--text-lo)')" x-text="_boBucketTxt(b)"></span>
-                    <div class="bo-pop" x-show="tip" x-text="_boTipBucket(b)"></div>
+                    <span class="bo-sk" x-text="r.tag"></span>
+                    <span class="bo-chip" x-show="_boRowChip(r)" :class="(r.gated||r.best.k>1)?'bo-ag':'bo-wi'" x-text="_boRowChip(r)"></span>
+                    <span class="bo-edge" x-text="r.best.edge==='top'?'&#9650; TOP':'&#9660; BOTTOM'"></span>
+                    <span class="bo-edge" x-show="r.best.k>1" x-text="r.best.k + 'x'"></span>
+                    <span class="bo-num" :style="'color:'+(r.best.S<0?'var(--short)':'var(--profit)')" x-text="_boFmt(r.best.S)"></span>
+                    <div class="bo-pop" x-show="tip" x-text="_boTipRow(r)"></div>
                   </div>
                 </template>
+                <div class="bo-lr" x-data="{ tip: false }" @pointerenter="if ($event.pointerType === 'mouse') tip = true" @pointerleave="if ($event.pointerType === 'mouse') tip = false" @click="if (($event.pointerType || 'touch') !== 'mouse') tip = !tip">
+                  <span class="bo-sk">HYPO</span>
+                  <span class="bo-cnt">n<b x-text="_boHypo().n"></b></span>
+                  <span class="bo-cnt">&#10003;<b x-text="_boHypo().win + '%'"></b></span>
+                  <span class="bo-cnt">R1<b x-text="(cfg.boW1 || []).length"></b></span>
+                  <span class="bo-cnt">R2<b x-text="(cfg.boW2 || []).length"></b></span>
+                  <span class="bo-num" :style="'color:'+(_boHypo().pnl<0?'var(--short)':'var(--profit)')" x-text="_boFmt(_boHypo().pnl)"></span>
+                  <div class="bo-pop" x-show="tip" x-text="_boTipHypo()"></div>
+                </div>
               </div>
-              <div x-show="(cfg.boTrack || []).length" style="margin-top:8px">
-                <div class="sec-ttl" style="margin-bottom:5px">Tracked <em x-text="(cfg.boTrack || []).length + '/' + (cfg.maxCond ?? 30)"></em></div>
-                <template x-for="t in (cfg.boTrack || [])" :key="t.id">
-                  <div class="cnd-card">
-                    <div class="cnd-head">
-                      <span class="pos-sym" x-text="t.symbol.replace('USDT','')"></span>
-                      <span style="display:contents" x-html="_roleBadge(t)"></span>
-                      <span class="cnd-meta" x-text="fmtAge(t.createdAt, tick)"></span>
+              <div x-data="{ o: false }" x-show="(cfg.boW1 || []).length" style="margin-top:8px">
+                <div class="sec-ttl" style="margin-bottom:5px;cursor:pointer" @click="o=!o">Round 1 <em x-text="(cfg.boW1 || []).length + '/' + (cfg.boWatchMax ?? 50)"></em></div>
+                <div class="bo-tbl" x-show="o">
+                  <template x-for="w in (cfg.boW1 || [])" :key="w.s + w.t">
+                    <div class="bo-trw">
+                      <span class="pos-sym" x-text="w.s.replace('USDT','')"></span>
+                      <span class="bo-cnt" x-text="w.L==='U'?'UP':w.L==='D'?'DOWN':'\u2014'"></span>
+                      <span class="bo-cnt" x-text="w.m.toFixed(2) + '%'"></span>
+                      <span class="bo-num" style="color:var(--text-lo)" x-text="_boW1Left(w)"></span>
                     </div>
-                    <div class="cnd-row">
-                      <span class="cnd-l">Now</span>
-                      <span class="cnd-p" x-text="fmtP(t.markPrice)"></span>
-                      <span class="bo-tbar"><i :class="_boTrackBar(t).cls" :style="'left:'+_boTrackBar(t).left+'%;width:'+_boTrackBar(t).width+'%'"></i><b :style="'left:'+_boTrackBar(t).e+'%'"></b></span>
-                      <span class="cnd-d" x-text="_boTrackBar(t).dist"></span>
+                  </template>
+                </div>
+              </div>
+              <div x-data="{ o: false }" x-show="(cfg.boW2 || []).length" style="margin-top:8px">
+                <div class="sec-ttl" style="margin-bottom:5px;cursor:pointer" @click="o=!o">Round 2 <em x-text="(cfg.boW2 || []).length"></em></div>
+                <div class="bo-tbl" x-show="o">
+                  <template x-for="s in (cfg.boW2 || [])" :key="s.id">
+                    <div class="bo-trw">
+                      <span class="pos-sym" x-text="s.s.replace('USDT','')"></span>
+                      <span class="bo-edge" x-text="_boSimLabel(s)"></span>
+                      <span class="bo-cnt" x-text="fmtAge(s.et, tick)"></span>
+                      <span class="bo-num" style="color:var(--text-lo)" x-text="_boSimLeft(s)"></span>
                     </div>
-                  </div>
-                </template>
+                  </template>
+                </div>
               </div>
               <div x-data="{ tip: false }">
                 <div class="bo-hint">🪙 Stablecoin filter · always on<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
@@ -297,19 +304,7 @@
         // Skew the bot can win with (Chaser upside, Winter downside) and the one it would expect to lose on.
         _boFavLean() { return WINTER ? 'downside' : 'upside'; },
         _boUnfavLean() { return WINTER ? 'upside' : 'downside'; },
-        _boMultNow() { return Math.max(MULT_BASE, Math.round(Number(this.cfg.boMult) || MULT_BASE)); },
-        _boMeta(o) { const g = k => (o && o[k] !== undefined) ? o[k] : o && o.candidate ? o.candidate[k] : undefined; return { edge: g('_boEdge'), flow: g('_boFlow'), mult: Number(g('_boMult')) || 0 }; },
-        // Double entry multiplier step: +1 on a loss, -1 on a reversal / untouched expiry; floor 2. Expiry drops at most once a minute (a batch expires together).
-        _boMultStep(d, why) {
-          const c = this.cfg, cur = this._boMultNow(), now = Date.now();
-          if (d < 0 && now - (this._boMultDownAt || 0) < 60000) return;
-          const nxt = Math.max(MULT_BASE, cur + d);
-          if (nxt === cur) return;
-          if (d < 0) this._boMultDownAt = now;
-          c.boMult = nxt;
-          this.log(`[BO] ${this._boGlyph()} Double entries ${d > 0 ? 'raised' : 'lowered'} to ${nxt}x (${why})`, 'warn');
-          this.persist();
-        },
+        _boMeta(o) { const g = k => (o && o[k] !== undefined) ? o[k] : o && o.candidate ? o.candidate[k] : undefined; return { edge: g('_boEdge'), flow: g('_boFlow'), mult: Number(g('_boMult')) || 0, cell: g('_boCell') }; },
         // Worse-price hit: the order's directional assumption was wrong; counted per badge.
         _boInvalidate(o) {
           const m = this._boMeta(o);
@@ -329,69 +324,73 @@
         _boDefaultEdge() { return WINTER ? 'top' : 'bottom'; },
         // Plugin symbol (text glyphs, not emoji): snowflake for Winter, fire for Chaser.
         _boGlyph() { return WINTER ? '\u2744\uFE0E' : '\u2668\uFE0E'; },
-
-        // ---- Live readout data (rendered in the General accordion's Mode line) ----
-        _boCol(f) { return f < 0.5 ? 'var(--profit)' : f < 0.8 ? 'var(--warn)' : 'var(--short)'; },
-        // One bucket per skew while flow is on (upside / downside), else one for the global edge: uPnL of its positions vs the Auto-switch limit.
-        _boBuckets() {
-          const c = this.cfg, pos = this.positions || [];
-          const per = (c.minNotional || 6) / (c.leverage || 6), pct = Number(c.boAutoPct) || 25;
-          const mk = (key, mine, extra) => {
-            const thr = pct / 100 * mine.length * per;
-            const up = mine.reduce((sum, p) => sum + (Number.isFinite(p.upnl) ? p.upnl : 0), 0);
-            const f = thr > 0 && up < 0 ? Math.min(1, -up / thr) : 0;
-            return Object.assign({ key, n: mine.length, up, thr, f, w: Math.round(f * 100), col: this._boCol(f), hot: f >= 0.8 }, extra);
-          };
-          if (c.boFlowOn) return ['upside', 'downside'].map(lean => {
-            if (lean === this._boUnfavLean()) { const mu = this._boMultNow(); return mk(lean, pos.filter(p => this._boPosLean(p) === lean && (+p._boMult || 0) === mu), { lean, mode: 'against', edge: this._boFlowEdge(lean), mult: mu, tag: lean === 'upside' ? 'UP' : 'DOWN' }); }
-            const mode = this._boFlowMode(lean);
-            return mk(lean, pos.filter(p => p._boFlow === mode && this._boPosLean(p) === lean), { lean, mode, edge: this._boFlowEdge(lean), tag: lean === 'upside' ? 'UP' : 'DOWN' });
+        // ---- Live readout data ----
+        _boU() { const c = this.cfg; return (c.minNotional || 6) / (c.leverage || 6); }, // one base margin, $
+        _boN() { return Math.max(1, Math.round(Number(this.cfg.boSamples) || SAMPLE_DEF)); },
+        _boTau() { return Math.max(1e-6, (Number(this.cfg.boStepX) || 1) * this._boU()); },
+        _boFmt(v) { return (v >= 0 ? '+' : '-') + '$' + Math.abs(v || 0).toFixed(2); },
+        _boFlowOf(L, edge) { // with / against from lean + edge; null without a lean
+          if (L === 'U') return edge === 'top' ? 'with' : 'against';
+          if (L === 'D') return edge === 'bottom' ? 'with' : 'against';
+          return null;
+        },
+        _boLabel(L, edge, k) { const f = this._boFlowOf(L, edge); return (k > 1 ? 'D-' : f === 'with' ? 'W-' : f === 'against' ? 'A-' : '') + String(edge).toUpperCase() + (k > 1 ? ' ' + k + 'x' : ''); },
+        _boCellName(key) { const p = this._boParts(key); return this._boLabel(p.L, p.edge, p.k) + (p.L === 'U' ? ' (up)' : p.L === 'D' ? ' (down)' : ''); },
+        _boParts(key) { return { L: key[0], edge: key[1] === 'T' ? 'top' : 'bottom', k: +key.slice(2) }; },
+        // One readout row per lean cohort: its best eligible cell and score.
+        _boRows() {
+          const leans = this.cfg.boFlowOn ? ['U', 'D'] : ['N'];
+          return leans.map(L => {
+            const p = this._boPick(L);
+            const best = p.rows.reduce((a, b) => (b.S > a.S ? b : a), p.rows[0]);
+            return { key: L, tag: L === 'U' ? 'UP' : L === 'D' ? 'DOWN' : 'ALL', gated: p.gated, best, rows: p.rows };
           });
-          const e = this._boResolveEdge();
-          return [mk('edge', pos.filter(p => p._boEdge === e), { lean: null, mode: null, edge: e, tag: 'EDGE' })];
         },
-        // Popover text for one skew row.
-        _boTipBucket(b) {
-          const c = this.cfg;
-          const pos = b.n + ' open position' + (b.n === 1 ? '' : 's') + (b.n ? ', uPnL ' + (b.up >= 0 ? '+' : '') + b.up.toFixed(2) + ' vs Auto-switch limit -' + b.thr.toFixed(2) : '') + (c.boAuto ? '' : ' (Auto-switch off)');
-          if (b.mult) return (b.lean === 'upside' ? 'Upside' : 'Downside') + '-skew tickers are unfavored for this bot: double ' + b.edge.toUpperCase() + ' conds sit at ' + b.mult + 'x the average move. ' + pos + ' (' + (this.cfg.boAuto ? 'a loss raises the multiplier by 1' : 'Auto-switch off') + ').';
-          if (b.lean) return (b.lean === 'upside' ? 'Upside-skew tickers (candles break up more often)' : 'Downside-skew tickers (candles break down more often)') + ' enter ' + (b.mode === 'against' ? 'AGAINST' : 'WITH') + ' flow, at the ' + b.edge.toUpperCase() + '. Entered this way: ' + pos + '.';
-          return 'New conds enter at the ' + b.edge.toUpperCase() + ' (Ticker flow off). Entered at this edge: ' + pos + '.';
+        _boRowChip(r) {
+          if (r.gated) return 'STAND DOWN';
+          if (r.best.k > 1) return 'DOUBLE';
+          const f = this._boFlowOf(r.key, r.best.edge);
+          return f === 'against' ? 'AGAINST' : f === 'with' ? 'WITH' : '';
         },
-        // Popover text for the LIVE row.
+        _boTipRow(r) {
+          const N = this._boN(), cs = r.rows.slice().sort((a, b) => b.S - a.S).map(x => this._boLabel(r.key, x.edge, x.k) + ' ' + this._boFmt(x.S)
+            + ' (R1 ' + this._boFmt(x.sc.a.v) + '/' + x.sc.a.n + ', R2 ' + this._boFmt(x.sc.b.v) + '/' + x.sc.b.n + ', real ' + this._boFmt(x.sc.c.v) + '/' + x.sc.c.n + ')');
+          const who = r.key === 'U' ? 'Upside-skew tickers (candles break up more often)' : r.key === 'D' ? 'Downside-skew tickers (candles break down more often)' : 'All tickers (Ticker flow off)';
+          return who + ': ' + (r.gated ? 'standing down, every eligible cell is at or below -' + this._boFmt(this._boTau()).slice(1) + ' so no real conds are placed here until the scores recover. ' : 'new conds are drawn from these cells, weighted by score. ')
+            + 'Score = last ' + N + ' samples of each type: ' + cs.join(' | ') + '.';
+        },
+        _boHypo() {
+          const h = this.cfg.boHypo || { n: 0, w: 0, pnl: 0, dur: 0 };
+          return { n: h.n || 0, win: h.n ? Math.round(h.w / h.n * 100) : 0, pnl: h.pnl || 0, hold: h.n ? h.dur / h.n : 0 };
+        },
+        _boTipHypo() {
+          const h = this._boHypo(), c = this.cfg, N = this._boN();
+          const avg = a => { const s = (Array.isArray(a) ? a : []).slice(-N); return { n: s.length, v: s.length ? s.reduce((x, y) => x + y, 0) / s.length : 0 }; };
+          const cells = Object.keys(c.boCells || {}).map(k => ({ k, b: avg(c.boCells[k].b), r: avg(c.boCells[k].c) })).filter(x => x.b.n || x.r.n)
+            .sort((a, b) => (b.b.n + b.r.n) - (a.b.n + a.r.n)).slice(0, 6)
+            .map(x => this._boCellName(x.k) + ' sim ' + (x.b.n ? this._boFmt(x.b.v) + '/' + x.b.n : '\u2014') + ' real ' + (x.r.n ? this._boFmt(x.r.v) + '/' + x.r.n : '\u2014'));
+          return 'Hypothetical positions closed at TP / SL / Force Close, net of estimated fees and funding: ' + h.n + ' closed, ' + h.win + '% won, ' + this._boFmt(h.pnl) + ' total'
+            + (h.n ? ', average hold ' + (h.hold / 3600000).toFixed(1) + 'h' : '') + '. Round 1 watching ' + (c.boW1 || []).length + '/' + (c.boWatchMax ?? WATCH_DEF) + ', round 2 live sims ' + (c.boW2 || []).length + '. '
+            + (cells.length ? 'Average $ per close, sim vs real (a sim that disagrees with real is missing a cost): ' + cells.join(' | ') + '.' : 'No sim or real closes yet.');
+        },
+        _boHot() { return !!this.cfg.boGate && this._boRows().some(r => r.gated); },
+        _boW1Left(w) { const left = w.t + Math.max(1, Number(this.cfg.boLifeMins) || 60) * 60000 - Date.now(); return left > 0 ? Math.ceil(left / 60000) + 'm' : 'due'; },
+        _boSimLabel(s) { const p = this._boParts(s.c); return this._boLabel(p.L, p.edge, p.k); },
+        _boSimLeft(s) { const left = s.h - Date.now(); return left > 0 ? (left / 3600000).toFixed(1) + 'h' : 'due'; },
         _boTipHead() {
-          const c = this.cfg, t = this._boTally(), p = this._boPend(), tr = this._boTrip();
-          const rq = (c.boRetry || []).map(x => String(x).replace('USDT', '')).join(', ');
-          let out = 'Pending conds ' + p.n + '/' + (c.maxCond ?? 30) + ' (' + p.top + ' top, ' + p.bottom + ' bottom). Of the last ' + t.n + ' resolved orders, price reached the top first ' + t.top + ', the bottom first ' + t.bottom + ', neither ' + t.none + '.';
-          const iv = this._boInvalTally();
-          out += ' Worse price hit (assumption invalidated), last ' + (this.cfg.boInval || []).length + ': W-TOP ' + iv.WT + ', W-BOTTOM ' + iv.WB + ', A-TOP ' + iv.AT + ', A-BOTTOM ' + iv.AB + ', D-TOP ' + iv.DT + ', D-BOTTOM ' + iv.DB + '.';
-          if ((this.cfg.boTrack || []).length) out += ' Tracked internally (max positions): ' + this.cfg.boTrack.length + '.';
-          if (tr.on) out += ' Per-ticker trip: ' + tr.latched + ' latched, worst ' + tr.txt + '.';
-          out += ' Retry queue: ' + (rq || 'empty') + '. Graylisted: ' + Object.keys(c.boGray || {}).length + '.';
-          if (!c.binaryModeEnabled) out += ' WARNING: Binary Mode is off, TP and SL are only set at entry there.';
-          return out;
+          const t = this._boTally(), w = this.cfg.boW1 ? this.cfg.boW1.length : 0, inv = this._boInvalTally();
+          const iv = Object.entries(inv).filter(([, n]) => n).map(([k, n]) => k[0] + '-' + (k[1] === 'T' ? 'TOP' : 'BOTTOM') + ' ' + n).join(', ');
+          return 'Last ' + t.n + ' resolved orders: ' + t.top + ' reached the top first, ' + t.bottom + ' the bottom first, ' + t.none + ' neither (expired). ' + (iv ? 'Worse-price hits (last ' + TALLY_WINDOW + '): ' + iv + '. ' : '')
+            + 'Resolved conds also feed the first-passage scores. ' + (this.cfg.boRetry || []).length + ' queued for retry, ' + w + ' watched in round 1.';
         },
-        _boBucketTxt(b) {
-          return b.n ? (b.up >= 0 ? '+' : '') + b.up.toFixed(2) + '/-' + b.thr.toFixed(2) : '\u2014';
+        _boFlowTip() {
+          return 'Groups tickers into lean cohorts by their candles: counts how many of the 24 broke past the average move upward vs downward (from each candle open). More upward = upside lean (U), more downward = downside lean (D), tie = none (N). Each cohort has its own cell scores. W- = entering with the lean, A- = against it. The lean the bot would expect to lose on (Chaser downside, Winter upside) only enters double or triple (D-) at the default edge. Off = every ticker is N.';
         },
-        // Per-ticker trip: worst Breakout position vs the per-position limit, and how many tickers are latched.
-        _boTrip() {
-          const c = this.cfg;
-          if (!c.boAuto || !c.boAutoTicker) return { on: false, latched: 0, f: 0, w: 0, col: '#3ddc84', txt: '' };
-          const L = c.boTickLatch || {};
-          const lim = (Number(c.boAutoPct) || 25) / 100 * ((c.minNotional || 6) / (c.leverage || 6));
-          let worst = null;
-          for (const p of (this.positions || [])) {
-            if (!(p._boEdge === 'top' || p._boEdge === 'bottom') || !Number.isFinite(p.upnl)) continue;
-            if (!worst || p.upnl < worst.upnl) worst = p;
-          }
-          const f = worst && worst.upnl < 0 && lim > 0 ? Math.min(1, -worst.upnl / lim) : 0;
-          const txt = worst ? String(worst.symbol).replace('USDT', '') + ' ' + (worst.upnl >= 0 ? '+' : '') + worst.upnl.toFixed(2) + ' / -' + lim.toFixed(2) : 'no positions yet';
-          return { on: true, latched: Object.keys(L).filter(k => L[k] === 'L').length, f, w: Math.round(f * 100), col: this._boCol(f), txt };
+        _boGateTip() {
+          return 'When the best eligible cell of a lean is at or below minus one score step (one base margin by default) no real conds are placed for that lean; its tickers are watched instead and the hypotheticals keep scoring, so entries resume once a cell recovers.';
         },
-        _boHot() {
-          const c = this.cfg;
-          return !!c.boAuto && (this._boBuckets().some(b => b.hot) || this._boTrip().f >= 0.8);
+        _boStepTip() {
+          return 'Sets how sharply scores steer entries and when a lean stands down. One step = this many base margins (base margin = Notional / Leverage, $' + this._boU().toFixed(2) + ' now, so a step is $' + this._boTau().toFixed(2) + '). A cell one step behind the best is drawn about 37% as often; a lean whose best cell is a step under water stands down.';
         },
         _boPend() {
           const n = (this.condOrders || []).filter(o => o.tag === 'breakout').length;
@@ -407,13 +406,8 @@
           for (const x of log) { if (x === 'T') top++; else if (x === 'B') bottom++; else if (x === 'N') none++; }
           return { top, bottom, none, n: log.length };
         },
-
-        // Edge the next batch enters at. Manual: the selector. Auto-switch: the dominant edge (Chaser) or its opposite (Winter), flipped by Invert; a tie keeps the current edge.
-        // Edge the next batch enters at: the selector, or whatever Auto-switch last flipped it to.
-        _boResolveEdge() {
-          const e = this.cfg.boEntry;
-          return (e === 'top' || e === 'bottom') ? e : this._boDefaultEdge();
-        },
+        // Default edge (Chaser bottom, Winter top): hint text and the unfavored lean's only edge.
+        _boResolveEdge() { return this._boDefaultEdge(); },
         // Ticker flow: score the candles. A candle breaks past the average move (m, %) upward when its high is more than m above its open, downward when its low is more than m below its open; one candle can do both.
         _boLean(candles, m) {
           let top = 0, bottom = 0;
@@ -425,124 +419,298 @@
           }
           return { top, bottom, lean: top > bottom ? 'upside' : bottom > top ? 'downside' : null };
         },
-        // Edge for a ticker under the current flow mode. With: upside skew -> top, downside skew -> bottom. Against: the opposite. Null lean: no flow.
-        _boFlowEdge(lean) {
-          if (lean && lean === this._boUnfavLean()) return this._boDefaultEdge(); // double entry: Chaser bottom, Winter top
-          const w = this._boFlowMode(lean) !== 'against';
-          return lean === 'upside' ? (w ? 'top' : 'bottom') : lean === 'downside' ? (w ? 'bottom' : 'top') : null;
-        },
-        // With / Against mode for one skew ('upside' | 'downside').
-        _boFlowMode(lean) {
-          if (lean && lean === this._boUnfavLean()) return 'against'; // double bottom / top: expects the reversal
-          return (lean === 'downside' ? this.cfg.boFlowDown : this.cfg.boFlowUp) === 'against' ? 'against' : 'with';
-        },
-        // Skew a stamped position was entered under, from its flow + edge (with+top / against+bottom = upside); null when it carries no flow stamp.
-        _boPosLean(p) {
-          const f = p && p._boFlow, e = p && p._boEdge;
-          if ((f !== 'with' && f !== 'against') || (e !== 'top' && e !== 'bottom')) return null;
-          if (p._boMult > 1) return this._boUnfavLean(); // stamped double entries only exist on the unfavored skew
-          return (e === 'top') === (f === 'with') ? 'upside' : 'downside';
-        },
-        _boFlowTip() {
-          return 'Per ticker: counts how many of its 24 candles broke past the average move upward vs downward (measured from each candle open). More upward breaks = upside skew, more downward = downside skew. With flow enters at the top on upside skew and the bottom on downside skew; against flow is the reverse. Badges read W-/A- before TOP / BOTTOM. A tie has no skew and uses the global edge. The skew this bot cannot win with (Chaser downside, Winter upside) never uses these switches: it enters double ' + (WINTER ? 'tops' : 'bottoms') + ' at the Double entry multiplier x the average move instead.';
-        },
-        _boAutoTip() {
-          if (this.cfg.boFlowOn) return 'For each skew separately, flips between entering with and against the ticker flow when the open Breakout positions of that skew entered under its current mode are down ' + (this.cfg.boAutoPct ?? 25) + '% of their base margin (the entry margin per position, DCA adds excluded) in uPnL. Checked about every minute; positions from before a switch no longer count. The unfavored skew raises the double entry multiplier by 1 instead of flipping.';
-          return 'Switches where conditionals are set (top or bottom of the range) when the open Breakout positions entered at the current edge are down ' + (this.cfg.boAutoPct ?? 25) + '% of their base margin (the entry margin per position, DCA adds excluded) in uPnL. Checked about every minute; positions from before a switch no longer count.';
-        },
-
-        // Auto-switch: uPnL of the positions that entered at the current edge vs their base margin. Loss only; flips the edge.
-        _boAutoCheck() {
+        // ---- Cell scores ----
+        // A cell = lean cohort (U / D / N) x edge (T / B) x k, e.g. 'UT1'. Per cell, three sample types (last boSamples each, $ at the configured notional):
+        //   a  first-passage: cond. orders (real, round-1 hypotheticals): trigger first = +k*m, worse first = -m (expired = not stored)
+        //   b  round-2 hypothetical positions closed at TP / SL / Force Close, net of fees and funding
+        //   c  real positions closed at TP / SL / Force Close, net
+        _boLeanCode(l) { return l === 'upside' ? 'U' : l === 'downside' ? 'D' : 'N'; },
+        _boCellKey(L, edge, k) { return (L || 'N') + (edge === 'top' ? 'T' : 'B') + k; },
+        _boSample(key, type, v) {
+          if (!key || !Number.isFinite(v)) return;
           const c = this.cfg;
-          if (!c.boAuto) return;
-          const now = Date.now();
-          if (now - (this._boAutoAt || 0) < 60000) return;
-          this._boAutoAt = now;
-          if (c.boAutoTicker && this._boTickCheck()) return;
-          const flowOn = !!c.boFlowOn;
-          for (const lean of (flowOn ? ['upside', 'downside'] : [null])) {
-            const cur = flowOn ? this._boFlowMode(lean) : this._boResolveEdge();
-            const mine = (this.positions || []).filter(p => flowOn ? (p._boFlow === cur && this._boPosLean(p) === lean && (lean !== this._boUnfavLean() || (+p._boMult || 0) === this._boMultNow())) : p._boEdge === cur);
-            if (!mine.length) continue;
-            const base = mine.length * ((c.minNotional || 6) / (c.leverage || 6));
-            const up = mine.reduce((sum, p) => sum + (Number.isFinite(p.upnl) ? p.upnl : 0), 0);
-            const thr = (Number(c.boAutoPct) || 25) / 100 * base;
-            if (up > -thr) continue;
-            this._boFlip(`${flowOn ? lean + ' ' : ''}${cur}${flowOn ? '-flow' : ''} positions at ${up.toFixed(2)} USDT (limit -${thr.toFixed(2)})`, lean);
+          if (!c.boCells || typeof c.boCells !== 'object') c.boCells = {};
+          const cell = c.boCells[key] || (c.boCells[key] = { a: [], b: [], c: [] });
+          const arr = Array.isArray(cell[type]) ? cell[type] : (cell[type] = []);
+          arr.push(+v.toFixed(4));
+          const N = this._boN();
+          if (arr.length > N) arr.splice(0, arr.length - N);
+        },
+        _boCellScore(key) {
+          const N = this._boN(), cell = (this.cfg.boCells || {})[key] || {};
+          const sum = a => { const s = (Array.isArray(a) ? a : []).slice(-N); return { n: s.length, v: s.reduce((x, y) => x + y, 0) }; };
+          const a = sum(cell.a), b = sum(cell.b), c = sum(cell.c);
+          return { a, b, c, S: a.v + b.v + c.v };
+        },
+        // Cells a lean may enter at. Unfavored lean (Chaser downside, Winter upside): default edge at k 2 / 3 only. Everything else: all six.
+        _boEligible(L) {
+          const out = [], unfav = WINTER ? 'U' : 'D';
+          for (const edge of ['top', 'bottom']) for (const k of KS) {
+            if (this.cfg.boFlowOn && L === unfav && (edge !== this._boDefaultEdge() || k < 2)) continue;
+            out.push({ edge, k });
           }
+          return out;
+        },
+        // Weighted draw among a lean's eligible cells: exp((score - best) / step) x prior(k). gated = every eligible cell at or below -step.
+        _boPick(L) {
+          const tau = this._boTau();
+          const rows = this._boEligible(L).map(x => { const key = this._boCellKey(L, x.edge, x.k), sc = this._boCellScore(key); return { edge: x.edge, k: x.k, key, sc, S: sc.S }; });
+          const mx = Math.max(...rows.map(r => r.S));
+          const gated = this.cfg.boGate !== false && mx <= -tau;
+          let tot = 0;
+          for (const r of rows) { r.w = (K_PRIOR[r.k] || 0.25) * Math.exp((r.S - mx) / tau); tot += r.w; }
+          let u = Math.random() * tot, pick = rows[rows.length - 1];
+          for (const r of rows) { u -= r.w; if (u <= 0) { pick = r; break; } }
+          return { pick, rows, gated, mx, tau };
         },
 
-        // Flips the switch: that skew's With <-> Against while flow is on, else top <-> bottom.
-        _boFlip(why, lean, back) {
-          const c = this.cfg;
-          if (c.boFlowOn) {
-            if (lean !== 'upside' && lean !== 'downside') return;
-            if (lean === this._boUnfavLean()) { this._boMultStep(back ? -1 : 1, why); return; }
-            const k = lean === 'downside' ? 'boFlowDown' : 'boFlowUp';
-            c[k] = this._boFlowMode(lean) === 'against' ? 'with' : 'against';
-            this.log(`[BO] ${this._boGlyph()} Auto-switch: ${why} — ${lean}-skew tickers now entering ${c[k]} flow`, 'warn');
-          } else {
-            c.boEntry = opp(this._boResolveEdge());
-            this.log(`[BO] ${this._boGlyph()} Auto-switch: ${why} — now entering at the ${c.boEntry}`, 'warn');
+        // Real positions closed at TP / SL / Force Close feed their cell once (stamped _boCell). Reads closedTrades so gap-audit closes count too.
+        _boFeedReal() {
+          const ct = this.closedTrades;
+          if (!Array.isArray(ct)) return false;
+          let any = false;
+          for (let i = 0; i < Math.min(ct.length, 60); i++) {
+            const t = ct[i];
+            if (!t || !t._boCell || t._boFed || !(t.reason === 'tp' || t.reason === 'sl' || t.reason === 'force') || !Number.isFinite(t.totalPnl)) continue;
+            t._boFed = true;
+            this._boSample(t._boCell, 'c', t.totalPnl);
+            any = true;
           }
-          this.persist();
+          return any;
         },
 
-        _boTickTip() {
-          const pct = this.cfg.boAutoPct ?? 25;
-          return 'Any single Breakout position at -' + pct + '% of its base margin in uPnL flips the switch right away, once per ticker. If that ticker later swings to +' + pct + '% it reverses the switch and is re-armed. Latches clear when the position closes.';
-        },
-
-        // Per-ticker trip: a loss at -pct flips and latches the ticker; a latched ticker at +pct reverses the flip and re-arms. Returns true when it flipped.
-        _boTickCheck() {
-          const c = this.cfg;
-          if (!c.boTickLatch || typeof c.boTickLatch !== 'object') c.boTickLatch = {};
-          const L = c.boTickLatch;
-          const mine = (this.positions || []).filter(p => (p._boEdge === 'top' || p._boEdge === 'bottom') && (!c.boFlowOn || this._boPosLean(p)));
-          const held = new Set(mine.map(p => p.symbol));
-          for (const k of Object.keys(L)) if (!held.has(k)) delete L[k];
-          const lim = (Number(c.boAutoPct) || 25) / 100 * ((c.minNotional || 6) / (c.leverage || 6));
-          for (const p of mine) {
-            if (!Number.isFinite(p.upnl)) continue;
-            if (L[p.symbol] === 'L') {
-              if (p.upnl < lim) continue;
-              delete L[p.symbol];
-              this._boFlip(`${p.symbol} swung to ${p.upnl.toFixed(2)} USDT (limit +${lim.toFixed(2)}), reversing`, this._boPosLean(p), true);
-              return true;
+        // ---- Hypotheticals (watch lists) ----
+        _boRtMs() { return Math.max(0.1, Number(this.cfg.runtimeHours ?? 12)) * 3600000; },
+        // Closed candles of one interval (min) from startMs, n of them, oldest first. Memoised per tick. Null when the read fails.
+        async _boKl(sym, ivMin, startMs, n, memo) {
+          const ivMs = ivMin * 60000, key = sym + '|' + ivMin + '|' + startMs + '|' + n;
+          if (memo && memo.has(key)) return memo.get(key);
+          let out = null;
+          try {
+            const url = `${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=${ivMin}&start=${startMs}&end=${startMs + n * ivMs - 1}&limit=${n}`;
+            const r = await (typeof this._qFetch === 'function' ? this._qFetch(url) : fetch(url));
+            const list = (await r.json())?.result?.list;
+            if (Array.isArray(list)) {
+              const now = Date.now();
+              out = list.map(x => ({ t: +x[0], o: +x[1], h: +x[2], l: +x[3], c: +x[4] })).filter(x => x.t > 0 && x.t + ivMs <= now).sort((a, b) => a.t - b.t);
             }
-            if (p.upnl > -lim) continue;
-            if (this._boPosLean(p) === this._boUnfavLean() && (+p._boMult || 0) !== this._boMultNow()) continue; // entered under an older multiplier
-            L[p.symbol] = 'L';
-            this._boFlip(`${p.symbol} at ${p.upnl.toFixed(2)} USDT (limit -${lim.toFixed(2)})`, this._boPosLean(p));
-            return true;
-          }
-          this.persist();
-          return false;
+          } catch (e) { out = null; }
+          if (memo) memo.set(key, out);
+          return out;
         },
-
-        // Logs one resolved order: hit = 'entry' (trigger reached), 'worse' (worse price reached) or 'none' (expired).
+        // First barrier touched. bars = { up, dn, adv } (adv: the adverse barrier, taken when order cannot be resolved). Both touched in one candle = one finer fetch, then adverse first.
+        async _boScan(sym, cs, ivMin, bars, memo, refine = true) {
+          const ivMs = ivMin * 60000;
+          for (const c of cs) {
+            const hu = c.h >= bars.up, hd = c.l <= bars.dn;
+            if (!hu && !hd) continue;
+            if (hu && hd) {
+              const f = refine ? REFINE[ivMin] : 0;
+              if (f) {
+                const fine = await this._boKl(sym, f, c.t, ivMin / f, memo);
+                if (fine && fine.length) { const r = await this._boScan(sym, fine, f, bars, memo, false); if (r) return r; }
+              }
+              return { tag: bars.adv, t: c.t + ivMs, px: bars.adv === 'dn' ? bars.dn : bars.up };
+            }
+            return hu ? { tag: 'up', t: c.t + ivMs, px: bars.up } : { tag: 'dn', t: c.t + ivMs, px: bars.dn };
+          }
+          return null;
+        },
+        // TP / SL bars of a sim on the bot's own side of the trigger: Chaser TP above / SL below, Winter the reverse.
+        _boPosBars(s) { return s.sd > 0 ? { up: s.tp, dn: s.sl, adv: 'dn' } : { up: s.sl, dn: s.tp, adv: 'up' }; },
+        _boReason(s, tag) { return (tag === 'up') === (s.sd > 0) ? 'tp' : 'sl'; },
+        // Funding accrued up to toMs (before sim.ck moves): one charge per funding time crossed, rate / interval from the host's cache, else the scan-time values.
+        _boFund(s, toMs) {
+          const cached = this._klineCache && this._klineCache['fr_' + s.s];
+          const iv = (cached && cached.intervalMs) || s.fi || 28800000;
+          const rate = cached && cached.rate != null ? cached.rate : s.fr;
+          if (!Number.isFinite(rate) || !(iv > 0)) return;
+          const cnt = Math.floor(toMs / iv) - Math.floor(s.ck / iv);
+          if (cnt > 0) s.fa += -s.sd * (rate / 100) * s.n * cnt;
+        },
+        // Books a hypothetical close: price P&L at the configured notional, plus funding, minus the host's fee estimate.
+        _boSimClose(s, reason, px, tMs) {
+          const c = this.cfg;
+          const pnl = s.sd * (px - s.ent) / s.ent * s.n;
+          let fee = 0;
+          try { fee = Number(this._estTradeFee({ entryPrice: s.ent, totalSize: s.n / s.ent, _pseudo: true }, px)) || 0; } catch (e) {}
+          const net = pnl + s.fa - fee;
+          this._boSample(s.c, 'b', net);
+          if (!c.boHypo || typeof c.boHypo !== 'object') c.boHypo = { n: 0, w: 0, pnl: 0, dur: 0 };
+          c.boHypo.n++; if (net > 0) c.boHypo.w++; c.boHypo.pnl += net; c.boHypo.dur += Math.max(0, tMs - s.et);
+        },
+        _boSimNew(w, x, N) {
+          const c = this.cfg, sd = WINTER ? -1 : 1, m = w.m;
+          return {
+            id: w.s + ':' + x.key + ':' + x.t, s: w.s, c: x.key, e: x.edge, k: x.k, m, ent: x.trig, et: x.t, ck: x.t,
+            tp: x.trig * (1 + sd * m / 100), sl: x.trig * (1 - sd * m / 100), sd, n: N, fr: w.fr, fi: w.fi, fa: 0, lc: x.trig, h: x.t + this._boRtMs(),
+          };
+        },
+        // Round 1: the scan-time grid (2 edges x 3 k) against the twelve 5m candles of the order life. Trigger first / worse first feed the first-passage scores;
+        // a cell whose trigger was reached becomes a round-2 sim, started at the end of the candle it triggered in and walked through the rest of the window.
+        // Returns true when done with this watch (also when dropped), false to retry later.
+        async _boRound1(w, memo) {
+          const c = this.cfg, N = c.minNotional || 6, life = Math.max(1, Number(c.boLifeMins) || 60) * 60000, now = Date.now();
+          if (now > w.t + life + 3600000) return true;
+          const start = Math.ceil(w.t / MIN5) * MIN5, end = Math.floor((w.t + life) / MIN5) * MIN5;
+          if (end <= start) return true;
+          const cs = await this._boKl(w.s, 5, start, Math.min(200, (end - start) / MIN5), memo);
+          if (!cs) return false;
+          const win = cs.filter(x => x.t >= start && x.t < end);
+          if (!win.length) return false;
+          const m = w.m, p = w.p;
+          const w2 = Array.isArray(c.boW2) ? c.boW2 : (c.boW2 = []);
+          let hits = 0;
+          for (const edge of ['top', 'bottom']) for (const k of KS) {
+            const dir = edge === 'top' ? 1 : -1, dist = Math.min(m * k, 90);
+            const trig = p * (1 + dir * dist / 100), worse = p * (1 - dir * m / 100);
+            const bars = dir > 0 ? { up: trig, dn: worse, adv: 'dn' } : { up: worse, dn: trig, adv: 'up' };
+            const r = await this._boScan(w.s, win, 5, bars, memo);
+            if (!r) continue;
+            const key = this._boCellKey(w.L, edge, k), trigFirst = dir > 0 ? r.tag === 'up' : r.tag === 'dn';
+            this._boSample(key, 'a', trigFirst ? dist / 100 * N : -m / 100 * N);
+            if (!trigFirst) continue;
+            hits++;
+            if (w2.length >= SIM_MAX) continue;
+            const sim = this._boSimNew(w, { key, edge, k, trig, t: r.t }, N);
+            const rest = win.filter(x => x.t >= sim.et);
+            const rr = rest.length ? await this._boScan(w.s, rest, 5, this._boPosBars(sim), memo) : null;
+            if (rr) { this._boFund(sim, rr.t); sim.ck = rr.t; this._boSimClose(sim, this._boReason(sim, rr.tag), rr.px, rr.t); continue; }
+            this._boFund(sim, end); sim.ck = Math.max(sim.ck, end); sim.lc = rest.length ? rest[rest.length - 1].c : sim.lc;
+            w2.push(sim);
+          }
+          return true;
+        },
+        // Round 2: advance one sim to now (or its horizon): 4h candles from a 4h boundary, 5m candles for the stretch up to the next boundary or the horizon.
+        // Returns 'closed' when booked, true when advanced / waiting, false when a fetch failed.
+        async _boRound2(s, memo) {
+          const now = Date.now(), tgt = Math.min(now, s.h), bars = this._boPosBars(s);
+          let guard = 0;
+          while (s.ck < tgt && guard++ < 14) {
+            const ck = s.ck, b = Math.ceil(ck / H4) * H4;
+            let cs, iv;
+            if (b === ck && ck + H4 <= tgt) {
+              const n = Math.min(12, Math.floor((tgt - ck) / H4));
+              iv = 240; cs = await this._boKl(s.s, 240, ck, n, memo);
+              if (cs) cs = cs.filter(x => x.t >= ck && x.t + H4 <= tgt);
+            } else {
+              const segEnd = b > ck ? Math.min(tgt, b) : Math.min(tgt, ck + H4);
+              const s5 = Math.ceil(ck / MIN5) * MIN5, e5 = Math.floor(segEnd / MIN5) * MIN5;
+              if (e5 <= s5) break;
+              iv = 5; cs = await this._boKl(s.s, 5, s5, Math.min(200, (e5 - s5) / MIN5), memo);
+              if (cs) cs = cs.filter(x => x.t >= s5 && x.t < e5);
+            }
+            if (!cs) return false;
+            if (!cs.length) break;
+            const r = await this._boScan(s.s, cs, iv, bars, memo);
+            if (r) { this._boFund(s, r.t); s.ck = r.t; this._boSimClose(s, this._boReason(s, r.tag), r.px, r.t); return 'closed'; }
+            const last = cs[cs.length - 1], nk = last.t + iv * 60000;
+            this._boFund(s, nk); s.ck = nk; s.lc = last.c;
+          }
+          if (now >= s.h && s.h - s.ck < MIN5) { this._boFund(s, s.h); s.ck = s.h; this._boSimClose(s, 'force', s.lc, s.h); return 'closed'; }
+          return true;
+        },
+        // A sim is due at the next 4h boundary after what it has covered (or its horizon, if sooner), plus a little for the candle to be published.
+        _boSimDue(s, now) {
+          const nb = s.ck % H4 === 0 ? s.ck + H4 : Math.ceil(s.ck / H4) * H4;
+          return now >= Math.min(s.h, nb) + 30000;
+        },
+        _boWatchAdd(pr) {
+          const c = this.cfg;
+          if (!Array.isArray(c.boW1)) c.boW1 = [];
+          if (c.boW1.some(x => x.s === pr.sym)) return false;
+          c.boW1.push({ s: pr.sym, t: Date.now(), p: pr.price, m: +pr.m.toFixed(3), L: pr.L, fr: pr.fr, fi: pr.fi });
+          return true;
+        },
+        // Keeps the round-1 list full: random tickers through the same filters as real orders. A few per tick to spread the fetches.
+        async _boWatchFill() {
+          const c = this.cfg, max = Math.max(0, Math.round(Number(c.boWatchMax) || 0));
+          if (!max) return false;
+          const w1 = Array.isArray(c.boW1) ? c.boW1 : (c.boW1 = []);
+          const room = max - w1.length;
+          if (room <= 0) return false;
+          const taken = new Set([...(this.positions || []).map(p => p.symbol), ...(this.condOrders || []).map(o => o.symbol),
+            ...w1.map(x => x.s), ...(c.boW2 || []).map(x => x.s)]);
+          const mega = new Set(Array.isArray(c.megacapExclude) ? c.megacapExclude : []);
+          const pool = (this._lastAllTickers || []).filter(t => t.symbol && t.symbol.endsWith('USDT') && !taken.has(t.symbol) && !mega.has(t.symbol)
+            && !(t.symbol in c.boGray) && parseFloat(t.lastPrice || 0) > 0 && !this._isSymbolBanned?.(t.symbol));
+          for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+          let added = 0, tries = 0;
+          for (const t of pool) {
+            if (added >= Math.min(room, 6) || tries >= 12) break;
+            tries++;
+            try { const pr = await this._boPrep(t.symbol, t, false, false); if (pr && this._boWatchAdd(pr)) added++; }
+            catch (e) { this.log(`[BO] watch ${t.symbol} error: ${e.message}`, 'warn'); }
+          }
+          return tries > 0;
+        },
+        // One pass every 30s (rides the cond. order watcher): real closes feed the scores, due round-1 / round-2 items are walked (a few tickers per pass), the list is refilled.
+        async _boSimTick() {
+          const c = this.cfg;
+          if (!c.boEnabled || this._boSimBusy) return;
+          const now = Date.now();
+          if (now - (this._boSimAt || 0) < 30000) return;
+          this._boSimAt = now; this._boSimBusy = true;
+          let dirty = false;
+          try {
+            if (this._boFeedReal()) dirty = true;
+            const memo = new Map(), life = Math.max(1, Number(c.boLifeMins) || 60) * 60000;
+            let budget = 8;
+            for (const w of (c.boW1 || []).slice()) {
+              if (budget <= 0) break;
+              if (now < Math.floor((w.t + life) / MIN5) * MIN5 + MIN5 + 15000 || now < w.t + life) continue;
+              budget--;
+              let ok = false;
+              try { ok = await this._boRound1(w, memo); } catch (e) { this.log(`[BO] round 1 ${w.s} error: ${e.message}`, 'warn'); }
+              if (ok) { c.boW1 = c.boW1.filter(x => x !== w); dirty = true; }
+            }
+            const seen = new Set();
+            for (const s of (c.boW2 || []).slice()) {
+              if (!this._boSimDue(s, now)) continue;
+              if (!seen.has(s.s)) { if (budget <= 0) continue; budget--; seen.add(s.s); }
+              let res = false;
+              try { res = await this._boRound2(s, memo); } catch (e) { this.log(`[BO] round 2 ${s.s} error: ${e.message}`, 'warn'); }
+              if (res === 'closed' || now > s.h + 86400000) c.boW2 = c.boW2.filter(x => x !== s);
+              dirty = true;
+            }
+            if (await this._boWatchFill()) dirty = true;
+            if (dirty) this.persist();
+          } finally { this._boSimBusy = false; }
+        },
+        // Logs one resolved order: hit = 'entry' (trigger reached), 'worse' (worse price reached) or 'none' (expired). Trigger / worse also feed the cell's first-passage scores.
         _boResolve(sym, hit) {
           const edges = this.cfg.boEdges || {};
           const edge = edges[sym];
           if (!edge) return;
           delete edges[sym];
+          const mt = this.cfg.boCellOf && this.cfg.boCellOf[sym];
+          if (this.cfg.boCellOf) delete this.cfg.boCellOf[sym];
+          if (mt && mt.c && mt.m > 0 && hit !== 'none') {
+            const N = this.cfg.minNotional || 6;
+            this._boSample(mt.c, 'a', hit === 'entry' ? Math.min(mt.m * (mt.k || 1), 90) / 100 * N : -mt.m / 100 * N);
+          }
           const side = hit === 'entry' ? edge : hit === 'worse' ? opp(edge) : null;
           if (!Array.isArray(this.cfg.boLog)) this.cfg.boLog = [];
           this.cfg.boLog.push(side === 'top' ? 'T' : side === 'bottom' ? 'B' : 'N');
           if (this.cfg.boLog.length > TALLY_WINDOW) this.cfg.boLog.splice(0, this.cfg.boLog.length - TALLY_WINDOW);
           this.persist();
         },
+        _boSetMeta(sym, cand) {
+          const c = this.cfg;
+          if (!c.boCellOf || typeof c.boCellOf !== 'object') c.boCellOf = {};
+          if (cand && cand._boCell) c.boCellOf[sym] = { c: cand._boCell, m: cand._boMovePct, k: cand._boMult || 1 };
+        },
 
-        // Fallback for fills that bypass _condTrigger (live plugins): a tracked order gone from the cond. list with a position on the ticker was triggered; any other disappearance is dropped from the tally.
+        // Fallback for fills that bypass _condTrigger (live plugins): a pending order gone from the cond. list with a position on the ticker was triggered; any other disappearance is dropped from the tally.
         _boReconcile() {
           const edges = this.cfg.boEdges;
           if (!edges) return;
-          const live = new Set([...(this.condOrders || []).filter(o => o.tag === 'breakout').map(o => o.symbol), ...(this.cfg.boTrack || []).map(t => t.symbol)]);
+          const live = new Set([...(this.condOrders || []).filter(o => o.tag === 'breakout').map(o => o.symbol)]);
           const held = new Set((this.positions || []).map(p => p.symbol));
           let dirty = false;
           for (const sym of Object.keys(edges)) {
             if (live.has(sym)) continue;
-            if (held.has(sym)) this._boResolve(sym, 'entry'); else delete edges[sym];
+            if (held.has(sym)) this._boResolve(sym, 'entry'); else { delete edges[sym]; if (this.cfg.boCellOf) delete this.cfg.boCellOf[sym]; }
             dirty = true;
           }
           if (dirty) this.persist();
@@ -550,7 +718,7 @@
 
         _boStatus() {
           const q = this.cfg.boRetry || [];
-          return (this.cfg.boFlowOn ? 'Up ' + this._boFlowMode('upside') + ' / Down ' + this._boFlowMode('downside') + ' flow · ' : '') + 'Pending ' + (this.condOrders || []).filter(o => o.tag === 'breakout').length + '/' + (this.cfg.maxCond ?? 30) + ' · Tracked ' + (this.cfg.boTrack || []).length + ' · Retry queue ' + (q.length ? q.map(s => s.replace('USDT', '')).join(', ') : 'empty') + ' · Graylisted ' + Object.keys(this.cfg.boGray || {}).length;
+          return 'Pending ' + (this.condOrders || []).filter(o => o.tag === 'breakout').length + '/' + (this.cfg.maxCond ?? 30) + ' · Watching R1 ' + (this.cfg.boW1 || []).length + ' / R2 ' + (this.cfg.boW2 || []).length + ' · Retry queue ' + (q.length ? q.map(s => s.replace('USDT', '')).join(', ') : 'empty') + ' · Graylisted ' + Object.keys(this.cfg.boGray || {}).length;
         },
 
         async init() {
@@ -566,23 +734,17 @@
             const ttl = dm ? 'Breakout double ' + e + ', ' + (item._boMult || item.candidate._boMult) + 'x' : (f === 'with' ? 'Breakout with flow, ' + e : f === 'against' ? 'Breakout against flow, ' + e : 'Breakout ' + e);
             return `<span title="${ttl}" style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid rgba(var(--bo-rgb),.35);background:rgba(var(--bo-rgb),.15);color:var(--bo-acc)">${pre}${e.toUpperCase()}</span>`;
           });
-          if (this.cfg.boFlow !== undefined) {
-            if (this.cfg.boFlowUp === undefined) this.cfg.boFlowUp = this.cfg.boFlow === 'against' ? 'against' : 'with';
-            if (this.cfg.boFlowDown === undefined) this.cfg.boFlowDown = this.cfg.boFlowUp;
-            delete this.cfg.boFlow;
-          }
           for (const [k, v] of Object.entries(BO_DEFAULT_CFG)) {
-            if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : v;
+            if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : (v && typeof v === 'object' ? { ...v } : v);
           }
           if (!Array.isArray(this.cfg.boRetry)) this.cfg.boRetry = [];
-          this.cfg.boMult = this._boMultNow();
-          this.cfg.boTrack = (Array.isArray(this.cfg.boTrack) ? this.cfg.boTrack : []).filter(t => t && t.symbol && t.target > 0 && t.worst > 0 && (t._boEdge === 'top' || t._boEdge === 'bottom'));
-          for (const t of this.cfg.boTrack) if (!this.cfg.boEdges[t.symbol]) this.cfg.boEdges[t.symbol] = t._boEdge;
           this.cfg.boInval = (Array.isArray(this.cfg.boInval) ? this.cfg.boInval : []).filter(x => /^[WAD][TB]$/.test(x)).slice(-TALLY_WINDOW);
-          if (this.cfg.boEntry !== 'top' && this.cfg.boEntry !== 'bottom') this.cfg.boEntry = this._boDefaultEdge();
           this.cfg.boLog = (Array.isArray(this.cfg.boLog) ? this.cfg.boLog : []).filter(x => x === 'T' || x === 'B' || x === 'N').slice(-TALLY_WINDOW);
-          for (const k of ['boGray', 'boWhite', 'boEdges', 'boTickLatch']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
-          for (const t of this.cfg.boTrack) this.cfg.boEdges[t.symbol] = t._boEdge;
+          for (const k of ['boGray', 'boWhite', 'boEdges', 'boCellOf', 'boCells']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
+          for (const k of ['boW1', 'boW2']) this.cfg[k] = (Array.isArray(this.cfg[k]) ? this.cfg[k] : []).filter(x => x && x.s && x.p !== 0);
+          if (!this.cfg.boHypo || typeof this.cfg.boHypo !== 'object') this.cfg.boHypo = { n: 0, w: 0, pnl: 0, dur: 0 };
+          for (const k of Object.keys(this.cfg.boCells)) { const x = this.cfg.boCells[k]; if (!/^[UDN][TB][123]$/.test(k) || !x || typeof x !== 'object') { delete this.cfg.boCells[k]; continue; } for (const t of ['a', 'b', 'c']) if (!Array.isArray(x[t])) x[t] = []; }
+          for (const k of ['boAuto', 'boAutoPct', 'boAutoTicker', 'boTickLatch', 'boFlowUp', 'boFlowDown', 'boMult', 'boEntry', 'boFlow', 'boTrack']) delete this.cfg[k]; // retired Auto-switch settings
           // Orders pending from before the edge setting all entered at the bot's default edge.
           for (const o of (this.condOrders || [])) if (o.tag === 'breakout' && !this.cfg.boEdges[o.symbol]) this.cfg.boEdges[o.symbol] = this._boDefaultEdge();
         },
@@ -593,17 +755,19 @@
           const ok = await _origCancel.call(this, id, reason);
           if (ok && o && o.tag === 'breakout') {
             if (/^worst case reached/.test(String(reason))) { this._boResolve(o.symbol, 'worse'); this._boRetryAdd(o.symbol); this._boInvalidate(o); }
-            else if (reason === 'breakout max positions') { /* tracker took over: keep its edge */ }
-            else if (reason === 'breakout expired') { this._boResolve(o.symbol, 'none'); if (this._boMeta(o).mult > 1) this._boMultStep(-1, o.symbol + ' double cond. expired untouched'); }
-            else if (this.cfg.boEdges) delete this.cfg.boEdges[o.symbol];
+            else if (reason === 'breakout expired') this._boResolve(o.symbol, 'none');
+            else if (this.cfg.boEdges) { delete this.cfg.boEdges[o.symbol]; if (this.cfg.boCellOf) delete this.cfg.boCellOf[o.symbol]; }
           }
           return ok;
         },
 
-        // Expiry rides the cond. order watcher so it fires on time rather than at the next scan.
+        // Expiry rides the cond. order watcher so it fires on time rather than at the next scan; the hypotheticals tick here too (throttled to 30s).
         async pseudoWatchCondOrders() {
           const r = await _origWatch.call(this);
-          if (this._boLoaded) { try { this._boAutoCheck(); this._boReconcile(); await this._boExpire(); await this._boCapCheck(); await this._boTrackWatch(); } catch (e) { this.log(`[BO] expiry error: ${e.message}`, 'warn'); } }
+          if (this._boLoaded) {
+            try { this._boReconcile(); await this._boExpire(); await this._boCapCheck(); } catch (e) { this.log(`[BO] expiry error: ${e.message}`, 'warn'); }
+            try { await this._boSimTick(); } catch (e) { this.log(`[BO] sim error: ${e.message}`, 'warn'); }
+          }
           return r;
         },
 
@@ -617,77 +781,17 @@
 
         _boAtCap() { return (this.positions || []).length >= (this.cfg.maxPos ?? 5); },
 
-        // Internal tracker: a cond. order that exists only here. Same fields the host's _condHit reads.
-        _boTrackAdd(src) {
-          const c = this.cfg, cand = src.candidate || {};
-          if (!Array.isArray(c.boTrack)) c.boTrack = [];
-          if (c.boTrack.some(t => t.symbol === src.symbol)) return null;
-          const t = {
-            id: `trk_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-            symbol: src.symbol, entryPrice: src.entryPrice, target: src.target, worst: src.worst,
-            dir: src.target > src.entryPrice ? 1 : -1,
-            markPrice: src.markPrice > 0 ? src.markPrice : src.entryPrice, _lastPx: src._lastPx > 0 ? src._lastPx : src.entryPrice,
-            createdAt: src.createdAt || Date.now(),
-            _boEdge: cand._boEdge, _boMovePct: cand._boMovePct,
-            ...(cand._boFlow ? { _boFlow: cand._boFlow } : {}), ...(cand._boMult > 1 ? { _boMult: cand._boMult } : {}),
-          };
-          if (!(t._boEdge === 'top' || t._boEdge === 'bottom')) return null;
-          c.boTrack.push(t);
-          c.boEdges[t.symbol] = t._boEdge;
-          this.persist();
-          return t;
-        },
-
-        // At max positions: every pending Breakout cond. is cancelled and carried on as a tracker. Runs after each cond. fill and each watcher tick / batch.
+        // At max positions every pending Breakout cond. is cancelled (the host drops a cond. that triggers past Max Positions anyway) and none are tracked. Runs after each cond. fill, each watcher tick and each batch.
         async _boCapCheck() {
           if (!this._boAtCap()) return;
           const pend = (this.condOrders || []).filter(o => o.tag === 'breakout');
           if (!pend.length) return;
-          let moved = 0;
           for (const o of pend) {
-            const cand = o.candidate || {};
-            if (this._boTrackAdd({ symbol: o.symbol, entryPrice: o.entryPrice, target: o.target, worst: o.worst, markPrice: o.markPrice, _lastPx: o._lastPx, createdAt: o.createdAt, candidate: cand })) moved++;
             try { await this.cancelCondOrder(o.id, 'breakout max positions'); }
             catch (e) { this.log(`[BO] cap cancel error (${o.symbol}): ${e.message}`, 'warn'); }
           }
-          this.log(`[BO] ${this._boGlyph()} Max positions (${(this.positions || []).length}/${this.cfg.maxPos ?? 5}) — ${pend.length} cond. order${pend.length === 1 ? '' : 's'} cancelled, ${moved} now tracked`, 'warn');
+          this.log(`[BO] ${this._boGlyph()} Max positions (${(this.positions || []).length}/${this.cfg.maxPos ?? 5}) — ${pend.length} cond. order${pend.length === 1 ? '' : 's'} cancelled`, 'warn');
           this.persist();
-        },
-
-        // Resolves trackers like cond. orders: trigger = break logged, worse price = invalidation + requeue, life up = neither.
-        async _boTrackWatch() {
-          const c = this.cfg, list = Array.isArray(c.boTrack) ? c.boTrack : [];
-          if (!list.length || this._boTrackBusy) return;
-          this._boTrackBusy = true;
-          try {
-            const px = await this._condPrices(list.map(t => t.symbol));
-            const now = Date.now(), life = Math.max(1, Number(c.boLifeMins) || 60) * 60000;
-            const done = new Set();
-            for (const t of list) {
-              const lp = px[t.symbol];
-              let hit = null;
-              if (lp > 0) { hit = this._condHit(t, lp); t.markPrice = lp; t._lastPx = lp; }
-              if (hit === 'target') {
-                this._boResolve(t.symbol, 'entry'); done.add(t.id);
-                this.log(`[BO] ${this._boGlyph()} ${t.symbol}: tracked ${t._boEdge} break — trigger ${+t.target.toPrecision(6)} reached (no order, max positions)`, 'info');
-              } else if (hit === 'worst') {
-                this._boResolve(t.symbol, 'worse'); this._boRetryAdd(t.symbol); this._boInvalidate(t); done.add(t.id);
-              } else if (now - t.createdAt >= life) {
-                this._boResolve(t.symbol, 'none'); done.add(t.id);
-                if (t._boMult > 1) this._boMultStep(-1, t.symbol + ' double cond. expired untouched');
-              }
-            }
-            if (done.size) c.boTrack = c.boTrack.filter(t => !done.has(t.id));
-            this.persist();
-          } finally { this._boTrackBusy = false; }
-        },
-
-        // One combined bar per tracker: worst on the left, trigger on the right, entry tick, fill from entry to the current price.
-        _boTrackBar(t) {
-          const span = t.target - t.worst, pc = x => span ? Math.max(0, Math.min(100, (x - t.worst) / span * 100)) : 0;
-          const e = pc(t.entryPrice), m = pc(t.markPrice > 0 ? t.markPrice : t.entryPrice);
-          const toT = t.markPrice > 0 ? (t.target - t.markPrice) / t.markPrice * 100 : 0;
-          return { e, left: Math.min(e, m), width: Math.abs(m - e), cls: m >= e ? 't' : 'w', dist: (Math.abs(toT)).toFixed(2) + '%' };
         },
 
         _boRetryAdd(sym) {
@@ -761,8 +865,8 @@
           return this.cfg.leverage > 0 ? this.cfg.leverage : 1;
         },
 
-        // One cond. order. Edge 'bottom': trigger below price, worse above. Edge 'top': trigger above, worse below.
-        async _boPlace(sym, t, retry, edge, track) {
+        // Everything before an order or a watch: candles, average move, filters, lean, fresh price (and funding), leverage when an order is going to be placed. Null when the ticker is skipped.
+        async _boPrep(sym, t, retry, needLev) {
           const candles = await this._boCandles(sym);
           if (!candles) { this.log(`[BO] ${sym}: fewer than ${CANDLES} closed 1hr candles — skipped`, 'info'); return null; }
           const m = this._boAvgMove(candles);
@@ -782,34 +886,46 @@
             return null;
           }
           if (gap != null && !white) this.cfg.boWhite[sym] = Date.now();
-          // Ticker flow: this ticker's own edge from its candles' breakout skew; no skew falls back to the global edge, unstamped.
-          let flow = null, lean = null, mult = 1;
-          if (this.cfg.boFlowOn) {
-            lean = this._boLean(candles, m);
-            const fe = this._boFlowEdge(lean.lean);
-            if (fe) { edge = fe; flow = this._boFlowMode(lean.lean); if (lean.lean === this._boUnfavLean()) mult = this._boMultNow(); }
-          }
-          let price = parseFloat(t?.lastPrice || 0);
+          // Lean cohort from the candles' breakout skew; Ticker flow off = every ticker N.
+          const lean = this.cfg.boFlowOn ? this._boLean(candles, m) : { top: 0, bottom: 0, lean: null };
+          const L = this._boLeanCode(lean.lean);
+          let price = parseFloat(t?.lastPrice || 0), fr = parseFloat(t?.fundingRate || 0) * 100, fi = t?.fundingIntervalHour ? parseInt(t.fundingIntervalHour, 10) * 3600000 : 28800000;
           try {
             const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
-            const lp = parseFloat((await r.json())?.result?.list?.[0]?.lastPrice);
+            const tk = (await r.json())?.result?.list?.[0];
+            const lp = parseFloat(tk?.lastPrice);
             if (lp > 0) price = lp;
+            if (tk && tk.fundingRate != null) fr = parseFloat(tk.fundingRate) * 100;
+            if (tk && tk.fundingIntervalHour) fi = parseInt(tk.fundingIntervalHour, 10) * 3600000;
           } catch (e) {}
           if (!(price > 0)) return null;
-          const lev = await this._boLev(sym);
-          if (!lev) return null;
+          let lev = 0;
+          if (needLev) { lev = await this._boLev(sym); if (!lev) return null; }
+          return { sym, t, candles, m, lean, L, price, lev, fr: Number.isFinite(fr) ? fr : 0, fi };
+        },
+
+        // One cond. order at the cell the scores draw for this ticker's lean. Edge 'bottom': trigger below price, worse above. Edge 'top': trigger above, worse below.
+        // Returns the order, 'gated' (every eligible cell is under water: watched instead), or null.
+        async _boPlace(sym, t, retry) {
+          const pr = await this._boPrep(sym, t, retry, true);
+          if (!pr) return null;
+          const { m, lean, L, price, lev } = pr;
+          const pk = this._boPick(L);
+          if (pk.gated) { this._boWatchAdd(pr); return 'gated'; }
+          const edge = pk.pick.edge, k = pk.pick.k, key = pk.pick.key, flow = this._boFlowOf(L, edge);
           const dir = edge === 'top' ? 1 : -1;
-          const dist = Math.min(m * mult, 90); // % from price to the trigger; capped so the trigger stays a positive price
+          const dist = Math.min(m * k, 90); // % from price to the trigger; capped so the trigger stays a positive price
           const target = price * (1 + dir * dist / 100), worst = price * (1 - dir * m / 100);
           const roi = +(m * lev).toFixed(2);
           const cand = {
               symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100,
-              _tpPct: roi, _slPct: roi, _bo: true, _boMovePct: +m.toFixed(3), _boEdge: edge, ...(flow ? { _boFlow: flow } : {}), ...(mult > 1 ? { _boMult: mult } : {}),
+              _tpPct: roi, _slPct: roi, _bo: true, _boMovePct: +m.toFixed(3), _boEdge: edge, _boCell: key, ...(flow ? { _boFlow: flow } : {}), ...(k > 1 ? { _boMult: k } : {}),
           };
-          const o = track ? this._boTrackAdd({ symbol: sym, entryPrice: price, target, worst, candidate: cand }) : await this.placeCondEntry({ candidate: cand, target, worst, tag: 'breakout' });
+          const o = await this.placeCondEntry({ candidate: cand, target, worst, tag: 'breakout' });
           if (o) {
             this.cfg.boEdges[sym] = edge;
-            this.log(`[BO] ${this._boGlyph()} ${sym}${retry ? ' (retry)' : ''}${track ? ' (tracked, max positions)' : ''}: average move ${m.toFixed(2)}% (${CANDLES}×1hr) — cond. ${dir > 0 ? '+' : '-'}${dist.toFixed(2)}%${mult > 1 ? ` (double ${mult}x)` : ''} (${flow ? (mult > 1 ? 'D-' : flow === 'with' ? 'W-' : 'A-') : ''}${edge}${lean ? `; ${lean.lean ? lean.lean + ' skew' : 'no skew'} ${lean.top}T/${lean.bottom}B` : ''}), TP/SL ${m.toFixed(2)}% from the trigger`, 'info');
+            this._boSetMeta(sym, cand);
+            this.log(`[BO] ${this._boGlyph()} ${sym}${retry ? ' (retry)' : ''}: average move ${m.toFixed(2)}% (${CANDLES}×1hr) — cond. ${dir > 0 ? '+' : '-'}${dist.toFixed(2)}% (${this._boLabel(L, edge, k)}; cell ${key} ${this._boFmt(pk.pick.S)}${lean && lean.lean ? `; ${lean.lean} skew ${lean.top}T/${lean.bottom}B` : '; no skew'}), TP/SL ${m.toFixed(2)}% from the trigger`, 'info');
           }
           return o;
         },
@@ -830,15 +946,12 @@
 
             this._boReconcile();
             await this._boCapCheck();
-            const atCap = this._boAtCap();
-            const n = (this.condOrders || []).length + (atCap ? (c.boTrack || []).length : 0);
+            if (this._boAtCap()) return; // max positions: no new conds
+            const n = (this.condOrders || []).length;
             const free = (c.maxCond ?? 30) - n; // the host's Max Cond. Orders; Max Positions does not cap this
             if (free <= 0) return;
 
-            const edge = this._boResolveEdge();
-            c.boEntry = edge;
-
-            const taken = new Set([...(this.positions || []).map(p => p.symbol), ...(this.condOrders || []).map(o => o.symbol), ...(c.boTrack || []).map(t => t.symbol)]);
+            const taken = new Set([...(this.positions || []).map(p => p.symbol), ...(this.condOrders || []).map(o => o.symbol)]);
             const tmap = new Map((this._lastAllTickers || []).map(t => [t.symbol, t]));
 
             // Retries the batch has room for leave the queue; the rest wait for the next batch.
@@ -856,14 +969,17 @@
 
             const queue = [...retries.map(s => ({ s, t: tmap.get(s), retry: true })), ...pool.map(t => ({ s: t.symbol, t, retry: false }))];
             const maxTry = free * 3; // a few spare picks for tickers that fail (new listings, refused orders)
-            let placed = 0, tries = 0;
+            let placed = 0, tries = 0, gated = 0, gatedRun = 0;
             for (const q of queue) {
-              if (placed >= free || tries >= maxTry) break;
+              if (placed >= free || tries >= maxTry || gatedRun >= 6) break; // six stood-down picks in a row: every lean is under water, stop spending fetches
               tries++;
-              try { if (await this._boPlace(q.s, q.t, q.retry, edge, atCap)) placed++; }
+              try {
+                const o = await this._boPlace(q.s, q.t, q.retry);
+                if (o === 'gated') { gated++; gatedRun++; } else { gatedRun = 0; if (o) placed++; }
+              }
               catch (e) { this.log(`[BO] ${q.s} error: ${e.message}`, 'warn'); }
             }
-            this.log(`[BO] ${this._boGlyph()} Batch — ${placed}/${free} order${free === 1 ? '' : 's'} placed${retries.length ? ` (${retries.length} retry)` : ''}`, 'info');
+            this.log(`[BO] ${this._boGlyph()} Batch — ${placed}/${free} order${free === 1 ? '' : 's'} placed${retries.length ? ` (${retries.length} retry)` : ''}${gated ? `, ${gated} stood down (watched instead)` : ''}`, 'info');
             this.persist();
           } finally { this._boBusy = false; }
         },
