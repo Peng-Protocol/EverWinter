@@ -37,7 +37,7 @@
   window.__BotPlugin = {
     id:        'sunchaser',
     name:      'SunChaser',
-    version:   '1.7.0',
+    version:   '1.7.1',
     targetBot: 'pseudochaser',
     after:     [],
     before:    [],
@@ -559,6 +559,7 @@
               if (!opp[sym]) this.log(`[SC] ${sym}: opposite (short) position gone from exchange — ticker unblocked`, 'info');
             }
             this._scOpposite = opp;
+            this._scExSyms = Object.fromEntries((d.result?.list || []).filter(e => parseFloat(e.size) > 0).map(e => [e.symbol, 1])); this._scExSyncAt = Date.now(); // read by _condSubmit so cond. orders don't each re-list positions
             for (const pos of [...this.positions]) {
               if (this._scClosing?.[pos.id]) continue; // retry-limit close in flight — it finalises the position itself
               const ep = exMap.get(pos.symbol);
@@ -670,7 +671,9 @@
           const instr = await this.getInstrInfo(sym);
           if (!instr) return refuse('instrument info unavailable');
           if (this._scOpposite?.[sym]) return refuse('opposite position open on exchange');
-          try {
+          const _fresh = this._scExSyms && (Date.now() - (this._scExSyncAt || 0)) < ((this.cfg.scanMins || 10) + 1) * 60000;
+          if (_fresh) { if (this._scExSyms[sym]) return refuse('position already open on exchange'); }
+          else try {
             await this._scDelay();
             const q = `category=linear&symbol=${sym}`;
             const h = await _sign(this.creds.key, this.creds.secret, q, this._tsOffset);
@@ -684,7 +687,8 @@
           const qty    = this.snapQty(this.cfg.minNotional / target, instr);
           if (!target || !qty || qty < (instr.minQty || 0)) return refuse('qty below exchange minimum at target');
           if (instr.minOrderAmt > 0 && qty * target < instr.minOrderAmt) return refuse('notional below exchange minimum');
-          if (!await this._scSetLeverage(sym, lev)) return false;
+          const _lc = (this._scLevSet = this._scLevSet || {});
+          if (!(_lc[sym] && _lc[sym].lev === lev && Date.now() - _lc[sym].at < 3600000)) { if (!await this._scSetLeverage(sym, lev)) return false; _lc[sym] = { lev, at: Date.now() }; }
           await this._scDelay();
           const px = target.toFixed(this._scPriceDp(sym));
           const b  = JSON.stringify({ category: 'linear', symbol: sym, side: 'Buy', orderType: 'Limit', qty: String(qty), price: px, triggerPrice: px, triggerBy: 'LastPrice', triggerDirection: order.dir > 0 ? 1 : 2, timeInForce: 'GTC', reduceOnly: false });
@@ -696,6 +700,43 @@
           } catch (e) { return refuse(e.message); }
           order._pseudo = false; order.qty = qty; order.target = target;
           return true;
+        },
+
+        // Within the whiplash proximity of its trigger (share of the entry->trigger distance still remaining)?
+        _scCondNear(o) {
+          const lp = o._lastPx, e = o.entryPrice;
+          if (!(lp > 0) || !(e > 0)) return false;
+          const prog = (lp - e) / (o.target - e);
+          return prog > 0 && prog >= 1 - (this.cfg.whiplashProximityPct ?? 20) / 100;
+        },
+
+        // Live cond. prices: WS when it has a read, else one REST ticker per symbol with the same adaptive backoff the
+        // position watcher uses (base interval, doubling while flat, 60s cap; base again near a trigger). Was a fixed 5s per symbol.
+        async _scCondPrices(orders) {
+          const now = Date.now(), baseMs = (this.cfg.restPollBaseSec ?? 5) * 1000, st = (this._scPxState = this._scPxState || {}), px = {};
+          await Promise.all([...new Set(orders.map(o => o.symbol))].map(async sym => {
+            let mp = 0;
+            if (typeof wsTicker === 'function') { try { const wt = wsTicker(sym); if (wt) mp = parseFloat(wt.lastPrice) || 0; } catch {} }
+            if (mp > 0) { px[sym] = mp; return; }
+            const s = (st[sym] = st[sym] || { last: 0, next: 0, every: baseMs });
+            if (now >= s.next) {
+              try {
+                const tr = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
+                const td = await tr.json();
+                const t  = td?.retCode === 0 ? td.result?.list?.[0] : null;
+                const lp = t ? parseFloat(t.lastPrice || t.markPrice || 0) : 0;
+                if (lp > 0) {
+                  const moved = s.last > 0 && Math.abs(lp - s.last) / s.last >= 0.001;
+                  s.every = (s.last > 0 && !moved) ? Math.min(s.every * 2, 60000) : baseMs;
+                  s.last = lp;
+                  if (orders.some(o => o.symbol === sym && this._scCondNear({ ...o, _lastPx: lp }))) s.every = baseMs;
+                }
+              } catch {}
+              s.next = now + s.every;
+            }
+            if (s.last > 0) px[sym] = s.last;
+          }));
+          return px;
         },
 
         async _scCondStatus(o) {
@@ -762,8 +803,11 @@
           if (!live.length || !(this.creds.key && this.creds.secret) || this._scCondWatching) return;
           this._scCondWatching = true;
           try {
-            const open = new Map(); let listOk = true, cursor = '';
-            for (let page = 0; page < 5; page++) {
+            const open = new Map(); let listOk = false, cursor = '';
+            // Open-orders list: every cfg.ewCondListSec (15s) unless a cond. is near its trigger — was every 5s tick
+            const _due = live.some(o => this._scCondNear(o)) || Date.now() - (this._scCondListAt || 0) >= (this.cfg.ewCondListSec ?? 15) * 1000;
+            if (_due) listOk = true;
+            for (let page = 0; _due && page < 5; page++) {
               await this._scDelay();
               const qs = 'category=linear&settleCoin=USDT&limit=50' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
               const h  = await _sign(this.creds.key, this.creds.secret, qs, this._tsOffset);
@@ -773,7 +817,8 @@
               cursor = d.result?.nextPageCursor || '';
               if (!cursor) break;
             }
-            const px = await this._condPrices(live.map(o => o.symbol));
+            if (listOk) this._scCondListAt = Date.now();
+            const px = await this._scCondPrices(live);
             for (const o of live) {
               if (!this.condOrders.some(x => x.id === o.id)) continue;
               if (listOk && !open.has(o.orderId)) {
