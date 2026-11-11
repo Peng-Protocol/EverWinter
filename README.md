@@ -120,7 +120,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's queues and state (`boRetry`, `boGray`, `boWhite`, `boEdges`, `boLog`, `boInval`, `boCells`, `boCellOf`, `boW1`, `boW2`, `boHypo`, plus its `boFlowOn`, `boGate`, `boSamples`, `boWatchMax` and `boStepX` settings) sit in the config and travel with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's queues and state (`boRetry`, `boGray`, `boWhite`, `boEdges`, `boLog`, `boInval`, `boCells`, `boCellOf`, `boW1`, `boW2`, `boHypo`, plus its `boFlowOn`, `boCritOn`, `boCritF`, `boCritS`, `boCritL`, `boCritI`, `boGate`, `boSamples`, `boWatchMax` and `boStepX` settings) sit in the config and travel with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -180,15 +180,19 @@ Two always-on filters skip dead tickers: **Stablecoin** (the 24 h range must be 
 
 ### Cells and scores
 
-A **cell** is one combination of ticker lean, entry edge (top / bottom) and distance (1×, 2×, 3× the average move), e.g. `UT1`. Each cell keeps a dollar score from its last 50 results of each kind (order outcomes, simulated positions, real closes), so bigger moves count for more.
+A **cell** is one entry edge (top / bottom) and distance (1×, 2×, 3× the average move), e.g. `T1`. Each cell keeps a dollar score from its last 50 results of each kind (order outcomes, simulated positions, real closes), so bigger moves count for more. A ticker's score at a cell adds the tables of the [criteria](#criteria) it exhibits, weighted by how strongly it exhibits them.
 
-### Ticker flow
+### P/A (ticker flow)
 
-Tickers are grouped by whether their last 24 candles broke upward more often (**upside**, `U`), downward more often (**downside**, `D`) or neither (`N`). Each group has its own scores, so the data decides whether the lean matters; badges show **W-** (with the lean), **A-** (against it) or **D-** (double distance or more).
+Each ticker's last 24 candles give its **P/A**: the average positive close against the average negative close. The larger positive average is **P/A +**, the larger negative one **P/A −**, and the gap is its strength. P/A's tables add to the cell scores in proportion to that strength, so the data decides whether it matters; badges show **W-** (with the P/A), **A-** (against it) or **D-** (double distance or more). A ticker whose P/A is the unfavored sign (Chaser −, Winter +) at 20%+ strength only enters at 2× or 3× at the default edge.
+
+### Criteria
+
+Behind the **Criteria** toggle, four more criteria read each ticker, each + or − with a strength: **Fund** (sign of the funding rate), **L/S** (more long or more short accounts), **LTA** (turnover of the latest 12 candles against the 12 before: rising or falling) and **IO/A** (open interest above or below the median of the filtered market). Each has its own tables per cell and learns only what its tickers do beyond the cell's average. L/S costs one extra fetch per ticker read; each criterion has its own switch. ([more](#criteria-details))
 
 ### Entry choice and stand down
 
-Each order draws a cell at random, favoring higher scores. When a lean's best cell is down about $1 or more, Breakout **stands down**: no real orders for that lean until the simulations recover.
+Each order draws a cell at random, favoring higher scores. When a ticker's best cell is down about $1 or more, Breakout **stands down** for it: no real order until the simulations recover.
 
 ### Watch lists
 
@@ -196,7 +200,7 @@ Alongside real orders, Breakout quietly simulates up to 50 tickers without placi
 
 ### Invalidations
 
-Each worse-price hit is counted under the order's badge, to show when a lean's assumption is wrong. The counts show in the LIVE popover and don't change entries.
+Each worse-price hit is counted under the order's badge, to show when a flow assumption is wrong. The counts show in the LIVE popover and don't change entries.
 
 ### Max positions
 
@@ -204,7 +208,7 @@ At **Max Positions**, every pending Breakout cond. order is cancelled and no new
 
 ### Live readout
 
-A small panel under the config fields; hover (PC) or tap (mobile) a row for detail. **LIVE** shows pending orders, break counts and warnings, **UP / DOWN** (or **ALL** with Ticker flow off) shows the best cell per lean, and **HYPO** shows how the simulations have done. **Round 1** and **Round 2** lists below show what is being watched.
+A small panel under the config fields; hover (PC) or tap (mobile) a row for detail. **LIVE** shows pending orders, break counts and warnings, **UP / DOWN** (or **ALL** with P/A off) shows the best cell per P/A sign, **HYPO** shows how the simulations have done, and **CRIT** shows how many samples each criterion has gathered. **Round 1** and **Round 2** lists below show what is being watched.
 
 ### Config
 
@@ -214,8 +218,9 @@ Each setting's explanation sits behind a circled **!** button next to it (click 
 |---|---|
 | **Breakout Mode** (`boEnabled`, default on) | Master on/off. Off = no new orders and the watch lists pause. |
 | **Order life** (`boLifeMins`, default **60**) | Minutes before an order is cancelled; also the round-1 window. |
-| **Ticker flow** (`boFlowOn`, default on) | Groups tickers by lean. Off = every ticker is `N`. |
-| **Stand down** (`boGate`, default on) | Stops real orders for a lean whose best cell is losing. |
+| **P/A (ticker flow)** (`boFlowOn`, default on) | Reads each ticker's P/A and scores by its strength. Off = no P/A. |
+| **Criteria** (`boCritOn`, default on) | Fund, L/S, LTA and IO/A as extra criteria. A button per criterion switches it (`boCritF`, `boCritS`, `boCritL`, `boCritI`, default on). |
+| **Stand down** (`boGate`, default on) | Stops real orders for a ticker whose best cell is losing. |
 | **Samples per type** (`boSamples`, default **50**) | Results kept per cell and kind; fewer = faster and noisier. |
 | **Watch tickers** (`boWatchMax`, default **50**) | Tickers simulated at once; 0 turns the hypotheticals off. |
 | **Score step** (`boStepX`, default **1**) | Step size in base margins: how sharply scores steer the draw, and the stand-down floor. |
@@ -306,9 +311,9 @@ Each scan, a batch fills every free cond. slot (**Max Cond. Orders** minus the p
 
 1. Read the last 24 closed 1h candles. The **average move** `m` is the mean candle range `(high − low) ÷ open`, in %.
 2. Run the stablecoin and illiquidity filters.
-3. Read a fresh last price, work out the ticker's lean ([Ticker flow](#ticker-flow)), draw a cell and place the cond. order at it.
+3. Read a fresh last price, read its [criteria](#criteria-details) (the fresh read brings its funding and open interest), draw a cell and place the cond. order at it.
 
-Attempts per batch are capped at 3× the free slots, so a ticker that fails (new listing, refused order, a filter) is replaced by the next pick. A retry leaves the queue when a batch takes it, one attempt each, and retries beyond the free slots wait for the next batch. Candidates carry `_bo`, `_boMovePct`, `_boEdge`, `_boCell`, `_tpPct` and `_slPct`, plus `_boFlow` (`with` / `against`) when the ticker has a lean and `_boMult` when `k` is above 1; the underscore keys are copied onto the position and its closed trade, which is what the badge and the real-close feed read.
+Attempts per batch are capped at 3× the free slots, so a ticker that fails (new listing, refused order, a filter) is replaced by the next pick. A retry leaves the queue when a batch takes it, one attempt each, and retries beyond the free slots wait for the next batch. Candidates carry `_bo`, `_boMovePct`, `_boEdge`, `_boCell`, `_tpPct` and `_slPct`, plus `_boX` (the criteria strengths) when it exhibits any, `_boFlow` (`with` / `against`) when the ticker has a lean and `_boMult` when `k` is above 1; the underscore keys are copied onto the position and its closed trade, which is what the badge and the real-close feed read.
 
 #### Entry levels and TP / SL
 
@@ -340,7 +345,7 @@ The graylist and whitelist are pruned at the start of each batch. A queued retry
 
 #### Cell samples
 
-Every ticker belongs to a **lean cohort** and every order to an edge and a multiplier, so the unit of account is a **cell**: lean (`U` upside, `D` downside, `N` none) × edge (`T` top, `B` bottom) × `k` (1, 2, 3), written e.g. `UT1` or `DB2`. Each cell keeps the last **Samples per type** (default 50) of three data types, with no decay, so that number alone sets how fast the scores react (fewer = faster and noisier, more = slower and steadier). A cell's **score** is the sum of the three types' windows.
+Every order has an edge and a multiplier, so the unit of account is a **cell**: edge (`T` top, `B` bottom) × `k` (1, 2, 3), written e.g. `T1` or `B2`. Each criterion adds **tables** per cell, keyed criterion + sign + cell: `P+T1`, `F-B2` (letters `P` P/A, `F` Fund, `S` L/S, `L` LTA, `I` IO/A). Each cell and table keeps the last **Samples per type** (default 50) of three data types, with no decay, so that number alone sets how fast the scores react (fewer = faster and noisier, more = slower and steadier). A **score** is the sum of the three types' windows.
 
 | Type | Key | Sample |
 |---|---|---|
@@ -348,35 +353,51 @@ Every ticker belongs to a **lean cohort** and every order to an edge and a multi
 | **Round-2 sim** | `b` | One per hypothetical position closed at TP, SL or Force Close, net of estimated fees and funding. |
 | **Real** | `c` | One per real position closed at TP, SL or Force Close, net P&L (`totalPnl`). Bails and manual closes are not counted. |
 
-All samples are in dollars at the configured notional: price move × notional, which equals the move × leverage × base margin (a 5% move at base settings is $0.30). A bigger mover therefore weighs more. Open-position uPnL never feeds a score. Because the first-passage sample pays +k·m against −m, a random walk has zero expected value at any `k`, so drift in that score is signal. Real closes are fed once each from `closedTrades` (stamped `_boCell`), so gap-audit closes count too.
+All samples are in dollars at the configured notional: price move × notional, which equals the move × leverage × base margin (a 5% move at base settings is $0.30). A bigger mover therefore weighs more. Open-position uPnL never feeds a score. Because the first-passage sample pays +k·m against −m, a random walk has zero expected value at any `k`, so drift in that score is signal. Real closes are fed once each from `closedTrades` (stamped `_boCell` and `_boX`), so gap-audit closes count too.
 
-#### Lean cohorts and flow labels
+A sample feeds its base cell as it is. Each criterion the ticker exhibits also takes `(sample − the cell's average of that type) × strength` into the table for its sign and cell, so a table only learns what its tickers do beyond the cell's norm. A ticker's score at a cell is the base cell's score plus, for each exhibited criterion, its strength × that table's score.
 
-**Ticker flow** (`boFlowOn`, default on) groups tickers into lean cohorts from the skew of their 24 candles. A candle breaks upward if its high is more than `m` above its open, and downward if its low is more than `m` below its open; one candle can do both. The ticker has **upside skew** (`U`) with more upward than downward breaks, **downside skew** (`D`) with more downward than upward, and **no skew** (`N`) on a tie. Each cohort has its own cell scores, so the data decides whether the lean predicts anything. With Ticker flow off every ticker is `N`.
+#### P/A and flow labels
+
+**P/A** (`boFlowOn`, default on) is read from the 24 candles: the mean positive close `(close − open) ÷ open` over the up candles against the mean negative close over the down candles. Its reading is `(pos − neg) ÷ (pos + neg)`, from −1 to 1, so size counts and there are no ties; the strength is the reading ÷ 0.5, capped at 1. **P/A +** (`U` in labels) has the larger positive average, **P/A −** (`D`) the larger negative one. Below 20% strength a ticker counts as no lean (`N`) for the label and the eligibility limit; the scoring still uses the exact strength. With P/A off there is no P/A reading.
 
 The flow labels mean: **with top**, expecting the ticker to keep going up; **with bottom**, keep going down; **against top**, expecting it to top and reverse; **against bottom**, expecting it to bottom and reverse. PseudoChaser (long) can only win with top or against bottom, PseudoWinter (short) only with bottom or against top; the other two mean expecting to lose.
 
 | | PseudoChaser | PseudoWinter |
 |---|---|---|
-| Favored lean | Upside | Downside |
-| Unfavored lean | Downside | Upside |
+| Favored P/A | + | − |
+| Unfavored P/A | − | + |
 
-Each order is stamped with its cell (`_boCell`) and, when the ticker has a lean, its flow (`_boFlow`, `with` / `against`) and, when `k` is above 1, `_boMult`. The badge gains a prefix: **W-TOP**, **W-BOTTOM** (with), **A-TOP**, **A-BOTTOM** (against) and **D-TOP** / **D-BOTTOM** for any order with `k` above 1; a ticker with no lean carries no prefix. The placement log line shows the cell, its score and the skew counts, e.g. `upside skew 5T/2B`.
+Each order is stamped with its cell (`_boCell`), its criteria strengths (`_boX`) and, when the ticker has a lean (P/A at 20%+), its flow (`_boFlow`, `with` / `against`) and, when `k` is above 1, `_boMult`. The badge gains a prefix: **W-TOP**, **W-BOTTOM** (with), **A-TOP**, **A-BOTTOM** (against) and **D-TOP** / **D-BOTTOM** for any order with `k` above 1; a ticker with no lean carries no prefix. The placement log line shows the cell, its score and the criteria readings, e.g. `P/A +0.67, Funding -1.00`.
+
+#### Criteria details
+
+Each criterion turns a raw reading into a strength from −1 to 1 (reading ÷ full-strength reading, capped; under 0.01 it is not stored), and the sign picks the table.
+
+| Criterion | Reading | Full strength at |
+|---|---|---|
+| **P/A** | `(pos − neg) ÷ (pos + neg)` of the 24 candles' closes | 0.5 |
+| **Fund** (`boCritF`) | funding rate ÷ the market's median \|funding\| | 2× the median |
+| **L/S** (`boCritS`) | long share of accounts − 0.5 (exchange account ratio, 1h) | 0.15 |
+| **LTA** (`boCritL`) | (turnover of the latest 12 candles − the 12 before) ÷ their sum | 0.5 |
+| **IO/A** (`boCritI`) | ln(ticker open interest ÷ median open interest) | 4× or ¼× the median |
+
+The ticker's own funding and open interest come from the fresh per-ticker read in `_boPrep`, turnover from its candles, and the skew from one extra `account-ratio` read per ticker read (real orders and watches alike; a failed read just leaves L/S out). The market medians come from the bulk list over USDT tickers that are not in `megacapExclude`, graylisted, banned, spanning under 1% over 24 h, or without turnover; they are not size-normalized. Criteria that are off are never read or fed.
 
 #### Choosing a cell
 
-For each ticker the batch draws one of the lean's **eligible cells** with weight `exp((score − best) ÷ step) × prior(k)`, where the prior is 1, 0.5, 0.25 for k = 1, 2, 3 (the starting preference before the scores say otherwise) and **step** is **Score step** × one base margin (`minNotional ÷ leverage`, $1 at base settings). A cell one step behind the best is drawn about 37% as often.
+For each ticker the batch draws one of its **eligible cells** with weight `exp((score − best) ÷ step) × prior(k)`, where the prior is 1, 0.5, 0.25 for k = 1, 2, 3 (the starting preference before the scores say otherwise) and **step** is **Score step** × one base margin (`minNotional ÷ leverage`, $1 at base settings). Here the score is the ticker's own (base cell plus its criteria). A cell one step behind the best is drawn about 37% as often.
 
-| Lean | Eligible cells |
+| P/A | Eligible cells |
 |---|---|
-| Favored, or none | All six (top and bottom at 1×, 2×, 3×) |
-| Unfavored | The default edge at 2× or 3× only (Chaser bottom, Winter top), so the contradictory combinations (Chaser with bottom / against top, Winter with top / against bottom) are never placed |
+| Favored, or under 20% strength | All six (top and bottom at 1×, 2×, 3×) |
+| Unfavored, 20%+ | The default edge at 2× or 3× only (Chaser bottom, Winter top), so the contradictory combinations (Chaser with bottom / against top, Winter with top / against bottom) are never placed |
 
-**Stand down** (`boGate`, default on): when the best eligible cell of a lean is at or below −step, no real order is placed for that lean. The ticker is watched instead, and the hypotheticals keep scoring, so entries resume once a cell recovers. Six stood-down picks in a row end the batch, to save fetches.
+**Stand down** (`boGate`, default on): when the best eligible cell of a ticker is at or below −step, no real order is placed for it. The ticker is watched instead, and the hypotheticals keep scoring, so entries resume once a cell recovers. Six stood-down picks in a row end the batch, to save fetches.
 
 #### Watch list rounds
 
-The watch lists run on the cond. order watcher tick, throttled to one pass every 30 s, and place no orders. They keep up to **Watch tickers** (default 50; 0 turns them off) random tickers in round 1, through the same filters as real orders, skipping held, pending and already-watched tickers. At scan time a ticker's price, `m`, lean, funding rate and funding interval are stored, and every cell (2 edges × 3 `k`) is simulated at once from that one set of data. A pass refills at most 6 watches and walks at most 8 tickers' due items.
+The watch lists run on the cond. order watcher tick, throttled to one pass every 30 s, and place no orders. They keep up to **Watch tickers** (default 50; 0 turns them off) random tickers in round 1, through the same filters as real orders, skipping held, pending and already-watched tickers. At scan time a ticker's price, `m`, criteria strengths, funding rate and funding interval are stored, and every cell (2 edges × 3 `k`) is simulated at once from that one set of data. A pass refills at most 6 watches and walks at most 8 tickers' due items.
 
 **Round 1** runs one **Order life** after the scan (default 60 min). The twelve 5-minute candles since the scan (from the next 5-minute boundary, so up to 5 minutes of the window go unobserved) are walked per cell for the trigger or the worse price first, which feeds the first-passage scores. If both are touched inside one candle, one finer 1-minute fetch for that ticker decides it; if still both, the worse price counts first. A cell whose trigger was reached becomes a round-2 sim, opened at the trigger price at the end of the candle it triggered in and walked through the rest of the window.
 
@@ -391,7 +412,7 @@ The watch lists run on the cond. order watcher tick, throttled to one pass every
 
 Sims are capped at 240 live; ones that still cannot be fetched a day past their horizon are dropped. The **HYPO** row of the [live readout](#live-readout) shows the realized hypothetical P&L, and its popover compares the average sim result with the average real result per cell, which exposes a cost the sim is missing.
 
-**Data use**: each new watch costs about three requests (24 hourly candles through the host queue, `recent-trade` unless whitelisted, one price read); round 1 adds one 5-minute kline read per watch, and round 2 one kline read per ticker per due 4-hour boundary (several sims on one ticker share it), plus the occasional finer fetch. Lowering **Watch tickers** scales this down directly.
+**Data use**: each new watch costs about three requests (24 hourly candles through the host queue, `recent-trade` unless whitelisted, one price read, plus the skew read when L/S is on); round 1 adds one 5-minute kline read per watch, and round 2 one kline read per ticker per due 4-hour boundary (several sims on one ticker share it), plus the occasional finer fetch. Lowering **Watch tickers** scales this down directly.
 
 #### Hypotheticals
 
@@ -411,9 +432,10 @@ A panel in the accordion, below the config fields, with no labels and only the a
 
 | Row | Shows |
 |---|---|
-| **LIVE** | Pending cond. orders over **Max Cond. Orders**, then the break counts ▲ top · ▼ bottom · – neither for the last 50 resolved orders, the larger of ▲ / ▼ in the theme colour. **↻** (retry queue) appears only when non-zero. A pulsing red dot and red border show while any lean is standing down, and a blinking yellow **⚠** shows while Binary Mode is off. The popover adds the break counts in words, the invalidation tally, the retry queue size and the round-1 watch count. |
-| **UP** / **DOWN** (Ticker flow on), **ALL** (off) | One row per lean: a **WITH** (theme), **AGAINST** or **DOUBLE** (yellow) chip, or **STAND DOWN**; the best eligible cell's entry edge (▲ TOP / ▼ BOTTOM), its multiplier when above 1, and its score in $ (green, or red when negative). The popover lists every eligible cell by score with its three sums and sample counts (`R1` first-passage, `R2` sim, `real`). |
+| **LIVE** | Pending cond. orders over **Max Cond. Orders**, then the break counts ▲ top · ▼ bottom · – neither for the last 50 resolved orders, the larger of ▲ / ▼ in the theme colour. **↻** (retry queue) appears only when non-zero. A pulsing red dot and red border show while any P/A group is standing down, and a blinking yellow **⚠** shows while Binary Mode is off. The popover adds the break counts in words, the invalidation tally, the retry queue size and the round-1 watch count. |
+| **UP** / **DOWN** (P/A on), **ALL** (off) | One row per P/A sign, scored at full P/A strength (other criteria add per ticker): a **WITH** (theme), **AGAINST** or **DOUBLE** (yellow) chip, or **STAND DOWN**; the best eligible cell's entry edge (▲ TOP / ▼ BOTTOM), its multiplier when above 1, and its score in $ (green, or red when negative). The popover lists every eligible cell by score with its base sums and sample counts (`R1` first-passage, `R2` sim, `real`) and the criteria part. |
 | **HYPO** | Hypotheticals closed (`n`), win % (✓), live round-1 (R1) and round-2 (R2) counts, and the realized hypothetical P&L. The popover adds the average hold, and the sim-vs-real average per cell for the six cells with most data. |
+| **CRIT** | One chip per active criterion (P/A, FND, L/S, LTA, IO/A) with the samples it has gathered. Hidden when every criterion is off. The popover shows the best cell of each + / − table. |
 
 The break counts record which edge of its range price reached first: the target counts for the order's own edge, the worse price for the opposite edge, and an expiry as no break. A fill the host drops for want of a position slot still counts; an order cancelled by hand, by a bail, by a halt or by the max-positions cap doesn't.
 
@@ -425,30 +447,30 @@ These sit in the bot's config and travel with an export. None has a control.
 
 | Key | Holds |
 |---|---|
-| **Cells** (`boCells`) | Cell key → `{ a, b, c }`, the last `boSamples` $ samples of each type. No control. |
-| **Cell link** (`boCellOf`) | Symbol → `{ c, m, k }` for each pending order, so its resolution feeds its cell. No control. |
+| **Cells** (`boCells`) | Table key → `{ a, b, c }`, the last `boSamples` $ samples of each type: base cells `T1`…`B3` and criterion tables `P+T1`, `F-B2`…. No control. |
+| **Cell link** (`boCellOf`) | Symbol → `{ c, m, k, x }` for each pending order (`x` = its criteria strengths), so its resolution feeds its cell and tables. No control. |
 | **Watch lists** (`boW1`, `boW2`, `boHypo`) | Round-1 watches, live round-2 sims and the realized hypothetical totals (`n`, `w`, `pnl`, `dur`). No control. |
 | **Invalidations** (`boInval`) | The last 50 worse-price hits by badge (`WT`, `WB`, `AT`, `AB`, `DT`, `DB`). Feeds the LIVE popover, no control. |
 | **Tally** (`boLog`, `boEdges`) | The last 50 resolved orders (`T`, `B` or `N`) and the edge each pending order was placed at, keyed by symbol. Feeds the live readout, no control. |
 | **Retry queue** (`boRetry`) | Symbols that reached the worse price, first in line for the next batch. The count shows in the live readout, no control. |
 | **Graylist / Whitelist** (`boGray` / `boWhite`) | Symbol → epoch ms, held one week. No control. |
 
-Settings retired in 2.0 (`boEntry`, `boAuto`, `boAutoPct`, `boAutoTicker`, `boTickLatch`, `boFlowUp`, `boFlowDown`, `boMult`, `boFlow`) and in 2.1 (`boTrack`) are deleted from a saved config on load.
+Settings retired in 2.0 (`boEntry`, `boAuto`, `boAutoPct`, `boAutoTicker`, `boTickLatch`, `boFlowUp`, `boFlowDown`, `boMult`, `boFlow`) and in 2.1 (`boTrack`) are deleted from a saved config on load. From 2.2.0, cells saved as lean × edge × `k` (`UT1`) are merged into the base cells on load: the old lean was a break count, a different P/A, so the criterion tables start empty.
 
 ### Breakout Internals
 
 - **Hooks**: `init` (config defaults and migration, and the `registerRoleBadge` provider), a scan stage `bo-batch` (a `runScan` wrapper on a host without stages), `cancelCondOrder`, `pseudoWatchCondOrders` and `_condTrigger`. Declares `after: ['sunchaser', 'everwinter']` so it wraps the live plugins' versions.
 - **Worse price**: the `cancelCondOrder` wrapper queues the symbol when the order's tag is `breakout` and the reason starts `worst case reached`, which covers the host watcher, the kline audits and the live plugins. It also calls `_boInvalidate(o)`.
 - **Expiry**: `_boExpire` runs after each cond. order watcher tick, cancelling `tag === 'breakout'` orders past `boLifeMins` with reason `breakout expired`.
-- **Slots**: `_boBatch` free slots are `maxCond − condOrders`. It runs `_boCapCheck` first and returns when `positions.length >= maxPos`. It skips while drawdown-halted or gains-locked. `_boPlace` returns the order, `'gated'` (the lean stood down; the ticker is added to the round-1 list instead) or null.
+- **Slots**: `_boBatch` free slots are `maxCond − condOrders`. It runs `_boCapCheck` first and returns when `positions.length >= maxPos`. It skips while drawdown-halted or gains-locked. `_boPlace` returns the order, `'gated'` (the ticker stood down; the ticker is added to the round-1 list instead) or null.
 - **Tally**: `_boResolve(sym, hit)` logs one order (`entry`, `worse` or `none`) against the edge in `boEdges`, and for `entry` / `worse` also pushes the first-passage sample to the cell recorded in `boCellOf`. The `cancelCondOrder` wrapper logs worse-price and `breakout expired` cancels, the `_condTrigger` wrapper logs a target hit before the host's first await (so a fill dropped for no free slot still counts), and `_boReconcile` is a fallback for fills that bypass `_condTrigger`: a pending order gone from the list with a position on its symbol.
-- **Cells**: `_boCellKey` builds the key, `_boSample(key, type, $)` pushes and trims to `boSamples`, `_boCellScore` sums the three windows, `_boEligible(lean)` lists the allowed cells and `_boPick(lean)` does the weighted draw and the stand-down test. `_boU` is one base margin, `_boTau` the step.
-- **Ticker flow**: `_boLean(candles, m)` returns the upward / downward break counts and the skew (`upside`, `downside` or null); `_boPrep` turns it into the lean code (`U` / `D` / `N`, always `N` with `boFlowOn` off). `_boFlowOf(lean, edge)` gives `with` / `against`.
+- **Cells**: `_boCellKey(edge, k)` builds the base key (`_boBase` strips a pre-2.2.0 lean letter), `_boSample(key, type, $, x)` pushes the base sample and each exhibited criterion's excess, trimming to `boSamples`, `_boCellScore(key)` sums one table's three windows, `_boScore(edge, k, x)` adds each exhibited criterion's strength × its table score to the base cell, `_boEligible(lean)` lists the allowed cells and `_boPick(x)` does the weighted draw and the stand-down test. `_boU` is one base margin, `_boTau` the step.
+- **P/A and criteria**: `_boPA(candles)` returns `(pos − neg) ÷ (pos + neg)` of the closes; `_boExhibit` builds the `{ P, F, S, L, I }` strengths from it, the ticker's fresh funding / open interest, its candles' turnover, `_boRatio` (skew) and `_boMkt` (median open interest and |funding|, 60 s memo); `_boPrep` stamps the result (`x`) and `_boLc(x)` turns it into the lean code (`U` / `D` at 20%+ P/A strength, else `N`). `_boFlowOf(lean, edge)` gives `with` / `against`. The `CRIT_FULL` and `PA_MIN` constants set the full-strength readings and the lean threshold.
 - **Badge**: the `registerRoleBadge` provider reads `_boEdge` and `_boFlow` off a position or off an order's `candidate` and returns the **TOP** / **BOTTOM** badge, with a **W-** or **A-** prefix when `_boFlow` is set, or **D-** when `_boMult` is above 1. The base bots render `_roleBadge(o)` in the cond. card header and in the position card.
-- **Live readout**: `_boRows` (best eligible cell per lean), `_boPend`, `_boHot` and `_boHypo` feed the rows in the `strategy-accordions` slot, below the config fields; `_boTipHead`, `_boTipRow` and `_boTipHypo` write the popover text. The popover opens on `pointerenter` for a mouse and on tap for touch, and every colour is one of the host's own variables.
+- **Live readout**: `_boRows` (best eligible cell per P/A sign), `_boPend`, `_boHot`, `_boHypo` and `_boCritRows` feed the rows in the `strategy-accordions` slot, below the config fields; `_boTipHead`, `_boTipRow`, `_boTipHypo` and `_boTipCrit` write the popover text. The popover opens on `pointerenter` for a mouse and on tap for touch, and every colour is one of the host's own variables.
 - **Invalidations**: `_boInvalidate(o)` pushes `W`/`A`/`D` + `T`/`B` into `boInval` (cap 50) from the order's `_boFlow`, `_boEdge` and `_boMult`, read through `_boMeta`.
 - **Max positions**: `_boCapCheck` (from the `_condTrigger` wrapper after every fill, the `_ewCondFilled` / `_scCondFilled` wrapper after every live fill, the watcher wrapper and `_boBatch`) cancels each pending `breakout` order with reason `breakout max positions`; the `cancelCondOrder` wrapper then drops its `boEdges` and `boCellOf` entries like any other cancel.
-- **Watch lists**: `_boSimTick` runs from the `pseudoWatchCondOrders` wrapper, throttled to 30 s, and does four things in order: `_boFeedReal` (real closes into `c` samples, once each, marked `_boFed` on the closed trade), due round-1 watches through `_boRound1`, due round-2 sims through `_boRound2`, then `_boWatchFill`. `_boPrep` is shared with real orders (candles, filters, lean, price, funding). `_boKl` fetches closed candles, `_boScan` finds the first barrier touched and does the one finer fetch (`REFINE`: 240→15, 15→1, 5→1), `_boFund` adds funding, `_boSimClose` books the net result and the `boHypo` totals, and `_boSimDue` sets the next 4-hour check.
+- **Watch lists**: `_boSimTick` runs from the `pseudoWatchCondOrders` wrapper, throttled to 30 s, and does four things in order: `_boFeedReal` (real closes into `c` samples, once each, marked `_boFed` on the closed trade), due round-1 watches through `_boRound1`, due round-2 sims through `_boRound2`, then `_boWatchFill`. `_boPrep` is shared with real orders (candles, filters, price, funding, open interest, criteria). `_boKl` fetches closed candles, `_boScan` finds the first barrier touched and does the one finer fetch (`REFINE`: 240→15, 15→1, 5→1), `_boFund` adds funding, `_boSimClose` books the net result and the `boHypo` totals, and `_boSimDue` sets the next 4-hour check.
 - **Leverage**: `_boLev` uses `resolveEffectiveLeverage` where the host has it (PseudoWinter), else `leverage`.
 
 ### localStorage Keys
