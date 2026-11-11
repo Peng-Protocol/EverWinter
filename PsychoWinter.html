@@ -1304,6 +1304,8 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
               <div style="font-family:var(--mono);font-size:7.5px;color:var(--text-lo);margin-top:2px" x-text="'Open '+fmtP(item.trade.origEntryPrice??item.trade.entryPrice)+' → Avg '+fmtP(item.trade.entryPrice)+' → Close '+fmtP(item.trade.exitPrice)"></div>
               <div x-show="item.trade.fundingFee" style="font-family:var(--mono);font-size:7.5px;margin-top:1px" :class="item.trade.fundingFee>=0?'profit':'loss'"
                 x-text="'Funding '+(item.trade.fundingFee>=0?'+':'')+(item.trade.fundingFee||0).toFixed(3)+' USDT'"></div>
+              <div x-show="item.trade.tradeFee" style="font-family:var(--mono);font-size:7.5px;margin-top:1px" class="loss"
+                x-text="'Fees (est.) -'+(item.trade.tradeFee||0).toFixed(3)+' USDT'"></div>
               <div x-show="item.trade.closedAt" style="font-family:var(--mono);font-size:7.5px;color:var(--text-lo);margin-top:2px;display:flex;gap:10px">
                 <span x-show="item.trade.closedAt && item.trade.duration" x-text="'opened '+new Date(item.trade.closedAt-item.trade.duration).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
                 <span x-text="item.trade.closedAt ? 'closed '+new Date(item.trade.closedAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''"></span>
@@ -1382,6 +1384,8 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
                 x-text="item.tab.finalClose ? ('Open '+fmtP(item.tab.finalClose.origEntryPrice??item.tab.origEntryPrice??item.tab.entryPrice)+' → Avg '+fmtP(item.tab.finalClose.entryPrice??item.tab.entryPrice)+' → Close '+fmtP(item.tab.finalClose.exitPrice)) : ''"></div>
               <div x-show="!item.tab.isOpen && item.tab.finalClose && item.tab.finalClose.fundingFee" style="font-family:var(--mono);font-size:7.5px;margin-top:1px" :class="item.tab.finalClose && item.tab.finalClose.fundingFee>=0?'profit':'loss'"
                 x-text="item.tab.finalClose ? ('Funding '+(item.tab.finalClose.fundingFee>=0?'+':'')+item.tab.finalClose.fundingFee.toFixed(3)+' USDT') : ''"></div>
+              <div x-show="!item.tab.isOpen && item.tab.finalClose && item.tab.finalClose.tradeFee" style="font-family:var(--mono);font-size:7.5px;margin-top:1px" class="loss"
+                x-text="item.tab.finalClose ? ('Fees (est.) -'+(item.tab.finalClose.tradeFee||0).toFixed(3)+' USDT') : ''"></div>
               <div style="font-family:var(--mono);font-size:7.5px;color:var(--text-lo);margin-top:2px;display:flex;gap:10px">
                 <span x-show="item.tab.firstCutAt" x-text="'first cut '+new Date(item.tab.firstCutAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
                 <span x-show="!item.tab.isOpen && item.tab.closedAt" x-text="'closed '+new Date(item.tab.closedAt).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
@@ -1675,7 +1679,8 @@ input[type=text]:focus,input[type=password]:focus{border-color:rgba(255,32,64,.4
 </div><!-- end .main -->
 
 <script>
-const VERSION = '1.12.2'; // x=production-only, y=significant additions/subtractions, z=tweaks
+const VERSION = '1.13.0'; // x=production-only, y=significant additions/subtractions, z=tweaks
+const FEE_MAKER_PCT = 0.02, FEE_TAKER_PCT = 0.055; // Bybit base-tier linear perp rates (%)
 
 // ── HMAC-SHA256 signing ──
 async function hmac(secret, msg) {
@@ -3081,6 +3086,17 @@ function psycho() { return {
     return this.pseudoClosePosition(pos, reason, fillPrice);
   },
 
+  // Estimated trade fees (paper only): entry side maker, exit side taker. One close in three gets a random 2-3x multiplier,
+  // skewed higher as the session win rate rises (u^k, k = 3^(1-2*winRate)); the rest pay the flat fee. Live closes skip — the exchange charges the real fee.
+  _estTradeFee(pos, exitPrice) {
+    if (pos._live || pos._pseudo === false) return 0;
+    const size = pos.totalSize || 0;
+    const n = (this.sess.wins || 0) + (this.sess.losses || 0);
+    const winRate = n ? this.sess.wins / n : 0.5;
+    const mult = Math.random() < 1 / 3 ? 2 + 1 * Math.pow(Math.random(), Math.pow(3, 1 - 2 * winRate)) : 1;
+    return (pos.entryPrice * size * FEE_MAKER_PCT + exitPrice * size * FEE_TAKER_PCT) / 100 * mult;
+  },
+
   async pseudoClosePosition(pos, reason='manual', fillPrice=null, realizedPnl=null) {
     if (_closingIds.has(pos.id)) return;
     _closingIds.add(pos.id);
@@ -3095,7 +3111,8 @@ function psycho() { return {
     const pnl       = realizedPnl != null ? realizedPnl : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * pos.margin;
     const pnlPct    = realizedPnl != null ? (pos.margin ? (pnl / pos.margin * 100) : 0) : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.leverage * 100;
     const fundFee   = pos._fundingAccrued ?? 0;
-    const totalPnl  = realizedPnl != null ? pnl : (pnl + fundFee);
+    const tradeFee  = realizedPnl != null ? 0 : this._estTradeFee(pos, exitPrice);
+    const totalPnl  = realizedPnl != null ? pnl : (pnl + fundFee - tradeFee);
     const duration  = Date.now() - pos.openedAt;
     const isWin     = totalPnl > 0;
 
@@ -3111,14 +3128,14 @@ function psycho() { return {
       id: pos.id, symbol: pos.symbol, reason,
       entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, exitPrice,
       dcaStage: pos.dcaStage, margin: pos.margin,
-      pnl, pnlPct, fundingFee: fundFee, totalPnl,
+      pnl, pnlPct, fundingFee: fundFee, tradeFee, totalPnl,
       duration, closedAt: _closedAt,
     };
     this.closedTrades.push(closed);
     // Fold into absorption tab if one exists for this position
     const _absTab = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
     if (_absTab) {
-      _absTab.finalClose = { reason, exitPrice, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, pnl, pnlPct, fundingFee: fundFee, closedAt: _closedAt };
+      _absTab.finalClose = { reason, exitPrice, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, pnl, pnlPct, fundingFee: fundFee, tradeFee, closedAt: _closedAt };
       _absTab.totalPnl   = parseFloat((_absTab.totalPnl + totalPnl).toFixed(6));
       _absTab.isOpen     = false;
       _absTab.closedAt   = _closedAt;
@@ -3573,7 +3590,8 @@ function psycho() { return {
               const pnl      = (pos.entryPrice - closePrice) / pos.entryPrice * pos.leverage * pos.margin;
               const pnlPct   = (pos.entryPrice - closePrice) / pos.entryPrice * pos.leverage * 100;
               const fundFee  = pos._fundingAccrued ?? 0;
-              const totalPnl = pnl + fundFee;
+              const tradeFee = this._estTradeFee(pos, closePrice);
+              const totalPnl = pnl + fundFee - tradeFee;
               const isWin    = totalPnl > 0;
               this.sess.trades++;
               this.sess.pnl = parseFloat((this.sess.pnl + totalPnl).toFixed(6));
@@ -3584,10 +3602,10 @@ function psycho() { return {
               if (closeReason === 'force') {
                 this._addForceRollup({ symbol: pos.symbol, exitPrice: closePrice, pnlPct, totalPnl, dcaStage: pos.dcaStage, margin: pos.margin, duration, isWin, id: pos.id });
               } else {
-                this.closedTrades.push({ id: pos.id, symbol: pos.symbol, reason: closeReason, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, exitPrice: closePrice, dcaStage: pos.dcaStage, margin: pos.margin, pnl, pnlPct, fundingFee: fundFee, totalPnl, duration, closedAt });
+                this.closedTrades.push({ id: pos.id, symbol: pos.symbol, reason: closeReason, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, exitPrice: closePrice, dcaStage: pos.dcaStage, margin: pos.margin, pnl, pnlPct, fundingFee: fundFee, tradeFee, totalPnl, duration, closedAt });
                 const _absTabGap = this.closedTrades.find(t => t.id === 'absorption_' + pos.id);
                 if (_absTabGap) {
-                  _absTabGap.finalClose = { reason: closeReason, exitPrice: closePrice, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, pnl, pnlPct, fundingFee: fundFee, closedAt };
+                  _absTabGap.finalClose = { reason: closeReason, exitPrice: closePrice, entryPrice: pos.entryPrice, origEntryPrice: pos._origEntryPrice ?? pos.entryPrice, pnl, pnlPct, fundingFee: fundFee, tradeFee, closedAt };
                   _absTabGap.totalPnl   = parseFloat((_absTabGap.totalPnl + totalPnl).toFixed(6));
                   _absTabGap.isOpen     = false;
                   _absTabGap.closedAt   = closedAt;

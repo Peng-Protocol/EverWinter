@@ -248,6 +248,8 @@ over the position's life — shown separately, not added into the headline
 number, since the two are tracked independently and aren't meant to be
 reconciled against each other.
 
+In pseudo mode, every close also pays an estimated trading fee, shown as a **Fees (est.)** line on the card and already subtracted from the headline net PnL. The entry is charged at the lower maker rate and the exit at the higher taker rate. Roughly one close in three is hit with a random 2–3× multiplier, and that chance of a heavier hit grows as your session win rate climbs. This is deliberate: a paper book that pays only flat fees flatters itself, and the multiplier keeps the sim closer to what live fills actually cost. Treat a pseudo result as credible only after fees. Live closes show no estimate, because the exchange charges the real fee.
+
 ---
 
 ## 6. Log Menu
@@ -280,7 +282,7 @@ Sits above the Activity Log so it's never scrolled out of view when opened.
 
 ## 7. A Note on Modes
 
-Pseudo and Live are tracked completely separately — separate positions, trade history, session stats, and peak-allocation record. Flipping the Live Trading toggle saves whichever mode you're leaving and loads the other's saved state.
+Pseudo and Live are tracked completely separately — separate positions, trade history, session stats, and peak-allocation record. Flipping the Live Trading toggle saves whichever mode you're leaving and loads the other's saved state. Estimated fees apply only in pseudo mode; live mode relies on the exchange's own figures.
 
 ---
 
@@ -331,6 +333,10 @@ If the scan is stopped, no sync runs at all, so anything that happens on the exc
 ### Absorbed Loss' impact on net PnL
 
 An open loss-absorption card pins to the top of the trades menu and keeps updating as it absorbs, rather than sinking down among unrelated closes — but it still isn't done until the underlying position actually closes. Absorbed loss is added to net PnL as soon as it's absorbed, so read a card's full history rather than judging performance off a single cut.
+
+### Absorption cuts don't carry estimated fees
+
+Estimated fees are charged when a position fully closes, not on each loss-absorption cut. A laggard that is cut down over time therefore only pays the entry fee on whatever size is left at its final close, so a heavily absorbed book looks slightly cheaper in pseudo mode than it would live.
 
 ### Nuances of Laggard Absorption
 
