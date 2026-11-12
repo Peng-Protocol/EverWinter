@@ -1197,8 +1197,8 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
 
       <!-- Cond. orders -->
       <div style="padding:9px 13px;border-bottom:1px solid var(--border)" x-show="condOrders.length>0">
-        <div class="sec-ttl" style="margin-bottom:7px">Cond. Orders <em x-text="condOrders.length+'/'+(cfg.maxCond??30)"></em></div>
-        <template x-for="o in condOrders" :key="o.id">
+        <div class="sec-ttl" style="margin-bottom:7px">Cond. Orders <em x-text="_condSlots()+'/'+(cfg.maxCond??30)"></em></div>
+        <template x-for="o in condOrders.filter(x => !x.bundle)" :key="o.id">
           <div class="cnd-card">
             <div class="cnd-head">
               <span class="pos-sym" x-text="fmtSym(o.symbol)"></span>
@@ -1208,6 +1208,25 @@ input[type=range]:disabled { opacity: .3; cursor: not-allowed; }
               <span class="cnd-meta" :style="o.tag?'margin-left:0':''" x-text="(o._pseudo===false?'LIVE · ':'')+fmtAge(o.createdAt, tick)"></span>
             </div>
             <template x-for="r in _condRows(o)" :key="r.k">
+              <div class="cnd-row">
+                <span class="cnd-l" x-text="r.label"></span>
+                <span class="cnd-p" x-text="fmtP(r.price)"></span>
+                <span class="cnd-bar"><i :class="r.cls" :style="'width:'+r.fill+'%'"></i></span>
+                <span class="cnd-d" x-text="r.dist"></span>
+              </div>
+            </template>
+          </div>
+        </template>
+        <template x-for="b in _condBundles()" :key="b.key">
+          <div class="cnd-card">
+            <div class="cnd-head">
+              <span class="pos-sym" x-text="b.symbol.replace('USDT','')"></span>
+              <span class="side-badge">▼ SHORT</span>
+              <span class="cnd-meta" x-text="'BUNDLE · '+b.orders.length"></span>
+              <span class="cnd-meta" x-show="b.tag" x-text="b.tag" style="margin-left:0"></span>
+              <span class="cnd-meta" style="margin-left:0" x-text="(b.live?'LIVE · ':'')+fmtAge(b.createdAt, tick)"></span>
+            </div>
+            <template x-for="r in _condBundleRows(b)" :key="r.k">
               <div class="cnd-row">
                 <span class="cnd-l" x-text="r.label"></span>
                 <span class="cnd-p" x-text="fmtP(r.price)"></span>
@@ -3604,15 +3623,16 @@ function pw() { return {
   // A pending entry that opens a position once price reaches `target`; reaching `worst` first cancels it. `entryPrice` is the price when the order was made.
   // Own count (cfg.maxCond), separate from maxPos. Callers (strategy plugins) pass the same candidate object they'd give pseudoOpenLong.
   // Live plugins override _condSubmit / cancelCondOrder / pseudoWatchCondOrders for real exchange orders (_pseudo === false).
-  async placeCondEntry({ candidate, target, worst, tag = null } = {}) {
+  async placeCondEntry({ candidate, target, worst, tag = null, bundle = null, kind = null } = {}) {
     const sym = candidate?.symbol, created = candidate?.price;
     const refuse = why => { this.log(`[CND] ${sym || '?'}: cond. order refused — ${why}`, 'warn'); return null; };
     if (!sym || !(created > 0)) return refuse('candidate needs a symbol and price');
     if (!(target > 0) || !(worst > 0)) return refuse('target and worst case must be positive prices');
     if ((target - created) * (worst - created) >= 0) return refuse('target and worst case must sit on opposite sides of the creation price');
     const cap = this.cfg.maxCond ?? 30;
-    if (this.condOrders.length >= cap) return refuse(`max cond. orders reached (${this.condOrders.length}/${cap})`);
-    if (this.condOrders.some(o => o.symbol === sym)) return refuse('cond. order already pending on this ticker');
+    const joins = !!bundle && this.condOrders.some(o => o.symbol === sym && o.bundle === bundle); // joining a bundle takes no new slot
+    if (!joins && this._condSlots() >= cap) return refuse(`max cond. orders reached (${this._condSlots()}/${cap})`);
+    if (this.condOrders.some(o => o.symbol === sym && !(bundle && o.bundle === bundle))) return refuse('cond. order already pending on this ticker');
     if (this.positions.some(p => p.symbol === sym)) return refuse('position already open on this ticker');
     if (this._lfPartnerHasSymbol(sym)) return refuse(`leader (${this._partnerBotId()}) already holds this ticker`);
     if (this._isSymbolBanned(sym)) return refuse('symbol banned');
@@ -3623,18 +3643,55 @@ function pw() { return {
       id: `cnd_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       symbol: sym, entryPrice: created, target, worst,
       dir: target > created ? 1 : -1, // 1: price must rise to target, -1: fall to it
-      markPrice: created, createdAt: Date.now(), tag, candidate: snap,
+      markPrice: created, createdAt: Date.now(), tag, bundle, kind, candidate: snap,
       _pseudo: true, _lastPx: created,
     };
     if (!await this._condSubmit(order)) return null;
     this.condOrders.push(order);
-    this.log(`[CND] ${sym}: cond. entry @ ${fmtP(created)} → target ${fmtP(order.target)} | worst ${fmtP(worst)}${tag ? ' | ' + tag : ''}`, 'info');
+    this.log(`[CND] ${sym}: cond. entry @ ${fmtP(created)} → target ${fmtP(order.target)} | worst ${fmtP(worst)}${tag ? ' | ' + tag : ''}${kind ? ' | ' + kind : ''}`, 'info');
     this.persist();
     return order;
   },
 
   // Venue hook: sim orders need nothing; live plugins place the real exchange order here and set order._pseudo = false.
   async _condSubmit(order) { return true; },
+
+  // ── Cond. bundles ──
+  // Orders on one ticker that share `bundle` (a string the placing plugin picks) take ONE cond. slot and cancel each other: the first to fill cancels the rest.
+  // `kind` names each order's role inside the bundle (e.g. 'top' / 'bottom') and is shown on the bundle card. Orders without a bundle behave as before.
+  _condSlots() {
+    const keys = new Set(); let n = 0;
+    for (const o of this.condOrders) { if (o.bundle) keys.add(o.symbol + '|' + o.bundle); else n++; }
+    return n + keys.size;
+  },
+  _condBundles() {
+    const m = new Map();
+    for (const o of this.condOrders) { if (!o.bundle) continue; const k = o.symbol + '|' + o.bundle; if (!m.has(k)) m.set(k, []); m.get(k).push(o); }
+    return [...m].map(([key, orders]) => {
+      orders = [...orders].sort((a, b) => b.target - a.target);
+      return { key, symbol: orders[0].symbol, orders, tag: orders[0].tag, createdAt: Math.min(...orders.map(o => o.createdAt)), live: orders.some(o => o._pseudo === false) };
+    });
+  },
+  // Card rows of a bundle: the shared entry price, then one row per order (labelled by its kind) with its distance from the current price.
+  _condBundleRows(b) {
+    const f = b.orders[0], e = f.entryPrice, m = f.markPrice > 0 ? f.markPrice : e;
+    const away = p => (Math.abs(p - m) / m * 100).toFixed(2) + '%';
+    const drift = (m - e) / e * 100;
+    return [
+      { k: 'e', label: 'Entry', price: e, cls: '', fill: Math.min(100, Math.abs(m - e) / Math.min(...b.orders.map(o => Math.abs(o.target - e))) * 100), dist: (drift >= 0 ? '+' : '') + drift.toFixed(2) + '%' },
+      ...b.orders.map(o => ({ k: o.id, label: o.kind ? String(o.kind).toUpperCase() : 'TARGET', price: o.target, cls: 't', fill: Math.max(0, Math.min(100, (m - e) / (o.target - e) * 100)), dist: away(o.target) })),
+    ];
+  },
+  async _condCancelSiblings(o, reason = 'bundle sibling') {
+    if (!o || !o.bundle) return;
+    for (const s of this.condOrders.filter(x => x.symbol === o.symbol && x.bundle === o.bundle && x.id !== o.id)) await this.cancelCondOrder(s.id, reason);
+  },
+  // Bundle members audit the same ticker together: one 6-minute kline read per ticker per 30s.
+  _condKlinesRecent(sym) {
+    const c = (this._condKlRecent = this._condKlRecent || {}), now = Date.now();
+    if (!(c[sym] && now - c[sym].t < 30000)) c[sym] = { t: now, p: this._condKlines(sym, now - 6 * 60 * 1000, now) };
+    return c[sym].p;
+  },
 
   async cancelCondOrder(id, reason = 'manual') {
     const o = this.condOrders.find(x => x.id === id);
@@ -3734,7 +3791,7 @@ function pw() { return {
     const o = this.condOrders.find(x => x.id === id);
     if (!o) return;
     try {
-      const now = Date.now(), candles = await this._condKlines(o.symbol, now - 6 * 60 * 1000, now);
+      const now = Date.now(), candles = await this._condKlinesRecent(o.symbol);
       if (!candles) return;
       const res = this._condKlineHit(o, candles, o._pseudo === false);
       if (res) { this.log(`[WPL] ${o.symbol}: whiplash audit — cond. ${res.hit} confirmed in klines`, 'warn'); await this._condResolve(o, res, 'whiplash'); }
@@ -3782,6 +3839,7 @@ function pw() { return {
   async _condTrigger(o, at = 0) {
     if (!this.condOrders.some(x => x.id === o.id)) return; // already resolved by the other check
     this.condOrders = this.condOrders.filter(x => x.id !== o.id);
+    await this._condCancelSiblings(o); // bundle: one fill cancels the rest, before anything else can fire
     const drop = why => { this.log(`[CND] ${o.symbol}: target hit but cond. order dropped — ${why}`, 'warn'); this.persist(); };
     if (this.positions.length >= this.cfg.maxPos) return drop(`no free position slot (${this.positions.length}/${this.cfg.maxPos})`);
     if (this._isDrawdownHalted() || this._isGainsLocked()) return drop('entries are halted');
@@ -4616,7 +4674,7 @@ const forceMs = this.cfg.runtimeHours * 3600000;
       data = {
         exportType: 'configs',
         exportedAt: new Date().toISOString(),
-        version: '1.6.10',
+        version: '1.6.11',
         cfg: this.cfg,
       };
       suffix = 'configs';
@@ -4624,7 +4682,7 @@ const forceMs = this.cfg.runtimeHours * 3600000;
       data = {
         exportType: 'positions',
         exportedAt: new Date().toISOString(),
-        version: '1.6.10',
+        version: '1.6.11',
         session: this.sess,
         closedTrades: this.closedTrades,
         positions: this.positions.map(p => ({ ...p })),
@@ -4636,7 +4694,7 @@ const forceMs = this.cfg.runtimeHours * 3600000;
       data = {
         exportType: 'log',
         exportedAt: new Date().toISOString(),
-        version: '1.6.10',
+        version: '1.6.11',
         logs: this.logs,
       };
       suffix = 'log';
