@@ -120,7 +120,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boPairs`, `boGray`, `boWhite`, plus its `boEnabled`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boPairs`, `boGray`, `boWhite`, plus its `boEnabled`, `boLifeMins`, `boWinH`, `boFlowEnabled`, `boFundW`, `boSkewW` and `boPushMax` settings) sits in the config and travels with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -166,11 +166,11 @@ Pending orders are listed under **Cond. Orders** in the market column, below Ope
 
 ## Breakout Plugin
 
-Breakout measures how far a ticker normally moves in an hour (its average over the last 24 hours) and places two conditional orders on it as one bundle: one an average move above the current price, one an average move below. Whichever breaks first opens the position, with TP and SL one average move from the entry, and cancels the other. The only stopgap for a bad regime is the [break counter](#break-counter). It is the only proactive plugin: one file for both bots (`plugins/strategies/Breakout.html`, settings `bo*`), no other plugin needed, and **Binary Mode must be on** (with it off, no orders are placed). It needs the cond. bundle support in PseudoChaser 1.6.12+ and PseudoWinter 1.6.11+ (EverWinter / SunChaser 1.7.2+ live); on an older host it logs one warning and places nothing. ([more](#breakout-details))
+Breakout reads a ticker's last 24 hourly candles and splits them by colour: the green candles give its average **top move** (how far above their open they ran) and the red candles its average **bottom move** (how far below their open). It places two conditional orders on the ticker as one bundle: one a top move above the current price, one a bottom move below. Whichever breaks first opens the position and cancels the other, with TP and SL taken from the same two moves. There is no stand down or other regime stopgap; an optional [Funding / Skew Tilt](#funding--skew-tilt) is the only thing that bends the targets. It is the only proactive plugin: one file for both bots (`plugins/strategies/Breakout.html`, settings `bo*`), no other plugin needed, and **Binary Mode must be on** (with it off, no orders are placed). It needs the cond. bundle support in PseudoChaser 1.6.12+ and PseudoWinter 1.6.11+ (EverWinter / SunChaser 1.7.2+ live); on an older host it logs one warning and places nothing. ([more](#breakout-details))
 
 ### Entry
 
-Each scan, Breakout fills every free cond. slot with a random ticker that passes the [filters](#filters); a ticker's pair is one slot. It does nothing at [Max Positions](#max-positions) or while the break counter is against the bot. The bot's side only decides which break is favorable and which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below); both orders are the bot's own direction.
+Each scan, Breakout fills every free cond. slot with a random ticker that passes the [filters](#filters); a ticker's pair is one slot. It does nothing at [Max Positions](#max-positions). The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below) and which move each one takes; both orders are the bot's own direction.
 
 ### Expiry
 
@@ -182,7 +182,11 @@ Two always-on filters skip dead tickers: **Stablecoin** (the 24 h range must be 
 
 ### Break counter
 
-Every fill is a **break**: ▲ top or ▼ bottom, kept for the **Break window** (default 4 h). A break is **favorable** when it goes the bot's way (PseudoChaser: top, PseudoWinter: bottom) and **unfavorable** otherwise. While unfavorable breaks outnumber favorable ones, every pending Breakout order is cancelled and none are placed; orders resume when old breaks age out of the window. It is the plugin's only regime filter: there is no scoring, forecasting or simulation.
+Every fill is a **break**: ▲ top or ▼ bottom, kept for the **Break window** (default 4 h) and shown in the live readout. It is a readout only: it never cancels or blocks an order.
+
+### Funding / Skew Tilt
+
+Off by default. It pushes the two moves apart before the levels are set: bullish readings stretch the top move and shrink the bottom move, bearish readings the reverse, and the triggers and TP / SL follow. Two readings, each a signed percentage like a price change: **skew**, how much one side of the long / short ratio exceeds the other (60% long = longs 50% above shorts = +50%), and **funding**, the ticker's rate as a % above or below the market's typical rate, clamped at the market's funding high / low. Each has a weight (100% applies it in full, negative flips it, 0 turns it off), and the **Push cap** limits their sum (default 100%: one move at most ×2, the other ÷2). ([more](#funding--skew-tilt-details))
 
 ### Max positions
 
@@ -190,7 +194,7 @@ At **Max Positions**, every pending Breakout cond. order is cancelled and no new
 
 ### Live readout
 
-A small panel under the config fields; hover (PC) or tap (mobile) it for detail. **LIVE** shows the slots Breakout uses over **Max Cond. Orders**, the ▲ top and ▼ bottom break counts (green for favorable, red for unfavorable), a red **STOP** with a pulsing dot while the break counter is against the bot, and a blinking yellow **⚠** while Binary Mode is off.
+A small panel under the config fields; hover (PC) or tap (mobile) it for detail. **LIVE** shows the slots Breakout uses over **Max Cond. Orders**, the ▲ top and ▼ bottom break counts, and a blinking yellow **⚠** while Binary Mode is off.
 
 ### Config
 
@@ -200,7 +204,11 @@ Each setting's explanation sits behind a circled **!** button next to it (click 
 |---|---|
 | **Breakout Mode** (`boEnabled`, default on) | Master on/off. Off = no new orders. |
 | **Order life** (`boLifeMins`, default **60**) | Minutes before an unfilled pair is cancelled. |
-| **Break window** (`boWinH`, default **4**) | Hours a break counts toward the counter. |
+| **Break window** (`boWinH`, default **4**) | Hours a break counts toward the live readout. |
+| **Funding / Skew Tilt** (`boFlowEnabled`, default off) | Pushes the top and bottom moves apart by funding and long / short skew. The three settings below show once it is on. |
+| **Funding weight** (`boFundW`, default **100**) | % of the funding percentage applied, −500 to 500. Negative flips it, 0 turns it off. |
+| **Skew weight** (`boSkewW`, default **100**) | The same for the skew percentage. 0 also skips its fetch. |
+| **Push cap** (`boPushMax`, default **100**) | Most the combined push can be, % either way, 0 to 1000. 100 = one move at most ×2 and the other ÷2; 0 = no effect. |
 
 The stored state is listed under [Breakout Details](#breakout-details).
 
@@ -278,34 +286,34 @@ The details left out of the shortened Breakout entries.
 
 The accordion is marked with a text glyph rather than an emoji: ❄︎ on PseudoWinter, ♨︎ on PseudoChaser. Breakout reads which bot it is loaded into and uses that side's conventions (PseudoChaser longs, PseudoWinter shorts). With Binary Mode off the plugin logs one warning and places no orders.
 
-#### Average move
+#### Top and bottom moves
 
-The newest 25 candles are fetched (`interval=60`) and the forming one dropped, so all 24 are closed; a ticker with fewer than 24 is skipped. The **average move** `m` is the mean candle range `(high − low) ÷ open`, in %. Candles go through the scheduling queue, while the last-price and `recent-trade` reads are direct fetches.
+The newest 25 candles are fetched (`interval=60`) and the forming one dropped, so all 24 are closed; a ticker with fewer than 24 readable candles is skipped. The candles are split by colour: a **green** candle (close above open) contributes `(high − open) ÷ open` to the **top move**, a **red** candle (close below open) contributes `(open − low) ÷ open` to the **bottom move**, and each move is the mean over its candles, in %. A doji (close = open) counts for neither. A ticker with no green or no red candle among the 24 is skipped and logged, so one that only went a single way in 24 h is not traded. Candles go through the scheduling queue, while the last-price and `recent-trade` reads are direct fetches.
 
 #### Batch
 
-Each scan, a batch fills every free cond. slot (**Max Cond. Orders** minus the slots in use) while a position slot is free; at **Max Positions** or while the break counter is against the bot the batch does nothing. The host drops a cond. order that triggers once no position slot is free, and a live order fails if the balance is short, which the cap check prevents. Tickers come at random from the bulk list (USDT pairs only, not banned, not held, not pending, not in `megacapExclude`, not graylisted). For each ticker:
+Each scan, a batch fills every free cond. slot (**Max Cond. Orders** minus the slots in use) while a position slot is free; at **Max Positions** the batch does nothing. The host drops a cond. order that triggers once no position slot is free, and a live order fails if the balance is short, which the cap check prevents. Tickers come at random from the bulk list (USDT pairs only, not banned, not held, not pending, not in `megacapExclude`, not graylisted). For each ticker:
 
-1. Read the last 24 closed 1h candles and take the **average move** `m`.
+1. Read the last 24 closed 1h candles and take the **top move** and **bottom move**.
 2. Run the stablecoin and illiquidity filters.
-3. Read a fresh last price and the leverage, then place the pair.
+3. Read a fresh last price (and funding rate) and the leverage, apply the [Funding / Skew Tilt](#funding--skew-tilt-details) if it is on, then place the pair.
 
-All reads happen once per ticker, not once per order. Attempts per batch are capped at 3× the free slots, so a ticker that fails (new listing, refused order, a filter) is replaced by the next pick. Each order's candidate carries `_bo`, `_boMovePct`, `_boEdge`, `_tpPct` and `_slPct`; the underscore keys are copied onto the position and its closed trade, which is what the badge reads. If the second order of a pair is refused, the first is cancelled and the ticker is skipped.
+All reads happen once per ticker, not once per order. Attempts per batch are capped at 3× the free slots, so a ticker that fails (new listing, refused order, a filter) is replaced by the next pick. Each order's candidate carries `_bo`, `_boTopPct`, `_boBotPct`, `_boEdge`, `_tpPct` and `_slPct` (and `_boPush` with the tilt on); the underscore keys are copied onto the position and its closed trade, which is what the badge reads. If the second order of a pair is refused, the first is cancelled and the ticker is skipped.
 
 #### Entry levels and TP / SL
 
-With `d = min(m, 90%)`, the pair is a bundle (`bundle: 'breakout'`) of two orders:
+With `dT = min(top, 90%)` and `dB = min(bottom, 90%)` (after any tilt), the pair is a bundle (`bundle: 'breakout'`) of two orders:
 
 | Order (`kind`) | Entry (target) | Worst price |
 |---|---|---|
-| `top` | price × (1 + d) | price × (1 − d), the bottom order's trigger |
-| `bottom` | price × (1 − d) | price × (1 + d), the top order's trigger |
+| `top` | price × (1 + dT) | price × (1 − dB), the bottom order's trigger |
+| `bottom` | price × (1 − dB) | price × (1 + dT), the top order's trigger |
 
-Each order's worst price is the other's trigger, so a move through one level fills that order and the host cancels the other; when a single sample or candle crosses both, the level nearer the previous price or the candle's open wins. TP and SL are one `m` from the entry on the bot's own side: PseudoChaser TP = entry × (1 + m) and SL = entry × (1 − m); PseudoWinter the reverse. The 90% cap keeps the lower trigger a positive price. TP and SL are ROI %, so each order carries `_tpPct` = `_slPct` = m × leverage, and the host applies them at fill in Binary Mode.
+Each order's worst price is the other's trigger, so a move through one level fills that order and the host cancels the other; when a single sample or candle crosses both, the level nearer the previous price or the candle's open wins. TP and SL come from the same two moves, measured from the entry on the bot's own side: PseudoChaser TP = entry × (1 + top) and SL = entry × (1 − bottom); PseudoWinter TP = entry × (1 − bottom) and SL = entry × (1 + top). Both orders of a pair therefore carry the same TP and SL; only their triggers differ. The 90% cap applies to the trigger distances only and keeps the lower trigger a positive price. TP and SL are ROI %, so each order carries `_tpPct` = its TP move × leverage and `_slPct` = its SL move × leverage, and the host applies them at fill in Binary Mode.
 
 #### Expiry details
 
-A pair is cancelled once its orders are older than **Order life** (reason `breakout expired`). A pair that is gone with no position on the ticker (expired, cancelled by hand, a bail, a halt, the max-positions cap or the stand-down) is dropped from the pair list without counting.
+A pair is cancelled once its orders are older than **Order life** (reason `breakout expired`). A pair that is gone with no position on the ticker (expired, cancelled by hand, a bail, a halt or the max-positions cap) is dropped from the pair list without counting.
 
 #### Filter details
 
@@ -320,7 +328,13 @@ A ticker that fails either is **graylisted for a week**. A ticker that passes th
 
 #### Break counter details
 
-A **break** is a Breakout order filling, recorded by the order's edge: `top` or `bottom`. A fill the host drops for want of a position slot still counts; an expiry, a bail, a halt, the max-positions cap, a stand-down and the sibling's cancel don't. Breaks are kept for the **Break window** (`boWinH`, default 4 h) and older ones stop counting. The counter reads the window as **fav** (the bot's way: PseudoChaser top, PseudoWinter bottom) and **unfav** (the other edge). While **unfav > fav**, every pending Breakout order is cancelled (reason `breakout stand down`) and no new pair is placed; the rule is literal, so a single unfavorable break against none stops it. With nothing placed there are no new breaks, so recovery comes only from old breaks aging out of the window.
+A **break** is a Breakout order filling, recorded by the order's edge: `top` or `bottom`. A fill the host drops for want of a position slot still counts; an expiry, a bail, a halt, the max-positions cap and the sibling's cancel don't. Breaks are kept for the **Break window** (`boWinH`, default 4 h) and older ones stop counting. The counts appear in the live readout and nothing else reads them: the earlier stand down, which cancelled every pending order and placed none while unfavorable breaks outnumbered favorable ones, is gone.
+
+#### Funding / Skew Tilt details
+
+The tilt runs in `_boPrep` after the filters, so a skipped ticker costs nothing extra. **Skew**: the long share comes from `GET /v5/market/account-ratio` (period 1 h, limit 1, `buyRatio` × 100), cached 15 min per ticker in memory. With L the long share and S = 100 − L (each floored at 1), the read is `L ÷ S − 1` when L ≥ S and `−(S ÷ L − 1)` otherwise. **Funding**: taken from the host's bulk ticker list (USDT pairs, no fetch) and cached 1 min. The market's typical rate is the median of all rates, the scale is the larger of its absolute value and the median absolute rate, and the market's funding high / low are the 95th percentile of the positive / negative rates (`FUND_TRIM`, so a few freak tickers do not set the range). The ticker's current rate is clamped to that high / low and the read is `(rate − median) ÷ scale`; under 20 readable rates there is no funding read.
+
+Each read × its weight ÷ 100 are summed into the push, limited to ± **Push cap** ÷ 100. A push of +x multiplies the top move by (1 + x) and divides the bottom move by (1 + x); a push of −x does the reverse (+150%: top ×2.5, bottom ÷2.5). A weight of 0 skips that signal, and an unreadable signal counts as 0. The log line shows the tilt and both reads. The funding is a percentage of a typical rate near 0.01%, so a small absolute difference is a large percentage, which is why the cap matters.
 
 #### Max positions details
 
@@ -328,11 +342,11 @@ Once open positions reach **Max Positions**, every pending Breakout cond. order 
 
 #### Live readout rows
 
-A panel in the accordion, below the config fields, with no labels and only the app's own colours. **Hover** it on PC, or **tap** it on mobile, for a popover with the window's top and bottom counts and whether orders are being placed.
+A panel in the accordion, below the config fields, with no labels and only the app's own colours. **Hover** it on PC, or **tap** it on mobile, for a popover with the window's top and bottom counts.
 
 | Item | Shows |
 |---|---|
-| **LIVE** | Slots Breakout uses over **Max Cond. Orders**, ▲ top and ▼ bottom break counts (green favorable, red unfavorable), **STOP** with a pulsing red dot and a red border while unfavorable breaks lead, and a blinking yellow **⚠** while Binary Mode is off. |
+| **LIVE** | Slots Breakout uses over **Max Cond. Orders**, ▲ top and ▼ bottom break counts, and a blinking yellow **⚠** while Binary Mode is off. |
 
 #### Stored state
 
@@ -349,10 +363,11 @@ Everything from earlier versions that this one no longer uses (the flow, criteri
 ### Breakout Internals
 
 - **Hooks**: `init` (config defaults and cleanup, and the `registerRoleBadge` provider), a scan stage `bo-batch` (a `runScan` wrapper on a host without stages), `pseudoWatchCondOrders` and `_condTrigger`, plus `_ewCondFilled` / `_scCondFilled` on a live host. Declares `after: ['sunchaser', 'everwinter']` so it wraps the live plugins' versions.
-- **Pairs**: `_boPlace` calls `_boPrep` once (candles, filters, price, leverage) and then `placeCondEntry` twice with `bundle: 'breakout'` and `kind: 'top' | 'bottom'`; each order's worst price is the other's target. If the second is refused the first is cancelled. `_boBatch` returns when `_condSlots` is missing (a host without bundles), when Binary Mode is off, at the position cap or while halted.
+- **Pairs**: `_boPlace` calls `_boPrep` once (candles, filters, price, leverage, and the tilt) and then `placeCondEntry` twice with `bundle: 'breakout'` and `kind: 'top' | 'bottom'`; each order's worst price is the other's target. If the second is refused the first is cancelled. `_boBatch` returns when `_condSlots` is missing (a host without bundles), when Binary Mode is off, at the position cap.
 - **Slots**: free slots are `maxCond − _condSlots()`, one per pair; `_boPend` counts Breakout's tickers.
-- **Break counter**: `_boCount(edge)` records a break and prunes the window, `_boTally` returns `{ top, bottom, fav, unfav }`, `_boHalted` is `unfav > fav` and `_boFavEdge` is `top` on PseudoChaser, `bottom` on PseudoWinter. The `_condTrigger` wrapper counts a fill and drops its pair before the host's first await; the host's `_condTrigger` then cancels the bundle's other order. `_boSettle` is the fallback for fills that bypass `_condTrigger` (live): a pair with a position on its symbol is counted (from the position's `_boEdge`, else whichever order is gone), a pair with nothing pending and no position is dropped, and leftover siblings are cancelled again.
-- **Guards**: `_boGuard` runs `_boCancelAll` for the position cap (`breakout max positions`) or the break counter (`breakout stand down`), from the `_condTrigger` wrapper after every fill, the live-fill wrapper, the watcher wrapper and `_boBatch`. `_boExpire` cancels orders past `boLifeMins` (`breakout expired`).
+- **Break counter**: `_boCount(edge)` records a break and prunes the window, `_boTally` returns `{ top, bottom }`. The `_condTrigger` wrapper counts a fill and drops its pair before the host's first await; the host's `_condTrigger` then cancels the bundle's other order. `_boSettle` is the fallback for fills that bypass `_condTrigger` (live): a pair with a position on its symbol is counted (from the position's `_boEdge`, else whichever order is gone), a pair with nothing pending and no position is dropped, and leftover siblings are cancelled again.
+- **Guards**: `_boGuard` runs `_boCancelAll` for the position cap (`breakout max positions`), from the `_condTrigger` wrapper after every fill, the live-fill wrapper, the watcher wrapper and `_boBatch`. `_boExpire` cancels orders past `boLifeMins` (`breakout expired`).
+- **Moves and tilt**: `_boMoves` splits the candles by colour into `{ top, bottom, green, red }`. With the tilt on, `_boFlow` combines `_boFundPct` (from `_boMarketFunding`, which reads the host's `_lastAllTickers`) and `_boSkewPct` (through the in-memory `_boCached`) into a push that `_boPrep` applies to the two moves.
 - **Badge**: the `registerRoleBadge` provider reads `_boEdge` off a position or an order's `candidate` and returns the **TOP** / **BOTTOM** badge.
 - **Leverage**: `_boLev` uses `resolveEffectiveLeverage` where the host has it (PseudoWinter), else `leverage`.
 
@@ -440,7 +455,7 @@ Each plugin's `transform(def)` receives and returns the component definition, so
 
 ### Bybit API Endpoints Used
 
-**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for Breakout's pre-entry price), `GET /v5/market/recent-trade` (Breakout's illiquidity filter), `GET /v5/market/kline` (hourly bars for Breakout's average move; 1-minute bars for the whiplash and gap audits), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots; signing is HMAC-SHA-256 via `crypto.subtle.sign` with a 250ms minimum gap between signed requests (plugins).
+**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for Breakout's pre-entry price and funding rate), `GET /v5/market/recent-trade` (Breakout's illiquidity filter), `GET /v5/market/account-ratio` (Breakout's long / short skew, only with the Funding / Skew Tilt on and a skew weight set), `GET /v5/market/kline` (hourly bars for Breakout's top and bottom moves; 1-minute bars for the whiplash and gap audits), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots; signing is HMAC-SHA-256 via `crypto.subtle.sign` with a 250ms minimum gap between signed requests (plugins).
 
 **Call cadence**: the full-book `position/list` runs only before and after each scan loop. Single-symbol `position/list` calls happen around an entry and while a close is repricing. On the Psycho bots, `execution/list` is called for a pending DCA/AMa stage once price reaches its trigger, plus one sweep of every pending stage after each scan loop to catch a wick.
 

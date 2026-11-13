@@ -2,16 +2,21 @@
   Breakout Plugin for PseudoChaser and PseudoWinter (unified)
   Modelled on MI's Fade (cond. entry, 1hr life) with no scoring, no forecasting and no simulation.
 
-  Each batch picks random tickers (up to Max Cond. Orders; a ticker's pair is one bundle = one slot), reads the last twenty-four closed 1hr candles of each and takes the
-  average move: the mean candle range, (high - low) / open, in %.
+  Each batch picks random tickers (up to Max Cond. Orders; a ticker's pair is one bundle = one slot), reads the last twenty-four closed 1hr candles of each and splits
+  them by colour: the green candles (close above open) give the average TOP move, the mean of (high - open) / open, in %; the red candles (close below open) give the average
+  BOTTOM move, the mean of (open - low) / open, in %. Doji candles count for neither; a ticker with no green or no red candle among the 24 is skipped.
 
-  Each ticker gets TWO cond. orders, one above price and one below, each 1 x the average move away: the top and the bottom of the range. Each one's worst price is the other's
-  trigger. The two are one cond. bundle (bundle 'breakout', kinds top / bottom): one slot, one card, and whichever breaks first fills and cancels the other. TP / SL are 1 x the average move from the trigger on the bot's own side (Chaser TP above / SL below,
-  Winter TP below / SL above). Needs the host's cond. bundle support (placeCondEntry bundle / kind, _condSlots, _condCancelSiblings).
+  Each ticker gets TWO cond. orders, one above price and one below, the upper one the average top move above price, the lower one the average bottom move below it: the top and the bottom of the range. Each one's worst price is the other's
+  trigger. The two are one cond. bundle (bundle 'breakout', kinds top / bottom): one slot, one card, and whichever breaks first fills and cancels the other. TP / SL come from the same two moves, measured from the trigger on the bot's own side (Chaser: TP = top move above, SL = bottom move below;
+  Winter: TP = bottom move below, SL = top move above), so both triggers of a pair carry the same TP / SL. Needs the host's cond. bundle support (placeCondEntry bundle / kind, _condSlots, _condCancelSiblings).
 
-  Break counter (the only regime stopgap): every filled cond. is a break, top or bottom, kept for the Break window (default 4h). A break is favorable when it goes the bot's way
-  (Chaser: top, Winter: bottom). While unfavorable breaks outnumber favorable ones, every pending Breakout cond. is cancelled and none are placed; the count recovers as old breaks age out.
-  Expired pairs and cancels are not breaks.
+  Break counter (readout only): every filled cond. is a break, top or bottom, kept for the Break window (default 4h) and shown in the LIVE readout. It no longer stops anything:
+  there is no stand down, pairs are placed whatever the counts. Expired pairs and cancels are not breaks.
+  Funding / Skew Tilt (optional, off by default): two readings, each a signed percentage the way a price change is. Skew: the long share against the short share, how much one side exceeds the
+  other (60 / 40 = longs 50% above shorts = +50%; 40 / 60 = -50%). Funding: the ticker's rate as a % above or below the market's typical funding (the median of the host's bulk ticker list, no
+  fetch), the rate first clamped at the market's funding high / low (95th percentile of the positive / negative rates, so a few freak tickers do not set the range). Each is multiplied by its own
+  weight (100% = all of it, up to +/-500%, negative flips it) and summed into the push, capped at +/-Push cap (default 100%, setting). A push of +x stretches the top move by (1 + x) and shrinks the bottom by the same
+  factor, a push of -x the reverse (+150%: top x2.5, bottom /2.5; the cap decides how far it can go), so the triggers and TP / SL both follow. A weight of 0 turns that signal off and skips its fetch; an unreadable signal counts as 0.
 
   Max positions: once open positions reach the host's Max Positions, every pending Breakout cond. is cancelled and no new ones are placed. They resume when a slot frees.
 
@@ -31,17 +36,22 @@
 (function () {
   'use strict';
 
-  const VERSION = '3.1.0'; // Change: Cond. bundles: a ticker's top/bottom pair is now one bundle (bundle 'breakout', kind top / bottom) taking ONE cond. slot with its own card, so Max Cond. Orders counts tickers; the host cancels the sibling on a fill, so Breakout no longer does. Needs the updated PseudoChaser 1.6.12 / PseudoWinter 1.6.11 (and EverWinter / SunChaser 1.7.2 live): on a host without _condSlots it logs once and places nothing | previous: 3.0.0 — Stripped to essentials: criteria, cell scores, watch lists, hypotheticals, ticker flow, double entries, retry queue and the worse-price logic are gone. Every ticker now gets TWO conds, one above and one below price at 1x the average move, each one's worst price being the other's trigger, so the first break fills and cancels its sibling. The only regime stopgap is the break counter: breaks (top / bottom fills) are counted over a Break window (default 4h), and while unfavorable breaks (Chaser: bottom, Winter: top) outnumber favorable ones every pending cond. is cancelled and none are placed until the count recovers. Needs the host's cond. bundles: a ticker's pair takes ONE cond. slot and shows as one bundle card | previous: Live readout rebuilt around the criteria instead of the P/A UP / DOWN cohorts: one column per criterion summarizing ALL of its stored scores, for its + and its - table the cell its tickers did best at after breaking out (W-/A- TOP / BTM, D / D3 double / triple, SND under the stand-down floor) above the tag and what that cell has paid below it (the base cell's samples plus the criterion table's, last N per type: first-passage, round-2 hypotheticals, real), BASE-best NET at the right; the CRIT sample-count row folds into it | previous: Criteria: P/A (average positive vs average negative close of the 24 candles, strength-weighted, replaces the break-count lean cohorts U / D / N) plus, behind a new Criteria toggle, Funding, long / short skew (one extra fetch), LTA (turnover of the latest 12 candles vs the 12 before) and IO/A (open interest vs the filtered-market median); base cells are now edge x k (T1 ... B3) and every criterion keeps +/- tables per base cell, a ticker's score = base cell + each exhibited criterion's table x its strength; tables learn the excess over the base cell's average; old lean cells are folded into the base cells | previous: Live mode (EverWinter / SunChaser): the max-positions cancel-all check runs the moment a live cond. fills (live fills bypass _condTrigger) instead of waiting for the next watcher tick; batches still fill Max Cond. Orders in live and sim alike | previous: Internal tracking of conds. at max positions removed (it polled every tracked ticker's price; the watch lists replace it): at max positions pending conds are simply cancelled and none are placed, and the Tracked table, tracker storage and their tally / invalidation feed are gone | previous: Numerical cell scoring replaces Auto-switch, the per-ticker trip, the With / Against switches and the double-entry ratchet: every ticker is simulated at both edges and 1x / 2x / 3x (round 1: twelve 5m candles of the order life, round 2: the position walked to TP / SL on 4h candles with one finer fetch when both touch, funding and fees included), cond. orders, hypotheticals and real TP / SL / Force Close results feed per-cell $ scores (last 50 samples per type, no decay, uPnL no longer scored), entries are drawn by score, and a lean whose cells are all under water stands down; new Round 1 / Round 2 lists and a HYPO row | previous: At max positions every Breakout cond. is cancelled and no new ones are placed; those tickers are tracked internally (top / bottom breaks, invalidations, expiry feed the tallies and the double multiplier) and listed in a new Tracked table with a one-bar progress view; re-checked after every cond. fill. | previous: Contradictory moves removed: the unfavored skew (Chaser downside, Winter upside) enters a double top / bottom cond. at 2x the average move (multiplier rises +1 when those positions lose, falls -1 when a double cond. expires untouched, floor 2); worse-price hits are counted as invalidations per W-/A- badge. | previous: Live readout cut to three label-free rows (LIVE: pending + break counts; UP skew; DOWN skew) using only the app's gray / theme / green / yellow / red; extra detail moved into a hover (PC) or tap (mobile) popover per row. | previous: Live readout moved into the Breakout accordion body, below the config fields, and shrunk to a compact bar-free table (entry mode + edge per skew with its loss figure, break counts, pending, trip, queue); General accordion's Mode line restored. | previous: Live readouts (pending / flow modes / auto-switch loss meters / per-ticker trip / break tally / retry queue / Binary warning) moved out of the Breakout config into the General accordion's Mode line, shown bold and colored with meters, pulses and an outcome strip. | previous: All hint text and hover tooltips are hidden behind circled "!" buttons next to their toggle or setting (click to show); Ticker flow, Auto-switch and Per-ticker trip default to on. | previous: Ticker flow With / Against is now two switches, one for upside-skew tickers and one for downside-skew tickers; Auto-switch and Per-ticker trip flip only the skew whose positions lost (or reversed). | previous: Per-ticker trip sub-toggle under Auto-switch: one position at -25% of its base margin flips the switch (and flow) once, latched; a swing to +25% reverses it and re-arms. | previous: Ticker flow: each ticker is scored toppy / bottomy from its 24 candles (breaks of the average move above the open vs below it) and enters With or Against that flow; W-/A- prefix on the TOP / BOTTOM badges; Auto-switch flips With <-> Against while flow is on. | previous: Chaser plugin glyph is the text-style hot springs symbol (fire-like) instead of the alchemical fire triangle. | previous: Auto-switch rebuilt on uPnL: flips the entry edge when open positions entered at the current edge are down 25% (setting) of their base margin, checked every minute; plugin glyph (snowflake / fire) replaces the explosion emoji. | previous: Auto-switch rule: tally in the bot's favor (Chaser: tops lead, Winter: bottoms lead) enters at the leading edge, against it at the opposite edge. | previous: TOP / BOTTOM position-type badge on pending conds and positions (needs the base bots' cond card badge slot); Auto-switch tooltip rewritten in plain English with the currently resolving edge. | previous: Entry edge setting (Chaser can enter at the top, Winter at the bottom); top / bottom / no-break tally readout; batch fills the host's Max Cond. Orders limit instead of being capped by Max Positions; tally counts fills dropped past Max Positions; Auto-switch picks the edge from the tally's skew. | previous: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
+  const VERSION = '3.6.0'; // Change: Funding / Skew Tilt push cap is now a setting (Push cap %, default 100, was a fixed 400): the combined push is limited to +/-that, so at 100% one move is at most x2 and the other /2; 0 = no effect | previous: 3.5.0 — Funding / Skew Tilt read as percentages like a price change: skew is the % one side exceeds the other (60 / 40 long = +50%, 40 / 60 = -50%), funding is the % above or below the market's median rate, clamped at the market's funding high / low; weight 100% applies the percentage in full, the push stretches one move by (1 + push) and shrinks the other by the same factor (capped at +/-400%) | previous: 3.4.0 — Funding / Skew Tilt made strong enough to matter: funding is read against the whole market's funding highs and lows (95th percentile of the positive / negative rates across the bulk ticker list, no fetch, no per-ticker history) instead of the ticker's own; weights now run to +/-500% (default 100) and the push is applied as top x e^push / bottom x e^-push (capped at +/-2) so a large push cannot flip or zero the opposite move | previous: 3.3.0 — Optional Funding / Skew Tilt: the ticker's funding rate (clamped by its recent funding highs and lows) and long / short skew (long share % centred on 50) each push the top and bottom moves apart by their own weight (top x (1 + push), bottom x (1 - push)), so the triggers and TP / SL follow; off by default, a weight of 0 skips that signal's fetch, funding range cached 1h and skew 15min in memory | previous: 3.2.0 — Tailored targets: the 24 candles are split by colour, green candles give the average top move (open to high) and red candles the average bottom move (open to low); the top cond. sits one top move above price, the bottom cond. one bottom move below, and TP / SL flow from the same two moves on the bot's own side (Chaser: TP top move, SL bottom move; Winter: TP bottom move, SL top move); a ticker missing green or red candles is skipped. Stand down removed: unfavorable breaks outnumbering favorable ones no longer cancels or blocks conds.; the break counter stays as a plain top / bottom readout | previous: 3.1.0 — Cond. bundles: a ticker's top/bottom pair is now one bundle (bundle 'breakout', kind top / bottom) taking ONE cond. slot with its own card, so Max Cond. Orders counts tickers; the host cancels the sibling on a fill, so Breakout no longer does. Needs the updated PseudoChaser 1.6.12 / PseudoWinter 1.6.11 (and EverWinter / SunChaser 1.7.2 live): on a host without _condSlots it logs once and places nothing | previous: 3.0.0 — Stripped to essentials: criteria, cell scores, watch lists, hypotheticals, ticker flow, double entries, retry queue and the worse-price logic are gone. Every ticker now gets TWO conds, one above and one below price at 1x the average move, each one's worst price being the other's trigger, so the first break fills and cancels its sibling. The only regime stopgap is the break counter: breaks (top / bottom fills) are counted over a Break window (default 4h), and while unfavorable breaks (Chaser: bottom, Winter: top) outnumber favorable ones every pending cond. is cancelled and none are placed until the count recovers. Needs the host's cond. bundles: a ticker's pair takes ONE cond. slot and shows as one bundle card | previous: Live readout rebuilt around the criteria instead of the P/A UP / DOWN cohorts: one column per criterion summarizing ALL of its stored scores, for its + and its - table the cell its tickers did best at after breaking out (W-/A- TOP / BTM, D / D3 double / triple, SND under the stand-down floor) above the tag and what that cell has paid below it (the base cell's samples plus the criterion table's, last N per type: first-passage, round-2 hypotheticals, real), BASE-best NET at the right; the CRIT sample-count row folds into it | previous: Criteria: P/A (average positive vs average negative close of the 24 candles, strength-weighted, replaces the break-count lean cohorts U / D / N) plus, behind a new Criteria toggle, Funding, long / short skew (one extra fetch), LTA (turnover of the latest 12 candles vs the 12 before) and IO/A (open interest vs the filtered-market median); base cells are now edge x k (T1 ... B3) and every criterion keeps +/- tables per base cell, a ticker's score = base cell + each exhibited criterion's table x its strength; tables learn the excess over the base cell's average; old lean cells are folded into the base cells | previous: Live mode (EverWinter / SunChaser): the max-positions cancel-all check runs the moment a live cond. fills (live fills bypass _condTrigger) instead of waiting for the next watcher tick; batches still fill Max Cond. Orders in live and sim alike | previous: Internal tracking of conds. at max positions removed (it polled every tracked ticker's price; the watch lists replace it): at max positions pending conds are simply cancelled and none are placed, and the Tracked table, tracker storage and their tally / invalidation feed are gone | previous: Numerical cell scoring replaces Auto-switch, the per-ticker trip, the With / Against switches and the double-entry ratchet: every ticker is simulated at both edges and 1x / 2x / 3x (round 1: twelve 5m candles of the order life, round 2: the position walked to TP / SL on 4h candles with one finer fetch when both touch, funding and fees included), cond. orders, hypotheticals and real TP / SL / Force Close results feed per-cell $ scores (last 50 samples per type, no decay, uPnL no longer scored), entries are drawn by score, and a lean whose cells are all under water stands down; new Round 1 / Round 2 lists and a HYPO row | previous: At max positions every Breakout cond. is cancelled and no new ones are placed; those tickers are tracked internally (top / bottom breaks, invalidations, expiry feed the tallies and the double multiplier) and listed in a new Tracked table with a one-bar progress view; re-checked after every cond. fill. | previous: Contradictory moves removed: the unfavored skew (Chaser downside, Winter upside) enters a double top / bottom cond. at 2x the average move (multiplier rises +1 when those positions lose, falls -1 when a double cond. expires untouched, floor 2); worse-price hits are counted as invalidations per W-/A- badge. | previous: Live readout cut to three label-free rows (LIVE: pending + break counts; UP skew; DOWN skew) using only the app's gray / theme / green / yellow / red; extra detail moved into a hover (PC) or tap (mobile) popover per row. | previous: Live readout moved into the Breakout accordion body, below the config fields, and shrunk to a compact bar-free table (entry mode + edge per skew with its loss figure, break counts, pending, trip, queue); General accordion's Mode line restored. | previous: Live readouts (pending / flow modes / auto-switch loss meters / per-ticker trip / break tally / retry queue / Binary warning) moved out of the Breakout config into the General accordion's Mode line, shown bold and colored with meters, pulses and an outcome strip. | previous: All hint text and hover tooltips are hidden behind circled "!" buttons next to their toggle or setting (click to show); Ticker flow, Auto-switch and Per-ticker trip default to on. | previous: Ticker flow With / Against is now two switches, one for upside-skew tickers and one for downside-skew tickers; Auto-switch and Per-ticker trip flip only the skew whose positions lost (or reversed). | previous: Per-ticker trip sub-toggle under Auto-switch: one position at -25% of its base margin flips the switch (and flow) once, latched; a swing to +25% reverses it and re-arms. | previous: Ticker flow: each ticker is scored toppy / bottomy from its 24 candles (breaks of the average move above the open vs below it) and enters With or Against that flow; W-/A- prefix on the TOP / BOTTOM badges; Auto-switch flips With <-> Against while flow is on. | previous: Chaser plugin glyph is the text-style hot springs symbol (fire-like) instead of the alchemical fire triangle. | previous: Auto-switch rebuilt on uPnL: flips the entry edge when open positions entered at the current edge are down 25% (setting) of their base margin, checked every minute; plugin glyph (snowflake / fire) replaces the explosion emoji. | previous: Auto-switch rule: tally in the bot's favor (Chaser: tops lead, Winter: bottoms lead) enters at the leading edge, against it at the opposite edge. | previous: TOP / BOTTOM position-type badge on pending conds and positions (needs the base bots' cond card badge slot); Auto-switch tooltip rewritten in plain English with the currently resolving edge. | previous: Entry edge setting (Chaser can enter at the top, Winter at the bottom); top / bottom / no-break tally readout; batch fills the host's Max Cond. Orders limit instead of being capped by Max Positions; tally counts fills dropped past Max Positions; Auto-switch picks the edge from the tally's skew. | previous: Illiquidity filter whitelist — a ticker confirmed liquid skips the 3-trade fetch for a week. | previous: Stablecoin filter (24h span under 1% = skipped) and Illiquidity filter (last 3 trades averaging over 12s apart = skipped), both always on; failures from random selection are graylisted for a week. | previous: Initial release — average-move cond. entries (24 x 1hr candles), TP/SL at +/- the average move from the trigger, 1hr expiry, worse-price orders requeued for the next batch.
   let   WINTER  = false;   // set in transform() from the host
-  const CANDLES = 24;      // closed 1hr candles the average move is read from
+  const CANDLES = 24;      // closed 1hr candles the top / bottom moves are read from
   const HOUR_MS = 3600000;
   const MIN_SPAN_PCT = 1;          // stablecoin filter: least % span the 24 candles must cover
   const MAX_GAP_MS   = 12000;      // illiquidity filter: most average ms between the last 3 trades
   const GRAY_MS      = 7 * 86400000; // graylist time for a ticker that fails either filter
+  const FUND_TRIM    = 0.95;       // market funding high / low = this percentile of the positive / negative rates (1 = the absolute extremes)
 
   const BO_DEFAULT_CFG = Object.freeze({
     boEnabled: true,   // Breakout mode
     boLifeMins: 60,    // how long a cond. pair waits before it is cancelled
+    boFlowEnabled: false, // Funding / Skew Tilt
+    boFundW: 100,      // funding weight, %: share of the funding percentage applied (100 = all of it, negative flips it, 0 = off)
+    boSkewW: 100,      // long / short skew weight, %: share of the skew percentage applied (same scale)
+    boPushMax: 100,    // most the combined push can be, % either way: 100 = one move at most x2, the other /2 (0 = no effect)
     boWinH: 4,         // break window, hours: breaks older than this stop counting
     boBreaks: [],      // [ms, 'T' | 'B'] filled conds. (top / bottom breaks) inside the window
     boPairs: {},       // symbol -> { t, top: cond id, bottom: cond id } pending pairs
@@ -66,12 +76,9 @@
       .bo-info { display:inline-flex; align-items:center; justify-content:center; width:12px; height:12px; margin-left:6px; padding:0; border-radius:50%; border:1px solid rgba(var(--bo-rgb),.35); background:transparent; color:var(--bo-acc); font:700 8px/1 var(--mono); cursor:pointer; flex:none; vertical-align:middle; }
       .bo-info.on { background:rgba(var(--bo-rgb),.15); }
       .bo-live { position:relative; margin-top:8px; padding:3px 8px; border:1px solid rgba(var(--bo-rgb),.28); border-left:3px solid var(--bo-acc); border-radius:4px; background:rgba(var(--bo-rgb),.05); font-family:var(--mono); font-size:10px; color:var(--text-hi); }
-      .bo-live.hot { border-color:var(--short); }
       .bo-lr { position:relative; display:flex; align-items:center; gap:7px; padding:4px 0; cursor:help; }
       .bo-ttl { font-weight:700; letter-spacing:2px; color:var(--bo-acc); }
       .bo-cnt { color:var(--text-lo); } .bo-cnt b { margin-left:2px; color:var(--text-hi); } .bo-cnt.lead b { color:var(--bo-acc); }
-      .bo-pulse { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--short); animation:bo-pulse 1s infinite; }
-      @keyframes bo-pulse { 0% { box-shadow:0 0 0 0 rgba(255,69,96,.7); } 70% { box-shadow:0 0 0 6px rgba(255,69,96,0); } 100% { box-shadow:0 0 0 0 rgba(255,69,96,0); } }
       .bo-blink { color:var(--warn); animation:bo-blink 1.6s infinite; }
       @keyframes bo-blink { 50% { opacity:.4; } }
       .bo-pop { position:absolute; left:0; right:0; top:100%; z-index:20; margin-top:2px; padding:5px 7px; font-size:9px; font-weight:400; letter-spacing:0; line-height:1.5; color:var(--text-mid); background:var(--bg-panel,#15110c); border:1px solid rgba(var(--bo-rgb),.35); border-radius:3px; box-shadow:0 4px 12px rgba(0,0,0,.5); }
@@ -95,7 +102,7 @@
               <div class="tog-t" :class="cfg.boEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.boEnabled=!cfg.boEnabled;persist()}"><div class="tog-k"></div></div>
               <div x-data="{ tip: false }">
                 <div class="tog-l">Breakout Mode<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
-                <div class="bo-hint" x-show="tip" x-text="'Two cond. entries per ticker, one above and one below price at the average move; the first to trigger cancels the other. TP and SL one average move from the trigger.'"></div>
+                <div class="bo-hint" x-show="tip" x-text="'Two cond. entries per ticker: one above price at the ticker\'s average top move (from its green candles) and one below at its average bottom move (from its red candles); the first to trigger cancels the other. TP and SL come from the same two moves.'"></div>
               </div>
             </label>
             <div x-show="cfg.boEnabled" style="margin-top:8px">
@@ -105,7 +112,7 @@
                   <input type="number" min="1" step="1" class="bo-in" x-model.number="cfg.boLifeMins" @change="cfg.boLifeMins=Math.max(1,Math.round(+cfg.boLifeMins||60));persist()">
                   <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
                 </div>
-                <div class="bo-hint" x-show="tip">Each ticker gets two conds, one above and one below price at 1x the average move; the first to trigger cancels the other. Unfilled pairs are cancelled after this. Each ticker is one bundle, one of the Max Cond. Orders, independent of Max Positions.</div>
+                <div class="bo-hint" x-show="tip">Each ticker gets two conds, one above price at its average top move and one below at its average bottom move; the first to trigger cancels the other. Unfilled pairs are cancelled after this. Each ticker is one bundle, one of the Max Cond. Orders, independent of Max Positions.</div>
               </div>
               <div x-data="{ tip: false }" style="margin-top:6px">
                 <div style="display:flex;align-items:center;gap:6px">
@@ -113,17 +120,50 @@
                   <input type="number" min="0.5" step="0.5" class="bo-in" x-model.number="cfg.boWinH" @change="cfg.boWinH=Math.max(0.5,+cfg.boWinH||4);persist()">
                   <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
                 </div>
-                <div class="bo-hint" x-show="tip">Fills are counted as breaks over this window. A break going the bot\'s way (Chaser: top, Winter: bottom) is favorable. While unfavorable breaks outnumber favorable ones, every pending cond. is cancelled and none are placed; it resumes as old breaks age out of the window.</div>
+                <div class="bo-hint" x-show="tip">Fills are counted as top / bottom breaks over this window and shown in the LIVE readout. The count is informational only; it does not stop or cancel anything.</div>
               </div>
-              <div class="bo-live" :class="_boHalted(tick)?'hot':''">
+              <div style="margin-top:8px">
+                <label class="tog">
+                  <div class="tog-t" :class="cfg.boFlowEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.boFlowEnabled=!cfg.boFlowEnabled;persist()}"><div class="tog-k"></div></div>
+                  <div x-data="{ tip: false }">
+                    <div class="tog-l">Funding / Skew Tilt<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
+                    <div class="bo-hint" x-show="tip">Funding (as a % above or below the market\'s typical rate, clamped at its highs / lows) and long / short skew (the % one side exceeds the other) stretch one move and shrink the other: bullish reads stretch the top and shrink the bottom, bearish the reverse. Triggers and TP / SL follow.</div>
+                  </div>
+                </label>
+                <div x-show="cfg.boFlowEnabled">
+                  <div x-data="{ tip: false }" style="margin-top:6px">
+                    <div style="display:flex;align-items:center;gap:6px">
+                      <span class="lbl" style="margin:0">Funding weight (%)</span>
+                      <input type="number" min="-500" max="500" step="10" class="bo-in" x-model.number="cfg.boFundW" @change="cfg.boFundW=Math.max(-500,Math.min(500,+cfg.boFundW||0));persist()">
+                      <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
+                    </div>
+                    <div class="bo-hint" x-show="tip">Funding as a % above or below the market\'s typical rate, clamped at the market\'s funding high / low, like a price change. 100% applies it in full (+150% = top x2.5, bottom /2.5); less applies a share. Negative flips it, 0 is off.</div>
+                  </div>
+                  <div x-data="{ tip: false }" style="margin-top:6px">
+                    <div style="display:flex;align-items:center;gap:6px">
+                      <span class="lbl" style="margin:0">Skew weight (%)</span>
+                      <input type="number" min="-500" max="500" step="10" class="bo-in" x-model.number="cfg.boSkewW" @change="cfg.boSkewW=Math.max(-500,Math.min(500,+cfg.boSkewW||0));persist()">
+                      <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
+                    </div>
+                    <div class="bo-hint" x-show="tip">How much % one side exceeds the other, like a price change: 60% long = longs 50% above shorts = +50% (top x1.5, bottom /1.5 at 100% weight); 40% long = -50%. More longs stretches the top. Negative flips it, 0 is off.</div>
+                  </div>
+                  <div x-data="{ tip: false }" style="margin-top:6px">
+                    <div style="display:flex;align-items:center;gap:6px">
+                      <span class="lbl" style="margin:0">Push cap (%)</span>
+                      <input type="number" min="0" max="1000" step="10" class="bo-in" x-model.number="cfg.boPushMax" @change="cfg.boPushMax=Math.max(0,Math.min(1000,+cfg.boPushMax||0));persist()">
+                      <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
+                    </div>
+                    <div class="bo-hint" x-show="tip">Most the combined funding + skew push can be, either way. 100% = one move at most x2 and the other /2; 400% = x5 and /5. 0 turns the effect off.</div>
+                  </div>
+                </div>
+              </div>
+              <div class="bo-live">
                 <div class="bo-lr" x-data="{ tip: false }" @pointerenter="if ($event.pointerType === 'mouse') tip = true" @pointerleave="if ($event.pointerType === 'mouse') tip = false" @click="if (($event.pointerType || 'touch') !== 'mouse') tip = !tip">
                   <span class="bo-ttl"><span x-text="_boGlyph()"></span> LIVE</span>
-                  <span class="bo-pulse" x-show="_boHalted(tick)"></span>
                   <span class="bo-blink" x-show="!cfg.binaryModeEnabled">&#9888;</span>
                   <span><b x-text="_boPend()"></b><span style="color:var(--text-lo)">/<span x-text="cfg.maxCond ?? 30"></span></span></span>
-                  <span class="bo-cnt" :class="_boFavEdge()==='top'?'bo-g':'bo-r'">&#9650;<b x-text="_boTally(tick).top"></b></span>
-                  <span class="bo-cnt" :class="_boFavEdge()==='bottom'?'bo-g':'bo-r'">&#9660;<b x-text="_boTally(tick).bottom"></b></span>
-                  <span class="bo-r" x-show="_boHalted(tick)">STOP</span>
+                  <span class="bo-cnt bo-g">&#9650;<b x-text="_boTally(tick).top"></b></span>
+                  <span class="bo-cnt bo-r">&#9660;<b x-text="_boTally(tick).bottom"></b></span>
                   <div class="bo-pop" x-show="tip" x-text="_boTip(tick)"></div>
                 </div>
               </div>
@@ -167,8 +207,6 @@
 
         // Plugin symbol (text glyphs, not emoji): snowflake for Winter, fire for Chaser.
         _boGlyph() { return WINTER ? '\u2744\uFE0E' : '\u2668\uFE0E'; },
-        // The break that goes the bot's way: Chaser (long) top, Winter (short) bottom.
-        _boFavEdge() { return WINTER ? 'bottom' : 'top'; },
         _boWinMs() { return Math.max(0.1, Number(this.cfg.boWinH) || 4) * 3600000; },
         _boPend() { return new Set((this.condOrders || []).filter(o => o.tag === 'breakout').map(o => o.symbol)).size; }, // slots used: one per ticker
         _boAtCap() { return (this.positions || []).length >= (this.cfg.maxPos ?? 5); },
@@ -179,14 +217,11 @@
           const cut = Date.now() - this._boWinMs();
           let top = 0, bottom = 0;
           for (const x of (Array.isArray(this.cfg.boBreaks) ? this.cfg.boBreaks : [])) if (x && x[0] >= cut) { if (x[1] === 'T') top++; else if (x[1] === 'B') bottom++; }
-          const fav = this._boFavEdge() === 'top' ? top : bottom;
-          return { top, bottom, fav, unfav: top + bottom - fav };
+          return { top, bottom };
         },
-        _boHalted(_t) { const t = this._boTally(); return t.unfav > t.fav; },
         _boTip(_t) {
           const t = this._boTally(), h = +(this._boWinMs() / 3600000).toFixed(1);
-          return 'Last ' + h + 'h: ' + t.top + ' top breaks, ' + t.bottom + ' bottom breaks. Favorable = ' + this._boFavEdge() + ' (green), unfavorable = ' + (this._boFavEdge() === 'top' ? 'bottom' : 'top') + ' (red). '
-            + (t.unfav > t.fav ? 'Unfavorable leads: all conds. cancelled, none placed until old breaks age out.' : 'Favorable at least level: conds. are being placed.');
+          return 'Last ' + h + 'h: ' + t.top + ' top breaks, ' + t.bottom + ' bottom breaks. Informational only; pairs are placed whatever the counts.';
         },
         _boCount(edge) {
           const c = this.cfg, now = Date.now(), cut = now - this._boWinMs();
@@ -213,7 +248,7 @@
           this.persist();
         },
 
-        // Cancels every pending Breakout cond.: at max positions (the host drops a cond. that triggers past Max Positions anyway) and while the break counter is against the bot.
+        // Cancels every pending Breakout cond. at max positions (the host drops a cond. that triggers past Max Positions anyway).
         async _boCancelAll(reason, msg) {
           const pend = (this.condOrders || []).filter(o => o.tag === 'breakout');
           if (!pend.length) return;
@@ -226,7 +261,6 @@
         },
         async _boGuard() {
           if (this._boAtCap()) return this._boCancelAll('breakout max positions', `Max positions (${(this.positions || []).length}/${this.cfg.maxPos ?? 5})`);
-          if (this._boHalted()) { const t = this._boTally(); return this._boCancelAll('breakout stand down', `Break counter against the bot (${t.unfav} unfavorable / ${t.fav} favorable)`); }
         },
 
         async _boExpire() {
@@ -247,15 +281,19 @@
           return closed.length === CANDLES ? closed : null;
         },
 
-        // Average move, %: mean of (high - low) / open over the candles.
-        _boAvgMove(candles) {
-          let sum = 0, n = 0;
+        // Top / bottom moves, %: green candles (close above open) give the top move, the mean of (high - open) / open; red candles (close below open) give the bottom move,
+        // the mean of (open - low) / open. Doji candles count for neither. Null when a candle is unreadable or either colour is missing.
+        _boMoves(candles) {
+          let tSum = 0, tN = 0, bSum = 0, bN = 0, ok = 0;
           for (const c of candles) {
-            const o = parseFloat(c[1]), h = parseFloat(c[2]), l = parseFloat(c[3]);
-            if (!(o > 0) || !(h >= l)) continue;
-            sum += (h - l) / o * 100; n++;
+            const o = parseFloat(c[1]), h = parseFloat(c[2]), l = parseFloat(c[3]), cl = parseFloat(c[4]);
+            if (!(o > 0) || !(cl > 0) || !(h >= l)) continue;
+            ok++;
+            if (cl > o) { tSum += (h - o) / o * 100; tN++; }
+            else if (cl < o) { bSum += (o - l) / o * 100; bN++; }
           }
-          return n === CANDLES ? sum / n : null;
+          if (ok !== CANDLES || !tN || !bN) return null;
+          return { top: tSum / tN, bottom: bSum / bN, green: tN, red: bN };
         },
 
         // Stablecoin filter: the 24 candles' full span, %. A stablecoin never moves 1%.
@@ -290,38 +328,114 @@
           return this.cfg.leverage > 0 ? this.cfg.leverage : 1;
         },
 
-        // Everything before an order: candles, average move, filters, fresh price, leverage. Null when the ticker is skipped.
+        // In-memory cache (not persisted): a ticker picked again soon does not refetch. Failed reads (null) are not cached.
+        async _boCached(key, ttl, fn) {
+          const m = this._boCache || (this._boCache = {}), e = m[key], now = Date.now();
+          if (e && now - e.t < ttl) return e.v;
+          const v = await fn();
+          if (v != null) m[key] = { t: now, v };
+          return v;
+        },
+
+        // Market funding from the host's bulk ticker list (no fetch), cached 1 min: mid = the median USDT rate, ref = the scale a % is taken against (the larger of |mid| and the median |rate|, so a
+        // market centred on 0 still has a scale), hi / lo = the FUND_TRIM percentile of the positive / negative rates (a few freak tickers do not set the range). Null under 20 readable rates.
+        _boMarketFunding() {
+          const m = this._boMktF, now = Date.now();
+          if (m && now - m.t < 60000) return m.v;
+          const all = [], pos = [], neg = [];
+          for (const t of (this._lastAllTickers || [])) {
+            if (!t.symbol || !t.symbol.endsWith('USDT')) continue;
+            const r = parseFloat(t.fundingRate);
+            if (!isFinite(r)) continue;
+            all.push(r);
+            if (r > 0) pos.push(r); else if (r < 0) neg.push(r);
+          }
+          const med = xs => { const a = [...xs].sort((x, y) => x - y), n = a.length; return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2; };
+          const at = (xs, desc) => { xs.sort((a, b) => desc ? b - a : a - b); return xs[Math.min(xs.length - 1, Math.floor((1 - FUND_TRIM) * xs.length))]; };
+          let v = null;
+          if (all.length >= 20) {
+            const mid = med(all), ref = Math.max(Math.abs(mid), med(all.map(x => Math.abs(x))));
+            if (ref > 0) v = { mid, ref, hi: pos.length ? at(pos, true) : mid, lo: neg.length ? at(neg, false) : mid };
+          }
+          this._boMktF = { t: now, v };
+          return v;
+        },
+
+        // Funding as a signed percentage (a fraction: 1.5 = +150%): the ticker's rate, clamped at the market's funding high / low, as a % above or below the market's median rate. Null when unreadable.
+        _boFundPct(cur) {
+          const r = this._boMarketFunding();
+          if (!r || !isFinite(cur)) return null;
+          const c = Math.max(Math.min(r.lo, r.hi), Math.min(Math.max(r.lo, r.hi), cur));
+          return (c - r.mid) / r.ref;
+        },
+
+        // Long / short skew as a signed percentage: how much one side exceeds the other (60 / 40 long = +0.5, 40 / 60 = -0.5). The long share comes from Bybit's account ratio as a fraction.
+        // Each side is floored at 1% so a one-sided book reads large rather than infinite. Null when unreadable.
+        async _boSkewPct(sym) {
+          const pct = await this._boCached('s:' + sym, 15 * 60000, async () => {
+            try {
+              const res = await fetch(`${this.base}/v5/market/account-ratio?category=linear&symbol=${sym}&period=1h&limit=1`);
+              const b = parseFloat((await res.json())?.result?.list?.[0]?.buyRatio);
+              return b >= 0 && b <= 1 ? b * 100 : null;
+            } catch (e) { return null; }
+          });
+          if (pct == null) return null;
+          const L = Math.max(pct, 1), S = Math.max(100 - pct, 1);
+          return L >= S ? L / S - 1 : -(S / L - 1);
+        },
+
+        // Signed percentage text for logs (a fraction in: 0.5 -> +50%).
+        _boPc(x) { return x == null ? 'n/a' : (x >= 0 ? '+' : '') + (x * 100).toFixed(0) + '%'; },
+
+        // Funding / Skew Tilt: each percentage times its weight, summed into one push capped at +/-Push cap (cfg.boPushMax, %) (a weight of 0 skips that signal; an unreadable read counts as 0).
+        async _boFlow(sym, fund) {
+          const c = this.cfg, wF = Number(c.boFundW) || 0, wS = Number(c.boSkewW) || 0;
+          const f = wF ? this._boFundPct(fund) : null, k = wS ? await this._boSkewPct(sym) : null;
+          const push = (f == null ? 0 : f * wF / 100) + (k == null ? 0 : k * wS / 100);
+          const cap = Math.max(0, Number.isFinite(+c.boPushMax) ? +c.boPushMax : 100) / 100;
+          return { f, k, push: Math.max(-cap, Math.min(cap, push)) };
+        },
+
+        // Everything before an order: candles, top / bottom moves, filters, fresh price, leverage. Null when the ticker is skipped.
         async _boPrep(sym, t) {
           const candles = await this._boCandles(sym);
           if (!candles) { this.log(`[BO] ${sym}: fewer than ${CANDLES} closed 1hr candles — skipped`, 'info'); return null; }
-          const m = this._boAvgMove(candles);
-          if (!(m > 0)) return null;
+          const mv = this._boMoves(candles);
+          if (!mv) { this.log(`[BO] ${sym}: no green or no red candle among the last ${CANDLES} (or unreadable data) — skipped`, 'info'); return null; }
           const span = this._boSpan(candles);
           if (span < MIN_SPAN_PCT) { this._boGrayAdd(sym, `stablecoin filter, ${span.toFixed(2)}% span over ${CANDLES}h`); return null; }
           const white = Date.now() - (this.cfg.boWhite[sym] || 0) < GRAY_MS;
           const gap = white ? 0 : await this._boTradeGap(sym);
           if (gap != null && gap > MAX_GAP_MS) { this._boGrayAdd(sym, `illiquidity filter, last 3 trades ${isFinite(gap) ? (gap / 1000).toFixed(1) + 's' : 'not found'} apart`); return null; }
           if (gap != null && !white) this.cfg.boWhite[sym] = Date.now();
-          let price = parseFloat(t?.lastPrice || 0);
+          let price = parseFloat(t?.lastPrice || 0), fund = parseFloat(t?.fundingRate);
           try {
             const r = await fetch(`${this.base}/v5/market/tickers?category=linear&symbol=${sym}`);
-            const lp = parseFloat((await r.json())?.result?.list?.[0]?.lastPrice);
+            const row = (await r.json())?.result?.list?.[0], lp = parseFloat(row?.lastPrice), fr = parseFloat(row?.fundingRate);
             if (lp > 0) price = lp;
+            if (isFinite(fr)) fund = fr;
           } catch (e) {}
           if (!(price > 0)) return null;
           const lev = await this._boLev(sym);
-          return lev ? { m, price, lev } : null;
+          if (!lev) return null;
+          if (!this.cfg.boFlowEnabled) return { mv, flow: null, price, lev };
+          const flow = await this._boFlow(sym, fund);
+          const fac = 1 + Math.abs(flow.push), adj = flow.push >= 0 ? { ...mv, top: mv.top * fac, bottom: mv.bottom / fac } : { ...mv, top: mv.top / fac, bottom: mv.bottom * fac };
+          return { mv: adj, flow, price, lev };
         },
 
         // One pair: cond. above (top) and cond. below (bottom), each one's worst price the other's trigger. Returns the pair's first order, or null.
         async _boPlace(sym, t) {
           const pr = await this._boPrep(sym, t);
           if (!pr) return null;
-          const { m, price, lev } = pr;
-          const dist = Math.min(m, 90); // % from price to each trigger; capped so the lower trigger stays a positive price
-          const up = price * (1 + dist / 100), dn = price * (1 - dist / 100), roi = +(m * lev).toFixed(2);
+          const { mv, flow, price, lev } = pr;
+          const upD = Math.min(mv.top, 90), dnD = Math.min(mv.bottom, 90); // % from price to each trigger; capped so the lower trigger stays a positive price
+          const up = price * (1 + upD / 100), dn = price * (1 - dnD / 100);
+          // TP / SL from the trigger on the bot's own side: Chaser (long) TP = top move above, SL = bottom move below; Winter (short) TP = bottom move below, SL = top move above.
+          const tpMove = WINTER ? mv.bottom : mv.top, slMove = WINTER ? mv.top : mv.bottom;
+          const tpRoi = +(tpMove * lev).toFixed(2), slRoi = +(slMove * lev).toFixed(2);
           const mk = (edge, target, worst) => this.placeCondEntry({ bundle: 'breakout', kind: edge,
-            candidate: { symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100, _tpPct: roi, _slPct: roi, _bo: true, _boMovePct: +m.toFixed(3), _boEdge: edge },
+            candidate: { symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100, _tpPct: tpRoi, _slPct: slRoi, _bo: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boEdge: edge, ...(flow ? { _boPush: +flow.push.toFixed(3) } : {}) },
             target, worst, tag: 'breakout',
           });
           const a = await mk('top', up, dn);
@@ -329,7 +443,7 @@
           const b = await mk('bottom', dn, up);
           if (!b) { await this.cancelCondOrder(a.id, 'breakout sibling'); return null; }
           this.cfg.boPairs[sym] = { t: Date.now(), top: a.id, bottom: b.id };
-          this.log(`[BO] ${this._boGlyph()} ${sym}: average move ${m.toFixed(2)}% (${CANDLES}×1hr) — conds. +${dist.toFixed(2)}% / -${dist.toFixed(2)}%, TP/SL ${m.toFixed(2)}% from the trigger`, 'info');
+          this.log(`[BO] ${this._boGlyph()} ${sym}: top move ${mv.top.toFixed(2)}% (${mv.green} green) / bottom move ${mv.bottom.toFixed(2)}% (${mv.red} red) over ${CANDLES}×1hr — conds. +${upD.toFixed(2)}% / -${dnD.toFixed(2)}%, TP ${tpMove.toFixed(2)}% / SL ${slMove.toFixed(2)}% from the trigger${flow ? ` — tilt ${this._boPc(flow.push)} (funding ${this._boPc(flow.f)}, skew ${this._boPc(flow.k)})` : ''}`, 'info');
           return a;
         },
 
@@ -353,7 +467,7 @@
 
             await this._boSettle();
             await this._boGuard();
-            if (this._boAtCap() || this._boHalted()) return; // max positions / break counter against the bot: no new conds
+            if (this._boAtCap()) return; // max positions: no new conds
             const free = (c.maxCond ?? 30) - this._condSlots(); // free slots = pairs; the host's Max Cond. Orders, Max Positions does not cap this
             if (free <= 0) return;
 
@@ -416,7 +530,7 @@
           return r;
         },
 
-        // Live fills bypass _condTrigger: settle the pair and check the cap / break counter the moment one lands.
+        // Live fills bypass _condTrigger: settle the pair and check the cap the moment one lands.
         ...(_liveFilled ? { [_liveFilled]: async function (o) {
           const r = await _origLiveFilled.call(this, o);
           if (this._boLoaded) { try { await this._boSettle(); await this._boGuard(); } catch (e) { this.log(`[BO] live fill check error: ${e.message}`, 'warn'); } }
