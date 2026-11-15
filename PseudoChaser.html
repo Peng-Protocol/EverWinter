@@ -3014,7 +3014,7 @@ function pw() { return {
         label: 'SYNC !',
         labelStyle: 'color:var(--warn)',
         border: 'border-color:rgba(240,192,96,.4);background:rgba(240,192,96,.06)',
-        title: 'Audio keepalive suspended — tap to resume background sync',
+        title: `Audio keepalive ${this.audioState} — tap to resume background sync`,
         action: () => this.resumeKeepalive(),
       });
     }
@@ -3270,12 +3270,13 @@ function pw() { return {
   },
 
   async startBot() {
+    this.startKeepalive(); // first, before any await: browsers (Safari / iOS above all) only let an audio context run when it is created inside the tap
     this.bot.running = true;
     this.cfgLocked = true; // starts locked; can now be unlocked while running
     this.bot.startTime = Date.now();
     this.log(`[SES] ${this.themeEmoji} Sim started — ${this.cfg.leverage}× lev | $${this.cfg.minNotional} entry`, 'success');
     try { await this.pseudoAuditGap(); } catch(e) { this.log('[SES] Gap audit error on start: ' + e.message, 'warn'); }
-    this.startKeepalive();
+    /* keepalive now starts first, inside the Start tap */
 
     try { await this.runScheduledCycle(); } catch(e) { this.log('[SES] Initial cycle error: ' + e.message, 'warn'); }
     this.scheduleScan();
@@ -3311,9 +3312,10 @@ function pw() { return {
       gain.connect(this._audioCtx.destination);
       this._oscillator.start();
       this.audioState = this._audioCtx.state; // 'running' immediately after user gesture
+      if (this._audioCtx.state !== 'running') this._keepaliveFallback(); // blocked context: start the silent audio element in the same tap
       _audioTimer = setInterval(() => {
         if (!this._audioCtx) return;
-        this.audioState = this._audioCtx.state;
+        this.audioState = this._audioStateNow();
       }, 3000);
       this.log('[AUD] Audio keepalive active — background processes protected.', 'info');
     } catch(e) {
@@ -3323,23 +3325,57 @@ function pw() { return {
   },
 
   stopKeepalive() {
+    clearInterval(_audioTimer);
+    _audioTimer = null;
+    try { if (this._oscillator) this._oscillator.stop(); } catch(e) {}
+    this._oscillator = null;
+    try { const c = this._audioCtx; if (c) { const r = c.close(); if (r && r.catch) r.catch(() => {}); } } catch(e) {}
+    this._audioCtx = null; // always cleared, even when stop() / close() throw, so startKeepalive can build a fresh context
+    try { if (this._silentEl) { this._silentEl.pause(); this._silentEl.removeAttribute('src'); } } catch(e) {}
+    this._silentEl = null;
+    this.audioState = 'off';
+  },
+
+  // What the pill reads: running when the silent <audio> fallback is playing, else the AudioContext's own state.
+  _audioStateNow() {
+    if (this._silentEl && !this._silentEl.paused) return 'running';
+    return this._audioCtx ? this._audioCtx.state : 'off';
+  },
+
+  _silentWavUrl() { // one second of 8-bit mono silence (128 = zero level), looped by the fallback element
+    const n = 8000, b = new Uint8Array(44 + n), dv = new DataView(b.buffer);
+    const w = (o, s) => { for (let i = 0; i < s.length; i++) b[o + i] = s.charCodeAt(i); };
+    w(0, 'RIFF'); dv.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, 8000, true); dv.setUint32(28, 8000, true); dv.setUint16(32, 1, true); dv.setUint16(34, 8, true); w(36, 'data'); dv.setUint32(40, n, true); b.fill(128, 44);
+    return URL.createObjectURL(new Blob([b], { type: 'audio/wav' }));
+  },
+
+  // The AudioContext can sit suspended (resume() then never settles). A looping silent <audio> element is the second way to keep the tab alive; play() is called before any await so a tap still counts.
+  async _keepaliveFallback() {
     try {
-      clearInterval(_audioTimer);
-      _audioTimer = null;
-      if (this._oscillator) { this._oscillator.stop(); this._oscillator = null; }
-      if (this._audioCtx) { this._audioCtx.close(); this._audioCtx = null; }
-      this.audioState = 'off';
-    } catch(e) {}
+      if (!this._silentEl) { const a = new Audio(this._silentWavUrl()); a.loop = true; this._silentEl = a; }
+      await Promise.race([this._silentEl.play(), new Promise((_, rej) => setTimeout(() => rej(new Error('play() timed out')), 1500))]);
+      this.log('[AUD] AudioContext blocked — a silent audio element keeps the tab alive instead.', 'info');
+    } catch(e) {
+      this.log('[AUD] Silent audio fallback failed: ' + e.message, 'warn');
+    }
+    this.audioState = this._audioStateNow();
   },
 
   async resumeKeepalive() {
     try {
-      if (!this._audioCtx) { this.startKeepalive(); return; }
-      if (this._audioCtx.state === 'suspended') {
-        await this._audioCtx.resume();
-        this.audioState = this._audioCtx.state;
-        this.log('[AUD] Audio keepalive resumed.', 'info');
+      const ctx = this._audioCtx;
+      this.log(`[AUD] Resume tapped — audio context ${ctx ? ctx.state : 'missing'}`, 'info');
+      if (ctx && ctx.state !== 'closed') {
+        // resume() can stay pending forever on a context the browser will not start, so it is raced against a timeout
+        if (ctx.state !== 'running') { try { await Promise.race([ctx.resume(), new Promise(r => setTimeout(r, 1500))]); } catch(e) {} }
+        this.audioState = this._audioStateNow();
+        if (ctx.state === 'running') { this.log('[AUD] Audio keepalive resumed.', 'info'); return; }
+        this.log(`[AUD] Resume left the context ${ctx.state} — rebuilding it`, 'warn');
       }
+      this.stopKeepalive();
+      this.startKeepalive();
+      if (this._audioStateNow() !== 'running') await this._keepaliveFallback();
     } catch(e) {
       this.log('[AUD] Audio resume failed: ' + e.message, 'warn');
     }
