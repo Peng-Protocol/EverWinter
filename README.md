@@ -120,7 +120,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boPairs`, `boGray`, `boWhite`, plus its `boEnabled`, `boDecide`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boPairs`, `boGray`, `boWhite`, plus its `boEnabled`, `boDecide`, `boFar`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -172,7 +172,7 @@ Breakout reads a ticker's last 24 closed hourly candles; their highest high and 
 
 Each scan, Breakout fills every free cond. slot with a random ticker that passes the [filters](#filters); each ticker is one slot, and its **top** (highest high) or **bottom** (lowest low) edge is picked as below. It does nothing at [Max Positions](#max-positions). The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below) and which move each one takes; the order is the bot's own direction whichever edge is picked.
 
-With **Decisive Edge** on (default), the edge is the closer extreme, the same on both bots, closer by a blend of two reads: numerical (% from price to each extreme) and historical (how many closed 1hr candles ago each printed). The blend is the mean of the peak's share of the two distances and its share of the two ages; below 0.5 the peak is closer, above it the abyss, and a tie goes to the numerical read. An edge less than one average move from price is moved out to one average move (top move above for the peak, bottom move below for the abyss). The position-type badge records both reads, e.g. **Hist-Peak, Num-Abyss** (the peak is closer historically, the abyss numerically); the tooltip names the edge entered. Off, a coin flip picks the edge and the badge reads TOP / BOTTOM.
+With **Decisive Edge** on (default), the closer extreme is found the same way on both bots, by a blend of two reads: numerical (% from price to each extreme) and historical (how many closed 1hr candles ago each printed). The blend is the mean of the peak's share of the two distances and its share of the two ages; below 0.5 the peak is closer, above it the abyss, and a tie goes to the numerical read. **Enter at** enters at that closer edge (Closer) or the opposite one (Further); PseudoWinter defaults to Further, PseudoChaser to Closer. An edge less than one average move from price is moved out to one average move (top move above for the peak, bottom move below for the abyss). The position-type badge records both reads, e.g. **Hist-Peak, Num-Abyss** (the peak is closer historically, the abyss numerically); the tooltip names the edge entered. Off, a coin flip picks the edge and the badge reads TOP / BOTTOM.
 
 ### Expiry
 
@@ -202,6 +202,7 @@ Each setting's explanation sits behind a circled **!** button next to it (click 
 |---|---|
 | **Breakout Mode** (`boEnabled`, default on) | Master on/off. Off = no new orders. |
 | **Decisive Edge** (`boDecide`, default on) | Picks the edge by the closer extreme, blending numerical and historical closeness, instead of a coin flip. |
+| **Enter at** (`boFar`, Winter Further, Chaser Closer) | With Decisive Edge on, enters at the closer edge or the further one. |
 | **Order life** (`boLifeMins`, default **2880**) | Minutes before an unfilled order is cancelled. |
 | **Break window** (`boWinH`, default **48**) | Hours a break counts toward the live readout. |
 
