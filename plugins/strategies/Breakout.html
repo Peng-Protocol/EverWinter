@@ -8,9 +8,9 @@
   for neither; a ticker with no green or no red candle among the 24 is skipped.
 
   Each ticker gets ONE cond. order, on one edge of its own range, top or bottom, never both: top = the highest high, bottom = the lowest low, a break out of the day's range. With Decisive
-  Edge on, which edge follows from the closer extreme (two switches: peak closer, abyss closer), and an edge less than one average move from price is moved out to one average move; off, a coin flip. The opposite extreme is the order's worst price: if price reaches it first the order is cancelled. TP / SL come from the average moves, measured
+  Edge on, the edge is the closer extreme, closer by a blend of numerical distance (% from price) and historical distance (how many 1hr candles ago it printed), and an edge less than one average move from price is moved out to one average move; off, a coin flip. The opposite extreme is the order's worst price: if price reaches it first the order is cancelled. TP / SL come from the average moves, measured
   from the trigger on the bot's own side (Chaser: TP = top move above, SL = bottom move below; Winter: TP = bottom move below, SL = top move above). Nothing about the ticker is predicted:
-  no funding, no long / short skew, no open interest, no lengthening or shortening of the targets, no clamp. The ticker's own range is the only input; the edge is chance.
+  no funding, no long / short skew, no open interest, no lengthening or shortening of the targets, no clamp. The ticker's own range is the only input.
 
   Break counter (readout only): every filled cond. is a break, top or bottom, kept for the Break window (default 4h) and shown in the LIVE readout. It stops nothing: orders are placed
   whatever the counts. Expired orders and cancels are not breaks.
@@ -33,17 +33,18 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.11.1'; // Change: with Decisive Edge on the edges are named peak / abyss (switch labels, hints, logs) and the position-type badge reads PEAK / ABYSS instead of TOP / BOTTOM; off, TOP / BOTTOM as before; stored keys and values unchanged | previous: 1.11.0 — new Decisive Edge setting (default on, off = the old coin flip): the edge is picked by which extreme is closer, with two switches for the pick (defaults: Winter peak when the peak is closer, bottom when the bottom is; Chaser bottom when the peak is closer, peak when the bottom is), and an edge less than one average move from price is moved out to one average move (top move for the peak, bottom move for the bottom); defaults now Order life 2880 min and Break window 48 h
+  const VERSION = '1.12.0'; // Change: Decisive Edge picks the edge by a blend of numerical closeness (% from price) and historical closeness (how recently the peak / abyss printed among the 24 1hr candles), the same for Winter and Chaser; the two edge switches are removed; the position-type badge records both reads, e.g. Hist-Peak, Num-Abyss | previous: 1.11.1 — with Decisive Edge on the edges are named peak / abyss (switch labels, hints, logs) and the position-type badge reads PEAK / ABYSS instead of TOP / BOTTOM; off, TOP / BOTTOM as before
   let   WINTER  = false;   // set in transform() from the host
   const CANDLES = 24;      // closed 1hr candles the top / bottom moves are read from
   const HOUR_MS = 3600000;
+  const BO_NAME = e => (e === 'top' ? 'Peak' : 'Abyss');
   const MIN_SPAN_PCT = 1;          // stablecoin filter: least % span the 24 candles must cover
   const MAX_GAP_MS   = 12000;      // illiquidity filter: most average ms between the last 3 trades
   const GRAY_MS      = 7 * 86400000; // graylist time for a ticker that fails either filter
 
   const BO_DEFAULT_CFG = Object.freeze({
     boEnabled: true,   // Breakout mode
-    boDecide: true,    // Decisive Edge: pick the edge by which extreme is closer (off = coin flip)
+    boDecide: true,    // Decisive Edge: pick the edge by which extreme is closer, numerically and historically blended (off = coin flip)
     boLifeMins: 2880,  // how long a cond. order waits before it is cancelled
     boWinH: 48,        // break window, hours: breaks older than this stop counting
     boBreaks: [],      // [ms, 'T' | 'B'] filled conds. (top / bottom breaks) inside the window
@@ -108,11 +109,7 @@
                     <div class="tog-l">Decisive Edge<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
                   </div>
                 </label>
-                <div class="bo-hint" x-show="tip">Off = a coin flip picks the edge. On = the edge follows from which extreme is closer to price, set by the two switches. An edge less than one average move away (top move for the peak, bottom move for the abyss) is moved out to one average move.</div>
-                <div x-show="cfg.boDecide" style="margin-top:6px">
-                  <div class="bo-sw"><span>Peak closer</span><button type="button" :class="cfg.boPeakCloser==='top'?'on':''" @click.prevent="if(!cfgLocked){cfg.boPeakCloser='top';persist()}">Peak</button><button type="button" :class="cfg.boPeakCloser==='bottom'?'on':''" @click.prevent="if(!cfgLocked){cfg.boPeakCloser='bottom';persist()}">Abyss</button></div>
-                  <div class="bo-sw"><span>Abyss closer</span><button type="button" :class="cfg.boBottomCloser==='top'?'on':''" @click.prevent="if(!cfgLocked){cfg.boBottomCloser='top';persist()}">Peak</button><button type="button" :class="cfg.boBottomCloser==='bottom'?'on':''" @click.prevent="if(!cfgLocked){cfg.boBottomCloser='bottom';persist()}">Abyss</button></div>
-                </div>
+                <div class="bo-hint" x-show="tip">Off = a coin flip picks the edge. On = the closer extreme, by distance from price and by how recently it printed. An edge less than one average move away is moved out to one average move.</div>
               </div>
               <div x-data="{ tip: false }" style="margin-top:8px">
                 <div style="display:flex;align-items:center;gap:6px">
@@ -266,11 +263,11 @@
           return { top: tSum / tN, bottom: bSum / bN, green: tN, red: bN };
         },
 
-        // The day's range: highest high and lowest low of the 24 candles. Null when unreadable.
+        // The day's range: highest high and lowest low of the 24 candles, with their age in hours (1 = the last closed candle). Null when unreadable.
         _boRange(candles) {
-          let hi = -Infinity, lo = Infinity;
-          for (const c of candles) { hi = Math.max(hi, parseFloat(c[2])); lo = Math.min(lo, parseFloat(c[3])); }
-          return lo > 0 && isFinite(hi) && hi > lo ? { hi, lo } : null;
+          let hi = -Infinity, lo = Infinity, hiI = 0, loI = 0;
+          candles.forEach((c, i) => { const h = parseFloat(c[2]), l = parseFloat(c[3]); if (h > hi) { hi = h; hiI = i; } if (l < lo) { lo = l; loI = i; } });
+          return lo > 0 && isFinite(hi) && hi > lo ? { hi, lo, hiAge: hiI + 1, loAge: loI + 1 } : null;
         },
 
         // Stablecoin filter: the 24 candles' full span, %. A stablecoin never moves 1%.
@@ -338,7 +335,11 @@
           const up = rng.hi, dn = rng.lo;
           const upD = (up / price - 1) * 100, dnD = (1 - dn / price) * 100; // % from price to each extreme
           const decide = this.cfg.boDecide !== false;
-          const edge = decide ? ((upD <= dnD ? this.cfg.boPeakCloser : this.cfg.boBottomCloser) === 'bottom' ? 'bottom' : 'top') : (Math.random() < 0.5 ? 'top' : 'bottom');
+          // Closeness reads: numerical (% from price) and historical (age of the extreme). The edge is the lower blend of the two shares; a tie goes to the numerical read.
+          const num = upD <= dnD ? 'top' : 'bottom';
+          const hist = rng.hiAge === rng.loAge ? num : (rng.hiAge < rng.loAge ? 'top' : 'bottom');
+          const blend = (upD / (upD + dnD) + rng.hiAge / (rng.hiAge + rng.loAge)) / 2; // peak's share; below 0.5 = peak closer
+          const edge = decide ? (blend < 0.5 ? 'top' : blend > 0.5 ? 'bottom' : num) : (Math.random() < 0.5 ? 'top' : 'bottom');
           // Decisive Edge: an edge nearer than one average move is moved out to one average move (top move above for the peak, bottom move below for the abyss).
           let tgt = edge === 'top' ? up : dn, floored = false;
           if (decide) {
@@ -350,12 +351,12 @@
           const tpMove = WINTER ? mv.bottom : mv.top, slMove = WINTER ? mv.top : mv.bottom;
           const tpRoi = +(tpMove * lev).toFixed(2), slRoi = +(slMove * lev).toFixed(2);
           const o = await this.placeCondEntry({
-            candidate: { symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100, _tpPct: tpRoi, _slPct: slRoi, _bo: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boEdge: edge, _boDecide: decide },
+            candidate: { symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100, _tpPct: tpRoi, _slPct: slRoi, _bo: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boEdge: edge, _boDecide: decide, _boHist: hist, _boNum: num },
             target: tgt, worst: edge === 'top' ? dn : up, tag: 'breakout',
           });
           if (!o) return null;
           this.cfg.boPairs[sym] = { t: Date.now(), edge, id: o.id };
-          this.log(`[BO] ${this._boGlyph()} ${sym}: ${decide ? (edge === 'top' ? 'PEAK' : 'ABYSS') : edge.toUpperCase()} edge ${decide ? 'picked (' + (upD <= dnD ? 'peak' : 'abyss') + ' closer' + (floored ? ', moved out to one average move' : '') + ')' : 'drawn'} — cond. ${edge === 'top' ? '+' : '-'}${tgtD.toFixed(2)}% (worst ${edge === 'top' ? '-' + dnD.toFixed(2) : '+' + upD.toFixed(2)}%), TP ${tpRoi}% / SL ${slRoi}% ROI — top move ${mv.top.toFixed(2)}% (${mv.green} green) / bottom move ${mv.bottom.toFixed(2)}% (${mv.red} red) over ${CANDLES}×1hr`, 'info');
+          this.log(`[BO] ${this._boGlyph()} ${sym}: ${decide ? (edge === 'top' ? 'PEAK' : 'ABYSS') : edge.toUpperCase()} edge ${decide ? 'picked (Hist-' + BO_NAME(hist) + ' ' + (hist === 'top' ? rng.hiAge : rng.loAge) + 'h vs ' + (hist === 'top' ? rng.loAge : rng.hiAge) + 'h, Num-' + BO_NAME(num) + ' ' + (num === 'top' ? upD : dnD).toFixed(2) + '% vs ' + (num === 'top' ? dnD : upD).toFixed(2) + '%' + (floored ? ', moved out to one average move' : '') + ')' : 'drawn'} — cond. ${edge === 'top' ? '+' : '-'}${tgtD.toFixed(2)}% (worst ${edge === 'top' ? '-' + dnD.toFixed(2) : '+' + upD.toFixed(2)}%), TP ${tpRoi}% / SL ${slRoi}% ROI — top move ${mv.top.toFixed(2)}% (${mv.green} green) / bottom move ${mv.bottom.toFixed(2)}% (${mv.red} red) over ${CANDLES}×1hr`, 'info');
           return o;
         },
 
@@ -403,24 +404,23 @@
         async init() {
           await _origInit.call(this);
           this._boLoaded = true;
-          // Position-type badge: TOP / BOTTOM (PEAK / ABYSS when the order was placed with Decisive Edge on) on pending conds and on the positions / closed trades they became (stamped via the candidate's _boEdge).
+          // Position-type badge: TOP / BOTTOM, or with Decisive Edge on the two closeness reads, e.g. Hist-Peak, Num-Abyss on pending conds and on the positions / closed trades they became (stamped via the candidate's _boEdge).
           if (typeof this.registerRoleBadge === 'function') this.registerRoleBadge(item => {
             const e = item && (item._boEdge || item.candidate?._boEdge);
             if (e !== 'top' && e !== 'bottom') return null;
-            const lbl = (item._boDecide ?? item.candidate?._boDecide) ? (e === 'top' ? 'PEAK' : 'ABYSS') : e.toUpperCase();
-            return `<span title="Breakout ${lbl.toLowerCase()}" style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid rgba(var(--bo-rgb),.35);background:rgba(var(--bo-rgb),.15);color:var(--bo-acc)">${lbl}</span>`;
+            const dec = item._boDecide ?? item.candidate?._boDecide;
+            const h = item._boHist || item.candidate?._boHist, n = item._boNum || item.candidate?._boNum;
+            const lbl = dec ? (h && n ? `Hist-${BO_NAME(h)}, Num-${BO_NAME(n)}` : (e === 'top' ? 'PEAK' : 'ABYSS')) : e.toUpperCase();
+            return `<span title="Breakout, entered at the ${e === 'top' ? 'peak' : 'abyss'}" style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid rgba(var(--bo-rgb),.35);background:rgba(var(--bo-rgb),.15);color:var(--bo-acc)">${lbl}</span>`;
           });
           for (const [k, v] of Object.entries(BO_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : (v && typeof v === 'object' ? { ...v } : v);
           }
-          // Edge picks by bot: Winter takes the closer extreme, Chaser the opposite one.
-          if (this.cfg.boPeakCloser !== 'top' && this.cfg.boPeakCloser !== 'bottom') this.cfg.boPeakCloser = WINTER ? 'top' : 'bottom';
-          if (this.cfg.boBottomCloser !== 'top' && this.cfg.boBottomCloser !== 'bottom') this.cfg.boBottomCloser = WINTER ? 'bottom' : 'top';
           for (const k of ['boGray', 'boWhite', 'boPairs']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
           this.cfg.boBreaks = (Array.isArray(this.cfg.boBreaks) ? this.cfg.boBreaks : []).filter(x => Array.isArray(x) && x[0] > 0 && (x[1] === 'T' || x[1] === 'B'));
           // Retired settings and stores (scoring, watch lists, hypotheticals, flow, auto-switch, tally, retry queue).
           for (const k of ['boFlowOn', 'boCritOn', 'boCritF', 'boCritS', 'boCritL', 'boCritI', 'boGate', 'boSamples', 'boWatchMax', 'boStepX', 'boCells', 'boCellOf', 'boW1', 'boW2', 'boHypo',
-            'boEdges', 'boLog', 'boInval', 'boRetry', 'boAuto', 'boAutoPct', 'boAutoTicker', 'boTickLatch', 'boFlowUp', 'boFlowDown', 'boMult', 'boEntry', 'boFlow', 'boTrack', 'boPushMax', 'boFlowEnabled', 'boFundW', 'boSkewW', 'boTgtMin', 'boTgtMax']) delete this.cfg[k];
+            'boEdges', 'boLog', 'boInval', 'boRetry', 'boAuto', 'boAutoPct', 'boAutoTicker', 'boTickLatch', 'boFlowUp', 'boFlowDown', 'boMult', 'boEntry', 'boFlow', 'boTrack', 'boPushMax', 'boFlowEnabled', 'boFundW', 'boSkewW', 'boTgtMin', 'boTgtMax', 'boPeakCloser', 'boBottomCloser']) delete this.cfg[k];
         },
 
         // Expiry and the break bookkeeping ride the cond. order watcher so they fire on time rather than at the next scan.

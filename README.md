@@ -120,7 +120,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boPairs`, `boGray`, `boWhite`, plus its `boEnabled`, `boDecide`, `boPeakCloser`, `boBottomCloser`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boPairs`, `boGray`, `boWhite`, plus its `boEnabled`, `boDecide`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -172,7 +172,7 @@ Breakout reads a ticker's last 24 closed hourly candles; their highest high and 
 
 Each scan, Breakout fills every free cond. slot with a random ticker that passes the [filters](#filters); each ticker is one slot, and its **top** (highest high) or **bottom** (lowest low) edge is picked as below. It does nothing at [Max Positions](#max-positions). The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below) and which move each one takes; the order is the bot's own direction whichever edge is picked.
 
-With **Decisive Edge** on (default), the edge follows from which extreme is closer to price: two switches, **Peak closer** and **Abyss closer**, each set it to the peak (highest high) or the abyss (lowest low). Defaults: PseudoWinter peak when the peak is closer, abyss when the abyss is; PseudoChaser abyss when the peak is closer, peak when the abyss is. An edge less than one average move from price is moved out to one average move (top move above for the peak, bottom move below for the abyss). The position-type badge then reads **PEAK** / **ABYSS**. Off, a coin flip picks the edge and the badge reads TOP / BOTTOM.
+With **Decisive Edge** on (default), the edge is the closer extreme, the same on both bots, closer by a blend of two reads: numerical (% from price to each extreme) and historical (how many closed 1hr candles ago each printed). The blend is the mean of the peak's share of the two distances and its share of the two ages; below 0.5 the peak is closer, above it the abyss, and a tie goes to the numerical read. An edge less than one average move from price is moved out to one average move (top move above for the peak, bottom move below for the abyss). The position-type badge records both reads, e.g. **Hist-Peak, Num-Abyss** (the peak is closer historically, the abyss numerically); the tooltip names the edge entered. Off, a coin flip picks the edge and the badge reads TOP / BOTTOM.
 
 ### Expiry
 
@@ -201,7 +201,7 @@ Each setting's explanation sits behind a circled **!** button next to it (click 
 | Setting | What it does |
 |---|---|
 | **Breakout Mode** (`boEnabled`, default on) | Master on/off. Off = no new orders. |
-| **Decisive Edge** (`boDecide`, default on) | Picks the edge by the closer extreme instead of a coin flip, with the **Peak closer** / **Abyss closer** switches (`boPeakCloser` / `boBottomCloser`, `top` or `bottom`). |
+| **Decisive Edge** (`boDecide`, default on) | Picks the edge by the closer extreme, blending numerical and historical closeness, instead of a coin flip. |
 | **Order life** (`boLifeMins`, default **2880**) | Minutes before an unfilled order is cancelled. |
 | **Break window** (`boWinH`, default **48**) | Hours a break counts toward the live readout. |
 
@@ -295,7 +295,7 @@ Each scan, a batch fills every free cond. slot (**Max Cond. Orders** minus the s
 
 1. Read the last 24 closed 1h candles and take the **top move** and **bottom move**.
 2. Run the stablecoin and illiquidity filters.
-3. Read a fresh last price (one per-ticker `tickers` call) and the leverage, pick the edge (the closer extreme per the Decisive Edge switches, or a coin flip when off; moved out to one average move if nearer), then place the order.
+3. Read a fresh last price (one per-ticker `tickers` call) and the leverage, pick the edge (the closer extreme by the numerical / historical blend, or a coin flip when off; moved out to one average move if nearer), then place the order.
 
 All reads happen once per ticker. Attempts per batch are capped at 3× the free slots, so a ticker that fails (new listing, refused order, a filter) is replaced by the next pick. Each order's candidate carries `_bo`, `_boTopPct` and `_boBotPct` (the top and bottom moves), `_boEdge`, `_tpPct` and `_slPct`; the underscore keys are copied onto the position and its closed trade, which is what the badge reads.
 
@@ -361,7 +361,7 @@ Everything from earlier versions that this one no longer uses (the Funding / Ske
 - **Break counter**: `_boCount(edge)` records a break and prunes the window, `_boTally` returns `{ top, bottom }`. The `_condTrigger` wrapper counts a fill and drops its pending record before the host's first await. `_boSettle` is the fallback for fills that bypass `_condTrigger` (live): a ticker with a position is counted (from the position's `_boEdge`, else the recorded edge), and one with nothing pending and no position is dropped.
 - **Guards**: `_boGuard` runs `_boCancelAll` for the position cap (`breakout max positions`), from the `_condTrigger` wrapper after every fill, the live-fill wrapper, the watcher wrapper and `_boBatch`. `_boExpire` cancels orders past `boLifeMins` (`breakout expired`).
 - **Range and moves**: `_boRange` returns `{ hi, lo }`, the entry and worst prices; `_boMoves` splits the candles by colour into `{ top, bottom, green, red }`, which `_boPlace` turns into the TP / SL ROI.
-- **Badge**: the `registerRoleBadge` provider reads `_boEdge` off a position or an order's `candidate` and returns the **TOP** / **BOTTOM** badge, or **PEAK** / **ABYSS** when `_boDecide` is set on the candidate.
+- **Badge**: the `registerRoleBadge` provider reads `_boEdge` off a position or an order's `candidate` and returns the **TOP** / **BOTTOM** badge, or, when `_boDecide` is set on the candidate, the `Hist-` / `Num-` reads from `_boHist` and `_boNum` (**PEAK** / **ABYSS** on an order placed before they existed).
 - **Leverage**: `_boLev` uses `resolveEffectiveLeverage` where the host has it (PseudoWinter), else `leverage`.
 
 ### localStorage Keys
