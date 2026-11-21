@@ -66,7 +66,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | Setting | What it does |
 |---|---|
 | **Scan Interval** (`scanMins`) | How often (minutes) the bot runs a full market scan. Controls both entry frequency and the scan bar in the UI. Can be changed while the bot is running (PseudoWinter/PseudoChaser): the interval is frozen when each cycle starts, so an edit applies from the next cycle and never fires or shifts the current one. |
-| **Max Positions** (`maxPos`) | Maximum simultaneously open positions. No new entries open once this is reached. Breakout also cancels its cond. orders and stops placing them ([Max positions](#max-positions)). |
+| **Max Positions** (`maxPos`) | Maximum simultaneously open positions. No new entries open once this is reached. Breakout also cancels its watches and stops placing them ([Max positions](#max-positions)). |
 | **Max Cond. Orders** (`maxCond`, default 30) | Maximum pending conditional-limit entries ([Conditional Orders](#conditional-orders)). Counted separately from **Max Positions**; no new cond. order is accepted once it is reached. |
 | **Leverage** (`leverage`) | Position leverage. Affects order size and TP/SL prices. |
 | **Min Notional** (`minNotional`) | Base margin per position in USDT. Actual order size = minNotional × leverage. |
@@ -120,7 +120,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boPairs`, `boGray`, `boWhite`, plus its `boEnabled`, `boDecide`, `boFar`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boWatch`, `boGray`, `boWhite`, plus its `boEnabled`, `boDecide`, `boTypes`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -156,7 +156,7 @@ The trades panel shows a card for each closed trade, newest first, with a close-
 
 ## Conditional Orders
 
-A plugin can enter through a conditional limit order instead of opening at once: `placeCondEntry({ candidate, target, worst, tag, bundle, kind })`, where `candidate` is what it would hand to `pseudoOpenShort`/`pseudoOpenLong`. Breakout is the only caller by default and places one plain order per ticker; bundles are there for plugins that need them. The order opens a position only when price reaches **target**; if price reaches **worst** (the worst case) first, it is cancelled. Target and worst sit on opposite sides of the **entry** price, the last price when the order was made.
+A plugin can enter through a conditional limit order instead of opening at once: `placeCondEntry({ candidate, target, worst, tag, bundle, kind })`, where `candidate` is what it would hand to `pseudoOpenShort`/`pseudoOpenLong`. Breakout no longer calls it (it places volume watches); it and bundles are there for plugins that need them. The order opens a position only when price reaches **target**; if price reaches **worst** (the worst case) first, it is cancelled. Target and worst sit on opposite sides of the **entry** price, the last price when the order was made.
 
 **Bundles**: orders on one ticker that pass the same `bundle` string form a bundle. A bundle takes **one** cond. slot however many orders it holds, shows as one card, and acts as one-cancels-other: the first order to fill cancels the rest. Each order's `kind` (e.g. `top` / `bottom`) names its role in the bundle. Orders with no `bundle` behave as before, one slot and one card each, and only one per ticker.
 
@@ -166,17 +166,17 @@ Pending orders are listed under **Cond. Orders** in the market column, below Ope
 
 ## Breakout Plugin
 
-Breakout reads a ticker's last 24 closed hourly candles; their highest high and lowest low are the day's range. It picks one edge of that range, top or bottom, never both (by which extreme is closer when [Decisive Edge](#entry) is on, else a coin flip), and places a single conditional order there: at the highest high above the current price, or at the lowest low below it. The opposite extreme is the order's worst price, so the order is cancelled if price reaches it first. A ticker whose price is already at or beyond either extreme is skipped for the batch. When the order fills, TP and SL come from the candles' average **top move** (green candles, how far above their open they ran) and **bottom move** (red candles, how far below their open). Nothing is predicted: no funding, long / short skew, open interest or other read of the crowd, and nothing lengthens or shortens the targets. The ticker's own range is the only input, and the edge is the closer extreme (Decisive Edge) or chance. There is no stand down or other regime stopgap. It is the only proactive plugin: one file for both bots (`plugins/strategies/Breakout.html`, settings `bo*`), no other plugin needed, and **Binary Mode must be on** (with it off, no orders are placed). It needs the host's cond. order support (`placeCondEntry`). ([more](#breakout-details))
+Breakout watches a ticker's own 24 h hourly turnover and enters at market when it breaks its 24 h high (a **top** break) or low (a **bottom** break). Each ticker gets one watch, on one edge, never both; the opposite edge breaking first cancels it. The edge is a **Double** or a **Revert** of the last break, the turnover extreme that printed most recently: a Double Top (the last break was the top, now the top again) is bullish, a Double Bottom bearish, and a Revert takes the other edge. When it fires, TP and SL come from the candles' average **top move** (green candles, how far above their open they ran) and **bottom move** (red candles, how far below their open). Nothing is predicted: no funding, long / short skew, open interest or other read of the crowd, and nothing lengthens or shortens the targets. The ticker's own turnover history is the only input, and the edge is the ticked types (Decisive Edge) or chance. There is no stand down or other regime stopgap. It is the only proactive plugin: one file for both bots (`plugins/strategies/Breakout.html`, settings `bo*`), no other plugin needed, and **Binary Mode must be on** (with it off, nothing is placed). ([more](#breakout-details))
 
 ### Entry
 
-Each scan, Breakout fills every free cond. slot with a random ticker that passes the [filters](#filters); each ticker is one slot, and its **top** (highest high) or **bottom** (lowest low) edge is picked as below. It does nothing at [Max Positions](#max-positions). The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below) and which move each one takes; the order is the bot's own direction whichever edge is picked.
+Each scan, Breakout fills every free cond. slot with a random ticker that passes the [filters](#filters); each ticker is one watch, on its **top** (24 h turnover high) or **bottom** (24 h turnover low) edge, and takes one **Max Cond. Orders** slot. Every 10 s the watch reads the forming 1hr candle's turnover against the last 24 closed candles': a top break is the forming candle passing the highest of the 24 (it can fire mid-candle), a bottom break is a candle closing below the lowest of the 24 (only after the close). The watch's own edge breaking opens a position at market on the bot's side; the opposite edge breaking first cancels the watch. Both count as breaks. It does nothing at [Max Positions](#max-positions). The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below) and which move each one takes; the entry is the bot's own direction whichever edge breaks.
 
-With **Decisive Edge** on (default), the closer extreme is found the same way on both bots, by a blend of two reads: numerical (% from price to each extreme) and historical (how many closed 1hr candles ago each printed). The blend is the mean of the peak's share of the two distances and its share of the two ages; below 0.5 the peak is closer, above it the abyss, and a tie goes to the numerical read. **Enter at** enters at that closer edge (Closer) or the opposite one (Further); PseudoWinter defaults to Further, PseudoChaser to Closer. An edge less than one average move from price is moved out to one average move (top move above for the peak, bottom move below for the abyss). The position-type badge records both reads, e.g. **Hist-Peak, Num-Abyss** (the peak is closer historically, the abyss numerically); the tooltip names the edge entered. Off, a coin flip picks the edge and the badge reads TOP / BOTTOM.
+The **last break** is the turnover extreme (24 h high or low) that printed most recently. A watch on the same edge is a **Double**, on the other edge a **Revert** (Revert Top: the last break was the bottom, now the top is targeted). With **Decisive Edge** on (default), only the ticked types are watched, by default Double Top and Revert Top on PseudoChaser, Double Bottom and Revert Bottom on PseudoWinter; off, a coin flip picks the edge. The position-type badge records the type either way, e.g. **Double Top-Vol**, **Revert Bottom-Vol**; the tooltip names the edge entered. Each watch shows as a card in the accordion: this hour's turnover so far against the 24 h high (top) or low (bottom), the opposite level as the worst, and the type. Each bar is how close that break is, so a bottom bar starts full and empties as turnover comes in.
 
 ### Expiry
 
-An order is cancelled after **Order life** (default 2880 min) if it has not filled. An expiry or any other cancel is not a break.
+A watch is cancelled after **Order life** (default 1440 min) if it has not broken. An expiry or a max-positions cancel is not a break.
 
 ### Filters
 
@@ -184,11 +184,11 @@ Two always-on filters skip dead tickers: **Stablecoin** (the 24 h range must be 
 
 ### Break counter
 
-Every fill is a **break**: ▲ top or ▼ bottom, kept for the **Break window** (default 48 h) and shown in the live readout. It is a readout only: it never cancels or blocks an order.
+Every volume break is a **break**: ▲ top or ▼ bottom, the watch's own edge or the opposite one, kept for the **Break window** (default 24 h) and shown in the live readout. It is a readout only: it never cancels or blocks a watch.
 
 ### Max positions
 
-At **Max Positions**, every pending Breakout cond. order is cancelled and no new ones are placed until a slot frees up.
+At **Max Positions**, every volume watch is cancelled and no new ones are placed until a slot frees up.
 
 ### Live readout
 
@@ -200,11 +200,11 @@ Each setting's explanation sits behind a circled **!** button next to it (click 
 
 | Setting | What it does |
 |---|---|
-| **Breakout Mode** (`boEnabled`, default on) | Master on/off. Off = no new orders. |
-| **Decisive Edge** (`boDecide`, default on) | Picks the edge by the closer extreme, blending numerical and historical closeness, instead of a coin flip. |
-| **Enter at** (`boFar`, Winter Further, Chaser Closer) | With Decisive Edge on, enters at the closer edge or the further one. |
-| **Order life** (`boLifeMins`, default **2880**) | Minutes before an unfilled order is cancelled. |
-| **Break window** (`boWinH`, default **48**) | Hours a break counts toward the live readout. |
+| **Breakout Mode** (`boEnabled`, default on) | Master on/off. Off = no new watches, and the existing ones are dropped. |
+| **Decisive Edge** (`boDecide`, default on) | Watches only the ticked types instead of a coin flip's edge. |
+| **Top / Bottom types** (`boTypes`, default Chaser: Double Top + Revert Top, Winter: Double Bottom + Revert Bottom) | With Decisive Edge on, which of Double Top, Revert Top, Double Bottom and Revert Bottom are watched. A ticker's last break gives it one Double and one Revert candidate: both ticked, one is drawn; neither, the ticker is skipped. One type always stays ticked. |
+| **Order life** (`boLifeMins`, default **1440**) | Minutes before an unbroken watch is cancelled. |
+| **Break window** (`boWinH`, default **24**) | Hours a break counts toward the live readout. |
 
 The stored state is listed under [Breakout Details](#breakout-details).
 
@@ -280,67 +280,29 @@ The core data it reads directly is the arrays, batched API payloads and state st
 
 ### Breakout Details
 
-The details left out of the shortened Breakout entries.
-
-#### Plugin symbol
-
-The accordion is marked with a text glyph rather than an emoji: ❄︎ on PseudoWinter, ♨︎ on PseudoChaser. Breakout reads which bot it is loaded into and uses that side's conventions (PseudoChaser longs, PseudoWinter shorts). With Binary Mode off the plugin logs one warning and places no orders.
-
 #### Top and bottom moves
 
-The newest 25 candles are fetched (`interval=60`) and the forming one dropped, so all 24 are closed; a ticker with fewer than 24 readable candles is skipped. The candles are split by colour: a **green** candle (close above open) contributes `(high − open) ÷ open` to the **top move**, a **red** candle (close below open) contributes `(open − low) ÷ open` to the **bottom move**, and each move is the mean over its candles, in %. A doji (close = open) counts for neither. A ticker with no green or no red candle among the 24 is skipped and logged, so one that only went a single way in 24 h is not traded. Candles go through the scheduling queue, while the last-price and `recent-trade` reads are direct fetches.
+The newest 25 candles are fetched (`interval=60`) and the forming one dropped; a ticker with fewer than 24 readable candles is skipped. A **green** candle (close above open) contributes `(high − open) ÷ open` to the **top move**, a **red** candle `(open − low) ÷ open` to the **bottom move**, each the mean over its candles, in %; a doji counts for neither. A ticker with no green or no red candle among the 24 is skipped.
 
 #### Batch
 
-Each scan, a batch fills every free cond. slot (**Max Cond. Orders** minus the slots in use) while a position slot is free; at **Max Positions** the batch does nothing. The host drops a cond. order that triggers once no position slot is free, and a live order fails if the balance is short, which the cap check prevents. Tickers come at random from the bulk list (USDT pairs only, not banned, not held, not pending, not in `megacapExclude`, not graylisted). For each ticker:
+Each scan, while a position slot is free, a batch fills every free cond. slot (**Max Cond. Orders** minus the slots in use, watches included) with random tickers from the bulk list (USDT pairs, not banned, held, watched, in `megacapExclude` or graylisted). Per ticker: read the candles, run the filters, read a fresh price, the leverage and the forming candle's turnover, pick the edge and register the watch. Attempts are capped at 3× the free slots. The position opened on a break carries `_bo`, `_boVol`, `_boTopPct`, `_boBotPct`, `_boEdge`, `_boHist` (the last break), `_tpPct` and `_slPct`, copied onto its closed trade, which is what the badge reads.
 
-1. Read the last 24 closed 1h candles and take the **top move** and **bottom move**.
-2. Run the stablecoin and illiquidity filters.
-3. Read a fresh last price (one per-ticker `tickers` call) and the leverage, pick the edge (the closer extreme by the numerical / historical blend, or a coin flip when off; moved out to one average move if nearer), then place the order.
+#### TP / SL
 
-All reads happen once per ticker. Attempts per batch are capped at 3× the free slots, so a ticker that fails (new listing, refused order, a filter) is replaced by the next pick. Each order's candidate carries `_bo`, `_boTopPct` and `_boBotPct` (the top and bottom moves), `_boEdge`, `_tpPct` and `_slPct`; the underscore keys are copied onto the position and its closed trade, which is what the badge reads.
+PseudoChaser TP = entry × (1 + top), SL = entry × (1 − bottom); PseudoWinter TP = entry × (1 − bottom), SL = entry × (1 + top), so both edges carry the same TP and SL. They are ROI %: `_tpPct` / `_slPct` = move × leverage, applied by the host at open in Binary Mode and not adjusted or clamped.
 
-#### Entry levels and TP / SL
+#### Watch details
 
-With `dT = min(top move, 90%)` and `dB = min(bottom move, 90%)`, the drawn edge sets one plain cond. order (no bundle):
+Turnover is kline field 6 (USDT). Each watch is polled every 10 s (`VOL_POLL_MS`, staggered) with one `kline` read (`limit=26`). A newly closed candle (start after the watch's `chk`) above the highest of the 24 before it is a top break, below their lowest a bottom break; the forming candle is compared with the highest of the last 24 closed, a top break only. A ticker whose forming candle is already above the 24 h high, or with an hour of no turnover, is skipped at placement.
 
-| Edge (`_boEdge`) | Entry (target) | Worst price |
-|---|---|---|
-| `top` | price × (1 + dT) | price × (1 − dB) |
-| `bottom` | price × (1 − dB) | price × (1 + dT) |
+The watch's own edge breaking opens through `pseudoOpenLong` / `pseudoOpenShort` at the forming candle's price, with `_tpPct` / `_slPct` from fresh moves (the watch's own if unreadable); the entry is dropped, still counted, with no free position slot, halted entries, Binary Mode off or a position already on the ticker. The opposite edge cancels the watch.
 
-The worst price is the opposite edge of the ticker's range, so if price reaches it before the entry level the host cancels the order (not a break); when a single sample or candle crosses both, the level nearer the previous price or the candle's open wins. TP and SL come from the two moves, measured from the entry on the bot's own side: PseudoChaser TP = entry × (1 + top) and SL = entry × (1 − bottom); PseudoWinter TP = entry × (1 − bottom) and SL = entry × (1 + top). Both edges therefore carry the same TP and SL; only the trigger differs. The 90% cap applies to the distances only and keeps the lower level a positive price. TP and SL are ROI %, so each order carries `_tpPct` = its TP move × leverage and `_slPct` = its SL move × leverage, and the host applies them at fill in Binary Mode. They are not adjusted or clamped.
-
-#### Expiry details
-
-An order is cancelled once it is older than **Order life** (reason `breakout expired`). An order that is gone with no position on the ticker (expired, cancelled by hand, a bail, a halt, its worst price or the max-positions cap) is dropped from the pending list without counting.
+The last break is the edge whose candle is newer (the high and the low are different candles, so they never tie). A ticker's last break gives it one Double (the same edge) and one Revert (the other); if both are ticked one is drawn, if neither the ticker is skipped. With Decisive Edge off a coin flip picks the edge and the type is still stamped. A watch lives in `boWatch`, not the host's cond. list, and is dropped on expiry, at Max Positions or with Breakout Mode off; leftover conds tagged `breakout` are cancelled.
 
 #### Filter details
 
-Both are always on, with no toggle, and run before every order.
-
-| Filter | Rule |
-|---|---|
-| **Stablecoin** | The 24 candles' full span, lowest low to highest high, must be at least **1%**, else the ticker is skipped. Reads the candles already fetched, so no extra request. |
-| **Illiquidity** | The last 3 trades are fetched (`recent-trade`, limit 3) before entry. They must average no more than **12 s** apart, else the ticker is skipped. Fewer than 3 trades counts as illiquid. |
-
-A ticker that fails either is **graylisted for a week**. A ticker that passes the illiquidity check is **whitelisted for a week** and skips the trade fetch. The stablecoin check still runs each time. A failed fetch neither graylists nor whitelists. The graylist and whitelist are pruned at the start of each batch.
-
-#### Break counter details
-
-A **break** is a Breakout order filling, recorded by the order's edge: `top` or `bottom`. A fill the host drops for want of a position slot still counts; an expiry, a bail, a halt and the max-positions cap don't. Breaks are kept for the **Break window** (`boWinH`, default 48 h) and older ones stop counting. The counts appear in the live readout and nothing else reads them: the earlier stand down, which cancelled every pending order and placed none while unfavorable breaks outnumbered favorable ones, is gone.
-
-#### Max positions details
-
-Once open positions reach **Max Positions**, every pending Breakout cond. order is cancelled (reason `breakout max positions`) and no new ones are placed. The check runs after every cond. order fill, on each watcher tick and at the start of each batch, so no other cond. can push past the cap. When a slot frees up, orders resume.
-
-#### Live readout rows
-
-A panel in the accordion, below the config fields, with no labels and only the app's own colours. **Hover** it on PC, or **tap** it on mobile, for a popover with the window's top and bottom counts.
-
-| Item | Shows |
-|---|---|
-| **LIVE** | Slots Breakout uses over **Max Cond. Orders**, ▲ top and ▼ bottom break counts, and a blinking yellow **⚠** while Binary Mode is off. |
+Fewer than 3 trades counts as illiquid. A ticker that passes is whitelisted for a week and skips the trade fetch; the stablecoin check reads the candles already fetched and runs each time. A failed fetch neither graylists nor whitelists.
 
 #### Stored state
 
@@ -348,21 +310,17 @@ These sit in the bot's config and travel with an export. Only the settings have 
 
 | Key | Holds |
 |---|---|
-| **Breaks** (`boBreaks`) | `[ms, 'T' \| 'B']` for each fill inside the Break window. |
-| **Pending** (`boPairs`) | Symbol → `{ t, edge, id }`: the picked edge and id of each ticker's pending order, so a fill is told from a cancel. |
+| **Breaks** (`boBreaks`) | `[ms, 'T' \| 'B']` for each volume break inside the Break window. |
+| **Watches** (`boWatch`) | Symbol → `{ t, edge, chk, next, hist, top, bot, lev, chg, fund, fv, rh, rl }`: each ticker's volume watch. |
 | **Graylist / Whitelist** (`boGray` / `boWhite`) | Symbol → epoch ms, held one week. |
 
-Everything from earlier versions that this one no longer uses (the Funding / Skew Tilt, flow, criteria, scoring, watch-list, hypothetical, retry and tally settings and stores) is deleted from a saved config on load.
+Settings from earlier versions that this one no longer uses (`boVol`, `boVolClose`, `boFar`, `boRevert`, `boPairs` and the older scoring, flow and tally stores) are deleted from a saved config on load.
 
 ### Breakout Internals
 
-- **Hooks**: `init` (config defaults and cleanup, and the `registerRoleBadge` provider), a scan stage `bo-batch` (a `runScan` wrapper on a host without stages), `pseudoWatchCondOrders` and `_condTrigger`, plus `_ewCondFilled` / `_scCondFilled` on a live host. Declares `after: ['sunchaser', 'everwinter']` so it wraps the live plugins' versions.
-- **Order**: `_boPlace` calls `_boPrep` once (candles, filters, price, leverage), skips the ticker if price is at or beyond the range, draws the edge and calls `placeCondEntry` once with `tag: 'breakout'` and no `bundle`; the entry is the range's high or low and the worst price is the opposite one. `_boBatch` returns when Binary Mode is off or at the position cap.
-- **Slots**: free slots are `maxCond − _condSlots()` (the order count on a host without `_condSlots`), one per ticker; `_boPend` counts Breakout's tickers.
-- **Break counter**: `_boCount(edge)` records a break and prunes the window, `_boTally` returns `{ top, bottom }`. The `_condTrigger` wrapper counts a fill and drops its pending record before the host's first await. `_boSettle` is the fallback for fills that bypass `_condTrigger` (live): a ticker with a position is counted (from the position's `_boEdge`, else the recorded edge), and one with nothing pending and no position is dropped.
-- **Guards**: `_boGuard` runs `_boCancelAll` for the position cap (`breakout max positions`), from the `_condTrigger` wrapper after every fill, the live-fill wrapper, the watcher wrapper and `_boBatch`. `_boExpire` cancels orders past `boLifeMins` (`breakout expired`).
-- **Range and moves**: `_boRange` returns `{ hi, lo }`, the entry and worst prices; `_boMoves` splits the candles by colour into `{ top, bottom, green, red }`, which `_boPlace` turns into the TP / SL ROI.
-- **Badge**: the `registerRoleBadge` provider reads `_boEdge` off a position or an order's `candidate` and returns the **TOP** / **BOTTOM** badge, or, when `_boDecide` is set on the candidate, the `Hist-` / `Num-` reads from `_boHist` and `_boNum` (**PEAK** / **ABYSS** on an order placed before they existed).
+- **Hooks**: `init` (config defaults and cleanup, and the `registerRoleBadge` provider), a scan stage `bo-batch` (a `runScan` wrapper on a host without stages) and `pseudoWatchCondOrders` (its wrapper also runs `_boModeSync`, `_boGuard` and `_boVolWatch`). Declares `after: ['sunchaser', 'everwinter']`.
+- **Watch**: `_boVolPlace` registers the watch, `_boVolWatch` polls it and `_boVolFire` opens the position; `_boGuard` and `_boModeSync` drop watches, `_boCount` / `_boTally` keep the break counter and `_boWatchRows` feeds the cards.
+- **Badge**: `registerRoleBadge` reads `_boEdge` and `_boHist` off a position and returns the type (**Double Top**, **Revert Bottom**), with `-Vol` added when `_boVol` is set; with no `_boHist` it shows **TOP-VOL** / **BOTTOM-VOL**.
 - **Leverage**: `_boLev` uses `resolveEffectiveLeverage` where the host has it (PseudoWinter), else `leverage`.
 
 ### localStorage Keys
@@ -420,7 +378,7 @@ The receiver reassembles in memory, checks length and checksum, and exposes the 
 - **Order record** (`condOrders`, saved in `pw_v1`/`pc_v1`): `id`, `symbol`, `entryPrice`, `target`, `worst`, `dir` (1 when target is above entry, -1 below), `markPrice`, `createdAt`, `tag`, `bundle` and `kind` (null outside a bundle), `candidate` (JSON copy), `_pseudo` (false for live), `_lastPx`, `_lastSeen`; live orders add `orderId` and `qty`.
 - **Host hooks**: `placeCondEntry` validates and calls `_condSubmit(order)`, a no-op in the simulation, and `pseudoWatchCondOrders` runs from `pseudoWatchPositions` (one run at a time) for `_pseudo !== false` orders. The cond. card header renders `_roleBadge(o)`, so a role-badge provider can read the order and its `candidate`. `_condPrices`, `_condHit`, `_condKlines`, `_condKlineHit`, `_condResolve`, `_condWhiplashCheck`/`_condWhiplashAudit` and `_condGapAudit` are shared with the live plugins. **Bundles**: `_condSlots()` counts orders without a bundle plus distinct `symbol|bundle` pairs and is what `placeCondEntry` and the card header compare with **Max Cond. Orders**; `_condBundles()` and `_condBundleRows(b)` feed the bundle card; `_condCancelSiblings(o)` cancels the rest of `o`'s bundle (reason `bundle sibling`) and is called by `_condTrigger` right after it removes the order and by the live plugins' fill handlers; `_condKlinesRecent(sym)` shares the whiplash audit's kline read. `bailAll` calls `cancelAllCondOrders` first.
 - **Fill**: `_condTrigger(o, at)` removes the order first, cancels the rest of its bundle, then opens through `pseudoOpenShort`/`pseudoOpenLong` with `candidate._condFill` used in place of the last price (and left off the position's copied fields). `at` back-dates `openedAt` and `_lastSeenAt`.
-- **Live order**: EverWinter/SunChaser replace `_condSubmit` and `pseudoWatchCondOrders` and wrap `cancelCondOrder`. `_condSubmit` runs the entry checks (the position check reads the symbol set from the last pre-scan position sync while it is fresh, and only falls back to a per-symbol `position/list`), sets leverage (skipped when the same value was set for that ticker within the hour) and posts `POST /v5/order/create` as a GTC Limit order, not reduce-only, with `triggerPrice` = `price` = target, `triggerBy` LastPrice and `triggerDirection` 1 or 2. Qty is `minNotional / target` snapped. Because the limit sits at the trigger, an entry on the continuation side (Chaser at the top, Winter at the bottom) can trigger with price already past the limit and rest until a retrace, while the fade side fills as price moves into it. Live fills bypass `_condTrigger`, so `_ewCondFilled` / `_scCondFilled` call `_condCancelSiblings` themselves and Breakout's `_boSettle` counts them as breaks.
+- **Live order**: EverWinter/SunChaser replace `_condSubmit` and `pseudoWatchCondOrders` and wrap `cancelCondOrder`. `_condSubmit` runs the entry checks (the position check reads the symbol set from the last pre-scan position sync while it is fresh, and only falls back to a per-symbol `position/list`), sets leverage (skipped when the same value was set for that ticker within the hour) and posts `POST /v5/order/create` as a GTC Limit order, not reduce-only, with `triggerPrice` = `price` = target, `triggerBy` LastPrice and `triggerDirection` 1 or 2. Qty is `minNotional / target` snapped. Because the limit sits at the trigger, an entry on the continuation side (Chaser at the top, Winter at the bottom) can trigger with price already past the limit and rest until a retrace, while the fade side fills as price moves into it. Live fills bypass `_condTrigger`, so `_ewCondFilled` / `_scCondFilled` call `_condCancelSiblings` themselves.
 - **Live watcher**: one `GET /v5/order/realtime` (up to 5 pages) every `ewCondListSec` seconds (default 15, no UI; every tick while a cond. is within **Whiplash Proximity** of its trigger), with a missing order looked up in `realtime` then `order/history` and dropped after 3 polls if found in neither. `Filled` hands `avgPrice` to the open function as `_condFill` with `_condQty`, which skips the entry guards, then builds TP, SL and DCA orders as usual. Worst case cancels on the exchange, and if the cancel is refused because the order filled, the position is tracked instead. Live cond. prices come from the WS feed when it has a read, otherwise one REST ticker per symbol on the same adaptive interval as open positions (**Price Poll Interval** doubling while flat, 60 s cap, back to base near a trigger).
 
 ### Live-Mode Internals
@@ -449,7 +407,7 @@ Each plugin's `transform(def)` receives and returns the component definition, so
 
 ### Bybit API Endpoints Used
 
-**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for Breakout's pre-entry price), `GET /v5/market/recent-trade` (Breakout's illiquidity filter), `GET /v5/market/kline` (hourly bars for Breakout's range and TP / SL moves; 1-minute bars for the whiplash and gap audits), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots; signing is HMAC-SHA-256 via `crypto.subtle.sign` with a 250ms minimum gap between signed requests (plugins).
+**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for Breakout's pre-entry price), `GET /v5/market/recent-trade` (Breakout's illiquidity filter), `GET /v5/market/kline` (hourly bars for Breakout's turnover range and TP / SL moves; 1-minute bars for the whiplash and gap audits), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots; signing is HMAC-SHA-256 via `crypto.subtle.sign` with a 250ms minimum gap between signed requests (plugins).
 
 **Call cadence**: the full-book `position/list` runs only before and after each scan loop. Single-symbol `position/list` calls happen around an entry and while a close is repricing. On the Psycho bots, `execution/list` is called for a pending DCA/AMa stage once price reaches its trigger, plus one sweep of every pending stage after each scan loop to catch a wick.
 
