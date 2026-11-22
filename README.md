@@ -120,7 +120,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boWatch`, `boGray`, `boWhite`, plus its `boEnabled`, `boDecide`, `boTypes`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boBreaks`, `boWatch`, `boGray`, `boWhite`, plus its `boEnabled`, `boBoth`, `boCandlePref`, `boNullify`, `boNullHrs`, `boMaxWatch`, `boPollSec`, `boLifeMins` and `boWinH` settings) sits in the config and travels with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -166,13 +166,28 @@ Pending orders are listed under **Cond. Orders** in the market column, below Ope
 
 ## Breakout Plugin
 
-Breakout watches a ticker's own 24 h hourly turnover and enters at market when it breaks its 24 h high (a **top** break) or low (a **bottom** break). Each ticker gets one watch, on one edge, never both; the opposite edge breaking first cancels it. The edge is a **Double** or a **Revert** of the last break, the turnover extreme that printed most recently: a Double Top (the last break was the top, now the top again) is bullish, a Double Bottom bearish, and a Revert takes the other edge. When it fires, TP and SL come from the candles' average **top move** (green candles, how far above their open they ran) and **bottom move** (red candles, how far below their open). Nothing is predicted: no funding, long / short skew, open interest or other read of the crowd, and nothing lengthens or shortens the targets. The ticker's own turnover history is the only input, and the edge is the ticked types (Decisive Edge) or chance. There is no stand down or other regime stopgap. It is the only proactive plugin: one file for both bots (`plugins/strategies/Breakout.html`, settings `bo*`), no other plugin needed, and **Binary Mode must be on** (with it off, nothing is placed). ([more](#breakout-details))
+Breakout watches a ticker's own 24 h hourly turnover and enters at market when it breaks its 24 h high (a **top** break) or low (a **bottom** break). Each ticker gets one watch, on one edge picked by chance, or on both edges with **Both Edges** on. Every entry is stamped a **Double** or a **Revert** of the last break, the turnover extreme that printed most recently: a Double Top (the last break was the top, now the top again) is bullish, a Double Bottom bearish, and a Revert is the other edge. When it fires, TP and SL come from the candles' average **top move** (green candles, how far above their open they ran) and **bottom move** (red candles, how far below their open). Nothing is predicted: no funding, long / short skew, open interest or other read of the crowd, and nothing lengthens or shortens the targets. The ticker's own turnover history is the only input, and the edge is chance (or both edges, with the last three 15 min candles choosing which bot enters). There is no stand down or other regime stopgap. It is the only proactive plugin: one file for both bots (`plugins/strategies/Breakout.html`, settings `bo*`), no other plugin needed, and **Binary Mode must be on** (with it off, nothing is placed). ([more](#breakout-details))
 
 ### Entry
 
-Each scan, Breakout fills every free cond. slot with a random ticker that passes the [filters](#filters); each ticker is one watch, on its **top** (24 h turnover high) or **bottom** (24 h turnover low) edge, and takes one **Max Cond. Orders** slot. Every 10 s the watch reads the forming 1hr candle's turnover against the last 24 closed candles': a top break is the forming candle passing the highest of the 24 (it can fire mid-candle), a bottom break is a candle closing below the lowest of the 24 (only after the close). The watch's own edge breaking opens a position at market on the bot's side; the opposite edge breaking first cancels the watch. Both count as breaks. It does nothing at [Max Positions](#max-positions). The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below) and which move each one takes; the entry is the bot's own direction whichever edge breaks.
+Each scan, Breakout fills every free cond. slot with a random ticker that passes the [filters](#filters); each ticker is one watch, on its **top** (24 h turnover high) or **bottom** (24 h turnover low) edge, or on both, and takes one of the **Max watches** (default 30; not the host's **Max Cond. Orders**). Every **Volume poll** (default 60 s) the watch reads the forming 1hr candle's turnover against the last 24 closed candles': a top break is the forming candle passing the highest of the 24 (it can fire mid-candle), a bottom break is a candle closing below the lowest of the 24 (only after the close). With Both Edges off, the watch's own edge breaking opens a position at market on the bot's side, and the opposite edge breaking first cancels the watch. Both count as breaks. It does nothing at [Max Positions](#max-positions). The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below) and which move each one takes; the entry is the bot's own direction whichever edge breaks.
 
-The **last break** is the turnover extreme (24 h high or low) that printed most recently. A watch on the same edge is a **Double**, on the other edge a **Revert** (Revert Top: the last break was the bottom, now the top is targeted). With **Decisive Edge** on (default), only the ticked types are watched, by default Double Top and Revert Top on PseudoChaser, Double Bottom and Revert Bottom on PseudoWinter; off, a coin flip picks the edge. The position-type badge records the type either way, e.g. **Double Top-Vol**, **Revert Bottom-Vol**; the tooltip names the edge entered. Each watch shows as a card in the accordion: this hour's turnover so far against the 24 h high (top) or low (bottom), the opposite level as the worst, and the type. Each bar is how close that break is, so a bottom bar starts full and empties as turnover comes in.
+The **last break** is the turnover extreme (24 h high or low) that printed most recently. A break on the same edge is a **Double**, on the other edge a **Revert** (Revert Top: the last break was the bottom, now the top broke). The position-type badge records it, e.g. **Double Top-Vol**, **Revert Bottom-Vol**; the tooltip names the edge entered. It is a label only and picks nothing. Each watch shows as a card in the accordion: this hour's turnover so far against the 24 h high (top) or low (bottom), the opposite level as the worst, and the type; a both-edges card is tagged **BOTH EDGES** and shows the high and the low as its two targets. Each bar is how close that break is, so a bottom bar starts full and empties as turnover comes in.
+
+### Both Edges
+
+Optional (off by default); it replaces the former Decisive Edge. The watch covers **both** edges and whichever breaks first is the break. Before the entry, the last three closed 15 min candles are fetched (the forming one is dropped), a red one closing below its open and a green one above it. Each bot has a **Candle preference** (a **Red** / **Green** button): **it enters when most of the three (2 or more) are its colour, and defers otherwise**. A new config starts PseudoChaser on Red and PseudoWinter on Green. The setting is per bot, so with the same colour on both, both enter the same break; with opposite colours the bots split a break between them. A split with doji candles, or candles that cannot be read, enters nothing on either bot. The 15 min read happens only after the cheap checks pass (Binary Mode, a free position slot, entries not halted, no position on the ticker), then the slot and the ticker are checked again.
+
+A deferred break is spent: the watch is removed (it counts as a break) and its slot refills at the next batch. Each bot reads the candles itself and draws its own random tickers, so the partner only takes a deferred break if it is watching that ticker too.
+
+### Nullify
+
+Optional (off by default), one toggle that does two things:
+
+1. **TP / SL from the bot.** No per-position TP or SL is passed, so the host's own **Take Profit** and **Stop Loss** (Binary Mode, `binaryTpPct` / `binarySlPct`) apply instead of the average moves.
+2. **Volume cut-off.** For **Nullify cut-off** hours (`boNullHrs`, default 6, 1 to 72) after the entry, the ticker's closed hourly candles are checked. A **top** entry is nullified when a closed hour's turnover is under **50%** of the **peak** (the 24 h turnover high at the entry, or the entry hour's turnover so far if higher). A **bottom** entry is nullified when a closed hour's turnover is more than **100% above** the **bottom** (over 2× the 24 h turnover low at the entry). The position then closes at the mark price with the reason **nullify** (badge **NUL**). After the cut-off, TP / SL alone decide.
+
+The first check is due at the next hour boundary after the entry, set when the position opens, outside the scan. A check only runs during a scan: a scan that finds it due reads the hourly candles closed since the last checked one (every missed hour is checked, oldest first), marks them checked and sets the next check at the next hour boundary. It does nothing with Nullify off, and a position opened with it on keeps its base TP / SL if it is turned off.
 
 ### Expiry
 
@@ -192,7 +207,7 @@ At **Max Positions**, every volume watch is cancelled and no new ones are placed
 
 ### Live readout
 
-A small panel under the config fields; hover (PC) or tap (mobile) it for detail. **LIVE** shows the slots Breakout uses over **Max Cond. Orders**, the ▲ top and ▼ bottom break counts, and a blinking yellow **⚠** while Binary Mode is off.
+A small panel under the config fields; hover (PC) or tap (mobile) it for detail. **LIVE** shows the watches Breakout holds over **Max watches**, the ▲ top and ▼ bottom break counts, and a blinking yellow **⚠** while Binary Mode is off.
 
 ### Config
 
@@ -201,8 +216,12 @@ Each setting's explanation sits behind a circled **!** button next to it (click 
 | Setting | What it does |
 |---|---|
 | **Breakout Mode** (`boEnabled`, default on) | Master on/off. Off = no new watches, and the existing ones are dropped. |
-| **Decisive Edge** (`boDecide`, default on) | Watches only the ticked types instead of a coin flip's edge. |
-| **Top / Bottom types** (`boTypes`, default Chaser: Double Top + Revert Top, Winter: Double Bottom + Revert Bottom) | With Decisive Edge on, which of Double Top, Revert Top, Double Bottom and Revert Bottom are watched. A ticker's last break gives it one Double and one Revert candidate: both ticked, one is drawn; neither, the ticker is skipped. One type always stays ticked. |
+| **Both Edges** (`boBoth`, default off) | Off = each watch is on one edge, a coin flip. On = both edges are watched and the last three closed 15 min candles pick the bot: a bot enters when most of them are its Candle preference colour and defers otherwise ([Both Edges](#both-edges)). |
+| **Candle preference** (`boCandlePref`, `red` / `green`, default Chaser **red**, Winter **green**; shown with Both Edges on) | The candle colour this bot enters on when Both Edges is on; most of the last three closed 15 min candles must be that colour, else it defers. |
+| **Nullify** (`boNullify`, default off) | Base bot TP / SL instead of the average moves, and a closed hourly candle's volume can close the position with reason nullify until the cut-off ([Nullify](#nullify)). |
+| **Nullify cut-off (h)** (`boNullHrs`, default **6**, 1 to 72; shown with Nullify on) | How many hours after the entry the hourly volume check runs. |
+| **Max watches** (`boMaxWatch`, default **30**, 1 to 100) | How many tickers are watched at once, one watch each. Independent of **Max Cond. Orders** and **Max Positions**; a new value is used from the next batch. |
+| **Volume poll (s)** (`boPollSec`, default **60**, least 5) | How often each watch reads its 1hr kline for a volume break. Applies from each watch's next poll. |
 | **Order life** (`boLifeMins`, default **1440**) | Minutes before an unbroken watch is cancelled. |
 | **Break window** (`boWinH`, default **24**) | Hours a break counts toward the live readout. |
 
@@ -212,7 +231,7 @@ The stored state is listed under [Breakout Details](#breakout-details).
 
 ## Randomized Outcomes
 
-Scan timing drifts independently per tab, and Breakout draws its tickers at random each batch (and flips a coin for each one's edge when Decisive Edge is off), so two identically configured instances won't share entry triggers, exit timing, or readings. This is intentional: instances in lockstep are easier to front-run and cluster losses at the same market event.
+Scan timing drifts independently per tab, and Breakout draws its tickers at random each batch (and flips a coin for each one's edge when Both Edges is off), so two identically configured instances won't share entry triggers, exit timing, or readings. This is intentional: instances in lockstep are easier to front-run and cluster losses at the same market event.
 
 ---
 
@@ -286,7 +305,7 @@ The newest 25 candles are fetched (`interval=60`) and the forming one dropped; a
 
 #### Batch
 
-Each scan, while a position slot is free, a batch fills every free cond. slot (**Max Cond. Orders** minus the slots in use, watches included) with random tickers from the bulk list (USDT pairs, not banned, held, watched, in `megacapExclude` or graylisted). Per ticker: read the candles, run the filters, read a fresh price, the leverage and the forming candle's turnover, pick the edge and register the watch. Attempts are capped at 3× the free slots. The position opened on a break carries `_bo`, `_boVol`, `_boTopPct`, `_boBotPct`, `_boEdge`, `_boHist` (the last break), `_tpPct` and `_slPct`, copied onto its closed trade, which is what the badge reads.
+Each scan, while a position slot is free, a batch fills every free watch slot (**Max watches** minus the watches held) with random tickers from the bulk list (USDT pairs, not banned, held, watched, in `megacapExclude` or graylisted). Per ticker: read the candles, run the filters, read a fresh price, the leverage and the forming candle's turnover, pick the edge and register the watch. Attempts are capped at 3× the free slots. The position opened on a break carries `_bo`, `_boVol`, `_boTopPct`, `_boBotPct`, `_boEdge`, `_boHist` (the last break), `_tpPct` and `_slPct`, copied onto its closed trade, which is what the badge reads.
 
 #### TP / SL
 
@@ -294,11 +313,11 @@ PseudoChaser TP = entry × (1 + top), SL = entry × (1 − bottom); PseudoWinter
 
 #### Watch details
 
-Turnover is kline field 6 (USDT). Each watch is polled every 10 s (`VOL_POLL_MS`, staggered) with one `kline` read (`limit=26`). A newly closed candle (start after the watch's `chk`) above the highest of the 24 before it is a top break, below their lowest a bottom break; the forming candle is compared with the highest of the last 24 closed, a top break only. A ticker whose forming candle is already above the 24 h high, or with an hour of no turnover, is skipped at placement.
+Turnover is kline field 6 (USDT). Each watch is polled every **Volume poll** (`boPollSec`, default 60 s, least 5; each watch's first poll is staggered over one interval) with one `kline` read (`limit=26`). A newly closed candle (start after the watch's `chk`) above the highest of the 24 before it is a top break, below their lowest a bottom break; the forming candle is compared with the highest of the last 24 closed, a top break only. A ticker whose forming candle is already above the 24 h high, or with an hour of no turnover, is skipped at placement.
 
-The watch's own edge breaking opens through `pseudoOpenLong` / `pseudoOpenShort` at the forming candle's price, with `_tpPct` / `_slPct` from fresh moves (the watch's own if unreadable); the entry is dropped, still counted, with no free position slot, halted entries, Binary Mode off or a position already on the ticker. The opposite edge cancels the watch.
+The watch's own edge breaking (either edge, with Both Edges) opens through `pseudoOpenLong` / `pseudoOpenShort` at the forming candle's price, with `_tpPct` / `_slPct` from fresh moves (the watch's own if unreadable); the entry is dropped, still counted, with no free position slot, halted entries, Binary Mode off or a position already on the ticker. With Both Edges off the opposite edge cancels the watch. With it on, `_boCandleSide` reads `kline` `interval=15`, `limit=4`, drops the forming candle and counts red and green among the newest three; `SIDE_NEED` (2) of one colour decides the side, so with three candles `SIDE_NEED = 3` would need all three and a split would enter nothing. A bot enters only on its own `boCandlePref` colour and the entry carries the edge that broke as `_boEdge`.
 
-The last break is the edge whose candle is newer (the high and the low are different candles, so they never tie). A ticker's last break gives it one Double (the same edge) and one Revert (the other); if both are ticked one is drawn, if neither the ticker is skipped. With Decisive Edge off a coin flip picks the edge and the type is still stamped. A watch lives in `boWatch`, not the host's cond. list, and is dropped on expiry, at Max Positions or with Breakout Mode off; leftover conds tagged `breakout` are cancelled.
+The last break is the edge whose candle is newer (the high and the low are different candles, so they never tie). The type stamped on a position is read against that edge: the same edge as the last break is a Double, the other a Revert. A one-edge watch's edge is a coin flip; a both-edges watch has `edge: 'both'`. A watch lives in `boWatch`, not the host's cond. list, and is dropped on expiry, at Max Positions or with Breakout Mode off; leftover conds tagged `breakout` are cancelled.
 
 #### Filter details
 
@@ -313,13 +332,14 @@ These sit in the bot's config and travel with an export. Only the settings have 
 | **Breaks** (`boBreaks`) | `[ms, 'T' \| 'B']` for each volume break inside the Break window. |
 | **Watches** (`boWatch`) | Symbol → `{ t, edge, chk, next, hist, top, bot, lev, chg, fund, fv, rh, rl }`: each ticker's volume watch. |
 | **Graylist / Whitelist** (`boGray` / `boWhite`) | Symbol → epoch ms, held one week. |
+| **Nullify fields** (on a position opened with Nullify) | `_boNullRef` (`top` / `bottom`), `_boNullLvl` (the peak or bottom turnover), `_boNullUntil` (cut-off, epoch ms), `_boNullChk` (start of the last checked hour) and `_boNullDue` (next check, 0 = done). |
 
-Settings from earlier versions that this one no longer uses (`boVol`, `boVolClose`, `boFar`, `boRevert`, `boPairs` and the older scoring, flow and tally stores) are deleted from a saved config on load.
+Settings from earlier versions that this one no longer uses (`boDecide`, `boTypes`, `boFlip`, `boVol`, `boVolClose`, `boFar`, `boRevert`, `boPairs` and the older scoring, flow and tally stores) are deleted from a saved config on load.
 
 ### Breakout Internals
 
-- **Hooks**: `init` (config defaults and cleanup, and the `registerRoleBadge` provider), a scan stage `bo-batch` (a `runScan` wrapper on a host without stages) and `pseudoWatchCondOrders` (its wrapper also runs `_boModeSync`, `_boGuard` and `_boVolWatch`). Declares `after: ['sunchaser', 'everwinter']`.
-- **Watch**: `_boVolPlace` registers the watch, `_boVolWatch` polls it and `_boVolFire` opens the position; `_boGuard` and `_boModeSync` drop watches, `_boCount` / `_boTally` keep the break counter and `_boWatchRows` feeds the cards.
+- **Hooks**: `init` (config defaults and cleanup, and the `registerRoleBadge` provider), scan stages `bo-batch` and `bo-nullify` (a `runScan` wrapper on a host without stages) and `pseudoWatchCondOrders` (its wrapper also runs `_boModeSync`, `_boGuard` and `_boVolWatch`). Declares `after: ['sunchaser', 'everwinter']`.
+- **Watch**: `_boVolPlace` registers the watch, `_boVolWatch` polls it, `_boCandleSide` reads the 15 min candles, `_boVolFire` opens the position and `_boNullify` runs the hourly volume check on open positions; `_boGuard` and `_boModeSync` drop watches, `_boCount` / `_boTally` keep the break counter and `_boWatchRows` feeds the cards.
 - **Badge**: `registerRoleBadge` reads `_boEdge` and `_boHist` off a position and returns the type (**Double Top**, **Revert Bottom**), with `-Vol` added when `_boVol` is set; with no `_boHist` it shows **TOP-VOL** / **BOTTOM-VOL**.
 - **Leverage**: `_boLev` uses `resolveEffectiveLeverage` where the host has it (PseudoWinter), else `leverage`.
 
@@ -407,7 +427,7 @@ Each plugin's `transform(def)` receives and returns the component definition, so
 
 ### Bybit API Endpoints Used
 
-**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for Breakout's pre-entry price), `GET /v5/market/recent-trade` (Breakout's illiquidity filter), `GET /v5/market/kline` (hourly bars for Breakout's turnover range and TP / SL moves; 1-minute bars for the whiplash and gap audits), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots; signing is HMAC-SHA-256 via `crypto.subtle.sign` with a 250ms minimum gap between signed requests (plugins).
+**Public**: `GET /v5/market/tickers` (bulk for the symbol universe, per symbol for Breakout's pre-entry price), `GET /v5/market/recent-trade` (Breakout's illiquidity filter), `GET /v5/market/kline` (hourly bars for Breakout's turnover range and TP / SL moves, 15-minute bars for its Both Edges side check; 1-minute bars for the whiplash and gap audits), `GET /v5/market/instruments-info`. **WebSocket**: `wss://stream.bybit.com/v5/public/linear` (position price stream). **Signed (live mode)**: `GET /v5/account/wallet-balance`, `GET /v5/position/list`, `GET /v5/position/closed-pnl`, `GET /v5/order/realtime`, `GET /v5/order/history`, `POST /v5/order/create`, `POST /v5/position/trading-stop`, `POST /v5/order/cancel`, plus `GET /v5/execution/list` on the Psycho bots; signing is HMAC-SHA-256 via `crypto.subtle.sign` with a 250ms minimum gap between signed requests (plugins).
 
 **Call cadence**: the full-book `position/list` runs only before and after each scan loop. Single-symbol `position/list` calls happen around an entry and while a close is repricing. On the Psycho bots, `execution/list` is called for a pending DCA/AMa stage once price reaches its trigger, plus one sweep of every pending stage after each scan loop to catch a wick.
 

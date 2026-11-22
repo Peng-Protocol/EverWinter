@@ -6,13 +6,17 @@
   average TOP move, the mean of (high - open) / open, in %; the red candles (close below open) give the average BOTTOM move, the mean of (open - low) / open, in %. Doji candles count
   for neither; a ticker with no green or no red candle among the 24 is skipped.
 
-  Each ticker gets a volume watch on one edge of its own 24h hourly turnover range (USDT), top or bottom, never both. Every 10s the watch reads the forming 1hr candle's turnover against the last 24 closed candles'. A top break is the forming candle's turnover above the highest of the 24 (can fire mid-candle); a bottom break is a candle closing with turnover below the lowest of the 24 (only after the close).
-  The watch's own edge breaking opens a position at market on the bot's side; the opposite edge breaking first cancels the watch. Every break counts. TP / SL come from the average moves, measured from the entry on the bot's own side (Chaser: TP = top move above, SL = bottom move below; Winter: TP = bottom move below, SL = top move above). Nothing about the ticker is predicted.
+  Each ticker gets a volume watch on one edge of its own 24h hourly turnover range (USDT), top or bottom, picked by a coin flip (Both Edges off), or on both edges (Both Edges on). Every Volume poll (default 60s) the watch reads the forming 1hr candle's turnover against the last 24 closed candles'. A top break is the forming candle's turnover above the highest of the 24 (can fire mid-candle); a bottom break is a candle closing with turnover below the lowest of the 24 (only after the close).
+  Both Edges off: the watch's own edge breaking opens a position at market on the bot's side; the opposite edge breaking first cancels the watch. Every break counts. TP / SL come from the average moves, measured from the entry on the bot's own side (Chaser: TP = top move above, SL = bottom move below; Winter: TP = bottom move below, SL = top move above). Nothing about the ticker is predicted.
 
-  Every watch is a Double or a Revert of the last break, the turnover extreme (24h high or low) that printed most recently. Double = the same edge as the last break (Double Top is bullish, Double Bottom bearish);
-  Revert = the other edge (Revert Top: the last break was the bottom, now the top is targeted). The type is stamped on every position, whether Decisive Edge is on or off.
-  Decisive Edge on watches only the ticked types (Double Top, Revert Top, Double Bottom, Revert Bottom). A ticker's last break gives it one Double and one Revert candidate: if both are ticked one is drawn, if neither the ticker is skipped.
-  Defaults: Chaser ticks Double Top and Revert Top (top edge only), Winter Double Bottom and Revert Bottom (bottom edge only). Off, the edge is a coin flip.
+  Every position is stamped as a Double or a Revert of the last break, the turnover extreme (24h high or low) that printed most recently. Double = the same edge as the last break (Double Top is bullish, Double Bottom bearish);
+  Revert = the other edge (Revert Top: the last break was the bottom, now the top broke). The stamp is a label only; it picks nothing.
+
+  Both Edges (optional, replaces Decisive Edge): the watch covers BOTH edges, and whichever breaks first is the break. Before the entry the last three closed 15min candles are fetched (the forming one is dropped).
+  A bot enters when most (2+) of them are its Candle preference colour (a Red / Green button per bot), else it defers. A split with doji candles, or unreadable candles, enters nothing. Each bot reads the candles itself,
+  so the partner only enters if it is watching that ticker too. A deferred break is spent: the watch is gone and its slot refills at the next batch.
+
+  Watched tickers (Max watches): how many tickers are watched at once. Volume poll (s): how often each watch reads its kline.
 
   Break counter (readout only): every volume break, top or bottom, is kept for the Break window (default 24h) and shown in the LIVE readout. It stops nothing: watches are placed whatever the counts. Expired watches are not breaks.
 
@@ -34,11 +38,19 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.16.0'; // Change: Decisive Edge takes the types to watch (Double / Revert Top / Bottom) in place of the Target switch | previous: 1.15.1 — Hist / Num removed, only Double / Revert types, always stamped
+  const VERSION = '1.20.0'; // Change: Nullify toggle (base TP/SL, hourly volume check closes with reason nullify until a cut-off) | previous: 1.19.0 — Candle preference (Red / Green button per bot) — Both Edges (15m candle colour picks the bot) replaces Decisive Edge; Max watches and Volume poll
   let   WINTER  = false;   // set in transform() from the host
   const CANDLES = 24;      // closed 1hr candles the top / bottom moves are read from
   const HOUR_MS = 3600000;
-  const VOL_POLL_MS = 10000;       // each watch reads its kline this often
+  const VOL_POLL_S  = 60;          // default Volume poll, s: each watch reads its kline this often
+  const POLL_MIN_S  = 5;           // least Volume poll, s
+  const WATCH_MAX   = 100;         // most tickers watched at once (the host's Max Cond. Orders slider tops out at the same)
+  const SIDE_CANDLES = 3;          // closed 15min candles read before an entry (Both Edges)
+  const SIDE_NEED    = 2;          // how many of them must share a colour to decide the side (2 of 3 = most; 3 = all)
+  const MIN15_MS = 900000;
+  const NUL_TOP = 0.5;             // Nullify: a closed hour with turnover under this share of the peak ends a top entry
+  const NUL_BOT = 2;               // Nullify: a closed hour with turnover over this multiple of the bottom (100% above it) ends a bottom entry
+  const NUL_HRS = 6;               // default Nullify cut-off, h
   const BO_NAME = e => (e === 'top' ? 'Top' : 'Bottom');
   // Type of an entry on edge e after a last break: Double (same edge) or Revert (the other edge).
   const BO_TYPE = (last, e) => (last === e ? 'Double ' : 'Revert ') + BO_NAME(e);
@@ -48,7 +60,11 @@
 
   const BO_DEFAULT_CFG = Object.freeze({
     boEnabled: true,   // Breakout mode
-    boDecide: true,    // Decisive Edge: watch only the ticked types (off = coin flip); boTypes { dt, rt, db, rb } is set per bot in init
+    boBoth: false,     // Both Edges: watch both edges, the last three closed 15m candles decide whether Chaser or Winter enters (off = one edge, a coin flip)
+    boMaxWatch: 30,    // Max watches: how many tickers are watched at once (1-100)
+    boNullify: false,  // Nullify: base bot TP/SL instead of the average moves, and a closed hour's volume can end the position (reason nullify) until the cut-off
+    boNullHrs: NUL_HRS, // Nullify cut-off, h after the entry
+    boPollSec: VOL_POLL_S, // Volume poll, s: how often each watch reads its kline
     boLifeMins: 1440,  // how long a volume watch waits before it is cancelled
     boWinH: 24,        // break window, hours: breaks older than this stop counting
     boBreaks: [],      // [ms, 'T' | 'B'] volume breaks (top / bottom) inside the window
@@ -102,28 +118,56 @@
               <div class="tog-t" :class="cfg.boEnabled?'on':''" @click.prevent="if(!cfgLocked){cfg.boEnabled=!cfg.boEnabled;persist()}"><div class="tog-k"></div></div>
               <div x-data="{ tip: false }">
                 <div class="tog-l">Breakout Mode<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
-                <div class="bo-hint" x-show="tip">One watch per ticker on its 24h hourly turnover top or bottom, entering at market on a break. TP and SL come from the average green / red candle moves.</div>
+                <div class="bo-hint" x-show="tip">One watch per ticker on its 24h hourly turnover top or bottom (or both), entering at market on a break. TP and SL come from the average green / red candle moves.</div>
               </div>
             </label>
             <div x-show="cfg.boEnabled" style="margin-top:8px">
               <div x-data="{ tip: false }">
                 <label class="tog">
-                  <div class="tog-t" :class="cfg.boDecide?'on':''" @click.prevent="if(!cfgLocked){cfg.boDecide=!cfg.boDecide;persist()}"><div class="tog-k"></div></div>
+                  <div class="tog-t" :class="cfg.boBoth?'on':''" @click.prevent="if(!cfgLocked){cfg.boBoth=!cfg.boBoth;persist()}"><div class="tog-k"></div></div>
                   <div>
-                    <div class="tog-l">Decisive Edge<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
+                    <div class="tog-l">Both Edges<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
                   </div>
                 </label>
-                <div class="bo-hint" x-show="tip">Off = a coin flip picks the edge. On = only the ticked types are watched: Double takes the last break's edge, Revert the other. One must stay ticked.</div>
-                <div class="bo-sw" x-show="cfg.boDecide">
-                  <span>Top</span>
-                  <button type="button" :class="cfg.boTypes?.dt?'on':''" @click="_boTypeToggle('dt')">DOUBLE</button>
-                  <button type="button" :class="cfg.boTypes?.rt?'on':''" @click="_boTypeToggle('rt')">REVERT</button>
+                <div class="bo-hint" x-show="tip">Off = each ticker is watched on one edge, picked by a coin flip. On = both edges are watched, and when either breaks the last three closed 15min candles pick the bot: mostly red, Winter enters and Chaser defers; mostly green, Chaser enters and Winter defers. The partner only enters if it watches that ticker too.</div>
+              </div>
+              <div x-data="{ tip: false }" x-show="cfg.boBoth" style="margin-top:8px">
+                <div class="bo-sw" style="margin-top:0">
+                  <span style="width:auto">Candle preference</span>
+                  <button type="button" :class="cfg.boCandlePref==='red'?'on':''" @click="if(!cfgLocked){cfg.boCandlePref='red';persist()}">Red</button>
+                  <button type="button" :class="cfg.boCandlePref==='green'?'on':''" @click="if(!cfgLocked){cfg.boCandlePref='green';persist()}">Green</button>
+                  <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
                 </div>
-                <div class="bo-sw" x-show="cfg.boDecide">
-                  <span>Bottom</span>
-                  <button type="button" :class="cfg.boTypes?.db?'on':''" @click="_boTypeToggle('db')">DOUBLE</button>
-                  <button type="button" :class="cfg.boTypes?.rb?'on':''" @click="_boTypeToggle('rb')">REVERT</button>
+                <div class="bo-hint" x-show="tip">The candle colour this bot enters on: when most of the last three closed 15min candles are this colour, it enters, otherwise it defers. Each bot has its own setting, so with the same colour on both, both enter the same break.</div>
+              </div>
+              <div x-data="{ tip: false }" style="margin-top:8px">
+                <label class="tog">
+                  <div class="tog-t" :class="cfg.boNullify?'on':''" @click.prevent="if(!cfgLocked){cfg.boNullify=!cfg.boNullify;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Nullify<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
+                  </div>
+                </label>
+                <div class="bo-hint" x-show="tip">Two things. TP and SL come from the bot's own Binary Mode targets instead of the average moves. And for the cut-off hours after the entry, each closed hourly candle is checked during the scan: a top entry closes with reason nullify when an hour's turnover is under 50% of the peak, a bottom entry when it is more than 100% above the bottom. After the cut-off TP / SL alone decide.</div>
+                <div style="display:flex;align-items:center;gap:6px;margin-top:6px" x-show="cfg.boNullify">
+                  <span class="lbl" style="margin:0">Nullify cut-off (h)</span>
+                  <input type="number" min="1" max="72" step="1" class="bo-in" x-model.number="cfg.boNullHrs" :disabled="cfgLocked" @change="cfg.boNullHrs=Math.max(1,Math.min(72,Math.round(+cfg.boNullHrs||6)));persist()">
                 </div>
+              </div>
+              <div x-data="{ tip: false }" style="margin-top:8px">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span class="lbl" style="margin:0">Max watches</span>
+                  <input type="number" min="1" :max="100" step="1" class="bo-in" x-model.number="cfg.boMaxWatch" :disabled="cfgLocked" @change="cfg.boMaxWatch=Math.max(1,Math.min(100,Math.round(+cfg.boMaxWatch||30)));persist()">
+                  <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
+                </div>
+                <div class="bo-hint" x-show="tip">How many tickers are watched at once, one watch each. Independent of the host's Max Cond. Orders and of Max Positions. A new value is used from the next batch.</div>
+              </div>
+              <div x-data="{ tip: false }" style="margin-top:6px">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span class="lbl" style="margin:0">Volume poll (s)</span>
+                  <input type="number" min="5" step="1" class="bo-in" x-model.number="cfg.boPollSec" :disabled="cfgLocked" @change="cfg.boPollSec=Math.max(5,Math.round(+cfg.boPollSec||60));persist()">
+                  <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
+                </div>
+                <div class="bo-hint" x-show="tip">How often each watch reads its 1hr kline for a volume break. Turnover moves slowly, so a minute is enough; a lower value costs one request per watch per interval.</div>
               </div>
               <div x-data="{ tip: false }" style="margin-top:8px">
                 <div style="display:flex;align-items:center;gap:6px">
@@ -131,7 +175,7 @@
                   <input type="number" min="1" step="1" class="bo-in" x-model.number="cfg.boLifeMins" @change="cfg.boLifeMins=Math.max(1,Math.round(+cfg.boLifeMins||1440));persist()">
                   <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
                 </div>
-                <div class="bo-hint" x-show="tip">Each ticker gets one watch, on its top or bottom edge. Unbroken watches are cancelled after this. Each takes one of the Max Cond. Orders, independent of Max Positions.</div>
+                <div class="bo-hint" x-show="tip">Each ticker gets one watch (one edge, or both with Both Edges on). Unbroken watches are cancelled after this. Each takes one of the Max watches, independent of Max Positions.</div>
               </div>
               <div x-data="{ tip: false }" style="margin-top:6px">
                 <div style="display:flex;align-items:center;gap:6px">
@@ -145,7 +189,7 @@
                 <div class="bo-lr" x-data="{ tip: false }" @pointerenter="if ($event.pointerType === 'mouse') tip = true" @pointerleave="if ($event.pointerType === 'mouse') tip = false" @click="if (($event.pointerType || 'touch') !== 'mouse') tip = !tip">
                   <span class="bo-ttl"><span x-text="_boGlyph()"></span> LIVE</span>
                   <span class="bo-blink" x-show="!cfg.binaryModeEnabled">&#9888;</span>
-                  <span><b x-text="_boPend()"></b><span style="color:var(--text-lo)">/<span x-text="cfg.maxCond ?? 30"></span></span></span>
+                  <span><b x-text="_boPend()"></b><span style="color:var(--text-lo)">/<span x-text="cfg.boMaxWatch ?? 30"></span></span></span>
                   <span class="bo-cnt bo-g">&#9650;<b x-text="_boTally(tick).top"></b></span>
                   <span class="bo-cnt bo-r">&#9660;<b x-text="_boTally(tick).bottom"></b></span>
                   <div class="bo-pop" x-show="tip" x-text="_boTip(tick)"></div>
@@ -167,7 +211,7 @@
                       <span class="cnd-d" x-text="s.dist"></span>
                     </div>
                     <div class="cnd-row">
-                      <span class="cnd-l">Worst</span>
+                      <span class="cnd-l" x-text="s.wl"></span>
                       <span class="cnd-p" x-text="s.wp"></span>
                       <span class="cnd-bar"><i class="w" :style="'width:'+s.wfill+'%'"></i></span>
                       <span class="cnd-d" x-text="s.wdist"></span>
@@ -224,14 +268,8 @@
           for (const x of (Array.isArray(this.cfg.boBreaks) ? this.cfg.boBreaks : [])) if (x && x[0] >= cut) { if (x[1] === 'T') top++; else if (x[1] === 'B') bottom++; }
           return { top, bottom };
         },
-        // Ticks / unticks a type; the last ticked one stays.
-        _boTypeToggle(k) {
-          if (this.cfgLocked) return;
-          const T = this.cfg.boTypes;
-          if (!T || (T[k] && Object.values(T).filter(Boolean).length < 2)) return;
-          T[k] = !T[k];
-          this.persist();
-        },
+        _boPollMs() { return Math.max(POLL_MIN_S, Number(this.cfg.boPollSec) || VOL_POLL_S) * 1000; },
+        _boMaxWatch() { return Math.max(1, Math.min(WATCH_MAX, Math.round(Number(this.cfg.boMaxWatch)) || 30)); },
         _boTip(_t) {
           const t = this._boTally(), h = +(this._boWinMs() / 3600000).toFixed(1);
           return 'Last ' + h + 'h: ' + t.top + ' volume top breaks, ' + t.bottom + ' volume bottom breaks. Informational only; watches are placed whatever the counts.';
@@ -345,14 +383,16 @@
         _boSide() { return WINTER ? '\u25BC SHORT' : '\u25B2 LONG'; },
         // Turnover as a short label: 950, 4.2K, 4.2M, 4.2B.
         _boFmtT(v) { v = +v || 0; return v >= 1e9 ? (v / 1e9).toFixed(1) + 'B' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'K' : String(Math.round(v)); },
-        // Card data per watch: this hour's turnover so far against the 24h high (top watch) or low (bottom watch), the opposite level as the worst, and the type. (_t only re-evaluates it on the host's tick.)
+        // Card data per watch: this hour's turnover so far against the 24h high (top watch) or low (bottom watch), the opposite level as the worst, and the type. A both-edges watch shows
+        // the high as its first row and the low as its second, both targets. (_t only re-evaluates it on the host's tick.)
         _boWatchRows(_t) {
           return Object.entries(this.cfg.boWatch || {}).sort((a, b) => a[1].t - b[1].t).map(([sym, w]) => {
-            const top = w.edge === 'top', fv = w.fv || 0, tg = top ? w.rh : w.rl, ws = top ? w.rl : w.rh;
+            const both = w.edge === 'both', top = w.edge !== 'bottom', fv = w.fv || 0, tg = top ? w.rh : w.rl, ws = top ? w.rl : w.rh;
             // Bars = how close a break is. Top: fills as turnover reaches the level. Bottom: starts full and empties as turnover comes in (the hour must close under the level).
             const up = r => r > 0 ? Math.min(100, fv / r * 100) : 0, dn = r => 100 - up(r);
-            return { sym: sym.replace('USDT', ''), t: w.t, tags: w.hist ? BO_TYPE(w.hist, w.edge) : '',
+            return { sym: sym.replace('USDT', ''), t: w.t, tags: both ? 'BOTH EDGES' : (w.hist ? BO_TYPE(w.hist, w.edge) : ''),
               label: top ? 'TOP' : 'BOTTOM', p: this._boFmtT(fv) + '/' + this._boFmtT(tg), fill: top ? up(tg) : dn(tg), dist: Math.round(top ? up(tg) : dn(tg)) + '%',
+              wl: both ? 'BOTTOM' : 'Worst',
               wp: (top ? '<' : '>') + this._boFmtT(ws), wfill: top ? dn(ws) : up(ws), wdist: Math.round(top ? dn(ws) : up(ws)) + '%' };
           });
         },
@@ -379,44 +419,37 @@
           return { closed: list.filter(c => Number(c[0]) + HOUR_MS <= now), forming: f ? { px: parseFloat(f[4]), v: parseFloat(f[6]) } : null };
         },
 
-        // One watch on one edge of the ticker's 24h hourly turnover range (top: turnover above the high, bottom: below the low). The last break is the extreme that printed most recently;
-        // the watch is a Double of it (same edge) or a Revert (the other edge). The type is always stamped; Decisive Edge decides whether the ticked types or a coin flip pick the edge. Returns the watch, or null.
+        // One watch on one edge of the ticker's 24h hourly turnover range (top: turnover above the high, bottom: below the low), or on both with Both Edges. The last break is the extreme that printed most recently;
+        // the position is stamped a Double of it (same edge) or a Revert (the other edge) when it opens. Returns the watch, or null.
         async _boVolPlace(sym, t) {
           const pr = await this._boPrep(sym, t);
           if (!pr) return null;
           const vr = this._boVolRange(pr.candles);
           if (!vr) { this.log(`[BO] ${sym}: turnover unreadable or an hour with none — skipped`, 'info'); return null; }
           const last = vr.hiAge < vr.loAge ? 'top' : 'bottom'; // the high and the low are different candles, so the ages never tie
-          const decide = this.cfg.boDecide !== false;
-          let edge, drawn = true;
-          if (decide) {
-            const T = this.cfg.boTypes || {}, other = last === 'top' ? 'bottom' : 'top';
-            const dbl = !!T[last === 'top' ? 'dt' : 'db'], rev = !!T[other === 'top' ? 'rt' : 'rb']; // the Double and the Revert this ticker could be
-            if (!dbl && !rev) { this.log(`[BO] ${sym}: last break ${last}, no ticked type fits — skipped`, 'info'); return null; }
-            edge = dbl && rev ? (Math.random() < 0.5 ? last : other) : dbl ? last : other;
-            drawn = dbl && rev;
-          } else edge = Math.random() < 0.5 ? 'top' : 'bottom';
+          // Both Edges: the watch covers both and whichever breaks is the break. Off: one edge, a coin flip.
+          const edge = this.cfg.boBoth ? 'both' : (Math.random() < 0.5 ? 'top' : 'bottom');
           const rd = await this._boVolRead(sym);
           if (rd?.forming && rd.forming.v > vr.hi) { this.log(`[BO] ${sym}: this hour's turnover is already above its 24h high — skipped`, 'info'); return null; }
           const now = Date.now();
-          const w = { t: now, edge, chk: vr.newest, next: now + Math.floor(Math.random() * VOL_POLL_MS), hist: last, top: pr.mv.top, bot: pr.mv.bottom, lev: pr.lev, chg: parseFloat(t?.price24hPcnt || 0) * 100, fund: parseFloat(t?.fundingRate || 0) * 100, fv: rd?.forming ? rd.forming.v : 0, rh: vr.hi, rl: vr.lo };
+          const w = { t: now, edge, chk: vr.newest, next: now + Math.floor(Math.random() * this._boPollMs()), hist: last, top: pr.mv.top, bot: pr.mv.bottom, lev: pr.lev, chg: parseFloat(t?.price24hPcnt || 0) * 100, fund: parseFloat(t?.fundingRate || 0) * 100, fv: rd?.forming ? rd.forming.v : 0, rh: vr.hi, rl: vr.lo };
           this.cfg.boWatch[sym] = w;
-          this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(edge).toUpperCase()} watch ${drawn ? 'drawn' : 'picked'} — ${BO_TYPE(last, edge)} (last break ${BO_NAME(last).toLowerCase()}, ${Math.min(vr.hiAge, vr.loAge)}h ago) — 24h hourly turnover high ${Math.round(vr.hi)} / low ${Math.round(vr.lo)} USDT`, 'info');
+          this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${edge === 'both' ? 'BOTH EDGES' : BO_NAME(edge).toUpperCase()} watch placed (last break ${BO_NAME(last).toLowerCase()}, ${Math.min(vr.hiAge, vr.loAge)}h ago) — 24h hourly turnover high ${Math.round(vr.hi)} / low ${Math.round(vr.lo)} USDT`, 'info');
           return w;
         },
 
-        // Polls the due watches (VOL_POLL_MS each). A newly closed candle is checked for a top break (turnover above the 24 before it) or a bottom break (below them); the forming candle for a top break
-        // (above the last 24 closed). The watch's own edge opens a position; the opposite edge cancels it. Either way the break counts.
+        // Polls the due watches (Volume poll each). A newly closed candle is checked for a top break (turnover above the 24 before it) or a bottom break (below them); the forming candle for a top break
+        // (above the last 24 closed). A one-edge watch opens on its own edge and is cancelled by the opposite; a both-edges watch takes either. Either way the break counts.
         async _boVolWatch() {
           if (this._boVolBusy) return;
           const c = this.cfg, W = c.boWatch;
           if (!c.boEnabled || !W || !Object.keys(W).length) return;
           this._boVolBusy = true;
           try {
-            const now = Date.now(), life = Math.max(1, Number(c.boLifeMins) || 1440) * 60000, due = [];
+            const now = Date.now(), life = Math.max(1, Number(c.boLifeMins) || 1440) * 60000, poll = this._boPollMs(), due = [];
             for (const sym of Object.keys(W)) {
               if (now - W[sym].t >= life) { delete W[sym]; this.log(`[BO] ${sym}: volume watch expired`, 'info'); continue; }
-              if (now >= W[sym].next) { W[sym].next = now + VOL_POLL_MS; due.push(sym); }
+              if (now >= W[sym].next) { W[sym].next = now + poll; due.push(sym); }
             }
             const reads = {};
             await Promise.all(due.map(async sym => { try { reads[sym] = await this._boVolRead(sym); } catch (e) {} }));
@@ -436,28 +469,105 @@
               if (!ev) continue;
               this._boCount(ev);
               delete W[sym];
-              if (ev !== w.edge) { this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(ev).toLowerCase()} break came first — ${BO_NAME(w.edge).toLowerCase()} watch cancelled`, 'info'); continue; }
-              await this._boVolFire(sym, w, rd);
+              if (w.edge !== 'both' && ev !== w.edge) { this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(ev).toLowerCase()} break came first — ${BO_NAME(w.edge).toLowerCase()} watch cancelled`, 'info'); continue; }
+              await this._boVolFire(sym, w, rd, ev);
             }
             this.persist();
           } finally { this._boVolBusy = false; }
         },
 
-        // The watch's edge broke: open on the bot's own side at market. TP / SL ROI from the fresh average moves (the watch's own when unreadable).
-        async _boVolFire(sym, w, rd) {
-          const c = this.cfg, pos0 = this.positions || [];
-          const drop = why => this.log(`[BO] ${sym}: volume ${BO_NAME(w.edge).toLowerCase()} broke but the entry was dropped — ${why}`, 'warn');
+        // Nullify: runs in the scan loop only. A position opened with Nullify carries _boNullDue, the next hour boundary, set outside the scan. Once a scan finds it due, the hourly candles closed since
+        // _boNullChk are read and each is checked: a top entry ends when a closed hour's turnover is under NUL_TOP of the peak, a bottom entry when it is over NUL_BOT times the bottom (the position
+        // closes with the reason nullify). The hours are then marked checked (_boNullChk) and the next check set to the next hour boundary; past the cut-off (_boNullUntil) the position is left to TP / SL.
+        async _boNullify() {
+          if (this._boNullBusy) return;
+          const c = this.cfg;
+          if (!c.boNullify) return;
+          const now = Date.now(), cand = (this.positions || []).filter(p => p._boNullDue > 0 && now >= p._boNullDue);
+          if (!cand.length) return;
+          this._boNullBusy = true;
+          try {
+            for (const pos of cand) {
+              try {
+                if (!(this.positions || []).includes(pos)) continue;
+                const n = Math.min(200, Math.ceil((now - pos._boNullChk) / HOUR_MS) + 2);
+                const url = `${this.base}/v5/market/kline?category=linear&symbol=${pos.symbol}&interval=60&limit=${n}`;
+                const r = await (typeof this._qFetch === 'function' ? this._qFetch(url) : fetch(url));
+                const list = (await r.json())?.result?.list;
+                if (!Array.isArray(list)) continue; // unreadable: stays due, tried again next scan
+                const hrs = list.filter(x => Number(x[0]) > pos._boNullChk && Number(x[0]) + HOUR_MS <= Math.min(now, pos._boNullUntil)).sort((a, b) => Number(a[0]) - Number(b[0]));
+                let hit = null;
+                for (const x of hrs) {
+                  const v = parseFloat(x[6]);
+                  if (!(v >= 0)) continue;
+                  if (pos._boNullRef === 'top' ? v < pos._boNullLvl * NUL_TOP : v > pos._boNullLvl * NUL_BOT) { hit = { v, t: Number(x[0]) }; break; }
+                }
+                if (hit) {
+                  this.log(`[BO] ${this._boGlyph()} ${pos.symbol}: nullify — the ${new Date(hit.t + HOUR_MS).toISOString().slice(11, 16)}Z hour closed at ${Math.round(hit.v)} USDT, ${pos._boNullRef === 'top' ? `under ${Math.round(NUL_TOP * 100)}% of the peak` : `over ${Math.round((NUL_BOT - 1) * 100)}% above the bottom`} (${Math.round(pos._boNullLvl)}) — closing`, 'info');
+                  await this.pseudoClosePosition(pos, 'nullify'); // if it did not close, the position stays due and is tried again next scan
+                  continue;
+                }
+                if (hrs.length) pos._boNullChk = Number(hrs[hrs.length - 1][0]);
+                const next = Math.floor(now / HOUR_MS) * HOUR_MS + HOUR_MS;
+                if (next > pos._boNullUntil) { pos._boNullDue = 0; this.log(`[BO] ${pos.symbol}: nullify cut-off reached — left to TP / SL`, 'info'); }
+                else pos._boNullDue = next;
+              } catch (e) { this.log(`[BO] ${pos.symbol} nullify check error: ${e.message}`, 'warn'); }
+            }
+            this.persist();
+          } finally { this._boNullBusy = false; }
+        },
+
+        // Both Edges: the last three closed 15min candles (the forming one is dropped), newest first. Red = close below open, green = close above, doji = neither.
+        // Returns { red, green, side } where side is 'red' / 'green' when SIDE_NEED of them share a colour, else null; null overall when the candles cannot be read.
+        async _boCandleSide(sym) {
+          try {
+            const url = `${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=15&limit=${SIDE_CANDLES + 1}`;
+            const r = await (typeof this._qFetch === 'function' ? this._qFetch(url) : fetch(url));
+            const list = (await r.json())?.result?.list;
+            if (!Array.isArray(list)) return null;
+            const now = Date.now(), closed = list.filter(x => Number(x[0]) + MIN15_MS <= now).slice(0, SIDE_CANDLES);
+            if (closed.length < SIDE_CANDLES) return null;
+            let red = 0, green = 0;
+            for (const x of closed) {
+              const o = parseFloat(x[1]), cl = parseFloat(x[4]);
+              if (!(o > 0) || !(cl > 0)) return null;
+              if (cl < o) red++; else if (cl > o) green++;
+            }
+            return { red, green, side: red >= SIDE_NEED ? 'red' : green >= SIDE_NEED ? 'green' : null };
+          } catch (e) { return null; }
+        },
+
+        // A break happened (edge ev): open on the bot's own side at market. TP / SL ROI from the fresh average moves (the watch's own when unreadable).
+        // With Both Edges the last three 15min candles decide the bot first: Winter enters on red, Chaser on green, the other defers.
+        async _boVolFire(sym, w, rd, ev) {
+          const c = this.cfg, pos0 = this.positions || [], edge = ev || w.edge;
+          const drop = why => this.log(`[BO] ${sym}: volume ${BO_NAME(edge).toLowerCase()} broke but the entry was dropped — ${why}`, 'warn');
           if (!c.binaryModeEnabled) return drop('Binary Mode is off');
           if (pos0.length >= (c.maxPos ?? 5)) return drop(`no free position slot (${pos0.length}/${c.maxPos ?? 5})`);
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return drop('entries are halted');
           if (pos0.some(p => p.symbol === sym)) return drop('position already open on this ticker');
+          if (w.edge === 'both') {
+            const sd = await this._boCandleSide(sym);
+            if (!sd) return drop('last three 15min candles unreadable');
+            if (!sd.side) return drop(`15min candles undecided (${sd.red} red / ${sd.green} green of ${SIDE_CANDLES}), neither bot enters`);
+            const mine = c.boCandlePref === 'red' ? 'red' : 'green'; // this bot's Candle preference
+            if (sd.side !== mine) { this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(edge).toLowerCase()} break — 15min candles ${sd.red} red / ${sd.green} green, ${WINTER ? 'Winter' : 'Chaser'} defers to ${WINTER ? 'Chaser' : 'Winter'}`, 'info'); return; }
+            this.log(`[BO] ${this._boGlyph()} ${sym}: 15min candles ${sd.red} red / ${sd.green} green — ${WINTER ? 'Winter' : 'Chaser'} enters`, 'info');
+            // the fetch above was awaited: re-check the host's limits
+            if ((this.positions || []).length >= (c.maxPos ?? 5)) return drop(`no free position slot (${(this.positions || []).length}/${c.maxPos ?? 5})`);
+            if ((this.positions || []).some(p => p.symbol === sym)) return drop('position already open on this ticker');
+          }
           const price = rd.forming && rd.forming.px > 0 ? rd.forming.px : parseFloat(rd.closed[0]?.[4]);
           if (!(price > 0)) return drop('no price');
           const mv = this._boMoves(rd.closed.slice(0, CANDLES)) || { top: w.top, bottom: w.bot };
           const tpMove = WINTER ? mv.bottom : mv.top, slMove = WINTER ? mv.top : mv.bottom;
           const tpRoi = +(tpMove * w.lev).toFixed(2), slRoi = +(slMove * w.lev).toFixed(2);
-          this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(w.edge).toLowerCase()} break — opening, TP ${tpRoi}% / SL ${slRoi}% ROI`, 'info');
-          const pos = await (WINTER ? this.pseudoOpenShort : this.pseudoOpenLong).call(this, { symbol: sym, price, change: w.chg, fundingRate: w.fund, _tpPct: tpRoi, _slPct: slRoi, _bo: true, _boVol: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boEdge: w.edge, _boHist: w.hist });
+          // Nullify: no per-position TP / SL, so the host's own (Binary Mode TP / SL) apply; the entry's volume reference and the first hourly check are armed.
+          const nul = !!c.boNullify, hrs = Math.max(1, Math.min(72, Math.round(Number(c.boNullHrs)) || NUL_HRS)), nowMs = Date.now(), hr0 = Math.floor(nowMs / HOUR_MS) * HOUR_MS;
+          const ref = edge === 'top' ? Math.max(w.rh || 0, rd.forming ? rd.forming.v : 0) : (w.rl || 0); // the peak (24h turnover high, or this hour's so far if higher) / the bottom (24h turnover low)
+          const nf = nul && ref > 0 ? { _boNullRef: edge, _boNullLvl: ref, _boNullUntil: nowMs + hrs * HOUR_MS, _boNullChk: hr0 - HOUR_MS, _boNullDue: hr0 + HOUR_MS } : {};
+          this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(edge).toLowerCase()} break — opening, ${nul ? `base TP/SL (${c.binaryTpPct ?? 18}% / ${c.binarySlPct ?? 18}% ROI), nullify checks for ${hrs}h` : `TP ${tpRoi}% / SL ${slRoi}% ROI`}`, 'info');
+          const pos = await (WINTER ? this.pseudoOpenShort : this.pseudoOpenLong).call(this, { symbol: sym, price, change: w.chg, fundingRate: w.fund, ...(nul ? {} : { _tpPct: tpRoi, _slPct: slRoi }), ...nf, _bo: true, _boVol: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boEdge: edge, _boHist: w.hist });
           if (!pos) this.log(`[BO] ${sym}: entry did not open after the volume break`, 'warn');
         },
 
@@ -491,7 +601,7 @@
             await this._boModeSync();
             await this._boGuard();
             if (this._boAtCap()) return; // max positions: no new conds
-            const free = (c.maxCond ?? 30) - (typeof this._condSlots === 'function' ? this._condSlots() : (this.condOrders || []).length) - Object.keys(c.boWatch || {}).length; // free slots (volume watches take one each); the host's Max Cond. Orders, Max Positions does not cap this
+            const free = this._boMaxWatch() - Object.keys(c.boWatch || {}).length; // free watch slots: Max watches, one per ticker; neither the host's Max Cond. Orders nor Max Positions caps this
             if (free <= 0) return;
 
             const taken = new Set([...(this.positions || []).map(p => p.symbol), ...(this.condOrders || []).map(o => o.symbol), ...Object.keys(c.boWatch || {})]);
@@ -518,6 +628,7 @@
         async init() {
           await _origInit.call(this);
           this._boLoaded = true;
+          if (typeof this.registerCloseReason === 'function') this.registerCloseReason('nullify', 'NUL');
           // Position-type badge, stamped on every watch's position and its closed trade: Double Top, Revert Bottom and so on, with -Vol at the end (_boHist = the last break the type is read against).
           if (typeof this.registerRoleBadge === 'function') this.registerRoleBadge(item => {
             const e = item && (item._boEdge || item.candidate?._boEdge);
@@ -526,15 +637,16 @@
             const lbl = h ? BO_TYPE(h, e) + sfx : e.toUpperCase() + sfx.toUpperCase();
             return `<span title="Breakout, entered at the ${vol ? 'volume ' : ''}${e}" style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid rgba(var(--bo-rgb),.35);background:rgba(var(--bo-rgb),.15);color:var(--bo-acc)">${lbl}</span>`;
           });
-          if (!this.cfg.boTypes || typeof this.cfg.boTypes !== 'object') this.cfg.boTypes = WINTER ? { dt: false, rt: false, db: true, rb: true } : { dt: true, rt: true, db: false, rb: false };
           for (const [k, v] of Object.entries(BO_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : (v && typeof v === 'object' ? { ...v } : v);
           }
+          // Candle preference is per bot: Chaser starts on red, Winter on green
+          if (this.cfg.boCandlePref !== 'red' && this.cfg.boCandlePref !== 'green') this.cfg.boCandlePref = WINTER ? 'green' : 'red';
           for (const k of ['boGray', 'boWhite', 'boWatch']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
           this.cfg.boBreaks = (Array.isArray(this.cfg.boBreaks) ? this.cfg.boBreaks : []).filter(x => Array.isArray(x) && x[0] > 0 && (x[1] === 'T' || x[1] === 'B'));
           // Retired settings and stores (scoring, watch lists, hypotheticals, flow, auto-switch, tally, retry queue).
           for (const k of ['boFlowOn', 'boCritOn', 'boCritF', 'boCritS', 'boCritL', 'boCritI', 'boGate', 'boSamples', 'boWatchMax', 'boStepX', 'boCells', 'boCellOf', 'boW1', 'boW2', 'boHypo',
-            'boEdges', 'boLog', 'boInval', 'boRetry', 'boAuto', 'boAutoPct', 'boAutoTicker', 'boTickLatch', 'boFlowUp', 'boFlowDown', 'boMult', 'boEntry', 'boFlow', 'boTrack', 'boPushMax', 'boFlowEnabled', 'boFundW', 'boSkewW', 'boTgtMin', 'boTgtMax', 'boPeakCloser', 'boBottomCloser', 'boVol', 'boVolClose', 'boPairs', 'boFar', 'boDR', 'boRevert']) delete this.cfg[k];
+            'boEdges', 'boLog', 'boInval', 'boRetry', 'boAuto', 'boAutoPct', 'boAutoTicker', 'boTickLatch', 'boFlowUp', 'boFlowDown', 'boMult', 'boEntry', 'boFlow', 'boTrack', 'boPushMax', 'boFlowEnabled', 'boFundW', 'boSkewW', 'boTgtMin', 'boTgtMax', 'boPeakCloser', 'boBottomCloser', 'boVol', 'boVolClose', 'boPairs', 'boFar', 'boDR', 'boRevert', 'boDecide', 'boTypes', 'boFlip']) delete this.cfg[k];
         },
 
         // The watches are polled on the cond. order watcher so they fire on time rather than at the next scan.
@@ -547,10 +659,12 @@
       }, _hostStages
         ? { _scanStageDefs: [...def._scanStageDefs,
             { id: 'bo-batch', group: 'bo', run: function (ctx) { return this._boBatch(ctx); } },
+            { id: 'bo-nullify', group: 'bo', run: function (ctx) { return this._boNullify(ctx); } },
           ] }
         : { async runScan() {
             await _origScan.call(this);
             await this._boBatch();
+            await this._boNullify();
           } });
     },
   };
