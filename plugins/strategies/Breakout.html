@@ -12,9 +12,17 @@
   Every position is stamped as a Double or a Revert of the last break, the turnover extreme (24h high or low) that printed most recently. Double = the same edge as the last break (Double Top is bullish, Double Bottom bearish);
   Revert = the other edge (Revert Top: the last break was the bottom, now the top broke). The stamp is a label only; it picks nothing.
 
-  Both Edges (optional, replaces Decisive Edge): the watch covers BOTH edges, and whichever breaks first is the break. Before the entry the last three closed 15min candles are fetched (the forming one is dropped).
-  A bot enters when most (2+) of them are its Candle preference colour (a Red / Green button per bot), else it defers. A split with doji candles, or unreadable candles, enters nothing. Each bot reads the candles itself,
-  so the partner only enters if it is watching that ticker too. A deferred break is spent: the watch is gone and its slot refills at the next batch.
+  Both Edges (optional): the watch covers BOTH edges, and whichever breaks first is the break. The bot enters on either edge, whatever the last 15min candles did (there is no candle preference any more).
+  The partner bot only enters if it is watching that ticker too. Off: one edge per ticker, picked by a coin flip.
+
+  Whipsaw (optional): the entry is no longer at market. After the volume break a cond. limit order is created one average move AGAINST the bot, measured from the price at the break: Chaser (long) a cond. BELOW,
+  at the average bottom move down; Winter (short) a cond. ABOVE, at the average top move up. The premise is that price whipsaws: it dips or pumps sharply, fills the cond., then reverts. TP / SL still come from the average
+  moves, now measured from the cond.'s fill price. The cond. is cancelled if price runs one average move the OTHER way first (Chaser: up to where its TP would be; Winter: down to it), because then no whipsaw came, and
+  it is cancelled after Order life. Whipsaw orders take the host's Max Cond. Orders slots, and are tagged 'whipsaw'.
+
+  Continuation (optional, the mirror of Whipsaw, and exclusive with it): the same cond. logic, but one average move WITH the bot from the price at the break: Chaser a cond. ABOVE (the average top move up), Winter a cond. BELOW
+  (the average bottom move down). The premise is that the break keeps running and the cond. buys / sells the continuation. TP / SL are the average moves from the fill. The cond. is cancelled if price runs one average move
+  the OTHER way first (Chaser: down; Winter: up), because the break then failed, and after Order life. Tagged 'continuation', same slots as Whipsaw.
 
   Watched tickers (Max watches): how many tickers are watched at once. Volume poll (s): how often each watch reads its kline.
 
@@ -27,7 +35,7 @@
     Illiquidity  — the last 3 trades are fetched; if they average more than 12s apart the ticker is illiquid.
   A ticker failing either is graylisted for a week. A ticker confirmed liquid is whitelisted for a week and skips the trade fetch.
 
-  Watches expire after Order Life (default 1440 min) and are simply cancelled.
+  Watches, and pending Whipsaw conds, expire after Order Life (default 1440 min) and are simply cancelled.
   TP / SL are set at entry only in Binary Mode, so Binary Mode must be on (the plugin places nothing otherwise).
   Needs no other plugin. The side is read from the host at load.
 
@@ -38,19 +46,13 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.20.0'; // Change: Nullify toggle (base TP/SL, hourly volume check closes with reason nullify until a cut-off) | previous: 1.19.0 — Candle preference (Red / Green button per bot) — Both Edges (15m candle colour picks the bot) replaces Decisive Edge; Max watches and Volume poll
+  const VERSION = '1.22.0'; // Change: Continuation (mirror of Whipsaw: cond. limit one average move WITH the bot, Chaser above / Winter below) | previous: 1.21.0 — Both Edges enters either edge whatever the 15m candles did, Nullify erased, Whipsaw added
   let   WINTER  = false;   // set in transform() from the host
   const CANDLES = 24;      // closed 1hr candles the top / bottom moves are read from
   const HOUR_MS = 3600000;
   const VOL_POLL_S  = 60;          // default Volume poll, s: each watch reads its kline this often
   const POLL_MIN_S  = 5;           // least Volume poll, s
   const WATCH_MAX   = 100;         // most tickers watched at once (the host's Max Cond. Orders slider tops out at the same)
-  const SIDE_CANDLES = 3;          // closed 15min candles read before an entry (Both Edges)
-  const SIDE_NEED    = 2;          // how many of them must share a colour to decide the side (2 of 3 = most; 3 = all)
-  const MIN15_MS = 900000;
-  const NUL_TOP = 0.5;             // Nullify: a closed hour with turnover under this share of the peak ends a top entry
-  const NUL_BOT = 2;               // Nullify: a closed hour with turnover over this multiple of the bottom (100% above it) ends a bottom entry
-  const NUL_HRS = 6;               // default Nullify cut-off, h
   const BO_NAME = e => (e === 'top' ? 'Top' : 'Bottom');
   // Type of an entry on edge e after a last break: Double (same edge) or Revert (the other edge).
   const BO_TYPE = (last, e) => (last === e ? 'Double ' : 'Revert ') + BO_NAME(e);
@@ -60,10 +62,10 @@
 
   const BO_DEFAULT_CFG = Object.freeze({
     boEnabled: true,   // Breakout mode
-    boBoth: false,     // Both Edges: watch both edges, the last three closed 15m candles decide whether Chaser or Winter enters (off = one edge, a coin flip)
+    boBoth: false,     // Both Edges: watch both edges, enter on whichever breaks (off = one edge, a coin flip)
+    boCont: false,     // Continuation (mirror of Whipsaw, exclusive with it): cond. limit one average move WITH the bot (Chaser above, Winter below)
+    boWhip: false,     // Whipsaw: on a break place a cond. limit one average move against the bot (Chaser below, Winter above) instead of entering at market
     boMaxWatch: 30,    // Max watches: how many tickers are watched at once (1-100)
-    boNullify: false,  // Nullify: base bot TP/SL instead of the average moves, and a closed hour's volume can end the position (reason nullify) until the cut-off
-    boNullHrs: NUL_HRS, // Nullify cut-off, h after the entry
     boPollSec: VOL_POLL_S, // Volume poll, s: how often each watch reads its kline
     boLifeMins: 1440,  // how long a volume watch waits before it is cancelled
     boWinH: 24,        // break window, hours: breaks older than this stop counting
@@ -129,29 +131,25 @@
                     <div class="tog-l">Both Edges<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
                   </div>
                 </label>
-                <div class="bo-hint" x-show="tip">Off = each ticker is watched on one edge, picked by a coin flip. On = both edges are watched, and when either breaks the last three closed 15min candles pick the bot: mostly red, Winter enters and Chaser defers; mostly green, Chaser enters and Winter defers. The partner only enters if it watches that ticker too.</div>
-              </div>
-              <div x-data="{ tip: false }" x-show="cfg.boBoth" style="margin-top:8px">
-                <div class="bo-sw" style="margin-top:0">
-                  <span style="width:auto">Candle preference</span>
-                  <button type="button" :class="cfg.boCandlePref==='red'?'on':''" @click="if(!cfgLocked){cfg.boCandlePref='red';persist()}">Red</button>
-                  <button type="button" :class="cfg.boCandlePref==='green'?'on':''" @click="if(!cfgLocked){cfg.boCandlePref='green';persist()}">Green</button>
-                  <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
-                </div>
-                <div class="bo-hint" x-show="tip">The candle colour this bot enters on: when most of the last three closed 15min candles are this colour, it enters, otherwise it defers. Each bot has its own setting, so with the same colour on both, both enter the same break.</div>
+                <div class="bo-hint" x-show="tip">Off = each ticker is watched on one edge, picked by a coin flip, and the opposite edge breaking first cancels the watch. On = both edges are watched and the bot enters on whichever breaks first, whatever the recent candles did. The partner only enters if it watches that ticker too.</div>
               </div>
               <div x-data="{ tip: false }" style="margin-top:8px">
                 <label class="tog">
-                  <div class="tog-t" :class="cfg.boNullify?'on':''" @click.prevent="if(!cfgLocked){cfg.boNullify=!cfg.boNullify;persist()}"><div class="tog-k"></div></div>
+                  <div class="tog-t" :class="cfg.boWhip?'on':''" @click.prevent="if(!cfgLocked){cfg.boWhip=!cfg.boWhip;if(cfg.boWhip)cfg.boCont=false;persist()}"><div class="tog-k"></div></div>
                   <div>
-                    <div class="tog-l">Nullify<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
+                    <div class="tog-l">Whipsaw<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
                   </div>
                 </label>
-                <div class="bo-hint" x-show="tip">Two things. TP and SL come from the bot's own Binary Mode targets instead of the average moves. And for the cut-off hours after the entry, each closed hourly candle is checked during the scan: a top entry closes with reason nullify when an hour's turnover is under 50% of the peak, a bottom entry when it is more than 100% above the bottom. After the cut-off TP / SL alone decide.</div>
-                <div style="display:flex;align-items:center;gap:6px;margin-top:6px" x-show="cfg.boNullify">
-                  <span class="lbl" style="margin:0">Nullify cut-off (h)</span>
-                  <input type="number" min="1" max="72" step="1" class="bo-in" x-model.number="cfg.boNullHrs" :disabled="cfgLocked" @change="cfg.boNullHrs=Math.max(1,Math.min(72,Math.round(+cfg.boNullHrs||6)));persist()">
-                </div>
+                <div class="bo-hint" x-show="tip">After a volume break, no market entry. A cond. limit is placed one average move against the bot from the price at the break: Chaser a cond. below (the average bottom move), Winter a cond. above (the average top move). The premise is a whipsaw: price dips or pumps sharply, fills the cond., then reverts. TP / SL are the average moves from the fill. The cond. is cancelled if price runs one average move the other way first, or after Order life. It uses the host's Max Cond. Orders slots. Turning Whipsaw off cancels the pending ones. Exclusive with Continuation.</div>
+              </div>
+              <div x-data="{ tip: false }" style="margin-top:8px">
+                <label class="tog">
+                  <div class="tog-t" :class="cfg.boCont?'on':''" @click.prevent="if(!cfgLocked){cfg.boCont=!cfg.boCont;if(cfg.boCont)cfg.boWhip=false;persist()}"><div class="tog-k"></div></div>
+                  <div>
+                    <div class="tog-l">Continuation<button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button></div>
+                  </div>
+                </label>
+                <div class="bo-hint" x-show="tip">The mirror of Whipsaw. After a volume break, no market entry. A cond. limit is placed one average move WITH the bot from the price at the break: Chaser a cond. above (the average top move), Winter a cond. below (the average bottom move). The premise is that the break keeps running. TP / SL are the average moves from the fill. The cond. is cancelled if price runs one average move the other way first, or after Order life. It uses the host's Max Cond. Orders slots. Turning Continuation off cancels the pending ones. Exclusive with Whipsaw.</div>
               </div>
               <div x-data="{ tip: false }" style="margin-top:8px">
                 <div style="display:flex;align-items:center;gap:6px">
@@ -175,7 +173,7 @@
                   <input type="number" min="1" step="1" class="bo-in" x-model.number="cfg.boLifeMins" @change="cfg.boLifeMins=Math.max(1,Math.round(+cfg.boLifeMins||1440));persist()">
                   <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
                 </div>
-                <div class="bo-hint" x-show="tip">Each ticker gets one watch (one edge, or both with Both Edges on). Unbroken watches are cancelled after this. Each takes one of the Max watches, independent of Max Positions.</div>
+                <div class="bo-hint" x-show="tip">Each ticker gets one watch (one edge, or both with Both Edges on). Unbroken watches are cancelled after this, and so are pending Whipsaw / Continuation conds. Each watch takes one of the Max watches, independent of Max Positions.</div>
               </div>
               <div x-data="{ tip: false }" style="margin-top:6px">
                 <div style="display:flex;align-items:center;gap:6px">
@@ -190,6 +188,7 @@
                   <span class="bo-ttl"><span x-text="_boGlyph()"></span> LIVE</span>
                   <span class="bo-blink" x-show="!cfg.binaryModeEnabled">&#9888;</span>
                   <span><b x-text="_boPend()"></b><span style="color:var(--text-lo)">/<span x-text="cfg.boMaxWatch ?? 30"></span></span></span>
+                  <span class="bo-cnt" x-show="cfg.boWhip||cfg.boCont" title="Pending Whipsaw / Continuation cond. orders" ><span x-text="cfg.boCont?'CONT':'WHIP'"></span><b x-text="_boWhipN()"></b></span>
                   <span class="bo-cnt bo-g">&#9650;<b x-text="_boTally(tick).top"></b></span>
                   <span class="bo-cnt bo-r">&#9660;<b x-text="_boTally(tick).bottom"></b></span>
                   <div class="bo-pop" x-show="tip" x-text="_boTip(tick)"></div>
@@ -258,6 +257,7 @@
         _boGlyph() { return WINTER ? '\u2744\uFE0E' : '\u2668\uFE0E'; },
         _boWinMs() { return Math.max(0.1, Number(this.cfg.boWinH) || 24) * 3600000; },
         _boPend() { return Object.keys(this.cfg.boWatch || {}).length; }, // slots used: one watch per ticker
+        _boWhipN() { return (this.condOrders || []).filter(o => o.tag === 'whipsaw' || o.tag === 'continuation').length; }, // pending Whipsaw / Continuation conds
         _boAtCap() { return (this.positions || []).length >= (this.cfg.maxPos ?? 5); },
 
         // ---- Break counter ----
@@ -476,69 +476,7 @@
           } finally { this._boVolBusy = false; }
         },
 
-        // Nullify: runs in the scan loop only. A position opened with Nullify carries _boNullDue, the next hour boundary, set outside the scan. Once a scan finds it due, the hourly candles closed since
-        // _boNullChk are read and each is checked: a top entry ends when a closed hour's turnover is under NUL_TOP of the peak, a bottom entry when it is over NUL_BOT times the bottom (the position
-        // closes with the reason nullify). The hours are then marked checked (_boNullChk) and the next check set to the next hour boundary; past the cut-off (_boNullUntil) the position is left to TP / SL.
-        async _boNullify() {
-          if (this._boNullBusy) return;
-          const c = this.cfg;
-          if (!c.boNullify) return;
-          const now = Date.now(), cand = (this.positions || []).filter(p => p._boNullDue > 0 && now >= p._boNullDue);
-          if (!cand.length) return;
-          this._boNullBusy = true;
-          try {
-            for (const pos of cand) {
-              try {
-                if (!(this.positions || []).includes(pos)) continue;
-                const n = Math.min(200, Math.ceil((now - pos._boNullChk) / HOUR_MS) + 2);
-                const url = `${this.base}/v5/market/kline?category=linear&symbol=${pos.symbol}&interval=60&limit=${n}`;
-                const r = await (typeof this._qFetch === 'function' ? this._qFetch(url) : fetch(url));
-                const list = (await r.json())?.result?.list;
-                if (!Array.isArray(list)) continue; // unreadable: stays due, tried again next scan
-                const hrs = list.filter(x => Number(x[0]) > pos._boNullChk && Number(x[0]) + HOUR_MS <= Math.min(now, pos._boNullUntil)).sort((a, b) => Number(a[0]) - Number(b[0]));
-                let hit = null;
-                for (const x of hrs) {
-                  const v = parseFloat(x[6]);
-                  if (!(v >= 0)) continue;
-                  if (pos._boNullRef === 'top' ? v < pos._boNullLvl * NUL_TOP : v > pos._boNullLvl * NUL_BOT) { hit = { v, t: Number(x[0]) }; break; }
-                }
-                if (hit) {
-                  this.log(`[BO] ${this._boGlyph()} ${pos.symbol}: nullify — the ${new Date(hit.t + HOUR_MS).toISOString().slice(11, 16)}Z hour closed at ${Math.round(hit.v)} USDT, ${pos._boNullRef === 'top' ? `under ${Math.round(NUL_TOP * 100)}% of the peak` : `over ${Math.round((NUL_BOT - 1) * 100)}% above the bottom`} (${Math.round(pos._boNullLvl)}) — closing`, 'info');
-                  await this.pseudoClosePosition(pos, 'nullify'); // if it did not close, the position stays due and is tried again next scan
-                  continue;
-                }
-                if (hrs.length) pos._boNullChk = Number(hrs[hrs.length - 1][0]);
-                const next = Math.floor(now / HOUR_MS) * HOUR_MS + HOUR_MS;
-                if (next > pos._boNullUntil) { pos._boNullDue = 0; this.log(`[BO] ${pos.symbol}: nullify cut-off reached — left to TP / SL`, 'info'); }
-                else pos._boNullDue = next;
-              } catch (e) { this.log(`[BO] ${pos.symbol} nullify check error: ${e.message}`, 'warn'); }
-            }
-            this.persist();
-          } finally { this._boNullBusy = false; }
-        },
-
-        // Both Edges: the last three closed 15min candles (the forming one is dropped), newest first. Red = close below open, green = close above, doji = neither.
-        // Returns { red, green, side } where side is 'red' / 'green' when SIDE_NEED of them share a colour, else null; null overall when the candles cannot be read.
-        async _boCandleSide(sym) {
-          try {
-            const url = `${this.base}/v5/market/kline?category=linear&symbol=${sym}&interval=15&limit=${SIDE_CANDLES + 1}`;
-            const r = await (typeof this._qFetch === 'function' ? this._qFetch(url) : fetch(url));
-            const list = (await r.json())?.result?.list;
-            if (!Array.isArray(list)) return null;
-            const now = Date.now(), closed = list.filter(x => Number(x[0]) + MIN15_MS <= now).slice(0, SIDE_CANDLES);
-            if (closed.length < SIDE_CANDLES) return null;
-            let red = 0, green = 0;
-            for (const x of closed) {
-              const o = parseFloat(x[1]), cl = parseFloat(x[4]);
-              if (!(o > 0) || !(cl > 0)) return null;
-              if (cl < o) red++; else if (cl > o) green++;
-            }
-            return { red, green, side: red >= SIDE_NEED ? 'red' : green >= SIDE_NEED ? 'green' : null };
-          } catch (e) { return null; }
-        },
-
-        // A break happened (edge ev): open on the bot's own side at market. TP / SL ROI from the fresh average moves (the watch's own when unreadable).
-        // With Both Edges the last three 15min candles decide the bot first: Winter enters on red, Chaser on green, the other defers.
+        // A break happened (edge ev): open on the bot's own side at market, or with Whipsaw / Continuation place a cond. limit one average move against / with the bot. TP / SL ROI from the fresh average moves (the watch's own when unreadable).
         async _boVolFire(sym, w, rd, ev) {
           const c = this.cfg, pos0 = this.positions || [], edge = ev || w.edge;
           const drop = why => this.log(`[BO] ${sym}: volume ${BO_NAME(edge).toLowerCase()} broke but the entry was dropped — ${why}`, 'warn');
@@ -546,34 +484,54 @@
           if (pos0.length >= (c.maxPos ?? 5)) return drop(`no free position slot (${pos0.length}/${c.maxPos ?? 5})`);
           if (this._isDrawdownHalted?.() || this._isGainsLocked?.()) return drop('entries are halted');
           if (pos0.some(p => p.symbol === sym)) return drop('position already open on this ticker');
-          if (w.edge === 'both') {
-            const sd = await this._boCandleSide(sym);
-            if (!sd) return drop('last three 15min candles unreadable');
-            if (!sd.side) return drop(`15min candles undecided (${sd.red} red / ${sd.green} green of ${SIDE_CANDLES}), neither bot enters`);
-            const mine = c.boCandlePref === 'red' ? 'red' : 'green'; // this bot's Candle preference
-            if (sd.side !== mine) { this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(edge).toLowerCase()} break — 15min candles ${sd.red} red / ${sd.green} green, ${WINTER ? 'Winter' : 'Chaser'} defers to ${WINTER ? 'Chaser' : 'Winter'}`, 'info'); return; }
-            this.log(`[BO] ${this._boGlyph()} ${sym}: 15min candles ${sd.red} red / ${sd.green} green — ${WINTER ? 'Winter' : 'Chaser'} enters`, 'info');
-            // the fetch above was awaited: re-check the host's limits
-            if ((this.positions || []).length >= (c.maxPos ?? 5)) return drop(`no free position slot (${(this.positions || []).length}/${c.maxPos ?? 5})`);
-            if ((this.positions || []).some(p => p.symbol === sym)) return drop('position already open on this ticker');
-          }
           const price = rd.forming && rd.forming.px > 0 ? rd.forming.px : parseFloat(rd.closed[0]?.[4]);
           if (!(price > 0)) return drop('no price');
           const mv = this._boMoves(rd.closed.slice(0, CANDLES)) || { top: w.top, bottom: w.bot };
           const tpMove = WINTER ? mv.bottom : mv.top, slMove = WINTER ? mv.top : mv.bottom;
           const tpRoi = +(tpMove * w.lev).toFixed(2), slRoi = +(slMove * w.lev).toFixed(2);
-          // Nullify: no per-position TP / SL, so the host's own (Binary Mode TP / SL) apply; the entry's volume reference and the first hourly check are armed.
-          const nul = !!c.boNullify, hrs = Math.max(1, Math.min(72, Math.round(Number(c.boNullHrs)) || NUL_HRS)), nowMs = Date.now(), hr0 = Math.floor(nowMs / HOUR_MS) * HOUR_MS;
-          const ref = edge === 'top' ? Math.max(w.rh || 0, rd.forming ? rd.forming.v : 0) : (w.rl || 0); // the peak (24h turnover high, or this hour's so far if higher) / the bottom (24h turnover low)
-          const nf = nul && ref > 0 ? { _boNullRef: edge, _boNullLvl: ref, _boNullUntil: nowMs + hrs * HOUR_MS, _boNullChk: hr0 - HOUR_MS, _boNullDue: hr0 + HOUR_MS } : {};
-          this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(edge).toLowerCase()} break — opening, ${nul ? `base TP/SL (${c.binaryTpPct ?? 18}% / ${c.binarySlPct ?? 18}% ROI), nullify checks for ${hrs}h` : `TP ${tpRoi}% / SL ${slRoi}% ROI`}`, 'info');
-          const pos = await (WINTER ? this.pseudoOpenShort : this.pseudoOpenLong).call(this, { symbol: sym, price, change: w.chg, fundingRate: w.fund, ...(nul ? {} : { _tpPct: tpRoi, _slPct: slRoi }), ...nf, _bo: true, _boVol: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boEdge: edge, _boHist: w.hist });
+          const cand = { symbol: sym, price, change: w.chg, fundingRate: w.fund, _tpPct: tpRoi, _slPct: slRoi, _bo: true, _boVol: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boEdge: edge, _boHist: w.hist };
+          if (c.boWhip || c.boCont) return this._boWhipPlace(sym, edge, price, mv, cand, c.boWhip ? 'whip' : 'cont');
+          this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(edge).toLowerCase()} break — opening, TP ${tpRoi}% / SL ${slRoi}% ROI`, 'info');
+          const pos = await (WINTER ? this.pseudoOpenShort : this.pseudoOpenLong).call(this, cand);
           if (!pos) this.log(`[BO] ${sym}: entry did not open after the volume break`, 'warn');
         },
 
-        // Watches are dropped when Breakout is off. Pending conds tagged 'breakout' (price conds) are cancelled.
+        // Whipsaw: one average move AGAINST the bot, from the price at the break. Chaser (long): target below by the average bottom move, worst above by the average top move (where its TP would be).
+        // Winter (short): target above by the average top move, worst below by the average bottom move.
+        // Continuation (mode 'cont'), the mirror: one average move WITH the bot. Chaser: target above by the average top move, worst below by the average bottom move. Winter: target below, worst above.
+        // The host fills the cond. like any other (pseudoOpenLong / pseudoOpenShort at the target), carrying the candidate's TP / SL ROI, which are measured from the fill.
+        // The worst level cancels the order: price ran the other way first (Whipsaw: no dip / pump; Continuation: the break failed).
+        async _boWhipPlace(sym, edge, price, mv, cand, mode = 'whip') {
+          const cont = mode === 'cont';
+          const up = cont ? !WINTER : WINTER; // does the target sit above the price? Whipsaw: Winter yes, Chaser no. Continuation: the reverse.
+          const tPct = up ? mv.top : mv.bottom, wPct = up ? mv.bottom : mv.top;
+          const target = up ? price * (1 + tPct / 100) : price * (1 - tPct / 100);
+          const worst  = up ? price * (1 - wPct / 100) : price * (1 + wPct / 100);
+          const fp = x => +x.toPrecision(6), name = cont ? 'continuation' : 'whipsaw';
+          const o = await this.placeCondEntry({ candidate: { ...cand, [cont ? '_boCont' : '_boWhip']: true }, target, worst, tag: name, kind: cont ? 'run' : (WINTER ? 'pump' : 'dip') });
+          if (!o) { this.log(`[BO] ${sym}: volume ${BO_NAME(edge).toLowerCase()} broke but the ${name} cond. was not placed`, 'warn'); return; }
+          this.log(`[BO] ${this._boGlyph()} ${sym}: volume ${BO_NAME(edge).toLowerCase()} break — ${name} cond. ${up ? 'above' : 'below'} @ ${fp(target)} (${tPct.toFixed(2)}% ${up ? 'up' : 'down'} from ${fp(price)}), cancelled at ${fp(worst)} (${wPct.toFixed(2)}% ${up ? 'down' : 'up'}), TP ${cand._tpPct}% / SL ${cand._slPct}% ROI from the fill`, 'info');
+        },
+
+        // Pending Whipsaw / Continuation conds expire after Order life, like the watches.
+        async _boWhipExpire() {
+          const life = Math.max(1, Number(this.cfg.boLifeMins) || 1440) * 60000, now = Date.now();
+          for (const o of [...(this.condOrders || [])]) {
+            if ((o.tag === 'whipsaw' || o.tag === 'continuation') && now - o.createdAt >= life) { try { await this.cancelCondOrder(o.id, o.tag + ' order life reached'); } catch (e) { this.log(`[BO] cancel error (${o.symbol}): ${e.message}`, 'warn'); } }
+          }
+        },
+
+        // Watches are dropped when Breakout is off. Pending conds tagged 'breakout' (the retired price conds) are cancelled.
         async _boModeSync() {
           const c = this.cfg;
+          // Whipsaw / Continuation conds are cancelled when Breakout or their own toggle is switched off.
+          for (const [tag, on, nm] of [['whipsaw', c.boWhip, 'Whipsaw'], ['continuation', c.boCont, 'Continuation']]) {
+            if (c.boEnabled && on) continue;
+            const ws = (this.condOrders || []).filter(o => o.tag === tag);
+            if (!ws.length) continue;
+            for (const o of ws) { try { await this.cancelCondOrder(o.id, c.boEnabled ? tag + ' off' : 'breakout off'); } catch (e) { this.log(`[BO] cancel error (${o.symbol}): ${e.message}`, 'warn'); } }
+            this.log(`[BO] ${this._boGlyph()} ${c.boEnabled ? nm + ' off' : 'Breakout off'} — ${ws.length} ${tag} cond. order${ws.length === 1 ? '' : 's'} cancelled`, 'info');
+          }
           if (c.boEnabled) {
             if ((this.condOrders || []).some(o => o.tag === 'breakout')) await this._boCancelAll('breakout price conds retired', 'Price breakouts are gone');
           } else if (Object.keys(c.boWatch || {}).length) {
@@ -628,43 +586,38 @@
         async init() {
           await _origInit.call(this);
           this._boLoaded = true;
-          if (typeof this.registerCloseReason === 'function') this.registerCloseReason('nullify', 'NUL');
           // Position-type badge, stamped on every watch's position and its closed trade: Double Top, Revert Bottom and so on, with -Vol at the end (_boHist = the last break the type is read against).
           if (typeof this.registerRoleBadge === 'function') this.registerRoleBadge(item => {
             const e = item && (item._boEdge || item.candidate?._boEdge);
             if (e !== 'top' && e !== 'bottom') return null;
-            const h = item._boHist || item.candidate?._boHist, vol = !!(item._boVol ?? item.candidate?._boVol), sfx = vol ? '-Vol' : '';
+            const h = item._boHist || item.candidate?._boHist, vol = !!(item._boVol ?? item.candidate?._boVol), sfx = (vol ? '-Vol' : '') + ((item._boWhip ?? item.candidate?._boWhip) ? '-Whip' : '') + ((item._boCont ?? item.candidate?._boCont) ? '-Cont' : '');
             const lbl = h ? BO_TYPE(h, e) + sfx : e.toUpperCase() + sfx.toUpperCase();
             return `<span title="Breakout, entered at the ${vol ? 'volume ' : ''}${e}" style="font-family:var(--mono);font-size:9px;letter-spacing:1px;padding:2px 5px;border-radius:2px;border:1px solid rgba(var(--bo-rgb),.35);background:rgba(var(--bo-rgb),.15);color:var(--bo-acc)">${lbl}</span>`;
           });
           for (const [k, v] of Object.entries(BO_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : (v && typeof v === 'object' ? { ...v } : v);
           }
-          // Candle preference is per bot: Chaser starts on red, Winter on green
-          if (this.cfg.boCandlePref !== 'red' && this.cfg.boCandlePref !== 'green') this.cfg.boCandlePref = WINTER ? 'green' : 'red';
           for (const k of ['boGray', 'boWhite', 'boWatch']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
           this.cfg.boBreaks = (Array.isArray(this.cfg.boBreaks) ? this.cfg.boBreaks : []).filter(x => Array.isArray(x) && x[0] > 0 && (x[1] === 'T' || x[1] === 'B'));
           // Retired settings and stores (scoring, watch lists, hypotheticals, flow, auto-switch, tally, retry queue).
           for (const k of ['boFlowOn', 'boCritOn', 'boCritF', 'boCritS', 'boCritL', 'boCritI', 'boGate', 'boSamples', 'boWatchMax', 'boStepX', 'boCells', 'boCellOf', 'boW1', 'boW2', 'boHypo',
-            'boEdges', 'boLog', 'boInval', 'boRetry', 'boAuto', 'boAutoPct', 'boAutoTicker', 'boTickLatch', 'boFlowUp', 'boFlowDown', 'boMult', 'boEntry', 'boFlow', 'boTrack', 'boPushMax', 'boFlowEnabled', 'boFundW', 'boSkewW', 'boTgtMin', 'boTgtMax', 'boPeakCloser', 'boBottomCloser', 'boVol', 'boVolClose', 'boPairs', 'boFar', 'boDR', 'boRevert', 'boDecide', 'boTypes', 'boFlip']) delete this.cfg[k];
+            'boEdges', 'boLog', 'boInval', 'boRetry', 'boAuto', 'boAutoPct', 'boAutoTicker', 'boTickLatch', 'boFlowUp', 'boFlowDown', 'boMult', 'boEntry', 'boFlow', 'boTrack', 'boPushMax', 'boFlowEnabled', 'boFundW', 'boSkewW', 'boTgtMin', 'boTgtMax', 'boPeakCloser', 'boBottomCloser', 'boVol', 'boVolClose', 'boPairs', 'boFar', 'boDR', 'boRevert', 'boDecide', 'boTypes', 'boFlip', 'boNullify', 'boNullHrs', 'boCandlePref']) delete this.cfg[k];
         },
 
         // The watches are polled on the cond. order watcher so they fire on time rather than at the next scan.
         async pseudoWatchCondOrders() {
           const r = await _origWatch.call(this);
-          if (this._boLoaded) { try { await this._boModeSync(); await this._boGuard(); await this._boVolWatch(); } catch (e) { this.log(`[BO] watcher error: ${e.message}`, 'warn'); } }
+          if (this._boLoaded) { try { await this._boModeSync(); await this._boGuard(); await this._boVolWatch(); await this._boWhipExpire(); } catch (e) { this.log(`[BO] watcher error: ${e.message}`, 'warn'); } }
           return r;
         },
 
       }, _hostStages
         ? { _scanStageDefs: [...def._scanStageDefs,
             { id: 'bo-batch', group: 'bo', run: function (ctx) { return this._boBatch(ctx); } },
-            { id: 'bo-nullify', group: 'bo', run: function (ctx) { return this._boNullify(ctx); } },
           ] }
         : { async runScan() {
             await _origScan.call(this);
             await this._boBatch();
-            await this._boNullify();
           } });
     },
   };
