@@ -2,7 +2,7 @@
   Breakout Plugin for PseudoChaser and PseudoWinter (unified)
   Random cond. bundles at each ticker's own average top and bottom moves, re-bundled after a loss until the ticker wins. No scoring, no forecasting, no volume watch.
 
-  Each batch picks random tickers (up to Max bundles; one bundle per ticker) and reads the last twenty-four closed 1hr candles of each. The candles are split by colour: the green candles (close above open) give the
+  Each batch picks tickers (up to Max bundles; one bundle per ticker; random, or in the Entry sorting order below) and reads the last twenty-four closed 1hr candles of each. The candles are split by colour: the green candles (close above open) give the
   average TOP move, the mean of (high - open) / open, in %; the red candles (close below open) give the average BOTTOM move, the mean of (open - low) / open, in %. Doji candles count for neither; a ticker with no green
   or no red candle among the 24 is skipped.
 
@@ -10,9 +10,16 @@
   first to fill cancels the other. The filled order opens on the bot's side at its price (Chaser long, Winter short). TP / SL come from the same averages, measured from the fill (Chaser: TP = top move, SL = bottom move;
   Winter: TP = bottom move, SL = top move). Nothing about the ticker is predicted: which edge fills is up to the price.
 
+  Edges: two buttons, Top and Bottom, choose which cond. the bundle is made of. Both on = the pair above. One on = a single cond. at that edge only. Default: Chaser Top only, Winter Bottom only; at least one stays on.
+  With a single edge the bundle's worst case is one average move the OTHER way: if the ticker gets there before the cond. fills, the cond. is cancelled and the ticker is scheduled for another bundle (Retry below).
+
+  Entry sorting: four buttons, +Fund / -Fund / +24h / -24h, order the tickers a batch tries first. + puts the highest value first, - the lowest (most negative) first; a bot can hold only one end of each (+Fund or -Fund, +24h or -24h), and none selected means random.
+  With both Fund and 24h on, each ticker's percentile rank on each (ties share their average rank, a missing value ranks lowest) is averaged into one blended score. Ties keep a random order. Default: Chaser -Fund and +24h, Winter +Fund and -24h.
+  While sorting is on, a ticker that was tried and not placed sits out for an hour, so tickers that keep failing cannot hold the top of the list. Scheduled retries still go first.
+
   Hold: a bundle stands for Order life (default 1440 min), then it is cancelled. There is no watch and no poll, the host's own cond. watcher does the filling.
 
-  Retry: when a Breakout position closes at a loss (the host's net result, fees and funding included), its ticker is scheduled for another bundle, built fresh from the latest 24 candles. The next batch places the scheduled
+  Retry: when a Breakout position closes at a loss (the host's net result, fees and funding included), or a single-edge ticker goes the other way before its cond. fills, its ticker is scheduled for another bundle, built fresh from the latest 24 candles. The next batch places the scheduled
   tickers first, then fills the rest at random. A ticker stays scheduled until one of its Breakout positions closes at a win; a bundle that expires unfilled does not clear it, the ticker is bundled again. A scheduled ticker is dropped
   only when it fails a filter (graylisted) or is banned by the host.
 
@@ -34,7 +41,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.29.1'; // Change: the retry counter lists its tickers with the new bundles each has had, on hover | 1.29.0: restructured to random cond. bundles at the average top / bottom moves, held for Order life, re-bundled after a loss until a win; Both, On break, Funding, Cull, volume watch and break counter removed | previous: 1.28.0 — Funding Cull
+  const VERSION = '1.31.1'; // Change: Edge and Sort buttons 25% smaller | 1.31.0: Entry sorting (+Fund / -Fund / +24h / -24h, blended when both are on; Chaser -Fund +24h, Winter +Fund -24h by default) | 1.30.2: one edge places a regular cond., not a bundle | 1.30.1: fixed the edge lookup running before it was declared in _boPlace (no bundles were placed) | 1.30.0: Top / Bottom edge buttons (Chaser Top, Winter Bottom by default); with one edge a ticker that goes the other way is scheduled for another bundle | 1.29.1: the retry counter lists its tickers with the new bundles each has had, on hover | 1.29.0: restructured to random cond. bundles at the average top / bottom moves, held for Order life, re-bundled after a loss until a win; Both, On break, Funding, Cull, volume watch and break counter removed | previous: 1.28.0 — Funding Cull
   let   WINTER  = false;   // set in transform() from the host
   const CANDLES = 24;      // closed 1hr candles the top / bottom moves are read from
   const HOUR_MS = 3600000;
@@ -43,12 +50,15 @@
   const MIN_SPAN_PCT = 1;          // stablecoin filter: least % span the 24 candles must cover
   const MAX_GAP_MS   = 12000;      // illiquidity filter: most average ms between the last 3 trades
   const GRAY_MS      = 7 * 86400000; // graylist time for a ticker that fails either filter
+  const COOL_MS      = 3600000;      // with Entry sorting on, a ticker tried and not placed sits out this long
 
   const BO_DEFAULT_CFG = Object.freeze({
     boEnabled: true,   // Breakout mode
     boMaxBundles: 30,  // Max bundles: how many tickers hold a cond. bundle at once (1-100)
     boLifeMins: 1440,  // Order life: how long a bundle stands before it is cancelled
-    boRedo: {},       // symbol -> { n: losses so far, t: ms of the last loss, b: new bundles given since the first loss }; stays until the ticker wins
+    // boTop / boBottom (which edges get a cond.) are set in init(): Chaser Top only, Winter Bottom only.
+    // boFund / boChg (entry sorting, 1 = highest first, -1 = lowest first, 0 = off) are set in init(): Chaser -1 / 1, Winter 1 / -1.
+    boRedo: {},       // symbol -> { n: losses so far, w: wrong-way cancels so far, t: ms of the last loss / wrong-way cancel, b: new bundles given since the first retry }; stays until the ticker wins
     boClosedMark: 0,   // closedAt of the newest closed trade already settled (win / loss)
     boWhite: {},       // symbol -> epoch ms it was confirmed liquid; skips the trade fetch for a week
     boGray: {},        // symbol -> epoch ms it was graylisted (stablecoin / illiquid), kept a week
@@ -63,7 +73,7 @@
     before:    [],
     conflicts: [],
     requires:  [],
-    touches:   ['init', 'runScan', 'pseudoWatchCondOrders', '_condTrigger', '_ewCondFilled', '_scCondFilled'],
+    touches:   ['init', 'runScan', 'pseudoWatchCondOrders', 'cancelCondOrder', '_condTrigger', '_ewCondFilled', '_scCondFilled'],
     css: `
       :root { --bo-rgb:255,200,60; --bo-acc:#ffc83c; }
       .bo-hint { font-size:9px; color:var(--text-lo); margin-top:3px; line-height:1.5; }
@@ -76,6 +86,9 @@
       .bo-blink { color:var(--warn); animation:bo-blink 1.6s infinite; }
       @keyframes bo-blink { 50% { opacity:.4; } }
       .bo-pop { position:absolute; left:0; right:0; top:100%; z-index:20; margin-top:2px; padding:5px 7px; font-size:9px; font-weight:400; letter-spacing:0; line-height:1.5; color:var(--text-mid); background:var(--bg-panel,#15110c); border:1px solid rgba(var(--bo-rgb),.35); border-radius:3px; box-shadow:0 4px 12px rgba(0,0,0,.5); }
+      .bo-edge { font-family:var(--mono); font-size:7.5px; letter-spacing:.75px; padding:1.5px 7.5px; border-radius:3px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.03); color:var(--text-lo); cursor:pointer; }
+      .bo-edge.on { border-color:rgba(var(--bo-rgb),.5); background:rgba(var(--bo-rgb),.15); color:var(--bo-acc); }
+      .bo-edge:disabled { opacity:.4; cursor:not-allowed; }
       .bo-in:disabled { opacity:.4; cursor:not-allowed; }
       .bo-in { width:60px; font-family:var(--mono); font-size:10px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.12); border-radius:3px; color:var(--text-hi); padding:2px 5px; }
     `,
@@ -102,6 +115,26 @@
             </label>
             <div x-show="cfg.boEnabled" style="margin-top:8px">
               <div x-data="{ tip: false }">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span class="lbl" style="margin:0">Edges</span>
+                  <button type="button" class="bo-edge" :class="cfg.boTop?'on':''" :disabled="cfgLocked" @click.prevent="_boEdgeSet('top')">Top</button>
+                  <button type="button" class="bo-edge" :class="cfg.boBottom?'on':''" :disabled="cfgLocked" @click.prevent="_boEdgeSet('bottom')">Bottom</button>
+                  <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
+                </div>
+                <div class="bo-hint" x-show="tip">Picks which edges get a cond., and with one edge a ticker that first moves an average move the other way is scheduled for another bundle.</div>
+              </div>
+              <div x-data="{ tip: false }" style="margin-top:8px">
+                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                  <span class="lbl" style="margin:0">Sort</span>
+                  <button type="button" class="bo-edge" :class="cfg.boFund===1?'on':''" :disabled="cfgLocked" @click.prevent="_boSortSet('boFund',1)">+Fund</button>
+                  <button type="button" class="bo-edge" :class="cfg.boFund===-1?'on':''" :disabled="cfgLocked" @click.prevent="_boSortSet('boFund',-1)">-Fund</button>
+                  <button type="button" class="bo-edge" :class="cfg.boChg===1?'on':''" :disabled="cfgLocked" @click.prevent="_boSortSet('boChg',1)">+24h</button>
+                  <button type="button" class="bo-edge" :class="cfg.boChg===-1?'on':''" :disabled="cfgLocked" @click.prevent="_boSortSet('boChg',-1)">-24h</button>
+                  <button type="button" class="bo-info" :class="tip?'on':''" :aria-expanded="tip" aria-label="Info" @click.prevent.stop="tip=!tip">!</button>
+                </div>
+                <div class="bo-hint" x-show="tip">Tries the tickers with the highest (+) or lowest (-) funding rate and 24hr change first, blends the two when both are on, and picks at random when none is selected.</div>
+              </div>
+              <div x-data="{ tip: false }" style="margin-top:8px">
                 <div style="display:flex;align-items:center;gap:6px">
                   <span class="lbl" style="margin:0">Max bundles</span>
                   <input type="number" min="1" :max="100" step="1" class="bo-in" x-model.number="cfg.boMaxBundles" :disabled="cfgLocked" @change="cfg.boMaxBundles=Math.max(1,Math.min(100,Math.round(+cfg.boMaxBundles||30)));persist()">
@@ -153,6 +186,7 @@
       const _origInit    = def.init;
       const _origScan    = def.runScan;
       const _origWatch   = def.pseudoWatchCondOrders;
+      const _origCancel  = def.cancelCondOrder;
       const _hostStages = Array.isArray(def._scanStageDefs); // host has the cooperative scan scheduler
 
       return Object.assign({}, def, {
@@ -163,21 +197,78 @@
 
         // Plugin symbol (text glyphs, not emoji): snowflake for Winter, fire for Chaser.
         _boGlyph() { return WINTER ? '\u2744\uFE0E' : '\u2668\uFE0E'; },
-        _boIs(o) { return !!o && o.tag === 'breakout' && o.bundle === 'bo'; },                 // one of this plugin's bundle legs
+        _boIs(o) { return !!o && o.tag === 'breakout' && (o.bundle === 'bo' || (!o.bundle && !!o.candidate?._boOne)); }, // one of this plugin's orders: a bundle leg, or the single regular cond. of a one-edge ticker
         _boPend() { return new Set((this.condOrders || []).filter(o => this._boIs(o)).map(o => o.symbol)).size; }, // bundles standing: one per ticker
         _boMax() { return Math.max(1, Math.min(BUNDLE_MAX, Math.round(Number(this.cfg.boMaxBundles)) || 30)); },
         _boRedoN() { return Object.keys(this.cfg.boRedo || {}).length; },
         _boAtCap() { return (this.positions || []).length >= (this.cfg.maxPos ?? 5); },
+        // Edges in use. A config with neither on falls back to the side's default (Chaser Top, Winter Bottom).
+        _boEdges() {
+          const t = !!this.cfg.boTop, b = !!this.cfg.boBottom;
+          return t || b ? { top: t, bottom: b } : { top: !WINTER, bottom: WINTER };
+        },
+        // Entry sorting. One end per metric: clicking the lit end turns that metric off, clicking the other end moves it. Both off = random.
+        _boSortSet(k, dir) {
+          if (this.cfgLocked) return;
+          this.cfg[k] = this.cfg[k] === dir ? 0 : dir;
+          this.persist();
+        },
+        _boSortMode() {
+          const f = this.cfg.boFund === 1 || this.cfg.boFund === -1 ? this.cfg.boFund : 0, g = this.cfg.boChg === 1 || this.cfg.boChg === -1 ? this.cfg.boChg : 0;
+          return f || g ? { fund: f, chg: g } : null;
+        },
+        // Sorts the pool in place, most eligible first: percentile rank per metric (ties averaged, missing = 0), averaged when both metrics are on. The sort is stable, so ties keep the pool's random order.
+        _boOrder(pool, m) {
+          const fs = [];
+          if (m.fund) fs.push(t => { const v = parseFloat(t.fundingRate); return isFinite(v) ? v * m.fund : null; });
+          if (m.chg) fs.push(t => { const v = parseFloat(t.price24hPcnt); return isFinite(v) ? v * m.chg : null; });
+          if (pool.length < 2 || !fs.length) return;
+          const score = new Array(pool.length).fill(0);
+          for (const f of fs) {
+            const vals = pool.map(f), idx = [];
+            vals.forEach((v, i) => { if (v != null) idx.push(i); });
+            idx.sort((a, b) => vals[a] - vals[b]);
+            const k = idx.length;
+            for (let i = 0; i < k;) {
+              let j = i;
+              while (j + 1 < k && vals[idx[j + 1]] === vals[idx[i]]) j++;
+              const r = k > 1 ? ((i + j) / 2) / (k - 1) : 1;
+              for (let q = i; q <= j; q++) score[idx[q]] += r;
+              i = j + 1;
+            }
+          }
+          const ord = pool.map((t, i) => ({ t, s: score[i] / fs.length }));
+          ord.sort((a, b) => b.s - a.s);
+          ord.forEach((o, i) => { pool[i] = o.t; });
+        },
+        // Edge buttons: at least one stays on. Clicking the only one that is on does nothing.
+        _boEdgeSet(side) {
+          if (this.cfgLocked) return;
+          const k = side === 'top' ? 'boTop' : 'boBottom', o = side === 'top' ? 'boBottom' : 'boTop';
+          if (this.cfg[k] && !this.cfg[o]) return;
+          this.cfg[k] = !this.cfg[k];
+          this.persist();
+        },
+        // A single-edge cond. that the host cancels at its worst case (one average move the other way): the ticker goes for another bundle.
+        _boWrongWay(o) {
+          const c = this.cfg, sym = o.symbol;
+          if (!c.boEnabled) return;
+          if (!c.boRedo || typeof c.boRedo !== 'object' || Array.isArray(c.boRedo)) c.boRedo = {};
+          const prev = c.boRedo[sym], w = (prev?.w || 0) + 1;
+          c.boRedo[sym] = { ...prev, n: prev?.n || 0, w, t: Date.now() };
+          this.log(`[BO] ${this._boGlyph()} ${sym}: went the other way before the ${o.kind || 'single'} cond. filled — scheduled for another bundle (wrong way ${w})`, 'info');
+          this.persist();
+        },
         _boTip(_t) {
           const p = this._boPend(), r = this._boRedoN();
-          return p + ' bundle' + (p === 1 ? '' : 's') + ' standing, ' + r + ' ticker' + (r === 1 ? '' : 's') + ' scheduled for another bundle after a loss.';
+          return p + ' bundle' + (p === 1 ? '' : 's') + ' standing, ' + r + ' ticker' + (r === 1 ? '' : 's') + ' scheduled for another bundle after a loss or a wrong-way move.';
         },
 
         // Hover text of the retry counter: each scheduled ticker with the number of new bundles it has been given since its first loss.
         _boRedoTip() {
           const e = Object.entries(this.cfg.boRedo || {});
           if (!e.length) return 'No ticker is scheduled for another bundle.';
-          return 'Scheduled after a loss, with the new bundles each has had:\n' + e.map(([sym, r]) => sym + ' \u2014 ' + ((r && r.b) || 0)).join('\n');
+          return 'Scheduled after a loss or a wrong-way move, with the new bundles each has had:\n' + e.map(([sym, r]) => sym + ' \u2014 ' + ((r && r.b) || 0)).join('\n');
         },
 
         // Last 24 closed 1hr candles, newest first from the exchange; the forming candle is dropped. Null when the ticker has fewer than 24.
@@ -264,28 +355,30 @@
 
         // The bundle: a cond. ABOVE the price at one average top move and a cond. BELOW it at one average bottom move, as ONE host bundle ('bo': one slot, the first fill cancels the other).
         // Each leg's worst case sits twice its opposite move away, beyond the other leg's target, so the other leg always fills first and the worst case only satisfies the host's two-sided rule.
-        // TP / SL ROI come from the same averages, measured from the fill (Chaser: TP top, SL bottom; Winter: TP bottom, SL top). tryN: 1 for a fresh ticker, losses + 1 for a retry. Returns the legs, or null.
+        // With one edge off there is no bundle: a single regular cond. whose worst case is one average move the OTHER way: the host cancels it there and _boWrongWay schedules the ticker for a retry.
+        // TP / SL ROI come from the same averages, measured from the fill (Chaser: TP top, SL bottom; Winter: TP bottom, SL top). tryN: 1 for a fresh ticker, losses + wrong-way cancels + 1 for a retry. Returns the legs, or null.
         async _boPlace(sym, t, tryN = 1) {
           const pr = await this._boPrep(sym, t);
           if (!pr) return null;
           const { mv, price, lev } = pr, fp = x => +x.toPrecision(6);
+          const { top: useTop, bottom: useBot } = this._boEdges(), both = useTop && useBot;
           const tpMove = WINTER ? mv.bottom : mv.top, slMove = WINTER ? mv.top : mv.bottom;
           const tpRoi = +(tpMove * lev).toFixed(2), slRoi = +(slMove * lev).toFixed(2);
-          const base = { symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100, _tpPct: tpRoi, _slPct: slRoi, _bo: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boTry: tryN };
-          const legs = [
-            { edge: 'top',    target: price * (1 + mv.top / 100),    worst: Math.max(price * 0.01, price * (1 - 2 * mv.bottom / 100)) },
-            { edge: 'bottom', target: price * (1 - mv.bottom / 100), worst: price * (1 + 2 * mv.top / 100) },
-          ];
+          const base = { symbol: sym, price, change: parseFloat(t?.price24hPcnt || 0) * 100, fundingRate: parseFloat(t?.fundingRate || 0) * 100, _tpPct: tpRoi, _slPct: slRoi, _bo: true, _boTopPct: +mv.top.toFixed(3), _boBotPct: +mv.bottom.toFixed(3), _boTry: tryN, _boOne: !(useTop && useBot) };
+          const legs = [];
+          if (useTop) legs.push({ edge: 'top',    target: price * (1 + mv.top / 100),    worst: Math.max(price * 0.01, price * (1 - (both ? 2 : 1) * mv.bottom / 100)) });
+          if (useBot) legs.push({ edge: 'bottom', target: price * (1 - mv.bottom / 100), worst: price * (1 + (both ? 2 : 1) * mv.top / 100) });
           const placed = [];
           for (const L of legs) {
-            const o = await this.placeCondEntry({ candidate: { ...base, _boEdge: L.edge }, target: L.target, worst: L.worst, tag: 'breakout', bundle: 'bo', kind: L.edge });
+            const o = await this.placeCondEntry({ candidate: { ...base, _boEdge: L.edge }, target: L.target, worst: L.worst, tag: 'breakout', bundle: both ? 'bo' : null, kind: L.edge }); // one edge: a regular cond., no bundle
             if (!o) {
               for (const p of placed) { try { await this.cancelCondOrder(p.id, 'breakout bundle incomplete'); } catch (e) {} }
               return null;
             }
             placed.push(o);
           }
-          this.log(`[BO] ${this._boGlyph()} ${sym}: ${tryN > 1 ? `retry ${tryN - 1} — ` : ''}bundle @ ${fp(price)}: top cond. ${fp(legs[0].target)} (+${mv.top.toFixed(2)}%) / bottom cond. ${fp(legs[1].target)} (-${mv.bottom.toFixed(2)}%), TP ${tpRoi}% / SL ${slRoi}% ROI from the fill, first fill cancels the other`, 'info');
+          const desc = legs.map(L => L.edge === 'top' ? `top cond. ${fp(L.target)} (+${mv.top.toFixed(2)}%)` : `bottom cond. ${fp(L.target)} (-${mv.bottom.toFixed(2)}%)`).join(' / ');
+          this.log(`[BO] ${this._boGlyph()} ${sym}: ${tryN > 1 ? `retry ${tryN - 1} — ` : ''}bundle @ ${fp(price)}: ${desc}, TP ${tpRoi}% / SL ${slRoi}% ROI from the fill${both ? ', first fill cancels the other' : `, ${legs[0].edge} edge only, retried if the ticker goes the other way first`}`, 'info');
           return placed;
         },
 
@@ -301,10 +394,10 @@
             top = Math.max(top, t.closedAt);
             const sym = t.symbol, prev = c.boRedo[sym];
             if (t.isWin) {
-              if (prev) { delete c.boRedo[sym]; this.log(`[BO] ${this._boGlyph()} ${sym}: won after ${prev.n} loss${prev.n === 1 ? '' : 'es'} — no more bundles scheduled`, 'success'); }
+              if (prev) { delete c.boRedo[sym]; this.log(`[BO] ${this._boGlyph()} ${sym}: won after ${[prev.n ? prev.n + ' loss' + (prev.n === 1 ? '' : 'es') : '', prev.w ? prev.w + ' wrong-way move' + (prev.w === 1 ? '' : 's') : ''].filter(Boolean).join(' and ')} — no more bundles scheduled`, 'success'); }
             } else {
               const n = (prev?.n || 0) + 1;
-              c.boRedo[sym] = { n, t: Date.now() };
+              c.boRedo[sym] = { ...prev, n, t: Date.now() };
               this.log(`[BO] ${this._boGlyph()} ${sym}: closed at a loss [${t.reason}] — scheduled for another bundle (loss ${n})`, 'info');
             }
           }
@@ -332,7 +425,7 @@
 
         // Conds left by earlier versions (Whipsaw / Continuation, the retired price conds) are cancelled. With Breakout off its bundles are cancelled too.
         async _boSync() {
-          const c = this.cfg, old = (this.condOrders || []).filter(o => o.tag === 'whipsaw' || o.tag === 'continuation' || o.tag === 'whipsaw + continuation' || (o.tag === 'breakout' && !o.bundle));
+          const c = this.cfg, old = (this.condOrders || []).filter(o => o.tag === 'whipsaw' || o.tag === 'continuation' || o.tag === 'whipsaw + continuation' || (o.tag === 'breakout' && !o.bundle && !o.candidate?._boOne));
           for (const o of old) { try { await this.cancelCondOrder(o.id, 'breakout retired order'); } catch (e) { this.log(`[BO] cancel error (${o.symbol}): ${e.message}`, 'warn'); } }
           if (old.length) this.log(`[BO] ${this._boGlyph()} ${old.length} cond. order${old.length === 1 ? '' : 's'} from an earlier version cancelled`, 'info');
           if (c.boEnabled) return;
@@ -373,26 +466,37 @@
               if (placed >= free) break;
               if (taken.has(sym)) continue;
               if (sym in c.boGray || this._isSymbolBanned?.(sym)) { delete c.boRedo[sym]; this.log(`[BO] ${sym}: dropped from the retry schedule — ${sym in c.boGray ? 'graylisted' : 'banned'}`, 'info'); continue; }
-              try { if (await this._boPlace(sym, tk(sym), (c.boRedo[sym].n || 0) + 1)) { c.boRedo[sym].b = (c.boRedo[sym].b || 0) + 1; placed++; retried++; taken.add(sym); } }
+              try { if (await this._boPlace(sym, tk(sym), (c.boRedo[sym].n || 0) + (c.boRedo[sym].w || 0) + 1)) { c.boRedo[sym].b = (c.boRedo[sym].b || 0) + 1; placed++; retried++; taken.add(sym); } }
               catch (e) { this.log(`[BO] ${sym} error: ${e.message}`, 'warn'); }
             }
 
             const now = Date.now();
             for (const m of [c.boGray, c.boWhite]) for (const k of Object.keys(m)) if (now - m[k] >= GRAY_MS) delete m[k];
             const mega = new Set(Array.isArray(c.megacapExclude) ? c.megacapExclude : []);
-            const pool = (this._lastAllTickers || []).filter(t => t.symbol && t.symbol.endsWith('USDT') && !taken.has(t.symbol) && !(t.symbol in c.boRedo)
+            let pool = (this._lastAllTickers || []).filter(t => t.symbol && t.symbol.endsWith('USDT') && !taken.has(t.symbol) && !(t.symbol in c.boRedo)
               && !mega.has(t.symbol) && !(t.symbol in c.boGray) && parseFloat(t.lastPrice || 0) > 0 && !this._isSymbolBanned?.(t.symbol));
             for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+
+            const sortMode = this._boSortMode();
+            if (sortMode) {
+              this._boCool = this._boCool || {};
+              for (const k of Object.keys(this._boCool)) if (now - this._boCool[k] >= COOL_MS) delete this._boCool[k];
+              pool = pool.filter(t => !(t.symbol in this._boCool));
+              this._boOrder(pool, sortMode);
+            }
+            const sortTxt = sortMode ? [sortMode.fund ? (sortMode.fund > 0 ? '+' : '-') + 'fund' : '', sortMode.chg ? (sortMode.chg > 0 ? '+' : '-') + '24h' : ''].filter(Boolean).join(' ') : '';
 
             const maxTry = (free - placed) * 3; // a few spare picks for tickers that fail (new listings, filters, refused orders)
             let tries = 0;
             for (const t of pool) {
               if (placed >= free || tries >= maxTry) break;
               tries++;
-              try { if (await this._boPlace(t.symbol, t, 1)) placed++; }
+              let ok = false;
+              try { ok = await this._boPlace(t.symbol, t, 1); }
               catch (e) { this.log(`[BO] ${t.symbol} error: ${e.message}`, 'warn'); }
+              if (ok) placed++; else if (sortMode) this._boCool[t.symbol] = Date.now();
             }
-            this.log(`[BO] ${this._boGlyph()} Batch — ${placed}/${free} bundle${free === 1 ? '' : 's'} placed${retried ? ` (${retried} retr${retried === 1 ? 'y' : 'ies'})` : ''}`, 'info');
+            this.log(`[BO] ${this._boGlyph()} Batch — ${placed}/${free} bundle${free === 1 ? '' : 's'} placed${retried ? ` (${retried} retr${retried === 1 ? 'y' : 'ies'})` : ''}${sortTxt ? `, sorted ${sortTxt}` : ''}`, 'info');
             this.persist();
           } finally { this._boBusy = false; }
         },
@@ -412,12 +516,27 @@
           for (const [k, v] of Object.entries(BO_DEFAULT_CFG)) {
             if (this.cfg[k] === undefined) this.cfg[k] = Array.isArray(v) ? [...v] : (v && typeof v === 'object' ? { ...v } : v);
           }
+          // Entry sorting: Chaser -Fund +24h, Winter +Fund -24h, unless the user has already chosen.
+          if (![-1, 0, 1].includes(this.cfg.boFund)) this.cfg.boFund = WINTER ? 1 : -1;
+          if (![-1, 0, 1].includes(this.cfg.boChg)) this.cfg.boChg = WINTER ? -1 : 1;
+          // Edges: Chaser Top only, Winter Bottom only, unless the user has already chosen.
+          if (typeof this.cfg.boTop !== 'boolean') this.cfg.boTop = !WINTER;
+          if (typeof this.cfg.boBottom !== 'boolean') this.cfg.boBottom = WINTER;
+          if (!this.cfg.boTop && !this.cfg.boBottom) { this.cfg.boTop = !WINTER; this.cfg.boBottom = WINTER; }
           for (const k of ['boGray', 'boWhite', 'boRedo']) if (!this.cfg[k] || typeof this.cfg[k] !== 'object' || Array.isArray(this.cfg[k])) this.cfg[k] = {};
           if (!this.cfg.boClosedMark) this.cfg.boClosedMark = Date.now(); // trades closed before this version are not settled
           // Retired settings and stores (scoring, watch lists, hypotheticals, flow, auto-switch, tally, retry queue, Both / On break / Funding / Cull, volume watch and break counter).
           for (const k of ['boFlowOn', 'boCritOn', 'boCritF', 'boCritS', 'boCritL', 'boCritI', 'boGate', 'boSamples', 'boWatchMax', 'boStepX', 'boCells', 'boCellOf', 'boW1', 'boW2', 'boHypo',
             'boEdges', 'boLog', 'boInval', 'boRetry', 'boAuto', 'boAutoPct', 'boAutoTicker', 'boTickLatch', 'boFlowUp', 'boFlowDown', 'boMult', 'boEntry', 'boFlow', 'boTrack', 'boPushMax', 'boFlowEnabled', 'boFundW', 'boSkewW', 'boTgtMin', 'boTgtMax', 'boPeakCloser', 'boBottomCloser', 'boVol', 'boVolClose', 'boPairs', 'boFar', 'boDR', 'boRevert', 'boDecide', 'boTypes', 'boFlip', 'boNullify', 'boNullHrs', 'boCandlePref',
             'boBoth', 'boCont', 'boWhip', 'boFundHigh', 'boFundLow', 'boFundHi', 'boFundLo', 'boFundCull', 'boPollSec', 'boWinH', 'boBreaks', 'boWatch', 'boMaxWatch']) delete this.cfg[k];
+        },
+
+        // A single-edge Breakout cond. cancelled at its worst case (the ticker went the other way first) schedules its ticker for another bundle.
+        async cancelCondOrder(id, reason = 'manual') {
+          const o = (this.condOrders || []).find(x => x.id === id);
+          const r = await _origCancel.call(this, id, reason);
+          if (r && o && this._boLoaded && this._boIs(o) && o.candidate?._boOne && String(reason).startsWith('worst case reached')) this._boWrongWay(o);
+          return r;
         },
 
         // Housekeeping rides the host's cond. order watcher: settle closed trades, cancel expired bundles, and clear bundles at max positions.

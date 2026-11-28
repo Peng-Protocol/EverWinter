@@ -66,7 +66,7 @@ Changes take effect immediately and are persisted to localStorage automatically.
 | Setting | What it does |
 |---|---|
 | **Scan Interval** (`scanMins`) | How often (minutes) the bot runs a full market scan. Controls both entry frequency and the scan bar in the UI. Can be changed while the bot is running (PseudoWinter/PseudoChaser): the interval is frozen when each cycle starts, so an edit applies from the next cycle and never fires or shifts the current one. |
-| **Max Positions** (`maxPos`) | Maximum simultaneously open positions. No new entries open once this is reached. Breakout also cancels its pending bundles and stops placing them ([Max positions](#max-positions)). |
+| **Max Positions** (`maxPos`) | Maximum simultaneously open positions. No new entries open once this is reached. Breakout also cancels its pending bundles and single conds. and stops placing them ([Max positions](#max-positions)). |
 | **Max Cond. Orders** (`maxCond`, default 30) | Maximum pending conditional-limit entries ([Conditional Orders](#conditional-orders)). Counted separately from **Max Positions**; no new cond. order is accepted once it is reached. |
 | **Leverage** (`leverage`) | Position leverage. Affects order size and TP/SL prices. |
 | **Min Notional** (`minNotional`) | Base margin per position in USDT. Actual order size = minNotional × leverage. |
@@ -120,7 +120,7 @@ The stats panel shows session-level metrics since the page was last loaded or st
 
 ### Actions Dropdown
 
-- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boRedo`, `boClosedMark`, `boGray`, `boWhite`, plus its `boEnabled`, `boMaxBundles` and `boLifeMins` settings; pending bundles are in `condOrders`) sits in the config and travels with it.
+- **Export** — Downloads current bot state (config, positions, closed trades, ban list) as a `.json` file. Breakout's state (`boRedo`, `boClosedMark`, `boGray`, `boWhite`, plus its `boEnabled`, `boTop`, `boBottom`, `boFund`, `boChg`, `boMaxBundles` and `boLifeMins` settings; pending bundles and single conds. are in `condOrders`) sits in the config and travels with it.
 - **Import** — Restores state from a previously exported `.json` file: config fields merge field by field and positions are replaced wholesale. A 5s debounce prevents accidental double-imports, and config keys that no longer belong to a loaded feature are dropped. ([more](#general-details))
 - **Clear Closed Trades** — Wipes the closed trades list, resets session stats, and clears the 6hr drawdown/gains-lock rolling PnL windows. Open positions are unaffected.
 - **Clear All** — Full reset. All positions, trades, stats, and config are wiped (config reverts to defaults).
@@ -156,7 +156,7 @@ The trades panel shows a card for each closed trade, newest first, with a close-
 
 ## Conditional Orders
 
-A plugin can enter through a conditional limit order instead of opening at once: `placeCondEntry({ candidate, target, worst, tag, bundle, kind })`, where `candidate` is what it would hand to `pseudoOpenShort`/`pseudoOpenLong`. Breakout enters this way only, one two-order bundle per ticker ([The bundle](#the-bundle)). The order opens a position only when price reaches **target**; if price reaches **worst** (the worst case) first, it is cancelled. Target and worst sit on opposite sides of the **entry** price, the last price when the order was made.
+A plugin can enter through a conditional limit order instead of opening at once: `placeCondEntry({ candidate, target, worst, tag, bundle, kind })`, where `candidate` is what it would hand to `pseudoOpenShort`/`pseudoOpenLong`. Breakout enters this way only: one two-order bundle per ticker with both edges on, or one regular cond. with one edge on ([Edges](#edges), [The bundle](#the-bundle)). The order opens a position only when price reaches **target**; if price reaches **worst** (the worst case) first, it is cancelled. Target and worst sit on opposite sides of the **entry** price, the last price when the order was made.
 
 **Bundles**: orders on one ticker that pass the same `bundle` string form a bundle. A bundle takes **one** cond. slot however many orders it holds, shows as one card, and acts as one-cancels-other: the first order to fill cancels the rest. Each order's `kind` (e.g. `top` / `bottom`) names its role in the bundle. Orders with no `bundle` behave as before, one slot and one card each, and only one per ticker.
 
@@ -166,15 +166,37 @@ Pending orders are listed under **Cond. Orders** in the market column, below Ope
 
 ## Breakout Plugin
 
-Breakout is the proactive plugin, and it makes no prediction. Each batch it picks **random tickers** and puts a **cond. bundle** on each: one cond. order **above** the price at the ticker's average **top move** and one **below** it at its average **bottom move** (green candles, how far above their open they ran; red candles, how far below their open). The bundle stands for **Order life**, the first order to fill opens a normal position on the bot's side, and TP and SL come from the same two averages. When a Breakout position **closes at a loss**, its ticker is scheduled for **another bundle**, and the ticker keeps being re-bundled until one of its positions closes at a win. There is no volume watch, no funding read, no candle colour, no long / short skew and no stand down or other regime stopgap; the ticker's own last 24 hourly candles are the only input, and which edge fills is up to the price. One file for both bots (`plugins/strategies/Breakout.html`, settings `bo*`), no other plugin needed, and **Binary Mode must be on** (with it off, nothing is placed). ([more](#breakout-details))
+Breakout is the proactive plugin, and it makes no prediction. Each batch it picks tickers and puts a cond. entry on each: one **above** the price at the ticker's average **top move**, one **below** it at its average **bottom move**, or both (green candles, how far above their open they ran; red candles, how far below their open). The **Top** and **Bottom** buttons choose the edges: **PseudoChaser defaults to Top only and PseudoWinter to Bottom only**, and with both on the two conds form a **bundle**. Tickers are tried in the **Entry sorting** order (funding rate and 24hr change, highest or lowest first, or random with none selected). The cond. stands for **Order life**, the order that fills opens a normal position on the bot's side, and TP and SL come from the same two averages. A ticker is scheduled for **another cond.** when a Breakout position **closes at a loss**, or when, with one edge on, the ticker moves one average move the other way before its cond. fills, and it keeps being retried until one of its positions closes at a win. There is no volume watch, no candle colour, no long / short skew and no stand down or other regime stopgap; funding rate and 24hr change only put the tickers in order and never decide whether one enters, and the ticker's own last 24 hourly candles set the levels. One file for both bots (`plugins/strategies/Breakout.html`, settings `bo*`), no other plugin needed, and **Binary Mode must be on** (with it off, nothing is placed). ([more](#breakout-details))
 
 ### Entry
 
-Each scan, while a position slot is free, Breakout fills the free bundle slots: first the tickers [scheduled for another bundle](#retry), then random tickers that pass the [filters](#filters). A ticker holds **one** bundle at a time and takes one of the **Max bundles** (default 30) and one of the host's **Max Cond. Orders** slots (a bundle counts once, however many orders it holds), so the smaller free count wins. Per ticker the last 24 closed 1hr candles give the two moves, the filters run, and the bundle is placed at the fresh price. The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below): the entry is the bot's own direction whichever order fills, so a Chaser buys the dip if the bottom order fills and buys strength if the top order fills.
+Each scan, while a position slot is free, Breakout fills the free slots: first the tickers [scheduled for another cond.](#retry), then fresh tickers that pass the [filters](#filters), in the [Entry sorting](#entry-sorting) order (random with no sort button on). A ticker holds **one** bundle or cond. at a time and takes one of the **Max bundles** (default 30) and one of the host's **Max Cond. Orders** slots (a bundle counts once, however many orders it holds), so the smaller free count wins. Per ticker the last 24 closed 1hr candles give the two moves, the filters run, and the order or bundle is placed at the fresh price. The bot's side only decides which way TP and SL point (PseudoChaser TP above, PseudoWinter TP below): the entry is the bot's own direction whichever order fills, so a Chaser buys the dip if a bottom order fills and buys strength if a top order fills.
+
+### Edges
+
+Two buttons, **Top** and **Bottom**, choose which orders a ticker gets. At least one stays on (clicking the only lit button does nothing).
+
+| Edges on | What is placed |
+|---|---|
+| **Both** | The two-order [bundle](#the-bundle). |
+| **One** | A single regular cond. order at that edge, with no bundle (tag `breakout`, kind `top` / `bottom`). Its worst case is **one** average move the *other* way: Top, price × (1 − bottom move); Bottom, price × (1 + top move). If the ticker gets there before the cond. fills, the host cancels it and the ticker is [scheduled for a retry](#retry). |
+
+Defaults (`boTop` / `boBottom`): **PseudoChaser Top only, PseudoWinter Bottom only**. A saved choice is kept, and a bundle already standing keeps the edges it was made with.
+
+### Entry sorting
+
+Four buttons put the tickers a batch tries first in order: **+Fund**, **-Fund**, **+24h**, **-24h**. `+` puts the highest value first and `-` the lowest (most negative) first, using the ticker's funding rate and 24hr price change from the bulk list. A bot holds only one end of each metric (+Fund or -Fund, +24h or -24h): clicking the lit button turns that metric off, clicking the opposite end moves it. With none selected the order is random.
+
+- **One metric**: tickers are tried in that metric's order.
+- **Both metrics**: each ticker's percentile rank on each metric is averaged into one blended score, equal weight. Ties share their average rank, a missing value ranks lowest, and tickers with equal scores keep a random order.
+- **Cooldown**: while sorting is on, a ticker that was tried and not placed (new listing, refused order, no green or red candle) sits out for an hour, in memory only, so tickers that keep failing cannot hold the top of the list. With no sort button on there is no cooldown.
+- **Retries** still go first; sorting orders only the fresh picks.
+
+Defaults (`boFund` / `boChg`): **PseudoChaser -Fund and +24h, PseudoWinter +Fund and -24h**. A saved choice is kept, including none.
 
 ### The bundle
 
-Two cond. orders, placed through the host's `placeCondEntry` ([Conditional Orders](#conditional-orders)) as one [bundle](#conditional-orders) (`bo`, tag `breakout`):
+With both [edges](#edges) on, two cond. orders, placed through the host's `placeCondEntry` ([Conditional Orders](#conditional-orders)) as one [bundle](#conditional-orders) (`bo`, tag `breakout`). With one edge on only that order is placed, as a regular cond. with no bundle:
 
 | Order | Target | Worst |
 |---|---|---|
@@ -182,22 +204,23 @@ Two cond. orders, placed through the host's `placeCondEntry` ([Conditional Order
 | **BOTTOM** | price × (1 − bottom move), below the price | price × (1 + 2 × top move), above it |
 
 - **One slot, one winner**: the pair takes one cond. slot, shows as one **BUNDLE · 2** card, and the first order to fill cancels the other.
-- **Worst case**: each order's worst level sits twice the opposite move away, beyond the other order's target, so the other order always fills first and the worst level only satisfies the host's rule that target and worst be on opposite sides of the price. If the host refuses the second order, the first is cancelled and the ticker is skipped.
-- **Fill and TP / SL**: the host fills it like any cond. order, opening a normal position at the target price. TP and SL are the average moves as ROI % (move × leverage), measured from the **fill** price: PseudoChaser TP = top move, SL = bottom move; PseudoWinter TP = bottom move, SL = top move.
+- **Worst case (both edges)**: each order's worst level sits twice the opposite move away, beyond the other order's target, so the other order always fills first and the worst level only satisfies the host's rule that target and worst be on opposite sides of the price. If the host refuses the second order, the first is cancelled and the ticker is skipped.
+- **One edge**: the worst level sits one opposite move away, so it can be reached before the order fills; the host then cancels the cond. and the ticker is [scheduled for a retry](#retry).
+- **Fill and TP / SL**: the host fills it like any cond. order, opening a normal position at the target price. TP and SL are the average moves as ROI % (move × leverage), measured from the **fill** price, the same for either order: PseudoChaser TP = top move, SL = bottom move; PseudoWinter TP = bottom move, SL = top move.
 - **Badge**: the position shows **TOP** or **BOTTOM** for the order that filled, plus **R1**, **R2**… for the retry number (no suffix on a first bundle).
 
 ### Hold
 
-A bundle stands for **Order life** (default 1440 min) counted from its placement, then both orders are cancelled. There is no watch and no polling: the host's own cond. watcher does the filling. An expiry is not a loss, and a ticker still [scheduled](#retry) is bundled again.
+A bundle, or a single cond., stands for **Order life** (default 1440 min) counted from its placement, then its orders are cancelled. There is no watch and no polling: the host's own cond. watcher does the filling. An expiry is not a loss, and a ticker still [scheduled](#retry) is given a new order again.
 
 ### Retry
 
-When a Breakout position closes with a **net loss** (the host's result, fees and funding included), its ticker is scheduled for another bundle, built fresh from the latest 24 candles. The next batch places the scheduled tickers first, then fills the rest at random.
+A ticker is scheduled for another bundle (or single cond.), built fresh from the latest 24 candles, in two cases: a Breakout position on it closes with a **net loss** (the host's result, fees and funding included), or, with one edge on, it moves one average move the **other** way before its cond. fills (the [worst case](#edges)), which cancels the cond. The next batch places the scheduled tickers first, then fills the rest in the [sort order](#entry-sorting).
 
-- **Until it wins**: a ticker stays scheduled until one of its Breakout positions closes at a win. There is no cap on retries.
+- **Until it wins**: a ticker stays scheduled until one of its Breakout positions closes at a win. There is no cap on retries, and wrong-way cancels count as retries too.
 - **An unfilled bundle does not clear it**: if a retry bundle expires without filling, the ticker is bundled again.
 - **Dropped only** when it fails a [filter](#filters) (graylisted) or the host bans it; the log says which.
-- **Counter**: the live readout shows how many tickers are scheduled, and hovering the counter lists them, each with the number of new bundles it has been given since its first loss.
+- **Counter**: the live readout shows how many tickers are scheduled, and hovering the counter lists them, each with the number of new bundles it has been given since it was first scheduled.
 - Retries take bundle slots like any other, so with no free slot they wait.
 
 ### Filters
@@ -206,7 +229,7 @@ Two always-on filters skip dead tickers: **Stablecoin** (the 24 candles' full sp
 
 ### Max positions
 
-At **Max Positions**, every pending bundle is cancelled and no new ones are placed until a slot frees up; scheduled tickers wait and are bundled once it does.
+At **Max Positions**, every pending bundle or single cond. is cancelled and no new ones are placed until a slot frees up; scheduled tickers wait and are bundled once it does.
 
 ### Live readout
 
@@ -219,8 +242,10 @@ Each setting's explanation sits behind a circled **!** button next to it (click 
 | Setting | What it does |
 |---|---|
 | **Breakout Mode** (`boEnabled`, default on) | Master on/off. Off = no new bundles, and the pending ones are cancelled. |
-| **Max bundles** (`boMaxBundles`, default **30**, 1 to 100) | How many tickers hold a bundle at once, one slot each, within the host's **Max Cond. Orders**. A new value is used from the next batch. |
-| **Order life** (`boLifeMins`, default **1440**) | Minutes before an unfilled bundle is cancelled. |
+| **Edges** (`boTop` / `boBottom`, default Chaser Top, Winter Bottom) | Which orders a ticker gets: both for a bundle, one for a single regular cond. At least one stays on ([Edges](#edges)). |
+| **Sort** (`boFund` / `boChg`, default Chaser -Fund +24h, Winter +Fund -24h) | Entry sorting: `1` highest first, `-1` lowest first, `0` off, one end per metric; both off = random ([Entry sorting](#entry-sorting)). |
+| **Max bundles** (`boMaxBundles`, default **30**, 1 to 100) | How many tickers hold a bundle or cond. at once, one slot each, within the host's **Max Cond. Orders**. A new value is used from the next batch. |
+| **Order life** (`boLifeMins`, default **1440**) | Minutes before an unfilled bundle or cond. is cancelled. |
 
 The stored state is listed under [Breakout Details](#breakout-details).
 
@@ -228,7 +253,7 @@ The stored state is listed under [Breakout Details](#breakout-details).
 
 ## Randomized Outcomes
 
-Scan timing drifts independently per tab, and Breakout draws its tickers at random each batch, so two identically configured instances won't share entry triggers, exit timing, or readings. This is intentional: instances in lockstep are easier to front-run and cluster losses at the same market event.
+Scan timing drifts independently per tab, and Breakout draws its tickers at random each batch (unless [Entry sorting](#entry-sorting) is on, which breaks ties at random), so two identically configured instances won't share entry triggers, exit timing, or readings. This is intentional: instances in lockstep are easier to front-run and cluster losses at the same market event.
 
 ---
 
@@ -302,7 +327,7 @@ The newest 25 candles are fetched (`interval=60`) and the forming one dropped; a
 
 #### Batch
 
-Each scan, `_boBatch` runs when Breakout Mode is on, Binary Mode is on and entries are not halted. It syncs, applies the Max Positions guard, settles closed trades, and returns at Max Positions. The free count is **Max bundles** minus the bundles standing, capped by the host's free cond. slots (`maxCond` minus slots in use). Scheduled tickers (`boRedo`) go first, skipping any that already hold a position or an order; a failed read leaves the ticker scheduled, while a ticker in `boGray` or banned by the host is dropped. The rest are random tickers from the bulk list (USDT pairs, not banned, held, scheduled, in `megacapExclude` or graylisted), with attempts capped at 3× the remaining slots. Per ticker `_boPrep` reads the candles, runs the filters, reads a fresh price and the leverage, and `_boPlace` places the bundle. The position opened from a fill carries `_bo`, `_boEdge` (`top` / `bottom`), `_boTry` (1 for a first bundle, losses + 1 for a retry), `_boTopPct`, `_boBotPct`, `_tpPct` and `_slPct`, copied onto its closed trade, which is what the badge reads.
+Each scan, `_boBatch` runs when Breakout Mode is on, Binary Mode is on and entries are not halted. It syncs, applies the Max Positions guard, settles closed trades, and returns at Max Positions. The free count is **Max bundles** minus the bundles standing, capped by the host's free cond. slots (`maxCond` minus slots in use). Scheduled tickers (`boRedo`) go first, skipping any that already hold a position or an order; a failed read leaves the ticker scheduled, while a ticker in `boGray` or banned by the host is dropped. The rest come from the bulk list (USDT pairs, not banned, held, scheduled, in `megacapExclude` or graylisted) in a random order. With Entry sorting on, tickers in `_boCool` (tried and not placed within the hour, `COOL_MS`) are dropped and the rest are ordered by `_boOrder`, which ranks each metric as a percentile (ties averaged, missing = 0), averages the ranks and sorts stably so equal scores keep the random order. Attempts are capped at 3× the remaining slots, and the batch log line ends with the active sort (e.g. `sorted -fund +24h`). Per ticker `_boPrep` reads the candles, runs the filters, reads a fresh price and the leverage, and `_boPlace` places the bundle, or the single cond. when one edge is on. The position opened from a fill carries `_bo`, `_boEdge` (`top` / `bottom`), `_boTry` (1 for a first bundle, losses + wrong-way cancels + 1 for a retry), `_boOne` (on the cond.'s candidate when only one edge is on), `_boTopPct`, `_boBotPct`, `_tpPct` and `_slPct`, copied onto its closed trade, which is what the badge reads.
 
 #### TP / SL
 
@@ -310,7 +335,7 @@ PseudoChaser TP = fill × (1 + top), SL = fill × (1 − bottom); PseudoWinter T
 
 #### Settling closed trades
 
-`_boSettle` runs in the cond. watcher and at each batch. It reads every closed trade with `_bo` set and `closedAt` newer than `boClosedMark`, oldest first (period roll-up entries are skipped), so it works whichever path closed the trade. `isWin` false: the ticker gets `boRedo[sym] = { n, t, b }`, where `n` counts its losses so far and `b` the new bundles it has been given since the first loss; `isWin` true removes the entry. `boClosedMark` then moves to the newest `closedAt` handled; on first load it starts at the current time, so trades closed before this version are not settled. Placing a retry bundle raises `b`; the badge's retry number is `n` at the time it was placed.
+`_boSettle` runs in the cond. watcher and at each batch. It reads every closed trade with `_bo` set and `closedAt` newer than `boClosedMark`, oldest first (period roll-up entries are skipped), so it works whichever path closed the trade. `isWin` false: the ticker gets `boRedo[sym] = { ...prev, n, t }`, the entry being `{ n, w, t, b }`: `n` counts its losses so far, `w` its wrong-way cancels, and `b` the new bundles it has been given since it was first scheduled; `isWin` true removes the entry. `boClosedMark` then moves to the newest `closedAt` handled; on first load it starts at the current time, so trades closed before this version are not settled. Placing a retry bundle raises `b`; the badge's retry number is `n` + `w` at the time it was placed. A wrong-way cancel (see Internals) writes the same entry with `w` + 1 and leaves `n` and `b` alone.
 
 #### Filter details
 
@@ -322,18 +347,20 @@ These sit in the bot's config and travel with an export. Only the settings have 
 
 | Key | Holds |
 |---|---|
-| **Scheduled tickers** (`boRedo`) | Symbol → `{ n, t, b }`: losses so far, epoch ms of the last loss, new bundles given since the first loss. |
+| **Scheduled tickers** (`boRedo`) | Symbol → `{ n, w, t, b }`: losses so far, wrong-way cancels so far, epoch ms of the last loss or wrong-way cancel, new bundles given since first scheduled. |
 | **Settled mark** (`boClosedMark`) | `closedAt` of the newest closed trade already settled. |
 | **Graylist / Whitelist** (`boGray` / `boWhite`) | Symbol → epoch ms, held one week. |
-| **Bundles** (in `condOrders`) | The host's order records with tag `breakout`, bundle `bo`, kind `top` / `bottom` and a `candidate` carrying the position's stamps and `_tpPct` / `_slPct`. |
+| **Edges and sort** (`boTop`, `boBottom`, `boFund`, `boChg`) | Two booleans, and two numbers that are `-1`, `0` or `1`. |
+| **Bundles and conds.** (in `condOrders`) | The host's order records with tag `breakout`, kind `top` / `bottom` and a `candidate` carrying the position's stamps and `_tpPct` / `_slPct`: bundle `bo` for a pair, no bundle (and `candidate._boOne`) for a single-edge cond. |
 
-Settings from earlier versions that this one no longer uses (`boBoth`, `boWhip`, `boCont`, `boFundHigh`, `boFundLow`, `boFundHi`, `boFundLo`, `boFundCull`, `boPollSec`, `boWinH`, `boBreaks`, `boWatch`, the older retry store `boRetry`, and the older scoring, flow and tally stores) are deleted from a saved config on load; `boMaxWatch` is carried over as `boMaxBundles` first. Cond. orders left by earlier versions (tags `whipsaw`, `continuation`, `whipsaw + continuation`, or `breakout` with no bundle) are cancelled on load. A closed trade carrying the old `_boVol`, `_boHist`, `_boWhip` or `_boCont` fields keeps them, and they are ignored.
+Settings from earlier versions that this one no longer uses (`boBoth`, `boWhip`, `boCont`, `boFundHigh`, `boFundLow`, `boFundHi`, `boFundLo`, `boFundCull`, `boPollSec`, `boWinH`, `boBreaks`, `boWatch`, the older retry store `boRetry`, and the older scoring, flow and tally stores) are deleted from a saved config on load; `boMaxWatch` is carried over as `boMaxBundles` first. Cond. orders left by earlier versions (tags `whipsaw`, `continuation`, `whipsaw + continuation`, or `breakout` with no bundle and no `_boOne` stamp) are cancelled on load. A closed trade carrying the old `_boVol`, `_boHist`, `_boWhip` or `_boCont` fields keeps them, and they are ignored.
 
 ### Breakout Internals
 
-- **Hooks**: `init` (config defaults, cleanup, and the `registerRoleBadge` provider), the scan stage `bo-batch` (a `runScan` wrapper on a host without stages) and `pseudoWatchCondOrders` (its wrapper also runs `_boSync`, `_boGuard`, `_boSettle` and `_boExpire`). Declares `after: ['sunchaser', 'everwinter']`.
-- **Bundles**: `_boPrep` reads the candles, moves and filters; `_boPlace` builds and places the two orders (and cancels the first if the second is refused); `_boBatch` fills the slots; `_boExpire` cancels bundles older than **Order life**; `_boGuard` cancels them all at Max Positions; `_boSync` cancels the leftovers of earlier versions and, with Breakout Mode off, the bundles. `_boIs(o)` identifies a bundle leg (tag `breakout`, bundle `bo`), `_boPend()` counts the tickers holding one.
-- **Retry**: `_boSettle` keeps `boRedo`; `_boRedoN()` is the counter and `_boRedoTip()` the hover list.
+- **Hooks**: `init` (config defaults including the edge and sort defaults, cleanup, and the `registerRoleBadge` provider), the scan stage `bo-batch` (a `runScan` wrapper on a host without stages), `pseudoWatchCondOrders` (its wrapper also runs `_boSync`, `_boGuard`, `_boSettle` and `_boExpire`) and `cancelCondOrder` (a wrapper that calls `_boWrongWay` when one of its single-edge conds. is cancelled with a reason starting `worst case reached`). Declares `after: ['sunchaser', 'everwinter']`.
+- **Bundles**: `_boPrep` reads the candles, moves and filters; `_boPlace` builds and places the orders (two as a bundle, or one regular cond. with one edge; with two it cancels the first if the second is refused); `_boBatch` fills the slots; `_boExpire` cancels bundles older than **Order life**; `_boGuard` cancels them all at Max Positions; `_boSync` cancels the leftovers of earlier versions and, with Breakout Mode off, the bundles. `_boIs(o)` identifies one of its orders (a bundle leg: tag `breakout`, bundle `bo`; or a single-edge cond.: tag `breakout`, no bundle, `candidate._boOne`), `_boPend()` counts the tickers holding one.
+- **Retry**: `_boSettle` keeps `boRedo`; `_boWrongWay(o)` adds a wrong-way cancel to it; `_boRedoN()` is the counter and `_boRedoTip()` the hover list.
+- **Edges and sort**: `_boEdges()` (falls back to the side's default if neither edge is on), `_boEdgeSet(side)`, `_boSortSet(key, dir)`, `_boSortMode()` (null when both are off) and `_boOrder(pool, mode)`; `_boCool` is the in-memory cooldown map.
 - **Badge**: `registerRoleBadge` reads `_boEdge` and `_boTry` off a position and returns **TOP** or **BOTTOM**, with **R1**, **R2**… added for a retry.
 - **Leverage**: `_boLev` uses `resolveEffectiveLeverage` where the host has it (PseudoWinter), else `leverage`.
 
